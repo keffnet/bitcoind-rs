@@ -498,15 +498,6 @@ async fn send_peer_extensions(
     }
     send_message(writer, network, &Message::SendHeaders).await?;
     send_message(writer, network, &Message::WtxidRelay).await?;
-    send_message(
-        writer,
-        network,
-        &Message::SendCmpct {
-            announce: true,
-            version: 2,
-        },
-    )
-    .await?;
     send_message(writer, network, &Message::FeeFilter(1_000)).await?;
     *sent = true;
     Ok(())

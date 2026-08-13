@@ -1110,6 +1110,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "logging" => Ok(json!({})),
         "validateaddress" => validate_address(node, params),
         "deriveaddresses" => derive_addresses(node, params),
+        "getdescriptorinfo" => get_descriptor_info(node, params),
         _ => bail!("Method not found"),
     }
 }
@@ -1176,6 +1177,91 @@ fn derive_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(json!(addresses))
+}
+
+fn descriptor_checksum(descriptor: &str) -> Option<String> {
+    const INPUT_CHARSET: &str = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ ";
+    const CHECKSUM_CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    const GENERATOR: [u64; 5] = [
+        0xf5dee51989,
+        0xa9fdca3312,
+        0x1bab10e32d,
+        0x3706b1677a,
+        0x644d626ffd,
+    ];
+    let polymod = |value: u64, symbol: u64| {
+        let top = (value >> 35) as u8;
+        let mut value = ((value & 0x0007_ffff_ffff) << 5) ^ symbol;
+        for (index, generator) in GENERATOR.iter().enumerate() {
+            if top & (1 << index) != 0 {
+                value ^= generator;
+            }
+        }
+        value
+    };
+    let mut checksum = 1u64;
+    let mut class = 0u64;
+    let mut class_count = 0u8;
+    for character in descriptor.chars() {
+        let position = INPUT_CHARSET.find(character)?;
+        checksum = polymod(checksum, (position & 31) as u64);
+        class = class * 3 + (position >> 5) as u64;
+        class_count += 1;
+        if class_count == 3 {
+            checksum = polymod(checksum, class);
+            class = 0;
+            class_count = 0;
+        }
+    }
+    if class_count > 0 {
+        checksum = polymod(checksum, class);
+    }
+    for _ in 0..8 {
+        checksum = polymod(checksum, 0);
+    }
+    checksum ^= 1;
+    Some(
+        (0..8)
+            .map(|index| CHECKSUM_CHARSET[((checksum >> (5 * (7 - index))) & 31) as usize] as char)
+            .collect(),
+    )
+}
+
+fn descriptor_payload(descriptor: &str) -> Result<(&str, String)> {
+    let mut parts = descriptor.split('#');
+    let payload = parts.next().ok_or_else(|| anyhow!("descriptor is empty"))?;
+    let supplied = parts.next();
+    if parts.next().is_some() {
+        bail!("descriptor contains multiple checksum separators")
+    }
+    let checksum = descriptor_checksum(payload)
+        .ok_or_else(|| anyhow!("descriptor contains invalid characters"))?;
+    if let Some(supplied) = supplied {
+        if supplied.len() != 8 || supplied != checksum {
+            bail!("descriptor checksum does not match")
+        }
+    }
+    Ok((payload, checksum))
+}
+
+fn get_descriptor_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let descriptor = param::<String>(params, 0)?;
+    let (payload, checksum) = descriptor_payload(&descriptor)?;
+    let isrange = payload.contains('*');
+    let range = isrange.then_some((0, 0));
+    let has_private_keys = [
+        "xprv", "tprv", "yprv", "zprv", "Yprv", "Zprv", "uprv", "vprv",
+    ]
+    .iter()
+    .any(|prefix| payload.contains(prefix));
+    let issolvable = expand_descriptor_scripts(node, payload, range).is_ok();
+    Ok(json!({
+        "descriptor": format!("{payload}#{checksum}"),
+        "checksum": checksum,
+        "isrange": isrange,
+        "issolvable": issolvable,
+        "hasprivatekeys": has_private_keys,
+    }))
 }
 
 fn parse_descriptor_range(value: &Value) -> Result<(u32, u32)> {
@@ -4887,10 +4973,11 @@ fn expand_descriptor_scripts(
     descriptor: &str,
     range: Option<(u32, u32)>,
 ) -> Result<Vec<ScriptBuf>> {
-    let descriptor = descriptor
-        .split_once('#')
-        .map(|(descriptor, _)| descriptor)
-        .unwrap_or(descriptor);
+    let descriptor = if descriptor.contains('#') {
+        descriptor_payload(descriptor)?.0
+    } else {
+        descriptor
+    };
     if let Some(address) = descriptor
         .strip_prefix("addr(")
         .and_then(|value| value.strip_suffix(')'))
@@ -4913,6 +5000,32 @@ fn expand_descriptor_scripts(
             bail!("raw descriptors do not accept a range")
         }
         return Ok(vec![ScriptBuf::from_bytes(hex::decode(script)?)]);
+    }
+    for kind in ["multi", "sortedmulti"] {
+        if let Some(arguments) = descriptor
+            .strip_prefix(&format!("{kind}("))
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            return expand_multisig_descriptor(node, arguments, range, kind == "sortedmulti");
+        }
+    }
+    if let Some(key_expression) = descriptor
+        .strip_prefix("pk(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, range)?;
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        return indices
+            .into_iter()
+            .map(|index| {
+                let public_key = descriptor_public_key(&key, &path, index, &secp)?;
+                Ok(Builder::new()
+                    .push_key(&public_key)
+                    .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKSIG)
+                    .into_script())
+            })
+            .collect();
     }
     for wrapper in ["sh", "wsh"] {
         if let Some(inner) = descriptor
@@ -4963,7 +5076,7 @@ fn expand_descriptor_scripts(
         .filter(|(kind, _)| matches!(*kind, "pkh" | "wpkh"))
     else {
         bail!(
-            "unsupported descriptor; use addr(...), raw(...), pkh(...), wpkh(...), sh(...), wsh(...), or tr(...)"
+            "unsupported descriptor; use addr(...), raw(...), pk(...), pkh(...), wpkh(...), multi(...), sortedmulti(...), sh(...), wsh(...), or tr(...)"
         )
     };
     let (base_key, path, wildcard) = parse_descriptor_key(key_expression)?;
@@ -5000,6 +5113,80 @@ enum DescriptorKey {
     PublicKey(bitcoin::PublicKey),
     XOnlyPublicKey(bitcoin::XOnlyPublicKey),
     Xpub(bitcoin::bip32::Xpub),
+}
+
+fn expand_multisig_descriptor(
+    _node: &Arc<Node>,
+    arguments: &str,
+    range: Option<(u32, u32)>,
+    sorted: bool,
+) -> Result<Vec<ScriptBuf>> {
+    let arguments = arguments.split(',').collect::<Vec<_>>();
+    if arguments.len() < 2 {
+        bail!("multisig descriptor requires a threshold and keys")
+    }
+    let required = arguments[0]
+        .parse::<u64>()
+        .map_err(|_| anyhow!("multisig threshold must be an integer"))?;
+    let keys = arguments[1..]
+        .iter()
+        .map(|key| parse_descriptor_key(key))
+        .collect::<Result<Vec<_>>>()?;
+    let key_count = u64::try_from(keys.len()).map_err(|_| anyhow!("too many multisig keys"))?;
+    if required == 0 || required > key_count || key_count > 16 {
+        bail!("multisig threshold must be between 1 and the number of keys (maximum 16)")
+    }
+    let wildcard = keys.iter().any(|(_, _, wildcard)| *wildcard);
+    if keys
+        .iter()
+        .any(|(_, _, key_wildcard)| *key_wildcard != wildcard)
+    {
+        bail!("all multisig keys must use the same wildcard form")
+    }
+    let indices = descriptor_indices(wildcard, range)?;
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    let mut scripts = Vec::with_capacity(indices.len());
+    for index in indices {
+        let mut public_keys = keys
+            .iter()
+            .map(|(key, path, _)| descriptor_public_key(key, path, index, &secp))
+            .collect::<Result<Vec<_>>>()?;
+        if sorted {
+            public_keys.sort_unstable();
+        }
+        let mut builder = Builder::new().push_int(required as i64);
+        for public_key in &public_keys {
+            builder = builder.push_key(public_key);
+        }
+        scripts.push(
+            builder
+                .push_int(key_count as i64)
+                .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
+                .into_script(),
+        );
+    }
+    Ok(scripts)
+}
+
+fn descriptor_public_key(
+    key: &DescriptorKey,
+    path: &bitcoin::bip32::DerivationPath,
+    index: Option<u32>,
+    secp: &bitcoin::secp256k1::Secp256k1<bitcoin::secp256k1::VerifyOnly>,
+) -> Result<bitcoin::PublicKey> {
+    match key {
+        DescriptorKey::PublicKey(public_key) => Ok(*public_key),
+        DescriptorKey::XOnlyPublicKey(_) => {
+            bail!("x-only public keys are only supported by tr descriptors")
+        }
+        DescriptorKey::Xpub(xpub) => {
+            let mut derivation = path.clone();
+            if let Some(index) = index {
+                derivation = derivation.child(index.into());
+            }
+            Ok(xpub.derive_pub(secp, &derivation)?.public_key.into())
+        }
+    }
 }
 
 fn descriptor_indices(wildcard: bool, range: Option<(u32, u32)>) -> Result<Vec<Option<u32>>> {
@@ -5049,6 +5236,9 @@ fn parse_descriptor_key(
             bail!("raw public keys cannot be derived")
         }
         DescriptorKey::XOnlyPublicKey(public_key)
+    } else if let Ok(private_key) = base.parse::<bitcoin::bip32::Xpriv>() {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        DescriptorKey::Xpub(bitcoin::bip32::Xpub::from_priv(&secp, &private_key))
     } else {
         DescriptorKey::Xpub(base.parse::<bitcoin::bip32::Xpub>()?)
     };
@@ -5340,6 +5530,7 @@ fn rpc_help(method: &str) -> String {
         "logging",
         "validateaddress",
         "deriveaddresses",
+        "getdescriptorinfo",
     ];
     if method.is_empty() {
         METHODS.join("\n")
@@ -6022,6 +6213,34 @@ mod tests {
         let ranged =
             derive_addresses(&node, &json!([format!("wpkh({xpub}/0/*)"), [0, 1]])).unwrap();
         assert_eq!(ranged.as_array().unwrap().len(), 2);
+        let descriptor_info =
+            get_descriptor_info(&node, &json!([format!("wpkh({public_key})")])).unwrap();
+        assert_eq!(descriptor_info["isrange"], false);
+        assert_eq!(descriptor_info["issolvable"], true);
+        assert_eq!(descriptor_info["hasprivatekeys"], false);
+        assert_eq!(descriptor_info["checksum"].as_str().unwrap().len(), 8);
+        assert!(
+            get_descriptor_info(&node, &json!([format!("wpkh({public_key})#qqqqqqqq")])).is_err()
+        );
+        let ranged_info =
+            get_descriptor_info(&node, &json!([format!("wpkh({xpub}/0/*)")])).unwrap();
+        assert_eq!(ranged_info["isrange"], true);
+        let second_public_key = bitcoin::PrivateKey::new(
+            bitcoin::secp256k1::SecretKey::from_slice(&[5; 32]).unwrap(),
+            Network::Regtest,
+        )
+        .public_key(&Secp256k1::new())
+        .to_string();
+        let multisig = format!("multi(1,{public_key},{second_public_key})");
+        let multisig_script = expand_descriptor_scripts(&node, &multisig, None).unwrap();
+        assert_eq!(multisig_script.len(), 1);
+        assert!(multisig_script[0].is_multisig());
+        let public_key_script =
+            expand_descriptor_scripts(&node, &format!("pk({public_key})"), None).unwrap();
+        assert!(public_key_script[0].is_p2pk());
+        let wrapped_multisig =
+            expand_descriptor_scripts(&node, &format!("wsh({multisig})"), None).unwrap();
+        assert!(wrapped_multisig[0].is_p2wsh());
         let wrapped = derive_addresses(&node, &json!([format!("sh(wpkh({public_key}))")])).unwrap();
         assert_eq!(wrapped.as_array().unwrap().len(), 1);
         let taproot_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";

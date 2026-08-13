@@ -35,6 +35,7 @@ use crate::Node;
 use crate::chain;
 use crate::mempool::Mempool;
 use crate::validation;
+use crate::wire;
 
 const MAX_HTTP_REQUEST: usize = 8 * 1024 * 1024;
 
@@ -1081,10 +1082,14 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 .map(|peer| json!({
                     "id": peer.id,
                     "addr": peer.address.to_string(),
-                    "addrbind": "",
+                    "addrbind": peer
+                        .local_address
+                        .map(|address| address.to_string())
+                        .unwrap_or_default(),
                     "addrlocal": "",
-                    "network": "ipv4",
+                    "network": if peer.address.ip().is_ipv4() { "ipv4" } else { "ipv6" },
                     "services": format!("{:016x}", peer.services),
+                    "servicesnames": peer_services_names(peer.services),
                     "relaytxes": peer.relay_transactions,
                     "lastsend": peer.last_send,
                     "lastrecv": peer.last_recv,
@@ -1096,6 +1101,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     "version": peer.version.unwrap_or_default(),
                     "subver": peer.user_agent,
                     "inbound": peer.inbound,
+                    "connection_type": if peer.inbound { "inbound" } else { "outbound-full" },
+                    "permissions": [],
                     "startingheight": peer.start_height,
                     "synced_headers": node.chain.read().best_header_tip().height,
                     "synced_blocks": node.chain.read().height(),
@@ -1167,6 +1174,17 @@ fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
         },
         "connections": peers.len(),
     }))
+}
+
+fn peer_services_names(services: u64) -> Vec<&'static str> {
+    [
+        (wire::NODE_NETWORK, "NETWORK"),
+        (wire::NODE_WITNESS, "WITNESS"),
+        (wire::NODE_COMPACT_FILTERS, "COMPACT_FILTERS"),
+    ]
+    .into_iter()
+    .filter_map(|(bit, name)| (services & bit != 0).then_some(name))
+    .collect()
 }
 
 fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {

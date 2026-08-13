@@ -200,6 +200,7 @@ pub struct OrphanTransaction {
 pub struct PeerInfo {
     pub id: usize,
     pub address: std::net::SocketAddr,
+    pub local_address: Option<std::net::SocketAddr>,
     pub inbound: bool,
     pub version: Option<i32>,
     pub services: u64,
@@ -526,12 +527,24 @@ impl Node {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn register_peer(
         &self,
         id: usize,
         address: SocketAddr,
         inbound: bool,
         commands: tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>,
+    ) {
+        self.register_peer_with_local(id, address, inbound, commands, None);
+    }
+
+    pub(crate) fn register_peer_with_local(
+        &self,
+        id: usize,
+        address: SocketAddr,
+        inbound: bool,
+        commands: tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>,
+        local_address: Option<SocketAddr>,
     ) {
         let connected_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -540,6 +553,7 @@ impl Node {
         let peer = PeerInfo {
             id,
             address,
+            local_address,
             inbound,
             version: None,
             services: 0,
@@ -605,6 +619,7 @@ impl Node {
         let entry = known.entry(address).or_insert_with(|| PeerInfo {
             id: 0,
             address,
+            local_address: None,
             inbound: false,
             version: None,
             services,

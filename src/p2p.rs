@@ -236,7 +236,8 @@ async fn serve_peer(
     let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
     let (commands, command_receiver) = mpsc::unbounded_channel();
-    node.register_peer(peer_id, address, !outbound, commands);
+    let local_address = stream.local_addr().ok();
+    node.register_peer_with_local(peer_id, address, !outbound, commands, local_address);
     let (mut reader, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
     peers.lock().insert(peer_id, writer.clone());

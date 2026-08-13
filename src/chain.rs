@@ -992,9 +992,7 @@ impl ChainState {
             input.push_str(&entry.height.to_string());
             input.push(':');
         }
-        let mut digest = Sha256::digest(input.as_bytes()).to_vec();
-        digest.reverse();
-        Some(hex::encode(digest))
+        Some(hex::encode(Sha256::digest(input.as_bytes())))
     }
 
     pub fn merkle_branch(&mut self, txid: &Txid) -> Result<Option<(Vec<Txid>, usize, u32)>> {

@@ -10,7 +10,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version as BlockVersion};
-use bitcoin::blockdata::script::Builder;
+use bitcoin::blockdata::opcodes::all::OP_RETURN;
+use bitcoin::blockdata::script::{Builder, PushBytesBuf};
 use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
@@ -876,6 +877,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "preciousblock" => precious_block(node, params),
         "getrawtransaction" => get_raw_transaction(node, params),
         "decoderawtransaction" => decode_raw_transaction(params),
+        "createrawtransaction" => create_raw_transaction(node, params),
+        "decodescript" => decode_script(node, params),
         "sendrawtransaction" => send_raw_transaction(node, params),
         "submitblock" => submit_block(node, params),
         "getblocktemplate" => get_block_template(node, params),
@@ -2769,6 +2772,169 @@ fn decode_raw_transaction(params: &Value) -> Result<Value> {
     Ok(rpc_transaction(&transaction, None, None, None, None))
 }
 
+fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let inputs = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("createrawtransaction inputs must be an array"))?;
+    let outputs = params
+        .get(1)
+        .ok_or_else(|| anyhow!("createrawtransaction outputs are missing"))?;
+    let lock_time = params
+        .get(2)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_u64)
+        .map(|value| {
+            u32::try_from(value)
+                .map_err(|_| anyhow!("locktime is out of range"))
+                .map(LockTime::from_consensus)
+        })
+        .transpose()?
+        .unwrap_or(LockTime::ZERO);
+    let replaceable = params.get(3).and_then(Value::as_bool).unwrap_or(false);
+    let transaction_inputs = inputs
+        .iter()
+        .map(|value| {
+            let txid: Txid = value
+                .get("txid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("transaction input txid is missing"))?
+                .parse()?;
+            let vout = value
+                .get("vout")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("transaction input vout is missing"))?;
+            let vout = u32::try_from(vout)
+                .map_err(|_| anyhow!("transaction input vout is out of range"))?;
+            let sequence = value
+                .get("sequence")
+                .filter(|value| !value.is_null())
+                .and_then(Value::as_u64)
+                .map(|sequence| {
+                    u32::try_from(sequence)
+                        .map_err(|_| anyhow!("transaction input sequence is out of range"))
+                })
+                .transpose()?
+                .unwrap_or(if replaceable { 0xffff_fffd } else { u32::MAX });
+            Ok(TxIn {
+                previous_output: OutPoint::new(txid, vout),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::from_consensus(sequence),
+                witness: Witness::default(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let transaction_outputs = create_transaction_outputs(node, outputs)?;
+    let transaction = Transaction {
+        version: Version::TWO,
+        lock_time,
+        input: transaction_inputs,
+        output: transaction_outputs,
+    };
+    Ok(json!(hex::encode(serialize(&transaction))))
+}
+
+fn create_transaction_outputs(node: &Arc<Node>, outputs: &Value) -> Result<Vec<TxOut>> {
+    let entries = if let Some(object) = outputs.as_object() {
+        object.iter().collect::<Vec<_>>()
+    } else if let Some(array) = outputs.as_array() {
+        array
+            .iter()
+            .map(|value| {
+                let object = value
+                    .as_object()
+                    .ok_or_else(|| anyhow!("transaction output must be an object"))?;
+                if object.len() != 1 {
+                    bail!("transaction output object must contain one entry")
+                }
+                Ok(object.iter().next().expect("one output entry"))
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        bail!("transaction outputs must be an object or array")
+    };
+    entries
+        .into_iter()
+        .map(|(destination, value)| {
+            if destination == "data" {
+                let data = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("data output must be hexadecimal"))?;
+                let data = hex::decode(data)?;
+                let data = PushBytesBuf::try_from(data)
+                    .map_err(|_| anyhow!("data output is too large"))?;
+                return Ok(TxOut {
+                    value: Amount::ZERO,
+                    script_pubkey: Builder::new()
+                        .push_opcode(OP_RETURN)
+                        .push_slice(data)
+                        .into_script(),
+                });
+            }
+            let address = destination
+                .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
+                .require_network(node.config.network)?;
+            let amount = value
+                .as_f64()
+                .ok_or_else(|| anyhow!("transaction output amount must be numeric"))?;
+            let amount = Amount::from_btc(amount)?;
+            if amount > Amount::MAX_MONEY {
+                bail!("transaction output amount exceeds MAX_MONEY")
+            }
+            Ok(TxOut {
+                value: amount,
+                script_pubkey: address.script_pubkey(),
+            })
+        })
+        .collect()
+}
+
+fn decode_script(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let bytes = hex::decode(param::<String>(params, 0)?)?;
+    let script = ScriptBuf::from_bytes(bytes);
+    let address = Address::from_script(&script, node.config.network).ok();
+    let script_type = if script.is_p2pkh() {
+        "pubkeyhash"
+    } else if script.is_p2sh() {
+        "scripthash"
+    } else if script.is_p2wpkh() {
+        "witness_v0_keyhash"
+    } else if script.is_p2wsh() {
+        "witness_v0_scripthash"
+    } else if script.is_p2tr() {
+        "witness_v1_taproot"
+    } else if script.is_op_return() {
+        "nulldata"
+    } else if script.is_p2pk() {
+        "pubkey"
+    } else {
+        "nonstandard"
+    };
+    let mut result = json!({
+        "asm": script.to_asm_string(),
+        "hex": hex::encode(script.as_bytes()),
+        "type": script_type,
+        "reqSigs": (script.is_p2pkh() || script.is_p2pk() || script.is_p2wpkh()).then_some(1),
+        "addresses": address
+            .as_ref()
+            .map(|address| vec![address.to_string()])
+            .unwrap_or_default(),
+        "p2sh": address
+            .as_ref()
+            .and_then(|_| Address::p2sh(&script, node.config.network).ok())
+            .map(|address| address.to_string()),
+    });
+    if let Some(address) = address
+        && script.is_p2tr()
+    {
+        result["segwit"] = json!({
+            "version": address.witness_program().map(|program| program.version().to_num()),
+            "hex": address.witness_program().map(|program| hex::encode(program.program().as_bytes())),
+        });
+    }
+    Ok(result)
+}
+
 fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let transaction: Transaction = deserialize(&bytes)?;
@@ -3942,31 +4108,68 @@ fn expand_descriptor_scripts(
         }
         return Ok(vec![ScriptBuf::from_bytes(hex::decode(script)?)]);
     }
+    for wrapper in ["sh", "wsh"] {
+        if let Some(inner) = descriptor
+            .strip_prefix(&format!("{wrapper}("))
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let scripts = expand_descriptor_scripts(node, inner, range)?;
+            return scripts
+                .into_iter()
+                .map(|script| {
+                    let address = if wrapper == "sh" {
+                        Address::p2sh(&script, node.config.network)?
+                    } else {
+                        Address::p2wsh(&script, node.config.network)
+                    };
+                    Ok(address.script_pubkey())
+                })
+                .collect();
+        }
+    }
+    if let Some(key_expression) = descriptor
+        .strip_prefix("tr(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (base_key, path, wildcard) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, range)?;
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let mut scripts = Vec::with_capacity(indices.len());
+        for index in indices {
+            let xonly = match &base_key {
+                DescriptorKey::PublicKey(public_key) => bitcoin::XOnlyPublicKey::from(*public_key),
+                DescriptorKey::XOnlyPublicKey(public_key) => *public_key,
+                DescriptorKey::Xpub(xpub) => {
+                    let mut derivation = path.clone();
+                    if let Some(index) = index {
+                        derivation = derivation.child(index.into());
+                    }
+                    xpub.derive_pub(&secp, &derivation)?.to_x_only_pub()
+                }
+            };
+            scripts.push(Address::p2tr(&secp, xonly, None, node.config.network).script_pubkey());
+        }
+        return Ok(scripts);
+    }
     let Some((kind, key_expression)) = descriptor
         .strip_suffix(')')
         .and_then(|value| value.split_once('('))
         .filter(|(kind, _)| matches!(*kind, "pkh" | "wpkh"))
     else {
-        bail!("unsupported descriptor; use addr(...), raw(...), pkh(...), or wpkh(...)")
+        bail!(
+            "unsupported descriptor; use addr(...), raw(...), pkh(...), wpkh(...), sh(...), wsh(...), or tr(...)"
+        )
     };
     let (base_key, path, wildcard) = parse_descriptor_key(key_expression)?;
-    let indices = if wildcard {
-        let (start, end) = range.ok_or_else(|| anyhow!("ranged descriptor requires a range"))?;
-        if end.saturating_sub(start) >= 10_000 {
-            bail!("descriptor range is too large")
-        }
-        (start..=end).map(Some).collect::<Vec<_>>()
-    } else {
-        if range.is_some_and(|(start, end)| start != 0 || end != 0) {
-            bail!("non-ranged descriptor cannot use a non-zero range")
-        }
-        vec![None]
-    };
+    let indices = descriptor_indices(wildcard, range)?;
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
     let mut scripts = Vec::with_capacity(indices.len());
     for index in indices {
         let public_key = match &base_key {
             DescriptorKey::PublicKey(public_key) => *public_key,
+            DescriptorKey::XOnlyPublicKey(_) => {
+                bail!("x-only public keys are only supported by tr descriptors")
+            }
             DescriptorKey::Xpub(xpub) => {
                 let mut derivation = path.clone();
                 if let Some(index) = index {
@@ -3989,7 +4192,23 @@ fn expand_descriptor_scripts(
 
 enum DescriptorKey {
     PublicKey(bitcoin::PublicKey),
+    XOnlyPublicKey(bitcoin::XOnlyPublicKey),
     Xpub(bitcoin::bip32::Xpub),
+}
+
+fn descriptor_indices(wildcard: bool, range: Option<(u32, u32)>) -> Result<Vec<Option<u32>>> {
+    if wildcard {
+        let (start, end) = range.ok_or_else(|| anyhow!("ranged descriptor requires a range"))?;
+        if end.saturating_sub(start) >= 10_000 {
+            bail!("descriptor range is too large")
+        }
+        Ok((start..=end).map(Some).collect())
+    } else {
+        if range.is_some_and(|(start, end)| start != 0 || end != 0) {
+            bail!("non-ranged descriptor cannot use a non-zero range")
+        }
+        Ok(vec![None])
+    }
 }
 
 fn parse_descriptor_key(
@@ -4019,6 +4238,11 @@ fn parse_descriptor_key(
             bail!("raw public keys cannot be derived")
         }
         DescriptorKey::PublicKey(public_key)
+    } else if let Ok(public_key) = bitcoin::XOnlyPublicKey::from_str(base) {
+        if !path.is_empty() || wildcard {
+            bail!("raw public keys cannot be derived")
+        }
+        DescriptorKey::XOnlyPublicKey(public_key)
     } else {
         DescriptorKey::Xpub(base.parse::<bitcoin::bip32::Xpub>()?)
     };
@@ -4244,6 +4468,8 @@ fn rpc_help(method: &str) -> String {
         "preciousblock",
         "getrawtransaction",
         "decoderawtransaction",
+        "createrawtransaction",
+        "decodescript",
         "sendrawtransaction",
         "submitblock",
         "getblocktemplate",
@@ -4979,6 +5205,64 @@ mod tests {
         let ranged =
             derive_addresses(&node, &json!([format!("wpkh({xpub}/0/*)"), [0, 1]])).unwrap();
         assert_eq!(ranged.as_array().unwrap().len(), 2);
+        let wrapped = derive_addresses(&node, &json!([format!("sh(wpkh({public_key}))")])).unwrap();
+        assert_eq!(wrapped.as_array().unwrap().len(), 1);
+        let taproot_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let taproot = derive_addresses(&node, &json!([format!("tr({taproot_key})")])).unwrap();
+        assert_eq!(taproot.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn raw_transaction_helpers_are_wallet_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let raw = create_raw_transaction(
+            &node,
+            &json!([
+                [{
+                    "txid": Txid::from_byte_array([7; 32]).to_string(),
+                    "vout": 1,
+                }],
+                {
+                    "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl": 0.25,
+                    "data": "deadbeef",
+                },
+                42,
+                true,
+            ]),
+        )
+        .unwrap();
+        let transaction: Transaction =
+            deserialize(&hex::decode(raw.as_str().expect("raw transaction hex")).unwrap()).unwrap();
+        assert_eq!(transaction.version, Version::TWO);
+        assert_eq!(transaction.lock_time, LockTime::from_consensus(42));
+        assert_eq!(
+            transaction.input[0].sequence.to_consensus_u32(),
+            0xffff_fffd
+        );
+        assert_eq!(transaction.output.len(), 2);
+        assert!(transaction.output[1].script_pubkey.is_op_return());
+        let decoded = decode_script(
+            &node,
+            &json!([hex::encode(transaction.output[0].script_pubkey.as_bytes())]),
+        )
+        .unwrap();
+        assert_eq!(decoded["type"], "witness_v0_keyhash");
+        assert_eq!(
+            decoded["addresses"][0],
+            "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
+        );
     }
 
     #[test]

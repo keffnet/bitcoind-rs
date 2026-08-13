@@ -472,6 +472,10 @@ fn history_status_for_script(node: &Arc<Node>, script_hash: &str) -> Option<Stri
     if records.is_empty() {
         return None;
     }
+    Some(history_status(&records))
+}
+
+fn history_status(records: &[(Txid, i64)]) -> String {
     let mut input = String::new();
     for (txid, height) in records {
         input.push_str(&txid.to_string());
@@ -479,9 +483,7 @@ fn history_status_for_script(node: &Arc<Node>, script_hash: &str) -> Option<Stri
         input.push_str(&height.to_string());
         input.push(':');
     }
-    let mut digest = Sha256::digest(input.as_bytes()).to_vec();
-    digest.reverse();
-    Some(hex::encode(digest))
+    hex::encode(Sha256::digest(input.as_bytes()))
 }
 
 fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<(Txid, i64)> {
@@ -648,6 +650,7 @@ fn param<T: serde::de::DeserializeOwned>(params: &Value, index: usize) -> Result
 mod tests {
     use super::*;
     use bitcoin::Network;
+    use bitcoin::hashes::Hash;
 
     #[test]
     fn empty_fee_histogram_is_a_valid_electrum_result() {
@@ -660,5 +663,14 @@ mod tests {
         let params = json!(["AA".repeat(32)]);
         assert_eq!(script_hash_param(&params, 0).unwrap(), "aa".repeat(32));
         assert!(script_hash_param(&json!(["00"]), 0).is_err());
+    }
+
+    #[test]
+    fn history_status_uses_electrum_digest_order() {
+        let txid = Txid::from_byte_array([1; 32]);
+        assert_eq!(
+            history_status(&[(txid, 1)]),
+            "549540a6810df8dc5008757fa694172b0f7a3e32facfd9f39eab228286543cde"
+        );
     }
 }

@@ -202,10 +202,45 @@ fn dispatch(
         "blockchain.transaction.get_merkle" => transaction_merkle(node, params),
         "blockchain.transaction.broadcast" => transaction_broadcast(node, params),
         "blockchain.estimatefee" | "blockchain.relayfee" => Ok(json!(0.00001000)),
-        "mempool.get_fee_histogram" => Ok(json!([])),
-        "server.peers.subscribe" => Ok(json!([])),
+        "mempool.get_fee_histogram" => {
+            let mempool = node.mempool.read();
+            Ok(fee_histogram(&mempool))
+        }
+        "server.peers.subscribe" => Ok(json!(
+            node.peer_infos()
+                .into_iter()
+                .map(|peer| {
+                    json!([
+                        peer.user_agent,
+                        peer.address.ip().to_string(),
+                        peer.address.port()
+                    ])
+                })
+                .collect::<Vec<_>>()
+        )),
         _ => bail!("unsupported Electrum method {method}"),
     }
+}
+
+fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
+    let mut entries = mempool
+        .transaction_order()
+        .into_iter()
+        .filter_map(|txid| mempool.get(&txid))
+        .filter_map(|entry| (entry.vsize > 0).then_some((entry.fee_sat / entry.vsize, entry.vsize)))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let mut histogram: Vec<(u64, u64)> = Vec::new();
+    for (fee_rate, vsize) in entries {
+        if let Some((last_fee_rate, total_vsize)) = histogram.last_mut()
+            && *last_fee_rate == fee_rate
+        {
+            *total_vsize = total_vsize.saturating_add(vsize);
+        } else {
+            histogram.push((fee_rate, vsize));
+        }
+    }
+    json!(histogram)
 }
 
 fn block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -473,4 +508,23 @@ fn param<T: serde::de::DeserializeOwned>(params: &Value, index: usize) -> Result
         .and_then(|values| values.get(index))
         .ok_or_else(|| anyhow!("missing parameter {index}"))?;
     Ok(serde_json::from_value(value.clone())?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::Network;
+
+    #[test]
+    fn empty_fee_histogram_is_a_valid_electrum_result() {
+        let mempool = crate::mempool::Mempool::new(Network::Regtest);
+        assert_eq!(fee_histogram(&mempool), json!([]));
+    }
+
+    #[test]
+    fn script_hash_validation_is_case_insensitive_but_length_strict() {
+        let params = json!(["AA".repeat(32)]);
+        assert_eq!(script_hash_param(&params, 0).unwrap(), "aa".repeat(32));
+        assert!(script_hash_param(&json!(["00"]), 0).is_err());
+    }
 }

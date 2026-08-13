@@ -50,6 +50,12 @@ pub enum MempoolError {
     AlreadyPresent,
     #[error("transaction input is already spent by mempool transaction {0}")]
     Conflict(Txid),
+    #[error("conflicting transaction does not signal replaceability")]
+    ReplacementNotSignaled,
+    #[error("replacement transaction fee is too low")]
+    ReplacementFee,
+    #[error("replacement transaction spends an unconfirmed output outside the conflicts")]
+    ReplacementUnconfirmedInput,
     #[error("transaction {0} input is missing")]
     MissingInput(OutPoint),
     #[error("transaction contains a duplicate input")]
@@ -314,7 +320,89 @@ impl Mempool {
             .duration_since(UNIX_EPOCH)
             .unwrap_or(Duration::ZERO)
             .as_secs();
-        self.accept_at(transaction, chain, added_at)
+        match self.accept_at(transaction.clone(), chain, added_at) {
+            Err(MempoolError::Conflict(_)) => self.replace(transaction, chain, added_at),
+            result => result,
+        }
+    }
+
+    fn replace(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
+    ) -> Result<Txid, MempoolError> {
+        let conflicts = self.conflicts_for(&transaction);
+        if conflicts.is_empty() {
+            return Err(MempoolError::Conflict(transaction.compute_txid()));
+        }
+        if conflicts.iter().any(|txid| {
+            self.entries
+                .get(txid)
+                .is_none_or(|entry| !signals_replaceability(&entry.transaction))
+        }) {
+            return Err(MempoolError::ReplacementNotSignaled);
+        }
+        let removal = self.conflicts_and_descendants(&conflicts);
+        for input in &transaction.input {
+            if self.entries.contains_key(&input.previous_output.txid)
+                && !removal.contains(&input.previous_output.txid)
+            {
+                return Err(MempoolError::ReplacementUnconfirmedInput);
+            }
+        }
+        let conflict_fees = removal
+            .iter()
+            .filter_map(|txid| self.entries.get(txid))
+            .map(|entry| entry.fee_sat)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or(MempoolError::BadOutput)?;
+        let mut candidate = self.clone();
+        for txid in &removal {
+            candidate.remove(txid);
+        }
+        let txid = candidate.accept_at(transaction, chain, added_at)?;
+        let replacement_fee = candidate
+            .get(&txid)
+            .map(|entry| entry.fee_sat)
+            .ok_or(MempoolError::BadOutput)?;
+        let required_fee = conflict_fees
+            .checked_add(
+                candidate
+                    .get(&txid)
+                    .map(|entry| entry.vsize)
+                    .unwrap_or_default()
+                    .saturating_mul(MIN_RELAY_SAT_PER_VBYTE),
+            )
+            .ok_or(MempoolError::BadOutput)?;
+        if replacement_fee < required_fee {
+            return Err(MempoolError::ReplacementFee);
+        }
+        *self = candidate;
+        Ok(txid)
+    }
+
+    fn conflicts_for(&self, transaction: &Transaction) -> Vec<Txid> {
+        let mut conflicts = transaction
+            .input
+            .iter()
+            .filter_map(|input| self.spent.get(&input.previous_output).copied())
+            .collect::<Vec<_>>();
+        conflicts.sort_by_key(ToString::to_string);
+        conflicts.dedup();
+        conflicts
+    }
+
+    fn conflicts_and_descendants(&self, conflicts: &[Txid]) -> HashSet<Txid> {
+        let mut removal = HashSet::new();
+        let mut pending = conflicts.to_vec();
+        while let Some(txid) = pending.pop() {
+            if !removal.insert(txid) {
+                continue;
+            }
+            pending.extend(self.children(&txid));
+        }
+        removal
     }
 
     fn accept_at(
@@ -534,6 +622,19 @@ impl Mempool {
             self.remove(&txid);
         }
     }
+
+    pub fn is_replaceable(&self, txid: &Txid) -> bool {
+        self.entries
+            .get(txid)
+            .is_some_and(|entry| signals_replaceability(&entry.transaction))
+    }
+}
+
+fn signals_replaceability(transaction: &Transaction) -> bool {
+    transaction
+        .input
+        .iter()
+        .any(|input| input.sequence.to_consensus_u32() < 0xffff_fffe)
 }
 
 impl From<ValidationError> for MempoolError {

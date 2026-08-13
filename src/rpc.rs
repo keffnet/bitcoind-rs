@@ -453,7 +453,15 @@ fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let requested_window = params.get(0).and_then(Value::as_i64).unwrap_or(30);
+    let explicit_window = params.get(0).is_some_and(|value| !value.is_null());
+    let requested_window = if explicit_window {
+        params
+            .get(0)
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("window must be an integer"))?
+    } else {
+        30
+    };
     if requested_window < 0 {
         bail!("window must not be negative");
     }
@@ -473,9 +481,17 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     } else {
         chain.height()
     };
-    let window = u32::try_from(requested_window)
-        .unwrap_or(u32::MAX)
-        .min(end_height.saturating_sub(1));
+    let window = if explicit_window {
+        let window = u32::try_from(requested_window).unwrap_or(u32::MAX);
+        if window > 0 && window >= end_height {
+            bail!("window must be between 0 and the block height - 1");
+        }
+        window
+    } else {
+        u32::try_from(requested_window)
+            .unwrap_or(u32::MAX)
+            .min(end_height.saturating_sub(1))
+    };
     let start_height = end_height.saturating_sub(window);
     let end_hash = chain
         .block_hash(end_height)
@@ -514,16 +530,21 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .median_time_past_for_hash(&start_hash)
                 .unwrap_or(start_time),
         );
-    Ok(json!({
+    let mut result = json!({
         "time": end_time,
         "txcount": txcount,
         "window_final_block_hash": end_hash.to_string(),
+        "window_final_block_height": end_height,
         "window_block_count": window,
-        "window_tx_count": window_tx_count,
-        "window_interval": interval,
-        "txrate": (interval > 0).then_some(window_tx_count as f64 / interval as f64),
-        "window_start_block_hash": start_hash.to_string(),
-    }))
+    });
+    if window > 0 {
+        result["window_tx_count"] = json!(window_tx_count);
+        result["window_interval"] = json!(interval);
+        if interval > 0 {
+            result["txrate"] = json!(window_tx_count as f64 / interval as f64);
+        }
+    }
+    Ok(result)
 }
 
 fn get_network_hash_ps(node: &Arc<Node>, params: &Value) -> Result<Value> {

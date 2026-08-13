@@ -38,6 +38,7 @@ pub struct Mempool {
     entries: HashMap<Txid, MempoolEntry>,
     spent: HashMap<OutPoint, Txid>,
     children: HashMap<Txid, HashSet<Txid>>,
+    wtxids: HashMap<Wtxid, Txid>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +76,7 @@ impl Mempool {
             entries: HashMap::new(),
             spent: HashMap::new(),
             children: HashMap::new(),
+            wtxids: HashMap::new(),
         }
     }
 
@@ -99,9 +101,9 @@ impl Mempool {
     }
 
     pub fn get_by_wtxid(&self, wtxid: &Wtxid) -> Option<&MempoolEntry> {
-        self.entries
-            .values()
-            .find(|entry| entry.transaction.compute_wtxid() == *wtxid)
+        self.wtxids
+            .get(wtxid)
+            .and_then(|txid| self.entries.get(txid))
     }
 
     pub fn is_spent(&self, outpoint: &OutPoint) -> bool {
@@ -383,6 +385,7 @@ impl Mempool {
             vsize,
             added_at,
         };
+        let wtxid = entry.transaction.compute_wtxid();
         for input in &entry.transaction.input {
             self.spent.insert(input.previous_output, txid);
             if self.entries.contains_key(&input.previous_output.txid) {
@@ -394,6 +397,7 @@ impl Mempool {
         }
         self.bytes += size;
         self.entries.insert(txid, entry);
+        self.wtxids.insert(wtxid, txid);
         Ok(txid)
     }
 
@@ -452,6 +456,7 @@ impl Mempool {
         self.entries.clear();
         self.spent.clear();
         self.children.clear();
+        self.wtxids.clear();
         self.bytes = 0;
         for (added_at, transaction) in ordered {
             let _ = self.accept_at(transaction, chain, added_at);
@@ -460,6 +465,7 @@ impl Mempool {
 
     pub fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
         let entry = self.entries.remove(txid)?;
+        self.wtxids.remove(&entry.transaction.compute_wtxid());
         let size = bitcoin::consensus::encode::serialize(&entry.transaction).len();
         self.bytes = self.bytes.saturating_sub(size);
         for input in &entry.transaction.input {
@@ -548,9 +554,11 @@ mod tests {
         let child_id = child.compute_txid();
         let grandchild = graph_transaction(child_id, 3);
         let grandchild_id = grandchild.compute_txid();
+        let grandchild_wtxid = grandchild.compute_wtxid();
         let mut pool = Mempool::new(Network::Regtest);
         for (time, transaction) in [(1, root), (2, child), (3, grandchild)] {
             let txid = transaction.compute_txid();
+            let wtxid = transaction.compute_wtxid();
             pool.entries.insert(
                 txid,
                 MempoolEntry {
@@ -560,6 +568,7 @@ mod tests {
                     transaction,
                 },
             );
+            pool.wtxids.insert(wtxid, txid);
         }
         pool.children.entry(root_id).or_default().insert(child_id);
         pool.children
@@ -571,5 +580,6 @@ mod tests {
         assert_eq!(pool.children(&root_id), vec![child_id]);
         assert_eq!(pool.ancestors(&grandchild_id), vec![root_id, child_id]);
         assert_eq!(pool.descendants(&root_id), vec![child_id, grandchild_id]);
+        assert_eq!(pool.get_by_wtxid(&grandchild_wtxid).unwrap().added_at, 3);
     }
 }

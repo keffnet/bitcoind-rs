@@ -1085,7 +1085,7 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let total_fee = chain
         .block_fee_stats(&hash)?
         .map(|stats| stats.total_fee_sat);
-    Ok(json!({
+    let result = json!({
         "blockhash": hash.to_string(),
         "height": height,
         "txs": block.txdata.len(),
@@ -1102,7 +1102,22 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "outs": outputs,
         "swtxs": segwit_transactions,
         "avgfee": total_fee.map(|fee| if non_coinbase == 0 { 0 } else { fee / non_coinbase as u64 }),
-    }))
+    });
+    let Some(selected) = params.get(1).and_then(Value::as_array) else {
+        return Ok(result);
+    };
+    let mut filtered = serde_json::Map::new();
+    for statistic in selected {
+        let statistic = statistic
+            .as_str()
+            .ok_or_else(|| anyhow!("block statistics must be strings"))?;
+        let value = result
+            .get(statistic)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown block statistic: {statistic}"))?;
+        filtered.insert(statistic.to_owned(), value);
+    }
+    Ok(Value::Object(filtered))
 }
 
 fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {

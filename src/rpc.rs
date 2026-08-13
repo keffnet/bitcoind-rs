@@ -755,6 +755,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         }
         "getblockheader" => get_block_header(node, params),
         "getblock" => get_block(node, params),
+        "getblockfilter" => get_block_filter(node, params),
         "getblockstats" => get_block_stats(node, params),
         "getchaintxstats" => get_chain_tx_stats(node, params),
         "getnetworkhashps" => get_network_hash_ps(node, params),
@@ -884,7 +885,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "version": 310100,
             "subversion": "/bitcoind-rs:0.1.0/",
             "protocolversion": 70016,
-            "localservices": "0000000000000009",
+            "localservices": "0000000000000049",
             "localrelay": true,
             "connections": node.peer_count(),
             "connections_in": node.peer_infos().iter().filter(|peer| peer.inbound).count(),
@@ -1527,6 +1528,29 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "previousblockhash": (height > 0).then(|| block.header.prev_blockhash.to_string()),
         "nextblockhash": chain.next_block_hash(&hash).map(|next| next.to_string()),
         "coinbase_tx": coinbase_transaction_json(&block.txdata[0]),
+    }))
+}
+
+fn get_block_filter(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    let filter_type = params.get(1).and_then(Value::as_str).unwrap_or("basic");
+    if filter_type != "basic" {
+        bail!("only the basic block filter is available")
+    }
+    let (content, header) = node
+        .chain
+        .write()
+        .basic_filter_chain(&hash)?
+        .and_then(|filters| {
+            filters
+                .into_iter()
+                .next_back()
+                .map(|(_, filter, header)| (filter.content, header))
+        })
+        .ok_or_else(|| anyhow!("Block filter not found"))?;
+    Ok(json!({
+        "filter": hex::encode(content),
+        "header": header.to_string(),
     }))
 }
 
@@ -2835,6 +2859,7 @@ fn rpc_help(method: &str) -> String {
         "getblockhash",
         "getblockheader",
         "getblock",
+        "getblockfilter",
         "getblockstats",
         "getchaintxstats",
         "getnetworkhashps",
@@ -3101,6 +3126,28 @@ mod tests {
                 .iter()
                 .any(|flag| { flag == "TAPROOT" })
         );
+    }
+
+    #[test]
+    fn block_filter_rpc_returns_the_basic_filter_and_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let hash = node.chain.read().best_hash();
+        let filter = get_block_filter(&node, &json!([hash.to_string()])).unwrap();
+        assert!(filter["filter"].as_str().is_some());
+        assert_eq!(filter["header"].as_str().unwrap().len(), 64);
+        assert!(get_block_filter(&node, &json!([hash.to_string(), "extended"])).is_err());
     }
 
     #[test]

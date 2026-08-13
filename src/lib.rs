@@ -226,6 +226,13 @@ pub struct BannedAddress {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedAddress {
+    address: String,
+    services: u64,
+    time: u64,
+}
+
 /// The wallet-free node facade shared by the network and RPC services.
 pub struct Node {
     pub config: Config,
@@ -264,6 +271,7 @@ impl Node {
         let mut mempool = Mempool::new(config.network);
         mempool.load_from_file(&mempool_path, &chain)?;
         let banned_addresses = load_banlist(&config.datadir)?;
+        let known_addresses = load_known_addresses(&config.datadir)?;
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let rpc_cookie = config
@@ -286,7 +294,7 @@ impl Node {
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
             orphans: parking_lot::Mutex::new(OrphanPool::default()),
-            known_addresses: parking_lot::RwLock::new(HashMap::new()),
+            known_addresses: parking_lot::RwLock::new(known_addresses),
             added_nodes: parking_lot::RwLock::new(added_nodes),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
             started_at: Instant::now(),
@@ -820,6 +828,7 @@ impl Node {
         rpc_task.abort();
         electrum_task.abort();
         self.persist_mempool()?;
+        self.persist_known_addresses()?;
         Ok(())
     }
 
@@ -840,6 +849,25 @@ impl Node {
         std::fs::rename(temp, path)?;
         Ok(())
     }
+
+    fn persist_known_addresses(&self) -> Result<()> {
+        let path = self.config.datadir.join("peers.json");
+        let temp = self.config.datadir.join("peers.json.tmp");
+        let mut entries = self
+            .known_addresses
+            .read()
+            .values()
+            .map(|peer| PersistedAddress {
+                address: peer.address.to_string(),
+                services: peer.services,
+                time: peer.connected_at,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.address.cmp(&right.address));
+        std::fs::write(&temp, serde_json::to_vec_pretty(&entries)?)?;
+        std::fs::rename(temp, path)?;
+        Ok(())
+    }
 }
 
 fn load_banlist(data_dir: &Path) -> Result<HashMap<IpAddr, BannedAddress>> {
@@ -853,6 +881,43 @@ fn load_banlist(data_dir: &Path) -> Result<HashMap<IpAddr, BannedAddress>> {
         .into_iter()
         .map(|entry| (entry.address, entry))
         .collect())
+}
+
+fn load_known_addresses(data_dir: &Path) -> Result<HashMap<SocketAddr, PeerInfo>> {
+    let path = data_dir.join("peers.json");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let bytes = std::fs::read(path)?;
+    let entries: Vec<PersistedAddress> = serde_json::from_slice(&bytes)?;
+    let mut known = HashMap::with_capacity(entries.len());
+    for entry in entries {
+        let address = entry.address.parse::<SocketAddr>()?;
+        known.insert(
+            address,
+            PeerInfo {
+                id: 0,
+                address,
+                local_address: None,
+                inbound: false,
+                version: None,
+                services: entry.services,
+                user_agent: String::new(),
+                start_height: 0,
+                relay_transactions: true,
+                connected_at: entry.time,
+                last_send: entry.time,
+                last_recv: entry.time,
+                bytes_sent: 0,
+                bytes_received: 0,
+                ping_time: None,
+                min_ping: None,
+                ping_nonce: None,
+                ping_sent_at: None,
+            },
+        );
+    }
+    Ok(known)
 }
 
 fn unix_time_seconds() -> u64 {
@@ -1020,5 +1085,25 @@ mod tests {
         assert!(mempool.get(&child.compute_txid()).is_some());
         assert!(mempool.get(&grandchild.compute_txid()).is_some());
         assert_eq!(node.orphan_count(), 0);
+    }
+
+    #[test]
+    fn discovered_addresses_survive_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let address = "[2001:db8::42]:18444".parse().unwrap();
+        node.remember_address(address, crate::wire::NODE_NETWORK, 123);
+        node.persist_known_addresses().unwrap();
+        drop(node);
+
+        let reopened = Node::open(test_config(directory.path())).unwrap();
+        let peer = reopened
+            .known_addresses()
+            .into_iter()
+            .find(|peer| peer.address == address)
+            .expect("persisted address");
+        assert_eq!(peer.id, 0);
+        assert_eq!(peer.services, crate::wire::NODE_NETWORK);
+        assert_eq!(peer.connected_at, 123);
     }
 }

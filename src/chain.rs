@@ -170,6 +170,14 @@ impl ChainState {
         self.headers.get(height as usize)
     }
 
+    pub fn header_by_hash(&self, hash: &BlockHash) -> Option<bitcoin::block::Header> {
+        self.block_index.get(hash).map(|node| node.header)
+    }
+
+    pub fn block_height_by_hash(&self, hash: &BlockHash) -> Option<u32> {
+        self.block_index.get(hash).map(|node| node.height)
+    }
+
     pub fn block_hash(&self, height: u32) -> Option<BlockHash> {
         self.active_chain.get(height as usize).copied()
     }

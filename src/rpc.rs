@@ -326,17 +326,23 @@ fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
     let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(true);
     let chain = node.chain.read();
-    let height = (0..=chain.height()).find(|height| chain.block_hash(*height) == Some(hash));
-    let Some(height) = height else {
-        bail!("Block not found");
-    };
-    let header = chain.header(height).expect("header index is consistent");
+    let height = chain
+        .block_height_by_hash(&hash)
+        .ok_or_else(|| anyhow!("Block not found"))?;
+    let header = chain
+        .header_by_hash(&hash)
+        .expect("header index is consistent");
     if !verbose {
-        return Ok(json!(hex::encode(serialize(header))));
+        return Ok(json!(hex::encode(serialize(&header))));
     }
+    let confirmations = if chain.is_active_block(&hash) {
+        chain.height().saturating_sub(height) as i64 + 1
+    } else {
+        -1
+    };
     Ok(json!({
         "hash": hash.to_string(),
-        "confirmations": chain.height().saturating_sub(height) + 1,
+        "confirmations": confirmations,
         "height": height,
         "version": header.version.to_consensus(),
         "merkleroot": header.merkle_root.to_string(),
@@ -347,7 +353,7 @@ fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "difficulty": header.difficulty_float(),
         "chainwork": format!("{:064x}", chain.tip().work),
         "nTx": 0,
-        "previousblockhash": (height > 0).then(|| chain.block_hash(height - 1).expect("previous header").to_string()),
+        "previousblockhash": (height > 0).then(|| header.prev_blockhash.to_string()),
     }))
 }
 
@@ -361,8 +367,12 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if verbosity == 0 {
         return Ok(json!(hex::encode(serialize(&block))));
     }
-    let height = (0..=chain.height()).find(|height| chain.block_hash(*height) == Some(hash));
-    let height = height.unwrap_or(0);
+    let height = chain.block_height_by_hash(&hash).unwrap_or(0);
+    let confirmations = if chain.is_active_block(&hash) {
+        chain.height().saturating_sub(height) as i64 + 1
+    } else {
+        -1
+    };
     let txs = if verbosity >= 2 {
         block
             .txdata
@@ -379,7 +389,7 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     };
     Ok(json!({
         "hash": hash.to_string(),
-        "confirmations": chain.height().saturating_sub(height) + 1,
+        "confirmations": confirmations,
         "height": height,
         "version": block.header.version.to_consensus(),
         "merkleroot": block.header.merkle_root.to_string(),
@@ -392,7 +402,7 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "size": serialize(&block).len(),
         "weight": block.weight().to_wu(),
         "tx": txs,
-        "previousblockhash": (height > 0).then(|| chain.block_hash(height - 1).expect("previous block").to_string()),
+        "previousblockhash": (height > 0).then(|| block.header.prev_blockhash.to_string()),
     }))
 }
 

@@ -968,6 +968,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "total_amount": sat_to_btc(total),
             }))
         }
+        "scantxoutset" => scan_txout_set(node, params),
         "getchaintips" => {
             let chain = node.chain.read();
             Ok(json!(
@@ -2978,6 +2979,95 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let action = param::<String>(params, 0)?;
+    match action.as_str() {
+        "start" => {
+            let scan_objects = params
+                .get(1)
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("scantxoutset start expects an array of descriptors"))?;
+            if scan_objects.is_empty() {
+                bail!("scantxoutset requires at least one descriptor")
+            }
+            let mut descriptors = Vec::with_capacity(scan_objects.len());
+            for object in scan_objects {
+                let (descriptor, range) = if let Some(descriptor) = object.as_str() {
+                    (descriptor.to_owned(), None)
+                } else {
+                    let descriptor = object
+                        .get("desc")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("scan descriptor object requires desc"))?
+                        .to_owned();
+                    (descriptor, object.get("range"))
+                };
+                if range.is_some_and(|value| !value.is_null()) {
+                    bail!("ranged descriptors are not supported")
+                }
+                let script = scan_descriptor_script(node, &descriptor)?;
+                descriptors.push((descriptor, script));
+            }
+            let chain = node.chain.read();
+            let mut unspents = Vec::new();
+            let mut total = 0u64;
+            for (outpoint, entry) in chain.all_utxos() {
+                let Some((descriptor, _)) = descriptors
+                    .iter()
+                    .find(|(_, script)| *script == entry.output.script_pubkey)
+                else {
+                    continue;
+                };
+                total = total.saturating_add(entry.output.value.to_sat());
+                unspents.push(json!({
+                    "txid": outpoint.txid.to_string(),
+                    "vout": outpoint.vout,
+                    "scriptPubKey": script_json(&entry.output.script_pubkey),
+                    "desc": descriptor,
+                    "amount": sat_to_btc(entry.output.value.to_sat()),
+                    "height": entry.height,
+                }));
+            }
+            unspents.sort_by(|left, right| {
+                left["txid"]
+                    .as_str()
+                    .cmp(&right["txid"].as_str())
+                    .then_with(|| left["vout"].as_u64().cmp(&right["vout"].as_u64()))
+            });
+            Ok(json!({
+                "success": true,
+                "txouts": unspents.len(),
+                "height": chain.height(),
+                "bestblock": chain.best_hash().to_string(),
+                "unspents": unspents,
+                "total_amount": sat_to_btc(total),
+            }))
+        }
+        "status" => Ok(Value::Null),
+        "abort" => Ok(Value::Bool(false)),
+        _ => bail!("scantxoutset action must be start, status, or abort"),
+    }
+}
+
+fn scan_descriptor_script(node: &Arc<Node>, descriptor: &str) -> Result<ScriptBuf> {
+    if let Some(address) = descriptor
+        .strip_prefix("addr(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return Ok(address
+            .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
+            .require_network(node.config.network)?
+            .script_pubkey());
+    }
+    if let Some(script) = descriptor
+        .strip_prefix("raw(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return Ok(ScriptBuf::from_bytes(hex::decode(script)?));
+    }
+    bail!("unsupported scan descriptor; use addr(...) or raw(...)")
+}
+
 fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let outpoints = params
         .get(0)
@@ -3180,6 +3270,7 @@ fn rpc_help(method: &str) -> String {
         "getmempooldescendants",
         "savemempool",
         "gettxoutsetinfo",
+        "scantxoutset",
         "getchaintips",
         "getnetworkinfo",
         "getpeerinfo",
@@ -3706,5 +3797,30 @@ mod tests {
         reconsider_block(&node, &json!([hash.to_string()])).unwrap();
         assert_eq!(node.chain.read().height(), 1);
         assert_eq!(node.chain.read().best_hash(), hash);
+    }
+
+    #[test]
+    fn scantxoutset_matches_wallet_free_address_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
+        generate_to_address(&node, &json!([1, address])).unwrap();
+        let result =
+            scan_txout_set(&node, &json!(["start", [format!("addr({address})")]])).unwrap();
+        assert_eq!(result["success"], true);
+        assert_eq!(result["txouts"], 1);
+        assert_eq!(result["unspents"][0]["height"], 1);
+        assert_eq!(result["total_amount"], 50.0);
     }
 }

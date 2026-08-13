@@ -111,6 +111,7 @@ pub struct ChainState {
     tx_index: HashMap<Txid, TxLocation>,
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
+    basic_filter_cache: HashMap<BlockHash, (Vec<u8>, FilterHeader)>,
 }
 
 impl ChainState {
@@ -182,6 +183,7 @@ impl ChainState {
             tx_index: HashMap::new(),
             tx_index_all: HashMap::new(),
             history: HashMap::new(),
+            basic_filter_cache: HashMap::new(),
         };
         let snapshot = state.load_snapshot(&active_chain)?;
         if let Some(snapshot) = snapshot {
@@ -525,6 +527,24 @@ impl ChainState {
         let Some(headers) = self.headers_to_hash(hash) else {
             return Ok(None);
         };
+        if headers
+            .iter()
+            .all(|header| self.basic_filter_cache.contains_key(&header.block_hash()))
+        {
+            return Ok(Some(
+                headers
+                    .into_iter()
+                    .map(|header| {
+                        let block_hash = header.block_hash();
+                        let (content, filter_header) = self
+                            .basic_filter_cache
+                            .get(&block_hash)
+                            .expect("filter cache was checked above");
+                        (block_hash, BlockFilter::new(content), *filter_header)
+                    })
+                    .collect(),
+            ));
+        }
         let mut previous_outputs: HashMap<OutPoint, TxOut> = HashMap::new();
         let mut previous_filter_header = FilterHeader::all_zeros();
         let mut filters = Vec::with_capacity(headers.len());
@@ -549,6 +569,8 @@ impl ChainState {
                     .ok_or(bitcoin::bip158::Error::UtxoMissing(*outpoint))
             })?;
             let filter_header = filter.filter_header(&previous_filter_header);
+            self.basic_filter_cache
+                .insert(block_hash, (filter.content.clone(), filter_header));
             filters.push((block_hash, filter, filter_header));
             previous_filter_header = filter_header;
 
@@ -808,6 +830,10 @@ impl ChainState {
 
     pub fn utxo(&self, outpoint: &OutPoint) -> Option<&UtxoEntry> {
         self.utxos.get(outpoint)
+    }
+
+    pub fn all_utxos(&self) -> impl Iterator<Item = (&OutPoint, &UtxoEntry)> {
+        self.utxos.iter()
     }
 
     pub fn utxo_stats(&self) -> (usize, usize, u64) {
@@ -1221,6 +1247,19 @@ impl ChainState {
         let block_median_time_past = self.median_time_past();
         let application =
             self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?;
+        let previous_filter_header =
+            if let Some((_, header)) = self.basic_filter_cache.get(&previous) {
+                *header
+            } else {
+                self.basic_filter_chain(&previous)?
+                    .and_then(|filters| filters.last().map(|(_, _, header)| *header))
+                    .unwrap_or(FilterHeader::all_zeros())
+            };
+        self.cache_basic_filter_for_block(
+            block,
+            &application.spent_entries,
+            &previous_filter_header,
+        )?;
 
         let hash = block.block_hash();
         if persist {
@@ -1314,6 +1353,7 @@ impl ChainState {
             },
         );
         self.index_transactions(genesis, 0);
+        self.cache_basic_filter_for_block(genesis, &[], &FilterHeader::all_zeros())?;
         Ok(())
     }
 
@@ -1401,6 +1441,7 @@ impl ChainState {
         let old_utxos_by_script = self.utxos_by_script.clone();
         let old_tx_index = self.tx_index.clone();
         let old_history = self.history.clone();
+        let old_basic_filter_cache = self.basic_filter_cache.clone();
         self.active_chain.clear();
         self.headers.clear();
         self.utxos.clear();
@@ -1422,8 +1463,39 @@ impl ChainState {
             self.utxos_by_script = old_utxos_by_script;
             self.tx_index = old_tx_index;
             self.history = old_history;
+            self.basic_filter_cache = old_basic_filter_cache;
             return Err(error);
         }
+        Ok(())
+    }
+
+    fn cache_basic_filter_for_block(
+        &mut self,
+        block: &Block,
+        spent_entries: &[(OutPoint, UtxoEntry)],
+        previous_filter_header: &FilterHeader,
+    ) -> Result<()> {
+        let previous_outputs: HashMap<OutPoint, TxOut> = spent_entries
+            .iter()
+            .map(|(outpoint, entry)| (*outpoint, entry.output.clone()))
+            .collect();
+        let mut created_outputs = HashMap::new();
+        for transaction in &block.txdata {
+            let txid = transaction.compute_txid();
+            for (vout, output) in transaction.output.iter().enumerate() {
+                created_outputs.insert(OutPoint::new(txid, vout as u32), output.clone());
+            }
+        }
+        let filter = BlockFilter::new_script_filter(block, |outpoint| {
+            previous_outputs
+                .get(outpoint)
+                .or_else(|| created_outputs.get(outpoint))
+                .map(|output| output.script_pubkey.clone())
+                .ok_or(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+        })?;
+        let filter_header = filter.filter_header(previous_filter_header);
+        self.basic_filter_cache
+            .insert(block.block_hash(), (filter.content, filter_header));
         Ok(())
     }
 

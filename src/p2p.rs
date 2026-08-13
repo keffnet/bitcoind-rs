@@ -37,6 +37,28 @@ impl PeerManager {
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
         let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let next_peer_id = Arc::new(AtomicUsize::new(1));
+        let mut mempool_events = self.node.subscribe_mempool();
+        let relay_peers = peers.clone();
+        let relay_network = self.node.config.network;
+        tokio::spawn(async move {
+            loop {
+                let txid = match mempool_events.recv().await {
+                    Ok(txid) => txid,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                broadcast_inventory(
+                    &relay_peers,
+                    0,
+                    relay_network,
+                    Inventory {
+                        kind: InventoryType::WitnessTransaction,
+                        hash: BlockHash::from_raw_hash(txid.to_raw_hash()),
+                    },
+                )
+                .await;
+            }
+        });
         let seed_nodes = if self.node.config.seed_nodes.is_empty() {
             discover_dns_seeds(self.node.config.network).await
         } else {
@@ -140,6 +162,7 @@ async fn serve_peer(
     peers: PeerRegistry,
     peer_id: usize,
 ) -> Result<()> {
+    let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
     let (mut reader, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
@@ -147,6 +170,25 @@ async fn serve_peer(
     let result = serve_peer_loop(&node, &mut reader, &writer, outbound, &peers, peer_id).await;
     peers.lock().remove(&peer_id);
     result
+}
+
+struct PeerCountGuard<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl<'a> PeerCountGuard<'a> {
+    fn new(node: &'a Arc<Node>) -> Self {
+        node.peer_count.fetch_add(1, Ordering::Relaxed);
+        Self {
+            count: &node.peer_count,
+        }
+    }
+}
+
+impl Drop for PeerCountGuard<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 async fn serve_peer_loop(
@@ -308,10 +350,7 @@ async fn serve_peer_loop(
             }
             Message::Transaction(transaction) => {
                 let txid = transaction.compute_txid();
-                let accepted = {
-                    let chain = node.chain.read();
-                    node.mempool.write().accept(transaction, &chain).is_ok()
-                };
+                let accepted = node.accept_transaction(transaction).is_ok();
                 if accepted {
                     debug!(%txid, "accepted peer transaction");
                     broadcast_inventory(

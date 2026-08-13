@@ -291,8 +291,7 @@ fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn transaction_broadcast(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let raw = param::<String>(params, 0)?;
     let transaction: Transaction = deserialize(&hex::decode(raw)?)?;
-    let chain = node.chain.read();
-    let txid = node.mempool.write().accept(transaction, &chain)?;
+    let txid = node.accept_transaction(transaction)?;
     Ok(json!(txid.to_string()))
 }
 

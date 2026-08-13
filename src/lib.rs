@@ -12,10 +12,15 @@ pub mod validation;
 pub mod wire;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::time::Instant;
 
 use anyhow::Result;
 use bitcoin::Block;
+use bitcoin::{Transaction, Txid};
 use parking_lot::RwLock;
 use rand::random;
 use tokio::sync::broadcast;
@@ -26,6 +31,7 @@ use crate::config::Config;
 use crate::mempool::Mempool;
 
 pub type ChainEvent = chain::ChainTip;
+pub type MempoolEvent = Txid;
 
 /// The wallet-free node facade shared by the network and RPC services.
 pub struct Node {
@@ -33,7 +39,10 @@ pub struct Node {
     pub chain: Arc<RwLock<ChainState>>,
     pub mempool: Arc<RwLock<Mempool>>,
     pub events: broadcast::Sender<ChainEvent>,
+    pub mempool_events: broadcast::Sender<MempoolEvent>,
     pub rpc_cookie: Option<String>,
+    pub peer_count: AtomicUsize,
+    pub started_at: Instant,
 }
 
 impl Node {
@@ -41,6 +50,7 @@ impl Node {
         let chain = ChainState::open(config.network, &config.datadir)?;
         let mempool = Mempool::new(config.network);
         let (events, _) = broadcast::channel(256);
+        let (mempool_events, _) = broadcast::channel(256);
         let rpc_cookie = config
             .rpc_bind
             .map(|_| load_rpc_cookie(&config.datadir))
@@ -50,7 +60,10 @@ impl Node {
             chain: Arc::new(RwLock::new(chain)),
             mempool: Arc::new(RwLock::new(mempool)),
             events,
+            mempool_events,
             rpc_cookie,
+            peer_count: AtomicUsize::new(0),
+            started_at: Instant::now(),
         }))
     }
 
@@ -59,14 +72,32 @@ impl Node {
         let previous_tip = self.chain.read().best_hash();
         let tip = self.chain.write().connect_block(block.clone())?;
         if tip.hash != previous_tip && self.chain.read().is_active_block(&hash) {
-            self.mempool.write().remove_confirmed(&block);
+            let chain = self.chain.read();
+            let mut mempool = self.mempool.write();
+            mempool.remove_confirmed(&block);
+            mempool.revalidate(&chain);
             let _ = self.events.send(tip.clone());
         }
         Ok(tip)
     }
 
+    pub fn accept_transaction(&self, transaction: Transaction) -> Result<Txid> {
+        let chain = self.chain.read();
+        let txid = self.mempool.write().accept(transaction, &chain)?;
+        let _ = self.mempool_events.send(txid);
+        Ok(txid)
+    }
+
     pub fn subscribe_chain(&self) -> broadcast::Receiver<ChainEvent> {
         self.events.subscribe()
+    }
+
+    pub fn subscribe_mempool(&self) -> broadcast::Receiver<MempoolEvent> {
+        self.mempool_events.subscribe()
+    }
+
+    pub fn peer_count(&self) -> usize {
+        self.peer_count.load(Ordering::Relaxed)
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {

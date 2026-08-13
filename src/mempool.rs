@@ -77,6 +77,10 @@ impl Mempool {
         self.bytes
     }
 
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
     pub fn get(&self, txid: &Txid) -> Option<&MempoolEntry> {
         self.entries.get(txid)
     }
@@ -89,6 +93,19 @@ impl Mempool {
         &mut self,
         transaction: Transaction,
         chain: &ChainState,
+    ) -> Result<Txid, MempoolError> {
+        let added_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        self.accept_at(transaction, chain, added_at)
+    }
+
+    fn accept_at(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
     ) -> Result<Txid, MempoolError> {
         let txid = transaction.compute_txid();
         if self.entries.contains_key(&txid) {
@@ -104,7 +121,6 @@ impl Mempool {
         let mut input_total = 0u64;
         let mut previous_outputs = Vec::with_capacity(transaction.input.len());
         let mut previous_entries = Vec::with_capacity(transaction.input.len());
-        let mut all_inputs_confirmed = true;
         for input in &transaction.input {
             if !seen.insert(input.previous_output) {
                 return Err(MempoolError::DuplicateInput);
@@ -113,12 +129,18 @@ impl Mempool {
                 return Err(MempoolError::Conflict(*conflict));
             }
             let previous = if let Some(entry) = self.entries.get(&input.previous_output.txid) {
-                all_inputs_confirmed = false;
-                entry
+                let output = entry
                     .transaction
                     .output
                     .get(input.previous_output.vout as usize)
-                    .ok_or(MempoolError::MissingInput(input.previous_output))?
+                    .ok_or(MempoolError::MissingInput(input.previous_output))?;
+                previous_entries.push(crate::chain::UtxoEntry {
+                    output: output.clone(),
+                    height: chain.height().saturating_add(1),
+                    median_time_past: chain.median_time_past_value(),
+                    coinbase: false,
+                });
+                output
             } else {
                 let entry = chain
                     .utxo(&input.previous_output)
@@ -134,15 +156,13 @@ impl Mempool {
                 .ok_or(MempoolError::BadOutput)?;
             previous_outputs.push(previous.clone());
         }
-        if all_inputs_confirmed {
-            validation::validate_transaction_finality(
-                &transaction,
-                chain.height() + 1,
-                chain.median_time_past_value(),
-                &previous_entries,
-            )
-            .map_err(|error| MempoolError::Script(error.to_string()))?;
-        }
+        validation::validate_transaction_finality(
+            &transaction,
+            chain.height() + 1,
+            chain.median_time_past_value(),
+            &previous_entries,
+        )
+        .map_err(|error| MempoolError::Script(error.to_string()))?;
         validation::validate_transaction_scripts(
             chain.network,
             chain.height() + 1,
@@ -179,10 +199,7 @@ impl Mempool {
             transaction,
             fee_sat,
             vsize,
-            added_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or(Duration::ZERO)
-                .as_secs(),
+            added_at,
         };
         for input in &entry.transaction.input {
             self.spent.insert(input.previous_output, txid);
@@ -190,6 +207,66 @@ impl Mempool {
         self.bytes += size;
         self.entries.insert(txid, entry);
         Ok(txid)
+    }
+
+    /// Rebuild the pool against a new active chain, dropping transactions
+    /// whose inputs, scripts, or locktimes are no longer valid. Parents are
+    /// replayed before children so valid unconfirmed chains are retained.
+    pub fn revalidate(&mut self, chain: &ChainState) {
+        let entries: HashMap<Txid, (u64, Transaction)> = self
+            .entries
+            .values()
+            .map(|entry| {
+                (
+                    entry.transaction.compute_txid(),
+                    (entry.added_at, entry.transaction.clone()),
+                )
+            })
+            .collect();
+        let mut transaction_ids: Vec<Txid> = entries.keys().copied().collect();
+        transaction_ids.sort_by_key(ToString::to_string);
+        let mut ordered = Vec::with_capacity(entries.len());
+        let mut visited = HashSet::new();
+        let mut visiting = HashSet::new();
+
+        fn visit(
+            txid: Txid,
+            entries: &HashMap<Txid, (u64, Transaction)>,
+            visited: &mut HashSet<Txid>,
+            visiting: &mut HashSet<Txid>,
+            ordered: &mut Vec<(u64, Transaction)>,
+        ) {
+            if visited.contains(&txid) || !visiting.insert(txid) {
+                return;
+            }
+            if let Some((_, transaction)) = entries.get(&txid) {
+                let mut parents: Vec<Txid> = transaction
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output.txid)
+                    .filter(|parent| entries.contains_key(parent))
+                    .collect();
+                parents.sort_by_key(ToString::to_string);
+                for parent in parents {
+                    visit(parent, entries, visited, visiting, ordered);
+                }
+            }
+            if let Some((added_at, transaction)) = entries.get(&txid) {
+                ordered.push((*added_at, transaction.clone()));
+            }
+            visiting.remove(&txid);
+            visited.insert(txid);
+        }
+
+        for txid in transaction_ids {
+            visit(txid, &entries, &mut visited, &mut visiting, &mut ordered);
+        }
+        self.entries.clear();
+        self.spent.clear();
+        self.bytes = 0;
+        for (added_at, transaction) in ordered {
+            let _ = self.accept_at(transaction, chain, added_at);
+        }
     }
 
     pub fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {

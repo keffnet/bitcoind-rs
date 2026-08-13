@@ -182,9 +182,15 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getblocktemplate" => get_block_template(node),
         "testmempoolaccept" => test_mempool_accept(node, params),
         "verifychain" => Ok(Value::Bool(true)),
-        "getmemoryinfo" => Ok(
-            json!({"used": 0, "free": 0, "total": 0, "locked": {"used": 0, "free": 0, "total": 0, "locked": 0}}),
-        ),
+        "getmemoryinfo" => {
+            let mempool = node.mempool.read();
+            Ok(json!({
+                "used": mempool.bytes(),
+                "free": 0,
+                "total": mempool.max_bytes(),
+                "locked": {"used": 0, "free": 0, "total": 0, "locked": 0},
+            }))
+        }
         "gettxout" => get_txout(node, params),
         "getmempoolinfo" => {
             let mempool = node.mempool.read();
@@ -193,7 +199,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "size": mempool.len(),
                 "bytes": mempool.bytes(),
                 "usage": mempool.bytes(),
-                "maxmempool": 300 * 1024 * 1024,
+                "maxmempool": mempool.max_bytes(),
                 "mempoolminfee": 0.00001000,
                 "minrelaytxfee": 0.00001000,
             }))
@@ -270,22 +276,37 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "total_amount": sat_to_btc(total),
             }))
         }
+        "getchaintips" => {
+            let chain = node.chain.read();
+            Ok(json!(
+                chain
+                    .chain_tips()
+                    .into_iter()
+                    .map(|tip| json!({
+                        "height": tip.height,
+                        "hash": tip.hash.to_string(),
+                        "branchlen": tip.branch_len,
+                        "status": tip.status,
+                    }))
+                    .collect::<Vec<_>>()
+            ))
+        }
         "getnetworkinfo" => Ok(json!({
             "version": 310100,
             "subversion": "/bitcoind-rs:0.1.0/",
             "protocolversion": 70016,
-            "connections": 0,
+            "connections": node.peer_count(),
             "networkactive": true,
-            "networks": [],
+            "networks": [{
+                "name": network_name(node.config.network),
+                "limited": false,
+                "reachable": true,
+                "proxy": "",
+                "proxy_randomize_credentials": false,
+            }],
             "relayfee": 0.00001000,
             "incrementalfee": 0.00001000,
         })),
-        "getchaintips" => Ok(json!([{
-            "height": node.chain.read().height(),
-            "hash": node.chain.read().best_hash().to_string(),
-            "branchlen": 0,
-            "status": "active",
-        }])),
         "estimatesmartfee" => Ok(
             json!({"feerate": 0.00001000, "blocks": params.get(0).and_then(Value::as_u64).unwrap_or(6)}),
         ),
@@ -296,8 +317,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 .map(|header| header.difficulty_float())
                 .unwrap_or(1.0)
         )),
-        "getconnectioncount" => Ok(json!(0)),
-        "uptime" => Ok(json!(0)),
+        "getconnectioncount" => Ok(json!(node.peer_count())),
+        "uptime" => Ok(json!(node.started_at.elapsed().as_secs())),
         _ => bail!("Method not found"),
     }
 }
@@ -351,7 +372,12 @@ fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "nonce": header.nonce,
         "bits": format!("{:08x}", header.bits.to_consensus()),
         "difficulty": header.difficulty_float(),
-        "chainwork": format!("{:064x}", chain.tip().work),
+        "chainwork": format!(
+            "{:064x}",
+            chain
+                .chain_work_by_hash(&hash)
+                .unwrap_or_else(|| chain.tip().work)
+        ),
         "nTx": 0,
         "previousblockhash": (height > 0).then(|| header.prev_blockhash.to_string()),
     }))
@@ -397,7 +423,12 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "nonce": block.header.nonce,
         "bits": format!("{:08x}", block.header.bits.to_consensus()),
         "difficulty": block.header.difficulty_float(),
-        "chainwork": format!("{:064x}", chain.tip().work),
+        "chainwork": format!(
+            "{:064x}",
+            chain
+                .chain_work_by_hash(&hash)
+                .unwrap_or_else(|| chain.tip().work)
+        ),
         "nTx": block.txdata.len(),
         "size": serialize(&block).len(),
         "weight": block.weight().to_wu(),
@@ -477,9 +508,13 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     let blockhash =
         (location.block_hash != BlockHash::all_zeros()).then(|| location.block_hash.to_string());
-    let confirmations = blockhash
-        .as_ref()
-        .map(|_| chain.height().saturating_sub(location.height) + 1);
+    let confirmations = blockhash.as_ref().map(|_| {
+        if chain.is_active_block(&location.block_hash) {
+            chain.height().saturating_sub(location.height) + 1
+        } else {
+            0
+        }
+    });
     Ok(rpc_transaction(
         &transaction,
         blockhash.as_deref(),
@@ -496,8 +531,7 @@ fn decode_raw_transaction(params: &Value) -> Result<Value> {
 fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let transaction: Transaction = deserialize(&bytes)?;
-    let chain = node.chain.read();
-    let txid = node.mempool.write().accept(transaction, &chain)?;
+    let txid = node.accept_transaction(transaction)?;
     Ok(json!(txid.to_string()))
 }
 
@@ -619,18 +653,34 @@ fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let vout = param::<u32>(params, 1)?;
+    let include_mempool = params.get(2).and_then(Value::as_bool).unwrap_or(true);
     let chain = node.chain.read();
     let outpoint = OutPoint::new(txid, vout);
-    let Some(entry) = chain.utxo(&outpoint) else {
-        return Ok(Value::Null);
-    };
-    Ok(json!({
-        "bestblock": chain.best_hash().to_string(),
-        "confirmations": chain.height().saturating_sub(entry.height) + 1,
-        "value": sat_to_btc(entry.output.value.to_sat()),
-        "scriptPubKey": script_json(&entry.output.script_pubkey),
-        "coinbase": entry.coinbase,
-    }))
+    if let Some(entry) = chain.utxo(&outpoint) {
+        return Ok(json!({
+            "bestblock": chain.best_hash().to_string(),
+            "confirmations": chain.height().saturating_sub(entry.height) + 1,
+            "value": sat_to_btc(entry.output.value.to_sat()),
+            "scriptPubKey": script_json(&entry.output.script_pubkey),
+            "coinbase": entry.coinbase,
+        }));
+    }
+    if include_mempool {
+        let mempool = node.mempool.read();
+        if let Some(entry) = mempool.get(&txid)
+            && let Some(output) = entry.transaction.output.get(vout as usize)
+        {
+            return Ok(json!({
+                "bestblock": chain.best_hash().to_string(),
+                "confirmations": 0,
+                "value": sat_to_btc(output.value.to_sat()),
+                "scriptPubKey": script_json(&output.script_pubkey),
+                "coinbase": false,
+            }));
+        }
+    }
+    drop(chain);
+    Ok(Value::Null)
 }
 
 fn rpc_transaction(
@@ -671,6 +721,7 @@ fn rpc_transaction(
         "txid": transaction.compute_txid().to_string(),
         "hash": transaction.compute_wtxid().to_string(),
         "version": transaction.version.0,
+        "hex": chain::transaction_hex(transaction),
         "size": serialize(transaction).len(),
         "vsize": transaction.vsize(),
         "weight": transaction.weight().to_wu(),

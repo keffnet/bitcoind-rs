@@ -48,6 +48,15 @@ pub struct ChainTip {
     pub work: Work,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KnownChainTip {
+    pub hash: BlockHash,
+    pub height: u32,
+    pub branch_len: u32,
+    pub status: &'static str,
+    pub work: Work,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct BlockNode {
     header: bitcoin::block::Header,
@@ -182,6 +191,56 @@ impl ChainState {
         self.tip().hash
     }
 
+    pub fn chain_tips(&self) -> Vec<KnownChainTip> {
+        let mut parents = HashSet::new();
+        for node in self.block_index.values() {
+            if node.height > 0 {
+                parents.insert(node.header.prev_blockhash);
+            }
+        }
+        let active: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
+        let mut tips = self
+            .block_index
+            .iter()
+            .filter(|(hash, _)| !parents.contains(*hash))
+            .map(|(hash, node)| {
+                if active.contains(hash) {
+                    return KnownChainTip {
+                        hash: *hash,
+                        height: node.height,
+                        branch_len: 0,
+                        status: "active",
+                        work: node.chain_work,
+                    };
+                }
+                let mut cursor = *hash;
+                let mut branch_len: u32 = 0;
+                while !active.contains(&cursor) {
+                    let Some(current) = self.block_index.get(&cursor) else {
+                        break;
+                    };
+                    cursor = current.header.prev_blockhash;
+                    branch_len = branch_len.saturating_add(1);
+                }
+                KnownChainTip {
+                    hash: *hash,
+                    height: node.height,
+                    branch_len,
+                    status: "valid-fork",
+                    work: node.chain_work,
+                }
+            })
+            .collect::<Vec<_>>();
+        tips.sort_by(|left, right| {
+            right
+                .height
+                .cmp(&left.height)
+                .then_with(|| right.work.cmp(&left.work))
+                .then_with(|| left.hash.to_string().cmp(&right.hash.to_string()))
+        });
+        tips
+    }
+
     pub fn is_active_block(&self, hash: &BlockHash) -> bool {
         self.active_chain.contains(hash)
     }
@@ -196,6 +255,10 @@ impl ChainState {
 
     pub fn block_height_by_hash(&self, hash: &BlockHash) -> Option<u32> {
         self.block_index.get(hash).map(|node| node.height)
+    }
+
+    pub fn chain_work_by_hash(&self, hash: &BlockHash) -> Option<Work> {
+        self.block_index.get(hash).map(|node| node.chain_work)
     }
 
     pub fn block_hash(&self, height: u32) -> Option<BlockHash> {
@@ -946,6 +1009,10 @@ mod tests {
         assert_eq!(reopened.height(), 2);
         assert_eq!(reopened.block_hash(1), Some(first_hash));
         assert_eq!(reopened.utxos.len(), 3);
+        drop(reopened);
+        fs::write(directory.path().join("chainstate.snapshot"), b"corrupt").unwrap();
+        let replayed = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(replayed.height(), 2);
     }
 
     fn mine_block(state: &ChainState, height: u32) -> Block {
@@ -978,6 +1045,10 @@ mod tests {
         assert_eq!(state.height(), 3);
         assert_eq!(state.best_hash(), side_three_hash);
         assert_eq!(state.block_hash(1), Some(side_one_hash));
+        let tips = state.chain_tips();
+        assert_eq!(tips.len(), 2);
+        assert_eq!(tips[0].status, "active");
+        assert_eq!(tips[1].status, "valid-fork");
 
         drop(state);
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();

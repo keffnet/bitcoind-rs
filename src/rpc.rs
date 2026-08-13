@@ -947,6 +947,12 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "unbroadcastcount": 0,
                 "incrementalrelayfee": 0.00001000,
                 "total_fee": sat_to_btc(total_fee),
+                "fullrbf": true,
+                "permitbaremultisig": true,
+                "maxdatacarriersize": 83,
+                "limitclustercount": 64,
+                "limitclustersize": 101_000,
+                "optimal": true,
             }))
         }
         "getrawmempool" => {
@@ -6444,6 +6450,9 @@ mod tests {
         assert_eq!(result["txids"], json!([]));
         assert_eq!(result["mempool_sequence"], json!(0));
         assert!(dispatch_method(&node, "getrawmempool", &json!([true, true])).is_err());
+        let info = dispatch_method(&node, "getmempoolinfo", &json!([])).unwrap();
+        assert_eq!(info["fullrbf"], json!(true));
+        assert_eq!(info["limitclustercount"], json!(64));
 
         let (_, body) = dispatch_rest(
             &node,

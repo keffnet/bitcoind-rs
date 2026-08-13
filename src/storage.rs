@@ -1,9 +1,9 @@
 //! Append-only block storage.
 //!
 //! Blocks are written as length-prefixed consensus-encoded records. The
-//! in-memory hash index makes reads O(1), while startup scans the append-only
-//! file and rejects truncated or oversized records instead of silently
-//! accepting corrupted chain data.
+//! in-memory hash index makes reads O(1). A durable location index avoids
+//! decoding the append-only file on normal restarts; truncated, stale, or
+//! corrupt index files fall back to a complete record scan.
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions, create_dir_all};

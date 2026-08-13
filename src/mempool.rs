@@ -85,6 +85,10 @@ impl Mempool {
         self.entries.get(txid)
     }
 
+    pub fn is_spent(&self, outpoint: &OutPoint) -> bool {
+        self.spent.contains_key(outpoint)
+    }
+
     pub fn transactions(&self) -> impl Iterator<Item = &Transaction> {
         self.entries.values().map(|entry| &entry.transaction)
     }
@@ -223,6 +227,9 @@ impl Mempool {
             .map(|output| output.value.to_sat())
             .try_fold(0u64, u64::checked_add)
             .ok_or(MempoolError::BadOutput)?;
+        if output_total > Amount::MAX_MONEY.to_sat() {
+            return Err(MempoolError::BadOutput);
+        }
         if output_total > input_total {
             return Err(MempoolError::NegativeFee);
         }

@@ -173,15 +173,12 @@ impl ChainState {
     }
 
     pub fn tip(&self) -> ChainTip {
-        let mut headers = self.headers.iter();
-        let mut work = headers.next().expect("genesis header exists").work();
-        for header in headers {
-            work = work + header.work();
-        }
+        let hash = *self.active_chain.last().expect("genesis is always active");
+        let node = self.block_index.get(&hash).expect("active tip is indexed");
         ChainTip {
-            hash: *self.active_chain.last().expect("genesis is always active"),
-            height: self.height(),
-            work,
+            hash,
+            height: node.height,
+            work: node.chain_work,
         }
     }
 
@@ -191,6 +188,22 @@ impl ChainState {
 
     pub fn best_hash(&self) -> BlockHash {
         self.tip().hash
+    }
+
+    pub fn best_header_tip(&self) -> ChainTip {
+        self.block_index
+            .iter()
+            .max_by(|(left_hash, left), (right_hash, right)| {
+                left.chain_work
+                    .cmp(&right.chain_work)
+                    .then_with(|| right_hash.to_string().cmp(&left_hash.to_string()))
+            })
+            .map(|(hash, node)| ChainTip {
+                hash: *hash,
+                height: node.height,
+                work: node.chain_work,
+            })
+            .expect("genesis header is indexed")
     }
 
     pub fn chain_tips(&self) -> Vec<KnownChainTip> {
@@ -379,6 +392,16 @@ impl ChainState {
         self.utxos.get(outpoint)
     }
 
+    pub fn utxo_stats(&self) -> (usize, usize, u64) {
+        let mut transactions = HashSet::new();
+        let mut total = 0u64;
+        for (outpoint, entry) in &self.utxos {
+            transactions.insert(outpoint.txid);
+            total = total.saturating_add(entry.output.value.to_sat());
+        }
+        (transactions.len(), self.utxos.len(), total)
+    }
+
     pub fn median_time_past_value(&self) -> u32 {
         self.median_time_past()
     }
@@ -451,6 +474,7 @@ impl ChainState {
         if parent_hash == self.best_hash() {
             self.connect_block_internal(&block, true)?;
             self.process_orphans(hash);
+            self.process_known_children(hash);
             return Ok(self.tip());
         }
 
@@ -483,6 +507,7 @@ impl ChainState {
             self.activate_chain(hash)?;
         }
         self.process_orphans(hash);
+        self.process_known_children(hash);
         Ok(self.tip())
     }
 
@@ -491,6 +516,23 @@ impl ChainState {
             return;
         };
         for child in children {
+            let _ = self.connect_block(child);
+        }
+    }
+
+    fn process_known_children(&mut self, parent_hash: BlockHash) {
+        let children: Vec<BlockHash> = self
+            .block_index
+            .iter()
+            .filter_map(|(hash, node)| {
+                (node.header.prev_blockhash == parent_hash && self.store.contains(hash))
+                    .then_some(*hash)
+            })
+            .collect();
+        for child_hash in children {
+            let Ok(Some(child)) = self.store.get(&child_hash) else {
+                continue;
+            };
             let _ = self.connect_block(child);
         }
     }
@@ -1136,6 +1178,21 @@ mod tests {
         assert_eq!(state.block_height_by_hash(&child.block_hash()), Some(2));
         state.connect_block(parent).unwrap();
         state.connect_block(child).unwrap();
+        assert_eq!(state.height(), 2);
+    }
+
+    #[test]
+    fn replays_known_child_after_parent_block_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let child = mine_block_from_header(&parent.header, 2, 10);
+        state
+            .accept_headers(&[parent.header, child.header])
+            .unwrap();
+        assert!(state.connect_block(child).is_err());
+        assert_eq!(state.height(), 0);
+        state.connect_block(parent).unwrap();
         assert_eq!(state.height(), 2);
     }
 

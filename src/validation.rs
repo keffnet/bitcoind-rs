@@ -6,6 +6,7 @@
 //! witness commitments, transaction shape, money range, and block weight.
 
 use std::collections::HashSet;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::blockdata::locktime::absolute::{Height, Time};
 use bitcoin::consensus::Params;
@@ -30,6 +31,8 @@ pub enum ValidationError {
     TargetAboveLimit,
     #[error("block timestamp is not after median time past")]
     TimeTooOld,
+    #[error("block timestamp is too far in the future")]
+    TimeTooNew,
     #[error("block contains no transactions")]
     EmptyBlock,
     #[error("block merkle root is invalid")]
@@ -97,7 +100,18 @@ pub fn validate_header(
     if header.time <= median_time_past {
         return Err(ValidationError::TimeTooOld);
     }
-    if header.target() != expected_target {
+    if header.time
+        > SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_add(2 * 60 * 60) as u32
+    {
+        return Err(ValidationError::TimeTooNew);
+    }
+    if header.target() != expected_target
+        || header.bits.to_consensus() != expected_target.to_compact_lossy().to_consensus()
+    {
         return Err(ValidationError::BadTarget);
     }
     let compact = header.bits.to_consensus();
@@ -190,6 +204,9 @@ pub fn validate_block_structure(
             tx_total = tx_total
                 .checked_add(value)
                 .ok_or(ValidationError::OutputTotalOverflow)?;
+        }
+        if tx_total > Amount::MAX_MONEY.to_sat() {
+            return Err(ValidationError::BadOutputValue(txid));
         }
         total_output_sat = total_output_sat
             .checked_add(tx_total)
@@ -325,7 +342,9 @@ pub fn validate_transaction_scripts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::Block;
     use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version as BlockVersion};
     use bitcoin::blockdata::script::ScriptBuf;
     use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
     use bitcoin::blockdata::witness::Witness;
@@ -396,5 +415,59 @@ mod tests {
             .is_err()
         );
         assert!(validate_transaction_finality(&transaction, 12, 500_000_001, &[entry]).is_ok());
+    }
+
+    #[test]
+    fn rejects_transaction_output_totals_above_money_range() {
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![1, 1]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(5_000_000_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([3u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::MAX_MONEY,
+                    script_pubkey: ScriptBuf::new(),
+                },
+                TxOut {
+                    value: Amount::MAX_MONEY,
+                    script_pubkey: ScriptBuf::new(),
+                },
+            ],
+        };
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, transaction],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(matches!(
+            validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
+            Err(ValidationError::BadOutputValue(_))
+        ));
     }
 }

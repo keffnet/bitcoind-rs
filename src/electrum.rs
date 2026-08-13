@@ -193,12 +193,25 @@ fn dispatch(
                     chain::electrum_script_hash(&output.script_pubkey) == script_hash
                 });
                 let affects_inputs = transaction.input.iter().any(|input| {
-                    chain
-                        .utxo(&input.previous_output)
-                        .map(|entry| {
+                    chain.utxo(&input.previous_output).map_or_else(
+                        || {
+                            mempool
+                                .get(&input.previous_output.txid)
+                                .and_then(|entry| {
+                                    entry
+                                        .transaction
+                                        .output
+                                        .get(input.previous_output.vout as usize)
+                                })
+                                .is_some_and(|output| {
+                                    chain::electrum_script_hash(&output.script_pubkey)
+                                        == script_hash
+                                })
+                        },
+                        |entry| {
                             chain::electrum_script_hash(&entry.output.script_pubkey) == script_hash
-                        })
-                        .unwrap_or(false)
+                        },
+                    )
                 });
                 if affects_outputs || affects_inputs {
                     let txid = transaction.compute_txid();

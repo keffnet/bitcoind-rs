@@ -207,23 +207,34 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         }
         "getrawmempool" => {
             let verbose = params.get(0).and_then(Value::as_bool).unwrap_or(false);
+            let height = node.chain.read().height();
             let mempool = node.mempool.read();
+            let order = mempool.transaction_order();
             if verbose {
                 Ok(Value::Object(
-                    mempool
-                        .transactions()
-                        .map(|tx| {
-                            let txid = tx.compute_txid();
-                            let entry = mempool.get(&txid).expect("mempool iterator is consistent");
+                    order
+                        .iter()
+                        .filter_map(|txid| mempool.get(txid).map(|entry| (txid, entry)))
+                        .map(|(txid, entry)| {
+                            let depends = entry
+                                .transaction
+                                .input
+                                .iter()
+                                .filter_map(|input| {
+                                    mempool
+                                        .get(&input.previous_output.txid)
+                                        .map(|_| input.previous_output.txid.to_string())
+                                })
+                                .collect::<Vec<_>>();
                             (
                                 txid.to_string(),
                                 json!({
                                     "vsize": entry.vsize,
-                                    "weight": tx.weight().to_wu(),
+                                    "weight": entry.transaction.weight().to_wu(),
                                     "fee": sat_to_btc(entry.fee_sat),
                                     "time": entry.added_at,
-                                    "height": 0,
-                                    "depends": [],
+                                    "height": height,
+                                    "depends": depends,
                                 }),
                             )
                         })
@@ -231,9 +242,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 ))
             } else {
                 Ok(json!(
-                    mempool
-                        .transactions()
-                        .map(Transaction::compute_txid)
+                    order
+                        .into_iter()
                         .map(|txid| txid.to_string())
                         .collect::<Vec<_>>()
                 ))
@@ -241,6 +251,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         }
         "getmempoolentry" => {
             let txid: Txid = param::<String>(params, 0)?.parse()?;
+            let height = node.chain.read().height();
             let mempool = node.mempool.read();
             let entry = mempool
                 .get(&txid)
@@ -250,29 +261,18 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "weight": entry.transaction.weight().to_wu(),
                 "fee": sat_to_btc(entry.fee_sat),
                 "time": entry.added_at,
-                "height": 0,
+                "height": height,
                 "descendantcount": 1,
                 "ancestorcount": 1,
             }))
         }
         "gettxoutsetinfo" => {
             let chain = node.chain.read();
-            let mut total = 0u64;
-            let mut transactions = std::collections::HashSet::new();
-            let mut outputs = 0u64;
-            // The complete UTXO set is intentionally exposed through the
-            // chain helper; this method remains cheap for normal RPC calls.
-            for script_hash in chain.script_hashes() {
-                for (outpoint, entry) in chain.get_utxos(&script_hash) {
-                    total = total.saturating_add(entry.output.value.to_sat());
-                    outputs += 1;
-                    transactions.insert(outpoint.txid);
-                }
-            }
+            let (transactions, outputs, total) = chain.utxo_stats();
             Ok(json!({
                 "height": chain.height(),
                 "bestblock": chain.best_hash().to_string(),
-                "transactions": transactions.len(),
+                "transactions": transactions,
                 "txouts": outputs,
                 "total_amount": sat_to_btc(total),
             }))
@@ -327,18 +327,19 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
 fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let chain = node.chain.read();
     let tip = chain.tip();
+    let header_tip = chain.best_header_tip();
     let header = chain.header(tip.height).expect("tip header exists");
     Ok(json!({
         "chain": network_name(chain.network),
         "blocks": tip.height,
-        "headers": tip.height,
+        "headers": header_tip.height,
         "bestblockhash": tip.hash.to_string(),
         "chainwork": format!("{:064x}", tip.work),
         "difficulty": header.difficulty_float(),
         "time": header.time,
         "mediantime": chain.median_time_past_value(),
-        "verificationprogress": 1.0,
-        "initialblockdownload": false,
+        "verificationprogress": if header_tip.height == 0 { 1.0 } else { tip.height as f64 / header_tip.height as f64 },
+        "initialblockdownload": tip.height < header_tip.height,
         "pruned": false,
         "size_on_disk": std::fs::metadata(chain.store.path()).map(|m| m.len()).unwrap_or(0),
     }))
@@ -679,7 +680,14 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let include_mempool = params.get(2).and_then(Value::as_bool).unwrap_or(true);
     let chain = node.chain.read();
     let outpoint = OutPoint::new(txid, vout);
+    let mempool = include_mempool.then(|| node.mempool.read());
     if let Some(entry) = chain.utxo(&outpoint) {
+        if mempool
+            .as_ref()
+            .is_some_and(|pool| pool.is_spent(&outpoint))
+        {
+            return Ok(Value::Null);
+        }
         return Ok(json!({
             "bestblock": chain.best_hash().to_string(),
             "confirmations": chain.height().saturating_sub(entry.height) + 1,
@@ -688,8 +696,10 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
             "coinbase": entry.coinbase,
         }));
     }
-    if include_mempool {
-        let mempool = node.mempool.read();
+    if let Some(mempool) = mempool {
+        if mempool.is_spent(&outpoint) {
+            return Ok(Value::Null);
+        }
         if let Some(entry) = mempool.get(&txid)
             && let Some(output) = entry.transaction.output.get(vout as usize)
         {

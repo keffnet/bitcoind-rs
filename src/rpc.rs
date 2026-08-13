@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, Network, OutPoint, Transaction, Txid};
@@ -50,7 +51,16 @@ async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()>
     stream.set_nodelay(true)?;
     let request = read_http_request(&mut stream).await?;
     let response = match request {
-        Some(body) => dispatch_json_rpc(&node, &body),
+        Some(request) => {
+            if !authorized(&node, &request.headers) {
+                stream
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await?;
+                stream.shutdown().await?;
+                return Ok(());
+            }
+            dispatch_json_rpc(&node, &request.body)
+        }
         None => {
             json!({"result": null, "error": {"code": -32700, "message": "empty request"}, "id": null})
         }
@@ -66,7 +76,12 @@ async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()>
     Ok(())
 }
 
-async fn read_http_request(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
+struct HttpRequest {
+    headers: String,
+    body: Vec<u8>,
+}
+
+async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     let header_end;
@@ -84,7 +99,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
             break;
         }
     }
-    let headers = std::str::from_utf8(&bytes[..header_end])?;
+    let headers = std::str::from_utf8(&bytes[..header_end])?.to_owned();
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -103,9 +118,26 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<Option<Vec<u8>>> {
         }
         bytes.extend_from_slice(&chunk[..read]);
     }
-    Ok(Some(
-        bytes[header_end..header_end + content_length].to_vec(),
-    ))
+    Ok(Some(HttpRequest {
+        headers,
+        body: bytes[header_end..header_end + content_length].to_vec(),
+    }))
+}
+
+fn authorized(node: &Arc<Node>, headers: &str) -> bool {
+    let Some(cookie) = node.rpc_cookie.as_deref() else {
+        return true;
+    };
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode(cookie.as_bytes())
+    );
+    headers.lines().any(|line| {
+        line.strip_prefix("Authorization:")
+            .or_else(|| line.strip_prefix("authorization:"))
+            .map(|value| value.trim() == expected)
+            .unwrap_or(false)
+    })
 }
 
 fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {

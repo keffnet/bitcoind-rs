@@ -11,11 +11,13 @@ pub mod storage;
 pub mod validation;
 pub mod wire;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
 use bitcoin::Block;
 use parking_lot::RwLock;
+use rand::random;
 use tokio::sync::broadcast;
 use tracing::info;
 
@@ -31,6 +33,7 @@ pub struct Node {
     pub chain: Arc<RwLock<ChainState>>,
     pub mempool: Arc<RwLock<Mempool>>,
     pub events: broadcast::Sender<ChainEvent>,
+    pub rpc_cookie: Option<String>,
 }
 
 impl Node {
@@ -38,11 +41,16 @@ impl Node {
         let chain = ChainState::open(config.network, &config.datadir)?;
         let mempool = Mempool::new(config.network);
         let (events, _) = broadcast::channel(256);
+        let rpc_cookie = config
+            .rpc_bind
+            .map(|_| load_rpc_cookie(&config.datadir))
+            .transpose()?;
         Ok(Arc::new(Self {
             config,
             chain: Arc::new(RwLock::new(chain)),
             mempool: Arc::new(RwLock::new(mempool)),
             events,
+            rpc_cookie,
         }))
     }
 
@@ -87,4 +95,21 @@ impl Node {
 
         Ok(())
     }
+}
+
+fn load_rpc_cookie(data_dir: &Path) -> Result<String> {
+    let path = data_dir.join(".cookie");
+    if path.exists() {
+        return Ok(std::fs::read_to_string(path)?.trim().to_owned());
+    }
+    let cookie = format!("__cookie__:{}", hex::encode(random::<[u8; 32]>()));
+    let temp = data_dir.join(".cookie.tmp");
+    std::fs::write(&temp, &cookie)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(temp, path)?;
+    Ok(cookie)
 }

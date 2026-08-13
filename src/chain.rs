@@ -67,6 +67,8 @@ struct BlockNode {
 #[derive(Serialize, Deserialize)]
 struct ChainMetadata {
     active_chain: Vec<String>,
+    #[serde(default)]
+    headers: Vec<bitcoin::block::Header>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -115,21 +117,22 @@ impl ChainState {
         }
 
         let metadata_path = data_dir.join("chainstate.json");
-        let active_chain = if metadata_path.exists() {
+        let (active_chain, persisted_headers) = if metadata_path.exists() {
             let bytes = fs::read(&metadata_path)
                 .with_context(|| format!("reading {}", metadata_path.display()))?;
             let metadata: ChainMetadata = serde_json::from_slice(&bytes)
                 .with_context(|| format!("decoding {}", metadata_path.display()))?;
-            metadata
+            let active_chain = metadata
                 .active_chain
                 .into_iter()
                 .map(|hash| {
                     hash.parse()
                         .with_context(|| format!("invalid block hash {hash}"))
                 })
-                .collect::<Result<Vec<BlockHash>>>()?
+                .collect::<Result<Vec<BlockHash>>>()?;
+            (active_chain, metadata.headers)
         } else {
-            vec![genesis_hash]
+            (vec![genesis_hash], Vec::new())
         };
         if active_chain.first().copied() != Some(genesis_hash) {
             bail!("chainstate does not start at the configured network genesis block");
@@ -182,10 +185,9 @@ impl ChainState {
         if state.active_chain != active_chain {
             bail!("chainstate metadata does not match replayed active chain");
         }
+        state.index_persisted_headers(&persisted_headers)?;
         state.rebuild_block_index()?;
-        if !metadata_path.exists() {
-            state.persist_metadata()?;
-        }
+        state.persist_metadata()?;
         Ok(state)
     }
 
@@ -365,7 +367,19 @@ impl ChainState {
     /// corresponding full blocks yet. This is the headers-first sync boundary
     /// used by the peer manager.
     pub fn accept_headers(&mut self, headers: &[bitcoin::block::Header]) -> Result<Vec<BlockHash>> {
+        let (hashes, inserted) = self.accept_headers_internal(headers)?;
+        if inserted {
+            self.persist_metadata()?;
+        }
+        Ok(hashes)
+    }
+
+    fn accept_headers_internal(
+        &mut self,
+        headers: &[bitcoin::block::Header],
+    ) -> Result<(Vec<BlockHash>, bool)> {
         let mut hashes = Vec::with_capacity(headers.len());
+        let mut inserted = false;
         for header in headers {
             let hash = header.block_hash();
             if let Some(existing) = self.block_index.get(&hash) {
@@ -396,9 +410,10 @@ impl ChainState {
                     chain_work: parent.chain_work + header.work(),
                 },
             );
+            inserted = true;
             hashes.push(hash);
         }
-        Ok(hashes)
+        Ok((hashes, inserted))
     }
 
     pub fn block(&mut self, hash: &BlockHash) -> Result<Option<Block>> {
@@ -1163,6 +1178,7 @@ impl ChainState {
     fn persist_metadata(&self) -> Result<()> {
         let metadata = ChainMetadata {
             active_chain: self.active_chain.iter().map(ToString::to_string).collect(),
+            headers: self.known_headers(),
         };
         let bytes = serde_json::to_vec_pretty(&metadata)?;
         let path = self.data_dir.join("chainstate.json");
@@ -1238,6 +1254,51 @@ impl ChainState {
             );
         }
         Ok(())
+    }
+
+    fn index_persisted_headers(&mut self, headers: &[bitcoin::block::Header]) -> Result<()> {
+        if headers.is_empty() {
+            return Ok(());
+        }
+        let mut pending = headers.to_vec();
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut remaining = Vec::with_capacity(before);
+            for header in pending {
+                let hash = header.block_hash();
+                if let Some(existing) = self.block_index.get(&hash) {
+                    if existing.header != header {
+                        bail!("header hash collision for {hash}");
+                    }
+                    continue;
+                }
+                if self.block_index.contains_key(&header.prev_blockhash) {
+                    self.accept_headers_internal(&[header])?;
+                } else {
+                    remaining.push(header);
+                }
+            }
+            if remaining.len() == before {
+                let header = remaining[0];
+                bail!(
+                    "persisted header {} has an unknown parent {}",
+                    header.block_hash(),
+                    header.prev_blockhash
+                );
+            }
+            pending = remaining;
+        }
+        Ok(())
+    }
+
+    fn known_headers(&self) -> Vec<bitcoin::block::Header> {
+        let mut nodes: Vec<(&BlockHash, &BlockNode)> = self.block_index.iter().collect();
+        nodes.sort_by(|(left_hash, left), (right_hash, right)| {
+            left.height
+                .cmp(&right.height)
+                .then_with(|| left_hash.to_string().cmp(&right_hash.to_string()))
+        });
+        nodes.into_iter().map(|(_, node)| node.header).collect()
     }
 }
 
@@ -1369,6 +1430,14 @@ mod tests {
             .unwrap();
         assert_eq!(hashes, vec![parent.block_hash(), child.block_hash()]);
         assert_eq!(state.block_height_by_hash(&child.block_hash()), Some(2));
+        drop(state);
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(state.height(), 0);
+        assert_eq!(
+            state.best_header_tip().hash,
+            child.block_hash(),
+            "header-only index should survive a restart"
+        );
         state.connect_block(parent).unwrap();
         state.connect_block(child).unwrap();
         assert_eq!(state.height(), 2);

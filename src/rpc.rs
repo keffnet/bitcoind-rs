@@ -148,6 +148,21 @@ fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {
             return json!({"result": null, "error": {"code": -32700, "message": error.to_string()}, "id": null});
         }
     };
+    if let Some(batch) = request.as_array() {
+        if batch.is_empty() {
+            return json!({"result": null, "error": {"code": -32600, "message": "empty batch"}, "id": null});
+        }
+        return Value::Array(
+            batch
+                .iter()
+                .map(|request| dispatch_request(node, request))
+                .collect(),
+        );
+    }
+    dispatch_request(node, &request)
+}
+
+fn dispatch_request(node: &Arc<Node>, request: &Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request
@@ -162,6 +177,10 @@ fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {
 
 fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
     match method {
+        "stop" => {
+            node.request_shutdown();
+            Ok(json!("bitcoind stopping"))
+        }
         "getblockchaininfo" => get_blockchain_info(node),
         "getblockcount" => Ok(json!(node.chain.read().height())),
         "getbestblockhash" => Ok(json!(node.chain.read().best_hash().to_string())),
@@ -182,7 +201,11 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "submitblock" => submit_block(node, params),
         "getblocktemplate" => get_block_template(node),
         "testmempoolaccept" => test_mempool_accept(node, params),
-        "verifychain" => Ok(Value::Bool(true)),
+        "verifychain" => {
+            let depth = params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
+            node.chain.write().verify_active_chain(depth)?;
+            Ok(Value::Bool(true))
+        }
         "getmemoryinfo" => {
             let mempool = node.mempool.read();
             Ok(json!({
@@ -308,6 +331,39 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "relayfee": 0.00001000,
             "incrementalfee": 0.00001000,
         })),
+        "getpeerinfo" => Ok(json!(
+            node.peer_infos()
+                .into_iter()
+                .map(|peer| json!({
+                    "id": peer.id,
+                    "addr": peer.address.to_string(),
+                    "addrbind": "",
+                    "addrlocal": "",
+                    "network": "ipv4",
+                    "services": "0000000000000000",
+                    "relaytxes": true,
+                    "lastsend": 0,
+                    "lastrecv": 0,
+                    "bytessent": 0,
+                    "bytesrecv": 0,
+                    "conntime": peer.connected_at,
+                    "pingtime": null,
+                    "minping": null,
+                    "version": peer.version.unwrap_or_default(),
+                    "subver": peer.user_agent,
+                    "inbound": peer.inbound,
+                    "startingheight": peer.start_height,
+                    "synced_headers": node.chain.read().best_header_tip().height,
+                    "synced_blocks": node.chain.read().height(),
+                    "inflight": [],
+                }))
+                .collect::<Vec<_>>()
+        )),
+        "getrpcinfo" => Ok(json!({
+            "active_commands": [],
+            "logpath": node.config.datadir.join("debug.log").to_string_lossy(),
+        })),
+        "help" => Ok(json!(rpc_help(method_params_string(params)))),
         "estimatesmartfee" => Ok(
             json!({"feerate": 0.00001000, "blocks": params.get(0).and_then(Value::as_u64).unwrap_or(6)}),
         ),
@@ -798,5 +854,48 @@ fn network_name(network: Network) -> &'static str {
         Network::Signet => "signet",
         Network::Regtest => "regtest",
         Network::Testnet4 => "testnet4",
+    }
+}
+
+fn method_params_string(params: &Value) -> &str {
+    params.get(0).and_then(Value::as_str).unwrap_or("")
+}
+
+fn rpc_help(method: &str) -> String {
+    const METHODS: &[&str] = &[
+        "getblockchaininfo",
+        "getblockcount",
+        "getbestblockhash",
+        "getblockhash",
+        "getblockheader",
+        "getblock",
+        "getblockstats",
+        "getrawtransaction",
+        "decoderawtransaction",
+        "sendrawtransaction",
+        "submitblock",
+        "getblocktemplate",
+        "testmempoolaccept",
+        "verifychain",
+        "gettxout",
+        "getmempoolinfo",
+        "getrawmempool",
+        "getmempoolentry",
+        "gettxoutsetinfo",
+        "getchaintips",
+        "getnetworkinfo",
+        "getpeerinfo",
+        "getrpcinfo",
+        "estimatesmartfee",
+        "getdifficulty",
+        "getconnectioncount",
+        "uptime",
+    ];
+    if method.is_empty() {
+        METHODS.join("\n")
+    } else if METHODS.contains(&method) {
+        format!("{method}: wallet-free Bitcoin Core-compatible RPC")
+    } else {
+        format!("unknown command: {method}")
     }
 }

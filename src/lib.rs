@@ -16,14 +16,14 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bitcoin::Block;
 use bitcoin::{Transaction, Txid};
 use parking_lot::RwLock;
 use rand::random;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 use tracing::info;
 
 use crate::chain::ChainState;
@@ -32,6 +32,17 @@ use crate::mempool::Mempool;
 
 pub type ChainEvent = chain::ChainTip;
 pub type MempoolEvent = Txid;
+
+#[derive(Clone, Debug)]
+pub struct PeerInfo {
+    pub id: usize,
+    pub address: std::net::SocketAddr,
+    pub inbound: bool,
+    pub version: Option<i32>,
+    pub user_agent: String,
+    pub start_height: i32,
+    pub connected_at: u64,
+}
 
 /// The wallet-free node facade shared by the network and RPC services.
 pub struct Node {
@@ -42,7 +53,9 @@ pub struct Node {
     pub mempool_events: broadcast::Sender<MempoolEvent>,
     pub rpc_cookie: Option<String>,
     pub peer_count: AtomicUsize,
+    peers: parking_lot::RwLock<std::collections::HashMap<usize, PeerInfo>>,
     pub started_at: Instant,
+    shutdown: Notify,
 }
 
 impl Node {
@@ -63,7 +76,9 @@ impl Node {
             mempool_events,
             rpc_cookie,
             peer_count: AtomicUsize::new(0),
+            peers: parking_lot::RwLock::new(std::collections::HashMap::new()),
             started_at: Instant::now(),
+            shutdown: Notify::new(),
         }))
     }
 
@@ -110,6 +125,50 @@ impl Node {
         self.peer_count.load(Ordering::Relaxed)
     }
 
+    pub fn register_peer(&self, id: usize, address: std::net::SocketAddr, inbound: bool) {
+        self.peers.write().insert(
+            id,
+            PeerInfo {
+                id,
+                address,
+                inbound,
+                version: None,
+                user_agent: String::new(),
+                start_height: 0,
+                connected_at: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            },
+        );
+    }
+
+    pub fn update_peer_version(
+        &self,
+        id: usize,
+        version: i32,
+        user_agent: &str,
+        start_height: i32,
+    ) {
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.version = Some(version);
+            peer.user_agent = user_agent.to_owned();
+            peer.start_height = start_height;
+        }
+    }
+
+    pub fn unregister_peer(&self, id: usize) {
+        self.peers.write().remove(&id);
+    }
+
+    pub fn peer_infos(&self) -> Vec<PeerInfo> {
+        self.peers.read().values().cloned().collect()
+    }
+
+    pub fn request_shutdown(&self) {
+        self.shutdown.notify_waiters();
+    }
+
     pub async fn run(self: Arc<Self>) -> Result<()> {
         let p2p = p2p::PeerManager::new(self.clone());
         let rpc = rpc::RpcServer::new(self.clone());
@@ -123,17 +182,21 @@ impl Node {
             "starting wallet-free Bitcoin node"
         );
 
-        let p2p_task = tokio::spawn(p2p.run());
-        let rpc_task = tokio::spawn(rpc.run());
-        let electrum_task = tokio::spawn(electrum.run());
+        let mut p2p_task = tokio::spawn(p2p.run());
+        let mut rpc_task = tokio::spawn(rpc.run());
+        let mut electrum_task = tokio::spawn(electrum.run());
 
         tokio::select! {
-            result = p2p_task => result??,
-            result = rpc_task => result??,
-            result = electrum_task => result??,
+            result = &mut p2p_task => result??,
+            result = &mut rpc_task => result??,
+            result = &mut electrum_task => result??,
             result = tokio::signal::ctrl_c() => result?,
-        }
+            _ = self.shutdown.notified() => (),
+        };
 
+        p2p_task.abort();
+        rpc_task.abort();
+        electrum_task.abort();
         Ok(())
     }
 }

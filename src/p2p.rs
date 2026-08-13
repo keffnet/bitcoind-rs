@@ -77,8 +77,15 @@ impl PeerManager {
                     match TcpStream::connect(address).await {
                         Ok(stream) => {
                             info!(%address, "connected to configured peer");
-                            if let Err(error) =
-                                serve_peer(node.clone(), stream, true, peers.clone(), peer_id).await
+                            if let Err(error) = serve_peer(
+                                node.clone(),
+                                stream,
+                                address,
+                                true,
+                                peers.clone(),
+                                peer_id,
+                            )
+                            .await
                             {
                                 debug!(%address, %error, "outbound peer ended");
                             }
@@ -103,7 +110,7 @@ impl PeerManager {
                     debug!(%address, "rejecting peer because peer limit is reached");
                     return;
                 };
-                if let Err(error) = serve_peer(node, stream, false, peers, peer_id).await {
+                if let Err(error) = serve_peer(node, stream, address, false, peers, peer_id).await {
                     debug!(%address, %error, "inbound peer ended");
                 }
                 drop(permit);
@@ -158,17 +165,20 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
 async fn serve_peer(
     node: Arc<Node>,
     stream: TcpStream,
+    address: std::net::SocketAddr,
     outbound: bool,
     peers: PeerRegistry,
     peer_id: usize,
 ) -> Result<()> {
     let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
+    node.register_peer(peer_id, address, !outbound);
     let (mut reader, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
     peers.lock().insert(peer_id, writer.clone());
     let result = serve_peer_loop(&node, &mut reader, &writer, outbound, &peers, peer_id).await;
     peers.lock().remove(&peer_id);
+    node.unregister_peer(peer_id);
     result
 }
 
@@ -220,6 +230,12 @@ async fn serve_peer_loop(
                 if version.version < 70001 {
                     anyhow::bail!("peer protocol version is too old");
                 }
+                node.update_peer_version(
+                    peer_id,
+                    version.version,
+                    &version.user_agent,
+                    version.start_height,
+                );
                 if !verack_sent {
                     send_message(writer, node.config.network, &Message::Verack).await?;
                     verack_sent = true;

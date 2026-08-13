@@ -200,9 +200,9 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                                 !chain.store.contains(&item.hash)
                             }
                             InventoryType::Transaction | InventoryType::WitnessTransaction => {
-                                !mempool
+                                mempool
                                     .get(&Txid::from_byte_array(item.hash.to_byte_array()))
-                                    .is_some()
+                                    .is_none()
                             }
                             _ => false,
                         })
@@ -276,7 +276,8 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
             }
             Message::Transaction(transaction) => {
                 let txid = transaction.compute_txid();
-                match node.mempool.write().accept(transaction, &node.chain.read()) {
+                let chain = node.chain.read();
+                match node.mempool.write().accept(transaction, &chain) {
                     Ok(_) => debug!(%txid, "accepted peer transaction"),
                     Err(error) => debug!(%txid, %error, "rejected peer transaction"),
                 }

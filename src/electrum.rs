@@ -128,6 +128,7 @@ fn dispatch(
     match method {
         "server.version" => Ok(json!(["bitcoind-rs 0.1.0", "1.4"])),
         "server.ping" => Ok(Value::Null),
+        "server.banner" => Ok(json!("bitcoind-rs wallet-free Bitcoin node")),
         "server.features" => Ok(json!({
             "server_version": "bitcoind-rs 0.1.0",
             "protocol_min": "1.4",
@@ -182,6 +183,33 @@ fn dispatch(
                     .collect::<Vec<_>>()
             ))
         }
+        "blockchain.scripthash.get_mempool" => {
+            let script_hash = script_hash_param(params, 0)?;
+            let chain = node.chain.read();
+            let mempool = node.mempool.read();
+            let mut result = Vec::new();
+            for transaction in mempool.transactions() {
+                let affects_outputs = transaction.output.iter().any(|output| {
+                    chain::electrum_script_hash(&output.script_pubkey) == script_hash
+                });
+                let affects_inputs = transaction.input.iter().any(|input| {
+                    chain
+                        .utxo(&input.previous_output)
+                        .map(|entry| {
+                            chain::electrum_script_hash(&entry.output.script_pubkey) == script_hash
+                        })
+                        .unwrap_or(false)
+                });
+                if affects_outputs || affects_inputs {
+                    let txid = transaction.compute_txid();
+                    let entry = mempool.get(&txid).expect("mempool iterator is consistent");
+                    result.push(
+                        json!({"tx_hash": txid.to_string(), "height": 0, "fee": entry.fee_sat}),
+                    );
+                }
+            }
+            Ok(json!(result))
+        }
         "blockchain.scripthash.subscribe" => {
             let script_hash = script_hash_param(params, 0)?;
             subscriptions.insert(script_hash.clone());
@@ -195,6 +223,7 @@ fn dispatch(
         "blockchain.transaction.get" => transaction_get(node, params),
         "blockchain.transaction.get_merkle" => transaction_merkle(node, params),
         "blockchain.transaction.broadcast" => transaction_broadcast(node, params),
+        "blockchain.estimatefee" | "blockchain.relayfee" => Ok(json!(0.00001000)),
         "mempool.get_fee_histogram" => Ok(json!([])),
         "server.peers.subscribe" => Ok(json!([])),
         _ => bail!("unsupported Electrum method {method}"),
@@ -262,10 +291,8 @@ fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn transaction_broadcast(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let raw = param::<String>(params, 0)?;
     let transaction: Transaction = deserialize(&hex::decode(raw)?)?;
-    let txid = node
-        .mempool
-        .write()
-        .accept(transaction, &node.chain.read())?;
+    let chain = node.chain.read();
+    let txid = node.mempool.write().accept(transaction, &chain)?;
     Ok(json!(txid.to_string()))
 }
 

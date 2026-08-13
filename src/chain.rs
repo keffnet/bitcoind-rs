@@ -23,6 +23,7 @@ const DIFFICULTY_INTERVAL: u32 = 2016;
 pub struct UtxoEntry {
     pub output: TxOut,
     pub height: u32,
+    pub median_time_past: u32,
     pub coinbase: bool,
 }
 
@@ -67,6 +68,7 @@ pub struct ChainState {
     block_index: HashMap<BlockHash, BlockNode>,
     utxos: HashMap<OutPoint, UtxoEntry>,
     tx_index: HashMap<Txid, TxLocation>,
+    tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
 }
 
@@ -120,6 +122,7 @@ impl ChainState {
             block_index: HashMap::new(),
             utxos: HashMap::new(),
             tx_index: HashMap::new(),
+            tx_index_all: HashMap::new(),
             history: HashMap::new(),
         };
         state.initialize_genesis(&blocks[0])?;
@@ -204,7 +207,12 @@ impl ChainState {
     }
 
     pub fn transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
-        let Some(location) = self.tx_index.get(txid).cloned() else {
+        let Some(location) = self
+            .tx_index
+            .get(txid)
+            .or_else(|| self.tx_index_all.get(txid))
+            .cloned()
+        else {
             return Ok(None);
         };
         let Some(block) = self.store.get(&location.block_hash)? else {
@@ -234,6 +242,10 @@ impl ChainState {
 
     pub fn utxo(&self, outpoint: &OutPoint) -> Option<&UtxoEntry> {
         self.utxos.get(outpoint)
+    }
+
+    pub fn median_time_past_value(&self) -> u32 {
+        self.median_time_past()
     }
 
     pub fn history_status(&self, script_hash: &str) -> Option<String> {
@@ -314,6 +326,7 @@ impl ChainState {
             Amount::MAX_MONEY.to_sat(),
         )?;
         self.store.insert(&block)?;
+        self.index_all_transactions(&block, height);
         let chain_work = parent.chain_work + block.header.work();
         self.block_index.insert(
             hash,
@@ -354,6 +367,7 @@ impl ChainState {
             let txid = transaction.compute_txid();
             let mut input_total = 0u64;
             let mut previous_outputs = Vec::with_capacity(transaction.input.len());
+            let mut previous_entries = Vec::with_capacity(transaction.input.len());
             for input in &transaction.input {
                 let outpoint = input.previous_output;
                 if !spent.insert(outpoint) {
@@ -369,8 +383,15 @@ impl ChainState {
                     .checked_add(entry.output.value.to_sat())
                     .ok_or(ValidationError::InputTotalOverflow)?;
                 previous_outputs.push(entry.output.clone());
+                previous_entries.push(entry.clone());
                 removals.push((outpoint, entry));
             }
+            validation::validate_transaction_finality(
+                transaction,
+                height,
+                self.median_time_past(),
+                &previous_entries,
+            )?;
             validation::validate_transaction_scripts(transaction, &previous_outputs)?;
             let output_total = transaction
                 .output
@@ -427,6 +448,7 @@ impl ChainState {
                     UtxoEntry {
                         output: output.clone(),
                         height,
+                        median_time_past: self.median_time_past(),
                         coinbase: transaction_index == 0,
                     },
                 );
@@ -436,6 +458,14 @@ impl ChainState {
                 self.add_history(&script_hash, HistoryEntry { txid, height });
             }
             self.tx_index.insert(
+                txid,
+                TxLocation {
+                    block_hash: hash,
+                    height,
+                    transaction_index,
+                },
+            );
+            self.tx_index_all.insert(
                 txid,
                 TxLocation {
                     block_hash: hash,
@@ -518,6 +548,11 @@ impl ChainState {
                 break;
             }
         }
+        for (hash, block) in blocks {
+            if let Some(node) = self.block_index.get(&hash).copied() {
+                self.index_all_transactions(&block, node.height);
+            }
+        }
         Ok(())
     }
 
@@ -587,6 +622,7 @@ impl ChainState {
                     UtxoEntry {
                         output: output.clone(),
                         height,
+                        median_time_past: block.header.time,
                         coinbase: transaction_index == 0,
                     },
                 );
@@ -596,6 +632,28 @@ impl ChainState {
                 self.add_history(&script_hash, HistoryEntry { txid, height });
             }
             self.tx_index.insert(
+                txid,
+                TxLocation {
+                    block_hash: block.block_hash(),
+                    height,
+                    transaction_index,
+                },
+            );
+            self.tx_index_all.insert(
+                txid,
+                TxLocation {
+                    block_hash: block.block_hash(),
+                    height,
+                    transaction_index,
+                },
+            );
+        }
+    }
+
+    fn index_all_transactions(&mut self, block: &Block, height: u32) {
+        for (transaction_index, transaction) in block.txdata.iter().enumerate() {
+            let txid = transaction.compute_txid();
+            self.tx_index_all.insert(
                 txid,
                 TxLocation {
                     block_hash: block.block_hash(),

@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 
+use bitcoin::blockdata::locktime::absolute::{Height, Time};
 use bitcoin::consensus::Params;
 use bitcoin::pow::Target;
 use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, Transaction, Txid};
@@ -211,7 +212,7 @@ pub fn block_subsidy(height: u32) -> u64 {
     if halvings >= 64 {
         0
     } else {
-        50 * 100_000_000 >> halvings
+        (50 * 100_000_000) >> halvings
     }
 }
 
@@ -223,6 +224,45 @@ pub fn checked_money_add(left: u64, right: u64) -> Result<u64, ValidationError> 
         return Err(ValidationError::SubsidyOverflow);
     }
     Ok(sum)
+}
+
+pub fn validate_transaction_finality(
+    transaction: &Transaction,
+    height: u32,
+    median_time_past: u32,
+    previous_entries: &[crate::chain::UtxoEntry],
+) -> Result<(), ValidationError> {
+    let block_height = Height::from_consensus(height).expect("block height fits consensus range");
+    let block_time =
+        Time::from_consensus(median_time_past).expect("median time is a valid timestamp");
+    if !transaction.is_absolute_timelock_satisfied(block_height, block_time) {
+        return Err(ValidationError::NonFinalTransaction);
+    }
+    if transaction.version.0 < 2 || previous_entries.len() != transaction.input.len() {
+        return Ok(());
+    }
+    for (input, entry) in transaction.input.iter().zip(previous_entries) {
+        let sequence = input.sequence.to_consensus_u32();
+        if !input.sequence.is_relative_lock_time() {
+            continue;
+        }
+        let relative = u32::from((sequence & 0x0000_ffff) as u16);
+        if input.sequence.is_height_locked() {
+            if height < entry.height.saturating_add(relative) {
+                return Err(ValidationError::NonFinalTransaction);
+            }
+        } else {
+            let relative_seconds = relative.saturating_mul(512);
+            if median_time_past
+                <= entry
+                    .median_time_past
+                    .saturating_add(relative_seconds.saturating_sub(1))
+            {
+                return Err(ValidationError::NonFinalTransaction);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Verify every non-coinbase input using the same libbitcoinconsensus script

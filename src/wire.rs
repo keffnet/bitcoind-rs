@@ -190,6 +190,9 @@ pub fn encode_message(network: Network, message: &Message) -> Result<Vec<u8>> {
         return Err(WireError::Oversized(payload.len()).into());
     }
     let command = message.command().as_bytes();
+    if command.is_empty() || command.len() > 12 || command.contains(&0) {
+        bail!("invalid Bitcoin command name");
+    }
     let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
     frame.extend_from_slice(&network_magic(network));
     let mut command_bytes = [0u8; 12];

@@ -398,10 +398,8 @@ fn decode_raw_transaction(params: &Value) -> Result<Value> {
 fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let transaction: Transaction = deserialize(&bytes)?;
-    let txid = node
-        .mempool
-        .write()
-        .accept(transaction, &node.chain.read())?;
+    let chain = node.chain.read();
+    let txid = node.mempool.write().accept(transaction, &chain)?;
     Ok(json!(txid.to_string()))
 }
 

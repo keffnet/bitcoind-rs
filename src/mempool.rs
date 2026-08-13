@@ -102,6 +102,8 @@ impl Mempool {
         let mut seen = HashSet::with_capacity(transaction.input.len());
         let mut input_total = 0u64;
         let mut previous_outputs = Vec::with_capacity(transaction.input.len());
+        let mut previous_entries = Vec::with_capacity(transaction.input.len());
+        let mut all_inputs_confirmed = true;
         for input in &transaction.input {
             if !seen.insert(input.previous_output) {
                 return Err(MempoolError::DuplicateInput);
@@ -110,6 +112,7 @@ impl Mempool {
                 return Err(MempoolError::Conflict(*conflict));
             }
             let previous = if let Some(entry) = self.entries.get(&input.previous_output.txid) {
+                all_inputs_confirmed = false;
                 entry
                     .transaction
                     .output
@@ -122,12 +125,22 @@ impl Mempool {
                 if entry.coinbase && chain.height() + 1 < entry.height.saturating_add(100) {
                     return Err(MempoolError::MissingInput(input.previous_output));
                 }
+                previous_entries.push(entry.clone());
                 &entry.output
             };
             input_total = input_total
                 .checked_add(previous.value.to_sat())
                 .ok_or(MempoolError::BadOutput)?;
             previous_outputs.push(previous.clone());
+        }
+        if all_inputs_confirmed {
+            validation::validate_transaction_finality(
+                &transaction,
+                chain.height() + 1,
+                chain.median_time_past_value(),
+                &previous_entries,
+            )
+            .map_err(|error| MempoolError::Script(error.to_string()))?;
         }
         validation::validate_transaction_scripts(&transaction, &previous_outputs)
             .map_err(|error| MempoolError::Script(error.to_string()))?;

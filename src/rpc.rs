@@ -852,6 +852,7 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
         "waitfornewblock" => wait_for_new_block(node, params).await,
         "waitforblock" => wait_for_block(node, params).await,
         "waitforblockheight" => wait_for_block_height(node, params).await,
+        "getblocktemplate" => get_block_template_async(node, params).await,
         _ => dispatch_method(node, method, params),
     }
 }
@@ -5767,12 +5768,49 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "sigoplimit": 80_000,
         "sizelimit": 4_000_000,
         "weightlimit": 4_000_000,
-        "longpollid": format!("{}:{}", tip.hash, weight),
+        "longpollid": format!("{}:{}", tip.hash, mempool.sequence()),
         "height": height,
         "bits": format!("{:08x}", bits),
         "default_witness_commitment": default_witness_commitment,
         "signet_challenge": chain.signet_challenge().map(hex::encode),
     }))
+}
+
+async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let request = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_object);
+    let longpoll_id = request
+        .filter(|request| request.get("mode").and_then(Value::as_str) != Some("proposal"))
+        .and_then(|request| request.get("longpollid"))
+        .and_then(Value::as_str);
+    if let Some(longpoll_id) = longpoll_id {
+        let mut chain_events = node.subscribe_chain();
+        let mut mempool_events = node.subscribe_mempool();
+        loop {
+            if current_block_template_longpoll_id(node) != longpoll_id {
+                break;
+            }
+            tokio::select! {
+                event = chain_events.recv() => match event {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                event = mempool_events.recv() => match event {
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            }
+        }
+    }
+    get_block_template(node, params)
+}
+
+fn current_block_template_longpoll_id(node: &Arc<Node>) -> String {
+    let tip = node.chain.read().tip();
+    let sequence = node.mempool.read().sequence();
+    format!("{}:{}", tip.hash, sequence)
 }
 
 fn prioritise_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -7993,11 +8031,37 @@ mod tests {
         let template = get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
         assert_eq!(template["height"], 1);
         assert_eq!(template["weightlimit"], 4_000_000);
+        assert_eq!(
+            template["longpollid"],
+            current_block_template_longpoll_id(&node)
+        );
         assert!(
             template["default_witness_commitment"]
                 .as_str()
                 .is_some_and(|value| value.starts_with("6a24aa21a9ed"))
         );
+    }
+
+    #[tokio::test]
+    async fn getblocktemplate_longpoll_returns_after_a_stale_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let stale = format!("{}:999", node.chain.read().best_hash());
+        let template = get_block_template_async(&node, &json!([{"longpollid": stale}]))
+            .await
+            .unwrap();
+        assert_eq!(template["height"], 1);
     }
 
     #[test]

@@ -52,6 +52,7 @@ pub struct Node {
     pub events: broadcast::Sender<ChainEvent>,
     pub mempool_events: broadcast::Sender<MempoolEvent>,
     pub rpc_cookie: Option<String>,
+    mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
     peers: parking_lot::RwLock<std::collections::HashMap<usize, PeerInfo>>,
     pub started_at: Instant,
@@ -61,7 +62,9 @@ pub struct Node {
 impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
         let chain = ChainState::open(config.network, &config.datadir)?;
-        let mempool = Mempool::new(config.network);
+        let mempool_path = config.datadir.join("mempool.json");
+        let mut mempool = Mempool::new(config.network);
+        mempool.load_from_file(&mempool_path, &chain)?;
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let rpc_cookie = config
@@ -75,6 +78,7 @@ impl Node {
             events,
             mempool_events,
             rpc_cookie,
+            mempool_path,
             peer_count: AtomicUsize::new(0),
             peers: parking_lot::RwLock::new(std::collections::HashMap::new()),
             started_at: Instant::now(),
@@ -197,7 +201,12 @@ impl Node {
         p2p_task.abort();
         rpc_task.abort();
         electrum_task.abort();
+        self.persist_mempool()?;
         Ok(())
+    }
+
+    fn persist_mempool(&self) -> Result<()> {
+        self.mempool.read().save_to_file(&self.mempool_path)
     }
 }
 

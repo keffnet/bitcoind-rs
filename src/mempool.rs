@@ -1,15 +1,26 @@
 //! In-memory transaction admission and relay pool.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::{Context, Result};
 use bitcoin::{Amount, Network, OutPoint, Transaction, Txid};
+use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainState;
 use crate::validation::{self, ValidationError};
 
 const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
 const MIN_RELAY_SAT_PER_VBYTE: u64 = 1;
+const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+#[derive(Deserialize, Serialize)]
+struct DiskMempoolEntry {
+    transaction: Transaction,
+    added_at: u64,
+}
 
 #[derive(Clone, Debug)]
 pub struct MempoolEntry {
@@ -138,6 +149,45 @@ impl Mempool {
             );
         }
         ordered
+    }
+
+    pub fn load_from_file(&mut self, path: &Path, chain: &ChainState) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let entries: Vec<DiskMempoolEntry> = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decoding {}", path.display()))?;
+        for entry in entries {
+            let _ = self.accept_at(entry.transaction, chain, entry.added_at);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        self.clear_expired(now, MEMPOOL_EXPIRY);
+        Ok(())
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        let entries = self
+            .transaction_order()
+            .into_iter()
+            .filter_map(|txid| self.entries.get(&txid))
+            .map(|entry| DiskMempoolEntry {
+                transaction: entry.transaction.clone(),
+                added_at: entry.added_at,
+            })
+            .collect::<Vec<_>>();
+        let bytes = serde_json::to_vec(&entries)?;
+        let temp = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
+        fs::rename(&temp, path)
+            .with_context(|| format!("replacing mempool file {}", path.display()))?;
+        Ok(())
     }
 
     pub fn accept(
@@ -356,5 +406,23 @@ impl Mempool {
 impl From<ValidationError> for MempoolError {
     fn from(error: ValidationError) -> Self {
         MempoolError::Script(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::Network;
+
+    #[test]
+    fn persists_and_loads_an_empty_pool() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let path = directory.path().join("mempool.json");
+        let pool = Mempool::new(Network::Regtest);
+        pool.save_to_file(&path).unwrap();
+        let mut loaded = Mempool::new(Network::Regtest);
+        loaded.load_from_file(&path, &chain).unwrap();
+        assert!(loaded.is_empty());
     }
 }

@@ -888,6 +888,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "decoderawtransaction" => decode_raw_transaction(params),
         "createrawtransaction" => create_raw_transaction(node, params),
         "decodescript" => decode_script(node, params),
+        "combinerawtransaction" => combine_raw_transaction(params),
         "createpsbt" => create_psbt(node, params),
         "decodepsbt" => decode_psbt(node, params),
         "converttopsbt" => convert_to_psbt(params),
@@ -2928,6 +2929,157 @@ fn decode_raw_transaction(params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let transaction: Transaction = deserialize(&bytes)?;
     Ok(rpc_transaction(&transaction, None, None, None, None))
+}
+
+fn combine_raw_transaction(params: &Value) -> Result<Value> {
+    let raw_transactions = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("combinerawtransaction expects an array of transactions"))?;
+    if raw_transactions.is_empty() {
+        bail!("Missing transactions")
+    }
+    let transactions = raw_transactions
+        .iter()
+        .enumerate()
+        .map(|(index, raw)| {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| anyhow!("transaction {index} must be hexadecimal"))?;
+            let bytes = hex::decode(raw)
+                .with_context(|| format!("TX decode failed for transaction {index}"))?;
+            deserialize::<Transaction>(&bytes)
+                .with_context(|| format!("TX decode failed for transaction {index}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first = transactions
+        .first()
+        .cloned()
+        .ok_or_else(|| anyhow!("Missing transactions"))?;
+    if transactions
+        .iter()
+        .skip(1)
+        .any(|transaction| !raw_transactions_match(&first, transaction))
+    {
+        bail!("TXs are not compatible")
+    }
+    let mut combined = first;
+    for transaction in transactions.iter().skip(1) {
+        for (combined_input, input) in combined.input.iter_mut().zip(&transaction.input) {
+            combined_input.script_sig =
+                choose_script_sig(&combined_input.script_sig, &input.script_sig);
+            combined_input.witness = choose_witness(&combined_input.witness, &input.witness);
+        }
+    }
+    Ok(json!(hex::encode(serialize(&combined))))
+}
+
+fn raw_transactions_match(left: &Transaction, right: &Transaction) -> bool {
+    left.version == right.version
+        && left.lock_time == right.lock_time
+        && left.output == right.output
+        && left.input.len() == right.input.len()
+        && left.input.iter().zip(&right.input).all(|(left, right)| {
+            left.previous_output == right.previous_output && left.sequence == right.sequence
+        })
+}
+
+fn choose_script_sig(left: &ScriptBuf, right: &ScriptBuf) -> ScriptBuf {
+    if left.is_empty() {
+        return right.to_owned();
+    }
+    if right.is_empty() {
+        return left.to_owned();
+    }
+    if let Some(merged) = merge_multisig_script_sigs(left, right) {
+        return merged;
+    }
+    if script_signature_score(right) > script_signature_score(left) {
+        right.to_owned()
+    } else {
+        left.to_owned()
+    }
+}
+
+fn merge_multisig_script_sigs(left: &ScriptBuf, right: &ScriptBuf) -> Option<ScriptBuf> {
+    let left = multisig_script_items(left)?;
+    let right = multisig_script_items(right)?;
+    if left.1 != right.1 {
+        return None;
+    }
+    let mut signatures = left.0.into_iter().chain(right.0).collect::<Vec<_>>();
+    signatures.dedup();
+    let mut builder = Builder::new().push_opcode(bitcoin::opcodes::OP_0);
+    for signature in signatures {
+        builder = builder.push_slice(PushBytesBuf::try_from(signature).ok()?);
+    }
+    builder = builder.push_slice(PushBytesBuf::try_from(left.1).ok()?);
+    Some(builder.into_script())
+}
+
+fn multisig_script_items(script: &bitcoin::Script) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+    let mut instructions = script.instructions();
+    match instructions.next()? {
+        Ok(Instruction::Op(opcode)) if opcode.to_u8() == 0 => {}
+        _ => return None,
+    }
+    let mut items = instructions
+        .map(|instruction| match instruction {
+            Ok(Instruction::PushBytes(bytes)) => Some(bytes.as_bytes().to_vec()),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let redeem_script = items.pop()?;
+    if items.is_empty() {
+        return None;
+    }
+    Some((items, redeem_script))
+}
+
+fn script_signature_score(script: &bitcoin::Script) -> (usize, usize) {
+    let pushes = script
+        .instructions()
+        .filter(|instruction| match instruction {
+            Ok(Instruction::PushBytes(_)) => true,
+            Ok(Instruction::Op(opcode)) => opcode.to_u8() == 0,
+            Err(_) => false,
+        })
+        .count();
+    (pushes, script.len())
+}
+
+fn choose_witness(left: &Witness, right: &Witness) -> Witness {
+    if let Some(merged) = merge_multisig_witnesses(left, right) {
+        return merged;
+    }
+    let left_score = (left.len(), serialize(left).len());
+    let right_score = (right.len(), serialize(right).len());
+    if right_score > left_score {
+        right.to_owned()
+    } else {
+        left.to_owned()
+    }
+}
+
+fn merge_multisig_witnesses(left: &Witness, right: &Witness) -> Option<Witness> {
+    let left = left.iter().collect::<Vec<_>>();
+    let right = right.iter().collect::<Vec<_>>();
+    if left.len() < 3
+        || right.len() < 3
+        || !left[0].is_empty()
+        || !right[0].is_empty()
+        || left.last() != right.last()
+    {
+        return None;
+    }
+    let mut stack = left[1..left.len() - 1]
+        .iter()
+        .chain(&right[1..right.len() - 1])
+        .map(|item| item.to_vec())
+        .collect::<Vec<_>>();
+    stack.dedup();
+    stack.push(left.last()?.to_vec());
+    Some(Witness::from_slice(&stack))
 }
 
 fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -5767,6 +5919,7 @@ fn rpc_help(method: &str) -> String {
         "decoderawtransaction",
         "createrawtransaction",
         "decodescript",
+        "combinerawtransaction",
         "createpsbt",
         "decodepsbt",
         "converttopsbt",
@@ -6737,6 +6890,57 @@ mod tests {
         assert_eq!(
             decoded["addresses"][0],
             "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
+        );
+    }
+
+    #[test]
+    fn combine_raw_transaction_merges_partial_inputs() {
+        let previous_a = OutPoint::new(Txid::from_byte_array([8; 32]), 0);
+        let previous_b = OutPoint::new(Txid::from_byte_array([9; 32]), 1);
+        let output = TxOut {
+            value: bitcoin::Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        let mut first = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: previous_a,
+                    script_sig: ScriptBuf::from_bytes(vec![0x51]),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                },
+                TxIn {
+                    previous_output: previous_b,
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                },
+            ],
+            output: vec![output.clone()],
+        };
+        let mut second = first.clone();
+        second.input[0].script_sig = ScriptBuf::new();
+        second.input[1].script_sig = ScriptBuf::from_bytes(vec![0x52]);
+        let combined = combine_raw_transaction(&json!([[
+            hex::encode(serialize(&first)),
+            hex::encode(serialize(&second)),
+        ]]))
+        .unwrap();
+        let combined: Transaction =
+            deserialize(&hex::decode(combined.as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(combined.input[0].script_sig, first.input[0].script_sig);
+        assert_eq!(combined.input[1].script_sig, second.input[1].script_sig);
+        assert_eq!(combined.output, vec![output]);
+
+        first.output[0].value = bitcoin::Amount::from_sat(999);
+        assert!(
+            combine_raw_transaction(&json!([[
+                hex::encode(serialize(&first)),
+                hex::encode(serialize(&second)),
+            ]]))
+            .is_err()
         );
     }
 

@@ -234,6 +234,7 @@ async fn serve_peer_loop(
     let mut verack_received = false;
     let mut verack_sent = false;
     let mut extensions_sent = false;
+    let mut addrv2_received = false;
     let mut compact_block_version = 2u64;
     let mut pending_compact = None;
     loop {
@@ -271,6 +272,9 @@ async fn serve_peer_loop(
                 }
                 send_peer_extensions(writer, node.config.network, &mut extensions_sent).await?;
                 request_headers(node, writer).await?;
+            }
+            Message::SendAddrV2 => {
+                addrv2_received = true;
             }
             Message::Ping(nonce) => {
                 send_message(writer, node.config.network, &Message::Pong(nonce)).await?;
@@ -547,6 +551,7 @@ async fn serve_peer_loop(
                 }
             }
             Message::Addr(_)
+            | Message::AddrV2(_)
             | Message::SendHeaders
             | Message::WtxidRelay
             | Message::FeeFilter(_)
@@ -561,18 +566,29 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetAddr => {
-                let addresses = node
+                let peer_infos = node
                     .peer_infos()
                     .into_iter()
                     .take(1_000)
-                    .map(|peer| wire::NetworkAddress {
-                        time: u32::try_from(peer.connected_at).unwrap_or(u32::MAX),
-                        services: wire::NODE_NETWORK | wire::NODE_WITNESS,
-                        address: socket_address_bytes(peer.address),
-                        port: peer.address.port(),
-                    })
                     .collect::<Vec<_>>();
-                send_message(writer, node.config.network, &Message::Addr(addresses)).await?;
+                if addrv2_received {
+                    let addresses = peer_infos
+                        .into_iter()
+                        .map(|peer| network_address_v2(peer.address, peer.connected_at))
+                        .collect::<Vec<_>>();
+                    send_message(writer, node.config.network, &Message::AddrV2(addresses)).await?;
+                } else {
+                    let addresses = peer_infos
+                        .into_iter()
+                        .map(|peer| wire::NetworkAddress {
+                            time: u32::try_from(peer.connected_at).unwrap_or(u32::MAX),
+                            services: wire::NODE_NETWORK | wire::NODE_WITNESS,
+                            address: socket_address_bytes(peer.address),
+                            port: peer.address.port(),
+                        })
+                        .collect::<Vec<_>>();
+                    send_message(writer, node.config.network, &Message::Addr(addresses)).await?;
+                }
             }
             Message::Mempool => {
                 let inventory = {
@@ -740,6 +756,21 @@ fn socket_address_bytes(address: std::net::SocketAddr) -> [u8; 16] {
     }
 }
 
+fn network_address_v2(address: std::net::SocketAddr, connected_at: u64) -> wire::NetworkAddressV2 {
+    let port = address.port();
+    let (network, address) = match address.ip() {
+        std::net::IpAddr::V4(ip) => (1, ip.octets().to_vec()),
+        std::net::IpAddr::V6(ip) => (2, ip.octets().to_vec()),
+    };
+    wire::NetworkAddressV2 {
+        time: u32::try_from(connected_at).unwrap_or(u32::MAX),
+        services: wire::NODE_NETWORK | wire::NODE_WITNESS,
+        network,
+        address,
+        port,
+    }
+}
+
 async fn send_peer_extensions(
     writer: &PeerWriter,
     network: Network,
@@ -749,6 +780,7 @@ async fn send_peer_extensions(
         return Ok(());
     }
     send_message(writer, network, &Message::SendHeaders).await?;
+    send_message(writer, network, &Message::SendAddrV2).await?;
     send_message(writer, network, &Message::WtxidRelay).await?;
     send_message(
         writer,

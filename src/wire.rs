@@ -75,6 +75,15 @@ pub struct NetworkAddress {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkAddressV2 {
+    pub time: u32,
+    pub services: u64,
+    pub network: u8,
+    pub address: Vec<u8>,
+    pub port: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionMessage {
     pub version: i32,
     pub services: u64,
@@ -125,7 +134,9 @@ pub enum Message {
     Version(VersionMessage),
     Verack,
     Addr(Vec<NetworkAddress>),
+    AddrV2(Vec<NetworkAddressV2>),
     GetAddr,
+    SendAddrV2,
     SendHeaders,
     WtxidRelay,
     Ping(u64),
@@ -153,7 +164,9 @@ impl Message {
             Self::Version(_) => "version",
             Self::Verack => "verack",
             Self::Addr(_) => "addr",
+            Self::AddrV2(_) => "addrv2",
             Self::GetAddr => "getaddr",
+            Self::SendAddrV2 => "sendaddrv2",
             Self::SendHeaders => "sendheaders",
             Self::WtxidRelay => "wtxidrelay",
             Self::Ping(_) => "ping",
@@ -289,6 +302,7 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
         Message::Version(version) => encode_version(version, &mut out)?,
         Message::Verack
         | Message::GetAddr
+        | Message::SendAddrV2
         | Message::SendHeaders
         | Message::WtxidRelay
         | Message::Mempool => {}
@@ -300,6 +314,23 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
             for entry in entries {
                 put_u32(entry.time, &mut out);
                 put_u64(entry.services, &mut out);
+                out.extend_from_slice(&entry.address);
+                out.extend_from_slice(&entry.port.to_be_bytes());
+            }
+        }
+        Message::AddrV2(entries) => {
+            if entries.len() > 1_000 {
+                return Err(WireError::Payload("too many address records".to_owned()).into());
+            }
+            put_compact_size(entries.len(), &mut out)?;
+            for entry in entries {
+                put_u32(entry.time, &mut out);
+                put_compact_size_u64(entry.services, &mut out);
+                out.push(entry.network);
+                if entry.address.len() > 512 {
+                    return Err(WireError::Payload("address record is too large".to_owned()).into());
+                }
+                put_compact_size(entry.address.len(), &mut out)?;
                 out.extend_from_slice(&entry.address);
                 out.extend_from_slice(&entry.port.to_be_bytes());
             }
@@ -350,10 +381,12 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
         "version" => Message::Version(decode_version(&mut reader)?),
         "verack" => Message::Verack,
         "getaddr" => Message::GetAddr,
+        "sendaddrv2" => Message::SendAddrV2,
         "sendheaders" => Message::SendHeaders,
         "wtxidrelay" => Message::WtxidRelay,
         "mempool" => Message::Mempool,
         "addr" => Message::Addr(decode_addr(&mut reader)?),
+        "addrv2" => Message::AddrV2(decode_addr_v2(&mut reader)?),
         "ping" => Message::Ping(reader.u64_le()?),
         "pong" => Message::Pong(reader.u64_le()?),
         "getheaders" => Message::GetHeaders(decode_getheaders(&mut reader)?),
@@ -502,6 +535,34 @@ fn decode_addr(reader: &mut Reader<'_>) -> Result<Vec<NetworkAddress>, WireError
     Ok(entries)
 }
 
+fn decode_addr_v2(reader: &mut Reader<'_>) -> Result<Vec<NetworkAddressV2>, WireError> {
+    let count = bounded_count(reader.compact_size()?)?;
+    if count > 1_000 {
+        return Err(WireError::Payload("too many address records".to_owned()));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let time = reader.u32_le()?;
+        let services = reader.compact_size()?;
+        let network = reader.u8()?;
+        let address_length = usize::try_from(reader.compact_size()?)
+            .map_err(|_| WireError::Payload("address length is out of range".to_owned()))?;
+        if address_length > 512 {
+            return Err(WireError::Payload("address record is too large".to_owned()));
+        }
+        let address = reader.bytes(address_length)?.to_vec();
+        let port = reader.u16_be()?;
+        entries.push(NetworkAddressV2 {
+            time,
+            services,
+            network,
+            address,
+            port,
+        });
+    }
+    Ok(entries)
+}
+
 fn decode_getheaders(reader: &mut Reader<'_>) -> Result<GetHeadersMessage, WireError> {
     let version = reader.i32_le()?;
     let count = bounded_count(reader.compact_size()?)?;
@@ -539,19 +600,23 @@ fn payload_error(error: bitcoin::consensus::encode::Error) -> WireError {
 }
 
 fn put_compact_size(value: usize, out: &mut Vec<u8>) -> Result<()> {
+    put_compact_size_u64(value as u64, out);
+    Ok(())
+}
+
+fn put_compact_size_u64(value: u64, out: &mut Vec<u8>) {
     if value < 0xfd {
         out.push(value as u8);
-    } else if value <= u16::MAX as usize {
+    } else if value <= u64::from(u16::MAX) {
         out.push(0xfd);
         out.extend_from_slice(&(value as u16).to_le_bytes());
-    } else if value <= u32::MAX as usize {
+    } else if value <= u64::from(u32::MAX) {
         out.push(0xfe);
         out.extend_from_slice(&(value as u32).to_le_bytes());
     } else {
         out.push(0xff);
-        out.extend_from_slice(&(value as u64).to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
     }
-    Ok(())
 }
 
 fn put_u32(value: u32, out: &mut Vec<u8>) {
@@ -687,9 +752,31 @@ mod tests {
     #[test]
     fn unknown_bounded_message_is_preserved() {
         let message = Message::Unknown {
-            command: "sendaddrv2".to_owned(),
+            command: "mystery".to_owned(),
             payload: Vec::new(),
         };
+        let frame = encode_message(Network::Regtest, &message).unwrap();
+        assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn addrv2_round_trip_uses_compact_services_and_network_ids() {
+        let message = Message::AddrV2(vec![
+            NetworkAddressV2 {
+                time: 123,
+                services: NODE_NETWORK | NODE_WITNESS,
+                network: 1,
+                address: vec![127, 0, 0, 1],
+                port: 8333,
+            },
+            NetworkAddressV2 {
+                time: 456,
+                services: NODE_NETWORK,
+                network: 2,
+                address: vec![0; 16],
+                port: 18333,
+            },
+        ]);
         let frame = encode_message(Network::Regtest, &message).unwrap();
         assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
     }

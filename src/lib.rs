@@ -354,8 +354,7 @@ impl Node {
 
     pub fn accept_transaction(&self, transaction: Transaction) -> Result<Txid> {
         let txid = self.try_accept_transaction(transaction.clone())?;
-        self.announce_mempool_transaction(txid);
-        self.promote_orphans_for_parent(&transaction);
+        self.notify_mempool_transaction(transaction);
         Ok(txid)
     }
 
@@ -373,8 +372,7 @@ impl Node {
     ) -> Result<Txid> {
         match self.try_accept_transaction(transaction.clone()) {
             Ok(txid) => {
-                self.announce_mempool_transaction(txid);
-                self.promote_orphans_for_parent(&transaction);
+                self.notify_mempool_transaction(transaction);
                 Ok(txid)
             }
             Err(error @ MempoolError::MissingInput(_)) => {
@@ -403,6 +401,13 @@ impl Node {
 
     fn announce_mempool_transaction(&self, txid: Txid) {
         let _ = self.mempool_events.send(txid);
+    }
+
+    pub(crate) fn notify_mempool_transaction(&self, transaction: Transaction) {
+        let txid = transaction.compute_txid();
+        self.orphans.lock().remove(&txid);
+        self.announce_mempool_transaction(txid);
+        self.promote_orphans_for_parent(&transaction);
     }
 
     fn promote_orphans_for_parent(&self, parent: &Transaction) {

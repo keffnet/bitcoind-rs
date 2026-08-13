@@ -5767,10 +5767,14 @@ fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> {
             }
         }
     }
-    let accepted = ordered.iter().map(|(txid, _)| *txid).collect::<Vec<_>>();
+    let accepted = ordered
+        .iter()
+        .map(|(txid, transaction)| (*txid, transaction.clone()))
+        .collect::<Vec<_>>();
+    drop(chain);
     *node.mempool.write() = candidate;
-    for txid in accepted {
-        let _ = node.mempool_events.send(txid);
+    for (_, transaction) in accepted {
+        node.notify_mempool_transaction(transaction);
     }
     Ok(json!({
         "package_msg": "success",

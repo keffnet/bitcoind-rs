@@ -1062,6 +1062,10 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "subversion": "/bitcoind-rs:0.1.0/",
             "protocolversion": 70016,
             "localservices": "0000000000000049",
+            "localservicesnames": peer_services_names(
+                wire::NODE_NETWORK | wire::NODE_WITNESS | wire::NODE_COMPACT_FILTERS,
+            ),
+            "timeoffset": 0,
             "localrelay": true,
             "connections": node.peer_count(),
             "connections_in": node.peer_infos().iter().filter(|peer| peer.inbound).count(),
@@ -1074,6 +1078,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "proxy": "",
                 "proxy_randomize_credentials": false,
             }],
+            "localaddresses": [],
             "relayfee": 0.00001000,
             "incrementalfee": 0.00001000,
         })),

@@ -870,6 +870,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "prioritisetransaction" => prioritise_transaction(node, params),
         "getprioritisedtransactions" => get_prioritised_transactions(node),
         "generatetoaddress" => generate_to_address(node, params),
+        "generatetodescriptor" => generate_to_descriptor(node, params),
         "generateblock" => generate_block(node, params),
         "testmempoolaccept" => test_mempool_accept(node, params),
         "verifychain" => {
@@ -969,6 +970,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             }))
         }
         "scantxoutset" => scan_txout_set(node, params),
+        "scanblocks" => scan_blocks(node, params),
+        "getdescriptoractivity" => get_descriptor_activity(node, params),
+        "getchainstates" => get_chain_states(node),
         "getchaintips" => {
             let chain = node.chain.read();
             Ok(json!(
@@ -2407,9 +2411,37 @@ fn generate_to_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("maxtries must not be negative");
     }
     let max_tries = u64::try_from(max_tries).map_err(|_| anyhow!("maxtries is out of range"))?;
+    generate_blocks_to_script(node, address.script_pubkey(), count, max_tries)
+}
+
+fn generate_to_descriptor(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let count = param::<i64>(params, 0)?;
+    if count < 0 {
+        bail!("nblocks must not be negative");
+    }
+    let descriptor = param::<String>(params, 1)?;
+    let script = scan_descriptor_script(node, &descriptor)?;
+    let max_tries = params
+        .get(2)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_i64)
+        .unwrap_or(1_000_000);
+    if max_tries < 0 {
+        bail!("maxtries must not be negative");
+    }
+    let max_tries = u64::try_from(max_tries).map_err(|_| anyhow!("maxtries is out of range"))?;
+    generate_blocks_to_script(node, script, count, max_tries)
+}
+
+fn generate_blocks_to_script(
+    node: &Arc<Node>,
+    script_pubkey: ScriptBuf,
+    count: i64,
+    max_tries: u64,
+) -> Result<Value> {
     let mut hashes = Vec::with_capacity(usize::try_from(count).unwrap_or_default());
     for _ in 0..count {
-        let block = build_mining_block(node, address.script_pubkey())?;
+        let block = build_mining_block(node, script_pubkey.clone())?;
         let Some(block) = mine_block(block, max_tries) else {
             break;
         };
@@ -3101,6 +3133,250 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
 }
 
+fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let action = param::<String>(params, 0)?;
+    match action.as_str() {
+        "status" => Ok(Value::Null),
+        "abort" => Ok(Value::Bool(false)),
+        "start" => {
+            let scan_objects = params
+                .get(1)
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("scanblocks start expects descriptors"))?;
+            let scripts = scan_object_scripts(node, scan_objects)?;
+            if scripts.is_empty() {
+                bail!("scanblocks requires at least one descriptor")
+            }
+            let chain_height = node.chain.read().height();
+            let start_height = params
+                .get(2)
+                .filter(|value| !value.is_null())
+                .and_then(Value::as_u64)
+                .map(|height| {
+                    u32::try_from(height).map_err(|_| anyhow!("start_height is too large"))
+                })
+                .transpose()?
+                .unwrap_or(0);
+            let stop_height = params
+                .get(3)
+                .filter(|value| !value.is_null())
+                .and_then(Value::as_u64)
+                .map(|height| {
+                    u32::try_from(height).map_err(|_| anyhow!("stop_height is too large"))
+                })
+                .transpose()?
+                .unwrap_or(chain_height);
+            let filter_type = params.get(4).and_then(Value::as_str).unwrap_or("basic");
+            if filter_type != "basic" {
+                bail!("only the basic block filter is available")
+            }
+            if start_height > stop_height || stop_height > chain_height {
+                bail!("invalid scan height range")
+            }
+            let mut chain = node.chain.write();
+            let stop_hash = chain
+                .block_hash(stop_height)
+                .ok_or_else(|| anyhow!("stop_height is out of range"))?;
+            let filters = chain
+                .basic_filter_chain(&stop_hash)?
+                .ok_or_else(|| anyhow!("block filters are not available"))?;
+            let mut relevant_blocks = Vec::new();
+            for height in start_height..=stop_height {
+                let hash = chain
+                    .block_hash(height)
+                    .ok_or_else(|| anyhow!("scan height is out of range"))?;
+                let (_, filter, _) = filters
+                    .get(height as usize)
+                    .ok_or_else(|| anyhow!("block filter is missing"))?;
+                if filter.match_any(&hash, scripts.iter().map(|script| script.as_bytes()))? {
+                    relevant_blocks.push(hash.to_string());
+                }
+            }
+            Ok(json!({
+                "from_height": start_height,
+                "to_height": stop_height,
+                "relevant_blocks": relevant_blocks,
+                "completed": true,
+            }))
+        }
+        _ => bail!("scanblocks action must be start, status, or abort"),
+    }
+}
+
+fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let requested_hashes = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("getdescriptoractivity expects block hashes"))?;
+    let scan_objects = params
+        .get(1)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("getdescriptoractivity expects descriptors"))?;
+    let scripts = scan_object_scripts(node, scan_objects)?;
+    let include_mempool = params.get(2).and_then(Value::as_bool).unwrap_or(true);
+    let mut chain = node.chain.write();
+    let mut blocks = requested_hashes
+        .iter()
+        .map(|value| {
+            let hash: BlockHash = value
+                .as_str()
+                .ok_or_else(|| anyhow!("block hash must be a string"))?
+                .parse()?;
+            if !chain.is_active_block(&hash) {
+                bail!("block is not in the active chain")
+            }
+            let height = chain
+                .block_height_by_hash(&hash)
+                .ok_or_else(|| anyhow!("block not found"))?;
+            let block = chain
+                .block(&hash)?
+                .ok_or_else(|| anyhow!("block not found"))?;
+            Ok((height, hash, block))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    blocks.sort_by_key(|(height, _, _)| *height);
+
+    let mut activity = Vec::new();
+    for (height, hash, block) in blocks {
+        for transaction in &block.txdata {
+            let txid = transaction.compute_txid();
+            for (vout, output) in transaction.output.iter().enumerate() {
+                if scripts.iter().any(|script| script == &output.script_pubkey) {
+                    activity.push(json!({
+                        "type": "receive",
+                        "amount": sat_to_btc(output.value.to_sat()),
+                        "blockhash": hash.to_string(),
+                        "height": height,
+                        "txid": txid.to_string(),
+                        "vout": vout,
+                        "output_spk": script_json(&output.script_pubkey),
+                    }));
+                }
+            }
+            for (vin, input) in transaction.input.iter().enumerate() {
+                if input.previous_output.is_null() {
+                    continue;
+                }
+                let Some((previous, _)) = chain.transaction(&input.previous_output.txid)? else {
+                    continue;
+                };
+                let Some(output) = previous.output.get(input.previous_output.vout as usize) else {
+                    continue;
+                };
+                if scripts.iter().any(|script| script == &output.script_pubkey) {
+                    activity.push(json!({
+                        "type": "spend",
+                        "amount": sat_to_btc(output.value.to_sat()),
+                        "blockhash": hash.to_string(),
+                        "height": height,
+                        "spend_txid": txid.to_string(),
+                        "spend_vin": vin,
+                        "prevout_txid": input.previous_output.txid.to_string(),
+                        "prevout_vout": input.previous_output.vout,
+                        "prevout_spk": script_json(&output.script_pubkey),
+                    }));
+                }
+            }
+        }
+    }
+
+    if include_mempool {
+        let mempool = node.mempool.read();
+        for txid in mempool.transaction_order() {
+            let Some(entry) = mempool.get(&txid) else {
+                continue;
+            };
+            for (vout, output) in entry.transaction.output.iter().enumerate() {
+                if scripts.iter().any(|script| script == &output.script_pubkey) {
+                    activity.push(json!({
+                        "type": "receive",
+                        "amount": sat_to_btc(output.value.to_sat()),
+                        "spend_txid": Value::Null,
+                        "txid": txid.to_string(),
+                        "vout": vout,
+                        "output_spk": script_json(&output.script_pubkey),
+                    }));
+                }
+            }
+            for (vin, input) in entry.transaction.input.iter().enumerate() {
+                let Some(output) = output_for_outpoint(&chain, &mempool, input.previous_output)
+                else {
+                    continue;
+                };
+                if scripts.iter().any(|script| script == &output.script_pubkey) {
+                    activity.push(json!({
+                        "type": "spend",
+                        "amount": sat_to_btc(output.value.to_sat()),
+                        "spend_txid": txid.to_string(),
+                        "spend_vin": vin,
+                        "prevout_txid": input.previous_output.txid.to_string(),
+                        "prevout_vout": input.previous_output.vout,
+                        "prevout_spk": script_json(&output.script_pubkey),
+                    }));
+                }
+            }
+        }
+    }
+    Ok(json!({"activity": activity}))
+}
+
+fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
+    let chain = node.chain.read();
+    let tip = chain.tip();
+    let header_tip = chain.best_header_tip();
+    let header = chain
+        .header(tip.height)
+        .ok_or_else(|| anyhow!("active tip header is unavailable"))?;
+    Ok(json!({
+        "headers": header_tip.height,
+        "chainstates": [{
+            "blocks": tip.height,
+            "bestblockhash": tip.hash.to_string(),
+            "bits": format!("{:08x}", header.bits.to_consensus()),
+            "target": format!("{:064x}", header.target()),
+            "difficulty": header.difficulty_float(),
+            "verificationprogress": 1.0,
+            "coins_db_cache_bytes": 0,
+            "coins_tip_cache_bytes": chain.utxo_bogo_size(),
+            "validated": true,
+        }],
+    }))
+}
+
+fn scan_object_scripts(node: &Arc<Node>, objects: &[Value]) -> Result<Vec<ScriptBuf>> {
+    objects
+        .iter()
+        .map(|object| {
+            let descriptor = if let Some(descriptor) = object.as_str() {
+                descriptor.to_owned()
+            } else {
+                object
+                    .get("desc")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("scan descriptor object requires desc"))?
+                    .to_owned()
+            };
+            scan_descriptor_script(node, &descriptor)
+        })
+        .collect()
+}
+
+fn output_for_outpoint(
+    chain: &chain::ChainState,
+    mempool: &Mempool,
+    outpoint: OutPoint,
+) -> Option<TxOut> {
+    chain
+        .utxo(&outpoint)
+        .map(|entry| entry.output.clone())
+        .or_else(|| {
+            mempool
+                .get(&outpoint.txid)
+                .and_then(|entry| entry.transaction.output.get(outpoint.vout as usize))
+                .cloned()
+        })
+}
+
 fn scan_descriptor_script(node: &Arc<Node>, descriptor: &str) -> Result<ScriptBuf> {
     if let Some(address) = descriptor
         .strip_prefix("addr(")
@@ -3310,6 +3586,7 @@ fn rpc_help(method: &str) -> String {
         "prioritisetransaction",
         "getprioritisedtransactions",
         "generatetoaddress",
+        "generatetodescriptor",
         "generateblock",
         "testmempoolaccept",
         "verifychain",
@@ -3323,6 +3600,9 @@ fn rpc_help(method: &str) -> String {
         "savemempool",
         "gettxoutsetinfo",
         "scantxoutset",
+        "scanblocks",
+        "getdescriptoractivity",
+        "getchainstates",
         "getchaintips",
         "getnetworkinfo",
         "getpeerinfo",
@@ -3902,5 +4182,42 @@ mod tests {
         );
         dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap();
         assert!(node.network_active());
+    }
+
+    #[test]
+    fn scanblocks_and_descriptor_activity_find_mined_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
+        let hash = generate_to_descriptor(&node, &json!([1, format!("addr({address})")])).unwrap()
+            [0]
+        .as_str()
+        .unwrap()
+        .to_owned();
+        let descriptor = format!("addr({address})");
+        let scan = scan_blocks(
+            &node,
+            &json!(["start", [descriptor.clone()], 0, 1, "basic"]),
+        )
+        .unwrap();
+        assert_eq!(scan["relevant_blocks"][0], hash);
+        let activity =
+            get_descriptor_activity(&node, &json!([[hash], [descriptor], false])).unwrap();
+        assert_eq!(activity["activity"][0]["type"], "receive");
+        assert_eq!(
+            get_chain_states(&node).unwrap()["chainstates"][0]["blocks"],
+            1
+        );
     }
 }

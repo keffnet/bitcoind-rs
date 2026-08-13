@@ -11,11 +11,12 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::Hash;
-use bitcoin::{Block, BlockHash};
+use bitcoin::{Block, BlockHash, TxOut};
 
 const MAX_STORED_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
 
@@ -30,6 +31,9 @@ pub struct BlockStore {
     file: File,
     index_file: File,
     index: HashMap<BlockHash, Record>,
+    undo_file: File,
+    undo_index_file: File,
+    undo_index: HashMap<BlockHash, Record>,
 }
 
 impl BlockStore {
@@ -62,11 +66,39 @@ impl BlockStore {
                 index
             }
         };
+        let undo_path = directory.join("undo.dat");
+        let mut undo_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&undo_path)
+            .with_context(|| format!("opening undo store {}", undo_path.display()))?;
+        let undo_index_path = directory.join("undo.index");
+        let mut undo_index_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&undo_index_path)
+            .with_context(|| format!("opening undo index {}", undo_index_path.display()))?;
+        let undo_data_len = undo_file.metadata()?.len();
+        let undo_index = match load_index(&mut undo_index_file, undo_data_len)? {
+            Some(index) => index,
+            None => {
+                let index = scan_undo_index(&mut undo_file)
+                    .with_context(|| format!("scanning {}", undo_path.display()))?;
+                rewrite_index(&mut undo_index_file, undo_data_len, &index)?;
+                index
+            }
+        };
         Ok(Self {
             path,
             file,
             index_file,
             index,
+            undo_file,
+            undo_index_file,
+            undo_index,
         })
     }
 
@@ -128,6 +160,49 @@ impl BlockStore {
             bail!("stored block hash does not match block index");
         }
         Ok(Some(block))
+    }
+
+    pub fn get_undo(&mut self, hash: &BlockHash) -> Result<Option<Vec<Vec<TxOut>>>> {
+        let Some(record) = self.undo_index.get(hash).copied() else {
+            return Ok(None);
+        };
+        self.undo_file.seek(SeekFrom::Start(record.offset))?;
+        let mut length = [0u8; 4];
+        self.undo_file.read_exact(&mut length)?;
+        let actual = u32::from_le_bytes(length);
+        if actual != record.length {
+            bail!("undo store index disagrees with record length");
+        }
+        let mut bytes = vec![0u8; record.length as usize];
+        self.undo_file.read_exact(&mut bytes)?;
+        let (stored_hash, undo) = decode_undo_record(&bytes)?;
+        if stored_hash != *hash {
+            bail!("stored block undo hash does not match undo index");
+        }
+        Ok(Some(undo))
+    }
+
+    pub fn insert_undo(&mut self, hash: BlockHash, undo: &[Vec<TxOut>]) -> Result<()> {
+        if self.undo_index.contains_key(&hash) {
+            return Ok(());
+        }
+        let bytes = encode_undo_record(hash, undo)?;
+        if bytes.len() > MAX_STORED_UNDO_SIZE {
+            bail!("block undo is too large: {} bytes", bytes.len());
+        }
+        let offset = self.undo_file.seek(SeekFrom::End(0))?;
+        let length = u32::try_from(bytes.len()).context("undo length does not fit u32")?;
+        self.undo_file.write_all(&length.to_le_bytes())?;
+        self.undo_file.write_all(&bytes)?;
+        self.undo_file.sync_data()?;
+        persist_index_entry(
+            &mut self.undo_index_file,
+            offset + 4 + bytes.len() as u64,
+            hash,
+            Record { offset, length },
+        )?;
+        self.undo_index.insert(hash, Record { offset, length });
+        Ok(())
     }
 
     pub fn hashes(&self) -> impl Iterator<Item = &BlockHash> {
@@ -248,6 +323,91 @@ fn scan_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
     Ok(index)
 }
 
+fn scan_undo_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut index = HashMap::new();
+    let mut max_end = 0u64;
+    loop {
+        let offset = file.stream_position()?;
+        let mut length_bytes = [0u8; 4];
+        match file.read_exact(&mut length_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                if offset == file.metadata()?.len() {
+                    break;
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let length = u32::from_le_bytes(length_bytes);
+        if length == 0 || length as usize > MAX_STORED_UNDO_SIZE {
+            bail!("invalid undo record length {} at offset {}", length, offset);
+        }
+        let mut bytes = vec![0u8; length as usize];
+        file.read_exact(&mut bytes).map_err(|error| {
+            anyhow::anyhow!("truncated undo record at offset {}: {}", offset, error)
+        })?;
+        let (hash, _) = decode_undo_record(&bytes)?;
+        if index.insert(hash, Record { offset, length }).is_some() {
+            bail!("duplicate block hash in undo store")
+        }
+        max_end = offset + 4 + u64::from(length);
+    }
+    if max_end != file.metadata()?.len() && max_end != 0 {
+        bail!("undo store contains trailing data")
+    }
+    Ok(index)
+}
+
+fn encode_undo_record(hash: BlockHash, undo: &[Vec<TxOut>]) -> Result<Vec<u8>> {
+    let mut bytes = serialize(&hash);
+    bytes.extend_from_slice(&serialize(&VarInt(undo.len() as u64)));
+    for outputs in undo {
+        bytes.extend_from_slice(&serialize(&VarInt(outputs.len() as u64)));
+        for output in outputs {
+            bytes.extend_from_slice(&serialize(output));
+        }
+    }
+    Ok(bytes)
+}
+
+fn decode_undo_record(bytes: &[u8]) -> Result<(BlockHash, Vec<Vec<TxOut>>)> {
+    let (hash, mut consumed) =
+        deserialize_partial::<BlockHash>(bytes).context("decoding stored block undo hash")?;
+    let (transaction_count, count_consumed) = deserialize_partial::<VarInt>(&bytes[consumed..])
+        .context("decoding stored block undo transaction count")?;
+    consumed = consumed.saturating_add(count_consumed);
+    let transaction_count = usize::try_from(transaction_count.0)
+        .context("stored block undo transaction count is too large")?;
+    if transaction_count > MAX_STORED_UNDO_SIZE {
+        bail!("stored block undo transaction count is unreasonable")
+    }
+    let mut undo = Vec::with_capacity(transaction_count);
+    for _ in 0..transaction_count {
+        let (output_count, count_consumed) = deserialize_partial::<VarInt>(&bytes[consumed..])
+            .context("decoding stored block undo output count")?;
+        consumed = consumed.saturating_add(count_consumed);
+        let output_count = usize::try_from(output_count.0)
+            .context("stored block undo output count is too large")?;
+        if output_count > MAX_STORED_UNDO_SIZE {
+            bail!("stored block undo output count is unreasonable")
+        }
+        let mut outputs = Vec::with_capacity(output_count);
+        for _ in 0..output_count {
+            let (output, output_consumed) = deserialize_partial::<TxOut>(&bytes[consumed..])
+                .context("decoding stored block undo output")?;
+            consumed = consumed.saturating_add(output_consumed);
+            outputs.push(output);
+        }
+        undo.push(outputs);
+    }
+    if consumed != bytes.len() {
+        bail!("stored block undo contains trailing data")
+    }
+    Ok((hash, undo))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +430,25 @@ mod tests {
         let mut reopened = BlockStore::open(directory.path()).unwrap();
         assert!(reopened.contains(&hash));
         assert_eq!(reopened.get(&hash).unwrap().unwrap(), block);
+    }
+
+    #[test]
+    fn persists_and_reopens_block_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let hash = BlockHash::from_byte_array([7; 32]);
+        let undo = vec![
+            Vec::new(),
+            vec![TxOut {
+                value: bitcoin::Amount::from_sat(42),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        ];
+        {
+            let mut store = BlockStore::open(directory.path()).unwrap();
+            store.insert_undo(hash, &undo).unwrap();
+            assert_eq!(store.get_undo(&hash).unwrap(), Some(undo.clone()));
+        }
+        let mut reopened = BlockStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get_undo(&hash).unwrap(), Some(undo));
     }
 }

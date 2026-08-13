@@ -1,6 +1,7 @@
 //! Wallet-free Bitcoin Core-style JSON-RPC over HTTP/1.1.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,7 @@ use rand::random;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::broadcast;
 use tracing::debug;
 
 use crate::Node;
@@ -87,7 +89,7 @@ async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()>
             (
                 "200 OK",
                 "application/json",
-                serde_json::to_vec(&dispatch_json_rpc(&node, &request.body))?,
+                serde_json::to_vec(&dispatch_json_rpc(&node, &request.body).await)?,
             )
         }
         None => (
@@ -470,7 +472,7 @@ fn rest_block_filter(
         })
         .ok_or_else(|| anyhow!("block filter not found"))?;
     match format {
-        "bin" | "hex" => rest_format_bytes(serialize(&content), format),
+        "bin" | "hex" => rest_format_bytes(content, format),
         "json" => rest_json(json!({"filter": hex::encode(content)})),
         _ => bail!("unsupported REST output format"),
     }
@@ -798,7 +800,7 @@ fn deserialize_get_utxos_request(bytes: &[u8]) -> Result<(bool, Vec<OutPoint>)> 
     Ok((check_mempool, outpoints))
 }
 
-fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {
+async fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {
     let request: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
@@ -809,26 +811,34 @@ fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {
         if batch.is_empty() {
             return json!({"result": null, "error": {"code": -32600, "message": "empty batch"}, "id": null});
         }
-        return Value::Array(
-            batch
-                .iter()
-                .map(|request| dispatch_request(node, request))
-                .collect(),
-        );
+        let mut responses = Vec::with_capacity(batch.len());
+        for request in batch {
+            responses.push(dispatch_request(node, request).await);
+        }
+        return Value::Array(responses);
     }
-    dispatch_request(node, &request)
+    dispatch_request(node, &request).await
 }
 
-fn dispatch_request(node: &Arc<Node>, request: &Value) -> Value {
+async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request
         .get("params")
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
-    match dispatch_method(node, method, &params) {
+    match dispatch_method_async(node, method, &params).await {
         Ok(result) => json!({"result": result, "error": null, "id": id}),
         Err(error) => json!({"result": null, "error": rpc_error(&error), "id": id}),
+    }
+}
+
+async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
+    match method {
+        "waitfornewblock" => wait_for_new_block(node, params).await,
+        "waitforblock" => wait_for_block(node, params).await,
+        "waitforblockheight" => wait_for_block_height(node, params).await,
+        _ => dispatch_method(node, method, params),
     }
 }
 
@@ -859,8 +869,10 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "gettxoutproof" => get_txout_proof(node, params),
         "verifytxoutproof" => verify_txout_proof(params),
         "submitheader" => submit_header(node, params),
+        "getblockfrompeer" => get_block_from_peer(node, params),
         "invalidateblock" => invalidate_block(node, params),
         "reconsiderblock" => reconsider_block(node, params),
+        "preciousblock" => precious_block(node, params),
         "getrawtransaction" => get_raw_transaction(node, params),
         "decoderawtransaction" => decode_raw_transaction(params),
         "sendrawtransaction" => send_raw_transaction(node, params),
@@ -969,6 +981,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "total_amount": sat_to_btc(total),
             }))
         }
+        "dumptxoutset" => dump_txoutset(node, params),
+        "loadtxoutset" => load_txoutset(node, params),
+        "pruneblockchain" => prune_blockchain(node, params),
         "scantxoutset" => scan_txout_set(node, params),
         "scanblocks" => scan_blocks(node, params),
         "getdescriptoractivity" => get_descriptor_activity(node, params),
@@ -1038,7 +1053,16 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         )),
         "getnettotals" => get_net_totals(node),
         "getnodeaddresses" => get_node_addresses(node, params),
-        "ping" => Ok(Value::Null),
+        "addnode" => add_node(node, params),
+        "disconnectnode" => disconnect_node(node, params),
+        "getaddednodeinfo" => get_added_node_info(node, params),
+        "setban" => set_ban(node, params),
+        "listbanned" => list_banned(node),
+        "clearbanned" => clear_banned(node),
+        "ping" => {
+            node.ping_peers();
+            Ok(Value::Null)
+        }
         "setnetworkactive" => {
             let active = param::<bool>(params, 0)?;
             node.set_network_active(active);
@@ -1095,7 +1119,7 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .unwrap_or(1_000)
         .min(1_000) as usize;
     Ok(json!(
-        node.peer_infos()
+        node.known_addresses()
             .into_iter()
             .take(count)
             .map(|peer| json!({
@@ -1107,6 +1131,153 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
             }))
             .collect::<Vec<_>>()
     ))
+}
+
+fn get_block_from_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    let peer_id = param::<u64>(params, 1)?;
+    let peer_id = usize::try_from(peer_id).map_err(|_| anyhow!("peer id is out of range"))?;
+    node.request_block_from_peer(peer_id, hash)?;
+    Ok(Value::Null)
+}
+
+fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let address = param::<String>(params, 0)?;
+    let address = parse_socket_address(&address)?;
+    let command = param::<String>(params, 1)?;
+    match command.as_str() {
+        "add" | "onetry" => {
+            node.add_node(address);
+            Ok(Value::Null)
+        }
+        "remove" => {
+            if node.remove_node(&address) {
+                Ok(Value::Null)
+            } else {
+                bail!("Node has not been added")
+            }
+        }
+        _ => bail!("addnode command must be add, remove, or onetry"),
+    }
+}
+
+fn disconnect_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let target = param::<String>(params, 0)?;
+    let disconnected = if let Ok(peer_id) = target.parse::<usize>() {
+        node.disconnect_peer(peer_id)
+    } else {
+        let address = parse_socket_address(&target)?;
+        node.disconnect_peer_at(address)
+    };
+    if !disconnected {
+        bail!("node is not connected")
+    }
+    Ok(Value::Null)
+}
+
+fn get_added_node_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let requested = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_str)
+        .map(parse_socket_address)
+        .transpose()?;
+    let peers = node.peer_infos();
+    let mut result = Vec::new();
+    for address in node.added_nodes() {
+        if requested.is_some_and(|requested| requested != address) {
+            continue;
+        }
+        let matching = peers.iter().find(|peer| peer.address == address);
+        result.push(json!({
+            "addednode": address.to_string(),
+            "connected": matching.is_some(),
+            "addresses": matching.into_iter().map(|peer| json!({
+                "address": peer.address.to_string(),
+                "connected": true,
+                "inbound": peer.inbound,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    Ok(Value::Array(result))
+}
+
+fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let command = param::<String>(params, 0)?;
+    let address = param::<String>(params, 1)?;
+    let address = parse_ip_address(&address)?;
+    match command.as_str() {
+        "add" => {
+            let requested_duration = params
+                .get(2)
+                .filter(|value| !value.is_null())
+                .and_then(Value::as_u64)
+                .unwrap_or(86_400);
+            let absolute = params.get(3).and_then(Value::as_bool).unwrap_or(false);
+            let now = unix_time();
+            let ban_until = if absolute {
+                requested_duration
+            } else {
+                now.saturating_add(requested_duration)
+            };
+            if ban_until <= now {
+                bail!("ban time must be in the future")
+            }
+            node.ban_address(address, ban_until, "manually banned".to_owned())?;
+            Ok(Value::Null)
+        }
+        "remove" => {
+            if node.unban_address(address)? {
+                Ok(Value::Null)
+            } else {
+                bail!("unban failed: address is not banned")
+            }
+        }
+        _ => bail!("setban command must be add or remove"),
+    }
+}
+
+fn list_banned(node: &Arc<Node>) -> Result<Value> {
+    Ok(json!(
+        node.banned_addresses()
+            .into_iter()
+            .map(|entry| json!({
+                "address": entry.address.to_string(),
+                "ban_created": entry.ban_created,
+                "banned_until": entry.ban_until,
+                "ban_reason": entry.reason,
+            }))
+            .collect::<Vec<_>>()
+    ))
+}
+
+fn clear_banned(node: &Arc<Node>) -> Result<Value> {
+    for entry in node.banned_addresses() {
+        node.unban_address(entry.address)?;
+    }
+    Ok(Value::Null)
+}
+
+fn parse_socket_address(value: &str) -> Result<SocketAddr> {
+    value
+        .parse()
+        .map_err(|error| anyhow!("invalid network address {value}: {error}"))
+}
+
+fn parse_ip_address(value: &str) -> Result<IpAddr> {
+    if value.contains('/') {
+        bail!("network ranges are not supported; use a single IP address")
+    }
+    value
+        .parse()
+        .map_err(|error| anyhow!("invalid IP address {value}: {error}"))
+}
+
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
@@ -1622,6 +1793,9 @@ fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
 fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
     let verbosity = params.get(1).and_then(Value::as_u64).unwrap_or(1);
+    if verbosity > 3 {
+        bail!("verbosity must be between 0 and 3")
+    }
     let mut chain = node.chain.write();
     let block = chain
         .block(&hash)?
@@ -1730,6 +1904,142 @@ fn reconsider_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
     node.reconsider_block(hash)?;
     Ok(Value::Null)
+}
+
+fn precious_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    node.chain.write().precious_block(&hash)?;
+    Ok(Value::Null)
+}
+
+fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let path = param::<String>(params, 0)?;
+    let dump_type = params.get(1).and_then(Value::as_str).unwrap_or("latest");
+    if dump_type != "latest" {
+        bail!("only the latest UTXO snapshot type is supported")
+    }
+    let path = std::path::PathBuf::from(path);
+    let chain = node.chain.read();
+    let (coins_written, base_hash, base_height) = chain.dump_utxo_set(&path)?;
+    Ok(json!({
+        "coins_written": coins_written,
+        "base_hash": base_hash.to_string(),
+        "base_height": base_height,
+        "path": path.to_string_lossy(),
+    }))
+}
+
+fn load_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let path = param::<String>(params, 0)?;
+    let path = std::path::PathBuf::from(path);
+    let (coins_loaded, tip_hash, base_height) = node.chain.write().load_utxo_set(&path)?;
+    Ok(json!({
+        "coins_loaded": coins_loaded,
+        "tip_hash": tip_hash.to_string(),
+        "base_height": base_height,
+    }))
+}
+
+fn prune_blockchain(_node: &Arc<Node>, _params: &Value) -> Result<Value> {
+    bail!("blockchain pruning is disabled for the append-only block store")
+}
+
+async fn wait_for_new_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let timeout = rpc_timeout(params, 0)?;
+    let mut events = node.subscribe_chain();
+    let start_height = node.chain.read().height();
+    loop {
+        let Some(tip) = receive_chain_event(&mut events, timeout).await? else {
+            return current_tip_json(node);
+        };
+        if tip.height > start_height {
+            return Ok(json!({"hash": tip.hash.to_string(), "height": tip.height}));
+        }
+    }
+}
+
+async fn wait_for_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    let timeout = rpc_timeout(params, 1)?;
+    let mut events = node.subscribe_chain();
+    loop {
+        {
+            let chain = node.chain.read();
+            if chain.is_active_block(&hash) {
+                let height = chain
+                    .block_height_by_hash(&hash)
+                    .ok_or_else(|| anyhow!("block height is unavailable"))?;
+                return Ok(json!({"hash": hash.to_string(), "height": height}));
+            }
+        }
+        if receive_chain_event(&mut events, timeout).await?.is_none() {
+            return current_tip_json(node);
+        }
+    }
+}
+
+async fn wait_for_block_height(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let height = param::<u64>(params, 0)?;
+    let height = u32::try_from(height).map_err(|_| anyhow!("height is out of range"))?;
+    let timeout = rpc_timeout(params, 1)?;
+    let mut events = node.subscribe_chain();
+    loop {
+        {
+            let chain = node.chain.read();
+            if chain.height() >= height {
+                let hash = chain
+                    .block_hash(height)
+                    .ok_or_else(|| anyhow!("block height is unavailable"))?;
+                return Ok(json!({"hash": hash.to_string(), "height": height}));
+            }
+        }
+        if receive_chain_event(&mut events, timeout).await?.is_none() {
+            return current_tip_json(node);
+        }
+    }
+}
+
+fn rpc_timeout(params: &Value, index: usize) -> Result<Option<tokio::time::Instant>> {
+    let timeout = params
+        .get(index)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("timeout must be a non-negative integer"))
+        })
+        .transpose()?;
+    Ok(timeout.map(|milliseconds| {
+        tokio::time::Instant::now() + std::time::Duration::from_millis(milliseconds)
+    }))
+}
+
+async fn receive_chain_event(
+    events: &mut broadcast::Receiver<chain::ChainTip>,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Option<chain::ChainTip>> {
+    loop {
+        let received = if let Some(deadline) = deadline {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(received) => received,
+                Err(_) => return Ok(None),
+            }
+        } else {
+            events.recv().await
+        };
+        match received {
+            Ok(tip) => return Ok(Some(tip)),
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => {
+                bail!("chain event stream is closed")
+            }
+        }
+    }
+}
+
+fn current_tip_json(node: &Arc<Node>) -> Result<Value> {
+    let tip = node.chain.read().tip();
+    Ok(json!({"hash": tip.hash.to_string(), "height": tip.height}))
 }
 
 fn get_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -2485,6 +2795,7 @@ fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let Some(block) = mine_block(block, 1_000_000) else {
         bail!("failed to make block")
     };
+    node.chain.read().validate_candidate_block(&block)?;
     let hash = block.block_hash();
     let serialized = (!submit).then(|| hex::encode(serialize(&block)));
     if submit {
@@ -2774,7 +3085,6 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
             let transaction = &entry.transaction;
             let wtxid = transaction.compute_wtxid();
             fees = fees.saturating_add(entry.fee_sat);
-            weight = weight.saturating_add(transaction.weight().to_wu());
             let depends = transaction
                 .input
                 .iter()
@@ -3575,8 +3885,10 @@ fn rpc_help(method: &str) -> String {
         "gettxoutproof",
         "verifytxoutproof",
         "submitheader",
+        "getblockfrompeer",
         "invalidateblock",
         "reconsiderblock",
+        "preciousblock",
         "getrawtransaction",
         "decoderawtransaction",
         "sendrawtransaction",
@@ -3599,6 +3911,12 @@ fn rpc_help(method: &str) -> String {
         "getmempooldescendants",
         "savemempool",
         "gettxoutsetinfo",
+        "dumptxoutset",
+        "loadtxoutset",
+        "pruneblockchain",
+        "waitfornewblock",
+        "waitforblock",
+        "waitforblockheight",
         "scantxoutset",
         "scanblocks",
         "getdescriptoractivity",
@@ -3608,6 +3926,12 @@ fn rpc_help(method: &str) -> String {
         "getpeerinfo",
         "getnettotals",
         "getnodeaddresses",
+        "addnode",
+        "disconnectnode",
+        "getaddednodeinfo",
+        "setban",
+        "listbanned",
+        "clearbanned",
         "ping",
         "setnetworkactive",
         "getrpcinfo",
@@ -4182,6 +4506,59 @@ mod tests {
         );
         dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap();
         assert!(node.network_active());
+    }
+
+    #[test]
+    fn network_control_rpcs_manage_added_nodes_and_bans() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        add_node(&node, &json!(["127.0.0.1:18444", "add"])).unwrap();
+        let added = get_added_node_info(&node, &json!([false])).unwrap();
+        assert_eq!(added[0]["addednode"], "127.0.0.1:18444");
+        set_ban(&node, &json!(["add", "192.0.2.1", 60])).unwrap();
+        assert_eq!(list_banned(&node).unwrap().as_array().unwrap().len(), 1);
+        clear_banned(&node).unwrap();
+        assert_eq!(list_banned(&node).unwrap(), json!([]));
+        add_node(&node, &json!(["127.0.0.1:18444", "remove"])).unwrap();
+        assert_eq!(
+            get_added_node_info(&node, &json!([false])).unwrap(),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn utxo_snapshot_rpcs_round_trip_the_active_chainstate() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let path = directory.path().join("utxos.snapshot");
+        let dumped = dump_txoutset(&node, &json!([path.to_string_lossy()])).unwrap();
+        assert_eq!(dumped["base_height"], 0);
+        assert_eq!(dumped["coins_written"], 0);
+        let loaded = load_txoutset(&node, &json!([path.to_string_lossy()])).unwrap();
+        assert_eq!(loaded["base_height"], 0);
+        assert_eq!(loaded["coins_loaded"], 0);
     }
 
     #[test]

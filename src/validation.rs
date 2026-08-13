@@ -243,7 +243,7 @@ pub fn script_flags_for_block(network: Network, height: u32, block_time: u32) ->
         flags |= bitcoinconsensus::VERIFY_NULLDUMMY | bitcoinconsensus::VERIFY_WITNESS;
     }
     let taproot_active = match network {
-        Network::Bitcoin => height > 709_632,
+        Network::Bitcoin => height >= 709_632,
         Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => true,
     };
     if taproot_active {

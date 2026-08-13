@@ -20,6 +20,7 @@ use crate::validation::{self, ValidationError};
 const COINBASE_MATURITY: u32 = 100;
 const DIFFICULTY_INTERVAL: u32 = 2016;
 const SNAPSHOT_INTERVAL: u32 = 1_000;
+const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
@@ -381,6 +382,21 @@ impl ChainState {
         Ok(self.tip())
     }
 
+    pub fn precious_block(&mut self, hash: &BlockHash) -> Result<ChainTip> {
+        let node = self
+            .block_index
+            .get(hash)
+            .copied()
+            .with_context(|| format!("block {hash} not found"))?;
+        if self.has_invalid_ancestor(*hash) {
+            bail!("cannot prefer an invalidated chain")
+        }
+        if node.chain_work >= self.tip().work && *hash != self.best_hash() {
+            self.activate_chain(*hash)?;
+        }
+        Ok(self.tip())
+    }
+
     pub fn header(&self, height: u32) -> Option<&bitcoin::block::Header> {
         self.headers.get(height as usize)
     }
@@ -602,6 +618,10 @@ impl ChainState {
         if let Some(undo) = self.block_undo_cache.get(hash) {
             return Ok(Some(undo.clone()));
         }
+        if let Some(undo) = self.store.get_undo(hash)? {
+            self.remember_block_undo(*hash, undo.clone());
+            return Ok(Some(undo));
+        }
         let Some(block) = self.store.get(hash)? else {
             return Ok(None);
         };
@@ -610,7 +630,7 @@ impl ChainState {
         };
         let mut undo = vec![Vec::new()];
         if node.height == 0 {
-            self.block_undo_cache.insert(*hash, undo.clone());
+            self.remember_block_undo(*hash, undo.clone());
             return Ok(Some(undo));
         }
         let mut outputs = self
@@ -638,7 +658,7 @@ impl ChainState {
                 );
             }
         }
-        self.block_undo_cache.insert(*hash, undo.clone());
+        self.remember_block_undo(*hash, undo.clone());
         Ok(Some(undo))
     }
 
@@ -883,6 +903,43 @@ impl ChainState {
         bitcoin::hashes::sha256d::Hash::from_engine(engine).to_string()
     }
 
+    pub fn dump_utxo_set(&self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {
+        let snapshot = self.current_snapshot();
+        let bytes = serde_json::to_vec(&snapshot)?;
+        fs::write(path.as_ref(), bytes)
+            .with_context(|| format!("writing UTXO snapshot {}", path.as_ref().display()))?;
+        Ok((self.utxos.len() as u64, self.best_hash(), self.height()))
+    }
+
+    pub fn load_utxo_set(&mut self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {
+        let bytes = fs::read(path.as_ref())
+            .with_context(|| format!("reading UTXO snapshot {}", path.as_ref().display()))?;
+        let snapshot: ChainSnapshot = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decoding UTXO snapshot {}", path.as_ref().display()))?;
+        if snapshot.tip != self.best_hash().to_string()
+            || snapshot.headers.len() != self.headers.len()
+            || snapshot
+                .headers
+                .iter()
+                .zip(&self.headers)
+                .any(|(snapshot, current)| snapshot.block_hash() != current.block_hash())
+        {
+            bail!("UTXO snapshot does not match the active chain")
+        }
+        self.utxos = snapshot.utxos;
+        self.rebuild_utxo_index();
+        self.tx_index = snapshot.tx_index;
+        self.tx_index_all = if snapshot.tx_index_all.is_empty() {
+            self.tx_index.clone()
+        } else {
+            snapshot.tx_index_all
+        };
+        self.history = snapshot.history;
+        self.block_undo_cache.clear();
+        self.persist_snapshot()?;
+        Ok((self.utxos.len() as u64, self.best_hash(), self.height()))
+    }
+
     pub fn verify_active_chain(&mut self, depth: u32) -> Result<()> {
         let _requested_depth = depth;
         self.replay_utxos_for_block(self.best_hash(), false)?
@@ -991,6 +1048,20 @@ impl ChainState {
         if self.has_invalid_ancestor(parent_hash) {
             bail!("block {hash} is on an invalidated branch")
         }
+        // Headers can arrive before full block bodies. Keep a child pending
+        // until its parent UTXO state is available so an unvalidated body
+        // cannot influence chain selection.
+        if !self.store.contains(&parent_hash) {
+            self.store.insert(&block)?;
+            let pending = self.orphans.entry(parent_hash).or_default();
+            if !pending
+                .iter()
+                .any(|candidate| candidate.block_hash() == hash)
+            {
+                pending.push(block);
+            }
+            bail!("block {} has a parent whose full body is unavailable", hash)
+        }
         if parent_hash == self.best_hash() {
             self.connect_block_internal(&block, true)?;
             self.process_orphans(hash);
@@ -1007,17 +1078,15 @@ impl ChainState {
             self.median_time_past_for_parent(parent_hash),
         )?;
         self.validate_block_structure(&block, self.network, height, Amount::MAX_MONEY.to_sat())?;
-        if self.store.contains(&parent_hash) {
-            let parent_utxos = self
-                .utxos_for_block(parent_hash)?
-                .context("side-chain parent UTXO state is unavailable")?;
-            self.validate_block_transactions(
-                &block,
-                height,
-                &parent_utxos,
-                self.median_time_past_for_parent(parent_hash),
-            )?;
-        }
+        let parent_utxos = self
+            .utxos_for_block(parent_hash)?
+            .context("side-chain parent UTXO state is unavailable")?;
+        self.validate_block_transactions(
+            &block,
+            height,
+            &parent_utxos,
+            self.median_time_past_for_parent(parent_hash),
+        )?;
         self.store.insert(&block)?;
         self.index_all_transactions(&block, height);
         let chain_work = parent.chain_work + block.header.work();
@@ -1362,8 +1431,9 @@ impl ChainState {
         );
         self.index_transactions(genesis, 0);
         self.cache_basic_filter_for_block(genesis, &[], &FilterHeader::all_zeros())?;
-        self.block_undo_cache
-            .insert(genesis.block_hash(), vec![Vec::new()]);
+        self.remember_block_undo(genesis.block_hash(), vec![Vec::new()]);
+        self.store
+            .insert_undo(genesis.block_hash(), &[Vec::new()])?;
         Ok(())
     }
 
@@ -1536,8 +1606,19 @@ impl ChainState {
         if offset != spent_entries.len() {
             bail!("block undo contains unexpected spent outputs")
         }
-        self.block_undo_cache.insert(block.block_hash(), undo);
+        self.store.insert_undo(block.block_hash(), &undo)?;
+        self.remember_block_undo(block.block_hash(), undo);
         Ok(())
+    }
+
+    fn remember_block_undo(&mut self, hash: BlockHash, undo: Vec<Vec<TxOut>>) {
+        self.block_undo_cache.insert(hash, undo);
+        while self.block_undo_cache.len() > MAX_UNDO_CACHE_ENTRIES {
+            let Some(oldest) = self.block_undo_cache.keys().next().copied() else {
+                break;
+            };
+            self.block_undo_cache.remove(&oldest);
+        }
     }
 
     fn is_descendant_or_self(&self, candidate: &BlockHash, ancestor: &BlockHash) -> bool {
@@ -1836,20 +1917,24 @@ impl ChainState {
     }
 
     fn persist_snapshot(&self) -> Result<()> {
-        let snapshot = ChainSnapshot {
-            tip: self.best_hash().to_string(),
-            headers: self.headers.clone(),
-            utxos: self.utxos.clone(),
-            tx_index: self.tx_index.clone(),
-            tx_index_all: self.tx_index_all.clone(),
-            history: self.history.clone(),
-        };
+        let snapshot = self.current_snapshot();
         let bytes = serde_json::to_vec(&snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
         let temp = self.data_dir.join("chainstate.snapshot.tmp");
         fs::write(&temp, bytes)?;
         fs::rename(temp, path)?;
         Ok(())
+    }
+
+    fn current_snapshot(&self) -> ChainSnapshot {
+        ChainSnapshot {
+            tip: self.best_hash().to_string(),
+            headers: self.headers.clone(),
+            utxos: self.utxos.clone(),
+            tx_index: self.tx_index.clone(),
+            tx_index_all: self.tx_index_all.clone(),
+            history: self.history.clone(),
+        }
     }
 
     fn index_active_headers(&mut self, headers: &[bitcoin::block::Header]) -> Result<()> {

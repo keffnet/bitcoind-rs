@@ -15,7 +15,7 @@ use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
 use bitcoin::{Block, BlockHash, Network, Transaction, Txid, Wtxid};
 use rand::random;
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::Node;
@@ -23,6 +23,13 @@ use crate::wire::{self, GetHeadersMessage, Inventory, InventoryType, Message, Ve
 
 type PeerWriter = Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>;
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, PeerWriter>>>;
+
+#[derive(Debug)]
+pub(crate) enum PeerCommand {
+    Disconnect,
+    RequestBlock(BlockHash),
+    Ping,
+}
 
 struct PendingCompactBlock {
     compact: HeaderAndShortIds,
@@ -52,6 +59,8 @@ impl PeerManager {
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
         let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let next_peer_id = Arc::new(AtomicUsize::new(1));
+        let (add_node_sender, mut add_node_receiver) = mpsc::unbounded_channel();
+        self.node.set_peer_manager_sender(add_node_sender);
         let mut mempool_events = self.node.subscribe_mempool();
         let relay_peers = peers.clone();
         let relay_node = self.node.clone();
@@ -87,47 +96,34 @@ impl PeerManager {
             self.node.config.seed_nodes.clone()
         };
         for address in seed_nodes {
-            let node = self.node.clone();
-            let slots = slots.clone();
-            let peers = peers.clone();
-            let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                let Ok(_permit) = slots.acquire_owned().await else {
-                    return;
-                };
-                loop {
-                    if !node.network_active() {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    match TcpStream::connect(address).await {
-                        Ok(stream) => {
-                            info!(%address, "connected to configured peer");
-                            if let Err(error) = serve_peer(
-                                node.clone(),
-                                stream,
-                                address,
-                                true,
-                                peers.clone(),
-                                peer_id,
-                            )
-                            .await
-                            {
-                                debug!(%address, %error, "outbound peer ended");
-                            }
-                        }
-                        Err(error) => {
-                            warn!(%address, %error, "unable to connect to configured peer")
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                }
-            });
+            self.node.ensure_node_added(address);
+            spawn_outbound_loop(
+                self.node.clone(),
+                address,
+                slots.clone(),
+                peers.clone(),
+                next_peer_id.clone(),
+            );
         }
+        let dynamic_node = self.node.clone();
+        let dynamic_slots = slots.clone();
+        let dynamic_peers = peers.clone();
+        let dynamic_ids = next_peer_id.clone();
+        tokio::spawn(async move {
+            while let Some(address) = add_node_receiver.recv().await {
+                spawn_outbound_loop(
+                    dynamic_node.clone(),
+                    address,
+                    dynamic_slots.clone(),
+                    dynamic_peers.clone(),
+                    dynamic_ids.clone(),
+                );
+            }
+        });
 
         loop {
             let (stream, address) = listener.accept().await?;
-            if !self.node.network_active() {
+            if !self.node.network_active() || self.node.is_banned(address.ip()) {
                 continue;
             }
             let node = self.node.clone();
@@ -146,6 +142,43 @@ impl PeerManager {
             });
         }
     }
+}
+
+fn spawn_outbound_loop(
+    node: Arc<Node>,
+    address: std::net::SocketAddr,
+    slots: Arc<Semaphore>,
+    peers: PeerRegistry,
+    next_peer_id: Arc<AtomicUsize>,
+) {
+    let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
+    tokio::spawn(async move {
+        let Ok(_permit) = slots.acquire_owned().await else {
+            return;
+        };
+        loop {
+            if !node.is_node_added(address) {
+                return;
+            }
+            if !node.network_active() || node.is_banned(address.ip()) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            match TcpStream::connect(address).await {
+                Ok(stream) => {
+                    info!(%address, "connected to configured peer");
+                    if let Err(error) =
+                        serve_peer(node.clone(), stream, address, true, peers.clone(), peer_id)
+                            .await
+                    {
+                        debug!(%address, %error, "outbound peer ended");
+                    }
+                }
+                Err(error) => warn!(%address, %error, "unable to connect to configured peer"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
 }
 
 async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
@@ -201,11 +234,21 @@ async fn serve_peer(
 ) -> Result<()> {
     let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
-    node.register_peer(peer_id, address, !outbound);
+    let (commands, command_receiver) = mpsc::unbounded_channel();
+    node.register_peer(peer_id, address, !outbound, commands);
     let (mut reader, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
     peers.lock().insert(peer_id, writer.clone());
-    let result = serve_peer_loop(&node, &mut reader, &writer, outbound, &peers, peer_id).await;
+    let result = serve_peer_loop(
+        &node,
+        &mut reader,
+        &writer,
+        outbound,
+        &peers,
+        peer_id,
+        command_receiver,
+    )
+    .await;
     peers.lock().remove(&peer_id);
     node.unregister_peer(peer_id);
     result
@@ -237,6 +280,7 @@ async fn serve_peer_loop(
     outbound: bool,
     peers: &PeerRegistry,
     peer_id: usize,
+    mut commands: mpsc::UnboundedReceiver<PeerCommand>,
 ) -> Result<()> {
     let height = node.chain.read().height() as i32;
     send_message(
@@ -256,7 +300,33 @@ async fn serve_peer_loop(
         if !node.network_active() {
             anyhow::bail!("networking is disabled");
         }
-        let message = wire::read_message(reader, node.config.network).await?;
+        let message = tokio::select! {
+            command = commands.recv() => {
+                match command {
+                    Some(PeerCommand::Disconnect) | None => anyhow::bail!("peer disconnected by node"),
+                    Some(PeerCommand::RequestBlock(hash)) => {
+                        send_message(
+                            writer,
+                            node.config.network,
+                            &Message::GetData(vec![Inventory {
+                                kind: InventoryType::WitnessBlock,
+                                hash,
+                            }]),
+                        ).await?;
+                        continue;
+                    }
+                    Some(PeerCommand::Ping) => {
+                        send_message(
+                            writer,
+                            node.config.network,
+                            &Message::Ping(random()),
+                        ).await?;
+                        continue;
+                    }
+                }
+            }
+            message = wire::read_message(reader, node.config.network) => message?,
+        };
         match message {
             Message::Version(version) => {
                 if version_received {

@@ -11,6 +11,8 @@ pub mod storage;
 pub mod validation;
 pub mod wire;
 
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -23,6 +25,7 @@ use bitcoin::Block;
 use bitcoin::{Transaction, Txid};
 use parking_lot::RwLock;
 use rand::random;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 use tracing::info;
 
@@ -46,6 +49,14 @@ pub struct PeerInfo {
     pub connected_at: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BannedAddress {
+    pub address: IpAddr,
+    pub ban_created: u64,
+    pub ban_until: u64,
+    pub reason: String,
+}
+
 /// The wallet-free node facade shared by the network and RPC services.
 pub struct Node {
     pub config: Config,
@@ -57,13 +68,21 @@ pub struct Node {
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
     network_active: AtomicBool,
-    peers: parking_lot::RwLock<std::collections::HashMap<usize, PeerInfo>>,
+    peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
+    peer_commands:
+        parking_lot::RwLock<HashMap<usize, tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>>>,
+    peer_manager_requests:
+        parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<SocketAddr>>>,
+    known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
+    added_nodes: parking_lot::RwLock<HashSet<SocketAddr>>,
+    banned_addresses: parking_lot::RwLock<HashMap<IpAddr, BannedAddress>>,
     pub started_at: Instant,
     shutdown: Notify,
 }
 
 impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
+        let added_nodes = config.seed_nodes.iter().copied().collect();
         let chain = ChainState::open_with_signet_challenge(
             config.network,
             &config.datadir,
@@ -72,6 +91,7 @@ impl Node {
         let mempool_path = config.datadir.join("mempool.json");
         let mut mempool = Mempool::new(config.network);
         mempool.load_from_file(&mempool_path, &chain)?;
+        let banned_addresses = load_banlist(&config.datadir)?;
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let rpc_cookie = config
@@ -88,7 +108,12 @@ impl Node {
             mempool_path,
             peer_count: AtomicUsize::new(0),
             network_active: AtomicBool::new(true),
-            peers: parking_lot::RwLock::new(std::collections::HashMap::new()),
+            peers: parking_lot::RwLock::new(HashMap::new()),
+            peer_commands: parking_lot::RwLock::new(HashMap::new()),
+            peer_manager_requests: parking_lot::RwLock::new(None),
+            known_addresses: parking_lot::RwLock::new(HashMap::new()),
+            added_nodes: parking_lot::RwLock::new(added_nodes),
+            banned_addresses: parking_lot::RwLock::new(banned_addresses),
             started_at: Instant::now(),
             shutdown: Notify::new(),
         }))
@@ -181,26 +206,36 @@ impl Node {
 
     pub fn set_network_active(&self, active: bool) {
         self.network_active.store(active, Ordering::Relaxed);
+        if !active {
+            self.disconnect_all_peers();
+        }
     }
 
-    pub fn register_peer(&self, id: usize, address: std::net::SocketAddr, inbound: bool) {
-        self.peers.write().insert(
+    pub(crate) fn register_peer(
+        &self,
+        id: usize,
+        address: SocketAddr,
+        inbound: bool,
+        commands: tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>,
+    ) {
+        let connected_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let peer = PeerInfo {
             id,
-            PeerInfo {
-                id,
-                address,
-                inbound,
-                version: None,
-                services: 0,
-                user_agent: String::new(),
-                start_height: 0,
-                relay_transactions: true,
-                connected_at: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            },
-        );
+            address,
+            inbound,
+            version: None,
+            services: 0,
+            user_agent: String::new(),
+            start_height: 0,
+            relay_transactions: true,
+            connected_at,
+        };
+        self.peers.write().insert(id, peer.clone());
+        self.peer_commands.write().insert(id, commands);
+        self.known_addresses.write().insert(address, peer);
     }
 
     pub fn update_peer_version(
@@ -218,15 +253,159 @@ impl Node {
             peer.user_agent = user_agent.to_owned();
             peer.start_height = start_height;
             peer.relay_transactions = relay_transactions;
+            if let Some(known) = self.known_addresses.write().get_mut(&peer.address) {
+                known.version = Some(version);
+                known.services = services;
+                known.user_agent = user_agent.to_owned();
+                known.start_height = start_height;
+                known.relay_transactions = relay_transactions;
+            }
         }
     }
 
     pub fn unregister_peer(&self, id: usize) {
         self.peers.write().remove(&id);
+        self.peer_commands.write().remove(&id);
     }
 
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
         self.peers.read().values().cloned().collect()
+    }
+
+    pub fn known_addresses(&self) -> Vec<PeerInfo> {
+        self.known_addresses.read().values().cloned().collect()
+    }
+
+    pub fn add_node(&self, address: SocketAddr) -> bool {
+        let inserted = self.added_nodes.write().insert(address);
+        if inserted {
+            if let Some(sender) = self.peer_manager_requests.read().as_ref() {
+                let _ = sender.send(address);
+            }
+        }
+        inserted
+    }
+
+    pub fn remove_node(&self, address: &SocketAddr) -> bool {
+        let removed = self.added_nodes.write().remove(address);
+        self.disconnect_peer_at(*address);
+        removed
+    }
+
+    pub fn added_nodes(&self) -> Vec<SocketAddr> {
+        self.added_nodes.read().iter().copied().collect()
+    }
+
+    pub(crate) fn is_node_added(&self, address: SocketAddr) -> bool {
+        self.added_nodes.read().contains(&address)
+    }
+
+    pub(crate) fn ensure_node_added(&self, address: SocketAddr) {
+        self.added_nodes.write().insert(address);
+    }
+
+    pub(crate) fn set_peer_manager_sender(
+        &self,
+        sender: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+    ) {
+        *self.peer_manager_requests.write() = Some(sender);
+    }
+
+    pub fn disconnect_peer(&self, id: usize) -> bool {
+        self.peer_commands
+            .read()
+            .get(&id)
+            .is_some_and(|sender| sender.send(p2p::PeerCommand::Disconnect).is_ok())
+    }
+
+    pub fn disconnect_peer_at(&self, address: SocketAddr) -> bool {
+        self.peer_infos()
+            .into_iter()
+            .filter(|peer| peer.address == address)
+            .any(|peer| self.disconnect_peer(peer.id))
+    }
+
+    pub fn disconnect_all_peers(&self) {
+        let commands: Vec<_> = self.peer_commands.read().values().cloned().collect();
+        for sender in commands {
+            let _ = sender.send(p2p::PeerCommand::Disconnect);
+        }
+    }
+
+    pub fn request_block_from_peer(&self, peer_id: usize, hash: bitcoin::BlockHash) -> Result<()> {
+        let sender = self
+            .peer_commands
+            .read()
+            .get(&peer_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("peer {peer_id} is not connected"))?;
+        sender
+            .send(p2p::PeerCommand::RequestBlock(hash))
+            .map_err(|_| anyhow::anyhow!("peer {peer_id} disconnected"))
+    }
+
+    pub fn ping_peers(&self) {
+        let commands: Vec<_> = self.peer_commands.read().values().cloned().collect();
+        for sender in commands {
+            let _ = sender.send(p2p::PeerCommand::Ping);
+        }
+    }
+
+    pub fn is_banned(&self, address: IpAddr) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut banned = self.banned_addresses.write();
+        if banned
+            .get(&address)
+            .is_some_and(|entry| entry.ban_until <= now)
+        {
+            banned.remove(&address);
+        }
+        banned.contains_key(&address)
+    }
+
+    pub fn banned_addresses(&self) -> Vec<BannedAddress> {
+        let addresses: Vec<_> = self.banned_addresses.read().values().cloned().collect();
+        addresses
+            .into_iter()
+            .filter(|entry| self.is_banned(entry.address))
+            .collect()
+    }
+
+    pub fn ban_address(&self, address: IpAddr, ban_until: u64, reason: String) -> Result<()> {
+        let ban_created = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.banned_addresses.write().insert(
+            address,
+            BannedAddress {
+                address,
+                ban_created,
+                ban_until,
+                reason,
+            },
+        );
+        let peers: Vec<_> = self
+            .peer_infos()
+            .into_iter()
+            .filter(|peer| peer.address.ip() == address)
+            .map(|peer| peer.id)
+            .collect();
+        for peer_id in peers {
+            self.disconnect_peer(peer_id);
+        }
+        self.persist_banlist()
+    }
+
+    pub fn unban_address(&self, address: IpAddr) -> Result<bool> {
+        let removed = self.banned_addresses.write().remove(&address).is_some();
+        if removed {
+            self.persist_banlist()?;
+        }
+        Ok(removed)
     }
 
     pub fn request_shutdown(&self) {
@@ -268,6 +447,28 @@ impl Node {
     pub fn persist_mempool(&self) -> Result<()> {
         self.mempool.read().save_to_file(&self.mempool_path)
     }
+
+    fn persist_banlist(&self) -> Result<()> {
+        let path = self.config.datadir.join("banlist.json");
+        let temp = self.config.datadir.join("banlist.json.tmp");
+        let entries: Vec<_> = self.banned_addresses.read().values().cloned().collect();
+        std::fs::write(&temp, serde_json::to_vec_pretty(&entries)?)?;
+        std::fs::rename(temp, path)?;
+        Ok(())
+    }
+}
+
+fn load_banlist(data_dir: &Path) -> Result<HashMap<IpAddr, BannedAddress>> {
+    let path = data_dir.join("banlist.json");
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let bytes = std::fs::read(path)?;
+    let entries: Vec<BannedAddress> = serde_json::from_slice(&bytes)?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| (entry.address, entry))
+        .collect())
 }
 
 fn load_rpc_cookie(data_dir: &Path) -> Result<String> {

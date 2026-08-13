@@ -1122,6 +1122,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "addpeeraddress" => add_peer_address(node, params),
         "getrawaddrman" => get_raw_addrman(node),
         "sendmsgtopeer" => send_message_to_peer(node, params),
+        "addconnection" => add_connection(node, params),
         "addnode" => add_node(node, params),
         "disconnectnode" => disconnect_node(node, params),
         "getaddednodeinfo" => get_added_node_info(node, params),
@@ -1499,6 +1500,29 @@ fn send_message_to_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .map_err(|_| anyhow!("Error parsing input for msg"))?;
     node.send_message_to_peer(peer_id, command, payload)?;
     Ok(json!({}))
+}
+
+fn add_connection(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    if node.config.network != Network::Regtest {
+        bail!("addconnection is only available on regtest")
+    }
+    let address_string = param::<String>(params, 0)?;
+    let address = parse_socket_address(&address_string)?;
+    let connection_type = param::<String>(params, 1)?;
+    if !matches!(
+        connection_type.as_str(),
+        "outbound-full-relay" | "block-relay-only" | "addr-fetch" | "feeler"
+    ) {
+        bail!("invalid connection type")
+    }
+    if param::<bool>(params, 2)? {
+        bail!("v2transport is not supported")
+    }
+    node.request_one_try(address);
+    Ok(json!({
+        "address": address_string,
+        "connection_type": connection_type,
+    }))
 }
 
 fn get_block_from_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -7106,6 +7130,7 @@ fn rpc_help(method: &str) -> String {
         "addpeeraddress",
         "getrawaddrman",
         "sendmsgtopeer",
+        "addconnection",
         "addnode",
         "disconnectnode",
         "getaddednodeinfo",
@@ -8047,6 +8072,26 @@ mod tests {
             max_peers: 1,
         })
         .unwrap();
+        assert_eq!(
+            dispatch_method(
+                &node,
+                "addconnection",
+                &json!(["127.0.0.1:18446", "feeler", false]),
+            )
+            .unwrap(),
+            json!({
+                "address": "127.0.0.1:18446",
+                "connection_type": "feeler"
+            })
+        );
+        assert!(
+            dispatch_method(
+                &node,
+                "addconnection",
+                &json!(["127.0.0.1:18446", "feeler", true]),
+            )
+            .is_err()
+        );
         add_node(&node, &json!(["127.0.0.1:18445", "onetry"])).unwrap();
         assert_eq!(get_added_node_info(&node, &json!([])).unwrap(), json!([]));
         add_node(&node, &json!(["127.0.0.1:18444", "add"])).unwrap();

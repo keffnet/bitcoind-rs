@@ -874,35 +874,76 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_network_hash_ps(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let nblocks = params.get(0).and_then(Value::as_u64).unwrap_or(120);
-    let requested_height = params.get(1).and_then(Value::as_i64).unwrap_or(-1);
+    let nblocks = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_i64)
+        .unwrap_or(120);
+    if nblocks < -1 || nblocks == 0 {
+        bail!("Invalid nblocks. Must be a positive number or -1.");
+    }
+    let requested_height = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_i64)
+        .unwrap_or(-1);
+    if requested_height < -1 {
+        bail!("Block does not exist at specified height");
+    }
     let chain = node.chain.read();
-    let end_height = if requested_height < 0 {
+    if requested_height > i64::from(chain.height()) {
+        bail!("Block does not exist at specified height");
+    }
+    let end_height = if requested_height == -1 {
         chain.height()
     } else {
-        u32::try_from(requested_height)
-            .map_err(|_| anyhow!("height is out of range"))?
-            .min(chain.height())
+        u32::try_from(requested_height).map_err(|_| anyhow!("height is out of range"))?
     };
-    let window = u32::try_from(nblocks)
-        .unwrap_or(u32::MAX)
-        .min(end_height.saturating_add(1));
-    if window == 0 {
+    if end_height == 0 {
         return Ok(json!(0.0));
     }
-    let start_height = end_height.saturating_sub(window.saturating_sub(1));
-    let start = chain
+    let mut lookup = if nblocks == -1 {
+        let interval = node
+            .config
+            .network
+            .params()
+            .difficulty_adjustment_interval();
+        u64::from(end_height) % interval + 1
+    } else {
+        u64::try_from(nblocks).map_err(|_| anyhow!("nblocks is out of range"))?
+    };
+    lookup = lookup.min(u64::from(end_height));
+    let start_height = end_height
+        .checked_sub(u32::try_from(lookup).map_err(|_| anyhow!("nblocks is out of range"))?)
+        .ok_or_else(|| anyhow!("nblocks is out of range"))?;
+    let first_time = chain
         .header(start_height)
-        .ok_or_else(|| anyhow!("block height out of range"))?;
-    let end = chain
-        .header(end_height)
-        .ok_or_else(|| anyhow!("block height out of range"))?;
-    let interval = end.time.saturating_sub(start.time);
-    if interval == 0 {
+        .ok_or_else(|| anyhow!("block height out of range"))?
+        .time;
+    let mut min_time = first_time;
+    let mut max_time = first_time;
+    for height in start_height..=end_height {
+        let header = chain
+            .header(height)
+            .ok_or_else(|| anyhow!("block height out of range"))?;
+        min_time = min_time.min(header.time);
+        max_time = max_time.max(header.time);
+    }
+    if min_time == max_time {
         return Ok(json!(0.0));
     }
-    let expected_hashes = end.difficulty_float() * 4_294_967_296.0 * f64::from(window);
-    Ok(json!(expected_hashes / f64::from(interval)))
+    let start_hash = chain
+        .block_hash(start_height)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    let end_hash = chain
+        .block_hash(end_height)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    let work = chain
+        .chain_work_by_hash(&end_hash)
+        .zip(chain.chain_work_by_hash(&start_hash))
+        .map(|(end_work, start_work)| work_to_f64(end_work - start_work))
+        .unwrap_or(0.0);
+    Ok(json!(work / f64::from(max_time.saturating_sub(min_time))))
 }
 
 fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
@@ -1398,12 +1439,17 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let mut utxo_count_actual = 0i64;
     let mut spent_output_index = 0usize;
     let mut transaction_index = 0usize;
+    let is_bip30_repeat =
+        height.is_some_and(|height| chain::is_bip30_repeat(chain.network, height, hash));
     for transaction in &block.txdata {
         outputs = outputs.saturating_add(transaction.output.len());
         for output in &transaction.output {
             let size = utxo_stat_size(output);
             utxo_size_inc = utxo_size_inc.saturating_add(size);
-            if !output.script_pubkey.is_op_return() {
+            let excluded_from_utxo = height == Some(0)
+                || (is_bip30_repeat && transaction.is_coinbase())
+                || output.script_pubkey.is_op_return();
+            if !excluded_from_utxo {
                 utxo_count_actual = utxo_count_actual.saturating_add(1);
                 utxo_size_inc_actual = utxo_size_inc_actual.saturating_add(size);
             }
@@ -1497,9 +1543,15 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "utxo_increase_actual": utxo_count_actual - inputs as i64,
         "utxo_size_inc_actual": utxo_size_inc_actual,
     });
-    let Some(selected) = params.get(1).and_then(Value::as_array) else {
+    let Some(selected_value) = params.get(1) else {
         return Ok(result);
     };
+    if selected_value.is_null() {
+        return Ok(result);
+    }
+    let selected = selected_value
+        .as_array()
+        .ok_or_else(|| anyhow!("block statistics must be an array"))?;
     if selected.is_empty() {
         return Ok(result);
     }
@@ -1848,13 +1900,19 @@ fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
         };
         let txid = transaction.compute_txid();
         match candidate.accept(transaction.clone(), &chain) {
-            Ok(_) => result.push(json!({
-                "txid": txid.to_string(),
-                "wtxid": transaction.compute_wtxid().to_string(),
-                "allowed": true,
-                "vsize": transaction.vsize(),
-                "fees": {"base": 0.0},
-            })),
+            Ok(_) => {
+                let fee_sat = candidate
+                    .get(&txid)
+                    .map(|entry| entry.fee_sat)
+                    .unwrap_or_default();
+                result.push(json!({
+                    "txid": txid.to_string(),
+                    "wtxid": transaction.compute_wtxid().to_string(),
+                    "allowed": true,
+                    "vsize": transaction.vsize(),
+                    "fees": {"base": sat_to_btc(fee_sat)},
+                }));
+            }
             Err(error) => result.push(json!({
                 "txid": txid.to_string(),
                 "wtxid": transaction.compute_wtxid().to_string(),
@@ -2041,6 +2099,20 @@ fn rpc_error(error: &anyhow::Error) -> Value {
 
 fn sat_to_btc(satoshis: u64) -> f64 {
     satoshis as f64 / 100_000_000.0
+}
+
+fn work_to_f64(work: bitcoin::pow::Work) -> f64 {
+    let bytes = work.to_be_bytes();
+    let Some(first) = bytes.iter().position(|byte| *byte != 0) else {
+        return 0.0;
+    };
+    let end = (first + 8).min(bytes.len());
+    let mut significand = 0u64;
+    for byte in &bytes[first..end] {
+        significand = (significand << 8) | u64::from(*byte);
+    }
+    let exponent = i32::try_from((bytes.len() - end) * 8).unwrap_or(i32::MAX);
+    (significand as f64) * 2f64.powi(exponent)
 }
 
 fn network_name(network: Network) -> &'static str {
@@ -2232,6 +2304,8 @@ mod tests {
         assert_eq!(stats["total_out"], json!(0));
         assert_eq!(stats["subsidy"], json!(5_000_000_000u64));
         assert_eq!(stats["totalfee"], json!(0));
+        assert_eq!(stats["utxo_increase_actual"], json!(0));
+        assert_eq!(stats["utxo_size_inc_actual"], json!(0));
         assert_eq!(
             get_block_stats(
                 &node,
@@ -2244,6 +2318,48 @@ mod tests {
                 "feerate_percentiles": [0, 0, 0, 0, 0],
             })
         );
+    }
+
+    #[test]
+    fn network_hash_rate_rejects_invalid_windows() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        assert!(get_network_hash_ps(&node, &json!([0])).is_err());
+        assert!(get_network_hash_ps(&node, &json!([-2])).is_err());
+        assert_eq!(
+            get_network_hash_ps(&node, &json!([-1])).unwrap(),
+            json!(0.0)
+        );
+    }
+
+    #[test]
+    fn block_stats_reject_a_non_array_statistic_selector() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let hash = node.chain.read().best_hash();
+        assert!(get_block_stats(&node, &json!([hash.to_string(), "txs"])).is_err());
     }
 
     #[test]

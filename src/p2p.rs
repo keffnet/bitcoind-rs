@@ -291,7 +291,7 @@ async fn serve_peer_loop(
                     .into_iter()
                     .take(500)
                     .map(|header| Inventory {
-                        kind: InventoryType::WitnessBlock,
+                        kind: InventoryType::Block,
                         hash: header.block_hash(),
                     })
                     .collect::<Vec<_>>();

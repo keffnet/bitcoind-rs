@@ -1572,7 +1572,7 @@ fn apply_block_to_utxos(
     }
 }
 
-fn is_bip30_repeat(network: Network, height: u32, hash: BlockHash) -> bool {
+pub(crate) fn is_bip30_repeat(network: Network, height: u32, hash: BlockHash) -> bool {
     if network != Network::Bitcoin {
         return false;
     }

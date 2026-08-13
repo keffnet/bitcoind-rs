@@ -270,6 +270,8 @@ pub fn validate_transaction_finality(
 /// supplied as a parallel slice so SegWit and Taproot spends receive the full
 /// spent-output context they require.
 pub fn validate_transaction_scripts(
+    network: Network,
+    height: u32,
     transaction: &Transaction,
     previous_outputs: &[bitcoin::TxOut],
 ) -> Result<(), ValidationError> {
@@ -289,7 +291,18 @@ pub fn validate_transaction_scripts(
             value: output.value.to_sat() as i64,
         })
         .collect();
-    let flags = bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT;
+    let flags = match network {
+        Network::Bitcoin => {
+            let mut flags = bitcoinconsensus::height_to_flags(height);
+            if height >= 709_632 {
+                flags |= bitcoinconsensus::VERIFY_TAPROOT;
+            }
+            flags
+        }
+        Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => {
+            bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT
+        }
+    };
     for (input, previous_output) in previous_outputs.iter().enumerate() {
         if let Err(error) = bitcoinconsensus::verify_with_flags(
             previous_output.script_pubkey.as_bytes(),
@@ -345,6 +358,6 @@ mod tests {
                 script_pubkey: ScriptBuf::new(),
             }],
         };
-        validate_transaction_scripts(&transaction, &[previous]).unwrap();
+        validate_transaction_scripts(Network::Regtest, 1, &transaction, &[previous]).unwrap();
     }
 }

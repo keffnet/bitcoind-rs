@@ -9,6 +9,7 @@ use clap::{Parser, ValueEnum};
 pub enum NetworkName {
     Bitcoin,
     Testnet,
+    Testnet4,
     Signet,
     Regtest,
 }
@@ -18,6 +19,7 @@ impl From<NetworkName> for Network {
         match value {
             NetworkName::Bitcoin => Network::Bitcoin,
             NetworkName::Testnet => Network::Testnet,
+            NetworkName::Testnet4 => Network::Testnet4,
             NetworkName::Signet => Network::Signet,
             NetworkName::Regtest => Network::Regtest,
         }

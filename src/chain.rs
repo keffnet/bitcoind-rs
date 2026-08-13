@@ -248,6 +248,12 @@ impl ChainState {
         self.median_time_past()
     }
 
+    pub fn next_bits(&self, candidate_time: u32) -> u32 {
+        self.expected_target(candidate_time)
+            .to_compact_lossy()
+            .to_consensus()
+    }
+
     pub fn history_status(&self, script_hash: &str) -> Option<String> {
         let history = self.history.get(script_hash)?;
         let mut input = String::new();
@@ -392,7 +398,12 @@ impl ChainState {
                 self.median_time_past(),
                 &previous_entries,
             )?;
-            validation::validate_transaction_scripts(transaction, &previous_outputs)?;
+            validation::validate_transaction_scripts(
+                self.network,
+                height,
+                transaction,
+                &previous_outputs,
+            )?;
             let output_total = transaction
                 .output
                 .iter()

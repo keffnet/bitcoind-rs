@@ -96,7 +96,8 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
     };
     let port = match network {
         Network::Bitcoin => 8333,
-        Network::Testnet | Network::Testnet4 => 18333,
+        Network::Testnet => 18333,
+        Network::Testnet4 => 48333,
         Network::Signet => 38333,
         Network::Regtest => return Vec::new(),
     };

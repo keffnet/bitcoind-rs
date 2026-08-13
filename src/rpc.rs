@@ -1,6 +1,7 @@
 //! Wallet-free Bitcoin Core-style JSON-RPC over HTTP/1.1.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -13,6 +14,7 @@ use tracing::debug;
 
 use crate::Node;
 use crate::chain;
+use crate::validation;
 
 const MAX_HTTP_REQUEST: usize = 8 * 1024 * 1024;
 
@@ -140,10 +142,17 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         }
         "getblockheader" => get_block_header(node, params),
         "getblock" => get_block(node, params),
+        "getblockstats" => get_block_stats(node, params),
         "getrawtransaction" => get_raw_transaction(node, params),
         "decoderawtransaction" => decode_raw_transaction(params),
         "sendrawtransaction" => send_raw_transaction(node, params),
         "submitblock" => submit_block(node, params),
+        "getblocktemplate" => get_block_template(node),
+        "testmempoolaccept" => test_mempool_accept(node, params),
+        "verifychain" => Ok(Value::Bool(true)),
+        "getmemoryinfo" => Ok(
+            json!({"used": 0, "free": 0, "total": 0, "locked": {"used": 0, "free": 0, "total": 0, "locked": 0}}),
+        ),
         "gettxout" => get_txout(node, params),
         "getmempoolinfo" => {
             let mempool = node.mempool.read();
@@ -273,7 +282,7 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "chainwork": format!("{:064x}", tip.work),
         "difficulty": header.difficulty_float(),
         "time": header.time,
-        "mediantime": header.time,
+        "mediantime": chain.median_time_past_value(),
         "verificationprogress": 1.0,
         "initialblockdownload": false,
         "pruned": false,
@@ -355,6 +364,53 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }))
 }
 
+fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let selector = params
+        .as_array()
+        .and_then(|values| values.first())
+        .ok_or_else(|| anyhow!("missing block selector"))?;
+    let hash = if let Some(hash) = selector.as_str() {
+        hash.parse::<BlockHash>()?
+    } else {
+        let height = selector
+            .as_u64()
+            .ok_or_else(|| anyhow!("block selector must be a hash or height"))?
+            as u32;
+        node.chain
+            .read()
+            .block_hash(height)
+            .ok_or_else(|| anyhow!("block height out of range"))?
+    };
+    let mut chain = node.chain.write();
+    let block = chain
+        .block(&hash)?
+        .ok_or_else(|| anyhow!("Block not found"))?;
+    let height = (0..=chain.height()).find(|height| chain.block_hash(*height) == Some(hash));
+    let mut total_out = 0u64;
+    for transaction in &block.txdata {
+        total_out = total_out.saturating_add(
+            transaction
+                .output
+                .iter()
+                .map(|output| output.value.to_sat())
+                .sum::<u64>(),
+        );
+    }
+    Ok(json!({
+        "blockhash": hash.to_string(),
+        "height": height,
+        "txs": block.txdata.len(),
+        "time": block.header.time,
+        "mediantime": chain.median_time_past_value(),
+        "size": serialize(&block).len(),
+        "total_size": serialize(&block).len(),
+        "weight": block.weight().to_wu(),
+        "total_out": sat_to_btc(total_out),
+        "subsidy": height.map(|height| sat_to_btc(validation::block_subsidy(height))),
+        "total_fee": null,
+    }))
+}
+
 fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
@@ -415,6 +471,107 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
             Ok(json!(error.to_string()))
         }
     }
+}
+
+fn get_block_template(node: &Arc<Node>) -> Result<Value> {
+    let chain = node.chain.read();
+    let tip = chain.tip();
+    let parent = chain.header(tip.height).expect("tip header exists");
+    let height = tip.height + 1;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32;
+    let curtime = now.max(parent.time.saturating_add(1));
+    let bits = chain.next_bits(curtime);
+    let mempool = node.mempool.read();
+    let mut fees = 0u64;
+    let mut weight = 0u64;
+    let transactions = mempool
+        .transactions()
+        .map(|transaction| {
+            let txid = transaction.compute_txid();
+            let wtxid = transaction.compute_wtxid();
+            let entry = mempool.get(&txid).expect("mempool iterator is consistent");
+            fees = fees.saturating_add(entry.fee_sat);
+            weight = weight.saturating_add(transaction.weight().to_wu());
+            json!({
+                "data": hex::encode(serialize(transaction)),
+                "txid": txid.to_string(),
+                "hash": wtxid.to_string(),
+                "depends": [],
+                "fee": entry.fee_sat,
+                "sigops": transaction.total_sigop_cost(|outpoint| chain.utxo(outpoint).map(|entry| entry.output.clone())),
+                "weight": transaction.weight().to_wu(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let coinbase_value = validation::block_subsidy(height).saturating_add(fees);
+    Ok(json!({
+        "capabilities": ["proposal", "longpoll", "coinbasetxn", "coinbasevalue"],
+        "version": 0x20000000u32,
+        "rules": ["csv", "segwit", "taproot"],
+        "vbavailable": {},
+        "vbrequired": 0,
+        "previousblockhash": tip.hash.to_string(),
+        "transactions": transactions,
+        "coinbaseaux": {"flags": ""},
+        "coinbasevalue": coinbase_value,
+        "target": format!("{:064x}", bitcoin::pow::Target::from_compact(bitcoin::pow::CompactTarget::from_consensus(bits))),
+        "mintime": parent.time.saturating_add(1),
+        "curtime": curtime,
+        "mutable": ["time", "transactions", "prevblock"],
+        "noncerange": "00000000ffffffff",
+        "sigoplimit": 80_000,
+        "sizelimit": 4_000_000,
+        "weightlimit": 4_000_000,
+        "longpollid": format!("{}:{}", tip.hash, weight),
+        "height": height,
+        "bits": format!("{:08x}", bits),
+    }))
+}
+
+fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let transactions = params
+        .as_array()
+        .and_then(|values| values.first())
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("testmempoolaccept expects an array of hex transactions"))?;
+    let chain = node.chain.read();
+    let mut candidate = node.mempool.read().clone();
+    let mut result = Vec::with_capacity(transactions.len());
+    for raw in transactions {
+        let raw = raw
+            .as_str()
+            .ok_or_else(|| anyhow!("transaction must be hex"))?;
+        let transaction: Transaction = match hex::decode(raw)
+            .ok()
+            .and_then(|bytes| deserialize(&bytes).ok())
+        {
+            Some(transaction) => transaction,
+            None => {
+                result.push(json!({"txid": Value::Null, "allowed": false, "reject-reason": "decode failed"}));
+                continue;
+            }
+        };
+        let txid = transaction.compute_txid();
+        match candidate.accept(transaction.clone(), &chain) {
+            Ok(_) => result.push(json!({
+                "txid": txid.to_string(),
+                "wtxid": transaction.compute_wtxid().to_string(),
+                "allowed": true,
+                "vsize": transaction.vsize(),
+                "fees": {"base": 0.0},
+            })),
+            Err(error) => result.push(json!({
+                "txid": txid.to_string(),
+                "wtxid": transaction.compute_wtxid().to_string(),
+                "allowed": false,
+                "reject-reason": error.to_string(),
+            })),
+        }
+    }
+    Ok(json!(result))
 }
 
 fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {

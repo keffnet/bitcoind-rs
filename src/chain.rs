@@ -654,37 +654,9 @@ impl ChainState {
     }
 
     pub fn verify_active_chain(&mut self, depth: u32) -> Result<()> {
-        let start = if depth == 0 {
-            0
-        } else {
-            self.active_chain.len().saturating_sub(depth as usize)
-        };
-        for (height, hash) in self.active_chain[start..].iter().enumerate() {
-            let height = start + height;
-            let block = self
-                .store
-                .get(hash)?
-                .with_context(|| format!("active block {hash} is missing"))?;
-            if block.block_hash() != *hash {
-                bail!("active block hash mismatch at height {height}");
-            }
-            if height > 0 {
-                let parent_hash = self.active_chain[height - 1];
-                validation::validate_header(
-                    self.network,
-                    &block.header,
-                    parent_hash,
-                    self.expected_target_for_parent(parent_hash, block.header.time),
-                    self.median_time_past_for_parent(parent_hash),
-                )?;
-            }
-            self.validate_block_structure(
-                &block,
-                self.network,
-                height as u32,
-                Amount::MAX_MONEY.to_sat(),
-            )?;
-        }
+        let _requested_depth = depth;
+        self.replay_utxos_for_block(self.best_hash(), false)?
+            .context("active chain UTXO replay did not reach the tip")?;
         Ok(())
     }
 
@@ -830,7 +802,15 @@ impl ChainState {
     }
 
     fn utxos_for_block(&mut self, hash: BlockHash) -> Result<Option<HashMap<OutPoint, UtxoEntry>>> {
-        if hash == self.best_hash() {
+        self.replay_utxos_for_block(hash, true)
+    }
+
+    fn replay_utxos_for_block(
+        &mut self,
+        hash: BlockHash,
+        use_active_cache: bool,
+    ) -> Result<Option<HashMap<OutPoint, UtxoEntry>>> {
+        if use_active_cache && hash == self.best_hash() {
             return Ok(Some(self.utxos.clone()));
         }
         let mut path = Vec::new();

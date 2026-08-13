@@ -435,6 +435,41 @@ impl ChainState {
         (transactions.len(), self.utxos.len(), total)
     }
 
+    pub fn verify_active_chain(&mut self, depth: u32) -> Result<()> {
+        let start = if depth == 0 {
+            0
+        } else {
+            self.active_chain.len().saturating_sub(depth as usize)
+        };
+        for (height, hash) in self.active_chain[start..].iter().enumerate() {
+            let height = start + height;
+            let block = self
+                .store
+                .get(hash)?
+                .with_context(|| format!("active block {hash} is missing"))?;
+            if block.block_hash() != *hash {
+                bail!("active block hash mismatch at height {height}");
+            }
+            if height > 0 {
+                let parent_hash = self.active_chain[height - 1];
+                validation::validate_header(
+                    self.network,
+                    &block.header,
+                    parent_hash,
+                    self.expected_target_for_parent(parent_hash, block.header.time),
+                    self.median_time_past_for_parent(parent_hash),
+                )?;
+            }
+            validation::validate_block_structure(
+                &block,
+                self.network,
+                height as u32,
+                Amount::MAX_MONEY.to_sat(),
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn median_time_past_value(&self) -> u32 {
         self.median_time_past()
     }
@@ -1132,6 +1167,7 @@ mod tests {
         state.connect_block(second).unwrap();
         assert_eq!(state.height(), 2);
         assert_eq!(state.best_hash(), state.block_hash(2).unwrap());
+        state.verify_active_chain(0).unwrap();
         state.persist_snapshot().unwrap();
         drop(state);
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();

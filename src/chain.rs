@@ -82,6 +82,8 @@ struct ChainSnapshot {
     headers: Vec<bitcoin::block::Header>,
     utxos: HashMap<OutPoint, UtxoEntry>,
     tx_index: HashMap<Txid, TxLocation>,
+    #[serde(default)]
+    tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
 }
 
@@ -169,7 +171,11 @@ impl ChainState {
             state.utxos = snapshot.utxos;
             state.rebuild_utxo_index();
             state.tx_index = snapshot.tx_index;
-            state.tx_index_all = state.tx_index.clone();
+            state.tx_index_all = if snapshot.tx_index_all.is_empty() {
+                state.tx_index.clone()
+            } else {
+                snapshot.tx_index_all
+            };
             state.history = snapshot.history;
             let headers = state.headers.clone();
             state.index_active_headers(&headers)?;
@@ -1283,6 +1289,7 @@ impl ChainState {
             headers: self.headers.clone(),
             utxos: self.utxos.clone(),
             tx_index: self.tx_index.clone(),
+            tx_index_all: self.tx_index_all.clone(),
             history: self.history.clone(),
         };
         let bytes = serde_json::to_vec(&snapshot)?;
@@ -1441,6 +1448,7 @@ mod tests {
         let main_one = mine_block(&state, 1);
         state.connect_block(main_one).unwrap();
         let main_two = mine_block(&state, 2);
+        let main_two_coinbase = main_two.txdata[0].compute_txid();
         let old_tip = main_two.block_hash();
         state.connect_block(main_two).unwrap();
 
@@ -1469,9 +1477,10 @@ mod tests {
         assert_eq!(tips[1].status, "valid-fork");
 
         drop(state);
-        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.best_hash(), side_three_hash);
         assert_eq!(reopened.block_hash(1), Some(side_one_hash));
+        assert!(reopened.transaction(&main_two_coinbase).unwrap().is_some());
     }
 
     #[test]

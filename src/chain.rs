@@ -295,6 +295,46 @@ impl ChainState {
             .collect()
     }
 
+    /// Validate and index a contiguous header batch without requiring the
+    /// corresponding full blocks yet. This is the headers-first sync boundary
+    /// used by the peer manager.
+    pub fn accept_headers(&mut self, headers: &[bitcoin::block::Header]) -> Result<Vec<BlockHash>> {
+        let mut hashes = Vec::with_capacity(headers.len());
+        for header in headers {
+            let hash = header.block_hash();
+            if let Some(existing) = self.block_index.get(&hash) {
+                if existing.header != *header {
+                    bail!("header hash collision for {hash}");
+                }
+                hashes.push(hash);
+                continue;
+            }
+            let parent_hash = header.prev_blockhash;
+            let parent = self
+                .block_index
+                .get(&parent_hash)
+                .copied()
+                .with_context(|| format!("header {hash} has an unknown parent {parent_hash}"))?;
+            validation::validate_header(
+                self.network,
+                header,
+                parent_hash,
+                self.expected_target_for_parent(parent_hash, header.time),
+                self.median_time_past_for_parent(parent_hash),
+            )?;
+            self.block_index.insert(
+                hash,
+                BlockNode {
+                    header: *header,
+                    height: parent.height.saturating_add(1),
+                    chain_work: parent.chain_work + header.work(),
+                },
+            );
+            hashes.push(hash);
+        }
+        Ok(hashes)
+    }
+
     pub fn block(&mut self, hash: &BlockHash) -> Result<Option<Block>> {
         self.store.get(hash)
     }
@@ -1066,6 +1106,22 @@ mod tests {
         assert!(state.connect_block(child).is_err());
         state.connect_block(parent).unwrap();
         assert_eq!(state.best_hash(), child_hash);
+        assert_eq!(state.height(), 2);
+    }
+
+    #[test]
+    fn indexes_headers_before_full_blocks_arrive() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let child = mine_block_from_header(&parent.header, 2, 9);
+        let hashes = state
+            .accept_headers(&[parent.header, child.header])
+            .unwrap();
+        assert_eq!(hashes, vec![parent.block_hash(), child.block_hash()]);
+        assert_eq!(state.block_height_by_hash(&child.block_hash()), Some(2));
+        state.connect_block(parent).unwrap();
+        state.connect_block(child).unwrap();
         assert_eq!(state.height(), 2);
     }
 

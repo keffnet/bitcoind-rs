@@ -250,19 +250,18 @@ async fn serve_peer_loop(
                 if headers.is_empty() {
                     continue;
                 }
-                let mut requests = Vec::new();
-                {
+                let hashes = node.chain.write().accept_headers(&headers)?;
+                let requests = {
                     let chain = node.chain.read();
-                    for header in headers {
-                        let hash = header.block_hash();
-                        if !chain.store.contains(&hash) {
-                            requests.push(Inventory {
-                                kind: InventoryType::Block,
-                                hash,
-                            });
-                        }
-                    }
-                }
+                    hashes
+                        .into_iter()
+                        .filter(|hash| !chain.store.contains(hash))
+                        .map(|hash| Inventory {
+                            kind: InventoryType::Block,
+                            hash,
+                        })
+                        .collect::<Vec<_>>()
+                };
                 if !requests.is_empty() {
                     send_message(writer, node.config.network, &Message::GetData(requests)).await?;
                 }

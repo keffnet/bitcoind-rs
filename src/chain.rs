@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use bitcoin::bip158::{BlockFilter, FilterHeader};
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::{Hash, HashEngine};
@@ -432,6 +433,104 @@ impl ChainState {
             transaction_fees_sat,
             spent_outputs,
         }))
+    }
+
+    /// Build the BIP158 basic filter and filter header for every block from
+    /// genesis through `hash`. Filters are computed on demand until a durable
+    /// filter index is added.
+    pub fn basic_filter_chain(
+        &mut self,
+        hash: &BlockHash,
+    ) -> Result<Option<Vec<(BlockHash, BlockFilter, FilterHeader)>>> {
+        let Some(headers) = self.headers_to_hash(hash) else {
+            return Ok(None);
+        };
+        let mut previous_outputs: HashMap<OutPoint, TxOut> = HashMap::new();
+        let mut previous_filter_header = FilterHeader::all_zeros();
+        let mut filters = Vec::with_capacity(headers.len());
+
+        for (height, header) in headers.into_iter().enumerate() {
+            let block_hash = header.block_hash();
+            let Some(block) = self.store.get(&block_hash)? else {
+                return Ok(None);
+            };
+            let mut created_outputs = HashMap::new();
+            for transaction in &block.txdata {
+                let txid = transaction.compute_txid();
+                for (vout, output) in transaction.output.iter().enumerate() {
+                    created_outputs.insert(OutPoint::new(txid, vout as u32), output.clone());
+                }
+            }
+            let filter = BlockFilter::new_script_filter(&block, |outpoint| {
+                previous_outputs
+                    .get(outpoint)
+                    .or_else(|| created_outputs.get(outpoint))
+                    .map(|output| output.script_pubkey.clone())
+                    .ok_or(bitcoin::bip158::Error::UtxoMissing(*outpoint))
+            })?;
+            let filter_header = filter.filter_header(&previous_filter_header);
+            filters.push((block_hash, filter, filter_header));
+            previous_filter_header = filter_header;
+
+            // The genesis coinbase output is intentionally not part of the
+            // spendable UTXO set, matching Bitcoin Core's chainstate rules.
+            if height > 0 {
+                for transaction in &block.txdata {
+                    for input in &transaction.input {
+                        previous_outputs.remove(&input.previous_output);
+                    }
+                    let txid = transaction.compute_txid();
+                    for (vout, output) in transaction.output.iter().enumerate() {
+                        previous_outputs.insert(OutPoint::new(txid, vout as u32), output.clone());
+                    }
+                }
+            }
+        }
+        Ok(Some(filters))
+    }
+
+    /// Return the outputs spent by each transaction in a block, with an empty
+    /// first entry for the coinbase transaction as in Core's block undo data.
+    pub fn spent_outputs_by_transaction(
+        &mut self,
+        hash: &BlockHash,
+    ) -> Result<Option<Vec<Vec<TxOut>>>> {
+        let Some(block) = self.store.get(hash)? else {
+            return Ok(None);
+        };
+        let Some(node) = self.block_index.get(hash).copied() else {
+            return Ok(None);
+        };
+        let mut undo = vec![Vec::new()];
+        if node.height == 0 {
+            return Ok(Some(undo));
+        }
+        let mut outputs = self
+            .replay_utxos_for_block(block.header.prev_blockhash, true)?
+            .context("block undo parent UTXO state is unavailable")?;
+        for transaction in block.txdata.iter().skip(1) {
+            let mut spent = Vec::with_capacity(transaction.input.len());
+            for input in &transaction.input {
+                let entry = outputs.remove(&input.previous_output).with_context(|| {
+                    format!("block undo is missing output {}", input.previous_output)
+                })?;
+                spent.push(entry.output);
+            }
+            undo.push(spent);
+            let txid = transaction.compute_txid();
+            for (vout, output) in transaction.output.iter().enumerate() {
+                outputs.insert(
+                    OutPoint::new(txid, vout as u32),
+                    UtxoEntry {
+                        output: output.clone(),
+                        height: node.height,
+                        median_time_past: 0,
+                        coinbase: false,
+                    },
+                );
+            }
+        }
+        Ok(Some(undo))
     }
 
     pub fn chain_work_by_hash(&self, hash: &BlockHash) -> Option<Work> {

@@ -11,7 +11,7 @@ use bitcoin::block::{Header, Version as BlockVersion};
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
-use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::consensus::encode::{VarInt, deserialize, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::{
     Address, Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
@@ -209,9 +209,17 @@ fn dispatch_rest(node: &Arc<Node>, target: &str) -> Result<(&'static str, Vec<u8
             rest_blockhash_by_height(node, route, format)
         }
         route if route.starts_with("headers/") => rest_headers(node, route, format, query),
+        route if route.starts_with("blockpart/") => rest_block_part(node, route, format, query),
+        route if route.starts_with("blockfilterheaders/") => {
+            rest_block_filter_headers(node, route, format, query)
+        }
+        route if route.starts_with("blockfilter/") => rest_block_filter(node, route, format),
         route if route.starts_with("block/notxdetails/") => rest_block(node, route, format, false),
         route if route.starts_with("block/") => rest_block(node, route, format, true),
         route if route.starts_with("tx/") => rest_transaction(node, route, format),
+        "deploymentinfo" => rest_deployment_info(node, route, format),
+        route if route.starts_with("deploymentinfo/") => rest_deployment_info(node, route, format),
+        route if route.starts_with("spenttxouts/") => rest_spent_txouts(node, route, format),
         route if route.starts_with("getutxos/") => rest_get_utxos(node, route, format),
         _ => bail!("unsupported REST endpoint"),
     }
@@ -380,6 +388,230 @@ fn rest_block(
         )?),
         "bin" => Ok(("application/octet-stream", serialize(&block))),
         "hex" => rest_format_bytes(serialize(&block), format),
+        _ => bail!("unsupported REST output format"),
+    }
+}
+
+fn rest_query_usize(query: &str, name: &str) -> Result<usize> {
+    query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .find_map(|(key, value)| (key == name).then_some(value))
+        .ok_or_else(|| anyhow!("REST query parameter {name} is required"))?
+        .parse::<usize>()
+        .map_err(|_| anyhow!("REST query parameter {name} must be a non-negative integer"))
+}
+
+fn rest_block_part(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+    query: &str,
+) -> Result<(&'static str, Vec<u8>)> {
+    if !matches!(format, "bin" | "hex") {
+        bail!("REST blockpart supports binary and hex output only")
+    }
+    let hash: BlockHash = route
+        .strip_prefix("blockpart/")
+        .ok_or_else(|| anyhow!("invalid blockpart path"))?
+        .parse()?;
+    let offset = rest_query_usize(query, "offset")?;
+    let size = rest_query_usize(query, "size")?;
+    let bytes = node
+        .chain
+        .write()
+        .block(&hash)?
+        .ok_or_else(|| anyhow!("block not found"))?;
+    let bytes = serialize(&bytes);
+    let end = offset
+        .checked_add(size)
+        .ok_or_else(|| anyhow!("block part range overflows"))?;
+    if end > bytes.len() {
+        bail!("block part offset/size is outside the block")
+    }
+    rest_format_bytes(bytes[offset..end].to_vec(), format)
+}
+
+fn rest_block_filter(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+) -> Result<(&'static str, Vec<u8>)> {
+    let suffix = route
+        .strip_prefix("blockfilter/")
+        .ok_or_else(|| anyhow!("invalid blockfilter path"))?;
+    let mut parts = suffix.split('/');
+    let filter_type = parts.next().unwrap_or_default();
+    let hash_text = parts.next().unwrap_or_default();
+    if filter_type != "basic" || parts.next().is_some() {
+        bail!("only the basic REST block filter is available")
+    }
+    let hash: BlockHash = hash_text.parse()?;
+    let content = node
+        .chain
+        .write()
+        .basic_filter_chain(&hash)?
+        .and_then(|filters| {
+            filters
+                .into_iter()
+                .next_back()
+                .map(|(_, filter, _)| filter.content)
+        })
+        .ok_or_else(|| anyhow!("block filter not found"))?;
+    match format {
+        "bin" | "hex" => rest_format_bytes(serialize(&content), format),
+        "json" => rest_json(json!({"filter": hex::encode(content)})),
+        _ => bail!("unsupported REST output format"),
+    }
+}
+
+fn rest_block_filter_headers(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+    query: &str,
+) -> Result<(&'static str, Vec<u8>)> {
+    let suffix = route
+        .strip_prefix("blockfilterheaders/")
+        .ok_or_else(|| anyhow!("invalid blockfilterheaders path"))?;
+    let parts = suffix.split('/').collect::<Vec<_>>();
+    let (filter_type, count, hash_text) = match parts.as_slice() {
+        [filter_type, hash_text] => (
+            *filter_type,
+            query
+                .split('&')
+                .filter_map(|part| part.split_once('='))
+                .find_map(|(key, value)| (key == "count").then_some(value))
+                .unwrap_or("5")
+                .parse::<usize>()?,
+            *hash_text,
+        ),
+        [filter_type, count, hash_text] => (*filter_type, count.parse::<usize>()?, *hash_text),
+        _ => bail!("invalid blockfilterheaders path"),
+    };
+    if filter_type != "basic" {
+        bail!("only the basic REST block filter is available")
+    }
+    if !(1..=2_000).contains(&count) {
+        bail!("filter header count must be between 1 and 2000")
+    }
+    let hash: BlockHash = hash_text.parse()?;
+    let filter_headers = {
+        let mut chain = node.chain.write();
+        match chain.block_height_by_hash(&hash) {
+            Some(start_height) if chain.is_active_block(&hash) => {
+                let end_height = start_height
+                    .saturating_add(u32::try_from(count.saturating_sub(1)).unwrap_or(u32::MAX))
+                    .min(chain.height());
+                let end_hash = chain
+                    .block_hash(end_height)
+                    .ok_or_else(|| anyhow!("block height out of range"))?;
+                let filters = chain
+                    .basic_filter_chain(&end_hash)?
+                    .ok_or_else(|| anyhow!("block filter headers are not available"))?;
+                filters
+                    .into_iter()
+                    .skip(start_height as usize)
+                    .take(count)
+                    .map(|(_, _, filter_header)| filter_header)
+                    .collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        }
+    };
+    match format {
+        "bin" => Ok((
+            "application/octet-stream",
+            filter_headers.iter().flat_map(serialize).collect(),
+        )),
+        "hex" => Ok((
+            "text/plain",
+            format!(
+                "{}\n",
+                hex::encode(
+                    filter_headers
+                        .iter()
+                        .flat_map(serialize)
+                        .collect::<Vec<_>>()
+                )
+            )
+            .into_bytes(),
+        )),
+        "json" => rest_json(json!(
+            filter_headers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        )),
+        _ => bail!("unsupported REST output format"),
+    }
+}
+
+fn rest_deployment_info(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+) -> Result<(&'static str, Vec<u8>)> {
+    if format != "json" {
+        bail!("REST deploymentinfo supports JSON output only")
+    }
+    let params = if route == "deploymentinfo" {
+        json!([])
+    } else {
+        let hash = route
+            .strip_prefix("deploymentinfo/")
+            .ok_or_else(|| anyhow!("invalid deploymentinfo path"))?;
+        if hash.is_empty() || hash.contains('/') {
+            bail!("invalid deploymentinfo path")
+        }
+        json!([hash])
+    };
+    rest_json(get_deployment_info(node, &params)?)
+}
+
+fn serialize_block_undo(undo: &[Vec<TxOut>]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend(serialize(&VarInt::from(undo.len() as u64)));
+    for outputs in undo {
+        bytes.extend(serialize(&VarInt::from(outputs.len() as u64)));
+        for output in outputs {
+            bytes.extend(serialize(output));
+        }
+    }
+    bytes
+}
+
+fn rest_spent_txouts(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+) -> Result<(&'static str, Vec<u8>)> {
+    let hash: BlockHash = route
+        .strip_prefix("spenttxouts/")
+        .ok_or_else(|| anyhow!("invalid spenttxouts path"))?
+        .parse()?;
+    let undo = node
+        .chain
+        .write()
+        .spent_outputs_by_transaction(&hash)?
+        .ok_or_else(|| anyhow!("block undo not found"))?;
+    match format {
+        "bin" | "hex" => rest_format_bytes(serialize_block_undo(&undo), format),
+        "json" => rest_json(json!(
+            undo.iter()
+                .map(|outputs| {
+                    outputs
+                        .iter()
+                        .map(|output| {
+                            json!({
+                                "value": output.value.to_btc(),
+                                "scriptPubKey": script_json(&output.script_pubkey),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        )),
         _ => bail!("unsupported REST output format"),
     }
 }
@@ -2928,6 +3160,47 @@ mod tests {
                 .len(),
             1
         );
+        let genesis_hash = node.chain.read().best_hash();
+        let (_, block_part) = dispatch_rest(
+            &node,
+            &format!("/rest/blockpart/{genesis_hash}.hex?offset=0&size=4"),
+        )
+        .unwrap();
+        assert_eq!(std::str::from_utf8(&block_part).unwrap(), "01000000\n");
+        let (_, filter) = dispatch_rest(
+            &node,
+            &format!("/rest/blockfilter/basic/{genesis_hash}.json"),
+        )
+        .unwrap();
+        let filter = serde_json::from_slice::<Value>(&filter).unwrap();
+        assert!(filter["filter"].as_str().is_some());
+        let (_, filter_headers) = dispatch_rest(
+            &node,
+            &format!("/rest/blockfilterheaders/basic/{genesis_hash}.json?count=1"),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&filter_headers)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let (_, deployment) = dispatch_rest(&node, "/rest/deploymentinfo.json").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&deployment).unwrap()["height"],
+            0
+        );
+        let (_, spent) =
+            dispatch_rest(&node, &format!("/rest/spenttxouts/{genesis_hash}.json")).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&spent).unwrap(),
+            json!([[]])
+        );
+        let (_, spent_hex) =
+            dispatch_rest(&node, &format!("/rest/spenttxouts/{genesis_hash}.hex")).unwrap();
+        assert_eq!(std::str::from_utf8(&spent_hex).unwrap(), "0100\n");
     }
 
     #[test]

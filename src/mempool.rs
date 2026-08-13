@@ -151,6 +151,77 @@ impl Mempool {
         ordered
     }
 
+    pub fn parents(&self, txid: &Txid) -> Vec<Txid> {
+        let Some(entry) = self.entries.get(txid) else {
+            return Vec::new();
+        };
+        let mut parents: Vec<Txid> = entry
+            .transaction
+            .input
+            .iter()
+            .map(|input| input.previous_output.txid)
+            .filter(|parent| self.entries.contains_key(parent))
+            .collect();
+        parents.sort_by_key(ToString::to_string);
+        parents.dedup();
+        parents
+    }
+
+    pub fn children(&self, txid: &Txid) -> Vec<Txid> {
+        let mut children = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .transaction
+                    .input
+                    .iter()
+                    .any(|input| input.previous_output.txid == *txid)
+            })
+            .map(|(candidate, _)| *candidate)
+            .collect::<Vec<_>>();
+        children.sort_by_key(ToString::to_string);
+        children
+    }
+
+    pub fn ancestors(&self, txid: &Txid) -> Vec<Txid> {
+        if !self.entries.contains_key(txid) {
+            return Vec::new();
+        }
+        let mut found = HashSet::new();
+        let mut pending = vec![*txid];
+        while let Some(current) = pending.pop() {
+            for parent in self.parents(&current) {
+                if parent != *txid && found.insert(parent) {
+                    pending.push(parent);
+                }
+            }
+        }
+        self.transaction_order()
+            .into_iter()
+            .filter(|candidate| found.contains(candidate))
+            .collect()
+    }
+
+    pub fn descendants(&self, txid: &Txid) -> Vec<Txid> {
+        if !self.entries.contains_key(txid) {
+            return Vec::new();
+        }
+        let mut found = HashSet::new();
+        let mut pending = vec![*txid];
+        while let Some(current) = pending.pop() {
+            for candidate in self.children(&current) {
+                if candidate != *txid && found.insert(candidate) {
+                    pending.push(candidate);
+                }
+            }
+        }
+        self.transaction_order()
+            .into_iter()
+            .filter(|candidate| found.contains(candidate))
+            .collect()
+    }
+
     pub fn load_from_file(&mut self, path: &Path, chain: &ChainState) -> Result<()> {
         if !path.exists() {
             return Ok(());
@@ -413,6 +484,28 @@ impl From<ValidationError> for MempoolError {
 mod tests {
     use super::*;
     use bitcoin::Network;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::blockdata::script::ScriptBuf;
+    use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
+    use bitcoin::blockdata::witness::Witness;
+    use bitcoin::hashes::Hash;
+
+    fn graph_transaction(previous: Txid, marker: u8) -> Transaction {
+        Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(previous, 0),
+                script_sig: ScriptBuf::from_bytes(vec![marker]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
 
     #[test]
     fn persists_and_loads_an_empty_pool() {
@@ -424,5 +517,33 @@ mod tests {
         let mut loaded = Mempool::new(Network::Regtest);
         loaded.load_from_file(&path, &chain).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn tracks_transitive_mempool_relationships() {
+        let root = graph_transaction(Txid::from_byte_array([1; 32]), 1);
+        let root_id = root.compute_txid();
+        let child = graph_transaction(root_id, 2);
+        let child_id = child.compute_txid();
+        let grandchild = graph_transaction(child_id, 3);
+        let grandchild_id = grandchild.compute_txid();
+        let mut pool = Mempool::new(Network::Regtest);
+        for (time, transaction) in [(1, root), (2, child), (3, grandchild)] {
+            let txid = transaction.compute_txid();
+            pool.entries.insert(
+                txid,
+                MempoolEntry {
+                    vsize: transaction.vsize() as u64,
+                    fee_sat: 10,
+                    added_at: time,
+                    transaction,
+                },
+            );
+        }
+
+        assert_eq!(pool.parents(&grandchild_id), vec![child_id]);
+        assert_eq!(pool.children(&root_id), vec![child_id]);
+        assert_eq!(pool.ancestors(&grandchild_id), vec![root_id, child_id]);
+        assert_eq!(pool.descendants(&root_id), vec![child_id, grandchild_id]);
     }
 }

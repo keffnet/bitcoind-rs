@@ -289,6 +289,40 @@ impl ChainState {
         self.block_index.get(hash).map(|node| node.height)
     }
 
+    pub fn next_block_hash(&self, hash: &BlockHash) -> Option<BlockHash> {
+        if let Some(position) = self
+            .active_chain
+            .iter()
+            .position(|candidate| candidate == hash)
+        {
+            return self.active_chain.get(position + 1).copied();
+        }
+        self.block_index
+            .iter()
+            .filter(|(_, node)| node.header.prev_blockhash == *hash)
+            .map(|(candidate, _)| *candidate)
+            .min_by_key(ToString::to_string)
+    }
+
+    pub fn median_time_past_for_hash(&self, hash: &BlockHash) -> Option<u32> {
+        let mut times = Vec::with_capacity(11);
+        let mut cursor = *hash;
+        for _ in 0..11 {
+            let node = self.block_index.get(&cursor)?;
+            times.push(node.header.time);
+            if node.height == 0 {
+                break;
+            }
+            cursor = node.header.prev_blockhash;
+        }
+        times.sort_unstable();
+        times.get(times.len() / 2).copied()
+    }
+
+    pub fn block_transaction_count(&mut self, hash: &BlockHash) -> Result<Option<usize>> {
+        Ok(self.store.get(hash)?.map(|block| block.txdata.len()))
+    }
+
     pub fn chain_work_by_hash(&self, hash: &BlockHash) -> Option<Work> {
         self.block_index.get(hash).map(|node| node.chain_work)
     }

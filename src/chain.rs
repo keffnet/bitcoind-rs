@@ -112,6 +112,7 @@ pub struct ChainState {
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
     basic_filter_cache: HashMap<BlockHash, (Vec<u8>, FilterHeader)>,
+    block_undo_cache: HashMap<BlockHash, Vec<Vec<TxOut>>>,
 }
 
 impl ChainState {
@@ -184,6 +185,7 @@ impl ChainState {
             tx_index_all: HashMap::new(),
             history: HashMap::new(),
             basic_filter_cache: HashMap::new(),
+            block_undo_cache: HashMap::new(),
         };
         let snapshot = state.load_snapshot(&active_chain)?;
         if let Some(snapshot) = snapshot {
@@ -597,6 +599,9 @@ impl ChainState {
         &mut self,
         hash: &BlockHash,
     ) -> Result<Option<Vec<Vec<TxOut>>>> {
+        if let Some(undo) = self.block_undo_cache.get(hash) {
+            return Ok(Some(undo.clone()));
+        }
         let Some(block) = self.store.get(hash)? else {
             return Ok(None);
         };
@@ -605,6 +610,7 @@ impl ChainState {
         };
         let mut undo = vec![Vec::new()];
         if node.height == 0 {
+            self.block_undo_cache.insert(*hash, undo.clone());
             return Ok(Some(undo));
         }
         let mut outputs = self
@@ -632,6 +638,7 @@ impl ChainState {
                 );
             }
         }
+        self.block_undo_cache.insert(*hash, undo.clone());
         Ok(Some(undo))
     }
 
@@ -1247,6 +1254,7 @@ impl ChainState {
         let block_median_time_past = self.median_time_past();
         let application =
             self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?;
+        self.cache_block_undo(block, &application.spent_entries)?;
         let previous_filter_header =
             if let Some((_, header)) = self.basic_filter_cache.get(&previous) {
                 *header
@@ -1354,6 +1362,8 @@ impl ChainState {
         );
         self.index_transactions(genesis, 0);
         self.cache_basic_filter_for_block(genesis, &[], &FilterHeader::all_zeros())?;
+        self.block_undo_cache
+            .insert(genesis.block_hash(), vec![Vec::new()]);
         Ok(())
     }
 
@@ -1442,6 +1452,7 @@ impl ChainState {
         let old_tx_index = self.tx_index.clone();
         let old_history = self.history.clone();
         let old_basic_filter_cache = self.basic_filter_cache.clone();
+        let old_block_undo_cache = self.block_undo_cache.clone();
         self.active_chain.clear();
         self.headers.clear();
         self.utxos.clear();
@@ -1464,6 +1475,7 @@ impl ChainState {
             self.tx_index = old_tx_index;
             self.history = old_history;
             self.basic_filter_cache = old_basic_filter_cache;
+            self.block_undo_cache = old_block_undo_cache;
             return Err(error);
         }
         Ok(())
@@ -1496,6 +1508,35 @@ impl ChainState {
         let filter_header = filter.filter_header(previous_filter_header);
         self.basic_filter_cache
             .insert(block.block_hash(), (filter.content, filter_header));
+        Ok(())
+    }
+
+    fn cache_block_undo(
+        &mut self,
+        block: &Block,
+        spent_entries: &[(OutPoint, UtxoEntry)],
+    ) -> Result<()> {
+        let mut undo = vec![Vec::new()];
+        let mut offset = 0usize;
+        for transaction in block.txdata.iter().skip(1) {
+            let end = offset
+                .checked_add(transaction.input.len())
+                .ok_or_else(|| anyhow::anyhow!("block undo input count overflow"))?;
+            if end > spent_entries.len() {
+                bail!("block undo input count does not match validation state")
+            }
+            undo.push(
+                spent_entries[offset..end]
+                    .iter()
+                    .map(|(_, entry)| entry.output.clone())
+                    .collect(),
+            );
+            offset = end;
+        }
+        if offset != spent_entries.len() {
+            bail!("block undo contains unexpected spent outputs")
+        }
+        self.block_undo_cache.insert(block.block_hash(), undo);
         Ok(())
     }
 

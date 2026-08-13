@@ -37,6 +37,7 @@ pub struct Mempool {
     bytes: usize,
     entries: HashMap<Txid, MempoolEntry>,
     spent: HashMap<OutPoint, Txid>,
+    children: HashMap<Txid, HashSet<Txid>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +74,7 @@ impl Mempool {
             bytes: 0,
             entries: HashMap::new(),
             spent: HashMap::new(),
+            children: HashMap::new(),
         }
     }
 
@@ -178,18 +180,13 @@ impl Mempool {
     }
 
     pub fn children(&self, txid: &Txid) -> Vec<Txid> {
-        let mut children = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| {
-                entry
-                    .transaction
-                    .input
-                    .iter()
-                    .any(|input| input.previous_output.txid == *txid)
-            })
-            .map(|(candidate, _)| *candidate)
-            .collect::<Vec<_>>();
+        let mut children = self.children.get(txid).map_or_else(Vec::new, |children| {
+            children
+                .iter()
+                .filter(|child| self.entries.contains_key(*child))
+                .copied()
+                .collect::<Vec<_>>()
+        });
         children.sort_by_key(ToString::to_string);
         children
     }
@@ -388,6 +385,12 @@ impl Mempool {
         };
         for input in &entry.transaction.input {
             self.spent.insert(input.previous_output, txid);
+            if self.entries.contains_key(&input.previous_output.txid) {
+                self.children
+                    .entry(input.previous_output.txid)
+                    .or_default()
+                    .insert(txid);
+            }
         }
         self.bytes += size;
         self.entries.insert(txid, entry);
@@ -448,6 +451,7 @@ impl Mempool {
         }
         self.entries.clear();
         self.spent.clear();
+        self.children.clear();
         self.bytes = 0;
         for (added_at, transaction) in ordered {
             let _ = self.accept_at(transaction, chain, added_at);
@@ -460,7 +464,14 @@ impl Mempool {
         self.bytes = self.bytes.saturating_sub(size);
         for input in &entry.transaction.input {
             self.spent.remove(&input.previous_output);
+            if let Some(children) = self.children.get_mut(&input.previous_output.txid) {
+                children.remove(txid);
+                if children.is_empty() {
+                    self.children.remove(&input.previous_output.txid);
+                }
+            }
         }
+        self.children.remove(txid);
         Some(entry)
     }
 
@@ -550,6 +561,11 @@ mod tests {
                 },
             );
         }
+        pool.children.entry(root_id).or_default().insert(child_id);
+        pool.children
+            .entry(child_id)
+            .or_default()
+            .insert(grandchild_id);
 
         assert_eq!(pool.parents(&grandchild_id), vec![child_id]);
         assert_eq!(pool.children(&root_id), vec![child_id]);

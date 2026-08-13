@@ -927,9 +927,10 @@ impl ChainState {
                 block_median_time_past,
                 &previous_entries,
             )?;
-            validation::validate_transaction_scripts(
+            validation::validate_transaction_scripts_at_time(
                 self.network,
                 height,
+                block.header.time,
                 transaction,
                 &previous_outputs,
             )?;

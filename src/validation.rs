@@ -25,6 +25,15 @@ pub struct BlockValidationStats {
     pub total_output_sat: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BuriedDeploymentHeights {
+    pub bip34: u32,
+    pub bip65: u32,
+    pub bip66: u32,
+    pub csv: u32,
+    pub segwit: u32,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("block does not extend the active tip")]
@@ -93,6 +102,73 @@ pub enum ValidationError {
 
 pub fn network_params(network: Network) -> &'static Params {
     network.params()
+}
+
+/// Consensus activation heights used by Bitcoin Core v31.1.
+pub fn buried_deployment_heights(network: Network) -> BuriedDeploymentHeights {
+    match network {
+        Network::Bitcoin => BuriedDeploymentHeights {
+            bip34: 227_931,
+            bip65: 388_381,
+            bip66: 363_725,
+            csv: 419_328,
+            segwit: 481_824,
+        },
+        Network::Testnet => BuriedDeploymentHeights {
+            bip34: 21_111,
+            bip65: 581_885,
+            bip66: 330_776,
+            csv: 770_112,
+            segwit: 834_624,
+        },
+        Network::Testnet4 | Network::Signet => BuriedDeploymentHeights {
+            bip34: 1,
+            bip65: 1,
+            bip66: 1,
+            csv: 1,
+            segwit: 1,
+        },
+        Network::Regtest => BuriedDeploymentHeights {
+            bip34: 1,
+            bip65: 1,
+            bip66: 1,
+            csv: 1,
+            segwit: 0,
+        },
+    }
+}
+
+pub fn script_flags_for_block(network: Network, height: u32, block_time: u32) -> u32 {
+    let heights = buried_deployment_heights(network);
+    let mut flags = bitcoinconsensus::VERIFY_NONE;
+    let p2sh_active = match network {
+        Network::Regtest | Network::Signet | Network::Testnet4 => true,
+        Network::Bitcoin | Network::Testnet => block_time >= network_params(network).bip16_time,
+    };
+    if p2sh_active {
+        flags |= bitcoinconsensus::VERIFY_P2SH;
+    }
+    if height >= heights.bip66 {
+        flags |= bitcoinconsensus::VERIFY_DERSIG;
+    }
+    if height >= heights.bip65 {
+        flags |= bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY;
+    }
+    if height >= heights.csv {
+        flags |= bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY;
+    }
+    if height >= heights.segwit {
+        flags |= bitcoinconsensus::VERIFY_NULLDUMMY | bitcoinconsensus::VERIFY_WITNESS;
+    }
+    let taproot_active = match network {
+        Network::Bitcoin => height > 709_632,
+        Network::Testnet => height > 1_842_096,
+        Network::Testnet4 | Network::Signet | Network::Regtest => true,
+    };
+    if taproot_active {
+        flags |= bitcoinconsensus::VERIFY_TAPROOT;
+    }
+    flags
 }
 
 pub fn validate_header(
@@ -178,7 +254,7 @@ pub fn validate_block_structure_with_signet(
     if first.input[0].script_sig.len() < 2 || first.input[0].script_sig.len() > 100 {
         return Err(ValidationError::BadCoinbase);
     }
-    if height >= network_params(network).bip34_height {
+    if height >= buried_deployment_heights(network).bip34 {
         let encoded_height = bitcoin::script::Builder::new()
             .push_int(height as i64)
             .into_script();
@@ -487,6 +563,16 @@ pub fn validate_transaction_scripts(
     transaction: &Transaction,
     previous_outputs: &[bitcoin::TxOut],
 ) -> Result<(), ValidationError> {
+    validate_transaction_scripts_at_time(network, height, u32::MAX, transaction, previous_outputs)
+}
+
+pub fn validate_transaction_scripts_at_time(
+    network: Network,
+    height: u32,
+    block_time: u32,
+    transaction: &Transaction,
+    previous_outputs: &[bitcoin::TxOut],
+) -> Result<(), ValidationError> {
     if previous_outputs.len() != transaction.input.len() {
         return Err(ValidationError::Script {
             txid: transaction.compute_txid(),
@@ -503,18 +589,7 @@ pub fn validate_transaction_scripts(
             value: output.value.to_sat() as i64,
         })
         .collect();
-    let flags = match network {
-        Network::Bitcoin => {
-            let mut flags = bitcoinconsensus::height_to_flags(height);
-            if height >= 709_632 {
-                flags |= bitcoinconsensus::VERIFY_TAPROOT;
-            }
-            flags
-        }
-        Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => {
-            bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT
-        }
-    };
+    let flags = script_flags_for_block(network, height, block_time);
     for (input, previous_output) in previous_outputs.iter().enumerate() {
         if let Err(error) = bitcoinconsensus::verify_with_flags(
             previous_output.script_pubkey.as_bytes(),
@@ -645,7 +720,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::null(),
-                script_sig: ScriptBuf::from_bytes(vec![1, 1]),
+                script_sig: ScriptBuf::from_bytes(vec![0x51, 0]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
@@ -686,6 +761,18 @@ mod tests {
             txdata: vec![coinbase, transaction],
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let mut invalid_height = block.clone();
+        invalid_height.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(vec![1, 1]);
+        invalid_height.header.merkle_root = invalid_height.compute_merkle_root().unwrap();
+        assert!(matches!(
+            validate_block_structure(
+                &invalid_height,
+                Network::Regtest,
+                1,
+                Amount::MAX_MONEY.to_sat()
+            ),
+            Err(ValidationError::BadCoinbaseHeight)
+        ));
         assert!(matches!(
             validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
             Err(ValidationError::BadOutputValue(_))

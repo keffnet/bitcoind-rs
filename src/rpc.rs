@@ -15,7 +15,10 @@ use bitcoin::blockdata::script::{Builder, PushBytesBuf};
 use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
+use bitcoin::ecdsa::Signature as EcdsaSignature;
 use bitcoin::hashes::Hash;
+use bitcoin::secp256k1::{Message, Secp256k1};
+use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{
     Address, Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
 };
@@ -880,6 +883,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "createrawtransaction" => create_raw_transaction(node, params),
         "decodescript" => decode_script(node, params),
         "sendrawtransaction" => send_raw_transaction(node, params),
+        "signrawtransactionwithkey" => sign_raw_transaction_with_key(node, params),
         "submitblock" => submit_block(node, params),
         "getblocktemplate" => get_block_template(node, params),
         "getmininginfo" => get_mining_info(node),
@@ -2942,6 +2946,252 @@ fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(txid.to_string()))
 }
 
+struct SigningPrevout {
+    output: TxOut,
+    redeem_script: Option<ScriptBuf>,
+}
+
+fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let bytes = hex::decode(param::<String>(params, 0)?)?;
+    let mut transaction: Transaction = deserialize(&bytes)?;
+    let private_keys = params
+        .get(1)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("private keys must be an array"))?
+        .iter()
+        .map(|value| {
+            let wif = value
+                .as_str()
+                .ok_or_else(|| anyhow!("private keys must be WIF strings"))?;
+            bitcoin::PrivateKey::from_wif(wif)
+                .map_err(|error| anyhow!("private key decode failed: {error}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let prevouts = parse_signing_prevouts(params.get(2))?;
+    let sighash_type = params
+        .get(3)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_str)
+        .unwrap_or("SIGHASH_ALL")
+        .parse::<EcdsaSighashType>()
+        .map_err(|error| anyhow!("invalid sighash type: {error}"))?;
+    let secp = Secp256k1::new();
+    let mut errors = Vec::new();
+    for input_index in 0..transaction.input.len() {
+        let input = &transaction.input[input_index];
+        let Some(prevout) = prevouts.get(&input.previous_output) else {
+            errors.push(signing_error(
+                &transaction,
+                input_index,
+                "missing prevtx metadata",
+            ));
+            continue;
+        };
+        if let Err(error) = sign_transaction_input(
+            &mut transaction,
+            input_index,
+            prevout,
+            &private_keys,
+            &secp,
+            sighash_type,
+        ) {
+            errors.push(signing_error(&transaction, input_index, &error.to_string()));
+        }
+    }
+    let previous_outputs = transaction
+        .input
+        .iter()
+        .filter_map(|input| {
+            prevouts
+                .get(&input.previous_output)
+                .map(|prevout| prevout.output.clone())
+        })
+        .collect::<Vec<_>>();
+    let complete = errors.is_empty()
+        && previous_outputs.len() == transaction.input.len()
+        && validation::validate_transaction_scripts(
+            node.config.network,
+            node.chain.read().height().saturating_add(1),
+            &transaction,
+            &previous_outputs,
+        )
+        .is_ok();
+    Ok(json!({
+        "hex": hex::encode(serialize(&transaction)),
+        "complete": complete,
+        "errors": errors,
+    }))
+}
+
+fn parse_signing_prevouts(value: Option<&Value>) -> Result<HashMap<OutPoint, SigningPrevout>> {
+    let Some(entries) = value.and_then(Value::as_array) else {
+        return Ok(HashMap::new());
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            let txid: Txid = entry
+                .get("txid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("prevtx txid is missing"))?
+                .parse()?;
+            let vout = entry
+                .get("vout")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("prevtx vout is missing"))?;
+            let vout = u32::try_from(vout).map_err(|_| anyhow!("prevtx vout is out of range"))?;
+            let script = entry
+                .get("scriptPubKey")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("prevtx scriptPubKey is missing"))?;
+            let amount = entry
+                .get("amount")
+                .and_then(Value::as_f64)
+                .ok_or_else(|| anyhow!("prevtx amount is missing"))?;
+            let redeem_script = entry
+                .get("redeemScript")
+                .filter(|value| !value.is_null())
+                .and_then(Value::as_str)
+                .map(|script| -> Result<ScriptBuf> {
+                    Ok(ScriptBuf::from_bytes(hex::decode(script)?))
+                })
+                .transpose()?;
+            Ok((
+                OutPoint::new(txid, vout),
+                SigningPrevout {
+                    output: TxOut {
+                        value: Amount::from_btc(amount)?,
+                        script_pubkey: ScriptBuf::from_bytes(hex::decode(script)?),
+                    },
+                    redeem_script,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn sign_transaction_input(
+    transaction: &mut Transaction,
+    input_index: usize,
+    prevout: &SigningPrevout,
+    private_keys: &[bitcoin::PrivateKey],
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+    sighash_type: EcdsaSighashType,
+) -> Result<()> {
+    let signing_script = prevout
+        .redeem_script
+        .as_ref()
+        .unwrap_or(&prevout.output.script_pubkey);
+    let key = private_keys
+        .iter()
+        .find(|key| key_matches_script(key, signing_script, secp))
+        .ok_or_else(|| anyhow!("no private key matches the prevout script"))?;
+    let public_key = key.public_key(secp);
+    if signing_script.is_p2wpkh() {
+        let sighash = SighashCache::new(&*transaction).p2wpkh_signature_hash(
+            input_index,
+            signing_script,
+            prevout.output.value,
+            sighash_type,
+        )?;
+        let signature = secp.sign_ecdsa(&Message::from(sighash), &key.inner);
+        let signature = EcdsaSignature {
+            signature,
+            sighash_type,
+        };
+        {
+            let mut cache = SighashCache::new(&mut *transaction);
+            *cache
+                .witness_mut(input_index)
+                .ok_or_else(|| anyhow!("input index is out of range"))? =
+                Witness::p2wpkh(&signature, &public_key.inner);
+        }
+        if prevout.output.script_pubkey.is_p2sh() {
+            let redeem = PushBytesBuf::try_from(signing_script.as_bytes().to_vec())
+                .map_err(|_| anyhow!("redeem script is too large"))?;
+            transaction.input[input_index].script_sig =
+                Builder::new().push_slice(redeem).into_script();
+        }
+    } else if signing_script.is_p2pkh() || signing_script.is_p2pk() {
+        let sighash = SighashCache::new(&*transaction).legacy_signature_hash(
+            input_index,
+            signing_script,
+            sighash_type.to_u32(),
+        )?;
+        let signature = secp.sign_ecdsa(&Message::from(sighash), &key.inner);
+        let mut signature_bytes = signature.serialize_der().to_vec();
+        signature_bytes.push(sighash_type.to_u32() as u8);
+        let signature = PushBytesBuf::try_from(signature_bytes)
+            .map_err(|_| anyhow!("signature is too large"))?;
+        let public_key = PushBytesBuf::try_from(public_key.to_bytes())
+            .map_err(|_| anyhow!("public key is too large"))?;
+        let mut builder = Builder::new();
+        if signing_script.is_p2pk() {
+            builder = builder.push_slice(signature);
+        } else {
+            builder = builder.push_slice(signature).push_slice(public_key);
+        }
+        if prevout.output.script_pubkey.is_p2sh() {
+            let redeem = PushBytesBuf::try_from(signing_script.as_bytes().to_vec())
+                .map_err(|_| anyhow!("redeem script is too large"))?;
+            builder = builder.push_slice(redeem);
+        }
+        transaction.input[input_index].script_sig = builder.into_script();
+    } else {
+        bail!("only P2PK, P2PKH, P2WPKH, and nested P2SH-P2WPKH are supported")
+    }
+    Ok(())
+}
+
+fn key_matches_script(
+    key: &bitcoin::PrivateKey,
+    script: &bitcoin::Script,
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+) -> bool {
+    let public_key = key.public_key(secp);
+    if script.is_p2pkh() {
+        Address::p2pkh(public_key, Network::Bitcoin)
+            .script_pubkey()
+            .as_script()
+            == script
+            || Address::p2pkh(public_key, Network::Testnet)
+                .script_pubkey()
+                .as_script()
+                == script
+    } else if script.is_p2wpkh() {
+        bitcoin::CompressedPublicKey::try_from(public_key).is_ok_and(|public_key| {
+            Address::p2wpkh(&public_key, Network::Bitcoin)
+                .script_pubkey()
+                .as_script()
+                == script
+                || Address::p2wpkh(&public_key, Network::Testnet)
+                    .script_pubkey()
+                    .as_script()
+                    == script
+        })
+    } else if script.is_p2pk() {
+        Builder::new()
+            .push_key(&public_key)
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKSIG)
+            .into_script()
+            .as_script()
+            == script
+    } else {
+        false
+    }
+}
+
+fn signing_error(transaction: &Transaction, input_index: usize, error: &str) -> Value {
+    let input = &transaction.input[input_index];
+    json!({
+        "txid": transaction.compute_txid().to_string(),
+        "vout": input.previous_output.vout,
+        "scriptSig": hex::encode(input.script_sig.as_bytes()),
+        "sequence": input.sequence.to_consensus_u32(),
+        "error": error,
+    })
+}
+
 fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let block: bitcoin::Block = deserialize(&bytes)?;
@@ -4471,6 +4721,7 @@ fn rpc_help(method: &str) -> String {
         "createrawtransaction",
         "decodescript",
         "sendrawtransaction",
+        "signrawtransactionwithkey",
         "submitblock",
         "getblocktemplate",
         "getmininginfo",
@@ -5263,6 +5514,64 @@ mod tests {
             decoded["addresses"][0],
             "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
         );
+    }
+
+    #[test]
+    fn signrawtransactionwithkey_signs_a_wallet_free_wpkh_spend() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        let private = bitcoin::PrivateKey::new(secret, Network::Regtest);
+        let secp = Secp256k1::new();
+        let public_key = private.public_key(&secp);
+        let compressed = bitcoin::CompressedPublicKey::try_from(public_key).unwrap();
+        let previous_script = Address::p2wpkh(&compressed, Network::Regtest).script_pubkey();
+        let previous_txid = Txid::from_byte_array([8; 32]);
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(previous_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let result = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                hex::encode(serialize(&unsigned)),
+                [private.to_wif()],
+                [{
+                    "txid": previous_txid.to_string(),
+                    "vout": 0,
+                    "scriptPubKey": hex::encode(previous_script.as_bytes()),
+                    "amount": 1.0,
+                }],
+            ]),
+        )
+        .unwrap();
+        assert_eq!(result["complete"], true);
+        assert!(result["errors"].as_array().unwrap().is_empty());
+        let signed: Transaction =
+            deserialize(&hex::decode(result["hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(signed.input[0].script_sig, ScriptBuf::new());
+        assert_eq!(signed.input[0].witness.len(), 2);
     }
 
     #[test]

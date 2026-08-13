@@ -512,7 +512,9 @@ impl ChainState {
         )?;
 
         let mut spent = HashSet::new();
-        let mut removals = Vec::new();
+        let mut spent_entries = Vec::new();
+        let mut created = HashMap::new();
+        let block_median_time_past = self.median_time_past();
         let mut total_fees = 0u64;
         for transaction in block.txdata.iter().skip(1) {
             let txid = transaction.compute_txid();
@@ -524,7 +526,11 @@ impl ChainState {
                 if !spent.insert(outpoint) {
                     return Err(ValidationError::DuplicateInput(txid).into());
                 }
-                let Some(entry) = self.utxos.get(&outpoint).cloned() else {
+                let Some(entry) = created
+                    .get(&outpoint)
+                    .or_else(|| self.utxos.get(&outpoint))
+                    .cloned()
+                else {
                     return Err(ValidationError::MissingInput { outpoint }.into());
                 };
                 if entry.coinbase && height < entry.height.saturating_add(COINBASE_MATURITY) {
@@ -535,12 +541,12 @@ impl ChainState {
                     .ok_or(ValidationError::InputTotalOverflow)?;
                 previous_outputs.push(entry.output.clone());
                 previous_entries.push(entry.clone());
-                removals.push((outpoint, entry));
+                spent_entries.push((outpoint, entry));
             }
             validation::validate_transaction_finality(
                 transaction,
                 height,
-                self.median_time_past(),
+                block_median_time_past,
                 &previous_entries,
             )?;
             validation::validate_transaction_scripts(
@@ -562,6 +568,18 @@ impl ChainState {
             total_fees = total_fees
                 .checked_add(input_total - output_total)
                 .ok_or(ValidationError::InputTotalOverflow)?;
+
+            for (output_index, output) in transaction.output.iter().enumerate() {
+                created.insert(
+                    OutPoint::new(txid, output_index as u32),
+                    UtxoEntry {
+                        output: output.clone(),
+                        height,
+                        median_time_past: block_median_time_past,
+                        coinbase: false,
+                    },
+                );
+            }
         }
         let allowed_coinbase =
             validation::checked_money_add(validation::block_subsidy(height), total_fees)?;
@@ -584,16 +602,15 @@ impl ChainState {
         if persist {
             self.store.insert(block)?;
         }
-        for (outpoint, _) in &removals {
+        for (outpoint, _) in &spent_entries {
             self.utxos.remove(outpoint);
         }
+        let spent_entries: HashMap<OutPoint, UtxoEntry> = spent_entries.into_iter().collect();
         for (transaction_index, transaction) in block.txdata.iter().enumerate() {
             let txid = transaction.compute_txid();
             let mut affected_scripts = HashSet::new();
             for input in &transaction.input {
-                if let Some(entry) =
-                    self.lookup_spent_entry(block, input.previous_output, &spent, &removals)
-                {
+                if let Some(entry) = spent_entries.get(&input.previous_output) {
                     affected_scripts.insert(electrum_script_hash(&entry.output.script_pubkey));
                 }
             }
@@ -604,7 +621,7 @@ impl ChainState {
                     UtxoEntry {
                         output: output.clone(),
                         height,
-                        median_time_past: self.median_time_past(),
+                        median_time_past: block_median_time_past,
                         coinbase: transaction_index == 0,
                     },
                 );
@@ -834,19 +851,6 @@ impl ChainState {
         if history.last() != Some(&entry) {
             history.push(entry);
         }
-    }
-
-    fn lookup_spent_entry(
-        &self,
-        _block: &Block,
-        outpoint: OutPoint,
-        _spent: &HashSet<OutPoint>,
-        removals: &[(OutPoint, UtxoEntry)],
-    ) -> Option<UtxoEntry> {
-        removals
-            .iter()
-            .find(|(candidate, _)| *candidate == outpoint)
-            .map(|(_, entry)| entry.clone())
     }
 
     fn expected_target(&self, candidate_time: u32) -> Target {
@@ -1125,25 +1129,70 @@ mod tests {
         assert_eq!(state.height(), 2);
     }
 
-    fn mine_block_from_header(previous: &Header, height: u32, tag: u8) -> Block {
-        let transaction = Transaction {
+    #[test]
+    fn accepts_transactions_spending_outputs_created_in_the_same_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut funding_block = None;
+        for height in 1..=100 {
+            let block = mine_block(&state, height);
+            if height == 1 {
+                funding_block = Some(block.clone());
+            }
+            state.connect_block(block).unwrap();
+        }
+        let funding = funding_block.expect("funding block");
+        let funding_outpoint = OutPoint::new(funding.txdata[0].compute_txid(), 0);
+        let first = Transaction {
             version: Version::ONE,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint::null(),
-                script_sig: Builder::new()
-                    .push_int(height as i64)
-                    .push_slice([tag])
-                    .push_slice([0u8])
-                    .into_script(),
+                previous_output: funding_outpoint,
+                script_sig: Builder::new().push_int(1).into_script(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
             }],
             output: vec![TxOut {
-                value: Amount::from_sat(5_000_000_000),
-                script_pubkey: bitcoin::ScriptBuf::new(),
+                value: Amount::from_sat(4_000_000_000),
+                script_pubkey: Builder::new().push_int(1).into_script(),
             }],
         };
+        let second = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(first.compute_txid(), 0),
+                script_sig: Builder::new().push_int(1).into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(3_000_000_000),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+        let previous = *state.header(100).expect("height 100 header");
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: previous.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: previous.time + 1,
+                bits: previous.bits,
+                nonce: 0,
+            },
+            txdata: vec![coinbase_transaction(101, 7_000_000_000, 11), first, second],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        state.connect_block(block).unwrap();
+        assert_eq!(state.height(), 101);
+    }
+
+    fn mine_block_from_header(previous: &Header, height: u32, tag: u8) -> Block {
+        let transaction = coinbase_transaction(height, 5_000_000_000, tag);
         let mut block = Block {
             header: Header {
                 version: BlockVersion::TWO,
@@ -1160,5 +1209,26 @@ mod tests {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
         block
+    }
+
+    fn coinbase_transaction(height: u32, value: u64, tag: u8) -> Transaction {
+        Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Builder::new()
+                    .push_int(height as i64)
+                    .push_slice([tag])
+                    .push_slice([0u8])
+                    .into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        }
     }
 }

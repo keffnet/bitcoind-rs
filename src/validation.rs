@@ -360,4 +360,41 @@ mod tests {
         };
         validate_transaction_scripts(Network::Regtest, 1, &transaction, &[previous]).unwrap();
     }
+
+    #[test]
+    fn relative_height_lock_is_enforced() {
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([2u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::from_height(2),
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let entry = crate::chain::UtxoEntry {
+            output: TxOut {
+                value: Amount::from_sat(2),
+                script_pubkey: ScriptBuf::new(),
+            },
+            height: 10,
+            median_time_past: 500_000_000,
+            coinbase: false,
+        };
+        assert!(
+            validate_transaction_finality(
+                &transaction,
+                11,
+                500_000_001,
+                std::slice::from_ref(&entry),
+            )
+            .is_err()
+        );
+        assert!(validate_transaction_finality(&transaction, 12, 500_000_001, &[entry]).is_ok());
+    }
 }

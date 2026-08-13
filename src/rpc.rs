@@ -994,6 +994,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         }
         "getmempoolancestors" => get_mempool_relationship(node, params, true),
         "getmempooldescendants" => get_mempool_relationship(node, params, false),
+        "getmempoolcluster" => get_mempool_cluster(node, params),
+        "getmempoolfeeratediagram" => get_mempool_fee_rate_diagram(node),
         "savemempool" => {
             node.persist_mempool()?;
             Ok(json!(
@@ -4607,6 +4609,69 @@ fn get_mempool_relationship(node: &Arc<Node>, params: &Value, ancestors: bool) -
     }
 }
 
+fn get_mempool_cluster(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let txid: Txid = param::<String>(params, 0)?.parse()?;
+    let mempool = node.mempool.read();
+    if mempool.get(&txid).is_none() {
+        bail!("Transaction not in mempool")
+    }
+    let mut cluster = HashSet::new();
+    let mut pending = vec![txid];
+    while let Some(current) = pending.pop() {
+        if !cluster.insert(current) {
+            continue;
+        }
+        pending.extend(mempool.parents(&current));
+        pending.extend(mempool.children(&current));
+    }
+    let transaction_ids = mempool
+        .transaction_order()
+        .into_iter()
+        .filter(|candidate| cluster.contains(candidate))
+        .collect::<Vec<_>>();
+    let (weight, fee) = transaction_ids
+        .iter()
+        .fold((0u64, 0u64), |(weight, fee), txid| {
+            let Some(entry) = mempool.get(txid) else {
+                return (weight, fee);
+            };
+            (
+                weight.saturating_add(entry.transaction.weight().to_wu()),
+                fee.saturating_add(entry.fee_sat),
+            )
+        });
+    Ok(json!({
+        "clusterweight": weight,
+        "txcount": transaction_ids.len(),
+        "chunks": [{
+            "chunkfee": sat_to_btc(fee),
+            "chunkweight": weight,
+            "txs": transaction_ids
+                .into_iter()
+                .map(|txid| txid.to_string())
+                .collect::<Vec<_>>(),
+        }],
+    }))
+}
+
+fn get_mempool_fee_rate_diagram(node: &Arc<Node>) -> Result<Value> {
+    let mempool = node.mempool.read();
+    let (weight, fee) = mempool
+        .transaction_order()
+        .into_iter()
+        .filter_map(|txid| mempool.get(&txid))
+        .fold((0u64, 0u64), |(weight, fee), entry| {
+            (
+                weight.saturating_add(entry.transaction.weight().to_wu()),
+                fee.saturating_add(entry.fee_sat),
+            )
+        });
+    if weight == 0 {
+        return Ok(json!([]));
+    }
+    Ok(json!([{"weight": weight, "fee": sat_to_btc(fee)}]))
+}
+
 fn mempool_entry_json(mempool: &Mempool, txid: &Txid, height: u32) -> Result<Value> {
     let entry = mempool
         .get(txid)
@@ -5733,6 +5798,8 @@ fn rpc_help(method: &str) -> String {
         "getmempoolentry",
         "getmempoolancestors",
         "getmempooldescendants",
+        "getmempoolcluster",
+        "getmempoolfeeratediagram",
         "savemempool",
         "gettxoutsetinfo",
         "dumptxoutset",
@@ -6190,6 +6257,66 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn mempool_cluster_and_fee_diagram_report_a_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let mined = generate_blocks_to_script(&node, script.clone(), 101, 1_000).unwrap();
+        assert_eq!(mined.as_array().unwrap().len(), 101);
+        let block_hash = node.chain.read().block_hash(1).unwrap();
+        let coinbase = node
+            .chain
+            .write()
+            .block(&block_hash)
+            .unwrap()
+            .unwrap()
+            .txdata[0]
+            .clone();
+        let previous_output = OutPoint::new(coinbase.compute_txid(), 0);
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: coinbase.output[0].value - bitcoin::Amount::from_sat(1_000),
+                script_pubkey: script,
+            }],
+        };
+        let txid = node.accept_transaction(transaction).unwrap();
+
+        let cluster =
+            dispatch_method(&node, "getmempoolcluster", &json!([txid.to_string()])).unwrap();
+        assert_eq!(
+            cluster["clusterweight"],
+            cluster["chunks"][0]["chunkweight"]
+        );
+        assert_eq!(cluster["txcount"], json!(1));
+        assert_eq!(cluster["chunks"][0]["txs"], json!([txid.to_string()]));
+
+        let diagram = dispatch_method(&node, "getmempoolfeeratediagram", &json!([])).unwrap();
+        assert_eq!(diagram.as_array().unwrap().len(), 1);
+        assert!(diagram[0]["weight"].as_u64().unwrap() > 0);
+        assert!(diagram[0]["fee"].as_f64().unwrap() > 0.0);
     }
 
     #[test]

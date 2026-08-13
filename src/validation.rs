@@ -34,6 +34,16 @@ pub struct BuriedDeploymentHeights {
     pub segwit: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Bip9Deployment {
+    pub bit: u8,
+    pub start_time: i64,
+    pub timeout: i64,
+    pub min_activation_height: u32,
+    pub threshold: u32,
+    pub period: u32,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("block does not extend the active tip")]
@@ -138,6 +148,78 @@ pub fn buried_deployment_heights(network: Network) -> BuriedDeploymentHeights {
     }
 }
 
+pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
+    let testdummy = match network {
+        Network::Regtest => Bip9Deployment {
+            bit: 28,
+            start_time: 0,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            threshold: 108,
+            period: 144,
+        },
+        Network::Bitcoin | Network::Signet => Bip9Deployment {
+            bit: 28,
+            start_time: -2,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            threshold: 1815,
+            period: 2016,
+        },
+        Network::Testnet | Network::Testnet4 => Bip9Deployment {
+            bit: 28,
+            start_time: -2,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            threshold: 1512,
+            period: 2016,
+        },
+    };
+    let taproot = match network {
+        Network::Bitcoin => Bip9Deployment {
+            bit: 2,
+            start_time: 1_619_222_400,
+            timeout: 1_628_640_000,
+            min_activation_height: 709_632,
+            threshold: 1815,
+            period: 2016,
+        },
+        Network::Testnet => Bip9Deployment {
+            bit: 2,
+            start_time: 1_619_222_400,
+            timeout: 1_628_640_000,
+            min_activation_height: 0,
+            threshold: 1512,
+            period: 2016,
+        },
+        Network::Testnet4 => Bip9Deployment {
+            bit: 2,
+            start_time: -1,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            threshold: 1512,
+            period: 2016,
+        },
+        Network::Signet => Bip9Deployment {
+            bit: 2,
+            start_time: -1,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            threshold: 1815,
+            period: 2016,
+        },
+        Network::Regtest => Bip9Deployment {
+            bit: 2,
+            start_time: -1,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            threshold: 108,
+            period: 144,
+        },
+    };
+    [testdummy, taproot]
+}
+
 pub fn script_flags_for_block(network: Network, height: u32, block_time: u32) -> u32 {
     let heights = buried_deployment_heights(network);
     let mut flags = bitcoinconsensus::VERIFY_NONE;
@@ -162,8 +244,7 @@ pub fn script_flags_for_block(network: Network, height: u32, block_time: u32) ->
     }
     let taproot_active = match network {
         Network::Bitcoin => height > 709_632,
-        Network::Testnet => height > 1_842_096,
-        Network::Testnet4 | Network::Signet | Network::Regtest => true,
+        Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => true,
     };
     if taproot_active {
         flags |= bitcoinconsensus::VERIFY_TAPROOT;

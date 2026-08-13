@@ -510,6 +510,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             Ok(json!("bitcoind stopping"))
         }
         "getblockchaininfo" => get_blockchain_info(node),
+        "getdeploymentinfo" => get_deployment_info(node, params),
         "getblockcount" => Ok(json!(node.chain.read().height())),
         "getbestblockhash" => Ok(json!(node.chain.read().best_hash().to_string())),
         "getblockhash" => {
@@ -742,6 +743,231 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         result["signet_challenge"] = json!(hex::encode(challenge));
     }
     Ok(result)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Bip9State {
+    Defined,
+    Started,
+    LockedIn,
+    Active,
+    Failed,
+}
+
+impl Bip9State {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Defined => "defined",
+            Self::Started => "started",
+            Self::LockedIn => "locked_in",
+            Self::Active => "active",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+fn median_header_time(headers: &[bitcoin::block::Header], end: usize) -> u32 {
+    let start = end.saturating_sub(10);
+    let mut times = headers[start..=end]
+        .iter()
+        .map(|header| header.time)
+        .collect::<Vec<_>>();
+    times.sort_unstable();
+    times[times.len() / 2]
+}
+
+fn version_signals(header: &bitcoin::block::Header, bit: u8) -> bool {
+    let version = header.version.to_consensus() as u32;
+    version & 0xe000_0000 == 0x2000_0000 && version & (1u32 << bit) != 0
+}
+
+fn bip9_state_at_height(
+    headers: &[bitcoin::block::Header],
+    deployment: validation::Bip9Deployment,
+    next_height: u32,
+) -> (Bip9State, u32) {
+    if deployment.start_time == -1 {
+        return (Bip9State::Active, 0);
+    }
+    if deployment.start_time == -2 {
+        return (Bip9State::Defined, 0);
+    }
+    let period = deployment.period.max(1);
+    let mut state = Bip9State::Defined;
+    let mut since = 0;
+    let mut boundary = period;
+    while boundary <= next_height {
+        let previous_end = usize::try_from(boundary - 1)
+            .unwrap_or(usize::MAX)
+            .min(headers.len().saturating_sub(1));
+        let previous_start = usize::try_from(boundary.saturating_sub(period))
+            .unwrap_or(usize::MAX)
+            .min(previous_end);
+        let median_time = median_header_time(headers, previous_end);
+        let signal_count = headers[previous_start..=previous_end]
+            .iter()
+            .filter(|header| version_signals(header, deployment.bit))
+            .count() as u32;
+        let next_state = match state {
+            Bip9State::Defined if i64::from(median_time) >= deployment.start_time => {
+                Bip9State::Started
+            }
+            Bip9State::Started if i64::from(median_time) >= deployment.timeout => Bip9State::Failed,
+            Bip9State::Started if signal_count >= deployment.threshold => Bip9State::LockedIn,
+            Bip9State::LockedIn if boundary >= deployment.min_activation_height => {
+                Bip9State::Active
+            }
+            _ => state,
+        };
+        if next_state != state {
+            state = next_state;
+            since = boundary;
+        }
+        let Some(next_boundary) = boundary.checked_add(period) else {
+            break;
+        };
+        boundary = next_boundary;
+    }
+    (state, since)
+}
+
+fn bip9_deployment_json(
+    headers: &[bitcoin::block::Header],
+    selected_height: u32,
+    deployment: validation::Bip9Deployment,
+) -> Value {
+    let next_height = selected_height.saturating_add(1);
+    let (state, since) = bip9_state_at_height(headers, deployment, next_height);
+    let (next_state, _) = bip9_state_at_height(headers, deployment, next_height.saturating_add(1));
+    let mut bip9 = json!({
+        "start_time": deployment.start_time,
+        "timeout": deployment.timeout,
+        "min_activation_height": deployment.min_activation_height,
+        "status": state.as_str(),
+        "since": since,
+        "status_next": next_state.as_str(),
+    });
+    if matches!(state, Bip9State::Started | Bip9State::LockedIn) {
+        let period = deployment.period.max(1);
+        let period_start = (selected_height / period) * period;
+        let start = usize::try_from(period_start).unwrap_or(usize::MAX);
+        let end = usize::try_from(selected_height)
+            .unwrap_or(usize::MAX)
+            .min(headers.len().saturating_sub(1));
+        let (count, signalling) = if start <= end {
+            let mut signalling = String::with_capacity(end - start + 1);
+            let mut count = 0u32;
+            for header in &headers[start..=end] {
+                if version_signals(header, deployment.bit) {
+                    count = count.saturating_add(1);
+                    signalling.push('#');
+                } else {
+                    signalling.push('-');
+                }
+            }
+            (count, signalling)
+        } else {
+            (0, String::new())
+        };
+        let elapsed = if start <= end {
+            u32::try_from(end - start + 1).unwrap_or(period)
+        } else {
+            0
+        };
+        bip9["bit"] = json!(deployment.bit);
+        bip9["statistics"] = json!({
+            "period": period,
+            "elapsed": elapsed,
+            "count": count,
+            "threshold": deployment.threshold,
+            "possible": count.saturating_add(period.saturating_sub(elapsed)) >= deployment.threshold,
+        });
+        bip9["signalling"] = json!(signalling);
+    }
+    let mut result = json!({
+        "type": "bip9",
+        "active": state == Bip9State::Active,
+        "bip9": bip9,
+    });
+    if state == Bip9State::Active {
+        result["height"] = json!(since);
+    }
+    result
+}
+
+fn script_flag_names(flags: u32) -> Vec<&'static str> {
+    [
+        (
+            bitcoinconsensus::VERIFY_CHECKLOCKTIMEVERIFY,
+            "CHECKLOCKTIMEVERIFY",
+        ),
+        (
+            bitcoinconsensus::VERIFY_CHECKSEQUENCEVERIFY,
+            "CHECKSEQUENCEVERIFY",
+        ),
+        (bitcoinconsensus::VERIFY_DERSIG, "DERSIG"),
+        (bitcoinconsensus::VERIFY_NULLDUMMY, "NULLDUMMY"),
+        (bitcoinconsensus::VERIFY_P2SH, "P2SH"),
+        (bitcoinconsensus::VERIFY_TAPROOT, "TAPROOT"),
+        (bitcoinconsensus::VERIFY_WITNESS, "WITNESS"),
+    ]
+    .into_iter()
+    .filter_map(|(flag, name)| (flags & flag != 0).then_some(name))
+    .collect()
+}
+
+fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let chain = node.chain.read();
+    let hash = match params.get(0).filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| anyhow!("blockhash must be a string"))?
+            .parse::<BlockHash>()?,
+        None => chain.best_hash(),
+    };
+    let height = chain
+        .block_height_by_hash(&hash)
+        .ok_or_else(|| anyhow!("Block not found"))?;
+    let header = chain
+        .header_by_hash(&hash)
+        .ok_or_else(|| anyhow!("Block header not found"))?;
+    let headers = chain
+        .headers_to_hash(&hash)
+        .ok_or_else(|| anyhow!("Block header chain is unavailable"))?;
+    let heights = validation::buried_deployment_heights(chain.network);
+    let mut deployments = serde_json::Map::new();
+    for (name, activation_height) in [
+        ("bip34", heights.bip34),
+        ("dersig", heights.bip66),
+        ("cltv", heights.bip65),
+        ("csv", heights.csv),
+        ("segwit", heights.segwit),
+    ] {
+        deployments.insert(
+            name.to_owned(),
+            json!({
+                "type": "buried",
+                "active": height.saturating_add(1) >= activation_height,
+                "height": activation_height,
+            }),
+        );
+    }
+    let [testdummy, taproot] = validation::bip9_deployments(chain.network);
+    deployments.insert(
+        "testdummy".to_owned(),
+        bip9_deployment_json(&headers, height, testdummy),
+    );
+    deployments.insert(
+        "taproot".to_owned(),
+        bip9_deployment_json(&headers, height, taproot),
+    );
+    let flags = validation::script_flags_for_block(chain.network, height, header.time);
+    Ok(json!({
+        "hash": hash.to_string(),
+        "height": height,
+        "script_flags": script_flag_names(flags),
+        "deployments": Value::Object(deployments),
+    }))
 }
 
 fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -2371,6 +2597,7 @@ fn method_params_string(params: &Value) -> &str {
 fn rpc_help(method: &str) -> String {
     const METHODS: &[&str] = &[
         "getblockchaininfo",
+        "getdeploymentinfo",
         "getblockcount",
         "getbestblockhash",
         "getblockhash",
@@ -2607,6 +2834,41 @@ mod tests {
         assert!(info["warnings"].is_array());
         assert!(info["bits"].as_str().is_some());
         assert!(info["target"].as_str().is_some());
+    }
+
+    #[test]
+    fn deployment_info_reports_buried_and_bip9_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+
+        let info = get_deployment_info(&node, &json!([])).unwrap();
+        assert_eq!(info["height"], json!(0));
+        assert_eq!(info["deployments"]["bip34"]["height"], json!(1));
+        assert_eq!(info["deployments"]["bip34"]["active"], json!(true));
+        assert_eq!(info["deployments"]["segwit"]["height"], json!(0));
+        assert_eq!(info["deployments"]["taproot"]["active"], json!(true));
+        assert_eq!(
+            info["deployments"]["testdummy"]["bip9"]["status"],
+            json!("defined")
+        );
+        assert!(
+            info["script_flags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|flag| { flag == "TAPROOT" })
+        );
     }
 
     #[test]

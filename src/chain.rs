@@ -304,6 +304,21 @@ impl ChainState {
         self.block_index.get(hash).map(|node| node.header)
     }
 
+    pub fn headers_to_hash(&self, hash: &BlockHash) -> Option<Vec<bitcoin::block::Header>> {
+        let mut headers = Vec::new();
+        let mut cursor = *hash;
+        loop {
+            let node = self.block_index.get(&cursor)?;
+            headers.push(node.header);
+            if node.height == 0 {
+                break;
+            }
+            cursor = node.header.prev_blockhash;
+        }
+        headers.reverse();
+        Some(headers)
+    }
+
     pub fn block_height_by_hash(&self, hash: &BlockHash) -> Option<u32> {
         self.block_index.get(hash).map(|node| node.height)
     }

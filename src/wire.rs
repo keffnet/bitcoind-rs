@@ -283,6 +283,13 @@ pub async fn read_message<R: AsyncRead + Unpin>(
     reader: &mut R,
     network: Network,
 ) -> Result<Message> {
+    Ok(read_message_with_size(reader, network).await?.0)
+}
+
+pub async fn read_message_with_size<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    network: Network,
+) -> Result<(Message, usize)> {
     let mut header = [0u8; HEADER_SIZE];
     reader.read_exact(&mut header).await?;
     let length = u32::from_le_bytes(header[16..20].try_into().expect("slice length")) as usize;
@@ -293,7 +300,8 @@ pub async fn read_message<R: AsyncRead + Unpin>(
     frame.extend_from_slice(&header);
     frame.resize(HEADER_SIZE + length, 0);
     reader.read_exact(&mut frame[HEADER_SIZE..]).await?;
-    decode_message(network, &frame)
+    let size = frame.len();
+    Ok((decode_message(network, &frame)?, size))
 }
 
 pub async fn write_message<W: AsyncWrite + Unpin>(
@@ -301,10 +309,21 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     network: Network,
     message: &Message,
 ) -> Result<()> {
+    write_message_with_size(writer, network, message)
+        .await
+        .map(|_| ())
+}
+
+pub async fn write_message_with_size<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    network: Network,
+    message: &Message,
+) -> Result<usize> {
     let frame = encode_message(network, message)?;
+    let size = frame.len();
     writer.write_all(&frame).await?;
     writer.flush().await?;
-    Ok(())
+    Ok(size)
 }
 
 fn checksum(payload: &[u8]) -> [u8; 4] {

@@ -16,7 +16,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +47,14 @@ pub struct PeerInfo {
     pub start_height: i32,
     pub relay_transactions: bool,
     pub connected_at: u64,
+    pub last_send: u64,
+    pub last_recv: u64,
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub ping_time: Option<f64>,
+    pub min_ping: Option<f64>,
+    ping_nonce: Option<u64>,
+    ping_sent_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -67,6 +75,8 @@ pub struct Node {
     pub rpc_cookie: Option<String>,
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
+    total_bytes_sent: AtomicU64,
+    total_bytes_received: AtomicU64,
     network_active: AtomicBool,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
     peer_commands:
@@ -107,6 +117,8 @@ impl Node {
             rpc_cookie,
             mempool_path,
             peer_count: AtomicUsize::new(0),
+            total_bytes_sent: AtomicU64::new(0),
+            total_bytes_received: AtomicU64::new(0),
             network_active: AtomicBool::new(true),
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
@@ -200,6 +212,49 @@ impl Node {
         self.peer_count.load(Ordering::Relaxed)
     }
 
+    pub fn total_bytes_sent(&self) -> u64 {
+        self.total_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    pub fn total_bytes_received(&self) -> u64 {
+        self.total_bytes_received.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn record_bytes_sent(&self, peer_id: usize, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.total_bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.bytes_sent = peer.bytes_sent.saturating_add(bytes);
+            peer.last_send = unix_time_seconds();
+        }
+    }
+
+    pub(crate) fn record_bytes_received(&self, peer_id: usize, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.total_bytes_received
+            .fetch_add(bytes, Ordering::Relaxed);
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.bytes_received = peer.bytes_received.saturating_add(bytes);
+            peer.last_recv = unix_time_seconds();
+        }
+    }
+
+    pub(crate) fn record_pong(&self, peer_id: usize, nonce: u64) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id)
+            && peer.ping_nonce == Some(nonce)
+        {
+            peer.ping_nonce = None;
+            if let Some(sent_at) = peer.ping_sent_at.take() {
+                let ping_time = sent_at.elapsed().as_secs_f64();
+                peer.ping_time = Some(ping_time);
+                peer.min_ping = Some(
+                    peer.min_ping
+                        .map_or(ping_time, |minimum| minimum.min(ping_time)),
+                );
+            }
+        }
+    }
+
     pub fn network_active(&self) -> bool {
         self.network_active.load(Ordering::Relaxed)
     }
@@ -232,6 +287,14 @@ impl Node {
             start_height: 0,
             relay_transactions: true,
             connected_at,
+            last_send: connected_at,
+            last_recv: connected_at,
+            bytes_sent: 0,
+            bytes_received: 0,
+            ping_time: None,
+            min_ping: None,
+            ping_nonce: None,
+            ping_sent_at: None,
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
@@ -345,9 +408,20 @@ impl Node {
     }
 
     pub fn ping_peers(&self) {
-        let commands: Vec<_> = self.peer_commands.read().values().cloned().collect();
-        for sender in commands {
-            let _ = sender.send(p2p::PeerCommand::Ping);
+        let commands: Vec<_> = self
+            .peer_commands
+            .read()
+            .iter()
+            .map(|(peer_id, sender)| (*peer_id, sender.clone()))
+            .collect();
+        for (peer_id, sender) in commands {
+            let nonce = random();
+            if sender.send(p2p::PeerCommand::Ping(nonce)).is_ok()
+                && let Some(peer) = self.peers.write().get_mut(&peer_id)
+            {
+                peer.ping_nonce = Some(nonce);
+                peer.ping_sent_at = Some(Instant::now());
+            }
         }
     }
 
@@ -469,6 +543,13 @@ fn load_banlist(data_dir: &Path) -> Result<HashMap<IpAddr, BannedAddress>> {
         .into_iter()
         .map(|entry| (entry.address, entry))
         .collect())
+}
+
+fn unix_time_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn load_rpc_cookie(data_dir: &Path) -> Result<String> {

@@ -28,7 +28,7 @@ type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, PeerWriter>>>;
 pub(crate) enum PeerCommand {
     Disconnect,
     RequestBlock(BlockHash),
-    Ping,
+    Ping(u64),
 }
 
 struct PendingCompactBlock {
@@ -79,6 +79,7 @@ impl PeerManager {
                     .map(|entry| entry.transaction.compute_wtxid())
                     .unwrap_or_else(|| Wtxid::from_raw_hash(txid.to_raw_hash()));
                 broadcast_inventory(
+                    &relay_node,
                     &relay_peers,
                     0,
                     relay_network,
@@ -284,6 +285,8 @@ async fn serve_peer_loop(
 ) -> Result<()> {
     let height = node.chain.read().height() as i32;
     send_message(
+        node,
+        peer_id,
         writer,
         node.config.network,
         &Message::Version(VersionMessage::new(height, random())),
@@ -306,6 +309,8 @@ async fn serve_peer_loop(
                     Some(PeerCommand::Disconnect) | None => anyhow::bail!("peer disconnected by node"),
                     Some(PeerCommand::RequestBlock(hash)) => {
                         send_message(
+                            node,
+                            peer_id,
                             writer,
                             node.config.network,
                             &Message::GetData(vec![Inventory {
@@ -315,17 +320,23 @@ async fn serve_peer_loop(
                         ).await?;
                         continue;
                     }
-                    Some(PeerCommand::Ping) => {
+                    Some(PeerCommand::Ping(nonce)) => {
                         send_message(
+                            node,
+                            peer_id,
                             writer,
                             node.config.network,
-                            &Message::Ping(random()),
+                            &Message::Ping(nonce),
                         ).await?;
                         continue;
                     }
                 }
             }
-            message = wire::read_message(reader, node.config.network) => message?,
+            message = wire::read_message_with_size(reader, node.config.network) => {
+                let (message, bytes) = message?;
+                node.record_bytes_received(peer_id, bytes);
+                message
+            },
         };
         match message {
             Message::Version(version) => {
@@ -345,10 +356,18 @@ async fn serve_peer_loop(
                     version.relay,
                 );
                 if !verack_sent {
-                    send_message(writer, node.config.network, &Message::Verack).await?;
+                    send_message(node, peer_id, writer, node.config.network, &Message::Verack)
+                        .await?;
                     verack_sent = true;
                 }
-                send_peer_extensions(writer, node.config.network, &mut extensions_sent).await?;
+                send_peer_extensions(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &mut extensions_sent,
+                )
+                .await?;
                 if outbound {
                     debug!(user_agent = %version.user_agent, height = version.start_height, "completed outbound version exchange");
                 }
@@ -358,22 +377,43 @@ async fn serve_peer_loop(
                 if !version_received {
                     continue;
                 }
-                send_peer_extensions(writer, node.config.network, &mut extensions_sent).await?;
-                request_headers(node, writer).await?;
+                send_peer_extensions(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &mut extensions_sent,
+                )
+                .await?;
+                request_headers(node, peer_id, writer).await?;
             }
             Message::SendAddrV2 => {
                 addrv2_received = true;
             }
             Message::Ping(nonce) => {
-                send_message(writer, node.config.network, &Message::Pong(nonce)).await?;
+                send_message(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &Message::Pong(nonce),
+                )
+                .await?;
             }
-            Message::Pong(_) => {}
+            Message::Pong(nonce) => node.record_pong(peer_id, nonce),
             Message::GetHeaders(request) => {
                 let headers = node
                     .chain
                     .read()
                     .headers_after_locator(&request.locator_hashes, request.stop_hash);
-                send_message(writer, node.config.network, &Message::Headers(headers)).await?;
+                send_message(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &Message::Headers(headers),
+                )
+                .await?;
             }
             Message::GetBlocks(request) => {
                 let hashes = node
@@ -387,7 +427,14 @@ async fn serve_peer_loop(
                         hash: header.block_hash(),
                     })
                     .collect::<Vec<_>>();
-                send_message(writer, node.config.network, &Message::Inv(hashes)).await?;
+                send_message(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &Message::Inv(hashes),
+                )
+                .await?;
             }
             Message::Headers(headers) => {
                 if headers.is_empty() {
@@ -406,9 +453,16 @@ async fn serve_peer_loop(
                         .collect::<Vec<_>>()
                 };
                 if !requests.is_empty() {
-                    send_message(writer, node.config.network, &Message::GetData(requests)).await?;
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::GetData(requests),
+                    )
+                    .await?;
                 } else {
-                    request_headers(node, writer).await?;
+                    request_headers(node, peer_id, writer).await?;
                 }
             }
             Message::Inv(items) => {
@@ -440,7 +494,14 @@ async fn serve_peer_loop(
                         .collect::<Vec<_>>()
                 };
                 if !requests.is_empty() {
-                    send_message(writer, node.config.network, &Message::GetData(requests)).await?;
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::GetData(requests),
+                    )
+                    .await?;
                 }
             }
             Message::GetData(items) => {
@@ -450,8 +511,14 @@ async fn serve_peer_loop(
                         InventoryType::Block | InventoryType::WitnessBlock => {
                             let block = node.chain.write().block(&item.hash)?;
                             if let Some(block) = block {
-                                send_message(writer, node.config.network, &Message::Block(block))
-                                    .await?;
+                                send_message(
+                                    node,
+                                    peer_id,
+                                    writer,
+                                    node.config.network,
+                                    &Message::Block(block),
+                                )
+                                .await?;
                             } else {
                                 missing.push(item);
                             }
@@ -473,6 +540,8 @@ async fn serve_peer_loop(
                             };
                             if let Some(transaction) = transaction {
                                 send_message(
+                                    node,
+                                    peer_id,
                                     writer,
                                     node.config.network,
                                     &Message::Transaction(transaction),
@@ -486,12 +555,19 @@ async fn serve_peer_loop(
                     }
                 }
                 if !missing.is_empty() {
-                    send_message(writer, node.config.network, &Message::NotFound(missing)).await?;
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::NotFound(missing),
+                    )
+                    .await?;
                 }
             }
             Message::Block(block) => {
                 handle_received_block(node, peers, peer_id, block).await;
-                request_headers(node, writer).await?;
+                request_headers(node, peer_id, writer).await?;
             }
             Message::CompactBlock(compact) => {
                 let hash = compact.header.block_hash();
@@ -500,11 +576,18 @@ async fn serve_peer_loop(
                         match complete_compact_block(&compact, transactions) {
                             Ok(block) => {
                                 handle_received_block(node, peers, peer_id, block).await;
-                                request_headers(node, writer).await?;
+                                request_headers(node, peer_id, writer).await?;
                             }
                             Err(error) => {
                                 debug!(%hash, %error, "invalid compact block reconstruction");
-                                request_full_block(writer, node.config.network, hash).await?;
+                                request_full_block(
+                                    node,
+                                    peer_id,
+                                    writer,
+                                    node.config.network,
+                                    hash,
+                                )
+                                .await?;
                             }
                         }
                     }
@@ -518,12 +601,19 @@ async fn serve_peer_loop(
                             transactions,
                             requested_indexes: missing,
                         });
-                        send_message(writer, node.config.network, &Message::GetBlockTxn(request))
-                            .await?;
+                        send_message(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            &Message::GetBlockTxn(request),
+                        )
+                        .await?;
                     }
                     Err(error) => {
                         debug!(%hash, %error, "unable to reconstruct compact block");
-                        request_full_block(writer, node.config.network, hash).await?;
+                        request_full_block(node, peer_id, writer, node.config.network, hash)
+                            .await?;
                     }
                 }
             }
@@ -551,6 +641,8 @@ async fn serve_peer_loop(
                 }
                 if valid {
                     send_message(
+                        node,
+                        peer_id,
                         writer,
                         node.config.network,
                         &Message::BlockTxn(BlockTransactions {
@@ -569,6 +661,8 @@ async fn serve_peer_loop(
                     || response.transactions.len() != pending.requested_indexes.len()
                 {
                     request_full_block(
+                        node,
+                        peer_id,
                         writer,
                         node.config.network,
                         pending.compact.header.block_hash(),
@@ -599,6 +693,8 @@ async fn serve_peer_loop(
                 }
                 if !valid || pending.transactions.iter().any(Option::is_none) {
                     request_full_block(
+                        node,
+                        peer_id,
                         writer,
                         node.config.network,
                         pending.compact.header.block_hash(),
@@ -609,12 +705,13 @@ async fn serve_peer_loop(
                 match complete_compact_block(&pending.compact, pending.transactions) {
                     Ok(block) => {
                         handle_received_block(node, peers, peer_id, block).await;
-                        request_headers(node, writer).await?;
+                        request_headers(node, peer_id, writer).await?;
                     }
                     Err(error) => {
                         let hash = pending.compact.header.block_hash();
                         debug!(%hash, %error, "invalid compact block completion");
-                        request_full_block(writer, node.config.network, hash).await?;
+                        request_full_block(node, peer_id, writer, node.config.network, hash)
+                            .await?;
                     }
                 }
             }
@@ -629,6 +726,8 @@ async fn serve_peer_loop(
                 };
                 for (block_hash, filter, _) in range.filters {
                     send_message(
+                        node,
+                        peer_id,
                         writer,
                         node.config.network,
                         &Message::CFilter(CFilter {
@@ -660,6 +759,8 @@ async fn serve_peer_loop(
                     .map(|(hash, _, _)| *hash)
                     .unwrap_or(range.stop_hash);
                 send_message(
+                    node,
+                    peer_id,
                     writer,
                     node.config.network,
                     &Message::CFHeaders(CFHeaders {
@@ -688,6 +789,8 @@ async fn serve_peer_loop(
                     })
                     .collect();
                 send_message(
+                    node,
+                    peer_id,
                     writer,
                     node.config.network,
                     &Message::CFCheckpt(CFCheckpt {
@@ -705,6 +808,7 @@ async fn serve_peer_loop(
                 if accepted {
                     debug!(%txid, "accepted peer transaction");
                     broadcast_inventory(
+                        node,
                         peers,
                         peer_id,
                         node.config.network,
@@ -747,7 +851,14 @@ async fn serve_peer_loop(
                         .into_iter()
                         .map(|peer| network_address_v2(peer.address, peer.connected_at))
                         .collect::<Vec<_>>();
-                    send_message(writer, node.config.network, &Message::AddrV2(addresses)).await?;
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::AddrV2(addresses),
+                    )
+                    .await?;
                 } else {
                     let addresses = peer_infos
                         .into_iter()
@@ -758,7 +869,14 @@ async fn serve_peer_loop(
                             port: peer.address.port(),
                         })
                         .collect::<Vec<_>>();
-                    send_message(writer, node.config.network, &Message::Addr(addresses)).await?;
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Addr(addresses),
+                    )
+                    .await?;
                 }
             }
             Message::Mempool => {
@@ -778,11 +896,18 @@ async fn serve_peer_loop(
                         .take(50_000)
                         .collect::<Vec<_>>()
                 };
-                send_message(writer, node.config.network, &Message::Inv(inventory)).await?;
+                send_message(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &Message::Inv(inventory),
+                )
+                .await?;
             }
         }
         if version_received && verack_received && !verack_sent {
-            send_message(writer, node.config.network, &Message::Verack).await?;
+            send_message(node, peer_id, writer, node.config.network, &Message::Verack).await?;
             verack_sent = true;
         }
     }
@@ -847,6 +972,7 @@ async fn handle_received_block(
         Ok(tip) => {
             info!(%hash, height = tip.height, "accepted peer block");
             broadcast_inventory(
+                node,
                 peers,
                 peer_id,
                 node.config.network,
@@ -861,8 +987,16 @@ async fn handle_received_block(
     }
 }
 
-async fn request_full_block(writer: &PeerWriter, network: Network, hash: BlockHash) -> Result<()> {
+async fn request_full_block(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    network: Network,
+    hash: BlockHash,
+) -> Result<()> {
     send_message(
+        node,
+        peer_id,
         writer,
         network,
         &Message::GetData(vec![Inventory {
@@ -991,6 +1125,8 @@ fn network_address_v2(address: std::net::SocketAddr, connected_at: u64) -> wire:
 }
 
 async fn send_peer_extensions(
+    node: &Arc<Node>,
+    peer_id: usize,
     writer: &PeerWriter,
     network: Network,
     sent: &mut bool,
@@ -998,10 +1134,12 @@ async fn send_peer_extensions(
     if *sent {
         return Ok(());
     }
-    send_message(writer, network, &Message::SendHeaders).await?;
-    send_message(writer, network, &Message::SendAddrV2).await?;
-    send_message(writer, network, &Message::WtxidRelay).await?;
+    send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
+    send_message(node, peer_id, writer, network, &Message::SendAddrV2).await?;
+    send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
     send_message(
+        node,
+        peer_id,
         writer,
         network,
         &Message::SendCmpct {
@@ -1010,14 +1148,16 @@ async fn send_peer_extensions(
         },
     )
     .await?;
-    send_message(writer, network, &Message::FeeFilter(1_000)).await?;
+    send_message(node, peer_id, writer, network, &Message::FeeFilter(1_000)).await?;
     *sent = true;
     Ok(())
 }
 
-async fn request_headers(node: &Arc<Node>, writer: &PeerWriter) -> Result<()> {
+async fn request_headers(node: &Arc<Node>, peer_id: usize, writer: &PeerWriter) -> Result<()> {
     let locator = vec![node.chain.read().best_hash()];
     send_message(
+        node,
+        peer_id,
         writer,
         node.config.network,
         &Message::GetHeaders(GetHeadersMessage {
@@ -1029,26 +1169,35 @@ async fn request_headers(node: &Arc<Node>, writer: &PeerWriter) -> Result<()> {
     .await
 }
 
-async fn send_message(writer: &PeerWriter, network: Network, message: &Message) -> Result<()> {
+async fn send_message(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    network: Network,
+    message: &Message,
+) -> Result<()> {
     let mut writer = writer.lock().await;
-    wire::write_message(&mut *writer, network, message).await
+    let bytes = wire::write_message_with_size(&mut *writer, network, message).await?;
+    node.record_bytes_sent(peer_id, bytes);
+    Ok(())
 }
 
 async fn broadcast_inventory(
+    node: &Arc<Node>,
     peers: &PeerRegistry,
     excluded_peer: usize,
     network: Network,
     item: Inventory,
 ) {
-    let recipients: Vec<PeerWriter> = peers
+    let recipients: Vec<(usize, PeerWriter)> = peers
         .lock()
         .iter()
         .filter(|(peer_id, _)| **peer_id != excluded_peer)
-        .map(|(_, writer)| writer.clone())
+        .map(|(peer_id, writer)| (*peer_id, writer.clone()))
         .collect();
     let message = Message::Inv(vec![item]);
-    for writer in recipients {
-        let _ = send_message(&writer, network, &message).await;
+    for (peer_id, writer) in recipients {
+        let _ = send_message(node, peer_id, &writer, network, &message).await;
     }
 }
 
@@ -1085,5 +1234,39 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn peer_counters_track_wire_traffic_and_pings() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
+        node.record_bytes_sent(7, 42);
+        node.record_bytes_received(7, 19);
+        assert_eq!(node.total_bytes_sent(), 42);
+        assert_eq!(node.total_bytes_received(), 19);
+        let peer = node.peer_infos().pop().expect("registered peer");
+        assert_eq!(peer.bytes_sent, 42);
+        assert_eq!(peer.bytes_received, 19);
+
+        node.ping_peers();
+        let PeerCommand::Ping(nonce) = receiver.try_recv().unwrap() else {
+            panic!("expected a ping command");
+        };
+        node.record_pong(7, nonce);
+        assert!(node.peer_infos()[0].ping_time.is_some());
+        assert!(node.peer_infos()[0].min_ping.is_some());
     }
 }

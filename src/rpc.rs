@@ -1036,13 +1036,13 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     "network": "ipv4",
                     "services": format!("{:016x}", peer.services),
                     "relaytxes": peer.relay_transactions,
-                    "lastsend": 0,
-                    "lastrecv": 0,
-                    "bytessent": 0,
-                    "bytesrecv": 0,
+                    "lastsend": peer.last_send,
+                    "lastrecv": peer.last_recv,
+                    "bytessent": peer.bytes_sent,
+                    "bytesrecv": peer.bytes_received,
                     "conntime": peer.connected_at,
-                    "pingtime": null,
-                    "minping": null,
+                    "pingtime": peer.ping_time,
+                    "minping": peer.min_ping,
                     "version": peer.version.unwrap_or_default(),
                     "subver": peer.user_agent,
                     "inbound": peer.inbound,
@@ -1097,8 +1097,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
 
 fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
     let peers = node.peer_infos();
-    let total_bytes_sent = 0u64;
-    let total_bytes_recv = 0u64;
+    let total_bytes_sent = node.total_bytes_sent();
+    let total_bytes_recv = node.total_bytes_received();
     Ok(json!({
         "totalbytesrecv": total_bytes_recv,
         "totalbytessent": total_bytes_sent,

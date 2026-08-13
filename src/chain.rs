@@ -968,8 +968,10 @@ impl ChainState {
                 );
             }
         }
-        let allowed_coinbase =
-            validation::checked_money_add(validation::block_subsidy(height), total_fees)?;
+        let allowed_coinbase = validation::checked_money_add(
+            validation::block_subsidy_for_network(self.network, height),
+            total_fees,
+        )?;
         let actual_coinbase = block.txdata[0]
             .output
             .iter()

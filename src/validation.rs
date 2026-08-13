@@ -411,7 +411,16 @@ fn parse_signet_solution(solution: &[u8]) -> Result<(ScriptBuf, Witness), Valida
 }
 
 pub fn block_subsidy(height: u32) -> u64 {
-    let halvings = height / 210_000;
+    block_subsidy_for_network(Network::Bitcoin, height)
+}
+
+pub fn block_subsidy_for_network(network: Network, height: u32) -> u64 {
+    let halving_interval = if network == Network::Regtest {
+        150
+    } else {
+        210_000
+    };
+    let halvings = height / halving_interval;
     if halvings >= 64 {
         0
     } else {
@@ -541,6 +550,11 @@ mod tests {
         assert_eq!(block_subsidy(0), 5_000_000_000);
         assert_eq!(block_subsidy(210_000), 2_500_000_000);
         assert_eq!(block_subsidy(64 * 210_000), 0);
+        assert_eq!(
+            block_subsidy_for_network(Network::Regtest, 150),
+            2_500_000_000
+        );
+        assert_eq!(block_subsidy_for_network(Network::Regtest, 64 * 150), 0);
     }
 
     #[test]

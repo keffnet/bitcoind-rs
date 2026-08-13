@@ -1518,7 +1518,9 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "total_size": total_size,
         "total_weight": total_weight,
         "total_out": total_out,
-        "subsidy": height.map(validation::block_subsidy).unwrap_or_default(),
+        "subsidy": height
+            .map(|height| validation::block_subsidy_for_network(chain.network, height))
+            .unwrap_or_default(),
         "totalfee": total_fee,
         "ins": inputs,
         "outs": outputs,
@@ -1763,7 +1765,8 @@ fn get_block_template(node: &Arc<Node>) -> Result<Value> {
             })
         })
         .collect::<Vec<_>>();
-    let coinbase_value = validation::block_subsidy(height).saturating_add(fees);
+    let coinbase_value =
+        validation::block_subsidy_for_network(chain.network, height).saturating_add(fees);
     Ok(json!({
         "capabilities": ["proposal", "longpoll", "coinbasetxn", "coinbasevalue"],
         "version": 0x20000000u32,

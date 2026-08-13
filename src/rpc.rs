@@ -7121,6 +7121,20 @@ fn add_prevout_details(
             .ok_or_else(|| anyhow!("transaction JSON input index is inconsistent"))?;
         input_json["prevout"] = prevout;
     }
+    let input_total = spent_outputs
+        .iter()
+        .map(|output| output.value.to_sat())
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| anyhow!("transaction input total overflowed"))?;
+    let output_total = transaction
+        .output
+        .iter()
+        .map(|output| output.value.to_sat())
+        .try_fold(0u64, u64::checked_add)
+        .ok_or_else(|| anyhow!("transaction output total overflowed"))?;
+    if input_total >= output_total {
+        transaction_json["fee"] = json!(sat_to_btc(input_total - output_total));
+    }
     Ok(())
 }
 
@@ -7934,6 +7948,7 @@ mod tests {
         assert_eq!(transaction["vin"][0]["prevout"]["generated"], true);
         assert_eq!(transaction["vin"][0]["prevout"]["height"], 1);
         assert_eq!(transaction["vin"][0]["prevout"]["value"], 50.0);
+        assert_eq!(transaction["fee"], 0.00001);
         assert_eq!(
             transaction["vin"][0]["prevout"]["scriptPubKey"]["hex"],
             "51"

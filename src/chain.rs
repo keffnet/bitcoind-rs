@@ -55,6 +55,10 @@ pub struct BlockFeeStats {
     pub spent_outputs: Vec<TxOut>,
 }
 
+struct BlockApplication {
+    spent_entries: Vec<(OutPoint, UtxoEntry)>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownChainTip {
     pub hash: BlockHash,
@@ -769,6 +773,17 @@ impl ChainState {
             self.median_time_past_for_parent(parent_hash),
         )?;
         self.validate_block_structure(&block, self.network, height, Amount::MAX_MONEY.to_sat())?;
+        if self.store.contains(&parent_hash) {
+            let parent_utxos = self
+                .utxos_for_block(parent_hash)?
+                .context("side-chain parent UTXO state is unavailable")?;
+            self.validate_block_transactions(
+                &block,
+                height,
+                &parent_utxos,
+                self.median_time_past_for_parent(parent_hash),
+            )?;
+        }
         self.store.insert(&block)?;
         self.index_all_transactions(&block, height);
         let chain_work = parent.chain_work + block.header.work();
@@ -814,18 +829,84 @@ impl ChainState {
         }
     }
 
-    fn connect_block_internal(&mut self, block: &Block, persist: bool) -> Result<()> {
-        let height = self.height().saturating_add(1);
-        let previous = self.best_hash();
-        let expected_target = self.expected_target(block.header.time);
-        validation::validate_header(
-            self.network,
-            &block.header,
-            previous,
-            expected_target,
-            self.median_time_past(),
-        )?;
-        self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
+    fn utxos_for_block(&mut self, hash: BlockHash) -> Result<Option<HashMap<OutPoint, UtxoEntry>>> {
+        if hash == self.best_hash() {
+            return Ok(Some(self.utxos.clone()));
+        }
+        let mut path = Vec::new();
+        let mut cursor = hash;
+        loop {
+            path.push(cursor);
+            if cursor == self.network_genesis_hash() {
+                break;
+            }
+            let Some(node) = self.block_index.get(&cursor) else {
+                return Ok(None);
+            };
+            cursor = node.header.prev_blockhash;
+        }
+        path.reverse();
+        let Some(genesis) = self.store.get(&path[0])? else {
+            return Ok(None);
+        };
+        let mut utxos = HashMap::new();
+        let genesis_transaction = &genesis.txdata[0];
+        let genesis_txid = genesis_transaction.compute_txid();
+        for (output_index, output) in genesis_transaction.output.iter().enumerate() {
+            utxos.insert(
+                OutPoint::new(genesis_txid, output_index as u32),
+                UtxoEntry {
+                    output: output.clone(),
+                    height: 0,
+                    median_time_past: genesis.header.time,
+                    coinbase: true,
+                },
+            );
+        }
+        for block_hash in path.into_iter().skip(1) {
+            let Some(block) = self.store.get(&block_hash)? else {
+                return Ok(None);
+            };
+            let node = self
+                .block_index
+                .get(&block_hash)
+                .copied()
+                .context("side-chain block index entry is missing")?;
+            let parent_hash = block.header.prev_blockhash;
+            validation::validate_header(
+                self.network,
+                &block.header,
+                parent_hash,
+                self.expected_target_for_parent(parent_hash, block.header.time),
+                self.median_time_past_for_parent(parent_hash),
+            )?;
+            self.validate_block_structure(
+                &block,
+                self.network,
+                node.height,
+                Amount::MAX_MONEY.to_sat(),
+            )?;
+            let median_time_past = self.median_time_past_for_parent(parent_hash);
+            let application =
+                self.validate_block_transactions(&block, node.height, &utxos, median_time_past)?;
+            apply_block_to_utxos(
+                &mut utxos,
+                &block,
+                node.height,
+                median_time_past,
+                application.spent_entries,
+            );
+        }
+        Ok(Some(utxos))
+    }
+
+    fn validate_block_transactions(
+        &self,
+        block: &Block,
+        height: u32,
+        utxos: &HashMap<OutPoint, UtxoEntry>,
+        block_median_time_past: u32,
+    ) -> Result<BlockApplication> {
         if !is_bip30_repeat(self.network, height, block.block_hash()) {
             for transaction in &block.txdata {
                 let txid = transaction.compute_txid();
@@ -833,17 +914,15 @@ impl ChainState {
                     .output
                     .iter()
                     .enumerate()
-                    .any(|(vout, _)| self.utxos.contains_key(&OutPoint::new(txid, vout as u32)))
+                    .any(|(vout, _)| utxos.contains_key(&OutPoint::new(txid, vout as u32)))
                 {
                     bail!("block tries to overwrite an unspent transaction {txid}");
                 }
             }
         }
-
         let mut spent = HashSet::new();
         let mut spent_entries = Vec::new();
         let mut created = HashMap::new();
-        let block_median_time_past = self.median_time_past();
         let mut total_fees = 0u64;
         for transaction in block.txdata.iter().skip(1) {
             let txid = transaction.compute_txid();
@@ -857,7 +936,7 @@ impl ChainState {
                 }
                 let Some(entry) = created
                     .get(&outpoint)
-                    .or_else(|| self.utxos.get(&outpoint))
+                    .or_else(|| utxos.get(&outpoint))
                     .cloned()
                 else {
                     return Err(ValidationError::MissingInput { outpoint }.into());
@@ -897,7 +976,6 @@ impl ChainState {
             total_fees = total_fees
                 .checked_add(input_total - output_total)
                 .ok_or(ValidationError::InputTotalOverflow)?;
-
             for (output_index, output) in transaction.output.iter().enumerate() {
                 created.insert(
                     OutPoint::new(txid, output_index as u32),
@@ -926,15 +1004,35 @@ impl ChainState {
             }
             .into());
         }
+        Ok(BlockApplication { spent_entries })
+    }
+
+    fn connect_block_internal(&mut self, block: &Block, persist: bool) -> Result<()> {
+        let height = self.height().saturating_add(1);
+        let previous = self.best_hash();
+        let expected_target = self.expected_target(block.header.time);
+        validation::validate_header(
+            self.network,
+            &block.header,
+            previous,
+            expected_target,
+            self.median_time_past(),
+        )?;
+        self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
+        let block_median_time_past = self.median_time_past();
+        let application =
+            self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?;
 
         let hash = block.block_hash();
         if persist {
             self.store.insert(block)?;
         }
-        for (outpoint, _) in &spent_entries {
+        for (outpoint, _) in &application.spent_entries {
             self.remove_utxo(outpoint);
         }
-        let spent_entries: HashMap<OutPoint, UtxoEntry> = spent_entries.into_iter().collect();
+        let spent_entries: HashMap<OutPoint, UtxoEntry> =
+            application.spent_entries.into_iter().collect();
+        let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
         for (transaction_index, transaction) in block.txdata.iter().enumerate() {
             let txid = transaction.compute_txid();
             let mut affected_scripts = HashSet::new();
@@ -945,15 +1043,17 @@ impl ChainState {
             }
             for (output_index, output) in transaction.output.iter().enumerate() {
                 let outpoint = OutPoint::new(txid, output_index as u32);
-                self.insert_utxo(
-                    outpoint,
-                    UtxoEntry {
-                        output: output.clone(),
-                        height,
-                        median_time_past: block_median_time_past,
-                        coinbase: transaction_index == 0,
-                    },
-                );
+                if !spent_outpoints.contains(&outpoint) {
+                    self.insert_utxo(
+                        outpoint,
+                        UtxoEntry {
+                            output: output.clone(),
+                            height,
+                            median_time_past: block_median_time_past,
+                            coinbase: transaction_index == 0,
+                        },
+                    );
+                }
                 affected_scripts.insert(electrum_script_hash(&output.script_pubkey));
             }
             for script_hash in affected_scripts {
@@ -1459,6 +1559,39 @@ impl ChainState {
     }
 }
 
+fn apply_block_to_utxos(
+    utxos: &mut HashMap<OutPoint, UtxoEntry>,
+    block: &Block,
+    height: u32,
+    median_time_past: u32,
+    spent_entries: Vec<(OutPoint, UtxoEntry)>,
+) {
+    let spent_outpoints: HashSet<OutPoint> = spent_entries
+        .iter()
+        .map(|(outpoint, _)| *outpoint)
+        .collect();
+    for (outpoint, _) in spent_entries {
+        utxos.remove(&outpoint);
+    }
+    for (transaction_index, transaction) in block.txdata.iter().enumerate() {
+        let txid = transaction.compute_txid();
+        for (output_index, output) in transaction.output.iter().enumerate() {
+            let outpoint = OutPoint::new(txid, output_index as u32);
+            if !spent_outpoints.contains(&outpoint) {
+                utxos.insert(
+                    outpoint,
+                    UtxoEntry {
+                        output: output.clone(),
+                        height,
+                        median_time_past,
+                        coinbase: transaction_index == 0,
+                    },
+                );
+            }
+        }
+    }
+}
+
 fn is_bip30_repeat(network: Network, height: u32, hash: BlockHash) -> bool {
     if network != Network::Bitcoin {
         return false;
@@ -1605,6 +1738,41 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_transaction_on_a_side_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let main_one = mine_block(&state, 1);
+        state.connect_block(main_one).unwrap();
+        let main_two = mine_block(&state, 2);
+        state.connect_block(main_two).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let mut side = mine_block_from_header(&genesis, 1, 99);
+        side.txdata.push(Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([42; 32]), 0),
+                script_sig: Builder::new().push_int(1).into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        });
+        side.header.merkle_root = side.compute_merkle_root().unwrap();
+        while !side.header.target().is_met_by(side.block_hash()) {
+            side.header.nonce = side.header.nonce.wrapping_add(1);
+        }
+        let side_hash = side.block_hash();
+        assert!(state.connect_block(side).is_err());
+        assert!(!state.store.contains(&side_hash));
+        assert_eq!(state.height(), 2);
+    }
+
+    #[test]
     fn queues_an_orphan_until_its_parent_arrives() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
@@ -1684,11 +1852,12 @@ mod tests {
                 script_pubkey: Builder::new().push_int(1).into_script(),
             }],
         };
+        let first_txid = first.compute_txid();
         let second = Transaction {
             version: Version::ONE,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint::new(first.compute_txid(), 0),
+                previous_output: OutPoint::new(first_txid, 0),
                 script_sig: Builder::new().push_int(1).into_script(),
                 sequence: Sequence::MAX,
                 witness: Witness::default(),
@@ -1717,6 +1886,7 @@ mod tests {
         let block_hash = block.block_hash();
         state.connect_block(block).unwrap();
         assert_eq!(state.height(), 101);
+        assert!(state.utxo(&OutPoint::new(first_txid, 0)).is_none());
         assert_eq!(
             state.block_fee_stats(&block_hash).unwrap(),
             Some(BlockFeeStats {

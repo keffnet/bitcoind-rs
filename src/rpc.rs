@@ -956,27 +956,49 @@ fn get_network_hash_ps(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
+    let network_hashps = get_network_hash_ps(node, &json!([]))?;
     let chain = node.chain.read();
     let tip = chain.tip();
     let header = chain.header(tip.height).expect("tip header exists");
-    let window = 120u32.min(tip.height.saturating_add(1));
-    let start_height = tip.height.saturating_sub(window.saturating_sub(1));
-    let start = chain.header(start_height).expect("start header exists");
-    let interval = header.time.saturating_sub(start.time);
-    let network_hashps = if interval == 0 {
-        0.0
-    } else {
-        header.difficulty_float() * 4_294_967_296.0 * f64::from(window) / f64::from(interval)
-    };
+    let now = u32::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(u32::MAX);
+    let next_time = now.max(header.time.saturating_add(1));
+    let next_bits = chain.next_bits(next_time);
     let mempool = node.mempool.read();
-    Ok(json!({
+    let mut result = json!({
         "blocks": tip.height,
+        "bits": format!("{:08x}", header.bits.to_consensus()),
         "difficulty": header.difficulty_float(),
         "networkhashps": network_hashps,
         "pooledtx": mempool.len(),
+        "blockmintxfee": sat_to_btc(1_000),
         "chain": network_name(chain.network),
-        "warnings": "",
-    }))
+        "next": {
+            "height": tip.height.saturating_add(1),
+            "bits": format!("{:08x}", next_bits),
+            "difficulty": bitcoin::pow::Target::from_compact(
+                bitcoin::pow::CompactTarget::from_consensus(next_bits),
+            )
+            .difficulty_float(),
+            "target": format!(
+                "{:064x}",
+                bitcoin::pow::Target::from_compact(
+                    bitcoin::pow::CompactTarget::from_consensus(next_bits)
+                )
+            ),
+        },
+        "target": format!("{:064x}", header.target()),
+        "warnings": [],
+    });
+    if let Some(challenge) = chain.signet_challenge() {
+        result["signet_challenge"] = json!(hex::encode(challenge));
+    }
+    Ok(result)
 }
 
 fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -2559,6 +2581,32 @@ mod tests {
             get_network_hash_ps(&node, &json!([-1])).unwrap(),
             json!(0.0)
         );
+    }
+
+    #[test]
+    fn mining_info_reports_current_and_next_block_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+
+        let info = get_mining_info(&node).unwrap();
+        assert_eq!(info["blocks"], json!(0));
+        assert_eq!(info["next"]["height"], json!(1));
+        assert_eq!(info["pooledtx"], json!(0));
+        assert_eq!(info["blockmintxfee"], json!(0.00001));
+        assert!(info["warnings"].is_array());
+        assert!(info["bits"].as_str().is_some());
+        assert!(info["target"].as_str().is_some());
     }
 
     #[test]

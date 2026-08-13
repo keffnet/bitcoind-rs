@@ -51,6 +51,9 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub connect: Vec<SocketAddr>,
 
+    #[arg(long, value_name = "HEX")]
+    pub signet_challenge: Option<String>,
+
     #[arg(long, default_value_t = 32)]
     pub max_peers: usize,
 }
@@ -63,6 +66,7 @@ pub struct Config {
     pub rpc_bind: Option<SocketAddr>,
     pub electrum_bind: Option<SocketAddr>,
     pub seed_nodes: Vec<SocketAddr>,
+    pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
 }
 
@@ -74,6 +78,15 @@ impl Config {
         if args.p2p.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) && args.p2p.port() == 0 {
             bail!("--p2p must use a non-zero port when binding all interfaces");
         }
+        let signet_challenge = match args.signet_challenge {
+            Some(_challenge) if args.network != NetworkName::Signet => {
+                bail!("--signet-challenge requires --network signet")
+            }
+            Some(challenge) => Some(
+                hex::decode(&challenge).with_context(|| "decoding --signet-challenge as hex")?,
+            ),
+            None => None,
+        };
         std::fs::create_dir_all(&args.datadir)
             .with_context(|| format!("creating data directory {}", args.datadir.display()))?;
         Ok(Self {
@@ -83,6 +96,7 @@ impl Config {
             rpc_bind: Some(args.rpc),
             electrum_bind: Some(args.electrum),
             seed_nodes: args.connect,
+            signet_challenge,
             max_peers: args.max_peers,
         })
     }

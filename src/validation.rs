@@ -8,10 +8,16 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use bitcoin::absolute::LockTime;
 use bitcoin::blockdata::locktime::absolute::{Height, Time};
+use bitcoin::blockdata::script::{Instruction, PushBytesBuf, ScriptBuf};
+use bitcoin::blockdata::transaction::{OutPoint as TransactionOutPoint, TxIn, TxOut, Version};
+use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::Params;
+use bitcoin::consensus::encode::{deserialize_partial, serialize};
+use bitcoin::opcodes::OP_0;
 use bitcoin::pow::Target;
-use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, Transaction, Txid};
+use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, Sequence, Transaction, Txid};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockValidationStats {
@@ -39,6 +45,8 @@ pub enum ValidationError {
     BadMerkleRoot,
     #[error("block witness commitment is invalid")]
     BadWitnessCommitment,
+    #[error("block signet solution is invalid")]
+    BadSignetSolution,
     #[error("block weight exceeds the consensus limit")]
     OversizedBlock,
     #[error("coinbase transaction is missing or malformed")]
@@ -134,6 +142,23 @@ pub fn validate_block_structure(
     height: u32,
     expected_coinbase_value: u64,
 ) -> Result<BlockValidationStats, ValidationError> {
+    let default_challenge = (network == Network::Signet).then(default_signet_challenge);
+    validate_block_structure_with_signet(
+        block,
+        network,
+        height,
+        expected_coinbase_value,
+        default_challenge.as_deref(),
+    )
+}
+
+pub fn validate_block_structure_with_signet(
+    block: &Block,
+    network: Network,
+    height: u32,
+    expected_coinbase_value: u64,
+    signet_challenge: Option<&[u8]>,
+) -> Result<BlockValidationStats, ValidationError> {
     if block.txdata.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }
@@ -218,10 +243,166 @@ pub fn validate_block_structure(
             allowed: expected_coinbase_value,
         });
     }
+    if let Some(challenge) = signet_challenge {
+        validate_signet_block_solution(block, challenge)?;
+    }
     Ok(BlockValidationStats {
         tx_count: block.txdata.len(),
         total_output_sat,
     })
+}
+
+/// The default signet challenge used by Bitcoin Core's public signet.
+pub fn default_signet_challenge() -> Vec<u8> {
+    hex::decode(
+        "512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae",
+    )
+    .expect("the built-in signet challenge is valid hex")
+}
+
+const SIGNET_HEADER: [u8; 4] = [0xec, 0xc7, 0xda, 0xa2];
+
+/// Validate the BIP325 solution committed to a signet block.
+pub fn validate_signet_block_solution(
+    block: &Block,
+    challenge: &[u8],
+) -> Result<(), ValidationError> {
+    if block.block_hash()
+        == bitcoin::blockdata::constants::genesis_block(Network::Signet).block_hash()
+    {
+        return Ok(());
+    }
+
+    let Some(coinbase) = block.txdata.first() else {
+        return Err(ValidationError::BadSignetSolution);
+    };
+    let Some(commitment_index) = coinbase.output.iter().rposition(|output| {
+        output.script_pubkey.len() >= 38
+            && output.script_pubkey.as_bytes()[..6] == [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]
+    }) else {
+        return Err(ValidationError::BadSignetSolution);
+    };
+
+    let (modified_commitment, solution) =
+        extract_signet_solution(&coinbase.output[commitment_index].script_pubkey)?;
+    let mut modified_coinbase = coinbase.clone();
+    modified_coinbase.output[commitment_index].script_pubkey = modified_commitment;
+
+    let mut merkle_leaves = Vec::with_capacity(block.txdata.len());
+    merkle_leaves.push(modified_coinbase.compute_txid());
+    merkle_leaves.extend(block.txdata.iter().skip(1).map(Transaction::compute_txid));
+    let modified_merkle = bitcoin::merkle_tree::calculate_root(merkle_leaves.into_iter())
+        .ok_or(ValidationError::BadSignetSolution)?;
+
+    let mut block_data = Vec::with_capacity(72);
+    block_data.extend_from_slice(&serialize(&block.header.version));
+    block_data.extend_from_slice(&serialize(&block.header.prev_blockhash));
+    block_data.extend_from_slice(&serialize(&modified_merkle));
+    block_data.extend_from_slice(&serialize(&block.header.time));
+    let block_data =
+        PushBytesBuf::try_from(block_data).map_err(|_| ValidationError::BadSignetSolution)?;
+
+    let mut to_spend_script_sig = ScriptBuf::new();
+    to_spend_script_sig.push_opcode(OP_0);
+    to_spend_script_sig.push_slice(block_data);
+    let tx_to_spend = Transaction {
+        version: Version::non_standard(0),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: TransactionOutPoint::null(),
+            script_sig: to_spend_script_sig,
+            sequence: Sequence::ZERO,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(challenge.to_vec()),
+        }],
+    };
+
+    let (script_sig, witness) = parse_signet_solution(&solution)?;
+    let tx_spending = Transaction {
+        version: Version::non_standard(0),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: TransactionOutPoint::new(tx_to_spend.compute_txid(), 0),
+            script_sig,
+            sequence: Sequence::ZERO,
+            witness,
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x6a]),
+        }],
+    };
+    let serialized = serialize(&tx_spending);
+    let spent_outputs = [bitcoinconsensus::Utxo {
+        script_pubkey: tx_to_spend.output[0].script_pubkey.as_bytes().as_ptr(),
+        script_pubkey_len: tx_to_spend.output[0].script_pubkey.len() as u32,
+        value: 0,
+    }];
+    let flags = bitcoinconsensus::VERIFY_P2SH
+        | bitcoinconsensus::VERIFY_WITNESS
+        | bitcoinconsensus::VERIFY_DERSIG
+        | bitcoinconsensus::VERIFY_NULLDUMMY;
+    bitcoinconsensus::verify_with_flags(
+        tx_to_spend.output[0].script_pubkey.as_bytes(),
+        0,
+        &serialized,
+        Some(&spent_outputs),
+        0,
+        flags,
+    )
+    .map_err(|_| ValidationError::BadSignetSolution)
+}
+
+fn extract_signet_solution(
+    commitment: &bitcoin::Script,
+) -> Result<(ScriptBuf, Vec<u8>), ValidationError> {
+    let mut replacement = ScriptBuf::new();
+    let mut solution = Vec::new();
+    let mut found_header = false;
+    for instruction in commitment.instructions() {
+        match instruction {
+            Ok(Instruction::PushBytes(pushdata)) => {
+                let bytes = pushdata.as_bytes();
+                if !found_header
+                    && bytes.len() > SIGNET_HEADER.len()
+                    && bytes.starts_with(&SIGNET_HEADER)
+                {
+                    solution.extend_from_slice(&bytes[SIGNET_HEADER.len()..]);
+                    replacement.push_slice(SIGNET_HEADER);
+                    found_header = true;
+                } else {
+                    replacement.push_slice(pushdata);
+                }
+            }
+            Ok(Instruction::Op(opcode)) => replacement.push_opcode(opcode),
+            Err(_) => break,
+        }
+    }
+    if found_header {
+        Ok((replacement, solution))
+    } else {
+        Ok((commitment.to_owned(), Vec::new()))
+    }
+}
+
+fn parse_signet_solution(solution: &[u8]) -> Result<(ScriptBuf, Witness), ValidationError> {
+    if solution.is_empty() {
+        return Ok((ScriptBuf::new(), Witness::default()));
+    }
+    let (script_sig, script_size) = deserialize_partial::<ScriptBuf>(solution)
+        .map_err(|_| ValidationError::BadSignetSolution)?;
+    let remaining = solution
+        .get(script_size..)
+        .ok_or(ValidationError::BadSignetSolution)?;
+    let (witness, witness_size) = deserialize_partial::<Witness>(remaining)
+        .map_err(|_| ValidationError::BadSignetSolution)?;
+    if script_size + witness_size != solution.len() {
+        return Err(ValidationError::BadSignetSolution);
+    }
+    Ok((script_sig, witness))
 }
 
 pub fn block_subsidy(height: u32) -> u64 {
@@ -468,6 +649,58 @@ mod tests {
         assert!(matches!(
             validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
             Err(ValidationError::BadOutputValue(_))
+        ));
+    }
+
+    fn signet_block(commitment_extension: Option<&[u8]>) -> Block {
+        let mut commitment = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment.extend_from_slice(&[0u8; 32]);
+        if let Some(extension) = commitment_extension {
+            assert!(extension.len() < 76);
+            commitment.push(extension.len() as u8);
+            commitment.extend_from_slice(extension);
+        }
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![1, 1]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(commitment),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block
+    }
+
+    #[test]
+    fn accepts_a_trivial_signet_challenge_without_a_solution_extension() {
+        let block = signet_block(None);
+        validate_signet_block_solution(&block, &[0x51]).unwrap();
+    }
+
+    #[test]
+    fn rejects_an_invalid_signet_solution() {
+        let block = signet_block(Some(&[0xec, 0xc7, 0xda, 0xa2, 0x00]));
+        assert!(matches!(
+            validate_signet_block_solution(&block, &[0x51]),
+            Err(ValidationError::BadSignetSolution)
         ));
     }
 }

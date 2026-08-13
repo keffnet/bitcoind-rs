@@ -81,6 +81,7 @@ struct ChainSnapshot {
 pub struct ChainState {
     pub network: Network,
     data_dir: PathBuf,
+    signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     active_chain: Vec<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
@@ -95,6 +96,14 @@ pub struct ChainState {
 
 impl ChainState {
     pub fn open(network: Network, data_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_signet_challenge(network, data_dir, None)
+    }
+
+    pub fn open_with_signet_challenge(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
@@ -129,6 +138,11 @@ impl ChainState {
         let mut state = Self {
             network,
             data_dir,
+            signet_challenge: (network == Network::Signet).then(|| {
+                signet_challenge
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(validation::default_signet_challenge)
+            }),
             store,
             active_chain: Vec::new(),
             headers: Vec::new(),
@@ -468,7 +482,7 @@ impl ChainState {
                     self.median_time_past_for_parent(parent_hash),
                 )?;
             }
-            validation::validate_block_structure(
+            self.validate_block_structure(
                 &block,
                 self.network,
                 height as u32,
@@ -562,12 +576,7 @@ impl ChainState {
             self.expected_target_for_parent(parent_hash, block.header.time),
             self.median_time_past_for_parent(parent_hash),
         )?;
-        validation::validate_block_structure(
-            &block,
-            self.network,
-            height,
-            Amount::MAX_MONEY.to_sat(),
-        )?;
+        self.validate_block_structure(&block, self.network, height, Amount::MAX_MONEY.to_sat())?;
         self.store.insert(&block)?;
         self.index_all_transactions(&block, height);
         let chain_work = parent.chain_work + block.header.work();
@@ -624,12 +633,7 @@ impl ChainState {
             expected_target,
             self.median_time_past(),
         )?;
-        validation::validate_block_structure(
-            block,
-            self.network,
-            height,
-            Amount::MAX_MONEY.to_sat(),
-        )?;
+        self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
 
         let mut spent = HashSet::new();
         let mut spent_entries = Vec::new();
@@ -1014,6 +1018,22 @@ impl ChainState {
         self.expected_target_for_parent(self.best_hash(), candidate_time)
     }
 
+    fn validate_block_structure(
+        &self,
+        block: &Block,
+        network: Network,
+        height: u32,
+        expected_coinbase_value: u64,
+    ) -> Result<validation::BlockValidationStats, ValidationError> {
+        validation::validate_block_structure_with_signet(
+            block,
+            network,
+            height,
+            expected_coinbase_value,
+            self.signet_challenge.as_deref(),
+        )
+    }
+
     fn expected_target_for_parent(&self, parent_hash: BlockHash, candidate_time: u32) -> Target {
         let parent_node = self
             .block_index
@@ -1058,7 +1078,12 @@ impl ChainState {
             .expect("ancestor is indexed")
             .header;
         let timespan = previous.time.saturating_sub(first.time) as u64;
-        CompactTarget::from_next_work_required(previous.bits, timespan, params).into()
+        let base_bits = if self.network == Network::Testnet4 {
+            first.bits
+        } else {
+            previous.bits
+        };
+        CompactTarget::from_next_work_required(base_bits, timespan, params).into()
     }
 
     fn ancestor_hash(&self, mut hash: BlockHash, height: u32) -> Option<BlockHash> {

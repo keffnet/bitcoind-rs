@@ -61,7 +61,11 @@ pub struct Node {
 
 impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
-        let chain = ChainState::open(config.network, &config.datadir)?;
+        let chain = ChainState::open_with_signet_challenge(
+            config.network,
+            &config.datadir,
+            config.signet_challenge.as_deref(),
+        )?;
         let mempool_path = config.datadir.join("mempool.json");
         let mut mempool = Mempool::new(config.network);
         mempool.load_from_file(&mempool_path, &chain)?;

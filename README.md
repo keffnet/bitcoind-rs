@@ -25,3 +25,5 @@ cargo run -- --network regtest --datadir ./data
 The default configuration listens on `127.0.0.1:8333` for P2P, `127.0.0.1:8332` for JSON-RPC, and `127.0.0.1:30001` for Electrum. Select `--network regtest` when using the standard regtest ports in external tooling.
 
 JSON-RPC uses the standard cookie file at `<datadir>/.cookie`; clients should send it as HTTP Basic authentication (`curl --user "$(cat data/.cookie)" ...`).
+
+For the public signet, use `--network signet`. Custom BIP325 challenges can be supplied as script hex with `--signet-challenge <hex>`.

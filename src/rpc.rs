@@ -2078,7 +2078,13 @@ fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
 
 fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
-    let verbosity = params.get(1).and_then(Value::as_u64).unwrap_or(1);
+    let verbosity = match params.get(1).filter(|value| !value.is_null()) {
+        None => 1,
+        Some(Value::Bool(verbose)) => u64::from(*verbose),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| anyhow!("verbosity must be an integer or boolean"))?,
+    };
     if verbosity > 3 {
         bail!("verbosity must be between 0 and 3")
     }
@@ -6647,6 +6653,12 @@ mod tests {
         assert_eq!(
             transaction["vin"][0]["prevout"]["scriptPubKey"]["hex"],
             "51"
+        );
+        let raw = get_block(&node, &json!([block_hash.to_string(), false])).unwrap();
+        assert!(raw.as_str().is_some_and(|raw| !raw.is_empty()));
+        assert_eq!(
+            get_block(&node, &json!([block_hash.to_string(), true])).unwrap()["hash"],
+            json!(block_hash.to_string())
         );
     }
 

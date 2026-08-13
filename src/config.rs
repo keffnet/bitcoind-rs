@@ -48,6 +48,9 @@ pub struct Args {
     #[arg(long, default_value = "127.0.0.1:30001")]
     pub electrum: SocketAddr,
 
+    #[arg(long, default_value_t = false)]
+    pub rest: bool,
+
     #[arg(long, value_delimiter = ',')]
     pub connect: Vec<SocketAddr>,
 
@@ -65,6 +68,7 @@ pub struct Config {
     pub p2p_bind: SocketAddr,
     pub rpc_bind: Option<SocketAddr>,
     pub electrum_bind: Option<SocketAddr>,
+    pub rest: bool,
     pub seed_nodes: Vec<SocketAddr>,
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
@@ -95,6 +99,7 @@ impl Config {
             p2p_bind: args.p2p,
             rpc_bind: Some(args.rpc),
             electrum_bind: Some(args.electrum),
+            rest: args.rest,
             seed_nodes: args.connect,
             signet_challenge,
             max_peers: args.max_peers,

@@ -52,7 +52,21 @@ impl RpcServer {
 async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()> {
     stream.set_nodelay(true)?;
     let request = read_http_request(&mut stream).await?;
-    let response = match request {
+    let (status, content_type, body) = match request {
+        Some(request)
+            if node.config.rest
+                && request.method.eq_ignore_ascii_case("GET")
+                && request.target.starts_with("/rest/") =>
+        {
+            match dispatch_rest(&node, &request.target) {
+                Ok((content_type, body)) => ("200 OK", content_type, body),
+                Err(error) => (
+                    "404 Not Found",
+                    "text/plain",
+                    format!("{error}\r\n").into_bytes(),
+                ),
+            }
+        }
         Some(request) => {
             if !authorized(&node, &request.headers) {
                 stream
@@ -61,15 +75,22 @@ async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()>
                 stream.shutdown().await?;
                 return Ok(());
             }
-            dispatch_json_rpc(&node, &request.body)
+            (
+                "200 OK",
+                "application/json",
+                serde_json::to_vec(&dispatch_json_rpc(&node, &request.body))?,
+            )
         }
-        None => {
-            json!({"result": null, "error": {"code": -32700, "message": "empty request"}, "id": null})
-        }
+        None => (
+            "200 OK",
+            "application/json",
+            serde_json::to_vec(
+                &json!({"result": null, "error": {"code": -32700, "message": "empty request"}, "id": null}),
+            )?,
+        ),
     };
-    let body = serde_json::to_vec(&response)?;
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes()).await?;
@@ -79,6 +100,8 @@ async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()>
 }
 
 struct HttpRequest {
+    method: String,
+    target: String,
     headers: String,
     body: Vec<u8>,
 }
@@ -102,6 +125,13 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>
         }
     }
     let headers = std::str::from_utf8(&bytes[..header_end])?.to_owned();
+    let mut request_line = headers
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .split_whitespace();
+    let method = request_line.next().unwrap_or_default().to_owned();
+    let target = request_line.next().unwrap_or_default().to_owned();
     let content_length = headers
         .lines()
         .find_map(|line| {
@@ -121,6 +151,8 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>
         bytes.extend_from_slice(&chunk[..read]);
     }
     Ok(Some(HttpRequest {
+        method,
+        target,
         headers,
         body: bytes[header_end..header_end + content_length].to_vec(),
     }))
@@ -140,6 +172,293 @@ fn authorized(node: &Arc<Node>, headers: &str) -> bool {
             .map(|value| value.trim() == expected)
             .unwrap_or(false)
     })
+}
+
+fn dispatch_rest(node: &Arc<Node>, target: &str) -> Result<(&'static str, Vec<u8>)> {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let route = path
+        .strip_prefix("/rest/")
+        .ok_or_else(|| anyhow!("invalid REST path"))?;
+    let (route, format) = route
+        .rsplit_once('.')
+        .ok_or_else(|| anyhow!("REST output format is required"))?;
+    match route {
+        "chaininfo" if format == "json" => rest_json(get_blockchain_info(node)?),
+        "mempool/info" if format == "json" => rest_json(dispatch_method(
+            node,
+            "getmempoolinfo",
+            &Value::Array(Vec::new()),
+        )?),
+        "mempool/contents" if format == "json" => {
+            let verbose = rest_query_bool(query, "verbose", true)?;
+            let sequence = rest_query_bool(query, "mempool_sequence", false)?;
+            if sequence {
+                bail!("mempool sequence values are not available")
+            }
+            rest_json(dispatch_method(node, "getrawmempool", &json!([verbose]))?)
+        }
+        route if route.starts_with("blockhashbyheight/") => {
+            rest_blockhash_by_height(node, route, format)
+        }
+        route if route.starts_with("headers/") => rest_headers(node, route, format, query),
+        route if route.starts_with("block/notxdetails/") => rest_block(node, route, format, false),
+        route if route.starts_with("block/") => rest_block(node, route, format, true),
+        route if route.starts_with("tx/") => rest_transaction(node, route, format),
+        route if route.starts_with("getutxos/") => rest_get_utxos(node, route, format),
+        _ => bail!("unsupported REST endpoint"),
+    }
+}
+
+fn rest_json(value: Value) -> Result<(&'static str, Vec<u8>)> {
+    let mut body = serde_json::to_vec(&value)?;
+    body.push(b'\n');
+    Ok(("application/json", body))
+}
+
+fn rest_query_bool(query: &str, name: &str, default: bool) -> Result<bool> {
+    let value = query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .find_map(|(key, value)| (key == name).then_some(value))
+        .unwrap_or(if default { "true" } else { "false" });
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => bail!("REST query parameter {name} must be true or false"),
+    }
+}
+
+fn rest_format_bytes(bytes: Vec<u8>, format: &str) -> Result<(&'static str, Vec<u8>)> {
+    match format {
+        "bin" => Ok(("application/octet-stream", bytes)),
+        "hex" => Ok((
+            "text/plain",
+            format!("{}\n", hex::encode(bytes)).into_bytes(),
+        )),
+        _ => bail!("unsupported REST output format"),
+    }
+}
+
+fn rest_blockhash_by_height(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+) -> Result<(&'static str, Vec<u8>)> {
+    let height = route
+        .strip_prefix("blockhashbyheight/")
+        .ok_or_else(|| anyhow!("invalid blockhashbyheight path"))?
+        .parse::<u32>()?;
+    let hash = node
+        .chain
+        .read()
+        .block_hash(height)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    match format {
+        "json" => rest_json(json!(hash.to_string())),
+        "bin" => Ok(("application/octet-stream", hash.to_byte_array().to_vec())),
+        "hex" => Ok(("text/plain", format!("{}\n", hash).into_bytes())),
+        _ => bail!("unsupported REST output format"),
+    }
+}
+
+fn rest_headers(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+    query: &str,
+) -> Result<(&'static str, Vec<u8>)> {
+    let suffix = route
+        .strip_prefix("headers/")
+        .ok_or_else(|| anyhow!("invalid headers path"))?;
+    let parts = suffix.split('/').collect::<Vec<_>>();
+    let (count, hash_text) = if parts.len() == 2 {
+        (parts[0].parse::<u32>()?, parts[1])
+    } else if parts.len() == 1 {
+        (
+            query
+                .split('&')
+                .filter_map(|part| part.split_once('='))
+                .find_map(|(key, value)| (key == "count").then_some(value))
+                .unwrap_or("5")
+                .parse::<u32>()?,
+            parts[0],
+        )
+    } else {
+        bail!("invalid headers path")
+    };
+    if !(1..=2_000).contains(&count) {
+        bail!("header count must be between 1 and 2000")
+    }
+    let hash: BlockHash = hash_text.parse()?;
+    let heights = {
+        let chain = node.chain.read();
+        let Some(start) = chain.block_height_by_hash(&hash) else {
+            return if format == "json" {
+                rest_json(json!([]))
+            } else {
+                rest_format_bytes(Vec::new(), format)
+            };
+        };
+        if !chain.is_active_block(&hash) {
+            return if format == "json" {
+                rest_json(json!([]))
+            } else {
+                rest_format_bytes(Vec::new(), format)
+            };
+        }
+        (start..start.saturating_add(count))
+            .filter_map(|height| chain.block_hash(height))
+            .collect::<Vec<_>>()
+    };
+    let mut headers = Vec::with_capacity(heights.len());
+    for hash in heights {
+        let header = node
+            .chain
+            .read()
+            .header_by_hash(&hash)
+            .ok_or_else(|| anyhow!("header not found"))?;
+        headers.push(header);
+    }
+    match format {
+        "bin" => Ok((
+            "application/octet-stream",
+            headers.iter().flat_map(serialize).collect(),
+        )),
+        "hex" => Ok((
+            "text/plain",
+            format!(
+                "{}\n",
+                hex::encode(headers.iter().flat_map(serialize).collect::<Vec<_>>())
+            )
+            .into_bytes(),
+        )),
+        "json" => {
+            let values = headers
+                .iter()
+                .map(|header| {
+                    get_block_header(node, &json!([header.block_hash().to_string(), true]))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rest_json(json!(values))
+        }
+        _ => bail!("unsupported REST output format"),
+    }
+}
+
+fn rest_block(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+    details: bool,
+) -> Result<(&'static str, Vec<u8>)> {
+    let prefix = if details {
+        "block/"
+    } else {
+        "block/notxdetails/"
+    };
+    let hash_text = route
+        .strip_prefix(prefix)
+        .ok_or_else(|| anyhow!("invalid block path"))?;
+    let hash: BlockHash = hash_text.parse()?;
+    let block = node
+        .chain
+        .write()
+        .block(&hash)?
+        .ok_or_else(|| anyhow!("block not found"))?;
+    match format {
+        "json" => rest_json(get_block(
+            node,
+            &json!([hash.to_string(), if details { 2 } else { 1 }]),
+        )?),
+        "bin" => Ok(("application/octet-stream", serialize(&block))),
+        "hex" => rest_format_bytes(serialize(&block), format),
+        _ => bail!("unsupported REST output format"),
+    }
+}
+
+fn rest_transaction(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+) -> Result<(&'static str, Vec<u8>)> {
+    let txid = route
+        .strip_prefix("tx/")
+        .ok_or_else(|| anyhow!("invalid transaction path"))?;
+    let raw = get_raw_transaction(node, &json!([txid, false]))?;
+    let raw = raw
+        .as_str()
+        .ok_or_else(|| anyhow!("raw transaction response is not hex"))?;
+    match format {
+        "json" => rest_json(get_raw_transaction(node, &json!([txid, true]))?),
+        "bin" => Ok(("application/octet-stream", hex::decode(raw)?)),
+        "hex" => Ok(("text/plain", format!("{raw}\n").into_bytes())),
+        _ => bail!("unsupported REST output format"),
+    }
+}
+
+fn rest_get_utxos(node: &Arc<Node>, route: &str, format: &str) -> Result<(&'static str, Vec<u8>)> {
+    if format != "json" {
+        bail!("REST getutxos currently supports JSON output only")
+    }
+    let suffix = route
+        .strip_prefix("getutxos/")
+        .ok_or_else(|| anyhow!("invalid getutxos path"))?;
+    let (check_mempool, outpoints) = if let Some(outpoints) = suffix.strip_prefix("checkmempool/") {
+        (true, outpoints)
+    } else {
+        (false, suffix)
+    };
+    let outpoints = outpoints
+        .split('/')
+        .map(|value| {
+            let (txid, vout) = value
+                .rsplit_once('-')
+                .ok_or_else(|| anyhow!("invalid getutxos outpoint"))?;
+            Ok(OutPoint::new(txid.parse()?, vout.parse()?))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if outpoints.is_empty() || outpoints.len() > 15 {
+        bail!("getutxos accepts between 1 and 15 outpoints")
+    }
+    let chain = node.chain.read();
+    let mempool = check_mempool.then(|| node.mempool.read());
+    let mut bitmap = 0u32;
+    let mut utxos = Vec::new();
+    for (index, outpoint) in outpoints.iter().enumerate() {
+        let mut value = chain.utxo(outpoint).map(|entry| {
+            (
+                entry.height | if entry.coinbase { 1 << 31 } else { 0 },
+                entry.output.clone(),
+            )
+        });
+        if let Some(pool) = mempool.as_ref()
+            && pool.is_spent(outpoint)
+        {
+            value = None;
+        }
+        if value.is_none()
+            && let Some(pool) = mempool.as_ref()
+            && let Some(entry) = pool.get(&outpoint.txid)
+            && let Some(output) = entry.transaction.output.get(outpoint.vout as usize)
+            && !pool.is_spent(outpoint)
+        {
+            value = Some((0, output.clone()));
+        }
+        if let Some((height, output)) = value {
+            bitmap |= 1 << index;
+            utxos.push(json!({
+                "height": height,
+                "value": output.value.to_btc(),
+                "scriptPubKey": script_json(&output.script_pubkey),
+            }));
+        }
+    }
+    rest_json(json!({
+        "chainHeight": chain.height(),
+        "chaintipHash": chain.best_hash().to_string(),
+        "bitmap": format!("{bitmap:x}"),
+        "utxos": utxos,
+    }))
 }
 
 fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {
@@ -393,7 +712,7 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let tip = chain.tip();
     let header_tip = chain.best_header_tip();
     let header = chain.header(tip.height).expect("tip header exists");
-    Ok(json!({
+    let mut result = json!({
         "chain": network_name(chain.network),
         "blocks": tip.height,
         "headers": header_tip.height,
@@ -409,8 +728,11 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "pruned": false,
         "size_on_disk": std::fs::metadata(chain.store.path()).map(|m| m.len()).unwrap_or(0),
         "warnings": [],
-        "signet_challenge": chain.signet_challenge().map(hex::encode),
-    }))
+    });
+    if let Some(challenge) = chain.signet_challenge() {
+        result["signet_challenge"] = json!(hex::encode(challenge));
+    }
+    Ok(result)
 }
 
 fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -1899,6 +2221,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             rpc_bind: None,
             electrum_bind: None,
+            rest: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -1920,6 +2243,46 @@ mod tests {
                 "totalfee": 0,
                 "feerate_percentiles": [0, 0, 0, 0, 0],
             })
+        );
+    }
+
+    #[test]
+    fn rest_endpoints_render_chain_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: true,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let (_, chaininfo) = dispatch_rest(&node, "/rest/chaininfo.json").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&chaininfo).unwrap()["chain"],
+            "regtest"
+        );
+        let (_, hash) = dispatch_rest(&node, "/rest/blockhashbyheight/0.hex").unwrap();
+        assert_eq!(hash.len(), 65);
+        let (_, headers) = dispatch_rest(
+            &node,
+            &format!(
+                "/rest/headers/{}.json?count=1",
+                node.chain.read().best_hash()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&headers)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

@@ -24,3 +24,4 @@ cargo run -- --network regtest --datadir ./data
 
 The default configuration listens on `127.0.0.1:18444` for P2P, `127.0.0.1:18443` for JSON-RPC, and `127.0.0.1:30001` for Electrum.
 
+JSON-RPC uses the standard cookie file at `<datadir>/.cookie`; clients should send it as HTTP Basic authentication (`curl --user "$(cat data/.cookie)" ...`).

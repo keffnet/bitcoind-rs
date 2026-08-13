@@ -7,8 +7,10 @@
 use std::io::Cursor;
 
 use anyhow::{Result, bail};
+use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn};
 use bitcoin::{Block, BlockHash, Network, Transaction};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -139,6 +141,9 @@ pub enum Message {
     Mempool,
     FeeFilter(i64),
     SendCmpct { announce: bool, version: u64 },
+    CompactBlock(HeaderAndShortIds),
+    GetBlockTxn(BlockTransactionsRequest),
+    BlockTxn(BlockTransactions),
     Unknown { command: String, payload: Vec<u8> },
 }
 
@@ -164,6 +169,9 @@ impl Message {
             Self::Mempool => "mempool",
             Self::FeeFilter(_) => "feefilter",
             Self::SendCmpct { .. } => "sendcmpct",
+            Self::CompactBlock(_) => "cmpctblock",
+            Self::GetBlockTxn(_) => "getblocktxn",
+            Self::BlockTxn(_) => "blocktxn",
             Self::Unknown { command, .. } => command.as_str(),
         }
     }
@@ -322,6 +330,15 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
             out.push(u8::from(*announce));
             put_u64(*version, &mut out);
         }
+        Message::CompactBlock(compact) => out.extend_from_slice(&serialize(&CmpctBlock {
+            compact_block: compact.clone(),
+        })),
+        Message::GetBlockTxn(request) => out.extend_from_slice(&serialize(&GetBlockTxn {
+            txs_request: request.clone(),
+        })),
+        Message::BlockTxn(transactions) => out.extend_from_slice(&serialize(&BlockTxn {
+            transactions: transactions.clone(),
+        })),
         Message::Unknown { payload, .. } => out.extend_from_slice(payload),
     }
     Ok(out)
@@ -352,6 +369,21 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
             announce: reader.u8()? != 0,
             version: reader.u64_le()?,
         },
+        "cmpctblock" => Message::CompactBlock(
+            deserialize::<CmpctBlock>(payload)
+                .map_err(payload_error)?
+                .compact_block,
+        ),
+        "getblocktxn" => Message::GetBlockTxn(
+            deserialize::<GetBlockTxn>(payload)
+                .map_err(payload_error)?
+                .txs_request,
+        ),
+        "blocktxn" => Message::BlockTxn(
+            deserialize::<BlockTxn>(payload)
+                .map_err(payload_error)?
+                .transactions,
+        ),
         other => Message::Unknown {
             command: other.to_owned(),
             payload: payload.to_vec(),
@@ -360,7 +392,12 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
     if reader.remaining() != 0
         && !matches!(
             message,
-            Message::Block(_) | Message::Transaction(_) | Message::Unknown { .. }
+            Message::Block(_)
+                | Message::Transaction(_)
+                | Message::CompactBlock(_)
+                | Message::GetBlockTxn(_)
+                | Message::BlockTxn(_)
+                | Message::Unknown { .. }
         )
     {
         return Err(WireError::Payload("trailing bytes".to_owned()));
@@ -665,6 +702,48 @@ mod tests {
             address: [7; 16],
             port: 8333,
         }]);
+        let frame = encode_message(Network::Regtest, &message).unwrap();
+        assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn compact_block_messages_round_trip() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::bip152::HeaderAndShortIds;
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::blockdata::script::ScriptBuf;
+        use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
+        use bitcoin::blockdata::witness::Witness;
+        use bitcoin::{Amount, Block, TxMerkleNode};
+
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![1, 2]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![transaction],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let compact = HeaderAndShortIds::from_block(&block, 7, 2, &[]).unwrap();
+        let message = Message::CompactBlock(compact);
         let frame = encode_message(Network::Regtest, &message).unwrap();
         assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
     }

@@ -8,8 +8,9 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
 use bitcoin::hashes::Hash;
-use bitcoin::{BlockHash, Network, Txid, Wtxid};
+use bitcoin::{Block, BlockHash, Network, Transaction, Txid, Wtxid};
 use rand::random;
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf};
 use tokio::sync::{Mutex, Semaphore};
@@ -20,6 +21,12 @@ use crate::wire::{self, GetHeadersMessage, Inventory, InventoryType, Message, Ve
 
 type PeerWriter = Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>;
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, PeerWriter>>>;
+
+struct PendingCompactBlock {
+    compact: HeaderAndShortIds,
+    transactions: Vec<Option<Transaction>>,
+    requested_indexes: Vec<u64>,
+}
 
 pub struct PeerManager {
     node: Arc<Node>,
@@ -227,6 +234,8 @@ async fn serve_peer_loop(
     let mut verack_received = false;
     let mut verack_sent = false;
     let mut extensions_sent = false;
+    let mut compact_block_version = 2u64;
+    let mut pending_compact = None;
     loop {
         let message = wire::read_message(reader, node.config.network).await?;
         match message {
@@ -389,24 +398,133 @@ async fn serve_peer_loop(
                 }
             }
             Message::Block(block) => {
-                let hash = block.block_hash();
-                match node.connect_block(block) {
-                    Ok(tip) => {
-                        info!(%hash, height = tip.height, "accepted peer block");
-                        broadcast_inventory(
-                            peers,
-                            peer_id,
-                            node.config.network,
-                            Inventory {
-                                kind: InventoryType::WitnessBlock,
-                                hash,
-                            },
-                        )
-                        .await;
-                    }
-                    Err(error) => debug!(%hash, %error, "rejected peer block"),
-                }
+                handle_received_block(node, peers, peer_id, block).await;
                 request_headers(node, writer).await?;
+            }
+            Message::CompactBlock(compact) => {
+                let hash = compact.header.block_hash();
+                match reconstruct_compact_block(&compact, node, compact_block_version) {
+                    Ok((transactions, missing)) if missing.is_empty() => {
+                        match complete_compact_block(&compact, transactions) {
+                            Ok(block) => {
+                                handle_received_block(node, peers, peer_id, block).await;
+                                request_headers(node, writer).await?;
+                            }
+                            Err(error) => {
+                                debug!(%hash, %error, "invalid compact block reconstruction");
+                                request_full_block(writer, node.config.network, hash).await?;
+                            }
+                        }
+                    }
+                    Ok((transactions, missing)) => {
+                        let request = BlockTransactionsRequest {
+                            block_hash: hash,
+                            indexes: missing.clone(),
+                        };
+                        pending_compact = Some(PendingCompactBlock {
+                            compact,
+                            transactions,
+                            requested_indexes: missing,
+                        });
+                        send_message(writer, node.config.network, &Message::GetBlockTxn(request))
+                            .await?;
+                    }
+                    Err(error) => {
+                        debug!(%hash, %error, "unable to reconstruct compact block");
+                        request_full_block(writer, node.config.network, hash).await?;
+                    }
+                }
+            }
+            Message::GetBlockTxn(request) => {
+                if request.indexes.len() > 100_000 {
+                    debug!("compact block transaction request is too large");
+                    continue;
+                }
+                let block = node.chain.write().block(&request.block_hash)?;
+                let Some(block) = block else {
+                    continue;
+                };
+                let mut transactions = Vec::with_capacity(request.indexes.len());
+                let mut valid = true;
+                for index in &request.indexes {
+                    let Ok(index) = usize::try_from(*index) else {
+                        valid = false;
+                        break;
+                    };
+                    let Some(transaction) = block.txdata.get(index) else {
+                        valid = false;
+                        break;
+                    };
+                    transactions.push(transaction.clone());
+                }
+                if valid {
+                    send_message(
+                        writer,
+                        node.config.network,
+                        &Message::BlockTxn(BlockTransactions {
+                            block_hash: request.block_hash,
+                            transactions,
+                        }),
+                    )
+                    .await?;
+                }
+            }
+            Message::BlockTxn(response) => {
+                let Some(mut pending) = pending_compact.take() else {
+                    continue;
+                };
+                if response.block_hash != pending.compact.header.block_hash()
+                    || response.transactions.len() != pending.requested_indexes.len()
+                {
+                    request_full_block(
+                        writer,
+                        node.config.network,
+                        pending.compact.header.block_hash(),
+                    )
+                    .await?;
+                    continue;
+                }
+                let mut valid = true;
+                for (index, transaction) in pending
+                    .requested_indexes
+                    .iter()
+                    .copied()
+                    .zip(response.transactions)
+                {
+                    let Ok(index) = usize::try_from(index) else {
+                        valid = false;
+                        break;
+                    };
+                    let Some(slot) = pending.transactions.get_mut(index) else {
+                        valid = false;
+                        break;
+                    };
+                    if slot.is_some() {
+                        valid = false;
+                        break;
+                    }
+                    *slot = Some(transaction);
+                }
+                if !valid || pending.transactions.iter().any(Option::is_none) {
+                    request_full_block(
+                        writer,
+                        node.config.network,
+                        pending.compact.header.block_hash(),
+                    )
+                    .await?;
+                    continue;
+                }
+                match complete_compact_block(&pending.compact, pending.transactions) {
+                    Ok(block) => {
+                        handle_received_block(node, peers, peer_id, block).await;
+                        request_headers(node, writer).await?;
+                    }
+                    Err(error) => {
+                        let hash = pending.compact.header.block_hash();
+                        debug!(%hash, %error, "invalid compact block completion");
+                        request_full_block(writer, node.config.network, hash).await?;
+                    }
+                }
             }
             Message::Transaction(transaction) => {
                 let txid = transaction.compute_txid();
@@ -432,9 +550,16 @@ async fn serve_peer_loop(
             | Message::SendHeaders
             | Message::WtxidRelay
             | Message::FeeFilter(_)
-            | Message::SendCmpct { .. }
             | Message::NotFound(_)
             | Message::Unknown { .. } => {}
+            Message::SendCmpct {
+                announce: _,
+                version,
+            } => {
+                if version == 1 || version == 2 {
+                    compact_block_version = version;
+                }
+            }
             Message::GetAddr => {
                 let addresses = node
                     .peer_infos()
@@ -476,6 +601,133 @@ async fn serve_peer_loop(
     }
 }
 
+async fn handle_received_block(
+    node: &Arc<Node>,
+    peers: &PeerRegistry,
+    peer_id: usize,
+    block: Block,
+) {
+    let hash = block.block_hash();
+    match node.connect_block(block) {
+        Ok(tip) => {
+            info!(%hash, height = tip.height, "accepted peer block");
+            broadcast_inventory(
+                peers,
+                peer_id,
+                node.config.network,
+                Inventory {
+                    kind: InventoryType::WitnessBlock,
+                    hash,
+                },
+            )
+            .await;
+        }
+        Err(error) => debug!(%hash, %error, "rejected peer block"),
+    }
+}
+
+async fn request_full_block(writer: &PeerWriter, network: Network, hash: BlockHash) -> Result<()> {
+    send_message(
+        writer,
+        network,
+        &Message::GetData(vec![Inventory {
+            kind: InventoryType::WitnessBlock,
+            hash,
+        }]),
+    )
+    .await
+}
+
+fn reconstruct_compact_block(
+    compact: &HeaderAndShortIds,
+    node: &Arc<Node>,
+    version: u64,
+) -> Result<(Vec<Option<Transaction>>, Vec<u64>)> {
+    if version != 1 && version != 2 {
+        anyhow::bail!("unsupported compact block version {version}");
+    }
+    let transaction_count = compact
+        .short_ids
+        .len()
+        .checked_add(compact.prefilled_txs.len())
+        .ok_or_else(|| anyhow::anyhow!("compact block transaction count overflow"))?;
+    if transaction_count == 0 || transaction_count > 1_000_000 {
+        anyhow::bail!("invalid compact block transaction count");
+    }
+    let mut transactions = vec![None; transaction_count];
+    let mut last_prefilled = 0usize;
+    for prefilled in &compact.prefilled_txs {
+        let index = last_prefilled
+            .checked_add(prefilled.idx as usize)
+            .ok_or_else(|| anyhow::anyhow!("compact block prefilled index overflow"))?;
+        if index >= transaction_count || transactions[index].is_some() {
+            anyhow::bail!("invalid compact block prefilled index");
+        }
+        transactions[index] = Some(prefilled.tx.clone());
+        last_prefilled = index.saturating_add(1);
+    }
+
+    let siphash_keys = ShortId::calculate_siphash_keys(&compact.header, compact.nonce);
+    let mut candidates: HashMap<ShortId, Option<Transaction>> = HashMap::new();
+    let mempool = node.mempool.read();
+    for transaction in mempool.transactions() {
+        let short_id = compact_short_id(transaction, version, siphash_keys);
+        match candidates.entry(short_id) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Some(transaction.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+        }
+    }
+
+    let mut missing = Vec::new();
+    let mut short_ids = compact.short_ids.iter();
+    for (index, transaction) in transactions.iter_mut().enumerate() {
+        if transaction.is_some() {
+            continue;
+        }
+        let Some(short_id) = short_ids.next() else {
+            anyhow::bail!("compact block short-id count is inconsistent");
+        };
+        match candidates.get(short_id) {
+            Some(Some(candidate)) => *transaction = Some(candidate.clone()),
+            _ => missing.push(index as u64),
+        }
+    }
+    if short_ids.next().is_some() {
+        anyhow::bail!("compact block has too many short ids");
+    }
+    Ok((transactions, missing))
+}
+
+fn compact_short_id(transaction: &Transaction, version: u64, siphash_keys: (u64, u64)) -> ShortId {
+    match version {
+        1 => ShortId::with_siphash_keys(&transaction.compute_txid().to_raw_hash(), siphash_keys),
+        2 => ShortId::with_siphash_keys(&transaction.compute_wtxid().to_raw_hash(), siphash_keys),
+        _ => unreachable!("compact block version validated by caller"),
+    }
+}
+
+fn complete_compact_block(
+    compact: &HeaderAndShortIds,
+    transactions: Vec<Option<Transaction>>,
+) -> Result<Block> {
+    let txdata = transactions
+        .into_iter()
+        .collect::<Option<Vec<Transaction>>>()
+        .ok_or_else(|| anyhow::anyhow!("compact block still has missing transactions"))?;
+    let block = Block {
+        header: compact.header,
+        txdata,
+    };
+    if block.block_hash() != compact.header.block_hash() {
+        anyhow::bail!("compact block header hash changed during reconstruction");
+    }
+    Ok(block)
+}
+
 fn socket_address_bytes(address: std::net::SocketAddr) -> [u8; 16] {
     match address.ip() {
         std::net::IpAddr::V4(ip) => {
@@ -498,6 +750,15 @@ async fn send_peer_extensions(
     }
     send_message(writer, network, &Message::SendHeaders).await?;
     send_message(writer, network, &Message::WtxidRelay).await?;
+    send_message(
+        writer,
+        network,
+        &Message::SendCmpct {
+            announce: false,
+            version: 2,
+        },
+    )
+    .await?;
     send_message(writer, network, &Message::FeeFilter(1_000)).await?;
     *sent = true;
     Ok(())

@@ -1196,7 +1196,7 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn utxo_stat_size(output: &TxOut) -> i64 {
-    i64::try_from(serialize(output).len().saturating_add(40)).unwrap_or(i64::MAX)
+    i64::try_from(serialize(output).len().saturating_add(41)).unwrap_or(i64::MAX)
 }
 
 fn truncated_median(values: &mut [u64]) -> u64 {

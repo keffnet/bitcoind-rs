@@ -801,6 +801,19 @@ impl ChainState {
             self.median_time_past(),
         )?;
         self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
+        if !is_bip30_repeat(self.network, height, block.block_hash()) {
+            for transaction in &block.txdata {
+                let txid = transaction.compute_txid();
+                if transaction
+                    .output
+                    .iter()
+                    .enumerate()
+                    .any(|(vout, _)| self.utxos.contains_key(&OutPoint::new(txid, vout as u32)))
+                {
+                    bail!("block tries to overwrite an unspent transaction {txid}");
+                }
+            }
+        }
 
         let mut spent = HashSet::new();
         let mut spent_entries = Vec::new();
@@ -1421,6 +1434,16 @@ impl ChainState {
     }
 }
 
+fn is_bip30_repeat(network: Network, height: u32, hash: BlockHash) -> bool {
+    if network != Network::Bitcoin {
+        return false;
+    }
+    let hash = hash.to_string();
+    (height == 91_842 && hash == "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")
+        || (height == 91_880
+            && hash == "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")
+}
+
 pub fn electrum_script_hash(script: &Script) -> String {
     let mut digest = Sha256::digest(script.as_bytes()).to_vec();
     digest.reverse();
@@ -1451,6 +1474,22 @@ mod tests {
             state.best_hash(),
             genesis_block(Network::Regtest).block_hash()
         );
+    }
+
+    #[test]
+    fn recognizes_only_the_two_bip30_mainnet_repeats() {
+        assert!(is_bip30_repeat(
+            Network::Bitcoin,
+            91_842,
+            "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec"
+                .parse()
+                .unwrap()
+        ));
+        assert!(!is_bip30_repeat(
+            Network::Regtest,
+            91_842,
+            BlockHash::all_zeros()
+        ));
     }
 
     #[test]

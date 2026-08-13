@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use bitcoin::{Amount, Network, OutPoint, Transaction, Txid};
+use bitcoin::{Amount, Network, OutPoint, Transaction, Txid, Wtxid};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainState;
@@ -94,6 +94,12 @@ impl Mempool {
 
     pub fn get(&self, txid: &Txid) -> Option<&MempoolEntry> {
         self.entries.get(txid)
+    }
+
+    pub fn get_by_wtxid(&self, wtxid: &Wtxid) -> Option<&MempoolEntry> {
+        self.entries
+            .values()
+            .find(|entry| entry.transaction.compute_wtxid() == *wtxid)
     }
 
     pub fn is_spent(&self, outpoint: &OutPoint) -> bool {

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bitcoin::hashes::Hash;
-use bitcoin::{BlockHash, Network, Txid};
+use bitcoin::{BlockHash, Network, Txid, Wtxid};
 use rand::random;
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf};
 use tokio::sync::{Mutex, Semaphore};
@@ -39,6 +39,7 @@ impl PeerManager {
         let next_peer_id = Arc::new(AtomicUsize::new(1));
         let mut mempool_events = self.node.subscribe_mempool();
         let relay_peers = peers.clone();
+        let relay_node = self.node.clone();
         let relay_network = self.node.config.network;
         tokio::spawn(async move {
             loop {
@@ -47,13 +48,19 @@ impl PeerManager {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
+                let hash = relay_node
+                    .mempool
+                    .read()
+                    .get(&txid)
+                    .map(|entry| entry.transaction.compute_wtxid())
+                    .unwrap_or_else(|| Wtxid::from_raw_hash(txid.to_raw_hash()));
                 broadcast_inventory(
                     &relay_peers,
                     0,
                     relay_network,
                     Inventory {
                         kind: InventoryType::WitnessTransaction,
-                        hash: BlockHash::from_raw_hash(txid.to_raw_hash()),
+                        hash: BlockHash::from_raw_hash(hash.to_raw_hash()),
                     },
                 )
                 .await;
@@ -219,6 +226,7 @@ async fn serve_peer_loop(
     let mut version_received = false;
     let mut verack_received = false;
     let mut verack_sent = false;
+    let mut extensions_sent = false;
     loop {
         let message = wire::read_message(reader, node.config.network).await?;
         match message {
@@ -233,13 +241,16 @@ async fn serve_peer_loop(
                 node.update_peer_version(
                     peer_id,
                     version.version,
+                    version.services,
                     &version.user_agent,
                     version.start_height,
+                    version.relay,
                 );
                 if !verack_sent {
                     send_message(writer, node.config.network, &Message::Verack).await?;
                     verack_sent = true;
                 }
+                send_peer_extensions(writer, node.config.network, &mut extensions_sent).await?;
                 if outbound {
                     debug!(user_agent = %version.user_agent, height = version.start_height, "completed outbound version exchange");
                 }
@@ -249,18 +260,33 @@ async fn serve_peer_loop(
                 if !version_received {
                     continue;
                 }
+                send_peer_extensions(writer, node.config.network, &mut extensions_sent).await?;
                 request_headers(node, writer).await?;
             }
             Message::Ping(nonce) => {
                 send_message(writer, node.config.network, &Message::Pong(nonce)).await?;
             }
             Message::Pong(_) => {}
-            Message::GetHeaders(request) | Message::GetBlocks(request) => {
+            Message::GetHeaders(request) => {
                 let headers = node
                     .chain
                     .read()
                     .headers_after_locator(&request.locator_hashes, request.stop_hash);
                 send_message(writer, node.config.network, &Message::Headers(headers)).await?;
+            }
+            Message::GetBlocks(request) => {
+                let hashes = node
+                    .chain
+                    .read()
+                    .headers_after_locator(&request.locator_hashes, request.stop_hash)
+                    .into_iter()
+                    .take(500)
+                    .map(|header| Inventory {
+                        kind: InventoryType::WitnessBlock,
+                        hash: header.block_hash(),
+                    })
+                    .collect::<Vec<_>>();
+                send_message(writer, node.config.network, &Message::Inv(hashes)).await?;
             }
             Message::Headers(headers) => {
                 if headers.is_empty() {
@@ -295,9 +321,17 @@ async fn serve_peer_loop(
                                 !chain.store.contains(&item.hash)
                             }
                             InventoryType::Transaction | InventoryType::WitnessTransaction => {
-                                mempool
-                                    .get(&Txid::from_byte_array(item.hash.to_byte_array()))
-                                    .is_none()
+                                if item.kind == InventoryType::WitnessTransaction {
+                                    mempool
+                                        .get_by_wtxid(&Wtxid::from_byte_array(
+                                            item.hash.to_byte_array(),
+                                        ))
+                                        .is_none()
+                                } else {
+                                    mempool
+                                        .get(&Txid::from_byte_array(item.hash.to_byte_array()))
+                                        .is_none()
+                                }
                             }
                             _ => false,
                         })
@@ -322,12 +356,20 @@ async fn serve_peer_loop(
                             }
                         }
                         InventoryType::Transaction | InventoryType::WitnessTransaction => {
-                            let txid = Txid::from_byte_array(item.hash.to_byte_array());
-                            let transaction = node
-                                .mempool
-                                .read()
-                                .get(&txid)
-                                .map(|entry| entry.transaction.clone());
+                            let transaction = {
+                                let mempool = node.mempool.read();
+                                if item.kind == InventoryType::WitnessTransaction {
+                                    mempool
+                                        .get_by_wtxid(&Wtxid::from_byte_array(
+                                            item.hash.to_byte_array(),
+                                        ))
+                                        .map(|entry| entry.transaction.clone())
+                                } else {
+                                    mempool
+                                        .get(&Txid::from_byte_array(item.hash.to_byte_array()))
+                                        .map(|entry| entry.transaction.clone())
+                                }
+                            };
                             if let Some(transaction) = transaction {
                                 send_message(
                                     writer,
@@ -368,6 +410,7 @@ async fn serve_peer_loop(
             }
             Message::Transaction(transaction) => {
                 let txid = transaction.compute_txid();
+                let wtxid = transaction.compute_wtxid();
                 let accepted = node.accept_transaction(transaction).is_ok();
                 if accepted {
                     debug!(%txid, "accepted peer transaction");
@@ -377,7 +420,7 @@ async fn serve_peer_loop(
                         node.config.network,
                         Inventory {
                             kind: InventoryType::WitnessTransaction,
-                            hash: BlockHash::from_raw_hash(txid.to_raw_hash()),
+                            hash: BlockHash::from_raw_hash(wtxid.to_raw_hash()),
                         },
                     )
                     .await;
@@ -386,20 +429,87 @@ async fn serve_peer_loop(
                 }
             }
             Message::Addr(_)
-            | Message::GetAddr
             | Message::SendHeaders
             | Message::WtxidRelay
-            | Message::Mempool
             | Message::FeeFilter(_)
             | Message::SendCmpct { .. }
             | Message::NotFound(_)
             | Message::Unknown { .. } => {}
+            Message::GetAddr => {
+                let addresses = node
+                    .peer_infos()
+                    .into_iter()
+                    .take(1_000)
+                    .map(|peer| wire::NetworkAddress {
+                        time: u32::try_from(peer.connected_at).unwrap_or(u32::MAX),
+                        services: wire::NODE_NETWORK | wire::NODE_WITNESS,
+                        address: socket_address_bytes(peer.address),
+                        port: peer.address.port(),
+                    })
+                    .collect::<Vec<_>>();
+                send_message(writer, node.config.network, &Message::Addr(addresses)).await?;
+            }
+            Message::Mempool => {
+                let inventory = {
+                    let mempool = node.mempool.read();
+                    mempool
+                        .transaction_order()
+                        .into_iter()
+                        .filter_map(|txid| {
+                            mempool.get(&txid).map(|entry| Inventory {
+                                kind: InventoryType::WitnessTransaction,
+                                hash: BlockHash::from_raw_hash(
+                                    entry.transaction.compute_wtxid().to_raw_hash(),
+                                ),
+                            })
+                        })
+                        .take(50_000)
+                        .collect::<Vec<_>>()
+                };
+                send_message(writer, node.config.network, &Message::Inv(inventory)).await?;
+            }
         }
         if version_received && verack_received && !verack_sent {
             send_message(writer, node.config.network, &Message::Verack).await?;
             verack_sent = true;
         }
     }
+}
+
+fn socket_address_bytes(address: std::net::SocketAddr) -> [u8; 16] {
+    match address.ip() {
+        std::net::IpAddr::V4(ip) => {
+            let mut bytes = [0u8; 16];
+            bytes[10..12].copy_from_slice(&[0xff, 0xff]);
+            bytes[12..].copy_from_slice(&ip.octets());
+            bytes
+        }
+        std::net::IpAddr::V6(ip) => ip.octets(),
+    }
+}
+
+async fn send_peer_extensions(
+    writer: &PeerWriter,
+    network: Network,
+    sent: &mut bool,
+) -> Result<()> {
+    if *sent {
+        return Ok(());
+    }
+    send_message(writer, network, &Message::SendHeaders).await?;
+    send_message(writer, network, &Message::WtxidRelay).await?;
+    send_message(
+        writer,
+        network,
+        &Message::SendCmpct {
+            announce: true,
+            version: 2,
+        },
+    )
+    .await?;
+    send_message(writer, network, &Message::FeeFilter(1_000)).await?;
+    *sent = true;
+    Ok(())
 }
 
 async fn request_headers(node: &Arc<Node>, writer: &PeerWriter) -> Result<()> {

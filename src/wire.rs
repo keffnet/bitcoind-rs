@@ -15,6 +15,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const HEADER_SIZE: usize = 24;
 
+pub const NODE_NETWORK: u64 = 1;
+pub const NODE_WITNESS: u64 = 1 << 3;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InventoryType {
     Error,
@@ -62,6 +65,14 @@ pub struct Inventory {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetworkAddress {
+    pub time: u32,
+    pub services: u64,
+    pub address: [u8; 16],
+    pub port: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VersionMessage {
     pub version: i32,
     pub services: u64,
@@ -84,12 +95,12 @@ impl VersionMessage {
     pub fn new(start_height: i32, nonce: u64) -> Self {
         Self {
             version: Self::PROTOCOL_VERSION,
-            services: 0,
+            services: NODE_NETWORK | NODE_WITNESS,
             timestamp: chrono_like_unix_time(),
-            receiver_services: 0,
+            receiver_services: NODE_NETWORK | NODE_WITNESS,
             receiver_address: [0; 16],
             receiver_port: 0,
-            sender_services: 0,
+            sender_services: NODE_NETWORK | NODE_WITNESS,
             sender_address: [0; 16],
             sender_port: 0,
             nonce,
@@ -111,7 +122,7 @@ pub struct GetHeadersMessage {
 pub enum Message {
     Version(VersionMessage),
     Verack,
-    Addr(Vec<([u8; 16], u16, u64)>),
+    Addr(Vec<NetworkAddress>),
     GetAddr,
     SendHeaders,
     WtxidRelay,
@@ -274,11 +285,15 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
         | Message::WtxidRelay
         | Message::Mempool => {}
         Message::Addr(entries) => {
+            if entries.len() > 1_000 {
+                return Err(WireError::Payload("too many address records".to_owned()).into());
+            }
             put_compact_size(entries.len(), &mut out)?;
-            for (address, port, services) in entries {
-                put_u64(*services, &mut out);
-                out.extend_from_slice(address);
-                out.extend_from_slice(&port.to_be_bytes());
+            for entry in entries {
+                put_u32(entry.time, &mut out);
+                put_u64(entry.services, &mut out);
+                out.extend_from_slice(&entry.address);
+                out.extend_from_slice(&entry.port.to_be_bytes());
             }
         }
         Message::Ping(nonce) | Message::Pong(nonce) => put_u64(*nonce, &mut out),
@@ -429,14 +444,23 @@ fn decode_inventory(reader: &mut Reader<'_>) -> Result<Vec<Inventory>, WireError
     Ok(items)
 }
 
-fn decode_addr(reader: &mut Reader<'_>) -> Result<Vec<([u8; 16], u16, u64)>, WireError> {
+fn decode_addr(reader: &mut Reader<'_>) -> Result<Vec<NetworkAddress>, WireError> {
     let count = bounded_count(reader.compact_size()?)?;
+    if count > 1_000 {
+        return Err(WireError::Payload("too many address records".to_owned()));
+    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
+        let time = reader.u32_le()?;
         let services = reader.u64_le()?;
         let address = reader.array::<16>()?;
         let port = reader.u16_be()?;
-        entries.push((address, port, services));
+        entries.push(NetworkAddress {
+            time,
+            services,
+            address,
+            port,
+        });
     }
     Ok(entries)
 }
@@ -629,6 +653,18 @@ mod tests {
             command: "sendaddrv2".to_owned(),
             payload: Vec::new(),
         };
+        let frame = encode_message(Network::Regtest, &message).unwrap();
+        assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn address_round_trip_includes_timestamp_and_services() {
+        let message = Message::Addr(vec![NetworkAddress {
+            time: 123,
+            services: NODE_NETWORK | NODE_WITNESS,
+            address: [7; 16],
+            port: 8333,
+        }]);
         let frame = encode_message(Network::Regtest, &message).unwrap();
         assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
     }

@@ -39,8 +39,10 @@ pub struct PeerInfo {
     pub address: std::net::SocketAddr,
     pub inbound: bool,
     pub version: Option<i32>,
+    pub services: u64,
     pub user_agent: String,
     pub start_height: i32,
+    pub relay_transactions: bool,
     pub connected_at: u64,
 }
 
@@ -141,8 +143,10 @@ impl Node {
                 address,
                 inbound,
                 version: None,
+                services: 0,
                 user_agent: String::new(),
                 start_height: 0,
+                relay_transactions: true,
                 connected_at: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -155,13 +159,17 @@ impl Node {
         &self,
         id: usize,
         version: i32,
+        services: u64,
         user_agent: &str,
         start_height: i32,
+        relay_transactions: bool,
     ) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.version = Some(version);
+            peer.services = services;
             peer.user_agent = user_agent.to_owned();
             peer.start_height = start_height;
+            peer.relay_transactions = relay_transactions;
         }
     }
 

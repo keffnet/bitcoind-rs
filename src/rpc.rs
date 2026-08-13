@@ -1514,8 +1514,14 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let address = parse_socket_address(&address)?;
     let command = param::<String>(params, 1)?;
     match command.as_str() {
-        "add" | "onetry" => {
-            node.add_node(address);
+        "add" => {
+            if !node.add_node(address) {
+                bail!("node has already been added")
+            }
+            Ok(Value::Null)
+        }
+        "onetry" => {
+            node.request_one_try(address);
             Ok(Value::Null)
         }
         "remove" => {
@@ -8041,7 +8047,10 @@ mod tests {
             max_peers: 1,
         })
         .unwrap();
+        add_node(&node, &json!(["127.0.0.1:18445", "onetry"])).unwrap();
+        assert_eq!(get_added_node_info(&node, &json!([])).unwrap(), json!([]));
         add_node(&node, &json!(["127.0.0.1:18444", "add"])).unwrap();
+        assert!(add_node(&node, &json!(["127.0.0.1:18444", "add"])).is_err());
         let added = get_added_node_info(&node, &json!([])).unwrap();
         assert_eq!(added[0]["addednode"], "127.0.0.1:18444");
         set_ban(&node, &json!(["add", "192.0.2.1", 60])).unwrap();

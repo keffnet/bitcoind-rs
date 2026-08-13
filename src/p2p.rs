@@ -1,6 +1,7 @@
 //! Bitcoin peer networking and block/transaction relay.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -30,6 +31,12 @@ pub(crate) enum PeerCommand {
     RequestBlock(BlockHash),
     Ping(u64),
     SendMessage { command: String, payload: Vec<u8> },
+}
+
+#[derive(Debug)]
+pub(crate) enum PeerManagerRequest {
+    Add(SocketAddr),
+    OneTry(SocketAddr),
 }
 
 struct PendingCompactBlock {
@@ -105,6 +112,7 @@ impl PeerManager {
                 slots.clone(),
                 peers.clone(),
                 next_peer_id.clone(),
+                true,
             );
         }
         let dynamic_node = self.node.clone();
@@ -112,13 +120,18 @@ impl PeerManager {
         let dynamic_peers = peers.clone();
         let dynamic_ids = next_peer_id.clone();
         tokio::spawn(async move {
-            while let Some(address) = add_node_receiver.recv().await {
+            while let Some(request) = add_node_receiver.recv().await {
+                let (address, persistent) = match request {
+                    PeerManagerRequest::Add(address) => (address, true),
+                    PeerManagerRequest::OneTry(address) => (address, false),
+                };
                 spawn_outbound_loop(
                     dynamic_node.clone(),
                     address,
                     dynamic_slots.clone(),
                     dynamic_peers.clone(),
                     dynamic_ids.clone(),
+                    persistent,
                 );
             }
         });
@@ -152,6 +165,7 @@ fn spawn_outbound_loop(
     slots: Arc<Semaphore>,
     peers: PeerRegistry,
     next_peer_id: Arc<AtomicUsize>,
+    persistent: bool,
 ) {
     let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
@@ -159,7 +173,7 @@ fn spawn_outbound_loop(
             return;
         };
         loop {
-            if !node.is_node_added(address) {
+            if persistent && !node.is_node_added(address) {
                 return;
             }
             if !node.network_active() || node.is_banned(address.ip()) {
@@ -175,8 +189,17 @@ fn spawn_outbound_loop(
                     {
                         debug!(%address, %error, "outbound peer ended");
                     }
+                    if !persistent {
+                        return;
+                    }
                 }
-                Err(error) => warn!(%address, %error, "unable to connect to configured peer"),
+                Err(error) => {
+                    if !persistent {
+                        debug!(%address, %error, "one-shot peer connection failed");
+                        return;
+                    }
+                    warn!(%address, %error, "unable to connect to configured peer");
+                }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }

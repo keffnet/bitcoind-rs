@@ -252,7 +252,7 @@ pub struct Node {
     peer_commands:
         parking_lot::RwLock<HashMap<usize, tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>>>,
     peer_manager_requests:
-        parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<SocketAddr>>>,
+        parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<p2p::PeerManagerRequest>>>,
     orphans: parking_lot::Mutex<OrphanPool>,
     known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
     tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
@@ -701,10 +701,16 @@ impl Node {
         let inserted = self.added_nodes.write().insert(address);
         if inserted {
             if let Some(sender) = self.peer_manager_requests.read().as_ref() {
-                let _ = sender.send(address);
+                let _ = sender.send(p2p::PeerManagerRequest::Add(address));
             }
         }
         inserted
+    }
+
+    pub(crate) fn request_one_try(&self, address: SocketAddr) {
+        if let Some(sender) = self.peer_manager_requests.read().as_ref() {
+            let _ = sender.send(p2p::PeerManagerRequest::OneTry(address));
+        }
     }
 
     pub fn remove_node(&self, address: &SocketAddr) -> bool {
@@ -727,7 +733,7 @@ impl Node {
 
     pub(crate) fn set_peer_manager_sender(
         &self,
-        sender: tokio::sync::mpsc::UnboundedSender<SocketAddr>,
+        sender: tokio::sync::mpsc::UnboundedSender<p2p::PeerManagerRequest>,
     ) {
         *self.peer_manager_requests.write() = Some(sender);
     }

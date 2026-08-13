@@ -3089,7 +3089,7 @@ fn weighted_fee_percentiles(values: &mut [(u64, u64)], total_weight: u64) -> [u6
 
 fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
-    let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let verbosity = parse_transaction_verbosity(params.get(1))?;
     let requested_block = params
         .get(2)
         .and_then(Value::as_str)
@@ -3134,7 +3134,7 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     } else {
         bail!("No such mempool or blockchain transaction");
     };
-    if !verbose {
+    if verbosity == 0 {
         return Ok(json!(chain::transaction_hex(&transaction)));
     }
     let blockhash =
@@ -3153,13 +3153,59 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .map(|header| header.time)
         })
         .flatten();
-    Ok(rpc_transaction(
+    let mut result = rpc_transaction(
         &transaction,
         blockhash.as_deref(),
         confirmations,
         block_time,
         block_time,
-    ))
+    );
+    if verbosity >= 2 {
+        if location.block_hash != BlockHash::all_zeros() {
+            if let Some(undo) = chain
+                .spent_outputs_by_transaction(&location.block_hash)?
+                .and_then(|entries| entries.get(location.transaction_index).cloned())
+                && undo.len() == transaction.input.len()
+            {
+                add_prevout_details(&mut result, &transaction, &undo, &mut chain)?;
+                let input_total = undo
+                    .iter()
+                    .map(|output| output.value.to_sat())
+                    .try_fold(0u64, u64::checked_add)
+                    .ok_or_else(|| anyhow!("transaction input total overflowed"))?;
+                let output_total = transaction
+                    .output
+                    .iter()
+                    .map(|output| output.value.to_sat())
+                    .try_fold(0u64, u64::checked_add)
+                    .ok_or_else(|| anyhow!("transaction output total overflowed"))?;
+                if input_total >= output_total {
+                    result["fee"] = json!(sat_to_btc(input_total - output_total));
+                }
+            }
+        } else if let Some(entry) = node.mempool.read().get(&txid) {
+            result["fee"] = json!(sat_to_btc(entry.fee_sat));
+        }
+    }
+    Ok(result)
+}
+
+fn parse_transaction_verbosity(value: Option<&Value>) -> Result<u8> {
+    match value {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Bool(verbose)) => Ok(u8::from(*verbose)),
+        Some(Value::Number(number)) => {
+            let verbosity = number
+                .as_u64()
+                .ok_or_else(|| anyhow!("verbosity must be a non-negative integer"))?;
+            let verbosity = u8::try_from(verbosity).map_err(|_| anyhow!("invalid verbosity"))?;
+            if verbosity > 2 {
+                bail!("invalid verbosity {verbosity}")
+            }
+            Ok(verbosity)
+        }
+        Some(_) => bail!("verbosity must be a number or boolean"),
+    }
 }
 
 fn decode_raw_transaction(params: &Value) -> Result<Value> {
@@ -8271,6 +8317,9 @@ mod tests {
             decoded["addresses"][0],
             "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
         );
+        assert_eq!(parse_transaction_verbosity(Some(&json!(1))).unwrap(), 1);
+        assert_eq!(parse_transaction_verbosity(Some(&json!(true))).unwrap(), 1);
+        assert!(parse_transaction_verbosity(Some(&json!(3))).is_err());
     }
 
     #[test]

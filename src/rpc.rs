@@ -20,6 +20,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::psbt::{Input as PsbtInput, Psbt};
 use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+use bitcoin::sign_message::{MessageSignature, signed_msg_hash};
 use bitcoin::{
     Address, Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
 };
@@ -890,6 +891,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "combinepsbt" => combine_psbt(params),
         "finalizepsbt" => finalize_psbt(params),
         "utxoupdatepsbt" => update_psbt_utxos(node, params),
+        "signmessagewithprivkey" => sign_message_with_private_key(params),
+        "verifymessage" => verify_message(node, params),
+        "createmultisig" => create_multisig(node, params),
         "sendrawtransaction" => send_raw_transaction(node, params),
         "signrawtransactionwithkey" => sign_raw_transaction_with_key(node, params),
         "submitblock" => submit_block(node, params),
@@ -3419,6 +3423,78 @@ fn update_psbt_utxos(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(encode_psbt(&psbt)))
 }
 
+fn sign_message_with_private_key(params: &Value) -> Result<Value> {
+    let private_key = bitcoin::PrivateKey::from_wif(&param::<String>(params, 0)?)?;
+    let message = param::<String>(params, 1)?;
+    let secp = Secp256k1::new();
+    let message_hash = signed_msg_hash(&message);
+    let signature = secp.sign_ecdsa_recoverable(
+        &Message::from_digest(message_hash.to_byte_array()),
+        &private_key.inner,
+    );
+    Ok(json!(base64::engine::general_purpose::STANDARD.encode(
+        MessageSignature::new(signature, private_key.compressed).serialize()
+    )))
+}
+
+fn verify_message(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let address = param::<String>(params, 0)?
+        .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
+        .require_network(node.config.network)?;
+    let signature = MessageSignature::from_slice(
+        &base64::engine::general_purpose::STANDARD.decode(param::<String>(params, 1)?)?,
+    )?;
+    let message = param::<String>(params, 2)?;
+    let verified =
+        signature.is_signed_by_address(&Secp256k1::new(), &address, signed_msg_hash(&message))?;
+    Ok(json!(verified))
+}
+
+fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let required = param::<u64>(params, 0)?;
+    let key_values = params
+        .get(1)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("createmultisig keys must be an array"))?;
+    let key_count = u64::try_from(key_values.len()).map_err(|_| anyhow!("too many keys"))?;
+    if required == 0 || required > key_count || key_count > 16 {
+        bail!("required signatures must be between 1 and the number of keys (maximum 16)")
+    }
+    let public_keys = key_values
+        .iter()
+        .map(|value| {
+            let key = value
+                .as_str()
+                .ok_or_else(|| anyhow!("multisig keys must be public key strings"))?;
+            key.parse::<bitcoin::PublicKey>()
+                .map_err(|error| anyhow!("invalid public key: {error}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut builder = Builder::new().push_int(required as i64);
+    for public_key in &public_keys {
+        builder = builder.push_key(public_key);
+    }
+    let redeem_script = builder
+        .push_int(key_count as i64)
+        .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
+        .into_script();
+    let address_type = params
+        .get(2)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_str)
+        .unwrap_or("legacy");
+    let address = match address_type {
+        "legacy" => Address::p2sh(&redeem_script, node.config.network)?,
+        "p2sh-segwit" => Address::p2shwsh(&redeem_script, node.config.network),
+        "bech32" => Address::p2wsh(&redeem_script, node.config.network),
+        _ => bail!("unsupported multisig address type: {address_type}"),
+    };
+    Ok(json!({
+        "address": address.to_string(),
+        "redeemScript": hex::encode(redeem_script.as_bytes()),
+    }))
+}
+
 fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let transaction: Transaction = deserialize(&bytes)?;
@@ -5207,6 +5283,9 @@ fn rpc_help(method: &str) -> String {
         "combinepsbt",
         "finalizepsbt",
         "utxoupdatepsbt",
+        "signmessagewithprivkey",
+        "verifymessage",
+        "createmultisig",
         "sendrawtransaction",
         "signrawtransactionwithkey",
         "submitblock",
@@ -6059,6 +6138,74 @@ mod tests {
             deserialize(&hex::decode(result["hex"].as_str().unwrap()).unwrap()).unwrap();
         assert_eq!(signed.input[0].script_sig, ScriptBuf::new());
         assert_eq!(signed.input[0].witness.len(), 2);
+    }
+
+    #[test]
+    fn message_signing_rpcs_round_trip_without_a_wallet() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[2; 32]).unwrap();
+        let private = bitcoin::PrivateKey::new(secret, Network::Regtest);
+        let public_key = private.public_key(&Secp256k1::new());
+        let address = Address::p2pkh(public_key, Network::Regtest);
+        let message = "wallet-free message";
+        let signature = sign_message_with_private_key(&json!([private.to_wif(), message])).unwrap();
+        assert_eq!(
+            verify_message(&node, &json!([address.to_string(), signature, message]),).unwrap(),
+            true
+        );
+        assert_eq!(
+            verify_message(&node, &json!([address.to_string(), signature, "tampered"]),).unwrap(),
+            false
+        );
+    }
+
+    #[test]
+    fn createmultisig_supports_legacy_and_segwit_address_types() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let secp = Secp256k1::new();
+        let first = bitcoin::PrivateKey::new(
+            bitcoin::secp256k1::SecretKey::from_slice(&[3; 32]).unwrap(),
+            Network::Regtest,
+        );
+        let second = bitcoin::PrivateKey::new(
+            bitcoin::secp256k1::SecretKey::from_slice(&[4; 32]).unwrap(),
+            Network::Regtest,
+        );
+        let keys = json!([
+            first.public_key(&secp).to_string(),
+            second.public_key(&secp).to_string(),
+        ]);
+        let legacy = create_multisig(&node, &json!([1, keys])).unwrap();
+        let redeem_script =
+            ScriptBuf::from_bytes(hex::decode(legacy["redeemScript"].as_str().unwrap()).unwrap());
+        assert!(redeem_script.is_multisig());
+        assert!(legacy["address"].as_str().unwrap().starts_with('2'));
+        let segwit = create_multisig(&node, &json!([1, keys, "bech32"])).unwrap();
+        assert!(segwit["address"].as_str().unwrap().starts_with("bcrt1q"));
     }
 
     #[test]

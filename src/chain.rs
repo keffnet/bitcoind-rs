@@ -46,6 +46,13 @@ pub struct ChainTip {
     pub work: Work,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct BlockNode {
+    header: bitcoin::block::Header,
+    height: u32,
+    chain_work: Work,
+}
+
 #[derive(Serialize, Deserialize)]
 struct ChainMetadata {
     active_chain: Vec<String>,
@@ -57,6 +64,7 @@ pub struct ChainState {
     pub store: BlockStore,
     active_chain: Vec<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
+    block_index: HashMap<BlockHash, BlockNode>,
     utxos: HashMap<OutPoint, UtxoEntry>,
     tx_index: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
@@ -109,6 +117,7 @@ impl ChainState {
             store,
             active_chain: Vec::new(),
             headers: Vec::new(),
+            block_index: HashMap::new(),
             utxos: HashMap::new(),
             tx_index: HashMap::new(),
             history: HashMap::new(),
@@ -120,6 +129,7 @@ impl ChainState {
         if state.active_chain != active_chain {
             bail!("chainstate metadata does not match replayed active chain");
         }
+        state.rebuild_block_index()?;
         if !metadata_path.exists() {
             state.persist_metadata()?;
         }
@@ -271,7 +281,47 @@ impl ChainState {
     }
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {
-        self.connect_block_internal(&block, true)?;
+        let hash = block.block_hash();
+        if self.active_chain.contains(&hash) {
+            return Ok(self.tip());
+        }
+        let parent_hash = block.header.prev_blockhash;
+        let Some(parent) = self.block_index.get(&parent_hash).copied() else {
+            self.store.insert(&block)?;
+            bail!("block {} has an unknown parent {}", hash, parent_hash);
+        };
+        if parent_hash == self.best_hash() {
+            self.connect_block_internal(&block, true)?;
+            return Ok(self.tip());
+        }
+
+        let height = parent.height.saturating_add(1);
+        validation::validate_header(
+            self.network,
+            &block.header,
+            parent_hash,
+            self.expected_target_for_parent(parent_hash, block.header.time),
+            self.median_time_past_for_parent(parent_hash),
+        )?;
+        validation::validate_block_structure(
+            &block,
+            self.network,
+            height,
+            Amount::MAX_MONEY.to_sat(),
+        )?;
+        self.store.insert(&block)?;
+        let chain_work = parent.chain_work + block.header.work();
+        self.block_index.insert(
+            hash,
+            BlockNode {
+                header: block.header,
+                height,
+                chain_work,
+            },
+        );
+        if chain_work > self.tip().work {
+            self.activate_chain(hash)?;
+        }
         Ok(self.tip())
     }
 
@@ -392,6 +442,19 @@ impl ChainState {
         }
         self.active_chain.push(hash);
         self.headers.push(block.header);
+        let parent_work = self
+            .block_index
+            .get(&block.header.prev_blockhash)
+            .context("block parent is not indexed")?
+            .chain_work;
+        self.block_index.insert(
+            hash,
+            BlockNode {
+                header: block.header,
+                height,
+                chain_work: parent_work + block.header.work(),
+            },
+        );
         if persist {
             self.persist_metadata()?;
         }
@@ -404,7 +467,108 @@ impl ChainState {
         }
         self.active_chain.push(genesis.block_hash());
         self.headers.push(genesis.header);
+        self.block_index.insert(
+            genesis.block_hash(),
+            BlockNode {
+                header: genesis.header,
+                height: 0,
+                chain_work: genesis.header.work(),
+            },
+        );
         self.index_transactions(genesis, 0);
+        Ok(())
+    }
+
+    fn rebuild_block_index(&mut self) -> Result<()> {
+        let hashes: Vec<BlockHash> = self.store.hashes().copied().collect();
+        let mut blocks = Vec::new();
+        for hash in hashes {
+            if self.block_index.contains_key(&hash) {
+                continue;
+            }
+            if let Some(block) = self.store.get(&hash)? {
+                blocks.push((hash, block));
+            }
+        }
+        for _ in 0..blocks.len() {
+            let mut progress = false;
+            for (hash, block) in &blocks {
+                if self.block_index.contains_key(hash) {
+                    continue;
+                }
+                let Some(parent) = self.block_index.get(&block.header.prev_blockhash).copied()
+                else {
+                    continue;
+                };
+                self.block_index.insert(
+                    *hash,
+                    BlockNode {
+                        header: block.header,
+                        height: parent.height.saturating_add(1),
+                        chain_work: parent.chain_work + block.header.work(),
+                    },
+                );
+                progress = true;
+            }
+            if !progress {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn activate_chain(&mut self, tip_hash: BlockHash) -> Result<()> {
+        let mut path = Vec::new();
+        let mut cursor = tip_hash;
+        loop {
+            path.push(cursor);
+            if cursor == self.network_genesis_hash() {
+                break;
+            }
+            let node = self
+                .block_index
+                .get(&cursor)
+                .copied()
+                .context("candidate chain is missing a block index entry")?;
+            cursor = node.header.prev_blockhash;
+        }
+        path.reverse();
+        let blocks = path
+            .iter()
+            .map(|hash| self.store.get(hash))
+            .collect::<Result<Vec<Option<Block>>>>()?
+            .into_iter()
+            .enumerate()
+            .map(|(index, block)| {
+                block.with_context(|| format!("candidate block {} is missing", path[index]))
+            })
+            .collect::<Result<Vec<Block>>>()?;
+
+        let old_active_chain = self.active_chain.clone();
+        let old_headers = self.headers.clone();
+        let old_utxos = self.utxos.clone();
+        let old_tx_index = self.tx_index.clone();
+        let old_history = self.history.clone();
+        self.active_chain.clear();
+        self.headers.clear();
+        self.utxos.clear();
+        self.tx_index.clear();
+        self.history.clear();
+        let replay = (|| -> Result<()> {
+            self.initialize_genesis(&blocks[0])?;
+            for block in blocks.iter().skip(1) {
+                self.connect_block_internal(block, false)?;
+            }
+            self.persist_metadata()
+        })();
+        if let Err(error) = replay {
+            self.active_chain = old_active_chain;
+            self.headers = old_headers;
+            self.utxos = old_utxos;
+            self.tx_index = old_tx_index;
+            self.history = old_history;
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -459,8 +623,16 @@ impl ChainState {
     }
 
     fn expected_target(&self, candidate_time: u32) -> Target {
-        let height = self.height().saturating_add(1);
-        let previous = self.headers.last().expect("genesis header exists");
+        self.expected_target_for_parent(self.best_hash(), candidate_time)
+    }
+
+    fn expected_target_for_parent(&self, parent_hash: BlockHash, candidate_time: u32) -> Target {
+        let parent_node = self
+            .block_index
+            .get(&parent_hash)
+            .expect("parent is indexed");
+        let height = parent_node.height.saturating_add(1);
+        let previous = &parent_node.header;
         let params = self.network.params();
         if params.no_pow_retargeting {
             return previous.target();
@@ -476,9 +648,25 @@ impl ChainState {
             }
             return previous.target();
         }
-        let first = &self.headers[(height - DIFFICULTY_INTERVAL) as usize];
+        let first_hash = self
+            .ancestor_hash(parent_hash, height - DIFFICULTY_INTERVAL)
+            .expect("difficulty interval ancestor exists");
+        let first = &self
+            .block_index
+            .get(&first_hash)
+            .expect("ancestor is indexed")
+            .header;
         let timespan = previous.time.saturating_sub(first.time) as u64;
         CompactTarget::from_next_work_required(previous.bits, timespan, params).into()
+    }
+
+    fn ancestor_hash(&self, mut hash: BlockHash, height: u32) -> Option<BlockHash> {
+        let mut current_height = self.block_index.get(&hash)?.height;
+        while current_height > height {
+            hash = self.block_index.get(&hash)?.header.prev_blockhash;
+            current_height -= 1;
+        }
+        (current_height == height).then_some(hash)
     }
 
     fn median_time_past(&self) -> u32 {
@@ -487,6 +675,23 @@ impl ChainState {
             .iter()
             .map(|header| header.time)
             .collect();
+        times.sort_unstable();
+        times[times.len() / 2]
+    }
+
+    fn median_time_past_for_parent(&self, parent_hash: BlockHash) -> u32 {
+        let mut times = Vec::with_capacity(11);
+        let mut cursor = parent_hash;
+        for _ in 0..11 {
+            let Some(node) = self.block_index.get(&cursor) else {
+                break;
+            };
+            times.push(node.header.time);
+            if node.height == 0 {
+                break;
+            }
+            cursor = node.header.prev_blockhash;
+        }
         times.sort_unstable();
         times[times.len() / 2]
     }
@@ -550,19 +755,51 @@ mod tests {
         let second = mine_block(&state, 2);
         state.connect_block(second).unwrap();
         assert_eq!(state.height(), 2);
-        assert_eq!(state.best_hash(), second_hash(&state));
+        assert_eq!(state.best_hash(), state.block_hash(2).unwrap());
         drop(state);
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.height(), 2);
         assert_eq!(reopened.block_hash(1), Some(first_hash));
     }
 
-    fn second_hash(state: &ChainState) -> BlockHash {
-        state.best_hash()
-    }
-
     fn mine_block(state: &ChainState, height: u32) -> Block {
         let previous = state.header(height - 1).expect("parent header");
+        mine_block_from_header(previous, height, 0)
+    }
+
+    #[test]
+    fn selects_and_replays_a_higher_work_fork() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let main_one = mine_block(&state, 1);
+        state.connect_block(main_one).unwrap();
+        let main_two = mine_block(&state, 2);
+        state.connect_block(main_two).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 1);
+        let side_one_hash = side_one.block_hash();
+        state.connect_block(side_one).unwrap();
+        let side_one_header = *state.block_index.get(&side_one_hash).unwrap();
+        let side_two = mine_block_from_header(&side_one_header.header, 2, 2);
+        let side_two_hash = side_two.block_hash();
+        state.connect_block(side_two).unwrap();
+        let side_two_header = *state.block_index.get(&side_two_hash).unwrap();
+        let side_three = mine_block_from_header(&side_two_header.header, 3, 3);
+        let side_three_hash = side_three.block_hash();
+        state.connect_block(side_three).unwrap();
+
+        assert_eq!(state.height(), 3);
+        assert_eq!(state.best_hash(), side_three_hash);
+        assert_eq!(state.block_hash(1), Some(side_one_hash));
+
+        drop(state);
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), side_three_hash);
+        assert_eq!(reopened.block_hash(1), Some(side_one_hash));
+    }
+
+    fn mine_block_from_header(previous: &Header, height: u32, tag: u8) -> Block {
         let transaction = Transaction {
             version: Version::ONE,
             lock_time: LockTime::ZERO,
@@ -570,6 +807,7 @@ mod tests {
                 previous_output: OutPoint::null(),
                 script_sig: Builder::new()
                     .push_int(height as i64)
+                    .push_slice([tag])
                     .push_slice([0u8])
                     .into_script(),
                 sequence: Sequence::MAX,

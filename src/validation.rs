@@ -99,6 +99,11 @@ pub fn validate_header(
     if header.target() != expected_target {
         return Err(ValidationError::BadTarget);
     }
+    let compact = header.bits.to_consensus();
+    let mantissa = compact & 0x007f_ffff;
+    if mantissa == 0 || (compact & 0x0080_0000) != 0 || header.target() == Target::ZERO {
+        return Err(ValidationError::BadTarget);
+    }
     if header.target() > network_params(network).max_attainable_target {
         return Err(ValidationError::TargetAboveLimit);
     }
@@ -146,6 +151,13 @@ pub fn validate_block_structure(
         }
     }
 
+    let coinbase_total = first
+        .output
+        .iter()
+        .try_fold(0u64, |total, output| {
+            total.checked_add(output.value.to_sat())
+        })
+        .ok_or(ValidationError::OutputTotalOverflow)?;
     let mut txids = HashSet::with_capacity(block.txdata.len());
     let mut total_output_sat = 0u64;
     for (position, tx) in block.txdata.iter().enumerate() {
@@ -182,19 +194,9 @@ pub fn validate_block_structure(
             .checked_add(tx_total)
             .ok_or(ValidationError::OutputTotalOverflow)?;
     }
-    if first
-        .output
-        .iter()
-        .map(|output| output.value.to_sat())
-        .sum::<u64>()
-        > expected_coinbase_value
-    {
+    if coinbase_total > expected_coinbase_value {
         return Err(ValidationError::CoinbaseOverpay {
-            actual: first
-                .output
-                .iter()
-                .map(|output| output.value.to_sat())
-                .sum(),
+            actual: coinbase_total,
             allowed: expected_coinbase_value,
         });
     }
@@ -270,11 +272,39 @@ pub fn validate_transaction_scripts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::blockdata::script::ScriptBuf;
+    use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
+    use bitcoin::blockdata::witness::Witness;
+    use bitcoin::hashes::Hash;
 
     #[test]
     fn subsidy_halves_and_eventually_stops() {
         assert_eq!(block_subsidy(0), 5_000_000_000);
         assert_eq!(block_subsidy(210_000), 2_500_000_000);
         assert_eq!(block_subsidy(64 * 210_000), 0);
+    }
+
+    #[test]
+    fn consensus_engine_accepts_an_anyone_can_spend_input() {
+        let previous = TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        };
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([1u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(9_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        validate_transaction_scripts(&transaction, &[previous]).unwrap();
     }
 }

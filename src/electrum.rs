@@ -123,14 +123,7 @@ fn dispatch(
         "server.version" => Ok(json!(["bitcoind-rs 0.1.0", "1.4"])),
         "server.ping" => Ok(Value::Null),
         "server.banner" => Ok(json!("bitcoind-rs wallet-free Bitcoin node")),
-        "server.features" => Ok(json!({
-            "server_version": "bitcoind-rs 0.1.0",
-            "protocol_min": "1.4",
-            "protocol_max": "1.4",
-            "genesis_hash": node.chain.read().block_hash(0).expect("genesis exists").to_string(),
-            "hash_function": "sha256",
-            "pruning": null,
-        })),
+        "server.features" => Ok(server_features(node)),
         "blockchain.headers.subscribe" => {
             let chain = node.chain.read();
             let height = chain.height();
@@ -188,8 +181,17 @@ fn dispatch(
                     )
                 });
                 if affects_outputs || affects_inputs {
+                    let height = if transaction
+                        .input
+                        .iter()
+                        .any(|input| mempool.get(&input.previous_output.txid).is_some())
+                    {
+                        -1
+                    } else {
+                        0
+                    };
                     result.push(
-                        json!({"tx_hash": txid.to_string(), "height": 0, "fee": entry.fee_sat}),
+                        json!({"tx_hash": txid.to_string(), "height": height, "fee": entry.fee_sat}),
                     );
                 }
             }
@@ -216,20 +218,31 @@ fn dispatch(
             let mempool = node.mempool.read();
             Ok(fee_histogram(&mempool))
         }
-        "server.peers.subscribe" => Ok(json!(
-            node.peer_infos()
-                .into_iter()
-                .map(|peer| {
-                    json!([
-                        peer.user_agent,
-                        peer.address.ip().to_string(),
-                        peer.address.port()
-                    ])
-                })
-                .collect::<Vec<_>>()
-        )),
+        "server.peers.subscribe" => Ok(json!([])),
         _ => bail!("unsupported Electrum method {method}"),
     }
+}
+
+fn server_features(node: &Arc<Node>) -> Value {
+    let mut hosts = serde_json::Map::new();
+    if let Some(address) = node.config.electrum_bind {
+        let host = if address.ip().is_unspecified() {
+            "localhost".to_owned()
+        } else {
+            address.ip().to_string()
+        };
+        hosts.insert(host, json!({"tcp_port": address.port(), "ssl_port": null}));
+    }
+    let chain = node.chain.read();
+    json!({
+        "hosts": Value::Object(hosts),
+        "server_version": "bitcoind-rs 0.1.0",
+        "protocol_min": "1.4",
+        "protocol_max": "1.4",
+        "genesis_hash": chain.block_hash(0).expect("genesis exists").to_string(),
+        "hash_function": "sha256",
+        "pruning": null,
+    })
 }
 
 fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
@@ -502,9 +515,13 @@ fn electrum_transaction_json(
 
 fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
+    let requested_height = param::<u32>(params, 1)?;
     let Some((branch, position, height)) = node.chain.write().merkle_branch(&txid)? else {
         bail!("transaction not found")
     };
+    if height != requested_height {
+        bail!("transaction is not in the requested block")
+    }
     Ok(json!({
         "block_height": height,
         "pos": position,
@@ -567,9 +584,18 @@ async fn send_status_notifications(
 }
 
 fn history_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
+    let mempool = node.mempool.read();
     history_records_for_script(node, script_hash)
         .into_iter()
-        .map(|(txid, height)| json!({"tx_hash": txid.to_string(), "height": height}))
+        .map(|(txid, height)| {
+            let mut result = json!({"tx_hash": txid.to_string(), "height": height});
+            if height == 0
+                && let Some(entry) = mempool.get(&txid)
+            {
+                result["fee"] = json!(entry.fee_sat);
+            }
+            result
+        })
         .collect()
 }
 
@@ -659,7 +685,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
             );
         }
     }
-    let mut results: Vec<(OutPoint, i64, u64)> = chain
+    let mut confirmed: Vec<(OutPoint, i64, u64)> = chain
         .get_utxos(script_hash)
         .into_iter()
         .filter(|(outpoint, _)| !spent.contains(outpoint))
@@ -671,6 +697,13 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
             )
         })
         .collect();
+    confirmed.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.txid.to_string().cmp(&right.0.txid.to_string()))
+            .then_with(|| left.0.vout.cmp(&right.0.vout))
+    });
+    let mut unconfirmed = Vec::new();
     for txid in mempool.transaction_order() {
         let Some(entry) = mempool.get(&txid) else {
             continue;
@@ -679,17 +712,13 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
             if chain::electrum_script_hash(&output.script_pubkey) == script_hash {
                 let outpoint = OutPoint::new(txid, vout as u32);
                 if !spent.contains(&outpoint) {
-                    results.push((outpoint, 0, output.value.to_sat()));
+                    unconfirmed.push((outpoint, 0, output.value.to_sat()));
                 }
             }
         }
     }
-    results.sort_by(|left, right| {
-        left.1
-            .cmp(&right.1)
-            .then_with(|| left.0.txid.to_string().cmp(&right.0.txid.to_string()))
-            .then_with(|| left.0.vout.cmp(&right.0.vout))
-    });
+    confirmed.extend(unconfirmed);
+    let results = confirmed;
     results
         .into_iter()
         .map(|(outpoint, height, value)| {
@@ -810,7 +839,7 @@ mod tests {
                 datadir: directory.path().to_owned(),
                 p2p_bind: "127.0.0.1:0".parse().unwrap(),
                 rpc_bind: None,
-                electrum_bind: None,
+                electrum_bind: Some("127.0.0.1:30001".parse().unwrap()),
                 rest: false,
                 seed_nodes: Vec::new(),
                 signet_challenge: None,
@@ -821,12 +850,27 @@ mod tests {
         let hash = node.chain.read().best_hash();
         let block = node.chain.write().block(&hash).unwrap().unwrap();
         let txid = block.txdata[0].compute_txid();
+        let features = server_features(&node);
+        assert_eq!(features["hosts"]["127.0.0.1"]["tcp_port"], 30001);
+        assert_eq!(
+            dispatch(
+                &node,
+                "server.peers.subscribe",
+                &json!([]),
+                &mut HashSet::new()
+            )
+            .unwrap(),
+            json!([])
+        );
         let result = transaction_get_batch(&node, &json!([[txid.to_string()]])).unwrap();
         assert_eq!(result.as_array().unwrap().len(), 1);
         assert_eq!(
             result[0].as_str().unwrap(),
             chain::transaction_hex(&block.txdata[0])
         );
+        let merkle = transaction_merkle(&node, &json!([txid.to_string(), 0])).unwrap();
+        assert_eq!(merkle["block_height"], 0);
+        assert!(transaction_merkle(&node, &json!([txid.to_string(), 1])).is_err());
 
         let script_hash = "00".repeat(32);
         let mut subscriptions = HashSet::new();

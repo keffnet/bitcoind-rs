@@ -72,6 +72,7 @@ struct ChainMetadata {
 #[derive(Serialize, Deserialize)]
 struct ChainSnapshot {
     tip: String,
+    headers: Vec<bitcoin::block::Header>,
     utxos: HashMap<OutPoint, UtxoEntry>,
     tx_index: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
@@ -124,14 +125,6 @@ impl ChainState {
             bail!("chainstate does not start at the configured network genesis block");
         }
 
-        let mut blocks = Vec::with_capacity(active_chain.len());
-        for hash in &active_chain {
-            let block = store
-                .get(hash)?
-                .with_context(|| format!("active block {hash} is missing from block store"))?;
-            blocks.push(block);
-        }
-
         let mut state = Self {
             network,
             data_dir,
@@ -148,13 +141,22 @@ impl ChainState {
         let snapshot = state.load_snapshot(&active_chain)?;
         if let Some(snapshot) = snapshot {
             state.active_chain = active_chain.clone();
-            state.headers = blocks.iter().map(|block| block.header).collect();
+            state.headers = snapshot.headers;
             state.utxos = snapshot.utxos;
             state.tx_index = snapshot.tx_index;
             state.tx_index_all = state.tx_index.clone();
             state.history = snapshot.history;
-            state.index_active_headers(&blocks)?;
+            let headers = state.headers.clone();
+            state.index_active_headers(&headers)?;
         } else {
+            let mut blocks = Vec::with_capacity(active_chain.len());
+            for hash in &active_chain {
+                let block = state
+                    .store
+                    .get(hash)?
+                    .with_context(|| format!("active block {hash} is missing from block store"))?;
+                blocks.push(block);
+            }
             state.initialize_genesis(&blocks[0])?;
             for block in blocks.iter().skip(1) {
                 state.connect_block_internal(block, false)?;
@@ -955,7 +957,14 @@ impl ChainState {
         let Some(tip) = active_chain.last() else {
             return Ok(None);
         };
-        if snapshot.tip != tip.to_string() {
+        if snapshot.tip != tip.to_string()
+            || snapshot.headers.len() != active_chain.len()
+            || snapshot
+                .headers
+                .iter()
+                .zip(active_chain)
+                .any(|(header, hash)| header.block_hash() != *hash)
+        {
             return Ok(None);
         }
         Ok(Some(snapshot))
@@ -964,6 +973,7 @@ impl ChainState {
     fn persist_snapshot(&self) -> Result<()> {
         let snapshot = ChainSnapshot {
             tip: self.best_hash().to_string(),
+            headers: self.headers.clone(),
             utxos: self.utxos.clone(),
             tx_index: self.tx_index.clone(),
             history: self.history.clone(),
@@ -976,25 +986,25 @@ impl ChainState {
         Ok(())
     }
 
-    fn index_active_headers(&mut self, blocks: &[Block]) -> Result<()> {
-        if blocks.len() != self.active_chain.len() {
+    fn index_active_headers(&mut self, headers: &[bitcoin::block::Header]) -> Result<()> {
+        if headers.len() != self.active_chain.len() {
             bail!("active block/header count mismatch");
         }
-        for (height, block) in blocks.iter().enumerate() {
-            let hash = block.block_hash();
+        for (height, header) in headers.iter().enumerate() {
+            let hash = header.block_hash();
             let chain_work = if height == 0 {
-                block.header.work()
+                header.work()
             } else {
                 self.block_index
-                    .get(&block.header.prev_blockhash)
+                    .get(&header.prev_blockhash)
                     .context("active block parent is not indexed")?
                     .chain_work
-                    + block.header.work()
+                    + header.work()
             };
             self.block_index.insert(
                 hash,
                 BlockNode {
-                    header: block.header,
+                    header: *header,
                     height: height as u32,
                     chain_work,
                 },

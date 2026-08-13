@@ -1,5 +1,6 @@
 //! Wallet-free Bitcoin Core-style JSON-RPC over HTTP/1.1.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -563,21 +564,43 @@ fn get_block_template(node: &Arc<Node>) -> Result<Value> {
     let mempool = node.mempool.read();
     let mut fees = 0u64;
     let mut weight = 0u64;
-    let transactions = mempool
-        .transactions()
-        .map(|transaction| {
-            let txid = transaction.compute_txid();
+    let order = mempool.transaction_order();
+    let positions: HashMap<Txid, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(index, txid)| (*txid, index + 1))
+        .collect();
+    let transactions = order
+        .iter()
+        .filter_map(|txid| mempool.get(txid).map(|entry| (txid, entry)))
+        .map(|(txid, entry)| {
+            let transaction = &entry.transaction;
             let wtxid = transaction.compute_wtxid();
-            let entry = mempool.get(&txid).expect("mempool iterator is consistent");
             fees = fees.saturating_add(entry.fee_sat);
             weight = weight.saturating_add(transaction.weight().to_wu());
+            let depends = transaction
+                .input
+                .iter()
+                .filter_map(|input| positions.get(&input.previous_output.txid))
+                .copied()
+                .collect::<Vec<_>>();
             json!({
                 "data": hex::encode(serialize(transaction)),
                 "txid": txid.to_string(),
                 "hash": wtxid.to_string(),
-                "depends": [],
+                "depends": depends,
                 "fee": entry.fee_sat,
-                "sigops": transaction.total_sigop_cost(|outpoint| chain.utxo(outpoint).map(|entry| entry.output.clone())),
+                "sigops": transaction.total_sigop_cost(|outpoint| {
+                    chain
+                        .utxo(outpoint)
+                        .map(|entry| entry.output.clone())
+                        .or_else(|| {
+                            mempool
+                                .get(&outpoint.txid)
+                                .and_then(|entry| entry.transaction.output.get(outpoint.vout as usize))
+                                .cloned()
+                        })
+                }),
                 "weight": transaction.weight().to_wu(),
             })
         })

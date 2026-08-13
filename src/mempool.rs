@@ -89,6 +89,53 @@ impl Mempool {
         self.entries.values().map(|entry| &entry.transaction)
     }
 
+    pub fn transaction_order(&self) -> Vec<Txid> {
+        let mut transaction_ids: Vec<Txid> = self.entries.keys().copied().collect();
+        transaction_ids.sort_by_key(ToString::to_string);
+        let mut ordered = Vec::with_capacity(transaction_ids.len());
+        let mut visited = HashSet::new();
+        let mut visiting = HashSet::new();
+
+        fn visit(
+            txid: Txid,
+            entries: &HashMap<Txid, MempoolEntry>,
+            visited: &mut HashSet<Txid>,
+            visiting: &mut HashSet<Txid>,
+            ordered: &mut Vec<Txid>,
+        ) {
+            if visited.contains(&txid) || !visiting.insert(txid) {
+                return;
+            }
+            if let Some(entry) = entries.get(&txid) {
+                let mut parents: Vec<Txid> = entry
+                    .transaction
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output.txid)
+                    .filter(|parent| entries.contains_key(parent))
+                    .collect();
+                parents.sort_by_key(ToString::to_string);
+                for parent in parents {
+                    visit(parent, entries, visited, visiting, ordered);
+                }
+            }
+            visiting.remove(&txid);
+            visited.insert(txid);
+            ordered.push(txid);
+        }
+
+        for txid in transaction_ids {
+            visit(
+                txid,
+                &self.entries,
+                &mut visited,
+                &mut visiting,
+                &mut ordered,
+            );
+        }
+        ordered
+    }
+
     pub fn accept(
         &mut self,
         transaction: Transaction,

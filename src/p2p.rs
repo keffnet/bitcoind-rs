@@ -264,6 +264,8 @@ async fn serve_peer_loop(
                 };
                 if !requests.is_empty() {
                     send_message(writer, node.config.network, &Message::GetData(requests)).await?;
+                } else {
+                    request_headers(node, writer).await?;
                 }
             }
             Message::Inv(items) => {
@@ -346,6 +348,7 @@ async fn serve_peer_loop(
                     }
                     Err(error) => debug!(%hash, %error, "rejected peer block"),
                 }
+                request_headers(node, writer).await?;
             }
             Message::Transaction(transaction) => {
                 let txid = transaction.compute_txid();

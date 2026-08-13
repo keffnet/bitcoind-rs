@@ -523,6 +523,32 @@ impl ChainState {
             .collect()
     }
 
+    pub fn disconnected_blocks_after(&mut self, previous_tip: BlockHash) -> Result<Vec<Block>> {
+        let active: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
+        if active.contains(&previous_tip) {
+            return Ok(Vec::new());
+        }
+        let mut path = Vec::new();
+        let mut cursor = previous_tip;
+        while !active.contains(&cursor) {
+            path.push(cursor);
+            cursor = self
+                .block_index
+                .get(&cursor)
+                .context("previous active tip is not indexed")?
+                .header
+                .prev_blockhash;
+        }
+        path.reverse();
+        path.into_iter()
+            .map(|hash| {
+                self.store
+                    .get(&hash)?
+                    .with_context(|| format!("disconnected block {hash} is missing"))
+            })
+            .collect()
+    }
+
     pub fn transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
         let Some(location) = self
             .tx_index
@@ -1446,6 +1472,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
         let main_one = mine_block(&state, 1);
+        let main_one_hash = main_one.block_hash();
         state.connect_block(main_one).unwrap();
         let main_two = mine_block(&state, 2);
         let main_two_coinbase = main_two.txdata[0].compute_txid();
@@ -1471,6 +1498,10 @@ mod tests {
         let replacement = state.active_blocks_after(old_tip).unwrap();
         assert_eq!(replacement.len(), 3);
         assert_eq!(replacement[0].block_hash(), side_one_hash);
+        let disconnected = state.disconnected_blocks_after(old_tip).unwrap();
+        assert_eq!(disconnected.len(), 2);
+        assert_eq!(disconnected[0].block_hash(), main_one_hash);
+        assert_eq!(disconnected[1].block_hash(), old_tip);
         let tips = state.chain_tips();
         assert_eq!(tips.len(), 2);
         assert_eq!(tips[0].status, "active");

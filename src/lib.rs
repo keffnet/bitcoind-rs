@@ -94,7 +94,7 @@ impl Node {
 
     pub fn connect_block(&self, block: Block) -> Result<ChainEvent> {
         let previous_tip = self.chain.read().best_hash();
-        let (tip, activated_blocks) = {
+        let (tip, activated_blocks, disconnected_blocks) = {
             let mut chain = self.chain.write();
             let tip = chain.connect_block(block)?;
             let activated_blocks = if tip.hash != previous_tip {
@@ -102,13 +102,23 @@ impl Node {
             } else {
                 Vec::new()
             };
-            (tip, activated_blocks)
+            let disconnected_blocks = if tip.hash != previous_tip {
+                chain.disconnected_blocks_after(previous_tip)?
+            } else {
+                Vec::new()
+            };
+            (tip, activated_blocks, disconnected_blocks)
         };
-        if !activated_blocks.is_empty() {
+        if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
             let chain = self.chain.read();
             let mut mempool = self.mempool.write();
             for block in &activated_blocks {
                 mempool.remove_confirmed(block);
+            }
+            for block in &disconnected_blocks {
+                for transaction in block.txdata.iter().skip(1) {
+                    let _ = mempool.accept(transaction.clone(), &chain);
+                }
             }
             mempool.revalidate(&chain);
             let _ = self.events.send(tip.clone());

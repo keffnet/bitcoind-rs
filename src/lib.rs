@@ -551,6 +551,11 @@ impl Node {
         self.mempool.read().save_to_file(&self.mempool_path)
     }
 
+    pub fn import_mempool(&self, path: impl AsRef<Path>) -> Result<()> {
+        let chain = self.chain.read();
+        self.mempool.write().load_from_file(path.as_ref(), &chain)
+    }
+
     fn persist_banlist(&self) -> Result<()> {
         let path = self.config.datadir.join("banlist.json");
         let temp = self.config.datadir.join("banlist.json.tmp");

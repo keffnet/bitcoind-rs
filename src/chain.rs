@@ -57,6 +57,8 @@ pub struct BlockFeeStats {
     pub spent_outputs: Vec<TxOut>,
 }
 
+type SpentTransaction = (Txid, usize, BlockHash, u32);
+
 struct BlockApplication {
     spent_entries: Vec<(OutPoint, UtxoEntry)>,
 }
@@ -112,6 +114,7 @@ pub struct ChainState {
     tx_index: HashMap<Txid, TxLocation>,
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
+    spent_by: HashMap<OutPoint, SpentTransaction>,
     basic_filter_cache: HashMap<BlockHash, (Vec<u8>, FilterHeader)>,
     block_undo_cache: HashMap<BlockHash, Vec<Vec<TxOut>>>,
 }
@@ -185,6 +188,7 @@ impl ChainState {
             tx_index: HashMap::new(),
             tx_index_all: HashMap::new(),
             history: HashMap::new(),
+            spent_by: HashMap::new(),
             basic_filter_cache: HashMap::new(),
             block_undo_cache: HashMap::new(),
         };
@@ -203,6 +207,7 @@ impl ChainState {
             state.history = snapshot.history;
             let headers = state.headers.clone();
             state.index_active_headers(&headers)?;
+            state.rebuild_spent_index()?;
         } else {
             let mut blocks = Vec::with_capacity(active_chain.len());
             for hash in &active_chain {
@@ -834,6 +839,13 @@ impl ChainState {
         Ok(Some((transaction, location)))
     }
 
+    pub fn spending_transaction(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Option<(Txid, usize, BlockHash, u32)> {
+        self.spent_by.get(outpoint).copied()
+    }
+
     pub fn get_history(&self, script_hash: &str) -> Vec<HistoryEntry> {
         self.history.get(script_hash).cloned().unwrap_or_default()
     }
@@ -1389,6 +1401,7 @@ impl ChainState {
                 },
             );
         }
+        self.index_block_spends(block, height);
         self.active_chain.push(hash);
         self.headers.push(block.header);
         let parent_work = self
@@ -1519,6 +1532,7 @@ impl ChainState {
         let old_utxos_by_script = self.utxos_by_script.clone();
         let old_tx_index = self.tx_index.clone();
         let old_history = self.history.clone();
+        let old_spent_by = self.spent_by.clone();
         let old_basic_filter_cache = self.basic_filter_cache.clone();
         let old_block_undo_cache = self.block_undo_cache.clone();
         self.active_chain.clear();
@@ -1527,6 +1541,7 @@ impl ChainState {
         self.utxos_by_script.clear();
         self.tx_index.clear();
         self.history.clear();
+        self.spent_by.clear();
         let replay = (|| -> Result<()> {
             self.initialize_genesis(&blocks[0])?;
             for block in blocks.iter().skip(1) {
@@ -1542,6 +1557,7 @@ impl ChainState {
             self.utxos_by_script = old_utxos_by_script;
             self.tx_index = old_tx_index;
             self.history = old_history;
+            self.spent_by = old_spent_by;
             self.basic_filter_cache = old_basic_filter_cache;
             self.block_undo_cache = old_block_undo_cache;
             return Err(error);
@@ -1702,6 +1718,39 @@ impl ChainState {
                 },
             );
         }
+        self.index_block_spends(block, height);
+    }
+
+    fn index_block_spends(&mut self, block: &Block, height: u32) {
+        let block_hash = block.block_hash();
+        for transaction in &block.txdata {
+            let txid = transaction.compute_txid();
+            for (input_index, input) in transaction.input.iter().enumerate() {
+                if !input.previous_output.is_null() {
+                    self.spent_by.insert(
+                        input.previous_output,
+                        (txid, input_index, block_hash, height),
+                    );
+                }
+            }
+        }
+    }
+
+    fn rebuild_spent_index(&mut self) -> Result<()> {
+        self.spent_by.clear();
+        let active_chain = self.active_chain.clone();
+        for hash in active_chain {
+            let Some(block) = self.store.get(&hash)? else {
+                bail!("active block {hash} is missing from block store")
+            };
+            let height = self
+                .block_index
+                .get(&hash)
+                .map(|node| node.height)
+                .with_context(|| format!("active block {hash} is not indexed"))?;
+            self.index_block_spends(&block, height);
+        }
+        Ok(())
     }
 
     fn index_all_transactions(&mut self, block: &Block, height: u32) {

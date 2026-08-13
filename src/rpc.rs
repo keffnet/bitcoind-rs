@@ -1010,6 +1010,11 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 node.config.datadir.join("mempool.json").to_string_lossy()
             ))
         }
+        "importmempool" => {
+            let path = param::<String>(params, 0)?;
+            node.import_mempool(path)?;
+            Ok(Value::Null)
+        }
         "gettxoutsetinfo" => {
             let chain = node.chain.read();
             let (transactions, outputs, total) = chain.utxo_stats();
@@ -6486,36 +6491,76 @@ fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
             Ok(OutPoint::new(txid, vout))
         })
         .collect::<Result<Vec<OutPoint>>>()?;
-    let height = node.chain.read().height();
+    if outpoints.is_empty() {
+        bail!("gettxspendingprevout expects at least one output")
+    }
+    let options = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let options = options
+        .as_object()
+        .ok_or_else(|| anyhow!("gettxspendingprevout options must be an object"))?;
+    if options
+        .keys()
+        .any(|key| key != "mempool_only" && key != "return_spending_tx")
+    {
+        bail!("unknown gettxspendingprevout option")
+    }
+    let mempool_only = options
+        .get("mempool_only")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("mempool_only must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let return_spending_tx = options
+        .get("return_spending_tx")
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("return_spending_tx must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let mut result = outpoints
+        .iter()
+        .map(|outpoint| json!({"txid": outpoint.txid.to_string(), "vout": outpoint.vout}))
+        .collect::<Vec<_>>();
     let mempool = node.mempool.read();
-    Ok(json!(
-        outpoints
-            .into_iter()
-            .map(|outpoint| {
-                let Some(spender_txid) = mempool.spender(&outpoint) else {
-                    return Value::Null;
-                };
-                let Some(entry) = mempool.get(&spender_txid) else {
-                    return Value::Null;
-                };
-                let Some(vin) = entry
-                    .transaction
-                    .input
-                    .iter()
-                    .position(|input| input.previous_output == outpoint)
-                else {
-                    return Value::Null;
-                };
-                json!({
-                "txid": spender_txid.to_string(),
-                "vin": vin,
-                "fees": {"base": sat_to_btc(entry.fee_sat)},
-                "time": entry.added_at,
-                "height": height,
-                })
-            })
-            .collect::<Vec<_>>()
-    ))
+    for (index, outpoint) in outpoints.iter().enumerate() {
+        let Some(spender_txid) = mempool.spender(outpoint) else {
+            continue;
+        };
+        let Some(entry) = mempool.get(&spender_txid) else {
+            continue;
+        };
+        result[index]["spendingtxid"] = json!(spender_txid.to_string());
+        if return_spending_tx {
+            result[index]["spendingtx"] = json!(hex::encode(serialize(&entry.transaction)));
+        }
+    }
+    drop(mempool);
+    if !mempool_only {
+        let mut chain = node.chain.write();
+        for (index, outpoint) in outpoints.iter().enumerate() {
+            if result[index].get("spendingtxid").is_some() {
+                continue;
+            }
+            let Some((spender_txid, _, blockhash, _)) = chain.spending_transaction(outpoint) else {
+                continue;
+            };
+            result[index]["spendingtxid"] = json!(spender_txid.to_string());
+            result[index]["blockhash"] = json!(blockhash.to_string());
+            if return_spending_tx && let Some(transaction) = chain.transaction(&spender_txid)? {
+                result[index]["spendingtx"] = json!(hex::encode(serialize(&transaction.0)));
+            }
+        }
+    }
+    Ok(Value::Array(result))
 }
 
 fn rpc_transaction(
@@ -6723,6 +6768,7 @@ fn rpc_help(method: &str) -> String {
         "getmempoolcluster",
         "getmempoolfeeratediagram",
         "savemempool",
+        "importmempool",
         "gettxoutsetinfo",
         "dumptxoutset",
         "loadtxoutset",
@@ -7327,11 +7373,12 @@ mod tests {
         let mined = generate_to_descriptor(&node, &json!([102, "raw(51)"])).unwrap();
         let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
         let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        let funding_txid = funding.txdata[0].compute_txid();
         let spend = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
-                previous_output: OutPoint::new(funding.txdata[0].compute_txid(), 0),
+                previous_output: OutPoint::new(funding_txid, 0),
                 script_sig: ScriptBuf::new(),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
@@ -7368,6 +7415,20 @@ mod tests {
             get_block(&node, &json!([block_hash.to_string(), true])).unwrap()["hash"],
             json!(block_hash.to_string())
         );
+        let spending = get_tx_spending_prevout(
+            &node,
+            &json!([[{"txid": funding_txid.to_string(), "vout": 0}], {"return_spending_tx": true}]),
+        )
+        .unwrap();
+        assert_eq!(spending[0]["spendingtxid"], json!(spend_txid.to_string()));
+        assert_eq!(spending[0]["blockhash"], json!(block_hash.to_string()));
+        assert!(spending[0]["spendingtx"].as_str().is_some());
+        let mempool_only = get_tx_spending_prevout(
+            &node,
+            &json!([[{"txid": funding_txid.to_string(), "vout": 0}], {"mempool_only": true}]),
+        )
+        .unwrap();
+        assert!(mempool_only[0].get("spendingtxid").is_none());
     }
 
     #[test]
@@ -8137,6 +8198,55 @@ mod tests {
             &Address::p2wpkh(&compressed, Network::Regtest).script_pubkey()
         );
         assert_eq!(nested_processed["complete"], false);
+    }
+
+    #[test]
+    fn importmempool_round_trips_the_wallet_free_json_pool() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let hashes = generate_to_descriptor(&node, &json!([101, "raw(51)"])).unwrap();
+        let funding_hash: BlockHash = hashes[0].as_str().unwrap().parse().unwrap();
+        let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(funding.txdata[0].compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let txid = node.accept_transaction(transaction).unwrap();
+        let path = directory.path().join("mempool-import.json");
+        node.mempool.read().save_to_file(&path).unwrap();
+        node.mempool.write().remove(&txid);
+        assert!(node.mempool.read().get(&txid).is_none());
+        assert_eq!(
+            dispatch_method(
+                &node,
+                "importmempool",
+                &json!([path.to_string_lossy().to_string()]),
+            )
+            .unwrap(),
+            Value::Null
+        );
+        assert!(node.mempool.read().get(&txid).is_some());
     }
 
     #[test]

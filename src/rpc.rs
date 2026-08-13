@@ -447,9 +447,9 @@ fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let requested_window = params.get(0).and_then(Value::as_u64).unwrap_or(30);
-    if requested_window == 0 {
-        bail!("window must be positive");
+    let requested_window = params.get(0).and_then(Value::as_i64).unwrap_or(30);
+    if requested_window < 0 {
+        bail!("window must not be negative");
     }
     let requested_hash = params
         .get(1)
@@ -469,8 +469,8 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     };
     let window = u32::try_from(requested_window)
         .unwrap_or(u32::MAX)
-        .min(end_height.saturating_add(1));
-    let start_height = end_height.saturating_sub(window.saturating_sub(1));
+        .min(end_height.saturating_sub(1));
+    let start_height = end_height.saturating_sub(window);
     let end_hash = chain
         .block_hash(end_height)
         .ok_or_else(|| anyhow!("block height out of range"))?;
@@ -488,7 +488,7 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .ok_or_else(|| anyhow!("active block is missing from block store"))?
             as u64;
         txcount = txcount.saturating_add(count);
-        if height >= start_height {
+        if height > start_height {
             window_tx_count = window_tx_count.saturating_add(count);
         }
     }
@@ -500,7 +500,14 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .header(end_height)
         .map(|header| header.time)
         .ok_or_else(|| anyhow!("block height out of range"))?;
-    let interval = end_time.saturating_sub(start_time);
+    let interval = chain
+        .median_time_past_for_hash(&end_hash)
+        .unwrap_or(end_time)
+        .saturating_sub(
+            chain
+                .median_time_past_for_hash(&start_hash)
+                .unwrap_or(start_time),
+        );
     Ok(json!({
         "time": end_time,
         "txcount": txcount,
@@ -1004,7 +1011,17 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("Block not found"))?;
     let height = chain.block_height_by_hash(&hash);
     let mut total_out = 0u64;
+    let mut inputs = 0usize;
+    let mut outputs = 0usize;
+    let mut total_size = 0usize;
+    let mut total_weight = 0u64;
+    let mut segwit_transactions = 0usize;
     for transaction in &block.txdata {
+        outputs = outputs.saturating_add(transaction.output.len());
+        if transaction.is_coinbase() {
+            continue;
+        }
+        inputs = inputs.saturating_add(transaction.input.len());
         total_out = total_out.saturating_add(
             transaction
                 .output
@@ -1012,21 +1029,37 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .map(|output| output.value.to_sat())
                 .sum::<u64>(),
         );
+        total_size = total_size.saturating_add(serialize(transaction).len());
+        total_weight = total_weight.saturating_add(transaction.weight().to_wu());
+        if transaction
+            .input
+            .iter()
+            .any(|input| !input.witness.is_empty())
+        {
+            segwit_transactions = segwit_transactions.saturating_add(1);
+        }
     }
+    let non_coinbase = block.txdata.len().saturating_sub(1);
+    let total_fee = chain
+        .block_fee_stats(&hash)?
+        .map(|stats| stats.total_fee_sat);
     Ok(json!({
         "blockhash": hash.to_string(),
         "height": height,
         "txs": block.txdata.len(),
         "time": block.header.time,
-        "mediantime": chain.median_time_past_value(),
+        "mediantime": chain.median_time_past_for_hash(&hash).unwrap_or(block.header.time),
         "size": serialize(&block).len(),
-        "total_size": serialize(&block).len(),
-        "weight": block.weight().to_wu(),
-        "total_out": sat_to_btc(total_out),
-        "subsidy": height.map(|height| sat_to_btc(validation::block_subsidy(height))),
-        "total_fee": chain
-            .block_fee_stats(&hash)?
-            .map(|stats| sat_to_btc(stats.total_fee_sat)),
+        "total_size": total_size,
+        "total_weight": total_weight,
+        "total_out": total_out,
+        "subsidy": height.map(validation::block_subsidy),
+        "totalfee": total_fee,
+        "total_fee": total_fee,
+        "ins": inputs,
+        "outs": outputs,
+        "swtxs": segwit_transactions,
+        "avgfee": total_fee.map(|fee| if non_coinbase == 0 { 0 } else { fee / non_coinbase as u64 }),
     }))
 }
 
@@ -1585,6 +1618,9 @@ fn rpc_help(method: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Node;
+    use crate::config::Config;
+    use bitcoin::Network;
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version as BlockVersion};
     use bitcoin::blockdata::script::ScriptBuf;
@@ -1662,5 +1698,26 @@ mod tests {
         let mut proof = serialize_merkle_proof(&block, &[txid]).unwrap();
         proof[36] ^= 1;
         assert!(verify_txout_proof(&json!([hex::encode(proof)])).is_err());
+    }
+
+    #[test]
+    fn block_stats_report_satoshi_amounts() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let hash = node.chain.read().best_hash();
+        let stats = get_block_stats(&node, &json!([hash.to_string()])).unwrap();
+        assert_eq!(stats["total_out"], json!(0));
+        assert_eq!(stats["subsidy"], json!(5_000_000_000u64));
+        assert_eq!(stats["totalfee"], json!(0));
     }
 }

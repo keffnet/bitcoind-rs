@@ -1034,6 +1034,19 @@ impl ChainState {
             {
                 return params.max_attainable_target;
             }
+            if params.allow_min_difficulty_blocks
+                && previous.target() == params.max_attainable_target
+            {
+                let mut cursor = parent_hash;
+                while let Some(node) = self.block_index.get(&cursor) {
+                    if node.height % DIFFICULTY_INTERVAL == 0
+                        || node.header.target() != params.max_attainable_target
+                    {
+                        return node.header.target();
+                    }
+                    cursor = node.header.prev_blockhash;
+                }
+            }
             return previous.target();
         }
         let first_hash = self

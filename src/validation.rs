@@ -1,0 +1,280 @@
+//! Consensus-adjacent block and transaction structure checks.
+//!
+//! Full script execution is intentionally kept behind this module's public
+//! validation boundary. The checks here cover the inexpensive, deterministic
+//! rules that must run before touching the UTXO set: proof of work, merkle and
+//! witness commitments, transaction shape, money range, and block weight.
+
+use std::collections::HashSet;
+
+use bitcoin::consensus::Params;
+use bitcoin::pow::Target;
+use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, Transaction, Txid};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockValidationStats {
+    pub tx_count: usize,
+    pub total_output_sat: u64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ValidationError {
+    #[error("block does not extend the active tip")]
+    WrongPreviousBlock,
+    #[error("block proof of work target is invalid")]
+    BadTarget,
+    #[error("block proof of work is invalid")]
+    BadProofOfWork,
+    #[error("block target exceeds the network limit")]
+    TargetAboveLimit,
+    #[error("block timestamp is not after median time past")]
+    TimeTooOld,
+    #[error("block contains no transactions")]
+    EmptyBlock,
+    #[error("block merkle root is invalid")]
+    BadMerkleRoot,
+    #[error("block witness commitment is invalid")]
+    BadWitnessCommitment,
+    #[error("block weight exceeds the consensus limit")]
+    OversizedBlock,
+    #[error("coinbase transaction is missing or malformed")]
+    BadCoinbase,
+    #[error("non-coinbase transaction appears in the coinbase position")]
+    FirstTransactionNotCoinbase,
+    #[error("transaction {0} is unexpectedly coinbase")]
+    ExtraCoinbase(Txid),
+    #[error("transaction {0} has no inputs")]
+    EmptyInputs(Txid),
+    #[error("transaction {0} has no outputs")]
+    EmptyOutputs(Txid),
+    #[error("transaction {0} contains a duplicate input")]
+    DuplicateInput(Txid),
+    #[error("block contains duplicate transaction {0}")]
+    DuplicateTransaction(Txid),
+    #[error("transaction {0} output value is out of range")]
+    BadOutputValue(Txid),
+    #[error("block output total exceeds MAX_MONEY")]
+    OutputTotalOverflow,
+    #[error("block subsidy and fees cannot be represented")]
+    SubsidyOverflow,
+    #[error("coinbase value {actual} exceeds allowed value {allowed}")]
+    CoinbaseOverpay { actual: u64, allowed: u64 },
+    #[error("transaction input {outpoint} is missing from the UTXO set")]
+    MissingInput { outpoint: OutPoint },
+    #[error("coinbase input {outpoint} has not matured")]
+    ImmatureCoinbase { outpoint: OutPoint },
+    #[error("transaction input values exceed MAX_MONEY")]
+    InputTotalOverflow,
+    #[error("transaction {txid} creates more value than it spends")]
+    NegativeFee { txid: Txid },
+    #[error("block height is not encoded in the coinbase script")]
+    BadCoinbaseHeight,
+    #[error("transaction locktime is not yet satisfied")]
+    NonFinalTransaction,
+    #[error("script validation failed for transaction {txid} input {input}: {reason}")]
+    Script {
+        txid: Txid,
+        input: usize,
+        reason: String,
+    },
+}
+
+pub fn network_params(network: Network) -> &'static Params {
+    network.params()
+}
+
+pub fn validate_header(
+    network: Network,
+    header: &bitcoin::block::Header,
+    expected_previous: BlockHash,
+    expected_target: Target,
+    median_time_past: u32,
+) -> Result<(), ValidationError> {
+    if header.prev_blockhash != expected_previous {
+        return Err(ValidationError::WrongPreviousBlock);
+    }
+    if header.time <= median_time_past {
+        return Err(ValidationError::TimeTooOld);
+    }
+    if header.target() != expected_target {
+        return Err(ValidationError::BadTarget);
+    }
+    if header.target() > network_params(network).max_attainable_target {
+        return Err(ValidationError::TargetAboveLimit);
+    }
+    if !header.target().is_met_by(header.block_hash()) {
+        return Err(ValidationError::BadProofOfWork);
+    }
+    Ok(())
+}
+
+pub fn validate_block_structure(
+    block: &Block,
+    network: Network,
+    height: u32,
+    expected_coinbase_value: u64,
+) -> Result<BlockValidationStats, ValidationError> {
+    if block.txdata.is_empty() {
+        return Err(ValidationError::EmptyBlock);
+    }
+    if !block.check_merkle_root() {
+        return Err(ValidationError::BadMerkleRoot);
+    }
+    if !block.check_witness_commitment() {
+        return Err(ValidationError::BadWitnessCommitment);
+    }
+    if block.weight().to_wu() > 4_000_000 {
+        return Err(ValidationError::OversizedBlock);
+    }
+    let first = &block.txdata[0];
+    if !first.is_coinbase() {
+        return Err(ValidationError::FirstTransactionNotCoinbase);
+    }
+    if first.input[0].script_sig.len() < 2 || first.input[0].script_sig.len() > 100 {
+        return Err(ValidationError::BadCoinbase);
+    }
+    if height >= network_params(network).bip34_height {
+        let encoded_height = bitcoin::script::Builder::new()
+            .push_int(height as i64)
+            .into_script();
+        if !first.input[0]
+            .script_sig
+            .as_bytes()
+            .starts_with(encoded_height.as_bytes())
+        {
+            return Err(ValidationError::BadCoinbaseHeight);
+        }
+    }
+
+    let mut txids = HashSet::with_capacity(block.txdata.len());
+    let mut total_output_sat = 0u64;
+    for (position, tx) in block.txdata.iter().enumerate() {
+        let txid = tx.compute_txid();
+        if !txids.insert(txid) {
+            return Err(ValidationError::DuplicateTransaction(txid));
+        }
+        if position > 0 && tx.is_coinbase() {
+            return Err(ValidationError::ExtraCoinbase(txid));
+        }
+        if tx.input.is_empty() {
+            return Err(ValidationError::EmptyInputs(txid));
+        }
+        if tx.output.is_empty() {
+            return Err(ValidationError::EmptyOutputs(txid));
+        }
+        let mut inputs = HashSet::with_capacity(tx.input.len());
+        for input in &tx.input {
+            if !inputs.insert(input.previous_output) {
+                return Err(ValidationError::DuplicateInput(txid));
+            }
+        }
+        let mut tx_total = 0u64;
+        for output in &tx.output {
+            let value = output.value.to_sat();
+            if output.value > Amount::MAX_MONEY {
+                return Err(ValidationError::BadOutputValue(txid));
+            }
+            tx_total = tx_total
+                .checked_add(value)
+                .ok_or(ValidationError::OutputTotalOverflow)?;
+        }
+        total_output_sat = total_output_sat
+            .checked_add(tx_total)
+            .ok_or(ValidationError::OutputTotalOverflow)?;
+    }
+    if first
+        .output
+        .iter()
+        .map(|output| output.value.to_sat())
+        .sum::<u64>()
+        > expected_coinbase_value
+    {
+        return Err(ValidationError::CoinbaseOverpay {
+            actual: first
+                .output
+                .iter()
+                .map(|output| output.value.to_sat())
+                .sum(),
+            allowed: expected_coinbase_value,
+        });
+    }
+    Ok(BlockValidationStats {
+        tx_count: block.txdata.len(),
+        total_output_sat,
+    })
+}
+
+pub fn block_subsidy(height: u32) -> u64 {
+    let halvings = height / 210_000;
+    if halvings >= 64 {
+        0
+    } else {
+        50 * 100_000_000 >> halvings
+    }
+}
+
+pub fn checked_money_add(left: u64, right: u64) -> Result<u64, ValidationError> {
+    let sum = left
+        .checked_add(right)
+        .ok_or(ValidationError::SubsidyOverflow)?;
+    if sum > Amount::MAX_MONEY.to_sat() {
+        return Err(ValidationError::SubsidyOverflow);
+    }
+    Ok(sum)
+}
+
+/// Verify every non-coinbase input using the same libbitcoinconsensus script
+/// engine used by Bitcoin Core's consensus boundary. The previous outputs are
+/// supplied as a parallel slice so SegWit and Taproot spends receive the full
+/// spent-output context they require.
+pub fn validate_transaction_scripts(
+    transaction: &Transaction,
+    previous_outputs: &[bitcoin::TxOut],
+) -> Result<(), ValidationError> {
+    if previous_outputs.len() != transaction.input.len() {
+        return Err(ValidationError::Script {
+            txid: transaction.compute_txid(),
+            input: 0,
+            reason: "previous-output count does not match input count".to_owned(),
+        });
+    }
+    let serialized = bitcoin::consensus::encode::serialize(transaction);
+    let spent_outputs: Vec<bitcoinconsensus::Utxo> = previous_outputs
+        .iter()
+        .map(|output| bitcoinconsensus::Utxo {
+            script_pubkey: output.script_pubkey.as_bytes().as_ptr(),
+            script_pubkey_len: output.script_pubkey.len() as u32,
+            value: output.value.to_sat() as i64,
+        })
+        .collect();
+    let flags = bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT;
+    for (input, previous_output) in previous_outputs.iter().enumerate() {
+        if let Err(error) = bitcoinconsensus::verify_with_flags(
+            previous_output.script_pubkey.as_bytes(),
+            previous_output.value.to_sat(),
+            &serialized,
+            Some(&spent_outputs),
+            input,
+            flags,
+        ) {
+            return Err(ValidationError::Script {
+                txid: transaction.compute_txid(),
+                input,
+                reason: format!("{error:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subsidy_halves_and_eventually_stops() {
+        assert_eq!(block_subsidy(0), 5_000_000_000);
+        assert_eq!(block_subsidy(210_000), 2_500_000_000);
+        assert_eq!(block_subsidy(64 * 210_000), 0);
+    }
+}

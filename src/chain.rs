@@ -368,6 +368,7 @@ impl ChainState {
                 return Ok(None);
             };
             let is_target = block_hash == *hash;
+            let is_genesis = block_hash == self.network_genesis_hash();
             for transaction in &block.txdata {
                 let txid = transaction.compute_txid();
                 if !transaction.is_coinbase() {
@@ -404,8 +405,10 @@ impl ChainState {
                         spent_outputs.extend(input_outputs);
                     }
                 }
-                for (vout, output) in transaction.output.iter().enumerate() {
-                    utxos.insert(OutPoint::new(txid, vout as u32), output.clone());
+                if !is_genesis {
+                    for (vout, output) in transaction.output.iter().enumerate() {
+                        utxos.insert(OutPoint::new(txid, vout as u32), output.clone());
+                    }
                 }
             }
         }
@@ -826,23 +829,10 @@ impl ChainState {
             cursor = node.header.prev_blockhash;
         }
         path.reverse();
-        let Some(genesis) = self.store.get(&path[0])? else {
+        let Some(_genesis) = self.store.get(&path[0])? else {
             return Ok(None);
         };
         let mut utxos = HashMap::new();
-        let genesis_transaction = &genesis.txdata[0];
-        let genesis_txid = genesis_transaction.compute_txid();
-        for (output_index, output) in genesis_transaction.output.iter().enumerate() {
-            utxos.insert(
-                OutPoint::new(genesis_txid, output_index as u32),
-                UtxoEntry {
-                    output: output.clone(),
-                    height: 0,
-                    median_time_past: genesis.header.time,
-                    coinbase: true,
-                },
-            );
-        }
         for block_hash in path.into_iter().skip(1) {
             let Some(block) = self.store.get(&block_hash)? else {
                 return Ok(None);
@@ -1213,15 +1203,17 @@ impl ChainState {
             let mut scripts = HashSet::new();
             for (output_index, output) in transaction.output.iter().enumerate() {
                 let outpoint = OutPoint::new(txid, output_index as u32);
-                self.insert_utxo(
-                    outpoint,
-                    UtxoEntry {
-                        output: output.clone(),
-                        height,
-                        median_time_past: block.header.time,
-                        coinbase: transaction_index == 0,
-                    },
-                );
+                if height != 0 {
+                    self.insert_utxo(
+                        outpoint,
+                        UtxoEntry {
+                            output: output.clone(),
+                            height,
+                            median_time_past: block.header.time,
+                            coinbase: transaction_index == 0,
+                        },
+                    );
+                }
                 scripts.insert(electrum_script_hash(&output.script_pubkey));
             }
             for script_hash in scripts {
@@ -1614,6 +1606,7 @@ mod tests {
             state.best_hash(),
             genesis_block(Network::Regtest).block_hash()
         );
+        assert_eq!(state.utxo_stats(), (0, 0, 0));
     }
 
     #[test]
@@ -1659,7 +1652,7 @@ mod tests {
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.height(), 2);
         assert_eq!(reopened.block_hash(1), Some(first_hash));
-        assert_eq!(reopened.utxos.len(), 3);
+        assert_eq!(reopened.utxos.len(), 2);
         assert_eq!(reopened.get_utxos(&script_hash).len(), 2);
         drop(reopened);
         fs::write(directory.path().join("chainstate.snapshot"), b"corrupt").unwrap();

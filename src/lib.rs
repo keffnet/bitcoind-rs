@@ -209,7 +209,7 @@ impl Node {
         Ok(())
     }
 
-    fn persist_mempool(&self) -> Result<()> {
+    pub fn persist_mempool(&self) -> Result<()> {
         self.mempool.read().save_to_file(&self.mempool_path)
     }
 }

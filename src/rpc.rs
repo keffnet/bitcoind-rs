@@ -196,6 +196,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getblockheader" => get_block_header(node, params),
         "getblock" => get_block(node, params),
         "getblockstats" => get_block_stats(node, params),
+        "getchaintxstats" => get_chain_tx_stats(node, params),
+        "getnetworkhashps" => get_network_hash_ps(node, params),
         "gettxoutproof" => get_txout_proof(node, params),
         "verifytxoutproof" => verify_txout_proof(params),
         "submitheader" => submit_header(node, params),
@@ -204,6 +206,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "sendrawtransaction" => send_raw_transaction(node, params),
         "submitblock" => submit_block(node, params),
         "getblocktemplate" => get_block_template(node),
+        "getmininginfo" => get_mining_info(node),
         "testmempoolaccept" => test_mempool_accept(node, params),
         "verifychain" => {
             let depth = params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -220,6 +223,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             }))
         }
         "gettxout" => get_txout(node, params),
+        "gettxspendingprevout" => get_tx_spending_prevout(node, params),
         "getmempoolinfo" => {
             let mempool = node.mempool.read();
             let total_fee = mempool
@@ -277,6 +281,12 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         }
         "getmempoolancestors" => get_mempool_relationship(node, params, true),
         "getmempooldescendants" => get_mempool_relationship(node, params, false),
+        "savemempool" => {
+            node.persist_mempool()?;
+            Ok(json!(
+                node.config.datadir.join("mempool.json").to_string_lossy()
+            ))
+        }
         "gettxoutsetinfo" => {
             let chain = node.chain.read();
             let (transactions, outputs, total) = chain.utxo_stats();
@@ -429,6 +439,129 @@ fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "nTx": chain.block_transaction_count(&hash)?.unwrap_or(0),
         "previousblockhash": (height > 0).then(|| header.prev_blockhash.to_string()),
         "nextblockhash": chain.next_block_hash(&hash).map(|next| next.to_string()),
+    }))
+}
+
+fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let requested_window = params.get(0).and_then(Value::as_u64).unwrap_or(30);
+    if requested_window == 0 {
+        bail!("window must be positive");
+    }
+    let requested_hash = params
+        .get(1)
+        .and_then(Value::as_str)
+        .map(str::parse::<BlockHash>)
+        .transpose()?;
+    let mut chain = node.chain.write();
+    let end_height = if let Some(hash) = requested_hash {
+        if !chain.is_active_block(&hash) {
+            bail!("block is not on the active chain");
+        }
+        chain
+            .block_height_by_hash(&hash)
+            .ok_or_else(|| anyhow!("block not found"))?
+    } else {
+        chain.height()
+    };
+    let window = u32::try_from(requested_window)
+        .unwrap_or(u32::MAX)
+        .min(end_height.saturating_add(1));
+    let start_height = end_height.saturating_sub(window.saturating_sub(1));
+    let end_hash = chain
+        .block_hash(end_height)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    let start_hash = chain
+        .block_hash(start_height)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    let mut txcount = 0u64;
+    let mut window_tx_count = 0u64;
+    for height in 0..=end_height {
+        let hash = chain
+            .block_hash(height)
+            .ok_or_else(|| anyhow!("block height out of range"))?;
+        let count = chain
+            .block_transaction_count(&hash)?
+            .ok_or_else(|| anyhow!("active block is missing from block store"))?
+            as u64;
+        txcount = txcount.saturating_add(count);
+        if height >= start_height {
+            window_tx_count = window_tx_count.saturating_add(count);
+        }
+    }
+    let start_time = chain
+        .header(start_height)
+        .map(|header| header.time)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    let end_time = chain
+        .header(end_height)
+        .map(|header| header.time)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    let interval = end_time.saturating_sub(start_time);
+    Ok(json!({
+        "time": end_time,
+        "txcount": txcount,
+        "window_final_block_hash": end_hash.to_string(),
+        "window_block_count": window,
+        "window_tx_count": window_tx_count,
+        "window_interval": interval,
+        "txrate": (interval > 0).then_some(window_tx_count as f64 / interval as f64),
+        "window_start_block_hash": start_hash.to_string(),
+    }))
+}
+
+fn get_network_hash_ps(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let nblocks = params.get(0).and_then(Value::as_u64).unwrap_or(120);
+    let requested_height = params.get(1).and_then(Value::as_i64).unwrap_or(-1);
+    let chain = node.chain.read();
+    let end_height = if requested_height < 0 {
+        chain.height()
+    } else {
+        u32::try_from(requested_height)
+            .map_err(|_| anyhow!("height is out of range"))?
+            .min(chain.height())
+    };
+    let window = u32::try_from(nblocks)
+        .unwrap_or(u32::MAX)
+        .min(end_height.saturating_add(1));
+    if window == 0 {
+        return Ok(json!(0.0));
+    }
+    let start_height = end_height.saturating_sub(window.saturating_sub(1));
+    let start = chain
+        .header(start_height)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    let end = chain
+        .header(end_height)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    let interval = end.time.saturating_sub(start.time);
+    if interval == 0 {
+        return Ok(json!(0.0));
+    }
+    let expected_hashes = end.difficulty_float() * 4_294_967_296.0 * f64::from(window);
+    Ok(json!(expected_hashes / f64::from(interval)))
+}
+
+fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
+    let chain = node.chain.read();
+    let tip = chain.tip();
+    let header = chain.header(tip.height).expect("tip header exists");
+    let window = 120u32.min(tip.height.saturating_add(1));
+    let start_height = tip.height.saturating_sub(window.saturating_sub(1));
+    let start = chain.header(start_height).expect("start header exists");
+    let interval = header.time.saturating_sub(start.time);
+    let network_hashps = if interval == 0 {
+        0.0
+    } else {
+        header.difficulty_float() * 4_294_967_296.0 * f64::from(window) / f64::from(interval)
+    };
+    let mempool = node.mempool.read();
+    Ok(json!({
+        "blocks": tip.height,
+        "difficulty": header.difficulty_float(),
+        "networkhashps": network_hashps,
+        "pooledtx": mempool.len(),
+        "chain": network_name(chain.network),
+        "warnings": "",
     }))
 }
 
@@ -894,11 +1027,39 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let requested_block = params
+        .get(2)
+        .and_then(Value::as_str)
+        .map(str::parse::<BlockHash>)
+        .transpose()?;
     let mut chain = node.chain.write();
-    let found = chain.transaction(&txid)?;
+    let found = if let Some(block_hash) = requested_block {
+        let block = chain
+            .block(&block_hash)?
+            .ok_or_else(|| anyhow!("Block not found"))?;
+        let Some(transaction_index) = block
+            .txdata
+            .iter()
+            .position(|transaction| transaction.compute_txid() == txid)
+        else {
+            bail!("No such transaction in specified block");
+        };
+        Some((
+            block.txdata[transaction_index].clone(),
+            chain::TxLocation {
+                block_hash,
+                height: chain.block_height_by_hash(&block_hash).unwrap_or(0),
+                transaction_index,
+            },
+        ))
+    } else {
+        chain.transaction(&txid)?
+    };
     let (transaction, location) = if let Some(found) = found {
         found
-    } else if let Some(entry) = node.mempool.read().get(&txid) {
+    } else if requested_block.is_none()
+        && let Some(entry) = node.mempool.read().get(&txid)
+    {
         (
             entry.transaction.clone(),
             chain::TxLocation {
@@ -1217,6 +1378,58 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let outpoints = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("gettxspendingprevout expects an array"))?
+        .iter()
+        .map(|value| {
+            let txid: Txid = value
+                .get("txid")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("outpoint txid must be a string"))?
+                .parse()?;
+            let vout = value
+                .get("vout")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("outpoint vout must be an integer"))?;
+            let vout = u32::try_from(vout).map_err(|_| anyhow!("outpoint vout is too large"))?;
+            Ok(OutPoint::new(txid, vout))
+        })
+        .collect::<Result<Vec<OutPoint>>>()?;
+    let height = node.chain.read().height();
+    let mempool = node.mempool.read();
+    Ok(json!(
+        outpoints
+            .into_iter()
+            .map(|outpoint| {
+                let Some(spender_txid) = mempool.spender(&outpoint) else {
+                    return Value::Null;
+                };
+                let Some(entry) = mempool.get(&spender_txid) else {
+                    return Value::Null;
+                };
+                let Some(vin) = entry
+                    .transaction
+                    .input
+                    .iter()
+                    .position(|input| input.previous_output == outpoint)
+                else {
+                    return Value::Null;
+                };
+                json!({
+                "txid": spender_txid.to_string(),
+                "vin": vin,
+                "fees": {"base": sat_to_btc(entry.fee_sat)},
+                "time": entry.added_at,
+                "height": height,
+                })
+            })
+            .collect::<Vec<_>>()
+    ))
+}
+
 fn rpc_transaction(
     transaction: &Transaction,
     blockhash: Option<&str>,
@@ -1323,6 +1536,8 @@ fn rpc_help(method: &str) -> String {
         "getblockheader",
         "getblock",
         "getblockstats",
+        "getchaintxstats",
+        "getnetworkhashps",
         "gettxoutproof",
         "verifytxoutproof",
         "submitheader",
@@ -1331,14 +1546,17 @@ fn rpc_help(method: &str) -> String {
         "sendrawtransaction",
         "submitblock",
         "getblocktemplate",
+        "getmininginfo",
         "testmempoolaccept",
         "verifychain",
         "gettxout",
+        "gettxspendingprevout",
         "getmempoolinfo",
         "getrawmempool",
         "getmempoolentry",
         "getmempoolancestors",
         "getmempooldescendants",
+        "savemempool",
         "gettxoutsetinfo",
         "getchaintips",
         "getnetworkinfo",

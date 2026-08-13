@@ -100,6 +100,10 @@ impl Mempool {
         self.spent.contains_key(outpoint)
     }
 
+    pub fn spender(&self, outpoint: &OutPoint) -> Option<Txid> {
+        self.spent.get(outpoint).copied()
+    }
+
     pub fn transactions(&self) -> impl Iterator<Item = &Transaction> {
         self.entries.values().map(|entry| &entry.transaction)
     }

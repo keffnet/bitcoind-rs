@@ -11,7 +11,7 @@ use base64::Engine;
 use bitcoin::absolute::LockTime;
 use bitcoin::block::{Header, Version as BlockVersion};
 use bitcoin::blockdata::opcodes::all::OP_RETURN;
-use bitcoin::blockdata::script::{Builder, PushBytesBuf};
+use bitcoin::blockdata::script::{Builder, Instruction, PushBytesBuf};
 use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
@@ -889,6 +889,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "converttopsbt" => convert_to_psbt(params),
         "analyzepsbt" => analyze_psbt(params),
         "combinepsbt" => combine_psbt(params),
+        "joinpsbts" => join_psbts(params),
         "finalizepsbt" => finalize_psbt(params),
         "utxoupdatepsbt" => update_psbt_utxos(node, params),
         "signmessagewithprivkey" => sign_message_with_private_key(params),
@@ -3269,10 +3270,72 @@ fn combine_psbt(params: &Value) -> Result<Value> {
     Ok(json!(encode_psbt(&combined)))
 }
 
+fn join_psbts(params: &Value) -> Result<Value> {
+    let values = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("joinpsbts expects an array of PSBTs"))?;
+    if values.is_empty() {
+        bail!("joinpsbts requires at least one PSBT")
+    }
+    let psbts = values
+        .iter()
+        .map(|value| {
+            let encoded = value
+                .as_str()
+                .ok_or_else(|| anyhow!("PSBT values must be base64 strings"))?;
+            Ok(Psbt::deserialize(
+                &base64::engine::general_purpose::STANDARD.decode(encoded)?,
+            )?)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let version = psbts[0].unsigned_tx.version;
+    let lock_time = psbts[0].unsigned_tx.lock_time;
+    let mut input_outpoints = HashSet::new();
+    let mut output_bytes = HashSet::new();
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    for psbt in &psbts {
+        if psbt.unsigned_tx.version != version || psbt.unsigned_tx.lock_time != lock_time {
+            bail!("PSBTs must use the same transaction version and locktime")
+        }
+        for (index, input) in psbt.unsigned_tx.input.iter().enumerate() {
+            if !input_outpoints.insert(input.previous_output) {
+                bail!("PSBTs contain duplicate inputs")
+            }
+            inputs.push((input.clone(), psbt.inputs[index].clone()));
+        }
+        for (index, output) in psbt.unsigned_tx.output.iter().enumerate() {
+            if !output_bytes.insert(serialize(output)) {
+                bail!("PSBTs contain duplicate outputs")
+            }
+            outputs.push((output.clone(), psbt.outputs[index].clone()));
+        }
+    }
+    let transaction = Transaction {
+        version,
+        lock_time,
+        input: inputs.iter().map(|(input, _)| input.clone()).collect(),
+        output: outputs.iter().map(|(output, _)| output.clone()).collect(),
+    };
+    let mut joined = Psbt::from_unsigned_tx(transaction)?;
+    for psbt in psbts {
+        joined.version = joined.version.max(psbt.version);
+        joined.xpub.extend(psbt.xpub);
+        joined.proprietary.extend(psbt.proprietary);
+        joined.unknown.extend(psbt.unknown);
+    }
+    joined.inputs = inputs.into_iter().map(|(_, input)| input).collect();
+    joined.outputs = outputs.into_iter().map(|(_, output)| output).collect();
+    Ok(json!(encode_psbt(&joined)))
+}
+
 fn analyze_psbt(params: &Value) -> Result<Value> {
     let psbt = parse_psbt(params, 0)?;
     let mut all_final = true;
     let mut missing_utxo = false;
+    let mut needs_signer = false;
+    let mut needs_finalizer = false;
     let inputs = psbt
         .inputs
         .iter()
@@ -3281,6 +3344,13 @@ fn analyze_psbt(params: &Value) -> Result<Value> {
             let is_final = input.final_script_sig.is_some() || input.final_script_witness.is_some();
             all_final &= is_final;
             missing_utxo |= !has_utxo;
+            if !is_final {
+                if input.partial_sigs.is_empty() {
+                    needs_signer = true;
+                } else {
+                    needs_finalizer = true;
+                }
+            }
             json!({
                 "has_utxo": has_utxo,
                 "is_final": is_final,
@@ -3296,7 +3366,7 @@ fn analyze_psbt(params: &Value) -> Result<Value> {
     let mut result = json!({
         "inputs": inputs,
         "estimated_vsize": estimated_vsize,
-        "next": if missing_utxo { "updater" } else if !all_final { "signer" } else { "extractor" },
+        "next": if missing_utxo { "updater" } else if needs_signer { "signer" } else if needs_finalizer { "finalizer" } else if all_final { "extractor" } else { "signer" },
     });
     if let Ok(fee) = psbt.fee() {
         result["fee"] = json!(sat_to_btc(fee.to_sat()));
@@ -3366,6 +3436,35 @@ fn public_key_matches_script(public_key: &bitcoin::PublicKey, script: &bitcoin::
     }
 }
 
+fn multisig_script_keys(script: &bitcoin::Script) -> Option<(usize, Vec<bitcoin::PublicKey>)> {
+    let instructions = script
+        .instructions()
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    if instructions.len() < 4
+        || instructions.last().and_then(Instruction::opcode)
+            != Some(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
+    {
+        return None;
+    }
+    let required = usize::try_from(instructions[0].script_num()?).ok()?;
+    let key_count = instructions
+        .get(instructions.len().saturating_sub(2))
+        .and_then(Instruction::script_num)
+        .and_then(|count| usize::try_from(count).ok())?;
+    if instructions.len() != key_count.saturating_add(3) || required == 0 || required > key_count {
+        return None;
+    }
+    let public_keys = instructions[1..=key_count]
+        .iter()
+        .map(|instruction| {
+            let bytes = instruction.push_bytes()?.as_bytes();
+            bitcoin::PublicKey::from_slice(bytes).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some((required, public_keys))
+}
+
 fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
     let Some(input) = psbt.inputs.get(input_index) else {
         return false;
@@ -3377,18 +3476,73 @@ fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
         return false;
     };
     let nested = prevout.script_pubkey.is_p2sh();
-    let spending_script = if nested {
-        let Some(redeem_script) = input.redeem_script.as_ref() else {
+    let redeem_script = input.redeem_script.clone();
+    let witness_script = input.witness_script.clone();
+    let (spending_script, segwit) = if nested {
+        let Some(redeem_script) = redeem_script.as_ref() else {
             return false;
         };
-        redeem_script.as_script()
+        if redeem_script.is_p2wsh() {
+            let Some(witness_script) = witness_script.as_ref() else {
+                return false;
+            };
+            (witness_script.clone(), true)
+        } else {
+            (redeem_script.clone(), false)
+        }
+    } else if prevout.script_pubkey.is_p2wsh() {
+        let Some(witness_script) = witness_script else {
+            return false;
+        };
+        (witness_script, true)
     } else {
-        prevout.script_pubkey.as_script()
+        (prevout.script_pubkey.clone(), false)
     };
+    if let Some((required, public_keys)) = multisig_script_keys(spending_script.as_script()) {
+        let signatures = public_keys
+            .iter()
+            .filter_map(|public_key| input.partial_sigs.get(public_key))
+            .take(required)
+            .map(|signature| signature.to_vec())
+            .collect::<Vec<_>>();
+        if signatures.len() < required {
+            return false;
+        }
+        let mut stack = vec![Vec::new()];
+        stack.extend(signatures);
+        if segwit {
+            stack.push(spending_script.to_bytes());
+            psbt.inputs[input_index].final_script_witness = Some(Witness::from_slice(&stack));
+            if nested {
+                psbt.inputs[input_index].final_script_sig = Some(
+                    push_script_items(&[redeem_script
+                        .as_ref()
+                        .expect("nested redeem script was checked")
+                        .to_bytes()])
+                    .expect("redeem script is bounded"),
+                );
+            }
+        } else {
+            if nested {
+                stack.push(
+                    redeem_script
+                        .as_ref()
+                        .expect("nested redeem script was checked")
+                        .to_bytes(),
+                );
+            }
+            if let Ok(script_sig) = push_script_items(&stack) {
+                psbt.inputs[input_index].final_script_sig = Some(script_sig);
+            } else {
+                return false;
+            }
+        }
+        return true;
+    }
     let Some((public_key, signature)) = input
         .partial_sigs
         .iter()
-        .find(|(public_key, _)| public_key_matches_script(public_key, spending_script))
+        .find(|(public_key, _)| public_key_matches_script(public_key, spending_script.as_script()))
         .map(|(public_key, signature)| (*public_key, *signature))
     else {
         return false;
@@ -3398,8 +3552,7 @@ fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
         psbt.inputs[input_index].final_script_witness = Some(witness);
         if nested {
             psbt.inputs[input_index].final_script_sig = Some(
-                push_script_items(&[psbt.inputs[input_index]
-                    .redeem_script
+                push_script_items(&[redeem_script
                     .as_ref()
                     .expect("nested redeem script was checked")
                     .to_bytes()])
@@ -3413,8 +3566,7 @@ fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
             push_script_items(&[
                 signature.to_vec(),
                 public_key.to_bytes(),
-                psbt.inputs[input_index]
-                    .redeem_script
+                redeem_script
                     .as_ref()
                     .expect("nested redeem script was checked")
                     .to_bytes(),
@@ -3430,8 +3582,7 @@ fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
         let mut items = vec![signature.to_vec()];
         if nested {
             items.push(
-                psbt.inputs[input_index]
-                    .redeem_script
+                redeem_script
                     .as_ref()
                     .expect("nested redeem script was checked")
                     .to_bytes(),
@@ -5207,6 +5358,14 @@ fn descriptor_indices(wildcard: bool, range: Option<(u32, u32)>) -> Result<Vec<O
 fn parse_descriptor_key(
     expression: &str,
 ) -> Result<(DescriptorKey, bitcoin::bip32::DerivationPath, bool)> {
+    let expression = if expression.starts_with('[') {
+        let end = expression
+            .find(']')
+            .ok_or_else(|| anyhow!("descriptor key origin is missing a closing bracket"))?;
+        &expression[end + 1..]
+    } else {
+        expression
+    };
     let mut parts = expression.split('/');
     let base = parts
         .next()
@@ -5471,6 +5630,7 @@ fn rpc_help(method: &str) -> String {
         "converttopsbt",
         "analyzepsbt",
         "combinepsbt",
+        "joinpsbts",
         "finalizepsbt",
         "utxoupdatepsbt",
         "signmessagewithprivkey",
@@ -6213,6 +6373,12 @@ mod tests {
         let ranged =
             derive_addresses(&node, &json!([format!("wpkh({xpub}/0/*)"), [0, 1]])).unwrap();
         assert_eq!(ranged.as_array().unwrap().len(), 2);
+        let ranged_with_origin = derive_addresses(
+            &node,
+            &json!([format!("wpkh([d34db33f/84'/0'/0']{xpub}/0/*)"), [0, 1]]),
+        )
+        .unwrap();
+        assert_eq!(ranged_with_origin.as_array().unwrap().len(), 2);
         let descriptor_info =
             get_descriptor_info(&node, &json!([format!("wpkh({public_key})")])).unwrap();
         assert_eq!(descriptor_info["isrange"], false);
@@ -6454,6 +6620,23 @@ mod tests {
             combine_psbt(&json!([[created.clone(), created]])).unwrap(),
             json!(encode_psbt(&created_psbt))
         );
+        let joined_first = create_psbt(
+            &node,
+            &json!([[{"txid": Txid::from_byte_array([11; 32]), "vout": 0}], {"data": "01"}]),
+        )
+        .unwrap();
+        let joined_second = create_psbt(
+            &node,
+            &json!([[{"txid": Txid::from_byte_array([12; 32]), "vout": 0}], {"data": "02"}]),
+        )
+        .unwrap();
+        let joined = parse_psbt(
+            &json!([join_psbts(&json!([[joined_first, joined_second]])).unwrap()]),
+            0,
+        )
+        .unwrap();
+        assert_eq!(joined.unsigned_tx.input.len(), 2);
+        assert_eq!(joined.unsigned_tx.output.len(), 2);
 
         let mined = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap();
         let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
@@ -6525,7 +6708,7 @@ mod tests {
             },
         );
         let analyzed = analyze_psbt(&json!([encode_psbt(&partial)])).unwrap();
-        assert_eq!(analyzed["next"], "signer");
+        assert_eq!(analyzed["next"], "finalizer");
         let finalized = finalize_psbt(&json!([encode_psbt(&partial), false])).unwrap();
         assert_eq!(finalized["complete"], true);
         assert!(finalized.get("hex").is_none());
@@ -6535,6 +6718,52 @@ mod tests {
         let converted = convert_to_psbt(&json!([extracted["hex"].clone(), true])).unwrap();
         let converted_psbt = parse_psbt(&json!([converted]), 0).unwrap();
         assert!(converted_psbt.inputs[0].final_script_witness.is_some());
+
+        let multisig_script = Builder::new()
+            .push_int(1)
+            .push_key(&public_key)
+            .push_int(1)
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
+            .into_script();
+        let mut multisig = Psbt::from_unsigned_tx(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([10; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        })
+        .unwrap();
+        multisig.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000_000),
+            script_pubkey: multisig_script.to_p2wsh(),
+        });
+        multisig.inputs[0].witness_script = Some(multisig_script);
+        multisig.inputs[0].partial_sigs.insert(
+            public_key,
+            EcdsaSignature {
+                signature,
+                sighash_type: EcdsaSighashType::All,
+            },
+        );
+        let finalized_multisig = finalize_psbt(&json!([encode_psbt(&multisig), false])).unwrap();
+        assert_eq!(finalized_multisig["complete"], true);
+        let finalized_multisig =
+            parse_psbt(&json!([finalized_multisig["psbt"].clone()]), 0).unwrap();
+        assert_eq!(
+            finalized_multisig.inputs[0]
+                .final_script_witness
+                .as_ref()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]

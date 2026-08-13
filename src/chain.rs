@@ -87,6 +87,7 @@ pub struct ChainState {
     block_index: HashMap<BlockHash, BlockNode>,
     orphans: HashMap<BlockHash, Vec<Block>>,
     utxos: HashMap<OutPoint, UtxoEntry>,
+    utxos_by_script: HashMap<String, HashSet<OutPoint>>,
     tx_index: HashMap<Txid, TxLocation>,
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
@@ -134,6 +135,7 @@ impl ChainState {
             block_index: HashMap::new(),
             orphans: HashMap::new(),
             utxos: HashMap::new(),
+            utxos_by_script: HashMap::new(),
             tx_index: HashMap::new(),
             tx_index_all: HashMap::new(),
             history: HashMap::new(),
@@ -143,6 +145,7 @@ impl ChainState {
             state.active_chain = active_chain.clone();
             state.headers = snapshot.headers;
             state.utxos = snapshot.utxos;
+            state.rebuild_utxo_index();
             state.tx_index = snapshot.tx_index;
             state.tx_index_all = state.tx_index.clone();
             state.history = snapshot.history;
@@ -414,10 +417,15 @@ impl ChainState {
     }
 
     pub fn get_utxos(&self, script_hash: &str) -> Vec<(OutPoint, UtxoEntry)> {
-        self.utxos
-            .iter()
-            .filter(|(_, entry)| electrum_script_hash(&entry.output.script_pubkey) == script_hash)
-            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+        self.utxos_by_script
+            .get(script_hash)
+            .into_iter()
+            .flat_map(|outpoints| outpoints.iter())
+            .filter_map(|outpoint| {
+                self.utxos
+                    .get(outpoint)
+                    .map(|entry| (*outpoint, entry.clone()))
+            })
             .collect()
     }
 
@@ -715,7 +723,7 @@ impl ChainState {
             self.store.insert(block)?;
         }
         for (outpoint, _) in &spent_entries {
-            self.utxos.remove(outpoint);
+            self.remove_utxo(outpoint);
         }
         let spent_entries: HashMap<OutPoint, UtxoEntry> = spent_entries.into_iter().collect();
         for (transaction_index, transaction) in block.txdata.iter().enumerate() {
@@ -728,7 +736,7 @@ impl ChainState {
             }
             for (output_index, output) in transaction.output.iter().enumerate() {
                 let outpoint = OutPoint::new(txid, output_index as u32);
-                self.utxos.insert(
+                self.insert_utxo(
                     outpoint,
                     UtxoEntry {
                         output: output.clone(),
@@ -879,11 +887,13 @@ impl ChainState {
         let old_active_chain = self.active_chain.clone();
         let old_headers = self.headers.clone();
         let old_utxos = self.utxos.clone();
+        let old_utxos_by_script = self.utxos_by_script.clone();
         let old_tx_index = self.tx_index.clone();
         let old_history = self.history.clone();
         self.active_chain.clear();
         self.headers.clear();
         self.utxos.clear();
+        self.utxos_by_script.clear();
         self.tx_index.clear();
         self.history.clear();
         let replay = (|| -> Result<()> {
@@ -898,6 +908,7 @@ impl ChainState {
             self.active_chain = old_active_chain;
             self.headers = old_headers;
             self.utxos = old_utxos;
+            self.utxos_by_script = old_utxos_by_script;
             self.tx_index = old_tx_index;
             self.history = old_history;
             return Err(error);
@@ -911,7 +922,7 @@ impl ChainState {
             let mut scripts = HashSet::new();
             for (output_index, output) in transaction.output.iter().enumerate() {
                 let outpoint = OutPoint::new(txid, output_index as u32);
-                self.utxos.insert(
+                self.insert_utxo(
                     outpoint,
                     UtxoEntry {
                         output: output.clone(),
@@ -955,6 +966,40 @@ impl ChainState {
                     transaction_index,
                 },
             );
+        }
+    }
+
+    fn insert_utxo(&mut self, outpoint: OutPoint, entry: UtxoEntry) {
+        if self.utxos.contains_key(&outpoint) {
+            self.remove_utxo(&outpoint);
+        }
+        let script_hash = electrum_script_hash(&entry.output.script_pubkey);
+        self.utxos.insert(outpoint, entry);
+        self.utxos_by_script
+            .entry(script_hash)
+            .or_default()
+            .insert(outpoint);
+    }
+
+    fn remove_utxo(&mut self, outpoint: &OutPoint) -> Option<UtxoEntry> {
+        let entry = self.utxos.remove(outpoint)?;
+        let script_hash = electrum_script_hash(&entry.output.script_pubkey);
+        if let Some(outpoints) = self.utxos_by_script.get_mut(&script_hash) {
+            outpoints.remove(outpoint);
+            if outpoints.is_empty() {
+                self.utxos_by_script.remove(&script_hash);
+            }
+        }
+        Some(entry)
+    }
+
+    fn rebuild_utxo_index(&mut self) {
+        self.utxos_by_script.clear();
+        for (outpoint, entry) in &self.utxos {
+            self.utxos_by_script
+                .entry(electrum_script_hash(&entry.output.script_pubkey))
+                .or_default()
+                .insert(*outpoint);
         }
     }
 
@@ -1167,6 +1212,8 @@ mod tests {
         state.connect_block(second).unwrap();
         assert_eq!(state.height(), 2);
         assert_eq!(state.best_hash(), state.block_hash(2).unwrap());
+        let script_hash = electrum_script_hash(&Builder::new().push_int(1).into_script());
+        assert_eq!(state.get_utxos(&script_hash).len(), 2);
         state.verify_active_chain(0).unwrap();
         state.persist_snapshot().unwrap();
         drop(state);
@@ -1174,6 +1221,7 @@ mod tests {
         assert_eq!(reopened.height(), 2);
         assert_eq!(reopened.block_hash(1), Some(first_hash));
         assert_eq!(reopened.utxos.len(), 3);
+        assert_eq!(reopened.get_utxos(&script_hash).len(), 2);
         drop(reopened);
         fs::write(directory.path().join("chainstate.snapshot"), b"corrupt").unwrap();
         let replayed = ChainState::open(Network::Regtest, directory.path()).unwrap();

@@ -48,6 +48,11 @@ pub struct ChainTip {
     pub work: Work,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockFeeStats {
+    pub total_fee_sat: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownChainTip {
     pub hash: BlockHash,
@@ -323,6 +328,65 @@ impl ChainState {
 
     pub fn block_transaction_count(&mut self, hash: &BlockHash) -> Result<Option<usize>> {
         Ok(self.store.get(hash)?.map(|block| block.txdata.len()))
+    }
+
+    pub fn block_fee_stats(&mut self, hash: &BlockHash) -> Result<Option<BlockFeeStats>> {
+        let Some(target) = self.block_index.get(hash).copied() else {
+            return Ok(None);
+        };
+        let mut path = Vec::with_capacity(target.height as usize + 1);
+        let mut cursor = *hash;
+        loop {
+            path.push(cursor);
+            if cursor == self.network_genesis_hash() {
+                break;
+            }
+            let Some(node) = self.block_index.get(&cursor) else {
+                return Ok(None);
+            };
+            cursor = node.header.prev_blockhash;
+        }
+        path.reverse();
+        let mut utxos: HashMap<OutPoint, u64> = HashMap::new();
+        let mut total_fee_sat = 0u64;
+        for block_hash in path {
+            let Some(block) = self.store.get(&block_hash)? else {
+                return Ok(None);
+            };
+            for transaction in &block.txdata {
+                let txid = transaction.compute_txid();
+                if !transaction.is_coinbase() {
+                    let input_total = transaction
+                        .input
+                        .iter()
+                        .map(|input| utxos.get(&input.previous_output).copied())
+                        .collect::<Option<Vec<u64>>>();
+                    let Some(input_total) = input_total else {
+                        return Ok(None);
+                    };
+                    let input_total = input_total.into_iter().sum::<u64>();
+                    for input in &transaction.input {
+                        utxos.remove(&input.previous_output);
+                    }
+                    let output_total = transaction
+                        .output
+                        .iter()
+                        .map(|output| output.value.to_sat())
+                        .try_fold(0u64, u64::checked_add)
+                        .ok_or_else(|| anyhow::anyhow!("transaction output total overflow"))?;
+                    if input_total < output_total {
+                        return Ok(None);
+                    }
+                    total_fee_sat = total_fee_sat
+                        .checked_add(input_total - output_total)
+                        .ok_or_else(|| anyhow::anyhow!("block fee total overflow"))?;
+                }
+                for (vout, output) in transaction.output.iter().enumerate() {
+                    utxos.insert(OutPoint::new(txid, vout as u32), output.value.to_sat());
+                }
+            }
+        }
+        Ok(Some(BlockFeeStats { total_fee_sat }))
     }
 
     pub fn chain_work_by_hash(&self, hash: &BlockHash) -> Option<Work> {
@@ -1341,6 +1405,10 @@ mod tests {
         let first = mine_block(&state, 1);
         let first_hash = first.block_hash();
         state.connect_block(first).unwrap();
+        assert_eq!(
+            state.block_fee_stats(&first_hash).unwrap(),
+            Some(BlockFeeStats { total_fee_sat: 0 })
+        );
         let second = mine_block(&state, 2);
         state.connect_block(second).unwrap();
         assert_eq!(state.height(), 2);

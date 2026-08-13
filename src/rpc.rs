@@ -1002,7 +1002,7 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let block = chain
         .block(&hash)?
         .ok_or_else(|| anyhow!("Block not found"))?;
-    let height = (0..=chain.height()).find(|height| chain.block_hash(*height) == Some(hash));
+    let height = chain.block_height_by_hash(&hash);
     let mut total_out = 0u64;
     for transaction in &block.txdata {
         total_out = total_out.saturating_add(
@@ -1024,7 +1024,9 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "weight": block.weight().to_wu(),
         "total_out": sat_to_btc(total_out),
         "subsidy": height.map(|height| sat_to_btc(validation::block_subsidy(height))),
-        "total_fee": null,
+        "total_fee": chain
+            .block_fee_stats(&hash)?
+            .map(|stats| sat_to_btc(stats.total_fee_sat)),
     }))
 }
 

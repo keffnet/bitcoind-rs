@@ -66,6 +66,7 @@ pub struct ChainState {
     active_chain: Vec<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
     block_index: HashMap<BlockHash, BlockNode>,
+    orphans: HashMap<BlockHash, Vec<Block>>,
     utxos: HashMap<OutPoint, UtxoEntry>,
     tx_index: HashMap<Txid, TxLocation>,
     tx_index_all: HashMap<Txid, TxLocation>,
@@ -120,6 +121,7 @@ impl ChainState {
             active_chain: Vec::new(),
             headers: Vec::new(),
             block_index: HashMap::new(),
+            orphans: HashMap::new(),
             utxos: HashMap::new(),
             tx_index: HashMap::new(),
             tx_index_all: HashMap::new(),
@@ -310,10 +312,12 @@ impl ChainState {
         let parent_hash = block.header.prev_blockhash;
         let Some(parent) = self.block_index.get(&parent_hash).copied() else {
             self.store.insert(&block)?;
+            self.orphans.entry(parent_hash).or_default().push(block);
             bail!("block {} has an unknown parent {}", hash, parent_hash);
         };
         if parent_hash == self.best_hash() {
             self.connect_block_internal(&block, true)?;
+            self.process_orphans(hash);
             return Ok(self.tip());
         }
 
@@ -345,7 +349,17 @@ impl ChainState {
         if chain_work > self.tip().work {
             self.activate_chain(hash)?;
         }
+        self.process_orphans(hash);
         Ok(self.tip())
+    }
+
+    fn process_orphans(&mut self, parent_hash: BlockHash) {
+        let Some(children) = self.orphans.remove(&parent_hash) else {
+            return;
+        };
+        for child in children {
+            let _ = self.connect_block(child);
+        }
     }
 
     fn connect_block_internal(&mut self, block: &Block, persist: bool) -> Result<()> {
@@ -562,6 +576,11 @@ impl ChainState {
         for (hash, block) in blocks {
             if let Some(node) = self.block_index.get(&hash).copied() {
                 self.index_all_transactions(&block, node.height);
+            } else {
+                self.orphans
+                    .entry(block.header.prev_blockhash)
+                    .or_default()
+                    .push(block);
             }
         }
         Ok(())
@@ -870,6 +889,19 @@ mod tests {
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.best_hash(), side_three_hash);
         assert_eq!(reopened.block_hash(1), Some(side_one_hash));
+    }
+
+    #[test]
+    fn queues_an_orphan_until_its_parent_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let child = mine_block_from_header(&parent.header, 2, 7);
+        let child_hash = child.block_hash();
+        assert!(state.connect_block(child).is_err());
+        state.connect_block(parent).unwrap();
+        assert_eq!(state.best_hash(), child_hash);
+        assert_eq!(state.height(), 2);
     }
 
     fn mine_block_from_header(previous: &Header, height: u32, tag: u8) -> Block {

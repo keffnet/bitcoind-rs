@@ -136,8 +136,9 @@ fn dispatch(
             let header = chain.header(height).expect("tip header exists");
             Ok(json!({"height": height, "hex": hex::encode(serialize(header))}))
         }
-        "blockchain.block.header" => block_header(node, params),
+        "blockchain.block.header" | "blockchain.block.get_header" => block_header(node, params),
         "blockchain.block.headers" => block_headers(node, params),
+        "blockchain.block.get_chunk" => block_chunk(node, params),
         "blockchain.scripthash.get_history" => {
             let script_hash = script_hash_param(params, 0)?;
             Ok(json!(history_for_script(node, &script_hash)))
@@ -202,6 +203,7 @@ fn dispatch(
         }
         "blockchain.transaction.get" => transaction_get(node, params),
         "blockchain.transaction.get_merkle" => transaction_merkle(node, params),
+        "blockchain.transaction.id_from_pos" => transaction_id_from_pos(node, params),
         "blockchain.transaction.broadcast" => transaction_broadcast(node, params),
         "blockchain.estimatefee" | "blockchain.relayfee" => Ok(json!(0.00001000)),
         "mempool.get_fee_histogram" => {
@@ -233,13 +235,15 @@ fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     let mut histogram: Vec<(u64, u64)> = Vec::new();
+    let mut cumulative_vsize = 0u64;
     for (fee_rate, vsize) in entries {
+        cumulative_vsize = cumulative_vsize.saturating_add(vsize);
         if let Some((last_fee_rate, total_vsize)) = histogram.last_mut()
             && *last_fee_rate == fee_rate
         {
-            *total_vsize = total_vsize.saturating_add(vsize);
+            *total_vsize = cumulative_vsize;
         } else {
-            histogram.push((fee_rate, vsize));
+            histogram.push((fee_rate, cumulative_vsize));
         }
     }
     json!(histogram)
@@ -268,6 +272,22 @@ fn block_headers(node: &Arc<Node>, params: &Value) -> Result<Value> {
         actual += 1;
     }
     Ok(json!({"count": actual, "hex": hex::encode(bytes), "max": 2_000}))
+}
+
+fn block_chunk(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let index = param::<u32>(params, 0)?;
+    let start = index
+        .checked_mul(2_016)
+        .ok_or_else(|| anyhow!("header chunk index is too large"))?;
+    let chain = node.chain.read();
+    let mut bytes = Vec::with_capacity(2_016 * 80);
+    for height in start..start.saturating_add(2_016) {
+        let Some(header) = chain.header(height) else {
+            break;
+        };
+        bytes.extend_from_slice(&serialize(header));
+    }
+    Ok(json!(hex::encode(bytes)))
 }
 
 fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -383,6 +403,35 @@ fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "block_height": height,
         "pos": position,
         "merkle": branch.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    }))
+}
+
+fn transaction_id_from_pos(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let height = param::<u32>(params, 0)?;
+    let position = param::<u32>(params, 1)?;
+    let include_merkle = params.get(2).and_then(Value::as_bool).unwrap_or(false);
+    let mut chain = node.chain.write();
+    let hash = chain
+        .block_hash(height)
+        .ok_or_else(|| anyhow!("block height out of range"))?;
+    let block = chain
+        .block(&hash)?
+        .ok_or_else(|| anyhow!("block not found"))?;
+    let transaction = block
+        .txdata
+        .get(position as usize)
+        .ok_or_else(|| anyhow!("transaction position out of range"))?;
+    let txid = transaction.compute_txid();
+    if !include_merkle {
+        return Ok(json!(txid.to_string()));
+    }
+    let (branch, _, _) = chain
+        .merkle_branch(&txid)?
+        .ok_or_else(|| anyhow!("transaction not found"))?;
+    Ok(json!({
+        "tx_hash": txid.to_string(),
+        "merkle": branch.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "pos": position,
     }))
 }
 

@@ -133,6 +133,34 @@ impl Node {
         Ok(txid)
     }
 
+    pub fn invalidate_block(&self, hash: bitcoin::BlockHash) -> Result<ChainEvent> {
+        let (tip, changed) = {
+            let mut chain = self.chain.write();
+            let previous = chain.best_hash();
+            let tip = chain.invalidate_block(&hash)?;
+            (tip, previous != chain.best_hash())
+        };
+        if changed {
+            self.mempool.write().revalidate(&self.chain.read());
+            let _ = self.events.send(tip.clone());
+        }
+        Ok(tip)
+    }
+
+    pub fn reconsider_block(&self, hash: bitcoin::BlockHash) -> Result<ChainEvent> {
+        let (tip, changed) = {
+            let mut chain = self.chain.write();
+            let previous = chain.best_hash();
+            let tip = chain.reconsider_block(&hash)?;
+            (tip, previous != chain.best_hash())
+        };
+        if changed {
+            self.mempool.write().revalidate(&self.chain.read());
+            let _ = self.events.send(tip.clone());
+        }
+        Ok(tip)
+    }
+
     pub fn subscribe_chain(&self) -> broadcast::Receiver<ChainEvent> {
         self.events.subscribe()
     }

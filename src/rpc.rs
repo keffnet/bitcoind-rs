@@ -859,12 +859,16 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "gettxoutproof" => get_txout_proof(node, params),
         "verifytxoutproof" => verify_txout_proof(params),
         "submitheader" => submit_header(node, params),
+        "invalidateblock" => invalidate_block(node, params),
+        "reconsiderblock" => reconsider_block(node, params),
         "getrawtransaction" => get_raw_transaction(node, params),
         "decoderawtransaction" => decode_raw_transaction(params),
         "sendrawtransaction" => send_raw_transaction(node, params),
         "submitblock" => submit_block(node, params),
         "getblocktemplate" => get_block_template(node, params),
         "getmininginfo" => get_mining_info(node),
+        "prioritisetransaction" => prioritise_transaction(node, params),
+        "getprioritisedtransactions" => get_prioritised_transactions(node),
         "generatetoaddress" => generate_to_address(node, params),
         "generateblock" => generate_block(node, params),
         "testmempoolaccept" => test_mempool_accept(node, params),
@@ -1656,6 +1660,18 @@ fn submit_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let header: bitcoin::block::Header = deserialize(&bytes)?;
     node.chain.write().accept_headers(&[header])?;
+    Ok(Value::Null)
+}
+
+fn invalidate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    node.invalidate_block(hash)?;
+    Ok(Value::Null)
+}
+
+fn reconsider_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    node.reconsider_block(hash)?;
     Ok(Value::Null)
 }
 
@@ -2753,6 +2769,37 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }))
 }
 
+fn prioritise_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let txid: Txid = param::<String>(params, 0)?.parse()?;
+    if let Some(dummy) = params.get(1).filter(|value| !value.is_null()) {
+        let dummy = dummy
+            .as_f64()
+            .ok_or_else(|| anyhow!("dummy priority argument must be numeric"))?;
+        if dummy != 0.0 {
+            bail!("priority is no longer supported; dummy argument must be 0")
+        }
+    }
+    let fee_delta = param::<i64>(params, 2)?;
+    node.mempool.write().prioritise(txid, fee_delta);
+    Ok(Value::Bool(true))
+}
+
+fn get_prioritised_transactions(node: &Arc<Node>) -> Result<Value> {
+    let mempool = node.mempool.read();
+    let mut result = serde_json::Map::new();
+    for (txid, fee_delta, in_mempool, modified_fee) in mempool.prioritised_transactions() {
+        let mut entry = json!({
+            "fee_delta": fee_delta,
+            "in_mempool": in_mempool,
+        });
+        if let Some(modified_fee) = modified_fee {
+            entry["modified_fee"] = json!(modified_fee);
+        }
+        result.insert(txid.to_string(), entry);
+    }
+    Ok(Value::Object(result))
+}
+
 fn get_mempool_relationship(node: &Arc<Node>, params: &Value, ancestors: bool) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
@@ -3110,12 +3157,16 @@ fn rpc_help(method: &str) -> String {
         "gettxoutproof",
         "verifytxoutproof",
         "submitheader",
+        "invalidateblock",
+        "reconsiderblock",
         "getrawtransaction",
         "decoderawtransaction",
         "sendrawtransaction",
         "submitblock",
         "getblocktemplate",
         "getmininginfo",
+        "prioritisetransaction",
+        "getprioritisedtransactions",
         "generatetoaddress",
         "generateblock",
         "testmempoolaccept",
@@ -3623,5 +3674,37 @@ mod tests {
             hex::decode(hex_response.strip_suffix(b"\n").unwrap()).unwrap(),
             binary
         );
+    }
+
+    #[test]
+    fn invalidate_and_reconsider_reselect_a_valid_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let hash = generate_to_address(
+            &node,
+            &json!([1, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"]),
+        )
+        .unwrap()[0]
+            .as_str()
+            .unwrap()
+            .parse::<BlockHash>()
+            .unwrap();
+        invalidate_block(&node, &json!([hash.to_string()])).unwrap();
+        assert_eq!(node.chain.read().height(), 0);
+        assert_eq!(node.chain.read().chain_tips()[0].status, "invalid");
+        reconsider_block(&node, &json!([hash.to_string()])).unwrap();
+        assert_eq!(node.chain.read().height(), 1);
+        assert_eq!(node.chain.read().best_hash(), hash);
     }
 }

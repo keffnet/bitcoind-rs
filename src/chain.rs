@@ -81,6 +81,8 @@ struct ChainMetadata {
     active_chain: Vec<String>,
     #[serde(default)]
     headers: Vec<bitcoin::block::Header>,
+    #[serde(default)]
+    invalid_blocks: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,6 +105,7 @@ pub struct ChainState {
     headers: Vec<bitcoin::block::Header>,
     block_index: HashMap<BlockHash, BlockNode>,
     orphans: HashMap<BlockHash, Vec<Block>>,
+    invalid_blocks: HashSet<BlockHash>,
     utxos: HashMap<OutPoint, UtxoEntry>,
     utxos_by_script: HashMap<String, HashSet<OutPoint>>,
     tx_index: HashMap<Txid, TxLocation>,
@@ -131,7 +134,7 @@ impl ChainState {
         }
 
         let metadata_path = data_dir.join("chainstate.json");
-        let (active_chain, persisted_headers) = if metadata_path.exists() {
+        let (active_chain, persisted_headers, invalid_blocks) = if metadata_path.exists() {
             let bytes = fs::read(&metadata_path)
                 .with_context(|| format!("reading {}", metadata_path.display()))?;
             let metadata: ChainMetadata = serde_json::from_slice(&bytes)
@@ -144,9 +147,17 @@ impl ChainState {
                         .with_context(|| format!("invalid block hash {hash}"))
                 })
                 .collect::<Result<Vec<BlockHash>>>()?;
-            (active_chain, metadata.headers)
+            let invalid_blocks = metadata
+                .invalid_blocks
+                .into_iter()
+                .map(|hash| {
+                    hash.parse()
+                        .with_context(|| format!("invalid invalidated block hash {hash}"))
+                })
+                .collect::<Result<HashSet<BlockHash>>>()?;
+            (active_chain, metadata.headers, invalid_blocks)
         } else {
-            (vec![genesis_hash], Vec::new())
+            (vec![genesis_hash], Vec::new(), HashSet::new())
         };
         if active_chain.first().copied() != Some(genesis_hash) {
             bail!("chainstate does not start at the configured network genesis block");
@@ -165,6 +176,7 @@ impl ChainState {
             headers: Vec::new(),
             block_index: HashMap::new(),
             orphans: HashMap::new(),
+            invalid_blocks,
             utxos: HashMap::new(),
             utxos_by_script: HashMap::new(),
             tx_index: HashMap::new(),
@@ -205,6 +217,16 @@ impl ChainState {
         }
         state.index_persisted_headers(&persisted_headers)?;
         state.rebuild_block_index()?;
+        if state
+            .active_chain
+            .iter()
+            .any(|hash| state.invalid_blocks.contains(hash))
+        {
+            let best_valid = state
+                .best_valid_tip_hash()
+                .context("invalidated chain has no valid alternative")?;
+            state.activate_chain(best_valid)?;
+        }
         state.persist_metadata()?;
         Ok(state)
     }
@@ -265,6 +287,15 @@ impl ChainState {
                         work: node.chain_work,
                     };
                 }
+                if self.invalid_blocks.contains(hash) || self.has_invalid_ancestor(*hash) {
+                    return KnownChainTip {
+                        hash: *hash,
+                        height: node.height,
+                        branch_len: 0,
+                        status: "invalid",
+                        work: node.chain_work,
+                    };
+                }
                 let mut cursor = *hash;
                 let mut branch_len: u32 = 0;
                 while !active.contains(&cursor) {
@@ -295,6 +326,55 @@ impl ChainState {
 
     pub fn is_active_block(&self, hash: &BlockHash) -> bool {
         self.active_chain.contains(hash)
+    }
+
+    pub fn invalidate_block(&mut self, hash: &BlockHash) -> Result<ChainTip> {
+        let node = self
+            .block_index
+            .get(hash)
+            .copied()
+            .with_context(|| format!("block {hash} not found"))?;
+        if node.height == 0 {
+            bail!("cannot invalidate the genesis block")
+        }
+        let invalidated: Vec<BlockHash> = self
+            .block_index
+            .keys()
+            .copied()
+            .filter(|candidate| self.is_descendant_or_self(candidate, hash))
+            .collect();
+        self.invalid_blocks.extend(invalidated);
+        let best_valid = self
+            .best_valid_tip_hash()
+            .context("invalidated chain has no valid alternative")?;
+        if best_valid != self.best_hash() {
+            self.activate_chain(best_valid)?;
+        }
+        self.persist_metadata()?;
+        Ok(self.tip())
+    }
+
+    pub fn reconsider_block(&mut self, hash: &BlockHash) -> Result<ChainTip> {
+        self.block_index
+            .get(hash)
+            .copied()
+            .with_context(|| format!("block {hash} not found"))?;
+        let reconsidered: Vec<BlockHash> = self
+            .invalid_blocks
+            .iter()
+            .copied()
+            .filter(|candidate| self.is_descendant_or_self(candidate, hash))
+            .collect();
+        for candidate in reconsidered {
+            self.invalid_blocks.remove(&candidate);
+        }
+        if let Some(best_valid) = self.best_valid_tip_hash()
+            && best_valid != self.best_hash()
+        {
+            self.activate_chain(best_valid)?;
+        }
+        self.persist_metadata()?;
+        Ok(self.tip())
     }
 
     pub fn header(&self, height: u32) -> Option<&bitcoin::block::Header> {
@@ -863,6 +943,9 @@ impl ChainState {
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {
         let hash = block.block_hash();
+        if self.has_invalid_ancestor(hash) {
+            bail!("block {hash} is on an invalidated branch")
+        }
         if self.active_chain.contains(&hash) {
             return Ok(self.tip());
         }
@@ -872,6 +955,9 @@ impl ChainState {
             self.orphans.entry(parent_hash).or_default().push(block);
             bail!("block {} has an unknown parent {}", hash, parent_hash);
         };
+        if self.has_invalid_ancestor(parent_hash) {
+            bail!("block {hash} is on an invalidated branch")
+        }
         if parent_hash == self.best_hash() {
             self.connect_block_internal(&block, true)?;
             self.process_orphans(hash);
@@ -1280,6 +1366,9 @@ impl ChainState {
     }
 
     fn activate_chain(&mut self, tip_hash: BlockHash) -> Result<()> {
+        if self.has_invalid_ancestor(tip_hash) {
+            bail!("cannot activate an invalidated chain")
+        }
         let mut path = Vec::new();
         let mut cursor = tip_hash;
         loop {
@@ -1336,6 +1425,50 @@ impl ChainState {
             return Err(error);
         }
         Ok(())
+    }
+
+    fn is_descendant_or_self(&self, candidate: &BlockHash, ancestor: &BlockHash) -> bool {
+        let mut cursor = *candidate;
+        loop {
+            if cursor == *ancestor {
+                return true;
+            }
+            let Some(node) = self.block_index.get(&cursor) else {
+                return false;
+            };
+            if node.height == 0 {
+                return false;
+            }
+            cursor = node.header.prev_blockhash;
+        }
+    }
+
+    fn has_invalid_ancestor(&self, hash: BlockHash) -> bool {
+        let mut cursor = hash;
+        loop {
+            if self.invalid_blocks.contains(&cursor) {
+                return true;
+            }
+            let Some(node) = self.block_index.get(&cursor) else {
+                return false;
+            };
+            if node.height == 0 {
+                return false;
+            }
+            cursor = node.header.prev_blockhash;
+        }
+    }
+
+    fn best_valid_tip_hash(&self) -> Option<BlockHash> {
+        self.block_index
+            .iter()
+            .filter(|(hash, _)| !self.has_invalid_ancestor(**hash))
+            .max_by(|(left_hash, left), (right_hash, right)| {
+                left.chain_work
+                    .cmp(&right.chain_work)
+                    .then_with(|| right_hash.to_string().cmp(&left_hash.to_string()))
+            })
+            .map(|(hash, _)| *hash)
     }
 
     fn index_transactions(&mut self, block: &Block, height: u32) {
@@ -1550,6 +1683,11 @@ impl ChainState {
         let metadata = ChainMetadata {
             active_chain: self.active_chain.iter().map(ToString::to_string).collect(),
             headers: self.known_headers(),
+            invalid_blocks: self
+                .invalid_blocks
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
         };
         let bytes = serde_json::to_vec_pretty(&metadata)?;
         let path = self.data_dir.join("chainstate.json");

@@ -39,6 +39,7 @@ pub struct Mempool {
     spent: HashMap<OutPoint, Txid>,
     children: HashMap<Txid, HashSet<Txid>>,
     wtxids: HashMap<Wtxid, Txid>,
+    priorities: HashMap<Txid, i64>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +78,7 @@ impl Mempool {
             spent: HashMap::new(),
             children: HashMap::new(),
             wtxids: HashMap::new(),
+            priorities: HashMap::new(),
         }
     }
 
@@ -118,9 +120,42 @@ impl Mempool {
         self.entries.values().map(|entry| &entry.transaction)
     }
 
+    pub fn prioritise(&mut self, txid: Txid, fee_delta: i64) {
+        let delta = self.priorities.entry(txid).or_insert(0);
+        *delta = delta.saturating_add(fee_delta);
+        if *delta == 0 {
+            self.priorities.remove(&txid);
+        }
+    }
+
+    pub fn prioritised_transactions(&self) -> Vec<(Txid, i64, bool, Option<i64>)> {
+        let mut result = self
+            .priorities
+            .iter()
+            .map(|(txid, delta)| {
+                let modified_fee = self.entries.get(txid).map(|entry| {
+                    i64::try_from(entry.fee_sat)
+                        .unwrap_or(i64::MAX)
+                        .saturating_add(*delta)
+                });
+                (*txid, *delta, modified_fee.is_some(), modified_fee)
+            })
+            .collect::<Vec<_>>();
+        result.sort_by_key(|(txid, _, _, _)| txid.to_string());
+        result
+    }
+
+    pub fn fee_delta(&self, txid: &Txid) -> i64 {
+        self.priorities.get(txid).copied().unwrap_or(0)
+    }
+
     pub fn transaction_order(&self) -> Vec<Txid> {
         let mut transaction_ids: Vec<Txid> = self.entries.keys().copied().collect();
-        transaction_ids.sort_by_key(ToString::to_string);
+        transaction_ids.sort_by(|left, right| {
+            self.fee_delta(right)
+                .cmp(&self.fee_delta(left))
+                .then_with(|| left.to_string().cmp(&right.to_string()))
+        });
         let mut ordered = Vec::with_capacity(transaction_ids.len());
         let mut visited = HashSet::new();
         let mut visiting = HashSet::new();
@@ -581,5 +616,36 @@ mod tests {
         assert_eq!(pool.ancestors(&grandchild_id), vec![root_id, child_id]);
         assert_eq!(pool.descendants(&root_id), vec![child_id, grandchild_id]);
         assert_eq!(pool.get_by_wtxid(&grandchild_wtxid).unwrap().added_at, 3);
+    }
+
+    #[test]
+    fn tracks_fee_delta_prioritisation_for_present_and_absent_transactions() {
+        let transaction = graph_transaction(Txid::from_byte_array([9; 32]), 9);
+        let txid = transaction.compute_txid();
+        let mut pool = Mempool::new(Network::Regtest);
+        pool.entries.insert(
+            txid,
+            MempoolEntry {
+                vsize: transaction.vsize() as u64,
+                fee_sat: 10,
+                added_at: 1,
+                transaction,
+            },
+        );
+        pool.prioritise(txid, 25);
+        assert_eq!(pool.fee_delta(&txid), 25);
+        assert_eq!(
+            pool.prioritised_transactions(),
+            vec![(txid, 25, true, Some(35))]
+        );
+
+        let absent = Txid::from_byte_array([8; 32]);
+        pool.prioritise(absent, -4);
+        assert_eq!(
+            pool.prioritised_transactions(),
+            vec![(absent, -4, false, None), (txid, 25, true, Some(35))]
+        );
+        pool.prioritise(txid, -25);
+        assert_eq!(pool.fee_delta(&txid), 0);
     }
 }

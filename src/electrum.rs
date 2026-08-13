@@ -202,6 +202,7 @@ fn dispatch(
                 .unwrap_or(Value::Null))
         }
         "blockchain.transaction.get" => transaction_get(node, params),
+        "blockchain.transaction.get_batch" => transaction_get_batch(node, params),
         "blockchain.transaction.get_merkle" => transaction_merkle(node, params),
         "blockchain.transaction.id_from_pos" => transaction_id_from_pos(node, params),
         "blockchain.transaction.broadcast" => transaction_broadcast(node, params),
@@ -323,6 +324,24 @@ fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
         return Ok(json!(chain::transaction_hex(&entry.transaction)));
     }
     bail!("transaction not found")
+}
+
+fn transaction_get_batch(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let txids = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("transaction.get_batch expects an array of txids"))?;
+    let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    txids
+        .iter()
+        .map(|txid| {
+            let txid = txid
+                .as_str()
+                .ok_or_else(|| anyhow!("transaction ids must be strings"))?;
+            transaction_get(node, &json!([txid, verbose]))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Value::Array)
 }
 
 fn electrum_transaction_json(
@@ -649,6 +668,7 @@ fn param<T: serde::de::DeserializeOwned>(params: &Value, index: usize) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Config, Node};
     use bitcoin::Network;
     use bitcoin::hashes::Hash;
 
@@ -671,6 +691,34 @@ mod tests {
         assert_eq!(
             history_status(&[(txid, 1)]),
             "549540a6810df8dc5008757fa694172b0f7a3e32facfd9f39eab228286543cde"
+        );
+    }
+
+    #[test]
+    fn transaction_get_batch_returns_each_requested_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            Node::open(Config {
+                network: Network::Regtest,
+                datadir: directory.path().to_owned(),
+                p2p_bind: "127.0.0.1:0".parse().unwrap(),
+                rpc_bind: None,
+                electrum_bind: None,
+                rest: false,
+                seed_nodes: Vec::new(),
+                signet_challenge: None,
+                max_peers: 1,
+            })
+            .unwrap(),
+        );
+        let hash = node.chain.read().best_hash();
+        let block = node.chain.write().block(&hash).unwrap().unwrap();
+        let txid = block.txdata[0].compute_txid();
+        let result = transaction_get_batch(&node, &json!([[txid.to_string()]])).unwrap();
+        assert_eq!(result.as_array().unwrap().len(), 1);
+        assert_eq!(
+            result[0].as_str().unwrap(),
+            chain::transaction_hex(&block.txdata[0])
         );
     }
 }

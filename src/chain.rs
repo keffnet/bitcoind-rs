@@ -18,8 +18,9 @@ use crate::validation::{self, ValidationError};
 
 const COINBASE_MATURITY: u32 = 100;
 const DIFFICULTY_INTERVAL: u32 = 2016;
+const SNAPSHOT_INTERVAL: u32 = 1_000;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
     pub output: TxOut,
     pub height: u32,
@@ -27,14 +28,14 @@ pub struct UtxoEntry {
     pub coinbase: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxLocation {
     pub block_hash: BlockHash,
     pub height: u32,
     pub transaction_index: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub txid: Txid,
     pub height: u32,
@@ -57,6 +58,14 @@ struct BlockNode {
 #[derive(Serialize, Deserialize)]
 struct ChainMetadata {
     active_chain: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChainSnapshot {
+    tip: String,
+    utxos: HashMap<OutPoint, UtxoEntry>,
+    tx_index: HashMap<Txid, TxLocation>,
+    history: HashMap<String, Vec<HistoryEntry>>,
 }
 
 pub struct ChainState {
@@ -127,9 +136,20 @@ impl ChainState {
             tx_index_all: HashMap::new(),
             history: HashMap::new(),
         };
-        state.initialize_genesis(&blocks[0])?;
-        for block in blocks.iter().skip(1) {
-            state.connect_block_internal(block, false)?;
+        let snapshot = state.load_snapshot(&active_chain)?;
+        if let Some(snapshot) = snapshot {
+            state.active_chain = active_chain.clone();
+            state.headers = blocks.iter().map(|block| block.header).collect();
+            state.utxos = snapshot.utxos;
+            state.tx_index = snapshot.tx_index;
+            state.tx_index_all = state.tx_index.clone();
+            state.history = snapshot.history;
+            state.index_active_headers(&blocks)?;
+        } else {
+            state.initialize_genesis(&blocks[0])?;
+            for block in blocks.iter().skip(1) {
+                state.connect_block_internal(block, false)?;
+            }
         }
         if state.active_chain != active_chain {
             bail!("chainstate metadata does not match replayed active chain");
@@ -524,6 +544,9 @@ impl ChainState {
         );
         if persist {
             self.persist_metadata()?;
+            if self.height() % SNAPSHOT_INTERVAL == 0 {
+                self.persist_snapshot()?;
+            }
         }
         Ok(())
     }
@@ -636,7 +659,8 @@ impl ChainState {
             for block in blocks.iter().skip(1) {
                 self.connect_block_internal(block, false)?;
             }
-            self.persist_metadata()
+            self.persist_metadata()?;
+            self.persist_snapshot()
         })();
         if let Err(error) = replay {
             self.active_chain = old_active_chain;
@@ -811,6 +835,66 @@ impl ChainState {
         fs::rename(temp, path)?;
         Ok(())
     }
+
+    fn load_snapshot(&self, active_chain: &[BlockHash]) -> Result<Option<ChainSnapshot>> {
+        let path = self.data_dir.join("chainstate.snapshot");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?;
+        let Ok(snapshot) = serde_json::from_slice::<ChainSnapshot>(&bytes) else {
+            return Ok(None);
+        };
+        let Some(tip) = active_chain.last() else {
+            return Ok(None);
+        };
+        if snapshot.tip != tip.to_string() {
+            return Ok(None);
+        }
+        Ok(Some(snapshot))
+    }
+
+    fn persist_snapshot(&self) -> Result<()> {
+        let snapshot = ChainSnapshot {
+            tip: self.best_hash().to_string(),
+            utxos: self.utxos.clone(),
+            tx_index: self.tx_index.clone(),
+            history: self.history.clone(),
+        };
+        let bytes = serde_json::to_vec(&snapshot)?;
+        let path = self.data_dir.join("chainstate.snapshot");
+        let temp = self.data_dir.join("chainstate.snapshot.tmp");
+        fs::write(&temp, bytes)?;
+        fs::rename(temp, path)?;
+        Ok(())
+    }
+
+    fn index_active_headers(&mut self, blocks: &[Block]) -> Result<()> {
+        if blocks.len() != self.active_chain.len() {
+            bail!("active block/header count mismatch");
+        }
+        for (height, block) in blocks.iter().enumerate() {
+            let hash = block.block_hash();
+            let chain_work = if height == 0 {
+                block.header.work()
+            } else {
+                self.block_index
+                    .get(&block.header.prev_blockhash)
+                    .context("active block parent is not indexed")?
+                    .chain_work
+                    + block.header.work()
+            };
+            self.block_index.insert(
+                hash,
+                BlockNode {
+                    header: block.header,
+                    height: height as u32,
+                    chain_work,
+                },
+            );
+        }
+        Ok(())
+    }
 }
 
 pub fn electrum_script_hash(script: &Script) -> String {
@@ -856,10 +940,12 @@ mod tests {
         state.connect_block(second).unwrap();
         assert_eq!(state.height(), 2);
         assert_eq!(state.best_hash(), state.block_hash(2).unwrap());
+        state.persist_snapshot().unwrap();
         drop(state);
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.height(), 2);
         assert_eq!(reopened.block_hash(1), Some(first_hash));
+        assert_eq!(reopened.utxos.len(), 3);
     }
 
     fn mine_block(state: &ChainState, height: u32) -> Block {

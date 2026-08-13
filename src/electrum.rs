@@ -292,6 +292,14 @@ fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
         return Ok(json!(chain::transaction_hex(&transaction)));
     }
     if let Some(entry) = node.mempool.read().get(&txid) {
+        if verbose {
+            return Ok(electrum_transaction_json(
+                &entry.transaction,
+                None,
+                None,
+                None,
+            ));
+        }
         return Ok(json!(chain::transaction_hex(&entry.transaction)));
     }
     bail!("transaction not found")

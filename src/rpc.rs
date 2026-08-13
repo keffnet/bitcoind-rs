@@ -6,9 +6,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
+use bitcoin::absolute::LockTime;
+use bitcoin::block::{Header, Version as BlockVersion};
+use bitcoin::blockdata::script::Builder;
+use bitcoin::blockdata::transaction::{TxIn, Version};
+use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
-use bitcoin::{BlockHash, Network, OutPoint, Transaction, TxOut, Txid};
+use bitcoin::{
+    Address, Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
+};
+use rand::random;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -526,6 +534,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "submitblock" => submit_block(node, params),
         "getblocktemplate" => get_block_template(node),
         "getmininginfo" => get_mining_info(node),
+        "generatetoaddress" => generate_to_address(node, params),
         "testmempoolaccept" => test_mempool_accept(node, params),
         "verifychain" => {
             let depth = params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -1710,6 +1719,211 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
 }
 
+fn generate_to_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let count = param::<i64>(params, 0)?;
+    if count < 0 {
+        bail!("nblocks must not be negative");
+    }
+    let address = param::<String>(params, 1)?
+        .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
+        .require_network(node.config.network)?;
+    let max_tries = params
+        .get(2)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_i64)
+        .unwrap_or(1_000_000);
+    if max_tries < 0 {
+        bail!("maxtries must not be negative");
+    }
+    let max_tries = u64::try_from(max_tries).map_err(|_| anyhow!("maxtries is out of range"))?;
+    let mut hashes = Vec::with_capacity(usize::try_from(count).unwrap_or_default());
+    for _ in 0..count {
+        let block = build_mining_block(node, address.script_pubkey())?;
+        let Some(block) = mine_block(block, max_tries) else {
+            break;
+        };
+        let hash = block.block_hash();
+        node.connect_block(block)?;
+        hashes.push(hash.to_string());
+    }
+    Ok(json!(hashes))
+}
+
+fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Block> {
+    let chain = node.chain.read();
+    let tip = chain.tip();
+    let parent = chain
+        .header(tip.height)
+        .copied()
+        .ok_or_else(|| anyhow!("active tip header is unavailable"))?;
+    let height = tip.height.saturating_add(1);
+    let now = u32::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(u32::MAX);
+    let time = now
+        .max(parent.time.saturating_add(1))
+        .max(chain.median_time_past_value().saturating_add(1));
+    let bits = chain.next_bits(time);
+    let network = chain.network;
+    let mempool = node.mempool.read();
+    let mut transactions = Vec::new();
+    let mut fees = 0u64;
+    let mut transaction_weight = 0u64;
+    for txid in mempool.transaction_order() {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        let next_weight = transaction_weight.saturating_add(entry.transaction.weight().to_wu());
+        if next_weight.saturating_add(2_000) > 4_000_000 {
+            break;
+        }
+        transaction_weight = next_weight;
+        fees = fees.saturating_add(entry.fee_sat);
+        transactions.push(entry.transaction.clone());
+    }
+    drop(mempool);
+    drop(chain);
+
+    let mut block = mining_block(MiningBlockTemplate {
+        network,
+        parent,
+        height,
+        time,
+        bits,
+        script_pubkey,
+        transactions,
+        fees,
+        extra_nonce: random(),
+    })?;
+    while block.weight().to_wu() > 4_000_000 {
+        if block.txdata.len() <= 1 {
+            bail!("coinbase transaction exceeds the block weight limit");
+        }
+        block.txdata.pop();
+        let mempool = node.mempool.read();
+        let fee = block
+            .txdata
+            .iter()
+            .skip(1)
+            .filter_map(|transaction| mempool.get(&transaction.compute_txid()))
+            .map(|entry| entry.fee_sat)
+            .sum();
+        drop(mempool);
+        block = mining_block(MiningBlockTemplate {
+            network,
+            parent,
+            height,
+            time,
+            bits,
+            script_pubkey: block.txdata[0].output[0].script_pubkey.clone(),
+            transactions: block.txdata.into_iter().skip(1).collect(),
+            fees: fee,
+            extra_nonce: random(),
+        })?;
+    }
+    Ok(block)
+}
+
+struct MiningBlockTemplate {
+    network: Network,
+    parent: Header,
+    height: u32,
+    time: u32,
+    bits: u32,
+    script_pubkey: ScriptBuf,
+    transactions: Vec<Transaction>,
+    fees: u64,
+    extra_nonce: u32,
+}
+
+fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
+    let MiningBlockTemplate {
+        network,
+        parent,
+        height,
+        time,
+        bits,
+        script_pubkey,
+        transactions,
+        fees,
+        extra_nonce,
+    } = template;
+    let mut coinbase = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: Builder::new()
+                .push_int(i64::from(height))
+                .push_slice(extra_nonce.to_le_bytes())
+                .into_script(),
+            sequence: bitcoin::Sequence::MAX,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(
+                validation::block_subsidy_for_network(network, height).saturating_add(fees),
+            ),
+            script_pubkey,
+        }],
+    };
+    let has_witness = transactions.iter().any(|transaction| {
+        transaction
+            .input
+            .iter()
+            .any(|input| !input.witness.is_empty())
+    });
+    if has_witness {
+        coinbase.input[0].witness = Witness::from_slice(&[vec![0u8; 32]]);
+    }
+    let mut block = Block {
+        header: Header {
+            version: BlockVersion::from_consensus(0x2000_0000),
+            prev_blockhash: parent.block_hash(),
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time,
+            bits: bitcoin::pow::CompactTarget::from_consensus(bits),
+            nonce: 0,
+        },
+        txdata: std::iter::once(coinbase).chain(transactions).collect(),
+    };
+    if has_witness {
+        let witness_root = block
+            .witness_root()
+            .ok_or_else(|| anyhow!("cannot calculate witness merkle root"))?;
+        let commitment = Block::compute_witness_commitment(&witness_root, &[0u8; 32]);
+        let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        script.extend_from_slice(&commitment.to_byte_array());
+        block.txdata[0].output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(script),
+        });
+    }
+    block.header.merkle_root = block
+        .compute_merkle_root()
+        .ok_or_else(|| anyhow!("cannot calculate transaction merkle root"))?;
+    Ok(block)
+}
+
+fn mine_block(mut block: Block, max_tries: u64) -> Option<Block> {
+    let mut tries = 0u64;
+    while tries < max_tries {
+        if block.header.target().is_met_by(block.block_hash()) {
+            return Some(block);
+        }
+        if block.header.nonce == u32::MAX {
+            return None;
+        }
+        block.header.nonce = block.header.nonce.saturating_add(1);
+        tries = tries.saturating_add(1);
+    }
+    None
+}
+
 fn get_block_template(node: &Arc<Node>) -> Result<Value> {
     let chain = node.chain.read();
     let tip = chain.tip();
@@ -2152,6 +2366,7 @@ fn rpc_help(method: &str) -> String {
         "submitblock",
         "getblocktemplate",
         "getmininginfo",
+        "generatetoaddress",
         "testmempoolaccept",
         "verifychain",
         "gettxout",
@@ -2403,5 +2618,35 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn generate_to_address_mines_and_connects_a_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+
+        let result = generate_to_address(
+            &node,
+            &json!([1, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"]),
+        )
+        .unwrap();
+        let hash = result[0].as_str().unwrap().parse::<BlockHash>().unwrap();
+        let mut chain = node.chain.write();
+        assert_eq!(chain.tip().height, 1);
+        assert_eq!(chain.best_hash(), hash);
+        let block = chain.block(&hash).unwrap().unwrap();
+        assert_eq!(block.txdata.len(), 1);
+        assert_eq!(block.txdata[0].output[0].value.to_sat(), 5_000_000_000);
     }
 }

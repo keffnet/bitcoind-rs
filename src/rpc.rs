@@ -22,7 +22,8 @@ use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::sign_message::{MessageSignature, signed_msg_hash};
 use bitcoin::{
-    Address, Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
+    Address, Amount, Block, BlockHash, Denomination, Network, OutPoint, ScriptBuf, Transaction,
+    TxOut, Txid,
 };
 use rand::random;
 use serde_json::{Value, json};
@@ -3384,7 +3385,24 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .transpose()?
         .unwrap_or(LockTime::ZERO);
-    let replaceable = params.get(3).and_then(Value::as_bool).unwrap_or(false);
+    let replaceable = params.get(3).and_then(Value::as_bool).unwrap_or(true);
+    let version = params
+        .get(4)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_i64)
+        .map(|version| {
+            i32::try_from(version).map_err(|_| anyhow!("transaction version is out of range"))
+        })
+        .transpose()?
+        .map(Version::non_standard)
+        .unwrap_or(Version::TWO);
+    let default_sequence = if replaceable {
+        0xffff_fffd
+    } else if lock_time != LockTime::ZERO {
+        0xffff_fffe
+    } else {
+        u32::MAX
+    };
     let transaction_inputs = inputs
         .iter()
         .map(|value| {
@@ -3408,7 +3426,7 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .map_err(|_| anyhow!("transaction input sequence is out of range"))
                 })
                 .transpose()?
-                .unwrap_or(if replaceable { 0xffff_fffd } else { u32::MAX });
+                .unwrap_or(default_sequence);
             Ok(TxIn {
                 previous_output: OutPoint::new(txid, vout),
                 script_sig: ScriptBuf::new(),
@@ -3419,7 +3437,7 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .collect::<Result<Vec<_>>>()?;
     let transaction_outputs = create_transaction_outputs(node, outputs)?;
     let transaction = Transaction {
-        version: Version::TWO,
+        version,
         lock_time,
         input: transaction_inputs,
         output: transaction_outputs,
@@ -3467,10 +3485,7 @@ fn create_transaction_outputs(node: &Arc<Node>, outputs: &Value) -> Result<Vec<T
             let address = destination
                 .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
                 .require_network(node.config.network)?;
-            let amount = value
-                .as_f64()
-                .ok_or_else(|| anyhow!("transaction output amount must be numeric"))?;
-            let amount = Amount::from_btc(amount)?;
+            let amount = parse_btc_amount(value, "transaction output amount")?;
             if amount > Amount::MAX_MONEY {
                 bail!("transaction output amount exceeds MAX_MONEY")
             }
@@ -3480,6 +3495,74 @@ fn create_transaction_outputs(node: &Arc<Node>, outputs: &Value) -> Result<Vec<T
             })
         })
         .collect()
+}
+
+fn parse_btc_amount(value: &Value, field: &str) -> Result<Amount> {
+    let text = match value {
+        Value::Number(number) => number.to_string(),
+        Value::String(string) => string.clone(),
+        _ => bail!("{field} must be a number or string"),
+    };
+    let text =
+        expand_decimal_exponent(&text).map_err(|error| anyhow!("invalid {field}: {error}"))?;
+    Amount::from_str_in(&text, Denomination::Bitcoin)
+        .map_err(|error| anyhow!("invalid {field}: {error}"))
+}
+
+fn expand_decimal_exponent(value: &str) -> Result<String> {
+    if value.len() > 64 {
+        bail!("amount is out of range")
+    }
+    let Some(exponent_offset) = value.find(['e', 'E']) else {
+        return Ok(value.to_owned());
+    };
+    let (mantissa, exponent) = value.split_at(exponent_offset);
+    let exponent = exponent[1..]
+        .parse::<i64>()
+        .map_err(|_| anyhow!("invalid exponent"))?;
+    let (negative, mantissa) = mantissa
+        .strip_prefix('-')
+        .map_or((false, mantissa), |mantissa| (true, mantissa));
+    let (whole, fraction) = mantissa
+        .split_once('.')
+        .map_or((mantissa, ""), |(whole, fraction)| (whole, fraction));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || (mantissa.contains('.') && fraction.is_empty())
+    {
+        bail!("invalid decimal number")
+    }
+    let digits = format!("{whole}{fraction}");
+    let decimal_position = i64::try_from(whole.len())
+        .ok()
+        .and_then(|position| position.checked_add(exponent))
+        .ok_or_else(|| anyhow!("exponent is out of range"))?;
+    let expanded = if decimal_position <= 0 {
+        let leading_zeroes = usize::try_from(decimal_position.unsigned_abs())
+            .map_err(|_| anyhow!("exponent is out of range"))?;
+        if leading_zeroes > 64 {
+            bail!("amount is out of range")
+        }
+        format!("0.{}{}", "0".repeat(leading_zeroes), digits)
+    } else if decimal_position >= i64::try_from(digits.len()).unwrap_or(i64::MAX) {
+        let trailing_zeroes =
+            usize::try_from(decimal_position - i64::try_from(digits.len()).unwrap_or(i64::MAX))
+                .map_err(|_| anyhow!("exponent is out of range"))?;
+        if trailing_zeroes > 64 {
+            bail!("amount is out of range")
+        }
+        format!("{}{}", digits, "0".repeat(trailing_zeroes))
+    } else {
+        let split =
+            usize::try_from(decimal_position).map_err(|_| anyhow!("exponent is out of range"))?;
+        format!("{}.{}", &digits[..split], &digits[split..])
+    };
+    Ok(if negative {
+        format!("-{expanded}")
+    } else {
+        expanded
+    })
 }
 
 fn decode_script(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -4899,17 +4982,12 @@ fn parse_max_fee_rate(value: Option<&Value>) -> Result<Option<f64>> {
 }
 
 fn parse_max_burn_amount(value: Option<&Value>) -> Result<u64> {
-    let max_burn = value
+    Ok(value
         .filter(|value| !value.is_null())
-        .map_or(Ok(0.0), |value| {
-            value
-                .as_f64()
-                .ok_or_else(|| anyhow!("maxburnamount must be a number"))
-        })?;
-    if !max_burn.is_finite() || max_burn < 0.0 {
-        bail!("maxburnamount must be a non-negative amount")
-    }
-    Ok(Amount::from_btc(max_burn)?.to_sat())
+        .map(|value| parse_btc_amount(value, "maxburnamount"))
+        .transpose()?
+        .unwrap_or(Amount::ZERO)
+        .to_sat())
 }
 
 fn validate_burn_amount(transaction: &Transaction, max_burn_amount: u64) -> Result<()> {
@@ -7278,6 +7356,10 @@ mod tests {
         assert!(parse_max_fee_rate(Some(&json!(1.1))).is_err());
         assert_eq!(parse_max_burn_amount(None).unwrap(), 0);
         assert_eq!(parse_max_burn_amount(Some(&json!(0.00000001))).unwrap(), 1);
+        assert_eq!(
+            parse_max_burn_amount(Some(&json!("0.00000001"))).unwrap(),
+            1
+        );
 
         let mut transaction = proof_transaction(8);
         transaction.output.push(TxOut {
@@ -8289,17 +8371,18 @@ mod tests {
                     "vout": 1,
                 }],
                 {
-                    "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl": 0.25,
+                    "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl": "0.25",
                     "data": "deadbeef",
                 },
                 42,
                 true,
+                3,
             ]),
         )
         .unwrap();
         let transaction: Transaction =
             deserialize(&hex::decode(raw.as_str().expect("raw transaction hex")).unwrap()).unwrap();
-        assert_eq!(transaction.version, Version::TWO);
+        assert_eq!(transaction.version, Version::non_standard(3));
         assert_eq!(transaction.lock_time, LockTime::from_consensus(42));
         assert_eq!(
             transaction.input[0].sequence.to_consensus_u32(),
@@ -8316,6 +8399,27 @@ mod tests {
         assert_eq!(
             decoded["addresses"][0],
             "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
+        );
+
+        let default_raw = create_raw_transaction(
+            &node,
+            &json!([
+                [{
+                    "txid": Txid::from_byte_array([7; 32]).to_string(),
+                    "vout": 1,
+                }],
+                {"data": "00"},
+            ]),
+        )
+        .unwrap();
+        let default_transaction: Transaction = deserialize(
+            &hex::decode(default_raw.as_str().expect("default raw transaction hex")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(default_transaction.version, Version::TWO);
+        assert_eq!(
+            default_transaction.input[0].sequence.to_consensus_u32(),
+            0xffff_fffd
         );
         assert_eq!(parse_transaction_verbosity(Some(&json!(1))).unwrap(), 1);
         assert_eq!(parse_transaction_verbosity(Some(&json!(true))).unwrap(), 1);

@@ -219,10 +219,11 @@ fn dispatch_rest_with_body(
         "mempool/contents" if format == "json" => {
             let verbose = rest_query_bool(query, "verbose", true)?;
             let sequence = rest_query_bool(query, "mempool_sequence", false)?;
-            if sequence {
-                bail!("mempool sequence values are not available")
-            }
-            rest_json(dispatch_method(node, "getrawmempool", &json!([verbose]))?)
+            rest_json(dispatch_method(
+                node,
+                "getrawmempool",
+                &json!([verbose, sequence]),
+            )?)
         }
         route if route.starts_with("blockhashbyheight/") => {
             rest_blockhash_by_height(node, route, format)
@@ -949,6 +950,10 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         }
         "getrawmempool" => {
             let verbose = params.get(0).and_then(Value::as_bool).unwrap_or(false);
+            let include_sequence = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+            if verbose && include_sequence {
+                bail!("Verbose results cannot contain mempool sequence values.")
+            }
             let height = node.chain.read().height();
             let mempool = node.mempool.read();
             let order = mempool.transaction_order();
@@ -967,12 +972,18 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                         .collect(),
                 ))
             } else {
-                Ok(json!(
-                    order
-                        .into_iter()
-                        .map(|txid| txid.to_string())
-                        .collect::<Vec<_>>()
-                ))
+                let txids = order
+                    .into_iter()
+                    .map(|txid| txid.to_string())
+                    .collect::<Vec<_>>();
+                if include_sequence {
+                    Ok(json!({
+                        "txids": txids,
+                        "mempool_sequence": mempool.sequence(),
+                    }))
+                } else {
+                    Ok(json!(txids))
+                }
             }
         }
         "getmempoolentry" => {
@@ -1463,6 +1474,9 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let tip = chain.tip();
     let header_tip = chain.best_header_tip();
     let header = chain.header(tip.height).expect("tip header exists");
+    let headers = chain
+        .headers_to_hash(&tip.hash)
+        .expect("active tip header chain exists");
     let mut result = json!({
         "chain": network_name(chain.network),
         "blocks": tip.height,
@@ -1478,12 +1492,48 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "initialblockdownload": tip.height < header_tip.height,
         "pruned": false,
         "size_on_disk": std::fs::metadata(chain.store.path()).map(|m| m.len()).unwrap_or(0),
+        "softforks": softforks_json(&headers, tip.height, chain.network),
         "warnings": [],
     });
     if let Some(challenge) = chain.signet_challenge() {
         result["signet_challenge"] = json!(hex::encode(challenge));
     }
     Ok(result)
+}
+
+fn softforks_json(
+    headers: &[bitcoin::block::Header],
+    selected_height: u32,
+    network: Network,
+) -> Value {
+    let heights = validation::buried_deployment_heights(network);
+    let mut softforks = serde_json::Map::new();
+    for (name, activation_height) in [
+        ("bip34", heights.bip34),
+        ("bip66", heights.bip66),
+        ("bip65", heights.bip65),
+        ("csv", heights.csv),
+        ("segwit", heights.segwit),
+    ] {
+        softforks.insert(
+            name.to_owned(),
+            json!({
+                "type": "buried",
+                "active": selected_height >= activation_height,
+                "height": activation_height,
+            }),
+        );
+    }
+    let [testdummy, taproot] = validation::bip9_deployments(network);
+    softforks.insert(
+        "testdummy".to_owned(),
+        bip9_deployment_json(headers, selected_height, testdummy),
+    );
+    softforks.insert(
+        "taproot".to_owned(),
+        bip9_deployment_json(headers, selected_height, taproot),
+    );
+    Value::Object(softforks)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5955,6 +6005,34 @@ mod tests {
     }
 
     #[test]
+    fn blockchain_info_reports_softforks() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+
+        let info = get_blockchain_info(&node).unwrap();
+        assert_eq!(info["softforks"]["bip34"]["type"], json!("buried"));
+        assert_eq!(info["softforks"]["bip34"]["height"], json!(1));
+        assert_eq!(info["softforks"]["bip34"]["active"], json!(false));
+        assert_eq!(info["softforks"]["segwit"]["active"], json!(true));
+        assert_eq!(
+            info["softforks"]["testdummy"]["bip9"]["status"],
+            json!("defined")
+        );
+        assert_eq!(info["softforks"]["taproot"]["active"], json!(true));
+    }
+
+    #[test]
     fn block_filter_rpc_returns_the_basic_filter_and_header() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
@@ -6074,6 +6152,44 @@ mod tests {
         let (_, spent_hex) =
             dispatch_rest(&node, &format!("/rest/spenttxouts/{genesis_hash}.hex")).unwrap();
         assert_eq!(std::str::from_utf8(&spent_hex).unwrap(), "0100\n");
+    }
+
+    #[test]
+    fn mempool_sequence_is_available_for_non_verbose_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: true,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+
+        let result = dispatch_method(&node, "getrawmempool", &json!([false, true])).unwrap();
+        assert_eq!(result["txids"], json!([]));
+        assert_eq!(result["mempool_sequence"], json!(0));
+        assert!(dispatch_method(&node, "getrawmempool", &json!([true, true])).is_err());
+
+        let (_, body) = dispatch_rest(
+            &node,
+            "/rest/mempool/contents.json?verbose=false&mempool_sequence=true",
+        )
+        .unwrap();
+        let result = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(result["txids"], json!([]));
+        assert_eq!(result["mempool_sequence"], json!(0));
+        assert!(
+            dispatch_rest(
+                &node,
+                "/rest/mempool/contents.json?verbose=true&mempool_sequence=true"
+            )
+            .is_err()
+        );
     }
 
     #[test]

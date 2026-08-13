@@ -35,6 +35,7 @@ pub struct Mempool {
     pub network: Network,
     max_bytes: usize,
     bytes: usize,
+    sequence: u64,
     entries: HashMap<Txid, MempoolEntry>,
     spent: HashMap<OutPoint, Txid>,
     children: HashMap<Txid, HashSet<Txid>>,
@@ -80,6 +81,7 @@ impl Mempool {
             network,
             max_bytes: DEFAULT_MAX_MEMPOOL_BYTES,
             bytes: 0,
+            sequence: 0,
             entries: HashMap::new(),
             spent: HashMap::new(),
             children: HashMap::new(),
@@ -102,6 +104,10 @@ impl Mempool {
 
     pub fn max_bytes(&self) -> usize {
         self.max_bytes
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     pub fn get(&self, txid: &Txid) -> Option<&MempoolEntry> {
@@ -521,6 +527,7 @@ impl Mempool {
         self.bytes += size;
         self.entries.insert(txid, entry);
         self.wtxids.insert(wtxid, txid);
+        self.sequence = self.sequence.saturating_add(1);
         Ok(txid)
     }
 
@@ -576,6 +583,9 @@ impl Mempool {
         for txid in transaction_ids {
             visit(txid, &entries, &mut visited, &mut visiting, &mut ordered);
         }
+        self.sequence = self
+            .sequence
+            .saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX));
         self.entries.clear();
         self.spent.clear();
         self.children.clear();
@@ -601,6 +611,7 @@ impl Mempool {
             }
         }
         self.children.remove(txid);
+        self.sequence = self.sequence.saturating_add(1);
         Some(entry)
     }
 

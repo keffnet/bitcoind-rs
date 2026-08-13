@@ -17,6 +17,7 @@ use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::ecdsa::Signature as EcdsaSignature;
 use bitcoin::hashes::Hash;
+use bitcoin::psbt::{Input as PsbtInput, Psbt};
 use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{
@@ -882,6 +883,13 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "decoderawtransaction" => decode_raw_transaction(params),
         "createrawtransaction" => create_raw_transaction(node, params),
         "decodescript" => decode_script(node, params),
+        "createpsbt" => create_psbt(node, params),
+        "decodepsbt" => decode_psbt(node, params),
+        "converttopsbt" => convert_to_psbt(params),
+        "analyzepsbt" => analyze_psbt(params),
+        "combinepsbt" => combine_psbt(params),
+        "finalizepsbt" => finalize_psbt(params),
+        "utxoupdatepsbt" => update_psbt_utxos(node, params),
         "sendrawtransaction" => send_raw_transaction(node, params),
         "signrawtransactionwithkey" => sign_raw_transaction_with_key(node, params),
         "submitblock" => submit_block(node, params),
@@ -2939,6 +2947,478 @@ fn decode_script(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(result)
 }
 
+fn parse_psbt(params: &Value, index: usize) -> Result<Psbt> {
+    let encoded = param::<String>(params, index)?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    Ok(Psbt::deserialize(&bytes)?)
+}
+
+fn encode_psbt(psbt: &Psbt) -> String {
+    base64::engine::general_purpose::STANDARD.encode(psbt.serialize())
+}
+
+fn create_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let raw = create_raw_transaction(node, params)?;
+    let transaction: Transaction =
+        deserialize(&hex::decode(raw.as_str().ok_or_else(|| {
+            anyhow!("createrawtransaction did not return hexadecimal data")
+        })?)?)?;
+    Ok(json!(encode_psbt(&Psbt::from_unsigned_tx(transaction)?)))
+}
+
+fn convert_to_psbt(params: &Value) -> Result<Value> {
+    let bytes = hex::decode(param::<String>(params, 0)?)?;
+    let transaction: Transaction = deserialize(&bytes)?;
+    let permitsigdata = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let has_signature_data = transaction
+        .input
+        .iter()
+        .any(|input| !input.script_sig.is_empty() || !input.witness.is_empty());
+    if has_signature_data && !permitsigdata {
+        bail!("transaction contains signature data; set permitsigdata to true")
+    }
+    let mut unsigned = transaction.clone();
+    for input in &mut unsigned.input {
+        input.script_sig = ScriptBuf::new();
+        input.witness = Witness::default();
+    }
+    let mut psbt = Psbt::from_unsigned_tx(unsigned)?;
+    if permitsigdata {
+        for (index, input) in transaction.input.iter().enumerate() {
+            if !input.script_sig.is_empty() {
+                psbt.inputs[index].final_script_sig = Some(input.script_sig.clone());
+            }
+            if !input.witness.is_empty() {
+                psbt.inputs[index].final_script_witness = Some(input.witness.clone());
+            }
+        }
+    }
+    Ok(json!(encode_psbt(&psbt)))
+}
+
+fn psbt_script_json(node: &Arc<Node>, script: &bitcoin::Script) -> Value {
+    decode_script(node, &json!([hex::encode(script.as_bytes())]))
+        .unwrap_or_else(|_| script_json(script))
+}
+
+fn psbt_unknown_json(
+    values: &std::collections::BTreeMap<bitcoin::psbt::raw::Key, Vec<u8>>,
+) -> Value {
+    Value::Object(
+        values
+            .iter()
+            .map(|(key, value)| {
+                (
+                    format!("{:02x}{}", key.type_value, hex::encode(&key.key)),
+                    json!(hex::encode(value)),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn psbt_proprietary_json(
+    values: &std::collections::BTreeMap<bitcoin::psbt::raw::ProprietaryKey, Vec<u8>>,
+) -> Value {
+    Value::Object(
+        values
+            .iter()
+            .map(|(key, value)| {
+                (
+                    format!(
+                        "{}:{:02x}:{}",
+                        hex::encode(&key.prefix),
+                        key.subtype,
+                        hex::encode(&key.key)
+                    ),
+                    json!(hex::encode(value)),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn decode_psbt_input(node: &Arc<Node>, input: &PsbtInput) -> Value {
+    let mut result = json!({});
+    if let Some(transaction) = &input.non_witness_utxo {
+        result["non_witness_utxo"] = json!(hex::encode(serialize(transaction)));
+    }
+    if let Some(output) = &input.witness_utxo {
+        result["witness_utxo"] = json!({
+            "amount": sat_to_btc(output.value.to_sat()),
+            "scriptPubKey": psbt_script_json(node, &output.script_pubkey),
+        });
+    }
+    if !input.partial_sigs.is_empty() {
+        result["partial_signatures"] = Value::Object(
+            input
+                .partial_sigs
+                .iter()
+                .map(|(public_key, signature)| {
+                    (
+                        public_key.to_string(),
+                        json!(hex::encode(signature.to_vec())),
+                    )
+                })
+                .collect(),
+        );
+    }
+    if let Some(sighash_type) = input.sighash_type {
+        result["sighash"] = json!(sighash_type.to_string());
+    }
+    if let Some(script) = &input.redeem_script {
+        result["redeem_script"] = psbt_script_json(node, script.as_script());
+    }
+    if let Some(script) = &input.witness_script {
+        result["witness_script"] = psbt_script_json(node, script.as_script());
+    }
+    if !input.bip32_derivation.is_empty() {
+        result["bip32_derivs"] = json!(
+            input
+                .bip32_derivation
+                .iter()
+                .map(|(public_key, source)| {
+                    json!({
+                        "pubkey": public_key.to_string(),
+                        "master_fingerprint": source.0.to_string(),
+                        "path": format!("m/{}", source.1),
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    if let Some(script) = &input.final_script_sig {
+        result["final_scriptSig"] = json!(hex::encode(script.as_bytes()));
+    }
+    if let Some(witness) = &input.final_script_witness {
+        result["final_scriptWitness"] = json!(hex::encode(serialize(witness)));
+    }
+    if let Some(signature) = &input.tap_key_sig {
+        result["tap_key_sig"] = json!(hex::encode(signature.to_vec()));
+    }
+    if input.tap_internal_key.is_some() {
+        result["tap_internal_key"] = json!(input.tap_internal_key.map(|key| key.to_string()));
+    }
+    if input.tap_merkle_root.is_some() {
+        result["tap_merkle_root"] = json!(input.tap_merkle_root.map(|root| root.to_string()));
+    }
+    result["proprietary"] = psbt_proprietary_json(&input.proprietary);
+    result["unknown"] = psbt_unknown_json(&input.unknown);
+    result
+}
+
+fn decode_psbt_output(output: &bitcoin::psbt::Output) -> Value {
+    let mut result = json!({});
+    if let Some(script) = &output.redeem_script {
+        result["redeem_script"] = json!(hex::encode(script.as_bytes()));
+    }
+    if let Some(script) = &output.witness_script {
+        result["witness_script"] = json!(hex::encode(script.as_bytes()));
+    }
+    if !output.bip32_derivation.is_empty() {
+        result["bip32_derivs"] = json!(
+            output
+                .bip32_derivation
+                .iter()
+                .map(|(public_key, source)| {
+                    json!({
+                        "pubkey": public_key.to_string(),
+                        "master_fingerprint": source.0.to_string(),
+                        "path": format!("m/{}", source.1),
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    if output.tap_internal_key.is_some() {
+        result["tap_internal_key"] = json!(output.tap_internal_key.map(|key| key.to_string()));
+    }
+    result["proprietary"] = psbt_proprietary_json(&output.proprietary);
+    result["unknown"] = psbt_unknown_json(&output.unknown);
+    result
+}
+
+fn decode_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let psbt = parse_psbt(params, 0)?;
+    Ok(json!({
+        "tx": rpc_transaction(&psbt.unsigned_tx, None, None, None, None),
+        "global_xpub": psbt.xpub.iter().map(|(xpub, source)| json!({
+            "xpub": xpub.to_string(),
+            "master_fingerprint": source.0.to_string(),
+            "path": format!("m/{}", source.1),
+        })).collect::<Vec<_>>(),
+        "psbt_version": psbt.version,
+        "proprietary": psbt_proprietary_json(&psbt.proprietary),
+        "unknown": psbt_unknown_json(&psbt.unknown),
+        "inputs": psbt.inputs.iter().map(|input| decode_psbt_input(node, input)).collect::<Vec<_>>(),
+        "outputs": psbt.outputs.iter().map(decode_psbt_output).collect::<Vec<_>>(),
+    }))
+}
+
+fn combine_psbt(params: &Value) -> Result<Value> {
+    let values = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("combinepsbt expects an array of PSBTs"))?;
+    let mut iter = values.iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| anyhow!("combinepsbt requires at least one PSBT"))?;
+    let first = first
+        .as_str()
+        .ok_or_else(|| anyhow!("PSBT values must be base64 strings"))?;
+    let mut combined =
+        Psbt::deserialize(&base64::engine::general_purpose::STANDARD.decode(first)?)?;
+    for value in iter {
+        let encoded = value
+            .as_str()
+            .ok_or_else(|| anyhow!("PSBT values must be base64 strings"))?;
+        let other = Psbt::deserialize(&base64::engine::general_purpose::STANDARD.decode(encoded)?)?;
+        combined.combine(other)?;
+    }
+    Ok(json!(encode_psbt(&combined)))
+}
+
+fn analyze_psbt(params: &Value) -> Result<Value> {
+    let psbt = parse_psbt(params, 0)?;
+    let mut all_final = true;
+    let mut missing_utxo = false;
+    let inputs = psbt
+        .inputs
+        .iter()
+        .map(|input| {
+            let has_utxo = input.witness_utxo.is_some() || input.non_witness_utxo.is_some();
+            let is_final = input.final_script_sig.is_some() || input.final_script_witness.is_some();
+            all_final &= is_final;
+            missing_utxo |= !has_utxo;
+            json!({
+                "has_utxo": has_utxo,
+                "is_final": is_final,
+                "next": if !has_utxo { "updater" } else if !is_final && input.partial_sigs.is_empty() { "signer" } else if !is_final { "finalizer" } else { "extractor" },
+            })
+        })
+        .collect::<Vec<_>>();
+    let estimated_vsize = if all_final {
+        psbt.clone().extract_tx_unchecked_fee_rate().vsize()
+    } else {
+        psbt.unsigned_tx.vsize()
+    };
+    let mut result = json!({
+        "inputs": inputs,
+        "estimated_vsize": estimated_vsize,
+        "next": if missing_utxo { "updater" } else if !all_final { "signer" } else { "extractor" },
+    });
+    if let Ok(fee) = psbt.fee() {
+        result["fee"] = json!(sat_to_btc(fee.to_sat()));
+        if estimated_vsize > 0 {
+            result["estimated_feerate"] = json!(sat_to_btc(
+                fee.to_sat().saturating_mul(1000) / estimated_vsize as u64
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn psbt_prevout(psbt: &Psbt, input_index: usize) -> Option<TxOut> {
+    let input = psbt.inputs.get(input_index)?;
+    if let Some(output) = &input.witness_utxo {
+        return Some(output.clone());
+    }
+    let transaction_input = psbt.unsigned_tx.input.get(input_index)?;
+    input
+        .non_witness_utxo
+        .as_ref()?
+        .output
+        .get(transaction_input.previous_output.vout as usize)
+        .cloned()
+}
+
+fn push_script_items(items: &[Vec<u8>]) -> Result<ScriptBuf> {
+    let mut builder = Builder::new();
+    for item in items {
+        let item = PushBytesBuf::try_from(item.clone())
+            .map_err(|_| anyhow!("script item is too large"))?;
+        builder = builder.push_slice(item);
+    }
+    Ok(builder.into_script())
+}
+
+fn public_key_matches_script(public_key: &bitcoin::PublicKey, script: &bitcoin::Script) -> bool {
+    if script.is_p2pkh() {
+        Address::p2pkh(*public_key, Network::Bitcoin)
+            .script_pubkey()
+            .as_script()
+            == script
+            || Address::p2pkh(*public_key, Network::Testnet)
+                .script_pubkey()
+                .as_script()
+                == script
+    } else if script.is_p2wpkh() {
+        bitcoin::CompressedPublicKey::try_from(*public_key).is_ok_and(|public_key| {
+            Address::p2wpkh(&public_key, Network::Bitcoin)
+                .script_pubkey()
+                .as_script()
+                == script
+                || Address::p2wpkh(&public_key, Network::Testnet)
+                    .script_pubkey()
+                    .as_script()
+                    == script
+        })
+    } else if script.is_p2pk() {
+        Builder::new()
+            .push_key(public_key)
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKSIG)
+            .into_script()
+            .as_script()
+            == script
+    } else {
+        false
+    }
+}
+
+fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
+    let Some(input) = psbt.inputs.get(input_index) else {
+        return false;
+    };
+    if input.final_script_sig.is_some() || input.final_script_witness.is_some() {
+        return true;
+    }
+    let Some(prevout) = psbt_prevout(psbt, input_index) else {
+        return false;
+    };
+    let nested = prevout.script_pubkey.is_p2sh();
+    let spending_script = if nested {
+        let Some(redeem_script) = input.redeem_script.as_ref() else {
+            return false;
+        };
+        redeem_script.as_script()
+    } else {
+        prevout.script_pubkey.as_script()
+    };
+    let Some((public_key, signature)) = input
+        .partial_sigs
+        .iter()
+        .find(|(public_key, _)| public_key_matches_script(public_key, spending_script))
+        .map(|(public_key, signature)| (*public_key, *signature))
+    else {
+        return false;
+    };
+    if spending_script.is_p2wpkh() {
+        let witness = Witness::from_slice(&[signature.to_vec(), public_key.to_bytes()]);
+        psbt.inputs[input_index].final_script_witness = Some(witness);
+        if nested {
+            psbt.inputs[input_index].final_script_sig = Some(
+                push_script_items(&[psbt.inputs[input_index]
+                    .redeem_script
+                    .as_ref()
+                    .expect("nested redeem script was checked")
+                    .to_bytes()])
+                .expect("redeem script is bounded"),
+            );
+        }
+        return true;
+    }
+    if spending_script.is_p2pkh() {
+        let script_sig = if nested {
+            push_script_items(&[
+                signature.to_vec(),
+                public_key.to_bytes(),
+                psbt.inputs[input_index]
+                    .redeem_script
+                    .as_ref()
+                    .expect("nested redeem script was checked")
+                    .to_bytes(),
+            ])
+        } else {
+            push_script_items(&[signature.to_vec(), public_key.to_bytes()])
+        };
+        if let Ok(script_sig) = script_sig {
+            psbt.inputs[input_index].final_script_sig = Some(script_sig);
+            return true;
+        }
+    } else if spending_script.is_p2pk() {
+        let mut items = vec![signature.to_vec()];
+        if nested {
+            items.push(
+                psbt.inputs[input_index]
+                    .redeem_script
+                    .as_ref()
+                    .expect("nested redeem script was checked")
+                    .to_bytes(),
+            );
+        }
+        if let Ok(script_sig) = push_script_items(&items) {
+            psbt.inputs[input_index].final_script_sig = Some(script_sig);
+            return true;
+        }
+    }
+    false
+}
+
+fn finalize_psbt(params: &Value) -> Result<Value> {
+    let mut psbt = parse_psbt(params, 0)?;
+    let extract = params.get(1).and_then(Value::as_bool).unwrap_or(true);
+    let complete = (0..psbt.inputs.len()).all(|index| finalize_psbt_input(&mut psbt, index));
+    let mut result = json!({
+        "psbt": encode_psbt(&psbt),
+        "complete": complete,
+    });
+    if complete && extract {
+        let transaction = psbt.clone().extract_tx_unchecked_fee_rate();
+        result["hex"] = json!(hex::encode(serialize(&transaction)));
+    }
+    Ok(result)
+}
+
+fn lookup_psbt_prevout(
+    node: &Arc<Node>,
+    outpoint: &OutPoint,
+) -> Result<Option<(TxOut, Option<Transaction>)>> {
+    if let Some(entry) = node.mempool.read().get(&outpoint.txid)
+        && let Some(output) = entry.transaction.output.get(outpoint.vout as usize)
+    {
+        return Ok(Some((output.clone(), Some(entry.transaction.clone()))));
+    }
+    let mut chain = node.chain.write();
+    let transaction = chain
+        .transaction(&outpoint.txid)?
+        .map(|(transaction, _)| transaction);
+    let output = transaction
+        .as_ref()
+        .and_then(|transaction| transaction.output.get(outpoint.vout as usize))
+        .cloned()
+        .or_else(|| chain.utxo(outpoint).map(|entry| entry.output.clone()));
+    Ok(output.map(|output| (output, transaction)))
+}
+
+fn update_psbt_utxos(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let mut psbt = parse_psbt(params, 0)?;
+    for index in 0..psbt.inputs.len() {
+        if psbt.inputs[index].witness_utxo.is_some()
+            || psbt.inputs[index].non_witness_utxo.is_some()
+        {
+            continue;
+        }
+        let Some(outpoint) = psbt
+            .unsigned_tx
+            .input
+            .get(index)
+            .map(|input| input.previous_output)
+        else {
+            continue;
+        };
+        let Some((output, transaction)) = lookup_psbt_prevout(node, &outpoint)? else {
+            continue;
+        };
+        if output.script_pubkey.is_witness_program() {
+            psbt.inputs[index].witness_utxo = Some(output);
+        } else if let Some(transaction) = transaction {
+            psbt.inputs[index].non_witness_utxo = Some(transaction);
+        }
+    }
+    Ok(json!(encode_psbt(&psbt)))
+}
+
 fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let transaction: Transaction = deserialize(&bytes)?;
@@ -4720,6 +5200,13 @@ fn rpc_help(method: &str) -> String {
         "decoderawtransaction",
         "createrawtransaction",
         "decodescript",
+        "createpsbt",
+        "decodepsbt",
+        "converttopsbt",
+        "analyzepsbt",
+        "combinepsbt",
+        "finalizepsbt",
+        "utxoupdatepsbt",
         "sendrawtransaction",
         "signrawtransactionwithkey",
         "submitblock",
@@ -5572,6 +6059,116 @@ mod tests {
             deserialize(&hex::decode(result["hex"].as_str().unwrap()).unwrap()).unwrap();
         assert_eq!(signed.input[0].script_sig, ScriptBuf::new());
         assert_eq!(signed.input[0].witness.len(), 2);
+    }
+
+    #[test]
+    fn psbt_rpcs_cover_wallet_free_lifecycle() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
+        let created = create_psbt(&node, &json!([[], {address: 0.5}])).unwrap();
+        let created_psbt = parse_psbt(&json!([created.clone()]), 0).unwrap();
+        assert!(created_psbt.unsigned_tx.input.is_empty());
+        assert_eq!(
+            decode_psbt(&node, &json!([created.clone()])).unwrap()["psbt_version"],
+            0
+        );
+        assert_eq!(
+            combine_psbt(&json!([[created.clone(), created]])).unwrap(),
+            json!(encode_psbt(&created_psbt))
+        );
+
+        let mined = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap();
+        let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
+        let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        let funding_txid = funding.txdata[0].compute_txid();
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(funding_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let psbt = Psbt::from_unsigned_tx(unsigned.clone()).unwrap();
+        let updated = update_psbt_utxos(&node, &json!([encode_psbt(&psbt)])).unwrap();
+        let updated_psbt = parse_psbt(&json!([updated]), 0).unwrap();
+        assert!(updated_psbt.inputs[0].non_witness_utxo.is_some());
+        assert_eq!(
+            analyze_psbt(&json!([encode_psbt(&updated_psbt)])).unwrap()["next"],
+            "signer"
+        );
+
+        let secret = bitcoin::secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        let private = bitcoin::PrivateKey::new(secret, Network::Regtest);
+        let secp = Secp256k1::new();
+        let public_key = private.public_key(&secp);
+        let compressed = bitcoin::CompressedPublicKey::try_from(public_key).unwrap();
+        let previous_script = Address::p2wpkh(&compressed, Network::Regtest).script_pubkey();
+        let previous_output = TxOut {
+            value: Amount::from_sat(100_000_000),
+            script_pubkey: previous_script.clone(),
+        };
+        let signed_unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut partial = Psbt::from_unsigned_tx(signed_unsigned).unwrap();
+        partial.inputs[0].witness_utxo = Some(previous_output);
+        let sighash = SighashCache::new(&partial.unsigned_tx)
+            .p2wpkh_signature_hash(
+                0,
+                &previous_script,
+                Amount::from_sat(100_000_000),
+                EcdsaSighashType::All,
+            )
+            .unwrap();
+        let signature = secp.sign_ecdsa(&Message::from(sighash), &private.inner);
+        partial.inputs[0].partial_sigs.insert(
+            public_key,
+            EcdsaSignature {
+                signature,
+                sighash_type: EcdsaSighashType::All,
+            },
+        );
+        let analyzed = analyze_psbt(&json!([encode_psbt(&partial)])).unwrap();
+        assert_eq!(analyzed["next"], "signer");
+        let finalized = finalize_psbt(&json!([encode_psbt(&partial), false])).unwrap();
+        assert_eq!(finalized["complete"], true);
+        assert!(finalized.get("hex").is_none());
+        let extracted = finalize_psbt(&json!([finalized["psbt"].clone()])).unwrap();
+        assert_eq!(extracted["complete"], true);
+        assert!(extracted["hex"].as_str().is_some());
+        let converted = convert_to_psbt(&json!([extracted["hex"].clone(), true])).unwrap();
+        let converted_psbt = parse_psbt(&json!([converted]), 0).unwrap();
+        assert!(converted_psbt.inputs[0].final_script_witness.is_some());
     }
 
     #[test]

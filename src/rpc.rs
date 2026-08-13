@@ -11,7 +11,7 @@ use bitcoin::block::{Header, Version as BlockVersion};
 use bitcoin::blockdata::script::Builder;
 use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
-use bitcoin::consensus::encode::{VarInt, deserialize, serialize};
+use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::{
     Address, Amount, Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid,
@@ -63,10 +63,11 @@ async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()>
     let (status, content_type, body) = match request {
         Some(request)
             if node.config.rest
-                && request.method.eq_ignore_ascii_case("GET")
+                && (request.method.eq_ignore_ascii_case("GET")
+                    || request.method.eq_ignore_ascii_case("POST"))
                 && request.target.starts_with("/rest/") =>
         {
-            match dispatch_rest(&node, &request.target) {
+            match dispatch_rest_with_body(&node, &request.target, &request.body) {
                 Ok((content_type, body)) => ("200 OK", content_type, body),
                 Err(error) => (
                     "404 Not Found",
@@ -182,7 +183,16 @@ fn authorized(node: &Arc<Node>, headers: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn dispatch_rest(node: &Arc<Node>, target: &str) -> Result<(&'static str, Vec<u8>)> {
+    dispatch_rest_with_body(node, target, &[])
+}
+
+fn dispatch_rest_with_body(
+    node: &Arc<Node>,
+    target: &str,
+    body: &[u8],
+) -> Result<(&'static str, Vec<u8>)> {
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let route = path
         .strip_prefix("/rest/")
@@ -220,7 +230,8 @@ fn dispatch_rest(node: &Arc<Node>, target: &str) -> Result<(&'static str, Vec<u8
         "deploymentinfo" => rest_deployment_info(node, route, format),
         route if route.starts_with("deploymentinfo/") => rest_deployment_info(node, route, format),
         route if route.starts_with("spenttxouts/") => rest_spent_txouts(node, route, format),
-        route if route.starts_with("getutxos/") => rest_get_utxos(node, route, format),
+        "getutxos" => rest_get_utxos(node, route, format, body),
+        route if route.starts_with("getutxos/") => rest_get_utxos(node, route, format, body),
         _ => bail!("unsupported REST endpoint"),
     }
 }
@@ -636,33 +647,76 @@ fn rest_transaction(
     }
 }
 
-fn rest_get_utxos(node: &Arc<Node>, route: &str, format: &str) -> Result<(&'static str, Vec<u8>)> {
-    if format != "json" {
-        bail!("REST getutxos currently supports JSON output only")
-    }
+fn rest_get_utxos(
+    node: &Arc<Node>,
+    route: &str,
+    format: &str,
+    body: &[u8],
+) -> Result<(&'static str, Vec<u8>)> {
     let suffix = route
-        .strip_prefix("getutxos/")
-        .ok_or_else(|| anyhow!("invalid getutxos path"))?;
-    let (check_mempool, outpoints) = if let Some(outpoints) = suffix.strip_prefix("checkmempool/") {
-        (true, outpoints)
+        .strip_prefix("getutxos")
+        .ok_or_else(|| anyhow!("invalid getutxos path"))?
+        .strip_prefix('/')
+        .unwrap_or_default();
+    let (uri_check_mempool, uri_outpoints) =
+        if let Some(outpoints) = suffix.strip_prefix("checkmempool/") {
+            (true, outpoints)
+        } else {
+            (false, suffix)
+        };
+    let uri_outpoints = if uri_outpoints.is_empty() {
+        Vec::new()
     } else {
-        (false, suffix)
+        uri_outpoints
+            .split('/')
+            .map(|value| {
+                let (txid, vout) = value
+                    .rsplit_once('-')
+                    .ok_or_else(|| anyhow!("invalid getutxos outpoint"))?;
+                Ok(OutPoint::new(txid.parse()?, vout.parse()?))
+            })
+            .collect::<Result<Vec<_>>>()?
     };
-    let outpoints = outpoints
-        .split('/')
-        .map(|value| {
-            let (txid, vout) = value
-                .rsplit_once('-')
-                .ok_or_else(|| anyhow!("invalid getutxos outpoint"))?;
-            Ok(OutPoint::new(txid.parse()?, vout.parse()?))
-        })
-        .collect::<Result<Vec<_>>>()?;
+
+    let (check_mempool, outpoints) = match format {
+        "json" => {
+            if body.is_empty() {
+                if uri_outpoints.is_empty() {
+                    bail!("getutxos request is empty")
+                }
+                (uri_check_mempool, uri_outpoints)
+            } else {
+                bail!("JSON getutxos requests must use URI outpoints")
+            }
+        }
+        "bin" | "hex" => {
+            if !body.is_empty() && !uri_outpoints.is_empty() {
+                bail!("getutxos cannot combine URI outpoints with a request body")
+            }
+            if body.is_empty() {
+                if uri_outpoints.is_empty() {
+                    bail!("getutxos request is empty")
+                }
+                (uri_check_mempool, uri_outpoints)
+            } else {
+                let request_body = if format == "hex" {
+                    hex::decode(body).context("invalid getutxos hexadecimal request")?
+                } else {
+                    body.to_vec()
+                };
+                let (check_mempool, outpoints) = deserialize_get_utxos_request(&request_body)?;
+                (check_mempool, outpoints)
+            }
+        }
+        _ => bail!("unsupported REST output format"),
+    };
     if outpoints.is_empty() || outpoints.len() > 15 {
         bail!("getutxos accepts between 1 and 15 outpoints")
     }
     let chain = node.chain.read();
     let mempool = check_mempool.then(|| node.mempool.read());
-    let mut bitmap = 0u32;
+    let mut bitmap = vec![0u8; outpoints.len().div_ceil(8)];
+    let mut bitmap_string = String::with_capacity(outpoints.len());
     let mut utxos = Vec::new();
     for (index, outpoint) in outpoints.iter().enumerate() {
         let mut value = chain.utxo(outpoint).map(|entry| {
@@ -685,20 +739,63 @@ fn rest_get_utxos(node: &Arc<Node>, route: &str, format: &str) -> Result<(&'stat
             value = Some((0, output.clone()));
         }
         if let Some((height, output)) = value {
-            bitmap |= 1 << index;
-            utxos.push(json!({
-                "height": height,
-                "value": output.value.to_btc(),
-                "scriptPubKey": script_json(&output.script_pubkey),
-            }));
+            bitmap[index / 8] |= 1 << (index % 8);
+            bitmap_string.push('1');
+            utxos.push((height, output));
+        } else {
+            bitmap_string.push('0');
         }
     }
-    rest_json(json!({
-        "chainHeight": chain.height(),
-        "chaintipHash": chain.best_hash().to_string(),
-        "bitmap": format!("{bitmap:x}"),
-        "utxos": utxos,
-    }))
+    let chain_height = chain.height();
+    let chain_tip = chain.best_hash();
+    if format == "json" {
+        return rest_json(json!({
+            "chainHeight": chain_height,
+            "chaintipHash": chain_tip.to_string(),
+            "bitmap": bitmap_string,
+            "utxos": utxos
+                .iter()
+                .map(|(height, output)| json!({
+                    "height": height,
+                    "value": output.value.to_btc(),
+                    "scriptPubKey": script_json(&output.script_pubkey),
+                }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+
+    // BIP64's binary response is: active height, active tip hash, bitmap,
+    // and a vector of CCoin records.  Each CCoin starts with a reserved
+    // transaction-version field for compatibility with Core's serializer.
+    let mut response = serialize(&(chain_height, chain_tip, bitmap));
+    response.extend(serialize(&VarInt::from(utxos.len() as u64)));
+    for (height, output) in &utxos {
+        response.extend(serialize(&(0u32, *height, output)));
+    }
+    rest_format_bytes(response, format)
+}
+
+fn deserialize_get_utxos_request(bytes: &[u8]) -> Result<(bool, Vec<OutPoint>)> {
+    let (check_mempool, mut consumed) =
+        deserialize_partial::<bool>(bytes).context("invalid getutxos request")?;
+    let (count, count_consumed) =
+        deserialize_partial::<VarInt>(&bytes[consumed..]).context("invalid getutxos request")?;
+    consumed = consumed.saturating_add(count_consumed);
+    let count = usize::try_from(count.0).context("getutxos request has too many outpoints")?;
+    if count > 15 {
+        bail!("getutxos accepts between 1 and 15 outpoints")
+    }
+    let mut outpoints = Vec::with_capacity(count);
+    for _ in 0..count {
+        let (outpoint, outpoint_consumed) = deserialize_partial::<OutPoint>(&bytes[consumed..])
+            .context("invalid getutxos request")?;
+        consumed = consumed.saturating_add(outpoint_consumed);
+        outpoints.push(outpoint);
+    }
+    if consumed != bytes.len() {
+        bail!("invalid getutxos request: trailing data")
+    }
+    Ok((check_mempool, outpoints))
 }
 
 fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {
@@ -766,9 +863,10 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "decoderawtransaction" => decode_raw_transaction(params),
         "sendrawtransaction" => send_raw_transaction(node, params),
         "submitblock" => submit_block(node, params),
-        "getblocktemplate" => get_block_template(node),
+        "getblocktemplate" => get_block_template(node, params),
         "getmininginfo" => get_mining_info(node),
         "generatetoaddress" => generate_to_address(node, params),
+        "generateblock" => generate_block(node, params),
         "testmempoolaccept" => test_mempool_accept(node, params),
         "verifychain" => {
             let depth = params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -2253,7 +2351,75 @@ fn generate_to_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(hashes))
 }
 
+fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let output = param::<String>(params, 0)?
+        .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
+        .require_network(node.config.network)?;
+    let requested = params
+        .get(1)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("transactions must be an array"))?;
+    let submit = params.get(2).and_then(Value::as_bool).unwrap_or(true);
+    let mempool = node.mempool.read();
+    let transactions = requested
+        .iter()
+        .map(|value| {
+            let text = value
+                .as_str()
+                .ok_or_else(|| anyhow!("transactions must contain hex strings or txids"))?;
+            if let Ok(txid) = text.parse::<Txid>() {
+                return mempool
+                    .get(&txid)
+                    .map(|entry| entry.transaction.clone())
+                    .ok_or_else(|| anyhow!("Transaction {txid} not in mempool"));
+            }
+            let bytes = hex::decode(text)
+                .with_context(|| format!("transaction decode failed for {text}"))?;
+            deserialize(&bytes).context("transaction decode failed")
+        })
+        .collect::<Result<Vec<Transaction>>>()?;
+    drop(mempool);
+
+    let block = build_mining_block_with_transactions(node, output.script_pubkey(), transactions)?;
+    let Some(block) = mine_block(block, 1_000_000) else {
+        bail!("failed to make block")
+    };
+    let hash = block.block_hash();
+    let serialized = (!submit).then(|| hex::encode(serialize(&block)));
+    if submit {
+        node.connect_block(block)?;
+    }
+    let mut result = json!({"hash": hash.to_string()});
+    if let Some(serialized) = serialized {
+        result["hex"] = json!(serialized);
+    }
+    Ok(result)
+}
+
 fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Block> {
+    let mempool = node.mempool.read();
+    let mut transactions = Vec::new();
+    let mut transaction_weight = 0u64;
+    for txid in mempool.transaction_order() {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        let next_weight = transaction_weight.saturating_add(entry.transaction.weight().to_wu());
+        if next_weight.saturating_add(2_000) > 4_000_000 {
+            break;
+        }
+        transaction_weight = next_weight;
+        transactions.push(entry.transaction.clone());
+    }
+    drop(mempool);
+    build_mining_block_with_transactions(node, script_pubkey, transactions)
+}
+
+fn build_mining_block_with_transactions(
+    node: &Arc<Node>,
+    script_pubkey: ScriptBuf,
+    transactions: Vec<Transaction>,
+) -> Result<Block> {
     let chain = node.chain.read();
     let tip = chain.tip();
     let parent = chain
@@ -2274,25 +2440,58 @@ fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Bloc
     let bits = chain.next_bits(time);
     let network = chain.network;
     let mempool = node.mempool.read();
-    let mut transactions = Vec::new();
+    let mut created = HashMap::new();
     let mut fees = 0u64;
-    let mut transaction_weight = 0u64;
-    for txid in mempool.transaction_order() {
-        let Some(entry) = mempool.get(&txid) else {
-            continue;
-        };
-        let next_weight = transaction_weight.saturating_add(entry.transaction.weight().to_wu());
-        if next_weight.saturating_add(2_000) > 4_000_000 {
-            break;
+    for transaction in &transactions {
+        if transaction.is_coinbase() {
+            bail!("coinbase transactions are not allowed in generateblock")
         }
-        transaction_weight = next_weight;
-        fees = fees.saturating_add(entry.fee_sat);
-        transactions.push(entry.transaction.clone());
+        let mut input_total = 0u64;
+        for input in &transaction.input {
+            let output = created
+                .get(&input.previous_output)
+                .cloned()
+                .or_else(|| {
+                    chain
+                        .utxo(&input.previous_output)
+                        .map(|entry| entry.output.clone())
+                })
+                .or_else(|| {
+                    mempool
+                        .get(&input.previous_output.txid)
+                        .and_then(|entry| {
+                            entry
+                                .transaction
+                                .output
+                                .get(input.previous_output.vout as usize)
+                        })
+                        .cloned()
+                })
+                .ok_or_else(|| anyhow!("transaction input {} is missing", input.previous_output))?;
+            input_total = input_total
+                .checked_add(output.value.to_sat())
+                .ok_or_else(|| anyhow!("transaction input total overflow"))?;
+        }
+        let output_total = transaction
+            .output
+            .iter()
+            .try_fold(0u64, |total, output| {
+                total.checked_add(output.value.to_sat())
+            })
+            .ok_or_else(|| anyhow!("transaction output total overflow"))?;
+        if output_total > input_total {
+            bail!("transaction spends more than its inputs")
+        }
+        fees = fees
+            .checked_add(input_total - output_total)
+            .ok_or_else(|| anyhow!("block fee total overflow"))?;
+        let txid = transaction.compute_txid();
+        for (vout, output) in transaction.output.iter().enumerate() {
+            created.insert(OutPoint::new(txid, vout as u32), output.clone());
+        }
     }
     drop(mempool);
-    drop(chain);
-
-    let mut block = mining_block(MiningBlockTemplate {
+    let block = mining_block(MiningBlockTemplate {
         network,
         parent,
         height,
@@ -2303,31 +2502,8 @@ fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Bloc
         fees,
         extra_nonce: random(),
     })?;
-    while block.weight().to_wu() > 4_000_000 {
-        if block.txdata.len() <= 1 {
-            bail!("coinbase transaction exceeds the block weight limit");
-        }
-        block.txdata.pop();
-        let mempool = node.mempool.read();
-        let fee = block
-            .txdata
-            .iter()
-            .skip(1)
-            .filter_map(|transaction| mempool.get(&transaction.compute_txid()))
-            .map(|entry| entry.fee_sat)
-            .sum();
-        drop(mempool);
-        block = mining_block(MiningBlockTemplate {
-            network,
-            parent,
-            height,
-            time,
-            bits,
-            script_pubkey: block.txdata[0].output[0].script_pubkey.clone(),
-            transactions: block.txdata.into_iter().skip(1).collect(),
-            fees: fee,
-            extra_nonce: random(),
-        })?;
+    if block.weight().to_wu() > 4_000_000 {
+        bail!("generated block exceeds the block weight limit")
     }
     Ok(block)
 }
@@ -2375,15 +2551,7 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
             script_pubkey,
         }],
     };
-    let has_witness = transactions.iter().any(|transaction| {
-        transaction
-            .input
-            .iter()
-            .any(|input| !input.witness.is_empty())
-    });
-    if has_witness {
-        coinbase.input[0].witness = Witness::from_slice(&[vec![0u8; 32]]);
-    }
+    coinbase.input[0].witness = Witness::from_slice(&[vec![0u8; 32]]);
     let mut block = Block {
         header: Header {
             version: BlockVersion::from_consensus(0x2000_0000),
@@ -2395,18 +2563,16 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
         },
         txdata: std::iter::once(coinbase).chain(transactions).collect(),
     };
-    if has_witness {
-        let witness_root = block
-            .witness_root()
-            .ok_or_else(|| anyhow!("cannot calculate witness merkle root"))?;
-        let commitment = Block::compute_witness_commitment(&witness_root, &[0u8; 32]);
-        let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-        script.extend_from_slice(&commitment.to_byte_array());
-        block.txdata[0].output.push(TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(script),
-        });
-    }
+    let witness_root = block
+        .witness_root()
+        .ok_or_else(|| anyhow!("cannot calculate witness merkle root"))?;
+    let commitment = Block::compute_witness_commitment(&witness_root, &[0u8; 32]);
+    let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    script.extend_from_slice(&commitment.to_byte_array());
+    block.txdata[0].output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(script),
+    });
     block.header.merkle_root = block
         .compute_merkle_root()
         .ok_or_else(|| anyhow!("cannot calculate transaction merkle root"))?;
@@ -2428,7 +2594,43 @@ fn mine_block(mut block: Block, max_tries: u64) -> Option<Block> {
     None
 }
 
-fn get_block_template(node: &Arc<Node>) -> Result<Value> {
+fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let request = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let request = request
+        .as_object()
+        .ok_or_else(|| anyhow!("getblocktemplate request must be an object"))?;
+    let mode = request
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("template");
+    if mode == "proposal" {
+        let data = request
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("proposal mode requires a data string"))?;
+        let bytes = hex::decode(data).context("block decode failed")?;
+        let block: Block = deserialize(&bytes).context("block decode failed")?;
+        node.chain.read().validate_candidate_block(&block)?;
+        return Ok(Value::Null);
+    }
+    if mode != "template" {
+        bail!("invalid getblocktemplate mode")
+    }
+    let requested_rules = request
+        .get("rules")
+        .and_then(Value::as_array)
+        .map(|rules| rules.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if node.config.network == Network::Signet
+        && !requested_rules.contains(&"signet")
+        && request.contains_key("rules")
+    {
+        bail!("getblocktemplate must be called with the signet rule set")
+    }
     let chain = node.chain.read();
     let tip = chain.tip();
     let parent = chain.header(tip.height).expect("tip header exists");
@@ -2443,12 +2645,28 @@ fn get_block_template(node: &Arc<Node>) -> Result<Value> {
     let mut fees = 0u64;
     let mut weight = 0u64;
     let order = mempool.transaction_order();
-    let positions: HashMap<Txid, usize> = order
-        .iter()
-        .enumerate()
-        .map(|(index, txid)| (*txid, index + 1))
-        .collect();
-    let transactions = order
+    let mut positions = HashMap::new();
+    let mut selected = Vec::new();
+    for txid in order {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        let has_unselected_parent = entry.transaction.input.iter().any(|input| {
+            mempool.get(&input.previous_output.txid).is_some()
+                && !positions.contains_key(&input.previous_output.txid)
+        });
+        if has_unselected_parent {
+            continue;
+        }
+        let next_weight = weight.saturating_add(entry.transaction.weight().to_wu());
+        if next_weight.saturating_add(4_000) > 4_000_000 {
+            continue;
+        }
+        weight = next_weight;
+        positions.insert(txid, selected.len() + 1);
+        selected.push(txid);
+    }
+    let transactions = selected
         .iter()
         .filter_map(|txid| mempool.get(txid).map(|entry| (txid, entry)))
         .map(|(txid, entry)| {
@@ -2483,17 +2701,41 @@ fn get_block_template(node: &Arc<Node>) -> Result<Value> {
             })
         })
         .collect::<Vec<_>>();
+    let selected_transactions = selected
+        .iter()
+        .filter_map(|txid| mempool.get(txid).map(|entry| entry.transaction.clone()))
+        .collect::<Vec<_>>();
+    let template_block = mining_block(MiningBlockTemplate {
+        network: chain.network,
+        parent: *parent,
+        height,
+        time: curtime,
+        bits,
+        script_pubkey: ScriptBuf::new(),
+        transactions: selected_transactions,
+        fees,
+        extra_nonce: 0,
+    })?;
+    let default_witness_commitment = template_block
+        .txdata
+        .first()
+        .and_then(|coinbase| coinbase.output.last())
+        .map(|output| hex::encode(output.script_pubkey.as_bytes()));
     let coinbase_value =
         validation::block_subsidy_for_network(chain.network, height).saturating_add(fees);
+    let mut rules = vec!["csv", "segwit"];
+    if chain.network == Network::Signet {
+        rules.push("!signet");
+    }
     Ok(json!({
-        "capabilities": ["proposal", "longpoll", "coinbasetxn", "coinbasevalue"],
+        "capabilities": ["proposal"],
         "version": 0x20000000u32,
-        "rules": ["csv", "segwit", "taproot"],
+        "rules": rules,
         "vbavailable": {},
         "vbrequired": 0,
         "previousblockhash": tip.hash.to_string(),
         "transactions": transactions,
-        "coinbaseaux": {"flags": ""},
+        "coinbaseaux": {},
         "coinbasevalue": coinbase_value,
         "target": format!("{:064x}", bitcoin::pow::Target::from_compact(bitcoin::pow::CompactTarget::from_consensus(bits))),
         "mintime": parent.time.saturating_add(1),
@@ -2506,6 +2748,8 @@ fn get_block_template(node: &Arc<Node>) -> Result<Value> {
         "longpollid": format!("{}:{}", tip.hash, weight),
         "height": height,
         "bits": format!("{:08x}", bits),
+        "default_witness_commitment": default_witness_commitment,
+        "signet_challenge": chain.signet_challenge().map(hex::encode),
     }))
 }
 
@@ -2873,6 +3117,7 @@ fn rpc_help(method: &str) -> String {
         "getblocktemplate",
         "getmininginfo",
         "generatetoaddress",
+        "generateblock",
         "testmempoolaccept",
         "verifychain",
         "gettxout",
@@ -3278,5 +3523,105 @@ mod tests {
         let block = chain.block(&hash).unwrap().unwrap();
         assert_eq!(block.txdata.len(), 1);
         assert_eq!(block.txdata[0].output[0].value.to_sat(), 5_000_000_000);
+    }
+
+    #[test]
+    fn generate_block_can_return_an_unsent_mined_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let result = generate_block(
+            &node,
+            &json!(["bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl", [], false]),
+        )
+        .unwrap();
+        assert!(result["hash"].as_str().is_some());
+        let block: Block =
+            deserialize(&hex::decode(result["hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(block.block_hash().to_string(), result["hash"]);
+        assert_eq!(node.chain.read().height(), 0);
+
+        generate_block(
+            &node,
+            &json!(["bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl", [], true]),
+        )
+        .unwrap();
+        assert_eq!(node.chain.read().height(), 1);
+    }
+
+    #[test]
+    fn getblocktemplate_reports_a_witness_commitment() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let template = get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
+        assert_eq!(template["height"], 1);
+        assert_eq!(template["weightlimit"], 4_000_000);
+        assert!(
+            template["default_witness_commitment"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("6a24aa21a9ed"))
+        );
+    }
+
+    #[test]
+    fn rest_getutxos_supports_bip64_binary_and_hex_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: true,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let outpoint = OutPoint::new(Txid::from_byte_array([0x42; 32]), 0);
+        let mut request = serialize(&true);
+        request.extend(serialize(&VarInt::from(1u64)));
+        request.extend(serialize(&outpoint));
+        let (_, binary) = dispatch_rest_with_body(&node, "/rest/getutxos.bin", &request).unwrap();
+        let ((height, tip, bitmap), consumed) =
+            deserialize_partial::<(u32, BlockHash, Vec<u8>)>(&binary).unwrap();
+        assert_eq!(height, 0);
+        assert_eq!(tip, node.chain.read().best_hash());
+        assert_eq!(bitmap, vec![0]);
+        let (count, count_bytes) = deserialize_partial::<VarInt>(&binary[consumed..]).unwrap();
+        assert_eq!(count.0, 0);
+        assert_eq!(consumed + count_bytes, binary.len());
+
+        let (_, hex_response) = dispatch_rest_with_body(
+            &node,
+            "/rest/getutxos.hex",
+            hex::encode(&request).as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            hex::decode(hex_response.strip_suffix(b"\n").unwrap()).unwrap(),
+            binary
+        );
     }
 }

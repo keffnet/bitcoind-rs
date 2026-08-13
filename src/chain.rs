@@ -777,6 +777,32 @@ impl ChainState {
         Ok(())
     }
 
+    /// Validate a proposed block against the current active tip without
+    /// storing it or changing chain state. This is the validation boundary
+    /// used by RPC proposal/template clients.
+    pub fn validate_candidate_block(&self, block: &Block) -> Result<()> {
+        let parent_hash = block.header.prev_blockhash;
+        if parent_hash != self.best_hash() {
+            bail!("proposed block does not build on the active tip")
+        }
+        let height = self.height().saturating_add(1);
+        validation::validate_header(
+            self.network,
+            &block.header,
+            parent_hash,
+            self.expected_target_for_parent(parent_hash, block.header.time),
+            self.median_time_past_for_parent(parent_hash),
+        )?;
+        self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
+        self.validate_block_transactions(
+            block,
+            height,
+            &self.utxos,
+            self.median_time_past_for_parent(parent_hash),
+        )?;
+        Ok(())
+    }
+
     pub fn median_time_past_value(&self) -> u32 {
         self.median_time_past()
     }

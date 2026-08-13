@@ -115,6 +115,8 @@ pub struct ChainState {
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
     spent_by: HashMap<OutPoint, SpentTransaction>,
+    precious_blocks: HashMap<BlockHash, u64>,
+    precious_sequence: u64,
     basic_filter_cache: HashMap<BlockHash, (Vec<u8>, FilterHeader)>,
     block_undo_cache: HashMap<BlockHash, Vec<Vec<TxOut>>>,
 }
@@ -189,6 +191,8 @@ impl ChainState {
             tx_index_all: HashMap::new(),
             history: HashMap::new(),
             spent_by: HashMap::new(),
+            precious_blocks: HashMap::new(),
+            precious_sequence: 0,
             basic_filter_cache: HashMap::new(),
             block_undo_cache: HashMap::new(),
         };
@@ -388,16 +392,20 @@ impl ChainState {
     }
 
     pub fn precious_block(&mut self, hash: &BlockHash) -> Result<ChainTip> {
-        let node = self
-            .block_index
+        self.block_index
             .get(hash)
             .copied()
             .with_context(|| format!("block {hash} not found"))?;
         if self.has_invalid_ancestor(*hash) {
             bail!("cannot prefer an invalidated chain")
         }
-        if node.chain_work >= self.tip().work && *hash != self.best_hash() {
-            self.activate_chain(*hash)?;
+        self.precious_sequence = self.precious_sequence.saturating_add(1);
+        self.precious_blocks.insert(*hash, self.precious_sequence);
+        let best = self
+            .best_valid_tip_hash()
+            .context("chain has no valid tip")?;
+        if best != self.best_hash() {
+            self.activate_chain(best)?;
         }
         Ok(self.tip())
     }
@@ -1674,9 +1682,29 @@ impl ChainState {
             .max_by(|(left_hash, left), (right_hash, right)| {
                 left.chain_work
                     .cmp(&right.chain_work)
+                    .then_with(|| {
+                        self.precious_priority(left_hash)
+                            .cmp(&self.precious_priority(right_hash))
+                    })
                     .then_with(|| right_hash.to_string().cmp(&left_hash.to_string()))
             })
             .map(|(hash, _)| *hash)
+    }
+
+    fn precious_priority(&self, hash: &BlockHash) -> u64 {
+        let mut priority = 0;
+        let mut cursor = *hash;
+        loop {
+            priority = priority.max(self.precious_blocks.get(&cursor).copied().unwrap_or(0));
+            let Some(node) = self.block_index.get(&cursor) else {
+                break;
+            };
+            if node.height == 0 {
+                break;
+            }
+            cursor = node.header.prev_blockhash;
+        }
+        priority
     }
 
     fn index_transactions(&mut self, block: &Block, height: u32) {
@@ -2234,6 +2262,33 @@ mod tests {
         assert_eq!(reopened.best_hash(), side_three_hash);
         assert_eq!(reopened.block_hash(1), Some(side_one_hash));
         assert!(reopened.transaction(&main_two_coinbase).unwrap().is_some());
+    }
+
+    #[test]
+    fn precious_block_preference_survives_equal_work_reconsideration() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let main_one = mine_block(&state, 1);
+        state.connect_block(main_one).unwrap();
+        let main_two = mine_block(&state, 2);
+        let main_two_hash = main_two.block_hash();
+        state.connect_block(main_two).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 31);
+        let side_one_hash = side_one.block_hash();
+        state.connect_block(side_one).unwrap();
+        let side_one_header = *state.block_index.get(&side_one_hash).unwrap();
+        let side_two = mine_block_from_header(&side_one_header.header, 2, 32);
+        let side_two_hash = side_two.block_hash();
+        state.connect_block(side_two).unwrap();
+
+        state.precious_block(&side_two_hash).unwrap();
+        assert_eq!(state.best_hash(), side_two_hash);
+        state.invalidate_block(&side_one_hash).unwrap();
+        assert_eq!(state.best_hash(), main_two_hash);
+        state.reconsider_block(&side_one_hash).unwrap();
+        assert_eq!(state.best_hash(), side_two_hash);
     }
 
     #[test]

@@ -1345,20 +1345,43 @@ fn parse_descriptor_range(value: &Value) -> Result<(u32, u32)> {
 }
 
 fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let count = params
-        .get(0)
-        .filter(|value| !value.is_null())
-        .and_then(Value::as_u64)
-        .unwrap_or(1_000)
-        .min(1_000) as usize;
+    let count = match params.get(0) {
+        None | Some(Value::Null) => 1,
+        Some(value) => {
+            let count = value
+                .as_i64()
+                .ok_or_else(|| anyhow!("address count must be an integer"))?;
+            usize::try_from(count).map_err(|_| anyhow!("address count out of range"))?
+        }
+    };
+    let network = match params.get(1) {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("network must be a string"))?
+                .to_owned(),
+        ),
+    };
+    if let Some(network) = &network
+        && !matches!(network.as_str(), "ipv4" | "ipv6")
+    {
+        bail!("network not recognized: {network}")
+    }
+    let mut peers = node.known_addresses();
+    peers.sort_by_key(|peer| peer.address);
     Ok(json!(
-        node.known_addresses()
+        peers
             .into_iter()
+            .filter(|peer| network.as_deref().is_none_or(|network| {
+                (network == "ipv4" && peer.address.ip().is_ipv4())
+                    || (network == "ipv6" && peer.address.ip().is_ipv6())
+            }))
             .take(count)
             .map(|peer| json!({
                 "address": peer.address.ip().to_string(),
                 "port": peer.address.port(),
-                "services": format!("{:016x}", peer.services),
+                "services": peer.services,
                 "time": peer.connected_at,
                 "network": if peer.address.ip().is_ipv4() { "ipv4" } else { "ipv6" },
             }))
@@ -1507,12 +1530,31 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn disconnect_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let target = param::<String>(params, 0)?;
-    let disconnected = if let Ok(peer_id) = target.parse::<usize>() {
-        node.disconnect_peer(peer_id)
-    } else {
-        let address = parse_socket_address(&target)?;
-        node.disconnect_peer_at(address)
+    let address = match params.get(0) {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("address must be a string"))?,
+        ),
+    };
+    let peer_id = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let peer_id = value
+                .as_i64()
+                .ok_or_else(|| anyhow!("nodeid must be an integer"))?;
+            usize::try_from(peer_id).map_err(|_| anyhow!("nodeid is out of range"))
+        })
+        .transpose()?;
+    let disconnected = match (address, peer_id) {
+        (Some(address), None) if !address.is_empty() => {
+            node.disconnect_peer_at(parse_socket_address(address)?)
+        }
+        (Some(""), Some(peer_id)) => node.disconnect_peer(peer_id),
+        (None, Some(peer_id)) => node.disconnect_peer(peer_id),
+        _ => bail!("only one of address and nodeid should be provided"),
     };
     if !disconnected {
         bail!("node is not connected")
@@ -1521,15 +1563,19 @@ fn disconnect_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_added_node_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let requested = params
-        .get(1)
-        .filter(|value| !value.is_null())
-        .and_then(Value::as_str)
-        .map(parse_socket_address)
-        .transpose()?;
+    let requested = match params.get(0) {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(parse_socket_address(
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("node must be a string"))?,
+        )?),
+    };
     let peers = node.peer_infos();
     let mut result = Vec::new();
-    for address in node.added_nodes() {
+    let mut added_nodes = node.added_nodes();
+    added_nodes.sort_unstable();
+    for address in added_nodes {
         if requested.is_some_and(|requested| requested != address) {
             continue;
         }
@@ -1539,10 +1585,12 @@ fn get_added_node_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             "connected": matching.is_some(),
             "addresses": matching.into_iter().map(|peer| json!({
                 "address": peer.address.to_string(),
-                "connected": true,
-                "inbound": peer.inbound,
+                "connected": if peer.inbound { "inbound" } else { "outbound" },
             })).collect::<Vec<_>>(),
         }));
+    }
+    if requested.is_some() && result.is_empty() {
+        bail!("node has not been added")
     }
     Ok(Value::Array(result))
 }
@@ -7994,17 +8042,55 @@ mod tests {
         })
         .unwrap();
         add_node(&node, &json!(["127.0.0.1:18444", "add"])).unwrap();
-        let added = get_added_node_info(&node, &json!([false])).unwrap();
+        let added = get_added_node_info(&node, &json!([])).unwrap();
         assert_eq!(added[0]["addednode"], "127.0.0.1:18444");
         set_ban(&node, &json!(["add", "192.0.2.1", 60])).unwrap();
         assert_eq!(list_banned(&node).unwrap().as_array().unwrap().len(), 1);
         clear_banned(&node).unwrap();
         assert_eq!(list_banned(&node).unwrap(), json!([]));
         add_node(&node, &json!(["127.0.0.1:18444", "remove"])).unwrap();
-        assert_eq!(
-            get_added_node_info(&node, &json!([false])).unwrap(),
-            json!([])
-        );
+        assert_eq!(get_added_node_info(&node, &json!([])).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn network_address_rpcs_honor_filters_and_node_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        node.remember_address("192.0.2.20:18444".parse().unwrap(), 1, 10);
+        node.remember_address("[2001:db8::20]:18444".parse().unwrap(), 8, 20);
+
+        let default = get_node_addresses(&node, &json!([])).unwrap();
+        assert_eq!(default.as_array().unwrap().len(), 1);
+        let ipv6 = get_node_addresses(&node, &json!([10, "ipv6"])).unwrap();
+        assert_eq!(ipv6[0]["address"], "2001:db8::20");
+        assert_eq!(ipv6[0]["services"], 8);
+        assert!(get_node_addresses(&node, &json!([1, "onion"])).is_err());
+
+        add_node(&node, &json!(["127.0.0.1:18444", "add"])).unwrap();
+        let selected = get_added_node_info(&node, &json!(["127.0.0.1:18444"])).unwrap();
+        assert_eq!(selected[0]["addednode"], "127.0.0.1:18444");
+        assert!(get_added_node_info(&node, &json!(["127.0.0.1:18445"])).is_err());
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(11, "127.0.0.1:18444".parse().unwrap(), false, sender);
+        let connected = get_added_node_info(&node, &json!(["127.0.0.1:18444"])).unwrap();
+        assert_eq!(connected[0]["addresses"][0]["connected"], "outbound");
+        disconnect_node(&node, &json!(["", 11])).unwrap();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            crate::p2p::PeerCommand::Disconnect
+        ));
     }
 
     #[test]

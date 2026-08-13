@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::{OutPoint, Transaction, TxOut, Txid};
+use bitcoin::hashes::{Hash, sha256d};
+use bitcoin::{BlockHash, OutPoint, Transaction, TxOut, Txid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -201,6 +202,10 @@ fn dispatch(
                 .map(Value::String)
                 .unwrap_or(Value::Null))
         }
+        "blockchain.scripthash.unsubscribe" => {
+            let script_hash = script_hash_param(params, 0)?;
+            Ok(Value::Bool(subscriptions.remove(&script_hash)))
+        }
         "blockchain.transaction.get" => transaction_get(node, params),
         "blockchain.transaction.get_batch" => transaction_get_batch(node, params),
         "blockchain.transaction.get_merkle" => transaction_merkle(node, params),
@@ -252,16 +257,34 @@ fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
 
 fn block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = param::<u32>(params, 0)?;
+    let checkpoint = params.get(1).and_then(Value::as_u64).unwrap_or(0);
+    let checkpoint = u32::try_from(checkpoint).map_err(|_| anyhow!("checkpoint is too large"))?;
     let chain = node.chain.read();
     let header = chain
         .header(height)
         .ok_or_else(|| anyhow!("block height out of range"))?;
-    Ok(json!(hex::encode(serialize(header))))
+    if checkpoint == 0 {
+        return Ok(json!(hex::encode(serialize(header))));
+    }
+    if height > checkpoint {
+        bail!("checkpoint height must not precede requested height")
+    }
+    let (branch, root) = header_merkle_proof(&chain, height, checkpoint)?;
+    Ok(json!({
+        "header": hex::encode(serialize(header)),
+        "branch": branch.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "root": root.to_string(),
+    }))
 }
 
 fn block_headers(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let start = param::<u32>(params, 0)?;
     let count = param::<u32>(params, 1)?.min(2_000);
+    let checkpoint = params.get(2).and_then(Value::as_u64).unwrap_or(0);
+    let checkpoint = u32::try_from(checkpoint).map_err(|_| anyhow!("checkpoint is too large"))?;
+    if checkpoint != 0 && count != 0 && start.saturating_add(count.saturating_sub(1)) > checkpoint {
+        bail!("checkpoint height is below the requested header range")
+    }
     let chain = node.chain.read();
     let mut bytes = Vec::with_capacity(count as usize * 80);
     let mut actual = 0u32;
@@ -272,7 +295,71 @@ fn block_headers(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bytes.extend_from_slice(&serialize(header));
         actual += 1;
     }
-    Ok(json!({"count": actual, "hex": hex::encode(bytes), "max": 2_000}))
+    let mut result = json!({"count": actual, "hex": hex::encode(bytes), "max": 2_000});
+    if checkpoint != 0 && actual != 0 {
+        let last_height = start + actual - 1;
+        let (branch, root) = header_merkle_proof(&chain, last_height, checkpoint)?;
+        result["branch"] = json!(branch.iter().map(ToString::to_string).collect::<Vec<_>>());
+        result["root"] = json!(root.to_string());
+    }
+    Ok(result)
+}
+
+fn header_merkle_proof(
+    chain: &crate::chain::ChainState,
+    height: u32,
+    checkpoint: u32,
+) -> Result<(Vec<BlockHash>, BlockHash)> {
+    if height > checkpoint {
+        bail!("header height exceeds checkpoint")
+    }
+    let hashes = (0..=checkpoint)
+        .map(|height| {
+            chain
+                .header(height)
+                .map(|header| header.block_hash())
+                .ok_or_else(|| anyhow!("checkpoint height out of range"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    header_merkle_proof_from_hashes(&hashes, height)
+}
+
+fn header_merkle_proof_from_hashes(
+    hashes: &[BlockHash],
+    height: u32,
+) -> Result<(Vec<BlockHash>, BlockHash)> {
+    if hashes.is_empty() {
+        bail!("cannot build an empty header proof")
+    }
+    let mut layer = hashes.to_vec();
+    let mut index = usize::try_from(height).map_err(|_| anyhow!("header height is too large"))?;
+    if index >= layer.len() {
+        bail!("header height exceeds checkpoint")
+    }
+    let mut branch = Vec::new();
+    while layer.len() > 1 {
+        let sibling = if index ^ 1 < layer.len() {
+            index ^ 1
+        } else {
+            index
+        };
+        branch.push(layer[sibling]);
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
+        for pair in layer.chunks(2) {
+            let right = *pair.get(1).unwrap_or(&pair[0]);
+            next.push(combine_header_hashes(pair[0], right));
+        }
+        layer = next;
+        index /= 2;
+    }
+    Ok((branch, layer[0]))
+}
+
+fn combine_header_hashes(left: BlockHash, right: BlockHash) -> BlockHash {
+    let mut bytes = [0u8; 64];
+    bytes[..32].copy_from_slice(&left.to_byte_array());
+    bytes[32..].copy_from_slice(&right.to_byte_array());
+    BlockHash::from_raw_hash(sha256d::Hash::hash(&bytes))
 }
 
 fn block_chunk(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -695,6 +782,26 @@ mod tests {
     }
 
     #[test]
+    fn header_checkpoint_proofs_return_a_branch_and_root() {
+        let hashes = vec![
+            BlockHash::from_byte_array([1; 32]),
+            BlockHash::from_byte_array([2; 32]),
+            BlockHash::from_byte_array([3; 32]),
+        ];
+        let (branch, root) = header_merkle_proof_from_hashes(&hashes, 2).unwrap();
+        assert_eq!(branch.len(), 2);
+        assert_eq!(branch[0], hashes[2]);
+        assert_eq!(
+            root,
+            combine_header_hashes(
+                combine_header_hashes(hashes[0], hashes[1]),
+                combine_header_hashes(hashes[2], hashes[2]),
+            )
+        );
+        assert!(header_merkle_proof_from_hashes(&hashes, 3).is_err());
+    }
+
+    #[test]
     fn transaction_get_batch_returns_each_requested_transaction() {
         let directory = tempfile::tempdir().unwrap();
         let node = Arc::new(
@@ -719,6 +826,29 @@ mod tests {
         assert_eq!(
             result[0].as_str().unwrap(),
             chain::transaction_hex(&block.txdata[0])
+        );
+
+        let script_hash = "00".repeat(32);
+        let mut subscriptions = HashSet::new();
+        assert_eq!(
+            dispatch(
+                &node,
+                "blockchain.scripthash.subscribe",
+                &json!([script_hash]),
+                &mut subscriptions,
+            )
+            .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            dispatch(
+                &node,
+                "blockchain.scripthash.unsubscribe",
+                &json!([script_hash]),
+                &mut subscriptions,
+            )
+            .unwrap(),
+            Value::Bool(true)
         );
     }
 }

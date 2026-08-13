@@ -993,7 +993,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "connections": node.peer_count(),
             "connections_in": node.peer_infos().iter().filter(|peer| peer.inbound).count(),
             "connections_out": node.peer_infos().iter().filter(|peer| !peer.inbound).count(),
-            "networkactive": true,
+            "networkactive": node.network_active(),
             "networks": [{
                 "name": network_name(node.config.network),
                 "limited": false,
@@ -1032,6 +1032,14 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 }))
                 .collect::<Vec<_>>()
         )),
+        "getnettotals" => get_net_totals(node),
+        "getnodeaddresses" => get_node_addresses(node, params),
+        "ping" => Ok(Value::Null),
+        "setnetworkactive" => {
+            let active = param::<bool>(params, 0)?;
+            node.set_network_active(active);
+            Ok(Value::Bool(true))
+        }
         "getrpcinfo" => Ok(json!({
             "active_commands": [],
             "logpath": node.config.datadir.join("debug.log").to_string_lossy(),
@@ -1051,6 +1059,50 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "uptime" => Ok(json!(node.started_at.elapsed().as_secs())),
         _ => bail!("Method not found"),
     }
+}
+
+fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
+    let peers = node.peer_infos();
+    let total_bytes_sent = 0u64;
+    let total_bytes_recv = 0u64;
+    Ok(json!({
+        "totalbytesrecv": total_bytes_recv,
+        "totalbytessent": total_bytes_sent,
+        "timemillis": SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+        "uploadtarget": {
+            "timeframe": 86_400,
+            "target": 0,
+            "target_reached": false,
+            "serve_historical_blocks": true,
+            "bytes_left": 0,
+        },
+        "connections": peers.len(),
+    }))
+}
+
+fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let count = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_u64)
+        .unwrap_or(1_000)
+        .min(1_000) as usize;
+    Ok(json!(
+        node.peer_infos()
+            .into_iter()
+            .take(count)
+            .map(|peer| json!({
+                "address": peer.address.ip().to_string(),
+                "port": peer.address.port(),
+                "services": format!("{:016x}", peer.services),
+                "time": peer.connected_at,
+                "network": "ipv4",
+            }))
+            .collect::<Vec<_>>()
+    ))
 }
 
 fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
@@ -3274,6 +3326,10 @@ fn rpc_help(method: &str) -> String {
         "getchaintips",
         "getnetworkinfo",
         "getpeerinfo",
+        "getnettotals",
+        "getnodeaddresses",
+        "ping",
+        "setnetworkactive",
         "getrpcinfo",
         "estimatesmartfee",
         "getdifficulty",
@@ -3822,5 +3878,29 @@ mod tests {
         assert_eq!(result["txouts"], 1);
         assert_eq!(result["unspents"][0]["height"], 1);
         assert_eq!(result["total_amount"], 50.0);
+    }
+
+    #[test]
+    fn network_active_rpc_controls_peer_admission_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        dispatch_method(&node, "setnetworkactive", &json!([false])).unwrap();
+        assert_eq!(
+            dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["networkactive"],
+            false
+        );
+        dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap();
+        assert!(node.network_active());
     }
 }

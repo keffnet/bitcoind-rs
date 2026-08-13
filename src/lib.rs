@@ -14,7 +14,7 @@ pub mod wire;
 use std::path::Path;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,6 +56,7 @@ pub struct Node {
     pub rpc_cookie: Option<String>,
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
+    network_active: AtomicBool,
     peers: parking_lot::RwLock<std::collections::HashMap<usize, PeerInfo>>,
     pub started_at: Instant,
     shutdown: Notify,
@@ -86,6 +87,7 @@ impl Node {
             rpc_cookie,
             mempool_path,
             peer_count: AtomicUsize::new(0),
+            network_active: AtomicBool::new(true),
             peers: parking_lot::RwLock::new(std::collections::HashMap::new()),
             started_at: Instant::now(),
             shutdown: Notify::new(),
@@ -171,6 +173,14 @@ impl Node {
 
     pub fn peer_count(&self) -> usize {
         self.peer_count.load(Ordering::Relaxed)
+    }
+
+    pub fn network_active(&self) -> bool {
+        self.network_active.load(Ordering::Relaxed)
+    }
+
+    pub fn set_network_active(&self, active: bool) {
+        self.network_active.store(active, Ordering::Relaxed);
     }
 
     pub fn register_peer(&self, id: usize, address: std::net::SocketAddr, inbound: bool) {

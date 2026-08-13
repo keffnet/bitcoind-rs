@@ -96,6 +96,10 @@ impl PeerManager {
                     return;
                 };
                 loop {
+                    if !node.network_active() {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
                     match TcpStream::connect(address).await {
                         Ok(stream) => {
                             info!(%address, "connected to configured peer");
@@ -123,6 +127,9 @@ impl PeerManager {
 
         loop {
             let (stream, address) = listener.accept().await?;
+            if !self.node.network_active() {
+                continue;
+            }
             let node = self.node.clone();
             let slots = slots.clone();
             let peers = peers.clone();
@@ -246,6 +253,9 @@ async fn serve_peer_loop(
     let mut compact_block_version = 2u64;
     let mut pending_compact = None;
     loop {
+        if !node.network_active() {
+            anyhow::bail!("networking is disabled");
+        }
         let message = wire::read_message(reader, node.config.network).await?;
         match message {
             Message::Version(version) => {

@@ -1119,6 +1119,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getnettotals" => get_net_totals(node),
         "getnodeaddresses" => get_node_addresses(node, params),
         "getaddrmaninfo" => get_addrman_info(node),
+        "addpeeraddress" => add_peer_address(node, params),
+        "getrawaddrman" => get_raw_addrman(node),
+        "sendmsgtopeer" => send_message_to_peer(node, params),
         "addnode" => add_node(node, params),
         "disconnectnode" => disconnect_node(node, params),
         "getaddednodeinfo" => get_added_node_info(node, params),
@@ -1382,7 +1385,7 @@ fn get_addrman_info(node: &Arc<Node>) -> Result<Value> {
         let Some((new, tried)) = counts.get_mut(network) else {
             continue;
         };
-        if peer.id == 0 {
+        if !node.is_address_tried(peer.address) {
             *new = new.saturating_add(1);
         } else {
             *tried = tried.saturating_add(1);
@@ -1409,6 +1412,70 @@ fn get_addrman_info(node: &Arc<Node>) -> Result<Value> {
         }),
     );
     Ok(Value::Object(result))
+}
+
+fn add_peer_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let address = parse_ip_address(&param::<String>(params, 0)?)?;
+    let port = param::<u16>(params, 1)?;
+    let tried = match params.get(2) {
+        None | Some(Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow!("tried must be a boolean"))?,
+    };
+    let address = SocketAddr::new(address, port);
+    if node.add_peer_address(address, tried) {
+        Ok(json!({"success": true}))
+    } else {
+        Ok(json!({"success": false, "error": "failed-adding-to-new"}))
+    }
+}
+
+fn get_raw_addrman(node: &Arc<Node>) -> Result<Value> {
+    let mut peers = node.known_addresses();
+    peers.sort_by_key(|peer| peer.address);
+    let mut new_table = serde_json::Map::new();
+    let mut tried_table = serde_json::Map::new();
+    for (position, peer) in peers.into_iter().enumerate() {
+        let network = if peer.address.ip().is_ipv4() {
+            "ipv4"
+        } else {
+            "ipv6"
+        };
+        let entry = json!({
+            "address": peer.address.ip().to_string(),
+            "port": peer.address.port(),
+            "services": peer.services,
+            "time": peer.connected_at,
+            "network": network,
+            "source": peer.address.ip().to_string(),
+            "source_network": network,
+        });
+        let table = if node.is_address_tried(peer.address) {
+            &mut tried_table
+        } else {
+            &mut new_table
+        };
+        table.insert(format!("0/{position}"), entry);
+    }
+    Ok(json!({"new": new_table, "tried": tried_table}))
+}
+
+fn send_message_to_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let peer_id = param::<u64>(params, 0)?;
+    let peer_id = usize::try_from(peer_id).map_err(|_| anyhow!("peer id is out of range"))?;
+    let command = param::<String>(params, 1)?;
+    if command.is_empty()
+        || command.len() > 12
+        || !command.is_ascii()
+        || command.as_bytes().contains(&0)
+    {
+        bail!("msg_type must be a non-empty ASCII command of at most 12 bytes")
+    }
+    let payload = hex::decode(param::<String>(params, 2)?)
+        .map_err(|_| anyhow!("Error parsing input for msg"))?;
+    node.send_message_to_peer(peer_id, command, payload)?;
+    Ok(json!({}))
 }
 
 fn get_block_from_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -6982,6 +7049,9 @@ fn rpc_help(method: &str) -> String {
         "getnettotals",
         "getnodeaddresses",
         "getaddrmaninfo",
+        "addpeeraddress",
+        "getrawaddrman",
+        "sendmsgtopeer",
         "addnode",
         "disconnectnode",
         "getaddednodeinfo",
@@ -7851,6 +7921,61 @@ mod tests {
             assert_eq!(result[network]["tried"], json!(0));
             assert_eq!(result[network]["total"], json!(0));
         }
+    }
+
+    #[test]
+    fn hidden_addrman_and_peer_message_rpcs_use_real_node_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+
+        assert_eq!(
+            dispatch_method(&node, "addpeeraddress", &json!(["192.0.2.10", 18444]),).unwrap(),
+            json!({"success": true})
+        );
+        assert_eq!(
+            dispatch_method(
+                &node,
+                "addpeeraddress",
+                &json!(["2001:db8::10", 18444, true]),
+            )
+            .unwrap(),
+            json!({"success": true})
+        );
+        assert_eq!(
+            dispatch_method(&node, "addpeeraddress", &json!(["192.0.2.10", 18444]),).unwrap()["success"],
+            false
+        );
+        let info = dispatch_method(&node, "getaddrmaninfo", &json!([])).unwrap();
+        assert_eq!(info["ipv4"], json!({"new": 1, "tried": 0, "total": 1}));
+        assert_eq!(info["ipv6"], json!({"new": 0, "tried": 1, "total": 1}));
+        let raw = dispatch_method(&node, "getrawaddrman", &json!([])).unwrap();
+        assert_eq!(raw["new"].as_object().unwrap().len(), 1);
+        assert_eq!(raw["tried"].as_object().unwrap().len(), 1);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
+        assert_eq!(
+            dispatch_method(&node, "sendmsgtopeer", &json!([7, "test", "0102"]),).unwrap(),
+            json!({})
+        );
+        let crate::p2p::PeerCommand::SendMessage { command, payload } =
+            receiver.try_recv().unwrap()
+        else {
+            panic!("expected raw peer message command");
+        };
+        assert_eq!(command, "test");
+        assert_eq!(payload, vec![1, 2]);
     }
 
     #[test]

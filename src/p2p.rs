@@ -29,6 +29,7 @@ pub(crate) enum PeerCommand {
     Disconnect,
     RequestBlock(BlockHash),
     Ping(u64),
+    SendMessage { command: String, payload: Vec<u8> },
 }
 
 struct PendingCompactBlock {
@@ -328,6 +329,16 @@ async fn serve_peer_loop(
                             writer,
                             node.config.network,
                             &Message::Ping(nonce),
+                        ).await?;
+                        continue;
+                    }
+                    Some(PeerCommand::SendMessage { command, payload }) => {
+                        send_message(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            &Message::Unknown { command, payload },
                         ).await?;
                         continue;
                     }

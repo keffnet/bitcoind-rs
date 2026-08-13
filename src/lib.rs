@@ -231,6 +231,8 @@ struct PersistedAddress {
     address: String,
     services: u64,
     time: u64,
+    #[serde(default)]
+    tried: bool,
 }
 
 /// The wallet-free node facade shared by the network and RPC services.
@@ -253,6 +255,7 @@ pub struct Node {
         parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<SocketAddr>>>,
     orphans: parking_lot::Mutex<OrphanPool>,
     known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
+    tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
     added_nodes: parking_lot::RwLock<HashSet<SocketAddr>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpAddr, BannedAddress>>,
     pub started_at: Instant,
@@ -271,7 +274,7 @@ impl Node {
         let mut mempool = Mempool::new(config.network);
         mempool.load_from_file(&mempool_path, &chain)?;
         let banned_addresses = load_banlist(&config.datadir)?;
-        let known_addresses = load_known_addresses(&config.datadir)?;
+        let (known_addresses, tried_addresses) = load_known_addresses(&config.datadir)?;
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let rpc_cookie = config
@@ -295,6 +298,7 @@ impl Node {
             peer_manager_requests: parking_lot::RwLock::new(None),
             orphans: parking_lot::Mutex::new(OrphanPool::default()),
             known_addresses: parking_lot::RwLock::new(known_addresses),
+            tried_addresses: parking_lot::RwLock::new(tried_addresses),
             added_nodes: parking_lot::RwLock::new(added_nodes),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
             started_at: Instant::now(),
@@ -581,6 +585,7 @@ impl Node {
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
         self.known_addresses.write().insert(address, peer);
+        self.tried_addresses.write().insert(address);
     }
 
     pub fn update_peer_version(
@@ -620,6 +625,46 @@ impl Node {
 
     pub fn known_addresses(&self) -> Vec<PeerInfo> {
         self.known_addresses.read().values().cloned().collect()
+    }
+
+    pub(crate) fn is_address_tried(&self, address: SocketAddr) -> bool {
+        self.tried_addresses.read().contains(&address)
+    }
+
+    pub(crate) fn add_peer_address(&self, address: SocketAddr, tried: bool) -> bool {
+        let now = unix_time_seconds();
+        let mut known = self.known_addresses.write();
+        if known.contains_key(&address) {
+            return false;
+        }
+        known.insert(
+            address,
+            PeerInfo {
+                id: 0,
+                address,
+                local_address: None,
+                inbound: false,
+                version: None,
+                services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+                user_agent: String::new(),
+                start_height: 0,
+                relay_transactions: true,
+                connected_at: now,
+                last_send: now,
+                last_recv: now,
+                bytes_sent: 0,
+                bytes_received: 0,
+                ping_time: None,
+                min_ping: None,
+                ping_nonce: None,
+                ping_sent_at: None,
+            },
+        );
+        drop(known);
+        if tried {
+            self.tried_addresses.write().insert(address);
+        }
+        true
     }
 
     pub(crate) fn remember_address(&self, address: SocketAddr, services: u64, time: u64) {
@@ -717,6 +762,23 @@ impl Node {
             .ok_or_else(|| anyhow::anyhow!("peer {peer_id} is not connected"))?;
         sender
             .send(p2p::PeerCommand::RequestBlock(hash))
+            .map_err(|_| anyhow::anyhow!("peer {peer_id} disconnected"))
+    }
+
+    pub fn send_message_to_peer(
+        &self,
+        peer_id: usize,
+        command: String,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let sender = self
+            .peer_commands
+            .read()
+            .get(&peer_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("peer {peer_id} is not connected"))?;
+        sender
+            .send(p2p::PeerCommand::SendMessage { command, payload })
             .map_err(|_| anyhow::anyhow!("peer {peer_id} disconnected"))
     }
 
@@ -861,6 +923,7 @@ impl Node {
                 address: peer.address.to_string(),
                 services: peer.services,
                 time: peer.connected_at,
+                tried: self.is_address_tried(peer.address),
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.address.cmp(&right.address));
@@ -883,16 +946,22 @@ fn load_banlist(data_dir: &Path) -> Result<HashMap<IpAddr, BannedAddress>> {
         .collect())
 }
 
-fn load_known_addresses(data_dir: &Path) -> Result<HashMap<SocketAddr, PeerInfo>> {
+fn load_known_addresses(
+    data_dir: &Path,
+) -> Result<(HashMap<SocketAddr, PeerInfo>, HashSet<SocketAddr>)> {
     let path = data_dir.join("peers.json");
     if !path.exists() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), HashSet::new()));
     }
     let bytes = std::fs::read(path)?;
     let entries: Vec<PersistedAddress> = serde_json::from_slice(&bytes)?;
     let mut known = HashMap::with_capacity(entries.len());
+    let mut tried = HashSet::new();
     for entry in entries {
         let address = entry.address.parse::<SocketAddr>()?;
+        if entry.tried {
+            tried.insert(address);
+        }
         known.insert(
             address,
             PeerInfo {
@@ -917,7 +986,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<HashMap<SocketAddr, PeerInfo>
             },
         );
     }
-    Ok(known)
+    Ok((known, tried))
 }
 
 fn unix_time_seconds() -> u64 {

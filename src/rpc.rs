@@ -467,7 +467,7 @@ fn rest_block_filter(
         bail!("only the basic REST block filter is available")
     }
     let hash: BlockHash = hash_text.parse()?;
-    let content = node
+    let (content, header) = node
         .chain
         .write()
         .basic_filter_chain(&hash)?
@@ -475,12 +475,15 @@ fn rest_block_filter(
             filters
                 .into_iter()
                 .next_back()
-                .map(|(_, filter, _)| filter.content)
+                .map(|(_, filter, header)| (filter.content, header))
         })
         .ok_or_else(|| anyhow!("block filter not found"))?;
     match format {
         "bin" | "hex" => rest_format_bytes(content, format),
-        "json" => rest_json(json!({"filter": hex::encode(content)})),
+        "json" => rest_json(json!({
+            "filter": hex::encode(content),
+            "header": header.to_string(),
+        })),
         _ => bail!("unsupported REST output format"),
     }
 }
@@ -5178,6 +5181,30 @@ fn expand_descriptor_scripts(
             })
             .collect();
     }
+    if let Some(key_expression) = descriptor
+        .strip_prefix("combo(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, range)?;
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let mut scripts = Vec::new();
+        for index in indices {
+            let public_key = descriptor_public_key(&key, &path, index, &secp)?;
+            scripts.push(
+                Builder::new()
+                    .push_key(&public_key)
+                    .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKSIG)
+                    .into_script(),
+            );
+            scripts.push(Address::p2pkh(public_key, node.config.network).script_pubkey());
+            if let Ok(compressed) = bitcoin::CompressedPublicKey::try_from(public_key) {
+                scripts.push(Address::p2wpkh(&compressed, node.config.network).script_pubkey());
+                scripts.push(Address::p2shwpkh(&compressed, node.config.network).script_pubkey());
+            }
+        }
+        return Ok(scripts);
+    }
     for wrapper in ["sh", "wsh"] {
         if let Some(inner) = descriptor
             .strip_prefix(&format!("{wrapper}("))
@@ -5227,7 +5254,7 @@ fn expand_descriptor_scripts(
         .filter(|(kind, _)| matches!(*kind, "pkh" | "wpkh"))
     else {
         bail!(
-            "unsupported descriptor; use addr(...), raw(...), pk(...), pkh(...), wpkh(...), multi(...), sortedmulti(...), sh(...), wsh(...), or tr(...)"
+            "unsupported descriptor; use addr(...), raw(...), pk(...), pkh(...), wpkh(...), combo(...), multi(...), sortedmulti(...), sh(...), wsh(...), or tr(...)"
         )
     };
     let (base_key, path, wildcard) = parse_descriptor_key(key_expression)?;
@@ -6404,6 +6431,9 @@ mod tests {
         let public_key_script =
             expand_descriptor_scripts(&node, &format!("pk({public_key})"), None).unwrap();
         assert!(public_key_script[0].is_p2pk());
+        let combo_scripts =
+            expand_descriptor_scripts(&node, &format!("combo({public_key})"), None).unwrap();
+        assert_eq!(combo_scripts.len(), 4);
         let wrapped_multisig =
             expand_descriptor_scripts(&node, &format!("wsh({multisig})"), None).unwrap();
         assert!(wrapped_multisig[0].is_p2wsh());

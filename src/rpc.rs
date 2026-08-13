@@ -8,7 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
-use bitcoin::{BlockHash, Network, OutPoint, Transaction, Txid};
+use bitcoin::{BlockHash, Network, OutPoint, Transaction, TxOut, Txid};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -1052,18 +1052,44 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .block(&hash)?
         .ok_or_else(|| anyhow!("Block not found"))?;
     let height = chain.block_height_by_hash(&hash);
+    let fee_stats = chain
+        .block_fee_stats(&hash)?
+        .ok_or_else(|| anyhow!("Block not found"))?;
+    let transaction_fees = fee_stats.transaction_fees_sat;
     let mut total_out = 0u64;
     let mut inputs = 0usize;
     let mut outputs = 0usize;
     let mut total_size = 0usize;
     let mut total_weight = 0u64;
     let mut segwit_transactions = 0usize;
+    let mut segwit_size = 0usize;
+    let mut segwit_weight = 0u64;
+    let mut fees = Vec::with_capacity(transaction_fees.len());
+    let mut fee_rates = Vec::with_capacity(transaction_fees.len());
+    let mut transaction_sizes = Vec::with_capacity(transaction_fees.len());
+    let mut utxo_size_inc = 0i64;
+    let mut utxo_size_inc_actual = 0i64;
+    let mut utxo_count_actual = 0i64;
+    let mut spent_output_index = 0usize;
+    let mut transaction_index = 0usize;
     for transaction in &block.txdata {
         outputs = outputs.saturating_add(transaction.output.len());
+        for output in &transaction.output {
+            let size = utxo_stat_size(output);
+            utxo_size_inc = utxo_size_inc.saturating_add(size);
+            if !output.script_pubkey.is_op_return() {
+                utxo_count_actual = utxo_count_actual.saturating_add(1);
+                utxo_size_inc_actual = utxo_size_inc_actual.saturating_add(size);
+            }
+        }
         if transaction.is_coinbase() {
             continue;
         }
         inputs = inputs.saturating_add(transaction.input.len());
+        let fee = *transaction_fees
+            .get(transaction_index)
+            .ok_or_else(|| anyhow!("block fee statistics are incomplete"))?;
+        transaction_index += 1;
         total_out = total_out.saturating_add(
             transaction
                 .output
@@ -1072,19 +1098,44 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .sum::<u64>(),
         );
         total_size = total_size.saturating_add(serialize(transaction).len());
-        total_weight = total_weight.saturating_add(transaction.weight().to_wu());
+        let size = serialize(transaction).len();
+        let weight = transaction.weight().to_wu();
+        total_weight = total_weight.saturating_add(weight);
+        transaction_sizes.push(size as u64);
+        fees.push(fee);
+        fee_rates.push((
+            fee.saturating_mul(4).checked_div(weight).unwrap_or(0),
+            weight,
+        ));
         if transaction
             .input
             .iter()
             .any(|input| !input.witness.is_empty())
         {
             segwit_transactions = segwit_transactions.saturating_add(1);
+            segwit_size = segwit_size.saturating_add(size);
+            segwit_weight = segwit_weight.saturating_add(weight);
+        }
+        for _ in &transaction.input {
+            let previous_output = fee_stats
+                .spent_outputs
+                .get(spent_output_index)
+                .ok_or_else(|| anyhow!("block fee statistics are incomplete"))?;
+            spent_output_index += 1;
+            let size = utxo_stat_size(previous_output);
+            utxo_size_inc = utxo_size_inc.saturating_sub(size);
+            if !previous_output.script_pubkey.is_op_return() {
+                utxo_count_actual = utxo_count_actual.saturating_sub(1);
+                utxo_size_inc_actual = utxo_size_inc_actual.saturating_sub(size);
+            }
         }
     }
     let non_coinbase = block.txdata.len().saturating_sub(1);
-    let total_fee = chain
-        .block_fee_stats(&hash)?
-        .map(|stats| stats.total_fee_sat);
+    let total_fee = fee_stats.total_fee_sat;
+    let mut sorted_fees = fees.clone();
+    let mut sorted_sizes = transaction_sizes.clone();
+    let mut sorted_fee_rates = fee_rates.clone();
+    let percentiles = weighted_fee_percentiles(&mut sorted_fee_rates, total_weight);
     let result = json!({
         "blockhash": hash.to_string(),
         "height": height,
@@ -1095,17 +1146,37 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "total_size": total_size,
         "total_weight": total_weight,
         "total_out": total_out,
-        "subsidy": height.map(validation::block_subsidy),
+        "subsidy": height.map(validation::block_subsidy).unwrap_or_default(),
         "totalfee": total_fee,
-        "total_fee": total_fee,
         "ins": inputs,
         "outs": outputs,
         "swtxs": segwit_transactions,
-        "avgfee": total_fee.map(|fee| if non_coinbase == 0 { 0 } else { fee / non_coinbase as u64 }),
+        "avgfee": if non_coinbase == 0 { 0 } else { total_fee / non_coinbase as u64 },
+        "avgfeerate": total_fee.saturating_mul(4).checked_div(total_weight).unwrap_or(0),
+        "avgtxsize": total_size.checked_div(non_coinbase).unwrap_or(0),
+        "feerate_percentiles": percentiles,
+        "maxfee": sorted_fees.iter().copied().max().unwrap_or(0),
+        "maxfeerate": fee_rates.iter().map(|(rate, _)| *rate).max().unwrap_or(0),
+        "maxtxsize": sorted_sizes.iter().copied().max().unwrap_or(0),
+        "medianfee": truncated_median(&mut sorted_fees),
+        "mediantime": chain.median_time_past_for_hash(&hash).unwrap_or(block.header.time),
+        "mediantxsize": truncated_median(&mut sorted_sizes),
+        "minfee": sorted_fees.iter().copied().min().unwrap_or(0),
+        "minfeerate": fee_rates.iter().map(|(rate, _)| *rate).min().unwrap_or(0),
+        "mintxsize": sorted_sizes.iter().copied().min().unwrap_or(0),
+        "swtotal_size": segwit_size,
+        "swtotal_weight": segwit_weight,
+        "utxo_increase": outputs as i64 - inputs as i64,
+        "utxo_size_inc": utxo_size_inc,
+        "utxo_increase_actual": utxo_count_actual - inputs as i64,
+        "utxo_size_inc_actual": utxo_size_inc_actual,
     });
     let Some(selected) = params.get(1).and_then(Value::as_array) else {
         return Ok(result);
     };
+    if selected.is_empty() {
+        return Ok(result);
+    }
     let mut filtered = serde_json::Map::new();
     for statistic in selected {
         let statistic = statistic
@@ -1118,6 +1189,43 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         filtered.insert(statistic.to_owned(), value);
     }
     Ok(Value::Object(filtered))
+}
+
+fn utxo_stat_size(output: &TxOut) -> i64 {
+    i64::try_from(serialize(output).len().saturating_add(40)).unwrap_or(i64::MAX)
+}
+
+fn truncated_median(values: &mut [u64]) -> u64 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    let middle = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[middle]
+    } else {
+        values[middle - 1].saturating_add(values[middle]) / 2
+    }
+}
+
+fn weighted_fee_percentiles(values: &mut [(u64, u64)], total_weight: u64) -> [u64; 5] {
+    if values.is_empty() || total_weight == 0 {
+        return [0; 5];
+    }
+    values.sort_unstable_by_key(|(rate, _)| *rate);
+    let mut result = [0; 5];
+    let mut cumulative = 0u64;
+    let targets =
+        [10u64, 25, 50, 75, 90].map(|percentile| total_weight.saturating_mul(percentile) / 100);
+    let mut target_index = 0usize;
+    for (rate, weight) in values.iter().copied() {
+        cumulative = cumulative.saturating_add(weight);
+        while target_index < targets.len() && cumulative >= targets[target_index] {
+            result[target_index] = rate;
+            target_index += 1;
+        }
+    }
+    result
 }
 
 fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -1797,5 +1905,17 @@ mod tests {
         assert_eq!(stats["total_out"], json!(0));
         assert_eq!(stats["subsidy"], json!(5_000_000_000u64));
         assert_eq!(stats["totalfee"], json!(0));
+        assert_eq!(
+            get_block_stats(
+                &node,
+                &json!([hash.to_string(), ["txs", "totalfee", "feerate_percentiles"]]),
+            )
+            .unwrap(),
+            json!({
+                "txs": 1,
+                "totalfee": 0,
+                "feerate_percentiles": [0, 0, 0, 0, 0],
+            })
+        );
     }
 }

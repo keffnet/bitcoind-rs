@@ -5,6 +5,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bitcoin::hashes::Hash;
@@ -47,19 +48,25 @@ impl PeerManager {
             let peers = peers.clone();
             let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
-                let Ok(permit) = slots.acquire_owned().await else {
+                let Ok(_permit) = slots.acquire_owned().await else {
                     return;
                 };
-                match TcpStream::connect(address).await {
-                    Ok(stream) => {
-                        info!(%address, "connected to configured peer");
-                        if let Err(error) = serve_peer(node, stream, true, peers, peer_id).await {
-                            debug!(%address, %error, "outbound peer ended");
+                loop {
+                    match TcpStream::connect(address).await {
+                        Ok(stream) => {
+                            info!(%address, "connected to configured peer");
+                            if let Err(error) =
+                                serve_peer(node.clone(), stream, true, peers.clone(), peer_id).await
+                            {
+                                debug!(%address, %error, "outbound peer ended");
+                            }
+                        }
+                        Err(error) => {
+                            warn!(%address, %error, "unable to connect to configured peer")
                         }
                     }
-                    Err(error) => warn!(%address, %error, "unable to connect to configured peer"),
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
-                drop(permit);
             });
         }
 

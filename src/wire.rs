@@ -11,6 +11,9 @@ use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShor
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn};
+use bitcoin::p2p::message_filter::{
+    CFCheckpt, CFHeaders, CFilter, GetCFCheckpt, GetCFHeaders, GetCFilters,
+};
 use bitcoin::{Block, BlockHash, Network, Transaction};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -19,6 +22,7 @@ const HEADER_SIZE: usize = 24;
 
 pub const NODE_NETWORK: u64 = 1;
 pub const NODE_WITNESS: u64 = 1 << 3;
+pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InventoryType {
@@ -106,12 +110,12 @@ impl VersionMessage {
     pub fn new(start_height: i32, nonce: u64) -> Self {
         Self {
             version: Self::PROTOCOL_VERSION,
-            services: NODE_NETWORK | NODE_WITNESS,
+            services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS,
             timestamp: chrono_like_unix_time(),
-            receiver_services: NODE_NETWORK | NODE_WITNESS,
+            receiver_services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS,
             receiver_address: [0; 16],
             receiver_port: 0,
-            sender_services: NODE_NETWORK | NODE_WITNESS,
+            sender_services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS,
             sender_address: [0; 16],
             sender_port: 0,
             nonce,
@@ -155,6 +159,12 @@ pub enum Message {
     CompactBlock(HeaderAndShortIds),
     GetBlockTxn(BlockTransactionsRequest),
     BlockTxn(BlockTransactions),
+    GetCFilters(GetCFilters),
+    CFilter(CFilter),
+    GetCFHeaders(GetCFHeaders),
+    CFHeaders(CFHeaders),
+    GetCFCheckpt(GetCFCheckpt),
+    CFCheckpt(CFCheckpt),
     Unknown { command: String, payload: Vec<u8> },
 }
 
@@ -185,6 +195,12 @@ impl Message {
             Self::CompactBlock(_) => "cmpctblock",
             Self::GetBlockTxn(_) => "getblocktxn",
             Self::BlockTxn(_) => "blocktxn",
+            Self::GetCFilters(_) => "getcfilters",
+            Self::CFilter(_) => "cfilter",
+            Self::GetCFHeaders(_) => "getcfheaders",
+            Self::CFHeaders(_) => "cfheaders",
+            Self::GetCFCheckpt(_) => "getcfcheckpt",
+            Self::CFCheckpt(_) => "cfcheckpt",
             Self::Unknown { command, .. } => command.as_str(),
         }
     }
@@ -370,6 +386,12 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
         Message::BlockTxn(transactions) => out.extend_from_slice(&serialize(&BlockTxn {
             transactions: transactions.clone(),
         })),
+        Message::GetCFilters(request) => out.extend_from_slice(&serialize(request)),
+        Message::CFilter(response) => out.extend_from_slice(&serialize(response)),
+        Message::GetCFHeaders(request) => out.extend_from_slice(&serialize(request)),
+        Message::CFHeaders(response) => out.extend_from_slice(&serialize(response)),
+        Message::GetCFCheckpt(request) => out.extend_from_slice(&serialize(request)),
+        Message::CFCheckpt(response) => out.extend_from_slice(&serialize(response)),
         Message::Unknown { payload, .. } => out.extend_from_slice(payload),
     }
     Ok(out)
@@ -417,6 +439,12 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
                 .map_err(payload_error)?
                 .transactions,
         ),
+        "getcfilters" => Message::GetCFilters(deserialize(payload).map_err(payload_error)?),
+        "cfilter" => Message::CFilter(deserialize(payload).map_err(payload_error)?),
+        "getcfheaders" => Message::GetCFHeaders(deserialize(payload).map_err(payload_error)?),
+        "cfheaders" => Message::CFHeaders(deserialize(payload).map_err(payload_error)?),
+        "getcfcheckpt" => Message::GetCFCheckpt(deserialize(payload).map_err(payload_error)?),
+        "cfcheckpt" => Message::CFCheckpt(deserialize(payload).map_err(payload_error)?),
         other => Message::Unknown {
             command: other.to_owned(),
             payload: payload.to_vec(),
@@ -430,6 +458,12 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
                 | Message::CompactBlock(_)
                 | Message::GetBlockTxn(_)
                 | Message::BlockTxn(_)
+                | Message::GetCFilters(_)
+                | Message::CFilter(_)
+                | Message::GetCFHeaders(_)
+                | Message::CFHeaders(_)
+                | Message::GetCFCheckpt(_)
+                | Message::CFCheckpt(_)
                 | Message::Unknown { .. }
         )
     {
@@ -831,6 +865,29 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         let compact = HeaderAndShortIds::from_block(&block, 7, 2, &[]).unwrap();
         let message = Message::CompactBlock(compact);
+        let frame = encode_message(Network::Regtest, &message).unwrap();
+        assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn compact_filter_messages_round_trip() {
+        use bitcoin::bip158::{FilterHash, FilterHeader};
+
+        let block_hash = BlockHash::from_byte_array([3; 32]);
+        let message = Message::GetCFilters(GetCFilters {
+            filter_type: 0,
+            start_height: 12,
+            stop_hash: block_hash,
+        });
+        let frame = encode_message(Network::Regtest, &message).unwrap();
+        assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+
+        let message = Message::CFHeaders(CFHeaders {
+            filter_type: 0,
+            stop_hash: block_hash,
+            previous_filter_header: FilterHeader::from_byte_array([4; 32]),
+            filter_hashes: vec![FilterHash::from_byte_array([5; 32])],
+        });
         let frame = encode_message(Network::Regtest, &message).unwrap();
         assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
     }

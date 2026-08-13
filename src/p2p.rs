@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
+use bitcoin::bip158::{FilterHash, FilterHeader};
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
 use bitcoin::{Block, BlockHash, Network, Transaction, Txid, Wtxid};
 use rand::random;
 use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf};
@@ -26,6 +28,12 @@ struct PendingCompactBlock {
     compact: HeaderAndShortIds,
     transactions: Vec<Option<Transaction>>,
     requested_indexes: Vec<u64>,
+}
+
+struct BasicFilterRange {
+    stop_hash: BlockHash,
+    previous_filter_header: FilterHeader,
+    filters: Vec<(BlockHash, Vec<u8>, FilterHeader)>,
 }
 
 pub struct PeerManager {
@@ -530,6 +538,86 @@ async fn serve_peer_loop(
                     }
                 }
             }
+            Message::GetCFilters(request) => {
+                if request.filter_type != 0 {
+                    continue;
+                }
+                let Some(range) =
+                    basic_filter_range(node, request.start_height, request.stop_hash, 1_000)?
+                else {
+                    continue;
+                };
+                for (block_hash, filter, _) in range.filters {
+                    send_message(
+                        writer,
+                        node.config.network,
+                        &Message::CFilter(CFilter {
+                            filter_type: 0,
+                            block_hash,
+                            filter,
+                        }),
+                    )
+                    .await?;
+                }
+            }
+            Message::GetCFHeaders(request) => {
+                if request.filter_type != 0 {
+                    continue;
+                }
+                let Some(range) =
+                    basic_filter_range(node, request.start_height, request.stop_hash, 2_000)?
+                else {
+                    continue;
+                };
+                let filter_hashes = range
+                    .filters
+                    .iter()
+                    .map(|(_, filter, _)| FilterHash::hash(filter))
+                    .collect();
+                let stop_hash = range
+                    .filters
+                    .last()
+                    .map(|(hash, _, _)| *hash)
+                    .unwrap_or(range.stop_hash);
+                send_message(
+                    writer,
+                    node.config.network,
+                    &Message::CFHeaders(CFHeaders {
+                        filter_type: 0,
+                        stop_hash,
+                        previous_filter_header: range.previous_filter_header,
+                        filter_hashes,
+                    }),
+                )
+                .await?;
+            }
+            Message::GetCFCheckpt(request) => {
+                if request.filter_type != 0 {
+                    continue;
+                }
+                let Some(range) = basic_filter_range(node, 0, request.stop_hash, usize::MAX)?
+                else {
+                    continue;
+                };
+                let filter_headers = range
+                    .filters
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(height, (_, _, header))| {
+                        ((height + 1) % 1_000 == 0).then_some(header)
+                    })
+                    .collect();
+                send_message(
+                    writer,
+                    node.config.network,
+                    &Message::CFCheckpt(CFCheckpt {
+                        filter_type: 0,
+                        stop_hash: range.stop_hash,
+                        filter_headers,
+                    }),
+                )
+                .await?;
+            }
             Message::Transaction(transaction) => {
                 let txid = transaction.compute_txid();
                 let wtxid = transaction.compute_wtxid();
@@ -552,6 +640,9 @@ async fn serve_peer_loop(
             }
             Message::Addr(_)
             | Message::AddrV2(_)
+            | Message::CFilter(_)
+            | Message::CFHeaders(_)
+            | Message::CFCheckpt(_)
             | Message::SendHeaders
             | Message::WtxidRelay
             | Message::FeeFilter(_)
@@ -615,6 +706,54 @@ async fn serve_peer_loop(
             verack_sent = true;
         }
     }
+}
+
+fn basic_filter_range(
+    node: &Arc<Node>,
+    start_height: u32,
+    requested_stop_hash: BlockHash,
+    limit: usize,
+) -> Result<Option<BasicFilterRange>> {
+    let mut chain = node.chain.write();
+    let stop_hash = if requested_stop_hash == BlockHash::all_zeros() {
+        chain.best_hash()
+    } else {
+        requested_stop_hash
+    };
+    let Some(stop_height) = chain.block_height_by_hash(&stop_hash) else {
+        return Ok(None);
+    };
+    if !chain.is_active_block(&stop_hash) || start_height > stop_height {
+        return Ok(None);
+    }
+    let end_height = start_height
+        .saturating_add(u32::try_from(limit.saturating_sub(1)).unwrap_or(u32::MAX))
+        .min(stop_height);
+    let end_hash = chain
+        .block_hash(end_height)
+        .ok_or_else(|| anyhow::anyhow!("compact filter height is out of range"))?;
+    let all_filters = chain
+        .basic_filter_chain(&end_hash)?
+        .ok_or_else(|| anyhow::anyhow!("compact filters are not available"))?;
+    let previous_filter_header = if start_height == 0 {
+        FilterHeader::all_zeros()
+    } else {
+        all_filters
+            .get(start_height as usize - 1)
+            .map(|(_, _, header)| *header)
+            .ok_or_else(|| anyhow::anyhow!("compact filter predecessor is unavailable"))?
+    };
+    let filters = all_filters
+        .into_iter()
+        .skip(start_height as usize)
+        .take(limit)
+        .map(|(hash, filter, header)| (hash, filter.content, header))
+        .collect();
+    Ok(Some(BasicFilterRange {
+        stop_hash: end_hash,
+        previous_filter_header,
+        filters,
+    }))
 }
 
 async fn handle_received_block(
@@ -830,5 +969,41 @@ async fn broadcast_inventory(
     let message = Message::Inv(vec![item]);
     for writer in recipients {
         let _ = send_message(&writer, network, &message).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::Network;
+
+    use crate::{Config, Node};
+
+    #[test]
+    fn builds_a_bounded_basic_filter_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let stop_hash = node.chain.read().best_hash();
+        let range = basic_filter_range(&node, 0, stop_hash, 1).unwrap().unwrap();
+        assert_eq!(range.stop_hash, stop_hash);
+        assert_eq!(range.filters.len(), 1);
+        assert_eq!(range.previous_filter_header, FilterHeader::all_zeros());
+        assert!(!range.filters[0].1.is_empty());
+        assert!(
+            basic_filter_range(&node, 1, stop_hash, 1)
+                .unwrap()
+                .is_none()
+        );
     }
 }

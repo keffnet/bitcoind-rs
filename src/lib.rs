@@ -339,6 +339,35 @@ impl Node {
         self.known_addresses.read().values().cloned().collect()
     }
 
+    pub(crate) fn remember_address(&self, address: SocketAddr, services: u64, time: u64) {
+        let mut known = self.known_addresses.write();
+        let entry = known.entry(address).or_insert_with(|| PeerInfo {
+            id: 0,
+            address,
+            inbound: false,
+            version: None,
+            services,
+            user_agent: String::new(),
+            start_height: 0,
+            relay_transactions: true,
+            connected_at: time,
+            last_send: time,
+            last_recv: time,
+            bytes_sent: 0,
+            bytes_received: 0,
+            ping_time: None,
+            min_ping: None,
+            ping_nonce: None,
+            ping_sent_at: None,
+        });
+        if entry.id == 0 {
+            entry.services |= services;
+            entry.connected_at = entry.connected_at.max(time);
+            entry.last_send = entry.last_send.max(time);
+            entry.last_recv = entry.last_recv.max(time);
+        }
+    }
+
     pub fn add_node(&self, address: SocketAddr) -> bool {
         let inserted = self.added_nodes.write().insert(address);
         if inserted {

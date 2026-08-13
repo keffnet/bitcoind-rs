@@ -386,6 +386,14 @@ async fn serve_peer_loop(
                 )
                 .await?;
                 request_headers(node, peer_id, writer).await?;
+                send_message(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &Message::GetAddr,
+                )
+                .await?;
             }
             Message::SendAddrV2 => {
                 addrv2_received = true;
@@ -822,9 +830,21 @@ async fn serve_peer_loop(
                     debug!(%txid, "rejected peer transaction");
                 }
             }
-            Message::Addr(_)
-            | Message::AddrV2(_)
-            | Message::CFilter(_)
+            Message::Addr(addresses) => {
+                for entry in addresses {
+                    if let Some(address) = socket_address_from_legacy(&entry) {
+                        node.remember_address(address, entry.services, u64::from(entry.time));
+                    }
+                }
+            }
+            Message::AddrV2(addresses) => {
+                for address in addresses {
+                    if let Some(socket) = socket_address_from_v2(&address) {
+                        node.remember_address(socket, address.services, u64::from(address.time));
+                    }
+                }
+            }
+            Message::CFilter(_)
             | Message::CFHeaders(_)
             | Message::CFCheckpt(_)
             | Message::SendHeaders
@@ -842,7 +862,7 @@ async fn serve_peer_loop(
             }
             Message::GetAddr => {
                 let peer_infos = node
-                    .peer_infos()
+                    .known_addresses()
                     .into_iter()
                     .take(1_000)
                     .collect::<Vec<_>>();
@@ -1109,6 +1129,33 @@ fn socket_address_bytes(address: std::net::SocketAddr) -> [u8; 16] {
     }
 }
 
+fn socket_address_from_legacy(address: &wire::NetworkAddress) -> Option<std::net::SocketAddr> {
+    let ip = if address.address[..10] == [0; 10] && address.address[10..12] == [0xff, 0xff] {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+            address.address[12],
+            address.address[13],
+            address.address[14],
+            address.address[15],
+        ))
+    } else {
+        std::net::IpAddr::V6(std::net::Ipv6Addr::from(address.address))
+    };
+    (address.port != 0).then(|| std::net::SocketAddr::new(ip, address.port))
+}
+
+fn socket_address_from_v2(address: &wire::NetworkAddressV2) -> Option<std::net::SocketAddr> {
+    let ip = match address.network {
+        1 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+            <[u8; 4]>::try_from(address.address.as_slice()).ok()?,
+        )),
+        2 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+            <[u8; 16]>::try_from(address.address.as_slice()).ok()?,
+        )),
+        _ => return None,
+    };
+    (address.port != 0).then(|| std::net::SocketAddr::new(ip, address.port))
+}
+
 fn network_address_v2(address: std::net::SocketAddr, connected_at: u64) -> wire::NetworkAddressV2 {
     let port = address.port();
     let (network, address) = match address.ip() {
@@ -1268,5 +1315,38 @@ mod tests {
         node.record_pong(7, nonce);
         assert!(node.peer_infos()[0].ping_time.is_some());
         assert!(node.peer_infos()[0].min_ping.is_some());
+    }
+
+    #[test]
+    fn address_messages_round_trip_into_the_known_address_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let legacy = wire::NetworkAddress {
+            time: 123,
+            services: wire::NODE_NETWORK,
+            address: socket_address_bytes("192.0.2.10:18444".parse().unwrap()),
+            port: 18444,
+        };
+        let legacy_socket = socket_address_from_legacy(&legacy).unwrap();
+        node.remember_address(legacy_socket, legacy.services, u64::from(legacy.time));
+        let v2 = network_address_v2("[2001:db8::10]:18444".parse().unwrap(), 456);
+        let v2_socket = socket_address_from_v2(&v2).unwrap();
+        node.remember_address(v2_socket, v2.services, u64::from(v2.time));
+
+        let addresses = node.known_addresses();
+        assert!(addresses.iter().any(|peer| peer.address == legacy_socket));
+        assert!(addresses.iter().any(|peer| peer.address == v2_socket));
+        assert_eq!(addresses.iter().filter(|peer| peer.id == 0).count(), 2);
     }
 }

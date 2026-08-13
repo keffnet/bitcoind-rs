@@ -1092,6 +1092,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         )),
         "getnettotals" => get_net_totals(node),
         "getnodeaddresses" => get_node_addresses(node, params),
+        "getaddrmaninfo" => get_addrman_info(node),
         "addnode" => add_node(node, params),
         "disconnectnode" => disconnect_node(node, params),
         "getaddednodeinfo" => get_added_node_info(node, params),
@@ -1319,10 +1320,58 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 "port": peer.address.port(),
                 "services": format!("{:016x}", peer.services),
                 "time": peer.connected_at,
-                "network": "ipv4",
+                "network": if peer.address.ip().is_ipv4() { "ipv4" } else { "ipv6" },
             }))
             .collect::<Vec<_>>()
     ))
+}
+
+fn get_addrman_info(node: &Arc<Node>) -> Result<Value> {
+    let mut counts = [
+        ("ipv4", (0usize, 0usize)),
+        ("ipv6", (0usize, 0usize)),
+        ("onion", (0usize, 0usize)),
+        ("i2p", (0usize, 0usize)),
+        ("cjdns", (0usize, 0usize)),
+    ]
+    .into_iter()
+    .collect::<HashMap<_, _>>();
+    for peer in node.known_addresses() {
+        let network = if peer.address.ip().is_ipv4() {
+            "ipv4"
+        } else {
+            "ipv6"
+        };
+        let Some((new, tried)) = counts.get_mut(network) else {
+            continue;
+        };
+        if peer.id == 0 {
+            *new = new.saturating_add(1);
+        } else {
+            *tried = tried.saturating_add(1);
+        }
+    }
+    let mut result = serde_json::Map::new();
+    let mut all_new = 0usize;
+    let mut all_tried = 0usize;
+    for network in ["ipv4", "ipv6", "onion", "i2p", "cjdns"] {
+        let (new, tried) = counts[network];
+        all_new = all_new.saturating_add(new);
+        all_tried = all_tried.saturating_add(tried);
+        result.insert(
+            network.to_owned(),
+            json!({"new": new, "tried": tried, "total": new.saturating_add(tried)}),
+        );
+    }
+    result.insert(
+        "all_networks".to_owned(),
+        json!({
+            "new": all_new,
+            "tried": all_tried,
+            "total": all_new.saturating_add(all_tried),
+        }),
+    );
+    Ok(Value::Object(result))
 }
 
 fn get_block_from_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -5970,6 +6019,7 @@ fn rpc_help(method: &str) -> String {
         "getpeerinfo",
         "getnettotals",
         "getnodeaddresses",
+        "getaddrmaninfo",
         "addnode",
         "disconnectnode",
         "getaddednodeinfo",
@@ -6736,6 +6786,29 @@ mod tests {
         );
         dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap();
         assert!(node.network_active());
+    }
+
+    #[test]
+    fn addrman_info_reports_all_network_buckets() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            max_peers: 1,
+            signet_challenge: None,
+        })
+        .unwrap();
+        let result = get_addrman_info(&node).unwrap();
+        for network in ["ipv4", "ipv6", "onion", "i2p", "cjdns", "all_networks"] {
+            assert_eq!(result[network]["new"], json!(0));
+            assert_eq!(result[network]["tried"], json!(0));
+            assert_eq!(result[network]["total"], json!(0));
+        }
     }
 
     #[test]

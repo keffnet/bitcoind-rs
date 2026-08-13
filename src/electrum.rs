@@ -156,7 +156,11 @@ fn dispatch(
             let chain = node.chain.read();
             let mempool = node.mempool.read();
             let mut result = Vec::new();
-            for transaction in mempool.transactions() {
+            for txid in mempool.transaction_order() {
+                let Some(entry) = mempool.get(&txid) else {
+                    continue;
+                };
+                let transaction = &entry.transaction;
                 let affects_outputs = transaction.output.iter().any(|output| {
                     chain::electrum_script_hash(&output.script_pubkey) == script_hash
                 });
@@ -182,8 +186,6 @@ fn dispatch(
                     )
                 });
                 if affects_outputs || affects_inputs {
-                    let txid = transaction.compute_txid();
-                    let entry = mempool.get(&txid).expect("mempool iterator is consistent");
                     result.push(
                         json!({"tx_hash": txid.to_string(), "height": 0, "fee": entry.fee_sat}),
                     );
@@ -273,13 +275,19 @@ fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
     if let Some((transaction, location)) = node.chain.write().transaction(&txid)? {
         if verbose {
-            return Ok(json!({
-                "txid": txid.to_string(),
-                "hash": transaction.compute_wtxid().to_string(),
-                "hex": chain::transaction_hex(&transaction),
-                "blockhash": location.block_hash.to_string(),
-                "height": location.height,
-            }));
+            let chain = node.chain.read();
+            let time = chain
+                .header_by_hash(&location.block_hash)
+                .map(|header| header.time);
+            let confirmations = chain
+                .is_active_block(&location.block_hash)
+                .then(|| chain.height().saturating_sub(location.height) + 1);
+            return Ok(electrum_transaction_json(
+                &transaction,
+                Some(&location),
+                confirmations,
+                time,
+            ));
         }
         return Ok(json!(chain::transaction_hex(&transaction)));
     }
@@ -287,6 +295,75 @@ fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
         return Ok(json!(chain::transaction_hex(&entry.transaction)));
     }
     bail!("transaction not found")
+}
+
+fn electrum_transaction_json(
+    transaction: &Transaction,
+    location: Option<&chain::TxLocation>,
+    confirmations: Option<u32>,
+    time: Option<u32>,
+) -> Value {
+    let vin = transaction
+        .input
+        .iter()
+        .map(|input| {
+            if input.previous_output.is_null() {
+                json!({
+                    "coinbase": hex::encode(input.script_sig.as_bytes()),
+                    "sequence": input.sequence.to_consensus_u32(),
+                })
+            } else {
+                json!({
+                    "txid": input.previous_output.txid.to_string(),
+                    "vout": input.previous_output.vout,
+                    "scriptSig": {
+                        "hex": hex::encode(input.script_sig.as_bytes()),
+                        "asm": input.script_sig.to_asm_string(),
+                    },
+                    "txinwitness": input.witness.to_vec().into_iter().map(hex::encode).collect::<Vec<_>>(),
+                    "sequence": input.sequence.to_consensus_u32(),
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    let vout = transaction
+        .output
+        .iter()
+        .enumerate()
+        .map(|(index, output)| {
+            json!({
+                "value": output.value.to_btc(),
+                "n": index,
+                "scriptPubKey": {
+                    "hex": hex::encode(output.script_pubkey.as_bytes()),
+                    "asm": output.script_pubkey.to_asm_string(),
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut result = json!({
+        "txid": transaction.compute_txid().to_string(),
+        "hash": transaction.compute_wtxid().to_string(),
+        "version": transaction.version.0,
+        "hex": chain::transaction_hex(transaction),
+        "size": serialize(transaction).len(),
+        "vsize": transaction.vsize(),
+        "weight": transaction.weight().to_wu(),
+        "locktime": transaction.lock_time.to_consensus_u32(),
+        "vin": vin,
+        "vout": vout,
+    });
+    if let Some(location) = location {
+        result["blockhash"] = json!(location.block_hash.to_string());
+        result["height"] = json!(location.height);
+    }
+    if let Some(confirmations) = confirmations {
+        result["confirmations"] = json!(confirmations);
+    }
+    if let Some(time) = time {
+        result["time"] = json!(time);
+    }
+    result
 }
 
 fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {

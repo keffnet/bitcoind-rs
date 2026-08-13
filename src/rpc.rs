@@ -298,8 +298,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "bestblock": chain.best_hash().to_string(),
                 "transactions": transactions,
                 "txouts": outputs,
-                "bogosize": outputs.saturating_mul(32 + 4 + 4 + 1 + 8 + 8),
-                "hash_serialized_2": chain.utxo_serialized_hash(),
+                "bogosize": chain.utxo_bogo_size(),
+                "hash_serialized_3": chain.utxo_serialized_hash(),
                 "disk_size": disk_size,
                 "total_amount": sat_to_btc(total),
             }))
@@ -399,6 +399,8 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "headers": header_tip.height,
         "bestblockhash": tip.hash.to_string(),
         "chainwork": format!("{:064x}", tip.work),
+        "bits": format!("{:08x}", header.bits.to_consensus()),
+        "target": format!("{:064x}", header.target()),
         "difficulty": header.difficulty_float(),
         "time": header.time,
         "mediantime": chain.median_time_past_value(),
@@ -406,6 +408,8 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "initialblockdownload": tip.height < header_tip.height,
         "pruned": false,
         "size_on_disk": std::fs::metadata(chain.store.path()).map(|m| m.len()).unwrap_or(0),
+        "warnings": [],
+        "signet_challenge": chain.signet_challenge().map(hex::encode),
     }))
 }
 

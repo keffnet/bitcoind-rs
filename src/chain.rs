@@ -619,24 +619,32 @@ impl ChainState {
         (transactions.len(), self.utxos.len(), total)
     }
 
+    pub fn utxo_bogo_size(&self) -> u64 {
+        self.utxos.values().fold(0u64, |size, entry| {
+            size.saturating_add(
+                32u64
+                    .saturating_add(4)
+                    .saturating_add(4)
+                    .saturating_add(8)
+                    .saturating_add(2)
+                    .saturating_add(entry.output.script_pubkey.len() as u64),
+            )
+        })
+    }
+
+    pub fn signet_challenge(&self) -> Option<&[u8]> {
+        self.signet_challenge.as_deref()
+    }
+
     pub fn utxo_serialized_hash(&self) -> String {
         let mut entries: Vec<(&OutPoint, &UtxoEntry)> = self.utxos.iter().collect();
-        entries.sort_by(|(left, _), (right, _)| {
-            left.txid
-                .to_string()
-                .cmp(&right.txid.to_string())
-                .then_with(|| left.vout.cmp(&right.vout))
-        });
+        entries.sort_by_key(|(outpoint, _)| (outpoint.txid.to_byte_array(), outpoint.vout));
         let mut engine = bitcoin::hashes::sha256d::Hash::engine();
         for (outpoint, entry) in entries {
-            engine.input(&outpoint.txid.to_byte_array());
-            engine.input(&outpoint.vout.to_le_bytes());
-            engine.input(&entry.height.to_le_bytes());
-            engine.input(&[u8::from(entry.coinbase)]);
-            engine.input(&entry.output.value.to_sat().to_le_bytes());
-            let script = entry.output.script_pubkey.as_bytes();
-            engine.input(&(script.len() as u64).to_le_bytes());
-            engine.input(script);
+            engine.input(&serialize(outpoint));
+            engine
+                .input(&(entry.height.saturating_mul(2) | u32::from(entry.coinbase)).to_le_bytes());
+            engine.input(&serialize(&entry.output));
         }
         bitcoin::hashes::sha256d::Hash::from_engine(engine).to_string()
     }

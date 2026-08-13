@@ -5,8 +5,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::{Transaction, Txid};
+use bitcoin::{OutPoint, Transaction, TxOut, Txid};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::debug;
@@ -48,6 +49,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut events = node.subscribe_chain();
+    let mut mempool_events = node.subscribe_mempool();
     let mut line = Vec::new();
     let mut subscriptions: HashSet<String> = HashSet::new();
     let mut headers_subscribed = false;
@@ -75,23 +77,14 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         write_half.write_all(&encoded).await?;
                     }
                 }
-                let statuses = {
-                    let chain = node.chain.read();
-                    subscriptions
-                        .iter()
-                        .map(|script_hash| {
-                            json!({
-                                "jsonrpc": "2.0",
-                                "method": "blockchain.scripthash.subscribe",
-                                "params": [script_hash, chain.history_status(script_hash)],
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                };
-                for notification in statuses {
-                    let mut encoded = serde_json::to_vec(&notification)?;
-                    encoded.push(b'\n');
-                    write_half.write_all(&encoded).await?;
+                send_status_notifications(&node, &subscriptions, &mut write_half).await?;
+            }
+            event = mempool_events.recv() => {
+                match event {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        send_status_notifications(&node, &subscriptions, &mut write_half).await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
             read = reader.read_until(b'\n', &mut line) => {
@@ -147,41 +140,16 @@ fn dispatch(
         "blockchain.block.headers" => block_headers(node, params),
         "blockchain.scripthash.get_history" => {
             let script_hash = script_hash_param(params, 0)?;
-            Ok(json!(
-                node.chain
-                    .read()
-                    .get_history(&script_hash)
-                    .into_iter()
-                    .map(|entry| json!({"tx_hash": entry.txid.to_string(), "height": entry.height}))
-                    .collect::<Vec<_>>()
-            ))
+            Ok(json!(history_for_script(node, &script_hash)))
         }
         "blockchain.scripthash.get_balance" => {
             let script_hash = script_hash_param(params, 0)?;
-            let confirmed = node
-                .chain
-                .read()
-                .get_utxos(&script_hash)
-                .into_iter()
-                .map(|(_, entry)| entry.output.value.to_sat())
-                .sum::<u64>();
-            Ok(json!({"confirmed": confirmed, "unconfirmed": 0}))
+            let (confirmed, unconfirmed) = balance_for_script(node, &script_hash);
+            Ok(json!({"confirmed": confirmed, "unconfirmed": unconfirmed}))
         }
         "blockchain.scripthash.listunspent" => {
             let script_hash = script_hash_param(params, 0)?;
-            Ok(json!(
-                node.chain
-                    .read()
-                    .get_utxos(&script_hash)
-                    .into_iter()
-                    .map(|(outpoint, entry)| json!({
-                        "tx_hash": outpoint.txid.to_string(),
-                        "tx_pos": outpoint.vout,
-                        "height": entry.height,
-                        "value": entry.output.value.to_sat(),
-                    }))
-                    .collect::<Vec<_>>()
-            ))
+            Ok(json!(unspent_for_script(node, &script_hash)))
         }
         "blockchain.scripthash.get_mempool" => {
             let script_hash = script_hash_param(params, 0)?;
@@ -226,10 +194,7 @@ fn dispatch(
         "blockchain.scripthash.subscribe" => {
             let script_hash = script_hash_param(params, 0)?;
             subscriptions.insert(script_hash.clone());
-            Ok(node
-                .chain
-                .read()
-                .history_status(&script_hash)
+            Ok(history_status_for_script(node, &script_hash)
                 .map(Value::String)
                 .unwrap_or(Value::Null))
         }
@@ -306,6 +271,192 @@ fn transaction_broadcast(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let transaction: Transaction = deserialize(&hex::decode(raw)?)?;
     let txid = node.accept_transaction(transaction)?;
     Ok(json!(txid.to_string()))
+}
+
+async fn send_status_notifications(
+    node: &Arc<Node>,
+    subscriptions: &HashSet<String>,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+) -> Result<()> {
+    for script_hash in subscriptions {
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.scripthash.subscribe",
+            "params": [script_hash, history_status_for_script(node, script_hash)],
+        });
+        let mut encoded = serde_json::to_vec(&notification)?;
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await?;
+    }
+    Ok(())
+}
+
+fn history_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
+    history_records_for_script(node, script_hash)
+        .into_iter()
+        .map(|(txid, height)| json!({"tx_hash": txid.to_string(), "height": height}))
+        .collect()
+}
+
+fn history_status_for_script(node: &Arc<Node>, script_hash: &str) -> Option<String> {
+    let records = history_records_for_script(node, script_hash);
+    if records.is_empty() {
+        return None;
+    }
+    let mut input = String::new();
+    for (txid, height) in records {
+        input.push_str(&txid.to_string());
+        input.push(':');
+        input.push_str(&height.to_string());
+        input.push(':');
+    }
+    let mut digest = Sha256::digest(input.as_bytes()).to_vec();
+    digest.reverse();
+    Some(hex::encode(digest))
+}
+
+fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<(Txid, i64)> {
+    let chain = node.chain.read();
+    let mempool = node.mempool.read();
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in chain.get_history(script_hash) {
+        if seen.insert(entry.txid) {
+            records.push((entry.txid, i64::from(entry.height)));
+        }
+    }
+    for txid in mempool.transaction_order() {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        if transaction_affects_script(&entry.transaction, &chain, &mempool, script_hash)
+            && seen.insert(txid)
+        {
+            records.push((txid, 0));
+        }
+    }
+    records
+}
+
+fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> (u64, i64) {
+    let chain = node.chain.read();
+    let mempool = node.mempool.read();
+    let confirmed = chain
+        .get_utxos(script_hash)
+        .into_iter()
+        .map(|(_, entry)| entry.output.value.to_sat())
+        .sum();
+    let mut unconfirmed = 0i64;
+    for txid in mempool.transaction_order() {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        for input in &entry.transaction.input {
+            if let Some(output) = output_for_outpoint(&chain, &mempool, input.previous_output)
+                && chain::electrum_script_hash(&output.script_pubkey) == script_hash
+            {
+                unconfirmed -= output.value.to_sat() as i64;
+            }
+        }
+        for output in &entry.transaction.output {
+            if chain::electrum_script_hash(&output.script_pubkey) == script_hash {
+                unconfirmed += output.value.to_sat() as i64;
+            }
+        }
+    }
+    (confirmed, unconfirmed)
+}
+
+fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
+    let chain = node.chain.read();
+    let mempool = node.mempool.read();
+    let mut spent = HashSet::new();
+    for txid in mempool.transaction_order() {
+        if let Some(entry) = mempool.get(&txid) {
+            spent.extend(
+                entry
+                    .transaction
+                    .input
+                    .iter()
+                    .map(|input| input.previous_output),
+            );
+        }
+    }
+    let mut results: Vec<(OutPoint, i64, u64)> = chain
+        .get_utxos(script_hash)
+        .into_iter()
+        .filter(|(outpoint, _)| !spent.contains(outpoint))
+        .map(|(outpoint, entry)| {
+            (
+                outpoint,
+                i64::from(entry.height),
+                entry.output.value.to_sat(),
+            )
+        })
+        .collect();
+    for txid in mempool.transaction_order() {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        for (vout, output) in entry.transaction.output.iter().enumerate() {
+            if chain::electrum_script_hash(&output.script_pubkey) == script_hash {
+                let outpoint = OutPoint::new(txid, vout as u32);
+                if !spent.contains(&outpoint) {
+                    results.push((outpoint, 0, output.value.to_sat()));
+                }
+            }
+        }
+    }
+    results.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.0.txid.to_string().cmp(&right.0.txid.to_string()))
+            .then_with(|| left.0.vout.cmp(&right.0.vout))
+    });
+    results
+        .into_iter()
+        .map(|(outpoint, height, value)| {
+            json!({
+                "tx_hash": outpoint.txid.to_string(),
+                "tx_pos": outpoint.vout,
+                "height": height,
+                "value": value,
+            })
+        })
+        .collect()
+}
+
+fn transaction_affects_script(
+    transaction: &Transaction,
+    chain: &crate::chain::ChainState,
+    mempool: &crate::mempool::Mempool,
+    script_hash: &str,
+) -> bool {
+    transaction
+        .output
+        .iter()
+        .any(|output| chain::electrum_script_hash(&output.script_pubkey) == script_hash)
+        || transaction.input.iter().any(|input| {
+            output_for_outpoint(chain, mempool, input.previous_output).is_some_and(|output| {
+                chain::electrum_script_hash(&output.script_pubkey) == script_hash
+            })
+        })
+}
+
+fn output_for_outpoint(
+    chain: &crate::chain::ChainState,
+    mempool: &crate::mempool::Mempool,
+    outpoint: OutPoint,
+) -> Option<TxOut> {
+    chain
+        .utxo(&outpoint)
+        .map(|entry| entry.output.clone())
+        .or_else(|| {
+            mempool
+                .get(&outpoint.txid)
+                .and_then(|entry| entry.transaction.output.get(outpoint.vout as usize))
+                .cloned()
+        })
 }
 
 fn script_hash_param(params: &Value, index: usize) -> Result<String> {

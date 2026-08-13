@@ -354,6 +354,39 @@ impl ChainState {
         self.store.get(hash)
     }
 
+    pub fn active_blocks_after(&mut self, previous_tip: BlockHash) -> Result<Vec<Block>> {
+        if previous_tip == self.best_hash() {
+            return Ok(Vec::new());
+        }
+        let active: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
+        let mut cursor = previous_tip;
+        let common = loop {
+            if active.contains(&cursor) {
+                break cursor;
+            }
+            cursor = self
+                .block_index
+                .get(&cursor)
+                .context("previous active tip is not indexed")?
+                .header
+                .prev_blockhash;
+        };
+        let start = self
+            .active_chain
+            .iter()
+            .position(|hash| *hash == common)
+            .expect("common active ancestor is in active chain")
+            .saturating_add(1);
+        self.active_chain[start..]
+            .iter()
+            .map(|hash| {
+                self.store
+                    .get(hash)?
+                    .with_context(|| format!("active block {hash} is missing"))
+            })
+            .collect()
+    }
+
     pub fn transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
         let Some(location) = self
             .tx_index
@@ -1123,6 +1156,7 @@ mod tests {
         let main_one = mine_block(&state, 1);
         state.connect_block(main_one).unwrap();
         let main_two = mine_block(&state, 2);
+        let old_tip = main_two.block_hash();
         state.connect_block(main_two).unwrap();
 
         let genesis = *state.header(0).unwrap();
@@ -1141,6 +1175,9 @@ mod tests {
         assert_eq!(state.height(), 3);
         assert_eq!(state.best_hash(), side_three_hash);
         assert_eq!(state.block_hash(1), Some(side_one_hash));
+        let replacement = state.active_blocks_after(old_tip).unwrap();
+        assert_eq!(replacement.len(), 3);
+        assert_eq!(replacement[0].block_hash(), side_one_hash);
         let tips = state.chain_tips();
         assert_eq!(tips.len(), 2);
         assert_eq!(tips[0].status, "active");

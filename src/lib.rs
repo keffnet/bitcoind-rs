@@ -68,13 +68,23 @@ impl Node {
     }
 
     pub fn connect_block(&self, block: Block) -> Result<ChainEvent> {
-        let hash = block.block_hash();
         let previous_tip = self.chain.read().best_hash();
-        let tip = self.chain.write().connect_block(block.clone())?;
-        if tip.hash != previous_tip && self.chain.read().is_active_block(&hash) {
+        let (tip, activated_blocks) = {
+            let mut chain = self.chain.write();
+            let tip = chain.connect_block(block)?;
+            let activated_blocks = if tip.hash != previous_tip {
+                chain.active_blocks_after(previous_tip)?
+            } else {
+                Vec::new()
+            };
+            (tip, activated_blocks)
+        };
+        if !activated_blocks.is_empty() {
             let chain = self.chain.read();
             let mut mempool = self.mempool.write();
-            mempool.remove_confirmed(&block);
+            for block in &activated_blocks {
+                mempool.remove_confirmed(block);
+            }
             mempool.revalidate(&chain);
             let _ = self.events.send(tip.clone());
         }

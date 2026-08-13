@@ -1,6 +1,6 @@
 //! Wallet-free Bitcoin Core-style JSON-RPC over HTTP/1.1.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -3092,6 +3092,49 @@ fn mine_block(mut block: Block, max_tries: u64) -> Option<Block> {
     None
 }
 
+fn select_template_transaction(
+    txid: Txid,
+    mempool: &Mempool,
+    positions: &mut HashMap<Txid, usize>,
+    selected: &mut Vec<Txid>,
+    weight: &mut u64,
+    visiting: &mut HashSet<Txid>,
+) -> bool {
+    if positions.contains_key(&txid) {
+        return true;
+    }
+    if !visiting.insert(txid) {
+        return false;
+    }
+    let Some(entry) = mempool.get(&txid) else {
+        visiting.remove(&txid);
+        return false;
+    };
+    let parents = entry
+        .transaction
+        .input
+        .iter()
+        .map(|input| input.previous_output.txid)
+        .filter(|parent| mempool.get(parent).is_some())
+        .collect::<Vec<_>>();
+    if parents.iter().any(|parent| {
+        !select_template_transaction(*parent, mempool, positions, selected, weight, visiting)
+    }) {
+        visiting.remove(&txid);
+        return false;
+    }
+    let next_weight = weight.saturating_add(entry.transaction.weight().to_wu());
+    if next_weight.saturating_add(4_000) > 4_000_000 {
+        visiting.remove(&txid);
+        return false;
+    }
+    *weight = next_weight;
+    positions.insert(txid, selected.len() + 1);
+    selected.push(txid);
+    visiting.remove(&txid);
+    true
+}
+
 fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let request = params
         .get(0)
@@ -3145,24 +3188,16 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let order = mempool.transaction_order();
     let mut positions = HashMap::new();
     let mut selected = Vec::new();
+    let mut visiting = HashSet::new();
     for txid in order {
-        let Some(entry) = mempool.get(&txid) else {
-            continue;
-        };
-        let has_unselected_parent = entry.transaction.input.iter().any(|input| {
-            mempool.get(&input.previous_output.txid).is_some()
-                && !positions.contains_key(&input.previous_output.txid)
-        });
-        if has_unselected_parent {
-            continue;
-        }
-        let next_weight = weight.saturating_add(entry.transaction.weight().to_wu());
-        if next_weight.saturating_add(4_000) > 4_000_000 {
-            continue;
-        }
-        weight = next_weight;
-        positions.insert(txid, selected.len() + 1);
-        selected.push(txid);
+        select_template_transaction(
+            txid,
+            &mempool,
+            &mut positions,
+            &mut selected,
+            &mut weight,
+            &mut visiting,
+        );
     }
     let transactions = selected
         .iter()
@@ -4998,6 +5033,88 @@ mod tests {
         let mempool = node.mempool.read();
         assert!(mempool.get(&old_txid).is_none());
         assert!(mempool.get(&replacement_txid).is_some());
+    }
+
+    #[test]
+    fn submit_package_orders_parent_and_child_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let mined = generate_to_descriptor(&node, &json!([102, "raw(51)"])).unwrap();
+        let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
+        let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        let funding_outpoint = OutPoint::new(funding.txdata[0].compute_txid(), 0);
+        let parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let parent_outpoint = OutPoint::new(parent.compute_txid(), 0);
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: parent_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(4_999_998_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let result = submit_package(
+            &node,
+            &json!([[
+                hex::encode(serialize(&child)),
+                hex::encode(serialize(&parent)),
+            ]]),
+        )
+        .unwrap();
+        assert_eq!(result["package_msg"], "success");
+        assert_eq!(
+            result["tx-results"][parent.compute_txid().to_string()]["allowed"],
+            true
+        );
+        assert_eq!(
+            result["tx-results"][child.compute_txid().to_string()]["allowed"],
+            true
+        );
+        let mempool = node.mempool.read();
+        assert!(mempool.get(&parent.compute_txid()).is_some());
+        assert!(mempool.get(&child.compute_txid()).is_some());
+        drop(mempool);
+        let template = get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
+        let template_transactions = template["transactions"].as_array().unwrap();
+        let parent_position = template_transactions
+            .iter()
+            .position(|entry| entry["txid"] == parent.compute_txid().to_string())
+            .expect("package parent is in the template");
+        let child_position = template_transactions
+            .iter()
+            .position(|entry| entry["txid"] == child.compute_txid().to_string())
+            .expect("package child is in the template");
+        assert!(parent_position < child_position);
     }
 
     #[test]

@@ -294,11 +294,7 @@ pub fn validate_signet_block_solution(
     let modified_merkle = bitcoin::merkle_tree::calculate_root(merkle_leaves.into_iter())
         .ok_or(ValidationError::BadSignetSolution)?;
 
-    let mut block_data = Vec::with_capacity(72);
-    block_data.extend_from_slice(&serialize(&block.header.version));
-    block_data.extend_from_slice(&serialize(&block.header.prev_blockhash));
-    block_data.extend_from_slice(&serialize(&modified_merkle));
-    block_data.extend_from_slice(&serialize(&block.header.time));
+    let block_data = signet_block_data(block, &modified_merkle);
     let block_data =
         PushBytesBuf::try_from(block_data).map_err(|_| ValidationError::BadSignetSolution)?;
 
@@ -354,6 +350,15 @@ pub fn validate_signet_block_solution(
         flags,
     )
     .map_err(|_| ValidationError::BadSignetSolution)
+}
+
+fn signet_block_data(block: &Block, modified_merkle: &Txid) -> Vec<u8> {
+    let mut block_data = Vec::with_capacity(72);
+    block_data.extend_from_slice(&serialize(&block.header.version));
+    block_data.extend_from_slice(&serialize(&block.header.prev_blockhash));
+    block_data.extend_from_slice(&serialize(modified_merkle));
+    block_data.extend_from_slice(&serialize(&block.header.time));
+    block_data
 }
 
 fn extract_signet_solution(
@@ -559,6 +564,27 @@ mod tests {
             }],
         };
         validate_transaction_scripts(Network::Regtest, 1, &transaction, &[previous]).unwrap();
+    }
+
+    #[test]
+    fn signet_message_has_the_bip325_header_fields_once() {
+        let block = Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: BlockHash::from_byte_array([1; 32]),
+                merkle_root: bitcoin::TxMerkleNode::from_byte_array([2; 32]),
+                time: 123,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: Vec::new(),
+        };
+        let modified_merkle = Txid::from_byte_array([3; 32]);
+        let data = signet_block_data(&block, &modified_merkle);
+        assert_eq!(data.len(), 72);
+        assert_eq!(&data[0..4], &2i32.to_le_bytes());
+        assert_eq!(&data[36..68], &modified_merkle.to_byte_array());
+        assert_eq!(&data[68..72], &123u32.to_le_bytes());
     }
 
     #[test]

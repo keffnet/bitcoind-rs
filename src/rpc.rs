@@ -1879,20 +1879,37 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         -1
     };
     let hash_string = hash.to_string();
+    let undo = if verbosity >= 3 {
+        Some(
+            chain
+                .spent_outputs_by_transaction(&hash)?
+                .ok_or_else(|| anyhow!("Block undo not found"))?,
+        )
+    } else {
+        None
+    };
     let txs = if verbosity >= 2 {
         block
             .txdata
             .iter()
-            .map(|tx| {
-                rpc_transaction(
+            .enumerate()
+            .map(|(transaction_index, tx)| {
+                let mut transaction_json = rpc_transaction(
                     tx,
                     Some(&hash_string),
                     Some(confirmations),
                     Some(block.header.time),
                     Some(block.header.time),
-                )
+                );
+                if let Some(undo) = undo.as_ref() {
+                    let spent_outputs = undo.get(transaction_index).ok_or_else(|| {
+                        anyhow!("Block undo is missing transaction {transaction_index}")
+                    })?;
+                    add_prevout_details(&mut transaction_json, tx, spent_outputs, &mut chain)?;
+                }
+                Ok(transaction_json)
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>>>()?
     } else {
         block
             .txdata
@@ -4088,6 +4105,40 @@ fn rpc_transaction(
     value
 }
 
+fn add_prevout_details(
+    transaction_json: &mut Value,
+    transaction: &Transaction,
+    spent_outputs: &[bitcoin::TxOut],
+    chain: &mut chain::ChainState,
+) -> Result<()> {
+    let vin = transaction_json
+        .get_mut("vin")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow!("transaction JSON has no vin array"))?;
+    for (input_index, input) in transaction.input.iter().enumerate() {
+        if input.previous_output.is_null() {
+            continue;
+        }
+        let output = spent_outputs
+            .get(input_index)
+            .ok_or_else(|| anyhow!("transaction undo is missing input {input_index}"))?;
+        let (previous_transaction, location) = chain
+            .transaction(&input.previous_output.txid)?
+            .ok_or_else(|| anyhow!("previous transaction is unavailable"))?;
+        let prevout = json!({
+            "generated": previous_transaction.is_coinbase(),
+            "height": location.height,
+            "value": sat_to_btc(output.value.to_sat()),
+            "scriptPubKey": script_json(&output.script_pubkey),
+        });
+        let input_json = vin
+            .get_mut(input_index)
+            .ok_or_else(|| anyhow!("transaction JSON input index is inconsistent"))?;
+        input_json["prevout"] = prevout;
+    }
+    Ok(())
+}
+
 fn script_json(script: &bitcoin::Script) -> Value {
     json!({"asm": script.to_asm_string(), "hex": hex::encode(script.as_bytes())})
 }
@@ -4631,6 +4682,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(node.chain.read().height(), 1);
+    }
+
+    #[test]
+    fn getblock_verbosity_three_includes_prevout_details() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let mined = generate_to_descriptor(&node, &json!([102, "raw(51)"])).unwrap();
+        let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
+        let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        let spend = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(funding.txdata[0].compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let spend_txid = node.accept_transaction(spend).unwrap();
+        let block_hash: BlockHash = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap()
+            [0]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+        let block = get_block(&node, &json!([block_hash.to_string(), 3])).unwrap();
+        let transaction = block["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|transaction| transaction["txid"] == spend_txid.to_string())
+            .expect("mined transaction is present");
+        assert_eq!(transaction["vin"][0]["prevout"]["generated"], true);
+        assert_eq!(transaction["vin"][0]["prevout"]["height"], 1);
+        assert_eq!(transaction["vin"][0]["prevout"]["value"], 50.0);
+        assert_eq!(
+            transaction["vin"][0]["prevout"]["scriptPubKey"]["hex"],
+            "51"
+        );
     }
 
     #[test]

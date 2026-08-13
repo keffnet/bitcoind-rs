@@ -739,10 +739,7 @@ fn verify_txout_proof(params: &Value) -> Result<Value> {
     };
     let height = merkle_tree_height(total);
     let (root, matches) = extract_merkle_node(height, 0, total, &mut cursor)?;
-    if root.to_raw_hash() != header.merkle_root.to_raw_hash()
-        || cursor.hash_index != hashes.len()
-        || matches.is_empty()
-    {
+    if root.to_raw_hash() != header.merkle_root.to_raw_hash() || cursor.hash_index != hashes.len() {
         bail!("invalid merkle proof");
     }
     Ok(json!(
@@ -971,9 +968,27 @@ impl<'a> ProofReader<'a> {
         let prefix = self.bytes(1)?[0];
         let value = match prefix {
             0..=0xfc => u64::from(prefix),
-            0xfd => u64::from(u16::from_le_bytes(self.array()?)),
-            0xfe => u64::from(u32::from_le_bytes(self.array()?)),
-            0xff => u64::from_le_bytes(self.array()?),
+            0xfd => {
+                let value = u16::from_le_bytes(self.array()?);
+                if value < 0xfd {
+                    return Err(anyhow!("non-canonical merkle proof count"));
+                }
+                u64::from(value)
+            }
+            0xfe => {
+                let value = u32::from_le_bytes(self.array()?);
+                if value <= u16::MAX as u32 {
+                    return Err(anyhow!("non-canonical merkle proof count"));
+                }
+                u64::from(value)
+            }
+            0xff => {
+                let value = u64::from_le_bytes(self.array()?);
+                if value <= u32::MAX as u64 {
+                    return Err(anyhow!("non-canonical merkle proof count"));
+                }
+                value
+            }
         };
         usize::try_from(value).map_err(|_| anyhow!("merkle proof count overflows usize"))
     }
@@ -1704,6 +1719,27 @@ mod tests {
         let mut proof = serialize_merkle_proof(&block, &[txid]).unwrap();
         proof[36] ^= 1;
         assert!(verify_txout_proof(&json!([hex::encode(proof)])).is_err());
+    }
+
+    #[test]
+    fn merkle_proof_can_validly_contain_no_matches() {
+        let mut block = bitcoin::Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![proof_transaction(6), proof_transaction(7)],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let proof = serialize_merkle_proof(&block, &[]).unwrap();
+        assert_eq!(
+            verify_txout_proof(&json!([hex::encode(proof)])).unwrap(),
+            json!([])
+        );
     }
 
     #[test]

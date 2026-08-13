@@ -602,6 +602,28 @@ impl ChainState {
         (transactions.len(), self.utxos.len(), total)
     }
 
+    pub fn utxo_serialized_hash(&self) -> String {
+        let mut entries: Vec<(&OutPoint, &UtxoEntry)> = self.utxos.iter().collect();
+        entries.sort_by(|(left, _), (right, _)| {
+            left.txid
+                .to_string()
+                .cmp(&right.txid.to_string())
+                .then_with(|| left.vout.cmp(&right.vout))
+        });
+        let mut engine = bitcoin::hashes::sha256d::Hash::engine();
+        for (outpoint, entry) in entries {
+            engine.input(&outpoint.txid.to_byte_array());
+            engine.input(&outpoint.vout.to_le_bytes());
+            engine.input(&entry.height.to_le_bytes());
+            engine.input(&[u8::from(entry.coinbase)]);
+            engine.input(&entry.output.value.to_sat().to_le_bytes());
+            let script = entry.output.script_pubkey.as_bytes();
+            engine.input(&(script.len() as u64).to_le_bytes());
+            engine.input(script);
+        }
+        bitcoin::hashes::sha256d::Hash::from_engine(engine).to_string()
+    }
+
     pub fn verify_active_chain(&mut self, depth: u32) -> Result<()> {
         let start = if depth == 0 {
             0

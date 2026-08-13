@@ -290,11 +290,17 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "gettxoutsetinfo" => {
             let chain = node.chain.read();
             let (transactions, outputs, total) = chain.utxo_stats();
+            let disk_size = std::fs::metadata(chain.store.path())
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
             Ok(json!({
                 "height": chain.height(),
                 "bestblock": chain.best_hash().to_string(),
                 "transactions": transactions,
                 "txouts": outputs,
+                "bogosize": outputs.saturating_mul(32 + 4 + 4 + 1 + 8 + 8),
+                "hash_serialized_2": chain.utxo_serialized_hash(),
+                "disk_size": disk_size,
                 "total_amount": sat_to_btc(total),
             }))
         }

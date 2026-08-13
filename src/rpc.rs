@@ -6036,6 +6036,15 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
             if filter_type != "basic" {
                 bail!("only the basic block filter is available")
             }
+            let filter_false_positives = match params.get(5).filter(|value| !value.is_null()) {
+                None => false,
+                Some(options) => options
+                    .get("filter_false_positives")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        anyhow!("scanblocks options.filter_false_positives must be a boolean")
+                    })?,
+            };
             if start_height > stop_height || stop_height > chain_height {
                 bail!("invalid scan height range")
             }
@@ -6054,7 +6063,10 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 let (_, filter, _) = filters
                     .get(height as usize)
                     .ok_or_else(|| anyhow!("block filter is missing"))?;
-                if filter.match_any(&hash, scripts.iter().map(|script| script.as_bytes()))? {
+                if filter.match_any(&hash, scripts.iter().map(|script| script.as_bytes()))?
+                    && (!filter_false_positives
+                        || block_matches_scripts(&mut chain, &hash, &scripts)?)
+                {
                     relevant_blocks.push(hash.to_string());
                 }
             }
@@ -6067,6 +6079,40 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }
         _ => bail!("scanblocks action must be start, status, or abort"),
     }
+}
+
+fn block_matches_scripts(
+    chain: &mut chain::ChainState,
+    hash: &BlockHash,
+    scripts: &[ScriptBuf],
+) -> Result<bool> {
+    let block = chain
+        .block(hash)?
+        .ok_or_else(|| anyhow!("block not found while verifying filter match"))?;
+    for transaction in &block.txdata {
+        if transaction
+            .output
+            .iter()
+            .any(|output| scripts.iter().any(|script| script == &output.script_pubkey))
+        {
+            return Ok(true);
+        }
+        for input in &transaction.input {
+            if input.previous_output.is_null() {
+                continue;
+            }
+            let Some((previous, _)) = chain.transaction(&input.previous_output.txid)? else {
+                continue;
+            };
+            let Some(output) = previous.output.get(input.previous_output.vout as usize) else {
+                continue;
+            };
+            if scripts.iter().any(|script| script == &output.script_pubkey) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -8643,6 +8689,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scan["relevant_blocks"][0], hash);
+        let exact_scan = scan_blocks(
+            &node,
+            &json!([
+                "start",
+                [descriptor.clone()],
+                0,
+                1,
+                "basic",
+                {"filter_false_positives": true}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(exact_scan["relevant_blocks"][0], hash);
         let activity =
             get_descriptor_activity(&node, &json!([[hash], [descriptor], false])).unwrap();
         assert_eq!(activity["activity"][0]["type"], "receive");

@@ -994,6 +994,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 }
             }
         }
+        "getorphantxs" => get_orphan_transactions(node, params),
         "getmempoolentry" => {
             let txid: Txid = param::<String>(params, 0)?.parse()?;
             let height = node.chain.read().height();
@@ -5478,6 +5479,47 @@ fn get_mempool_relationship(node: &Arc<Node>, params: &Value, ancestors: bool) -
     }
 }
 
+fn get_orphan_transactions(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let verbosity = match params.get(0) {
+        None | Some(Value::Null) => 0,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| anyhow!("verbosity must be a number"))?,
+    };
+    if verbosity > 2 {
+        bail!("Invalid verbosity value {verbosity}");
+    }
+    let orphans = node.orphan_transactions();
+    if verbosity == 0 {
+        return Ok(json!(
+            orphans
+                .iter()
+                .map(|orphan| orphan.transaction.compute_txid().to_string())
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(json!(
+        orphans
+            .into_iter()
+            .map(|orphan| {
+                let transaction = orphan.transaction;
+                let mut value = json!({
+                    "txid": transaction.compute_txid().to_string(),
+                    "wtxid": transaction.compute_wtxid().to_string(),
+                    "bytes": serialize(&transaction).len(),
+                    "vsize": transaction.vsize(),
+                    "weight": transaction.weight().to_wu(),
+                    "from": orphan.peer_ids,
+                });
+                if verbosity == 2 {
+                    value["hex"] = json!(hex::encode(serialize(&transaction)));
+                }
+                value
+            })
+            .collect::<Vec<_>>()
+    ))
+}
+
 fn get_mempool_cluster(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let mempool = node.mempool.read();
@@ -6762,6 +6804,7 @@ fn rpc_help(method: &str) -> String {
         "gettxspendingprevout",
         "getmempoolinfo",
         "getrawmempool",
+        "getorphantxs",
         "getmempoolentry",
         "getmempoolancestors",
         "getmempooldescendants",
@@ -6842,6 +6885,41 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         }
+    }
+
+    #[test]
+    fn getorphantxs_reports_peer_orphans_at_each_verbosity() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let transaction = proof_transaction(7);
+        let txid = transaction.compute_txid().to_string();
+        let raw = hex::encode(serialize(&transaction));
+        assert!(node.accept_peer_transaction_from(42, transaction).is_err());
+
+        assert_eq!(
+            dispatch_method(&node, "getorphantxs", &json!([])).unwrap(),
+            json!([txid])
+        );
+        let verbose = dispatch_method(&node, "getorphantxs", &json!([1])).unwrap();
+        assert_eq!(verbose[0]["txid"], txid);
+        assert_eq!(verbose[0]["from"], json!([42]));
+        assert!(verbose[0]["bytes"].as_u64().unwrap() > 0);
+        assert!(verbose[0]["vsize"].as_u64().unwrap() > 0);
+        assert!(verbose[0]["weight"].as_u64().unwrap() > 0);
+        let detailed = dispatch_method(&node, "getorphantxs", &json!([2])).unwrap();
+        assert_eq!(detailed[0]["hex"], raw);
+        assert!(dispatch_method(&node, "getorphantxs", &json!([3])).is_err());
     }
 
     #[test]

@@ -11,18 +11,18 @@ pub mod storage;
 pub mod validation;
 pub mod wire;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bitcoin::Block;
-use bitcoin::{Transaction, Txid};
+use bitcoin::{OutPoint, Transaction, Txid};
 use parking_lot::RwLock;
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -31,10 +31,170 @@ use tracing::info;
 
 use crate::chain::ChainState;
 use crate::config::Config;
-use crate::mempool::Mempool;
+use crate::mempool::{Mempool, MempoolError};
+
+const MAX_ORPHAN_TRANSACTIONS: usize = 100;
+const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
+const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
+
+struct OrphanEntry {
+    transaction: Transaction,
+    added_at: Instant,
+    announcers: HashSet<usize>,
+}
+
+#[derive(Default)]
+struct OrphanPool {
+    entries: HashMap<Txid, OrphanEntry>,
+    by_prevout: HashMap<OutPoint, HashSet<Txid>>,
+    insertion_order: VecDeque<Txid>,
+}
+
+impl OrphanPool {
+    fn add(&mut self, transaction: Transaction, peer_id: Option<usize>) -> bool {
+        let announcers = peer_id.into_iter().collect();
+        self.add_entry(OrphanEntry {
+            transaction,
+            added_at: Instant::now(),
+            announcers,
+        })
+    }
+
+    fn add_entry(&mut self, entry: OrphanEntry) -> bool {
+        self.prune_expired();
+        let txid = entry.transaction.compute_txid();
+        if let Some(existing) = self.entries.get_mut(&txid) {
+            existing.announcers.extend(entry.announcers);
+            return false;
+        }
+        if entry.transaction.weight().to_wu() > MAX_ORPHAN_TRANSACTION_WEIGHT
+            || entry.added_at.elapsed() >= ORPHAN_TRANSACTION_EXPIRY
+        {
+            return false;
+        }
+        for input in &entry.transaction.input {
+            self.by_prevout
+                .entry(input.previous_output)
+                .or_default()
+                .insert(txid);
+        }
+        self.entries.insert(txid, entry);
+        self.insertion_order.push_back(txid);
+        while self.entries.len() > MAX_ORPHAN_TRANSACTIONS {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.remove(&oldest);
+        }
+        true
+    }
+
+    fn remove(&mut self, txid: &Txid) -> Option<OrphanEntry> {
+        let entry = self.entries.remove(txid)?;
+        for input in &entry.transaction.input {
+            if let Some(children) = self.by_prevout.get_mut(&input.previous_output) {
+                children.remove(txid);
+                if children.is_empty() {
+                    self.by_prevout.remove(&input.previous_output);
+                }
+            }
+        }
+        Some(entry)
+    }
+
+    fn take_children(&mut self, parent: &Transaction) -> Vec<OrphanEntry> {
+        self.prune_expired();
+        let parent_txid = parent.compute_txid();
+        let mut txids = HashSet::new();
+        for vout in 0..parent.output.len() {
+            let outpoint = OutPoint::new(parent_txid, vout as u32);
+            if let Some(children) = self.by_prevout.get(&outpoint) {
+                txids.extend(children.iter().copied());
+            }
+        }
+        let mut txids: Vec<_> = txids.into_iter().collect();
+        txids.sort_by_key(ToString::to_string);
+        txids
+            .into_iter()
+            .filter_map(|txid| self.remove(&txid))
+            .collect()
+    }
+
+    fn erase_for_peer(&mut self, peer_id: usize) {
+        let txids: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(txid, entry)| entry.announcers.contains(&peer_id).then_some(*txid))
+            .collect();
+        for txid in txids {
+            self.remove(&txid);
+        }
+    }
+
+    fn transactions(&mut self) -> Vec<OrphanTransaction> {
+        self.prune_expired();
+        let mut transactions = self
+            .entries
+            .values()
+            .map(|entry| {
+                let mut peer_ids: Vec<_> = entry.announcers.iter().copied().collect();
+                peer_ids.sort_unstable();
+                OrphanTransaction {
+                    transaction: entry.transaction.clone(),
+                    peer_ids,
+                }
+            })
+            .collect::<Vec<_>>();
+        transactions.sort_by_key(|entry| entry.transaction.compute_txid().to_string());
+        transactions
+    }
+
+    fn erase_for_block(&mut self, block: &Block) {
+        let mut txids = HashSet::new();
+        for transaction in &block.txdata {
+            let transaction_id = transaction.compute_txid();
+            if self.entries.contains_key(&transaction_id) {
+                txids.insert(transaction_id);
+            }
+            for input in &transaction.input {
+                if let Some(children) = self.by_prevout.get(&input.previous_output) {
+                    txids.extend(children.iter().copied());
+                }
+            }
+        }
+        for txid in txids {
+            self.remove(&txid);
+        }
+    }
+
+    fn len(&mut self) -> usize {
+        self.prune_expired();
+        self.entries.len()
+    }
+
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        while let Some(txid) = self.insertion_order.front().copied() {
+            let expired = self.entries.get(&txid).is_none_or(|entry| {
+                now.duration_since(entry.added_at) >= ORPHAN_TRANSACTION_EXPIRY
+            });
+            if !expired {
+                break;
+            }
+            self.insertion_order.pop_front();
+            self.remove(&txid);
+        }
+    }
+}
 
 pub type ChainEvent = chain::ChainTip;
 pub type MempoolEvent = Txid;
+
+#[derive(Clone, Debug)]
+pub struct OrphanTransaction {
+    pub transaction: Transaction,
+    pub peer_ids: Vec<usize>,
+}
 
 #[derive(Clone, Debug)]
 pub struct PeerInfo {
@@ -83,6 +243,7 @@ pub struct Node {
         parking_lot::RwLock<HashMap<usize, tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>>>,
     peer_manager_requests:
         parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<SocketAddr>>>,
+    orphans: parking_lot::Mutex<OrphanPool>,
     known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
     added_nodes: parking_lot::RwLock<HashSet<SocketAddr>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpAddr, BannedAddress>>,
@@ -123,6 +284,7 @@ impl Node {
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
+            orphans: parking_lot::Mutex::new(OrphanPool::default()),
             known_addresses: parking_lot::RwLock::new(HashMap::new()),
             added_nodes: parking_lot::RwLock::new(added_nodes),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
@@ -149,6 +311,10 @@ impl Node {
             (tip, activated_blocks, disconnected_blocks)
         };
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
+            let disconnected_transactions = disconnected_blocks
+                .iter()
+                .flat_map(|block| block.txdata.iter().skip(1).cloned())
+                .collect::<Vec<_>>();
             let chain = self.chain.read();
             let mut mempool = self.mempool.write();
             for block in &activated_blocks {
@@ -161,15 +327,104 @@ impl Node {
             }
             mempool.revalidate(&chain);
             let _ = self.events.send(tip.clone());
+
+            drop(mempool);
+            drop(chain);
+            for block in &activated_blocks {
+                self.orphans.lock().erase_for_block(block);
+            }
+            for block in &activated_blocks {
+                for transaction in &block.txdata {
+                    self.promote_orphans_for_parent(transaction);
+                }
+            }
+            for transaction in disconnected_transactions {
+                if self
+                    .mempool
+                    .read()
+                    .get(&transaction.compute_txid())
+                    .is_some()
+                {
+                    self.promote_orphans_for_parent(&transaction);
+                }
+            }
         }
         Ok(tip)
     }
 
     pub fn accept_transaction(&self, transaction: Transaction) -> Result<Txid> {
-        let chain = self.chain.read();
-        let txid = self.mempool.write().accept(transaction, &chain)?;
-        let _ = self.mempool_events.send(txid);
+        let txid = self.try_accept_transaction(transaction.clone())?;
+        self.announce_mempool_transaction(txid);
+        self.promote_orphans_for_parent(&transaction);
         Ok(txid)
+    }
+
+    /// Process a transaction received over the peer network. Missing-input
+    /// transactions are retained briefly so they can be retried when a parent
+    /// arrives; direct RPC submission remains strict via `accept_transaction`.
+    pub fn accept_peer_transaction(&self, transaction: Transaction) -> Result<Txid> {
+        self.accept_peer_transaction_from(0, transaction)
+    }
+
+    pub fn accept_peer_transaction_from(
+        &self,
+        peer_id: usize,
+        transaction: Transaction,
+    ) -> Result<Txid> {
+        match self.try_accept_transaction(transaction.clone()) {
+            Ok(txid) => {
+                self.announce_mempool_transaction(txid);
+                self.promote_orphans_for_parent(&transaction);
+                Ok(txid)
+            }
+            Err(error @ MempoolError::MissingInput(_)) => {
+                self.orphans.lock().add(transaction, Some(peer_id));
+                Err(error.into())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn orphan_count(&self) -> usize {
+        self.orphans.lock().len()
+    }
+
+    pub fn orphan_transactions(&self) -> Vec<OrphanTransaction> {
+        self.orphans.lock().transactions()
+    }
+
+    fn try_accept_transaction(
+        &self,
+        transaction: Transaction,
+    ) -> std::result::Result<Txid, MempoolError> {
+        let chain = self.chain.read();
+        self.mempool.write().accept(transaction, &chain)
+    }
+
+    fn announce_mempool_transaction(&self, txid: Txid) {
+        let _ = self.mempool_events.send(txid);
+    }
+
+    fn promote_orphans_for_parent(&self, parent: &Transaction) {
+        let mut pending = self
+            .orphans
+            .lock()
+            .take_children(parent)
+            .into_iter()
+            .collect::<VecDeque<_>>();
+        while let Some(entry) = pending.pop_front() {
+            let transaction = entry.transaction.clone();
+            match self.try_accept_transaction(transaction.clone()) {
+                Ok(txid) => {
+                    self.announce_mempool_transaction(txid);
+                    pending.extend(self.orphans.lock().take_children(&transaction));
+                }
+                Err(MempoolError::MissingInput(_)) => {
+                    self.orphans.lock().add_entry(entry);
+                }
+                Err(_) => {}
+            }
+        }
     }
 
     pub fn invalidate_block(&self, hash: bitcoin::BlockHash) -> Result<ChainEvent> {
@@ -329,6 +584,7 @@ impl Node {
     pub fn unregister_peer(&self, id: usize) {
         self.peers.write().remove(&id);
         self.peer_commands.write().remove(&id);
+        self.orphans.lock().erase_for_peer(id);
     }
 
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
@@ -601,4 +857,148 @@ fn load_rpc_cookie(data_dir: &Path) -> Result<String> {
     }
     std::fs::rename(temp, path)?;
     Ok(cookie)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::Amount;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version as BlockVersion};
+    use bitcoin::blockdata::script::{Builder, ScriptBuf};
+    use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
+    use bitcoin::blockdata::witness::Witness;
+    use bitcoin::hashes::Hash;
+
+    fn test_config(datadir: &Path) -> Config {
+        Config {
+            network: bitcoin::Network::Regtest,
+            datadir: datadir.to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        }
+    }
+
+    fn mine_test_block(previous: &Header, height: u32, tag: u8) -> Block {
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: previous.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: previous.time + 1,
+                bits: previous.bits,
+                nonce: 0,
+            },
+            txdata: vec![Transaction {
+                version: Version::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: Builder::new()
+                        .push_int(i64::from(height))
+                        .push_slice([tag])
+                        .push_slice([0u8])
+                        .into_script(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(5_000_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        block
+    }
+
+    #[test]
+    fn peer_orphans_are_promoted_recursively_when_the_parent_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        for height in 1..=101 {
+            let previous = *node.chain.read().header(height - 1).unwrap();
+            node.connect_block(mine_test_block(&previous, height, height as u8))
+                .unwrap();
+        }
+
+        let funding_block_hash = node.chain.read().block_hash(1).unwrap();
+        let funding_block = node
+            .chain
+            .write()
+            .block(&funding_block_hash)
+            .unwrap()
+            .unwrap();
+        let funding = OutPoint::new(funding_block.txdata[0].compute_txid(), 0);
+        let parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_998_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let grandchild = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(child.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_997_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        assert!(node.accept_peer_transaction(grandchild.clone()).is_err());
+        assert!(node.accept_peer_transaction(child.clone()).is_err());
+        assert_eq!(node.orphan_count(), 2);
+        assert!(node.mempool.read().get(&child.compute_txid()).is_none());
+        assert!(
+            node.mempool
+                .read()
+                .get(&grandchild.compute_txid())
+                .is_none()
+        );
+
+        let expected_parent_txid = parent.compute_txid();
+        let parent_txid = node.accept_transaction(parent).unwrap();
+        let mempool = node.mempool.read();
+        assert_eq!(parent_txid, expected_parent_txid);
+        assert!(mempool.get(&expected_parent_txid).is_some());
+        assert!(mempool.get(&child.compute_txid()).is_some());
+        assert!(mempool.get(&grandchild.compute_txid()).is_some());
+        assert_eq!(node.orphan_count(), 0);
+    }
 }

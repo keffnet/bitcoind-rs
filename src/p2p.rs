@@ -812,7 +812,9 @@ async fn serve_peer_loop(
             Message::Transaction(transaction) => {
                 let txid = transaction.compute_txid();
                 let wtxid = transaction.compute_wtxid();
-                let accepted = node.accept_transaction(transaction).is_ok();
+                let accepted = node
+                    .accept_peer_transaction_from(peer_id, transaction)
+                    .is_ok();
                 if accepted {
                     debug!(%txid, "accepted peer transaction");
                     broadcast_inventory(

@@ -128,10 +128,11 @@ pub enum Message {
     Mempool,
     FeeFilter(i64),
     SendCmpct { announce: bool, version: u64 },
+    Unknown { command: String, payload: Vec<u8> },
 }
 
 impl Message {
-    pub fn command(&self) -> &'static str {
+    pub fn command(&self) -> &str {
         match self {
             Self::Version(_) => "version",
             Self::Verack => "verack",
@@ -152,6 +153,7 @@ impl Message {
             Self::Mempool => "mempool",
             Self::FeeFilter(_) => "feefilter",
             Self::SendCmpct { .. } => "sendcmpct",
+            Self::Unknown { command, .. } => command.as_str(),
         }
     }
 }
@@ -271,7 +273,7 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
         Message::Addr(entries) => {
             put_compact_size(entries.len(), &mut out)?;
             for (address, port, services) in entries {
-                put_u32(*services as u32, &mut out);
+                put_u64(*services, &mut out);
                 out.extend_from_slice(address);
                 out.extend_from_slice(&port.to_be_bytes());
             }
@@ -302,6 +304,7 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
             out.push(u8::from(*announce));
             put_u64(*version, &mut out);
         }
+        Message::Unknown { payload, .. } => out.extend_from_slice(payload),
     }
     Ok(out)
 }
@@ -331,9 +334,17 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
             announce: reader.u8()? != 0,
             version: reader.u64_le()?,
         },
-        other => return Err(WireError::UnknownCommand(other.to_owned())),
+        other => Message::Unknown {
+            command: other.to_owned(),
+            payload: payload.to_vec(),
+        },
     };
-    if reader.remaining() != 0 && !matches!(message, Message::Block(_) | Message::Transaction(_)) {
+    if reader.remaining() != 0
+        && !matches!(
+            message,
+            Message::Block(_) | Message::Transaction(_) | Message::Unknown { .. }
+        )
+    {
         return Err(WireError::Payload("trailing bytes".to_owned()));
     }
     Ok(message)
@@ -419,7 +430,7 @@ fn decode_addr(reader: &mut Reader<'_>) -> Result<Vec<([u8; 16], u16, u64)>, Wir
     let count = bounded_count(reader.compact_size()?)?;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        let services = reader.u32_le()? as u64;
+        let services = reader.u64_le()?;
         let address = reader.array::<16>()?;
         let port = reader.u16_be()?;
         entries.push((address, port, services));
@@ -607,5 +618,15 @@ mod tests {
         let message = Message::Version(VersionMessage::new(12, 99));
         let frame = encode_message(Network::Bitcoin, &message).unwrap();
         assert_eq!(decode_message(Network::Bitcoin, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn unknown_bounded_message_is_preserved() {
+        let message = Message::Unknown {
+            command: "sendaddrv2".to_owned(),
+            payload: Vec::new(),
+        };
+        let frame = encode_message(Network::Regtest, &message).unwrap();
+        assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
     }
 }

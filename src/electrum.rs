@@ -47,35 +47,75 @@ impl ElectrumServer {
 async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
+    let mut events = node.subscribe_chain();
     let mut line = Vec::new();
-    let mut subscriptions = HashSet::new();
+    let mut subscriptions: HashSet<String> = HashSet::new();
+    let mut headers_subscribed = false;
     loop {
         line.clear();
-        let bytes = reader.read_until(b'\n', &mut line).await?;
-        if bytes == 0 {
-            return Ok(());
-        }
-        if line.len() > MAX_LINE_SIZE {
-            bail!("Electrum request exceeds limit");
-        }
-        let request: Value = serde_json::from_slice(&line)
-            .map_err(|error| anyhow!("invalid Electrum JSON: {error}"))?;
-        let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = request
-            .get("params")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        let result = dispatch(&node, method, &params, &mut subscriptions);
-        let response = match result {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            Err(error) => {
-                json!({"jsonrpc": "2.0", "id": id, "error": {"code": -1, "message": error.to_string()}})
+        tokio::select! {
+            event = events.recv() => {
+                let tip = match event {
+                    Ok(tip) => tip,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => continue,
+                };
+                if headers_subscribed {
+                    let header = {
+                        let chain = node.chain.read();
+                        chain.header(tip.height).map(|header| json!({
+                            "jsonrpc": "2.0",
+                            "method": "blockchain.headers.subscribe",
+                            "params": [{"height": tip.height, "hex": hex::encode(serialize(header))}],
+                        }))
+                    };
+                    if let Some(header) = header {
+                        let mut encoded = serde_json::to_vec(&header)?;
+                        encoded.push(b'\n');
+                        write_half.write_all(&encoded).await?;
+                    }
+                }
+                let statuses = {
+                    let chain = node.chain.read();
+                    subscriptions
+                        .iter()
+                        .map(|script_hash| {
+                            json!({
+                                "jsonrpc": "2.0",
+                                "method": "blockchain.scripthash.subscribe",
+                                "params": [script_hash, chain.history_status(script_hash)],
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for notification in statuses {
+                    let mut encoded = serde_json::to_vec(&notification)?;
+                    encoded.push(b'\n');
+                    write_half.write_all(&encoded).await?;
+                }
             }
-        };
-        let mut encoded = serde_json::to_vec(&response)?;
-        encoded.push(b'\n');
-        write_half.write_all(&encoded).await?;
+            read = reader.read_until(b'\n', &mut line) => {
+                let bytes = read?;
+                if bytes == 0 { return Ok(()); }
+                if line.len() > MAX_LINE_SIZE { bail!("Electrum request exceeds limit"); }
+                let request: Value = serde_json::from_slice(&line)
+                    .map_err(|error| anyhow!("invalid Electrum JSON: {error}"))?;
+                let id = request.get("id").cloned().unwrap_or(Value::Null);
+                let method = request.get("method").and_then(Value::as_str).unwrap_or("");
+                let params = request.get("params").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
+                let result = dispatch(&node, method, &params, &mut subscriptions);
+                if method == "blockchain.headers.subscribe" && result.is_ok() {
+                    headers_subscribed = true;
+                }
+                let response = match result {
+                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                    Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -1, "message": error.to_string()}}),
+                };
+                let mut encoded = serde_json::to_vec(&response)?;
+                encoded.push(b'\n');
+                write_half.write_all(&encoded).await?;
+            }
+        }
     }
 }
 

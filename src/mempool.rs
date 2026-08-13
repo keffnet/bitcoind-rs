@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bitcoin::{Amount, Network, OutPoint, Transaction, Txid};
 
 use crate::chain::ChainState;
-use crate::validation::ValidationError;
+use crate::validation::{self, ValidationError};
 
 const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
 const MIN_RELAY_SAT_PER_VBYTE: u64 = 1;
@@ -47,6 +47,8 @@ pub enum MempoolError {
     NegativeFee,
     #[error("transaction fee rate is below the relay minimum")]
     FeeRate,
+    #[error("transaction script validation failed: {0}")]
+    Script(String),
     #[error("mempool size limit exceeded")]
     Full,
 }
@@ -99,6 +101,7 @@ impl Mempool {
         }
         let mut seen = HashSet::with_capacity(transaction.input.len());
         let mut input_total = 0u64;
+        let mut previous_outputs = Vec::with_capacity(transaction.input.len());
         for input in &transaction.input {
             if !seen.insert(input.previous_output) {
                 return Err(MempoolError::DuplicateInput);
@@ -106,25 +109,28 @@ impl Mempool {
             if let Some(conflict) = self.spent.get(&input.previous_output) {
                 return Err(MempoolError::Conflict(*conflict));
             }
-            let previous = self
-                .entries
-                .get(&input.previous_output.txid)
-                .and_then(|entry| {
-                    entry
-                        .transaction
-                        .output
-                        .get(input.previous_output.vout as usize)
-                })
-                .or_else(|| {
-                    chain
-                        .utxo(&input.previous_output)
-                        .map(|entry| &entry.output)
-                })
-                .ok_or(MempoolError::MissingInput(input.previous_output))?;
+            let previous = if let Some(entry) = self.entries.get(&input.previous_output.txid) {
+                entry
+                    .transaction
+                    .output
+                    .get(input.previous_output.vout as usize)
+                    .ok_or(MempoolError::MissingInput(input.previous_output))?
+            } else {
+                let entry = chain
+                    .utxo(&input.previous_output)
+                    .ok_or(MempoolError::MissingInput(input.previous_output))?;
+                if entry.coinbase && chain.height() + 1 < entry.height.saturating_add(100) {
+                    return Err(MempoolError::MissingInput(input.previous_output));
+                }
+                &entry.output
+            };
             input_total = input_total
                 .checked_add(previous.value.to_sat())
                 .ok_or(MempoolError::BadOutput)?;
+            previous_outputs.push(previous.clone());
         }
+        validation::validate_transaction_scripts(&transaction, &previous_outputs)
+            .map_err(|error| MempoolError::Script(error.to_string()))?;
         let output_total = transaction
             .output
             .iter()
@@ -198,7 +204,7 @@ impl Mempool {
 }
 
 impl From<ValidationError> for MempoolError {
-    fn from(_: ValidationError) -> Self {
-        MempoolError::BadOutput
+    fn from(error: ValidationError) -> Self {
+        MempoolError::Script(error.to_string())
     }
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bitcoin::hashes::Hash;
-use bitcoin::{BlockHash, Txid};
+use bitcoin::{BlockHash, Network, Txid};
 use rand::random;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -27,7 +27,12 @@ impl PeerManager {
             .await
             .with_context(|| format!("binding P2P listener {}", self.node.config.p2p_bind))?;
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
-        for address in self.node.config.seed_nodes.clone() {
+        let seed_nodes = if self.node.config.seed_nodes.is_empty() {
+            discover_dns_seeds(self.node.config.network).await
+        } else {
+            self.node.config.seed_nodes.clone()
+        };
+        for address in seed_nodes {
             let node = self.node.clone();
             let slots = slots.clone();
             tokio::spawn(async move {
@@ -63,6 +68,48 @@ impl PeerManager {
             });
         }
     }
+}
+
+async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
+    let hosts: &[&str] = match network {
+        Network::Bitcoin => &[
+            "seed.bitcoin.sipa.be",
+            "dnsseed.bluematt.me",
+            "seed.bitcoinstats.com",
+            "seed.bitcoin.jonasschnelli.ch",
+            "seed.btc.petertodd.org",
+            "seed.bitcoin.sprovoost.nl",
+            "dnsseed.emzy.de",
+            "seed.bitcoin.wiz.biz",
+        ],
+        Network::Testnet => &[
+            "testnet-seed.bitcoin.jonasschnelli.ch",
+            "seed.tbtc.petertodd.org",
+            "seed.testnet.bitcoin.sprovoost.nl",
+            "testnet-seed.bluematt.me",
+        ],
+        Network::Signet => &[
+            "seed.signet.bitcoin.sprovoost.nl",
+            "xarb1.signet.seed.bluematt.me",
+        ],
+        Network::Testnet4 | Network::Regtest => &[],
+    };
+    let port = match network {
+        Network::Bitcoin => 8333,
+        Network::Testnet | Network::Testnet4 => 18333,
+        Network::Signet => 38333,
+        Network::Regtest => return Vec::new(),
+    };
+    let mut addresses = Vec::new();
+    for host in hosts {
+        if let Ok(resolved) = tokio::net::lookup_host((*host, port)).await {
+            addresses.extend(resolved.take(16));
+        }
+        if addresses.len() >= 64 {
+            break;
+        }
+    }
+    addresses
 }
 
 async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> Result<()> {
@@ -220,10 +267,8 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
             }
             Message::Block(block) => {
                 let hash = block.block_hash();
-                let confirmed = block.clone();
-                match node.chain.write().connect_block(block) {
+                match node.connect_block(block) {
                     Ok(tip) => {
-                        node.mempool.write().remove_confirmed(&confirmed);
                         info!(%hash, height = tip.height, "accepted peer block");
                     }
                     Err(error) => debug!(%hash, %error, "rejected peer block"),
@@ -243,7 +288,8 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
             | Message::Mempool
             | Message::FeeFilter(_)
             | Message::SendCmpct { .. }
-            | Message::NotFound(_) => {}
+            | Message::NotFound(_)
+            | Message::Unknown { .. } => {}
         }
         if version_received && verack_received && !verack_sent {
             wire::write_message(&mut stream, node.config.network, &Message::Verack).await?;

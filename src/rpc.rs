@@ -409,7 +409,7 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let block: bitcoin::Block = deserialize(&bytes)?;
     let hash = block.block_hash();
-    let result = node.chain.write().connect_block(block);
+    let result = node.connect_block(block);
     match result {
         Ok(_) => Ok(Value::Null),
         Err(error) => {

@@ -157,6 +157,10 @@ impl ChainState {
         self.tip().hash
     }
 
+    pub fn is_active_block(&self, hash: &BlockHash) -> bool {
+        self.active_chain.contains(hash)
+    }
+
     pub fn header(&self, height: u32) -> Option<&bitcoin::block::Header> {
         self.headers.get(height as usize)
     }

@@ -16,12 +16,12 @@ The implementation is an actively developed, wallet-free Core-compatible node su
 
 - regtest, testnet, testnet4, signet, and mainnet chain parameters, proof-of-work/header checks, UTXO validation, libbitcoinconsensus script checks, reorgs, invalidation/reconsideration, compact filters, and durable block undo data;
 - Bitcoin P2P handshake, header/block/transaction relay, compact blocks, BIP157 relay, peer controls, bans, dynamic connections, traffic counters, and ping measurements;
-- mining templates and proposal validation, package-aware transaction selection, raw transaction submission, wallet-free raw signing, PSBT lifecycle, message-signing, and multisig RPCs, opt-in RBF, package submission, wallet-free descriptors (`addr`, `raw`, `pk`, `pkh`, `wpkh`, `combo`, `multi`, `sortedmulti`, `sh`, `wsh`, and `tr`) with checksum metadata, UTXO scans, and the implemented JSON-RPC/REST methods;
+- mining templates and proposal validation, package-aware transaction selection, raw transaction submission, wallet-free raw signing, PSBT lifecycle including descriptor-driven updates and transient descriptor-key signing, message-signing, and multisig RPCs, opt-in RBF, package submission, wallet-free descriptors (`addr`, `raw`, `pk`, `pkh`, `wpkh`, `combo`, `multi`, `sortedmulti`, `sh`, `wsh`, and `tr`) with checksum metadata, UTXO scans, and the implemented JSON-RPC/REST methods;
 - an Electrum protocol server with header and scripthash subscriptions, history, balances, UTXOs, mempool queries, transaction retrieval, merkle proofs, broadcasts, and fee histograms.
 
 It is not yet a drop-in replacement for every Bitcoin Core 31.1 behavior. In particular, the storage engine is append-only with JSON chain metadata rather than Core's production database, pruning is intentionally disabled, UTXO snapshot files use this implementation's JSON format, descriptor parsing is not full miniscript or taproot-tree coverage, and Electrum indexing is in-process rather than a separate electrs database. Full mainnet deployment still requires broader Core test-vector, reorg, fuzz, and interoperability testing.
 
-The node never creates, imports, or stores private keys. Wallet RPCs are intentionally not implemented.
+The node never creates, imports, or stores private keys. A private extended key supplied directly in a descriptor RPC is used only for that request and is not retained. Wallet RPCs are intentionally not implemented.
 
 ## Running
 

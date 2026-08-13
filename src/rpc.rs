@@ -897,6 +897,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "joinpsbts" => join_psbts(params),
         "finalizepsbt" => finalize_psbt(params),
         "utxoupdatepsbt" => update_psbt_utxos(node, params),
+        "descriptorprocesspsbt" => descriptor_process_psbt(node, params),
         "signmessagewithprivkey" => sign_message_with_private_key(params),
         "verifymessage" => verify_message(node, params),
         "createmultisig" => create_multisig(node, params),
@@ -3829,6 +3830,24 @@ fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
         }
         return true;
     }
+    if segwit && (spending_script.is_p2pkh() || spending_script.is_p2pk()) {
+        let mut witness_items = vec![signature.to_vec()];
+        if spending_script.is_p2pkh() {
+            witness_items.push(public_key.to_bytes());
+        }
+        witness_items.push(spending_script.to_bytes());
+        psbt.inputs[input_index].final_script_witness = Some(Witness::from_slice(&witness_items));
+        if nested {
+            psbt.inputs[input_index].final_script_sig = Some(
+                push_script_items(&[redeem_script
+                    .as_ref()
+                    .expect("nested redeem script was checked")
+                    .to_bytes()])
+                .expect("redeem script is bounded"),
+            );
+        }
+        return true;
+    }
     if spending_script.is_p2pkh() {
         let script_sig = if nested {
             push_script_items(&[
@@ -3877,6 +3896,638 @@ fn finalize_psbt(params: &Value) -> Result<Value> {
         result["hex"] = json!(hex::encode(serialize(&transaction)));
     }
     Ok(result)
+}
+
+#[derive(Clone)]
+struct DescriptorDerivedKey {
+    public_key: Option<bitcoin::PublicKey>,
+    private_key: Option<bitcoin::PrivateKey>,
+    origin: Option<(bitcoin::bip32::Fingerprint, bitcoin::bip32::DerivationPath)>,
+}
+
+#[derive(Clone)]
+struct DescriptorCandidate {
+    script_pubkey: ScriptBuf,
+    redeem_script: Option<ScriptBuf>,
+    witness_script: Option<ScriptBuf>,
+    keys: Vec<DescriptorDerivedKey>,
+}
+
+fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let mut psbt = parse_psbt(params, 0)?;
+    let descriptors = params
+        .get(1)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("descriptorprocesspsbt expects an array of descriptors"))?;
+    if descriptors.is_empty() {
+        bail!("descriptorprocesspsbt requires at least one descriptor")
+    }
+    let mut candidates = Vec::new();
+    for descriptor in descriptors {
+        let (descriptor, range) = parse_descriptor_spec(descriptor)?;
+        candidates.extend(descriptor_candidates(node, &descriptor, range)?);
+    }
+    let sighash_name = params
+        .get(2)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_str)
+        .unwrap_or("SIGHASH_ALL");
+    let sighash_type = parse_descriptor_sighash_type(sighash_name)?;
+    let include_bip32_derivations = params
+        .get(3)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let finalize = params
+        .get(4)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    for input_index in 0..psbt.inputs.len() {
+        if psbt.inputs[input_index].witness_utxo.is_none()
+            && psbt.inputs[input_index].non_witness_utxo.is_none()
+            && let Some(outpoint) = psbt
+                .unsigned_tx
+                .input
+                .get(input_index)
+                .map(|input| input.previous_output)
+            && let Some((output, transaction)) = lookup_psbt_prevout(node, &outpoint)?
+        {
+            if output.script_pubkey.is_witness_program() {
+                psbt.inputs[input_index].witness_utxo = Some(output);
+            } else if let Some(transaction) = transaction {
+                psbt.inputs[input_index].non_witness_utxo = Some(transaction);
+            }
+        }
+        let Some(prevout) = psbt_prevout(&psbt, input_index) else {
+            continue;
+        };
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.script_pubkey == prevout.script_pubkey)
+        else {
+            continue;
+        };
+        if let Some(redeem_script) = &candidate.redeem_script {
+            psbt.inputs[input_index].redeem_script = Some(redeem_script.clone());
+        }
+        if let Some(witness_script) = &candidate.witness_script {
+            psbt.inputs[input_index].witness_script = Some(witness_script.clone());
+        }
+        if include_bip32_derivations {
+            for key in &candidate.keys {
+                if let (Some(public_key), Some(origin)) = (key.public_key, &key.origin) {
+                    psbt.inputs[input_index]
+                        .bip32_derivation
+                        .entry(public_key.inner)
+                        .or_insert_with(|| (origin.0, origin.1.clone()));
+                }
+            }
+        }
+        sign_descriptor_psbt_input(&mut psbt, input_index, &prevout, candidate, sighash_type)?;
+        if finalize {
+            let _ = finalize_psbt_input(&mut psbt, input_index);
+        }
+    }
+
+    for output_index in 0..psbt.outputs.len() {
+        let script_pubkey = &psbt.unsigned_tx.output[output_index].script_pubkey;
+        let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| &candidate.script_pubkey == script_pubkey)
+        else {
+            continue;
+        };
+        if let Some(redeem_script) = &candidate.redeem_script {
+            psbt.outputs[output_index].redeem_script = Some(redeem_script.clone());
+        }
+        if let Some(witness_script) = &candidate.witness_script {
+            psbt.outputs[output_index].witness_script = Some(witness_script.clone());
+        }
+        if include_bip32_derivations {
+            for key in &candidate.keys {
+                if let (Some(public_key), Some(origin)) = (key.public_key, &key.origin) {
+                    psbt.outputs[output_index]
+                        .bip32_derivation
+                        .entry(public_key.inner)
+                        .or_insert_with(|| (origin.0, origin.1.clone()));
+                }
+            }
+        }
+    }
+
+    let complete = (0..psbt.inputs.len()).all(|index| {
+        psbt.inputs[index].final_script_sig.is_some()
+            || psbt.inputs[index].final_script_witness.is_some()
+    });
+    let mut result = json!({
+        "psbt": encode_psbt(&psbt),
+        "complete": complete,
+    });
+    if complete {
+        result["hex"] = json!(hex::encode(serialize(
+            &psbt.clone().extract_tx_unchecked_fee_rate()
+        )));
+    }
+    Ok(result)
+}
+
+fn parse_descriptor_sighash_type(value: &str) -> Result<EcdsaSighashType> {
+    let uppercase = value.to_ascii_uppercase();
+    let normalized = match uppercase.as_str() {
+        "DEFAULT" | "ALL" => "SIGHASH_ALL",
+        "NONE" => "SIGHASH_NONE",
+        "SINGLE" => "SIGHASH_SINGLE",
+        "ALL|ANYONECANPAY" => "SIGHASH_ALL|SIGHASH_ANYONECANPAY",
+        "NONE|ANYONECANPAY" => "SIGHASH_NONE|SIGHASH_ANYONECANPAY",
+        "SINGLE|ANYONECANPAY" => "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY",
+        other => other,
+    };
+    normalized
+        .parse::<EcdsaSighashType>()
+        .map_err(|error| anyhow!("invalid sighash type: {error}"))
+}
+
+fn parse_descriptor_spec(value: &Value) -> Result<(String, Option<(u32, u32)>)> {
+    if let Some(descriptor) = value.as_str() {
+        return Ok((
+            descriptor.to_owned(),
+            descriptor
+                .split('#')
+                .next()
+                .is_some_and(|payload| payload.contains('*'))
+                .then_some((0, 1_000)),
+        ));
+    }
+    let descriptor = value
+        .get("desc")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("descriptor entries must be strings or objects with desc"))?;
+    let range = value
+        .get("range")
+        .filter(|value| !value.is_null())
+        .map(parse_descriptor_process_range)
+        .transpose()?;
+    Ok((
+        descriptor.to_owned(),
+        range.or_else(|| {
+            descriptor
+                .split('#')
+                .next()
+                .is_some_and(|payload| payload.contains('*'))
+                .then_some((0, 1_000))
+        }),
+    ))
+}
+
+fn parse_descriptor_process_range(value: &Value) -> Result<(u32, u32)> {
+    if let Some(end) = value.as_u64() {
+        let end = u32::try_from(end).map_err(|_| anyhow!("descriptor range is too large"))?;
+        return Ok((0, end));
+    }
+    parse_descriptor_range(value)
+}
+
+fn descriptor_candidates(
+    node: &Arc<Node>,
+    descriptor: &str,
+    range: Option<(u32, u32)>,
+) -> Result<Vec<DescriptorCandidate>> {
+    let descriptor = if descriptor.contains('#') {
+        descriptor_payload(descriptor)?.0
+    } else {
+        descriptor
+    };
+    descriptor_candidates_inner(node, descriptor, range)
+}
+
+fn descriptor_candidates_inner(
+    node: &Arc<Node>,
+    descriptor: &str,
+    range: Option<(u32, u32)>,
+) -> Result<Vec<DescriptorCandidate>> {
+    if let Some(address) = descriptor
+        .strip_prefix("addr(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        if range.is_some() {
+            bail!("addr descriptors do not accept a range")
+        }
+        return Ok(vec![DescriptorCandidate {
+            script_pubkey: address
+                .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
+                .require_network(node.config.network)?
+                .script_pubkey(),
+            redeem_script: None,
+            witness_script: None,
+            keys: Vec::new(),
+        }]);
+    }
+    if let Some(script) = descriptor
+        .strip_prefix("raw(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        if range.is_some() {
+            bail!("raw descriptors do not accept a range")
+        }
+        return Ok(vec![DescriptorCandidate {
+            script_pubkey: ScriptBuf::from_bytes(hex::decode(script)?),
+            redeem_script: None,
+            witness_script: None,
+            keys: Vec::new(),
+        }]);
+    }
+    for kind in ["sh", "wsh"] {
+        if let Some(inner) = descriptor
+            .strip_prefix(&format!("{kind}("))
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let children = descriptor_candidates_inner(node, inner, range)?;
+            return children
+                .into_iter()
+                .map(|child| {
+                    if kind == "sh" {
+                        let redeem_script = child.script_pubkey.clone();
+                        Ok(DescriptorCandidate {
+                            script_pubkey: Address::p2sh(&redeem_script, node.config.network)?
+                                .script_pubkey(),
+                            redeem_script: Some(redeem_script),
+                            witness_script: child.witness_script,
+                            keys: child.keys,
+                        })
+                    } else {
+                        let witness_script = child.script_pubkey.clone();
+                        Ok(DescriptorCandidate {
+                            script_pubkey: Address::p2wsh(&witness_script, node.config.network)
+                                .script_pubkey(),
+                            redeem_script: None,
+                            witness_script: Some(witness_script),
+                            keys: child.keys,
+                        })
+                    }
+                })
+                .collect();
+        }
+    }
+    if let Some(arguments) = descriptor
+        .strip_prefix("multi(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return multisig_descriptor_candidates(node, arguments, range, false);
+    }
+    if let Some(arguments) = descriptor
+        .strip_prefix("sortedmulti(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return multisig_descriptor_candidates(node, arguments, range, true);
+    }
+    if let Some(key_expression) = descriptor
+        .strip_prefix("pk(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return single_key_descriptor_candidates(node, key_expression, range, |public_key| {
+            Ok(Builder::new()
+                .push_key(&public_key)
+                .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKSIG)
+                .into_script())
+        });
+    }
+    if let Some(key_expression) = descriptor
+        .strip_prefix("combo(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let origin = descriptor_key_origin(key_expression)?;
+        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, range)?;
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let mut candidates = Vec::new();
+        for index in indices {
+            let public_key = descriptor_public_key(&key, &path, index, &secp)?;
+            let derived_key =
+                descriptor_derived_key(node, &key, &path, index, public_key, origin.clone())?;
+            candidates.push(DescriptorCandidate {
+                script_pubkey: Builder::new()
+                    .push_key(&public_key)
+                    .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKSIG)
+                    .into_script(),
+                redeem_script: None,
+                witness_script: None,
+                keys: vec![derived_key.clone()],
+            });
+            candidates.push(DescriptorCandidate {
+                script_pubkey: Address::p2pkh(public_key, node.config.network).script_pubkey(),
+                redeem_script: None,
+                witness_script: None,
+                keys: vec![derived_key.clone()],
+            });
+            if let Ok(compressed) = bitcoin::CompressedPublicKey::try_from(public_key) {
+                candidates.push(DescriptorCandidate {
+                    script_pubkey: Address::p2wpkh(&compressed, node.config.network)
+                        .script_pubkey(),
+                    redeem_script: None,
+                    witness_script: None,
+                    keys: vec![derived_key.clone()],
+                });
+                candidates.push(DescriptorCandidate {
+                    script_pubkey: Address::p2shwpkh(&compressed, node.config.network)
+                        .script_pubkey(),
+                    redeem_script: Some(
+                        Address::p2wpkh(&compressed, node.config.network).script_pubkey(),
+                    ),
+                    witness_script: None,
+                    keys: vec![derived_key],
+                });
+            }
+        }
+        return Ok(candidates);
+    }
+    if let Some(key_expression) = descriptor
+        .strip_prefix("tr(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let origin = descriptor_key_origin(key_expression)?;
+        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, range)?;
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let mut candidates = Vec::new();
+        for index in indices {
+            let xonly = match &key {
+                DescriptorKey::PublicKey(public_key) => bitcoin::XOnlyPublicKey::from(*public_key),
+                DescriptorKey::XOnlyPublicKey(public_key) => *public_key,
+                DescriptorKey::Xpriv(_) | DescriptorKey::Xpub(_) => {
+                    bitcoin::XOnlyPublicKey::from(descriptor_public_key(&key, &path, index, &secp)?)
+                }
+            };
+            let derived_key = match &key {
+                DescriptorKey::XOnlyPublicKey(_) => DescriptorDerivedKey {
+                    public_key: None,
+                    private_key: None,
+                    origin: origin.clone(),
+                },
+                _ => descriptor_derived_key(
+                    node,
+                    &key,
+                    &path,
+                    index,
+                    descriptor_public_key(&key, &path, index, &secp)?,
+                    origin.clone(),
+                )?,
+            };
+            candidates.push(DescriptorCandidate {
+                script_pubkey: Address::p2tr(&secp, xonly, None, node.config.network)
+                    .script_pubkey(),
+                redeem_script: None,
+                witness_script: None,
+                keys: vec![derived_key],
+            });
+        }
+        return Ok(candidates);
+    }
+    let Some((kind, key_expression)) = descriptor
+        .strip_suffix(')')
+        .and_then(|value| value.split_once('('))
+        .filter(|(kind, _)| matches!(*kind, "pkh" | "wpkh"))
+    else {
+        bail!(
+            "unsupported descriptor; use addr(...), raw(...), pk(...), pkh(...), wpkh(...), combo(...), multi(...), sortedmulti(...), sh(...), wsh(...), or tr(...)"
+        )
+    };
+    single_key_descriptor_candidates(node, key_expression, range, |public_key| {
+        if kind == "pkh" {
+            Ok(Address::p2pkh(public_key, node.config.network).script_pubkey())
+        } else {
+            let compressed = bitcoin::CompressedPublicKey::try_from(public_key)
+                .map_err(|_| anyhow!("wpkh requires a compressed public key"))?;
+            Ok(Address::p2wpkh(&compressed, node.config.network).script_pubkey())
+        }
+    })
+}
+
+fn single_key_descriptor_candidates<F>(
+    node: &Arc<Node>,
+    key_expression: &str,
+    range: Option<(u32, u32)>,
+    script: F,
+) -> Result<Vec<DescriptorCandidate>>
+where
+    F: Fn(bitcoin::PublicKey) -> Result<ScriptBuf>,
+{
+    let origin = descriptor_key_origin(key_expression)?;
+    let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
+    let indices = descriptor_indices(wildcard, range)?;
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    indices
+        .into_iter()
+        .map(|index| {
+            let public_key = descriptor_public_key(&key, &path, index, &secp)?;
+            Ok(DescriptorCandidate {
+                script_pubkey: script(public_key)?,
+                redeem_script: None,
+                witness_script: None,
+                keys: vec![descriptor_derived_key(
+                    node,
+                    &key,
+                    &path,
+                    index,
+                    public_key,
+                    origin.clone(),
+                )?],
+            })
+        })
+        .collect()
+}
+
+fn multisig_descriptor_candidates(
+    node: &Arc<Node>,
+    arguments: &str,
+    range: Option<(u32, u32)>,
+    sorted: bool,
+) -> Result<Vec<DescriptorCandidate>> {
+    let arguments = arguments.split(',').collect::<Vec<_>>();
+    if arguments.len() < 2 {
+        bail!("multisig descriptor requires a threshold and keys")
+    }
+    let required = arguments[0]
+        .parse::<u64>()
+        .map_err(|_| anyhow!("multisig threshold must be an integer"))?;
+    let keys = arguments[1..]
+        .iter()
+        .map(|key| parse_descriptor_key(key))
+        .collect::<Result<Vec<_>>>()?;
+    let origins = arguments[1..]
+        .iter()
+        .map(|key| descriptor_key_origin(key))
+        .collect::<Result<Vec<_>>>()?;
+    let key_count = u64::try_from(keys.len()).map_err(|_| anyhow!("too many multisig keys"))?;
+    if required == 0 || required > key_count || key_count > 16 {
+        bail!("multisig threshold must be between 1 and the number of keys (maximum 16)")
+    }
+    let wildcard = keys.iter().any(|(_, _, wildcard)| *wildcard);
+    if keys
+        .iter()
+        .any(|(_, _, key_wildcard)| *key_wildcard != wildcard)
+    {
+        bail!("all multisig keys must use the same wildcard form")
+    }
+    let indices = descriptor_indices(wildcard, range)?;
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    indices
+        .into_iter()
+        .map(|index| {
+            let mut derived = keys
+                .iter()
+                .enumerate()
+                .map(|(key_index, (key, path, _))| {
+                    let public_key = descriptor_public_key(key, path, index, &secp)?;
+                    Ok((
+                        public_key,
+                        descriptor_derived_key(
+                            node,
+                            key,
+                            path,
+                            index,
+                            public_key,
+                            origins[key_index].clone(),
+                        )?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut public_keys = derived
+                .iter()
+                .map(|(public_key, _)| *public_key)
+                .collect::<Vec<_>>();
+            if sorted {
+                derived.sort_by_key(|(public_key, _)| *public_key);
+                public_keys = derived.iter().map(|(public_key, _)| *public_key).collect();
+            }
+            let mut builder = Builder::new().push_int(required as i64);
+            for public_key in &public_keys {
+                builder = builder.push_key(public_key);
+            }
+            Ok(DescriptorCandidate {
+                script_pubkey: builder
+                    .push_int(key_count as i64)
+                    .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
+                    .into_script(),
+                redeem_script: None,
+                witness_script: None,
+                keys: derived.into_iter().map(|(_, key)| key).collect(),
+            })
+        })
+        .collect()
+}
+
+fn descriptor_derived_key(
+    node: &Arc<Node>,
+    key: &DescriptorKey,
+    path: &bitcoin::bip32::DerivationPath,
+    index: Option<u32>,
+    public_key: bitcoin::PublicKey,
+    origin: Option<(bitcoin::bip32::Fingerprint, bitcoin::bip32::DerivationPath)>,
+) -> Result<DescriptorDerivedKey> {
+    let private_key = if let DescriptorKey::Xpriv(xpriv) = key {
+        let mut derivation = path.clone();
+        if let Some(index) = index {
+            derivation = derivation.child(index.into());
+        }
+        Some(bitcoin::PrivateKey::new(
+            xpriv
+                .derive_priv(&bitcoin::secp256k1::Secp256k1::new(), &derivation)?
+                .private_key,
+            node.config.network,
+        ))
+    } else {
+        None
+    };
+    Ok(DescriptorDerivedKey {
+        public_key: Some(public_key),
+        private_key,
+        origin: origin.map(|(fingerprint, origin_path)| {
+            let mut derivation = Vec::from(origin_path);
+            derivation.extend(path.as_ref().iter().copied());
+            if let Some(index) = index {
+                derivation.push(index.into());
+            }
+            (fingerprint, derivation.into())
+        }),
+    })
+}
+
+fn sign_descriptor_psbt_input(
+    psbt: &mut Psbt,
+    input_index: usize,
+    prevout: &TxOut,
+    candidate: &DescriptorCandidate,
+    sighash_type: EcdsaSighashType,
+) -> Result<()> {
+    let signing_script = candidate
+        .witness_script
+        .as_ref()
+        .or(candidate.redeem_script.as_ref())
+        .unwrap_or(&prevout.script_pubkey);
+    let keys = candidate
+        .keys
+        .iter()
+        .filter_map(|key| key.private_key.as_ref().map(|private| (key, private)))
+        .filter_map(|(key, private)| key.public_key.map(|public| (public, private)))
+        .filter(|(public_key, _)| descriptor_public_key_matches_script(public_key, signing_script))
+        .collect::<Vec<_>>();
+    if keys.is_empty()
+        || !(signing_script.is_p2pk()
+            || signing_script.is_p2pkh()
+            || signing_script.is_p2wpkh()
+            || multisig_script_keys(signing_script).is_some())
+    {
+        return Ok(());
+    }
+    let message = if signing_script.is_p2wpkh() {
+        Message::from(SighashCache::new(&psbt.unsigned_tx).p2wpkh_signature_hash(
+            input_index,
+            signing_script,
+            prevout.value,
+            sighash_type,
+        )?)
+    } else if candidate.witness_script.is_some() {
+        Message::from(SighashCache::new(&psbt.unsigned_tx).p2wsh_signature_hash(
+            input_index,
+            signing_script,
+            prevout.value,
+            sighash_type,
+        )?)
+    } else {
+        Message::from(SighashCache::new(&psbt.unsigned_tx).legacy_signature_hash(
+            input_index,
+            signing_script,
+            sighash_type.to_u32(),
+        )?)
+    };
+    let secp = Secp256k1::new();
+    for (public_key, private_key) in keys {
+        if psbt.inputs[input_index]
+            .partial_sigs
+            .contains_key(&public_key)
+        {
+            continue;
+        }
+        let signature = secp.sign_ecdsa(&message, &private_key.inner);
+        psbt.inputs[input_index].partial_sigs.insert(
+            public_key,
+            EcdsaSignature {
+                signature,
+                sighash_type,
+            },
+        );
+    }
+    Ok(())
+}
+
+fn descriptor_public_key_matches_script(
+    public_key: &bitcoin::PublicKey,
+    script: &bitcoin::Script,
+) -> bool {
+    public_key_matches_script(public_key, script)
+        || multisig_script_keys(script).is_some_and(|(_, keys)| keys.contains(public_key))
 }
 
 fn lookup_psbt_prevout(
@@ -5564,6 +6215,18 @@ fn expand_descriptor_scripts(
             let xonly = match &base_key {
                 DescriptorKey::PublicKey(public_key) => bitcoin::XOnlyPublicKey::from(*public_key),
                 DescriptorKey::XOnlyPublicKey(public_key) => *public_key,
+                DescriptorKey::Xpriv(xpriv) => {
+                    let mut derivation = path.clone();
+                    if let Some(index) = index {
+                        derivation = derivation.child(index.into());
+                    }
+                    xpriv
+                        .derive_priv(&bitcoin::secp256k1::Secp256k1::new(), &derivation)?
+                        .private_key
+                        .public_key(&bitcoin::secp256k1::Secp256k1::new())
+                        .x_only_public_key()
+                        .0
+                }
                 DescriptorKey::Xpub(xpub) => {
                     let mut derivation = path.clone();
                     if let Some(index) = index {
@@ -5595,6 +6258,17 @@ fn expand_descriptor_scripts(
             DescriptorKey::XOnlyPublicKey(_) => {
                 bail!("x-only public keys are only supported by tr descriptors")
             }
+            DescriptorKey::Xpriv(xpriv) => {
+                let mut derivation = path.clone();
+                if let Some(index) = index {
+                    derivation = derivation.child(index.into());
+                }
+                xpriv
+                    .derive_priv(&bitcoin::secp256k1::Secp256k1::new(), &derivation)?
+                    .private_key
+                    .public_key(&bitcoin::secp256k1::Secp256k1::new())
+                    .into()
+            }
             DescriptorKey::Xpub(xpub) => {
                 let mut derivation = path.clone();
                 if let Some(index) = index {
@@ -5618,6 +6292,7 @@ fn expand_descriptor_scripts(
 enum DescriptorKey {
     PublicKey(bitcoin::PublicKey),
     XOnlyPublicKey(bitcoin::XOnlyPublicKey),
+    Xpriv(bitcoin::bip32::Xpriv),
     Xpub(bitcoin::bip32::Xpub),
 }
 
@@ -5685,6 +6360,17 @@ fn descriptor_public_key(
         DescriptorKey::XOnlyPublicKey(_) => {
             bail!("x-only public keys are only supported by tr descriptors")
         }
+        DescriptorKey::Xpriv(xpriv) => {
+            let mut derivation = path.clone();
+            if let Some(index) = index {
+                derivation = derivation.child(index.into());
+            }
+            Ok(xpriv
+                .derive_priv(&bitcoin::secp256k1::Secp256k1::new(), &derivation)?
+                .private_key
+                .public_key(&bitcoin::secp256k1::Secp256k1::new())
+                .into())
+        }
         DescriptorKey::Xpub(xpub) => {
             let mut derivation = path.clone();
             if let Some(index) = index {
@@ -5751,12 +6437,33 @@ fn parse_descriptor_key(
         }
         DescriptorKey::XOnlyPublicKey(public_key)
     } else if let Ok(private_key) = base.parse::<bitcoin::bip32::Xpriv>() {
-        let secp = bitcoin::secp256k1::Secp256k1::new();
-        DescriptorKey::Xpub(bitcoin::bip32::Xpub::from_priv(&secp, &private_key))
+        DescriptorKey::Xpriv(private_key)
     } else {
         DescriptorKey::Xpub(base.parse::<bitcoin::bip32::Xpub>()?)
     };
     Ok((key, path.into(), wildcard))
+}
+
+fn descriptor_key_origin(
+    expression: &str,
+) -> Result<Option<(bitcoin::bip32::Fingerprint, bitcoin::bip32::DerivationPath)>> {
+    let Some(expression) = expression.strip_prefix('[') else {
+        return Ok(None);
+    };
+    let end = expression
+        .find(']')
+        .ok_or_else(|| anyhow!("descriptor key origin is missing a closing bracket"))?;
+    let origin = &expression[..end];
+    let mut parts = origin.split('/');
+    let fingerprint = parts
+        .next()
+        .ok_or_else(|| anyhow!("descriptor key origin is empty"))?
+        .parse::<bitcoin::bip32::Fingerprint>()?;
+    let path = parts
+        .map(str::parse::<bitcoin::bip32::ChildNumber>)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into();
+    Ok(Some((fingerprint, path)))
 }
 
 fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -5989,6 +6696,7 @@ fn rpc_help(method: &str) -> String {
         "joinpsbts",
         "finalizepsbt",
         "utxoupdatepsbt",
+        "descriptorprocesspsbt",
         "signmessagewithprivkey",
         "verifymessage",
         "createmultisig",
@@ -7335,6 +8043,100 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn descriptorprocesspsbt_updates_wrappers_and_signs_transient_xprivs() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let xpriv = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[7; 32]).unwrap();
+        let descriptor = format!("wpkh([d34db33f/84'/0'/0']{xpriv})");
+        let secp = Secp256k1::new();
+        let private = bitcoin::PrivateKey::new(xpriv.private_key, Network::Regtest);
+        let public_key = private.public_key(&secp);
+        let compressed = bitcoin::CompressedPublicKey::try_from(public_key).unwrap();
+        let previous_script = Address::p2wpkh(&compressed, Network::Regtest).script_pubkey();
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([21; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(unsigned).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: previous_script,
+        });
+        let processed = descriptor_process_psbt(
+            &node,
+            &json!([encode_psbt(&psbt), [descriptor], "SIGHASH_ALL", true, true]),
+        )
+        .unwrap();
+        assert_eq!(processed["complete"], true);
+        assert!(processed["hex"].as_str().is_some());
+        let processed_psbt = parse_psbt(&json!([processed["psbt"].clone()]), 0).unwrap();
+        assert!(processed_psbt.inputs[0].final_script_witness.is_some());
+        assert_eq!(
+            processed_psbt.inputs[0]
+                .bip32_derivation
+                .get(&public_key.inner)
+                .unwrap()
+                .1
+                .to_string(),
+            "84'/0'/0'"
+        );
+
+        let nested_descriptor = format!("sh(wpkh({public_key}))");
+        let nested_script = Address::p2sh(
+            &Address::p2wpkh(&compressed, Network::Regtest).script_pubkey(),
+            Network::Regtest,
+        )
+        .unwrap()
+        .script_pubkey();
+        let mut nested = processed_psbt.clone();
+        nested.inputs[0].final_script_sig = None;
+        nested.inputs[0].final_script_witness = None;
+        nested.inputs[0].partial_sigs.clear();
+        nested.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: nested_script,
+        });
+        let nested_processed = descriptor_process_psbt(
+            &node,
+            &json!([
+                encode_psbt(&nested),
+                [nested_descriptor],
+                "SIGHASH_ALL",
+                true,
+                false
+            ]),
+        )
+        .unwrap();
+        let nested_psbt = parse_psbt(&json!([nested_processed["psbt"].clone()]), 0).unwrap();
+        assert_eq!(
+            nested_psbt.inputs[0].redeem_script.as_ref().unwrap(),
+            &Address::p2wpkh(&compressed, Network::Regtest).script_pubkey()
+        );
+        assert_eq!(nested_processed["complete"], false);
     }
 
     #[test]

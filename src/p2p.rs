@@ -1,17 +1,24 @@
 //! Bitcoin peer networking and block/transaction relay.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use anyhow::{Context, Result};
 use bitcoin::hashes::Hash;
 use bitcoin::{BlockHash, Network, Txid};
 use rand::random;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf};
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::Node;
 use crate::wire::{self, GetHeadersMessage, Inventory, InventoryType, Message, VersionMessage};
+
+type PeerWriter = Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>;
+type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, PeerWriter>>>;
 
 pub struct PeerManager {
     node: Arc<Node>,
@@ -27,6 +34,8 @@ impl PeerManager {
             .await
             .with_context(|| format!("binding P2P listener {}", self.node.config.p2p_bind))?;
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
+        let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let next_peer_id = Arc::new(AtomicUsize::new(1));
         let seed_nodes = if self.node.config.seed_nodes.is_empty() {
             discover_dns_seeds(self.node.config.network).await
         } else {
@@ -35,6 +44,8 @@ impl PeerManager {
         for address in seed_nodes {
             let node = self.node.clone();
             let slots = slots.clone();
+            let peers = peers.clone();
+            let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let Ok(permit) = slots.acquire_owned().await else {
                     return;
@@ -42,7 +53,7 @@ impl PeerManager {
                 match TcpStream::connect(address).await {
                     Ok(stream) => {
                         info!(%address, "connected to configured peer");
-                        if let Err(error) = serve_peer(node, stream, true).await {
+                        if let Err(error) = serve_peer(node, stream, true, peers, peer_id).await {
                             debug!(%address, %error, "outbound peer ended");
                         }
                     }
@@ -56,12 +67,14 @@ impl PeerManager {
             let (stream, address) = listener.accept().await?;
             let node = self.node.clone();
             let slots = slots.clone();
+            let peers = peers.clone();
+            let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
             tokio::spawn(async move {
                 let Ok(permit) = slots.try_acquire_owned() else {
                     debug!(%address, "rejecting peer because peer limit is reached");
                     return;
                 };
-                if let Err(error) = serve_peer(node, stream, false).await {
+                if let Err(error) = serve_peer(node, stream, false, peers, peer_id).await {
                     debug!(%address, %error, "inbound peer ended");
                 }
                 drop(permit);
@@ -113,11 +126,33 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
     addresses
 }
 
-async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> Result<()> {
+async fn serve_peer(
+    node: Arc<Node>,
+    stream: TcpStream,
+    outbound: bool,
+    peers: PeerRegistry,
+    peer_id: usize,
+) -> Result<()> {
     stream.set_nodelay(true)?;
+    let (mut reader, writer_half) = stream.into_split();
+    let writer = Arc::new(Mutex::new(writer_half));
+    peers.lock().insert(peer_id, writer.clone());
+    let result = serve_peer_loop(&node, &mut reader, &writer, outbound, &peers, peer_id).await;
+    peers.lock().remove(&peer_id);
+    result
+}
+
+async fn serve_peer_loop(
+    node: &Arc<Node>,
+    reader: &mut OwnedReadHalf,
+    writer: &PeerWriter,
+    outbound: bool,
+    peers: &PeerRegistry,
+    peer_id: usize,
+) -> Result<()> {
     let height = node.chain.read().height() as i32;
-    wire::write_message(
-        &mut stream,
+    send_message(
+        writer,
         node.config.network,
         &Message::Version(VersionMessage::new(height, random())),
     )
@@ -126,7 +161,7 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
     let mut verack_received = false;
     let mut verack_sent = false;
     loop {
-        let message = wire::read_message(&mut stream, node.config.network).await?;
+        let message = wire::read_message(reader, node.config.network).await?;
         match message {
             Message::Version(version) => {
                 if version_received {
@@ -137,7 +172,7 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                     anyhow::bail!("peer protocol version is too old");
                 }
                 if !verack_sent {
-                    wire::write_message(&mut stream, node.config.network, &Message::Verack).await?;
+                    send_message(writer, node.config.network, &Message::Verack).await?;
                     verack_sent = true;
                 }
                 if outbound {
@@ -149,11 +184,10 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                 if !version_received {
                     continue;
                 }
-                request_headers(&node, &mut stream).await?;
+                request_headers(node, writer).await?;
             }
             Message::Ping(nonce) => {
-                wire::write_message(&mut stream, node.config.network, &Message::Pong(nonce))
-                    .await?;
+                send_message(writer, node.config.network, &Message::Pong(nonce)).await?;
             }
             Message::Pong(_) => {}
             Message::GetHeaders(request) | Message::GetBlocks(request) => {
@@ -161,8 +195,7 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                     .chain
                     .read()
                     .headers_after_locator(&request.locator_hashes, request.stop_hash);
-                wire::write_message(&mut stream, node.config.network, &Message::Headers(headers))
-                    .await?;
+                send_message(writer, node.config.network, &Message::Headers(headers)).await?;
             }
             Message::Headers(headers) => {
                 if headers.is_empty() {
@@ -182,12 +215,7 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                     }
                 }
                 if !requests.is_empty() {
-                    wire::write_message(
-                        &mut stream,
-                        node.config.network,
-                        &Message::GetData(requests),
-                    )
-                    .await?;
+                    send_message(writer, node.config.network, &Message::GetData(requests)).await?;
                 }
             }
             Message::Inv(items) => {
@@ -211,12 +239,7 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                         .collect::<Vec<_>>()
                 };
                 if !requests.is_empty() {
-                    wire::write_message(
-                        &mut stream,
-                        node.config.network,
-                        &Message::GetData(requests),
-                    )
-                    .await?;
+                    send_message(writer, node.config.network, &Message::GetData(requests)).await?;
                 }
             }
             Message::GetData(items) => {
@@ -226,12 +249,8 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                         InventoryType::Block | InventoryType::WitnessBlock => {
                             let block = node.chain.write().block(&item.hash)?;
                             if let Some(block) = block {
-                                wire::write_message(
-                                    &mut stream,
-                                    node.config.network,
-                                    &Message::Block(block),
-                                )
-                                .await?;
+                                send_message(writer, node.config.network, &Message::Block(block))
+                                    .await?;
                             } else {
                                 missing.push(item);
                             }
@@ -244,8 +263,8 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                                 .get(&txid)
                                 .map(|entry| entry.transaction.clone());
                             if let Some(transaction) = transaction {
-                                wire::write_message(
-                                    &mut stream,
+                                send_message(
+                                    writer,
                                     node.config.network,
                                     &Message::Transaction(transaction),
                                 )
@@ -258,12 +277,7 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                     }
                 }
                 if !missing.is_empty() {
-                    wire::write_message(
-                        &mut stream,
-                        node.config.network,
-                        &Message::NotFound(missing),
-                    )
-                    .await?;
+                    send_message(writer, node.config.network, &Message::NotFound(missing)).await?;
                 }
             }
             Message::Block(block) => {
@@ -271,16 +285,40 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
                 match node.connect_block(block) {
                     Ok(tip) => {
                         info!(%hash, height = tip.height, "accepted peer block");
+                        broadcast_inventory(
+                            peers,
+                            peer_id,
+                            node.config.network,
+                            Inventory {
+                                kind: InventoryType::WitnessBlock,
+                                hash,
+                            },
+                        )
+                        .await;
                     }
                     Err(error) => debug!(%hash, %error, "rejected peer block"),
                 }
             }
             Message::Transaction(transaction) => {
                 let txid = transaction.compute_txid();
-                let chain = node.chain.read();
-                match node.mempool.write().accept(transaction, &chain) {
-                    Ok(_) => debug!(%txid, "accepted peer transaction"),
-                    Err(error) => debug!(%txid, %error, "rejected peer transaction"),
+                let accepted = {
+                    let chain = node.chain.read();
+                    node.mempool.write().accept(transaction, &chain).is_ok()
+                };
+                if accepted {
+                    debug!(%txid, "accepted peer transaction");
+                    broadcast_inventory(
+                        peers,
+                        peer_id,
+                        node.config.network,
+                        Inventory {
+                            kind: InventoryType::WitnessTransaction,
+                            hash: BlockHash::from_raw_hash(txid.to_raw_hash()),
+                        },
+                    )
+                    .await;
+                } else {
+                    debug!(%txid, "rejected peer transaction");
                 }
             }
             Message::Addr(_)
@@ -294,16 +332,16 @@ async fn serve_peer(node: Arc<Node>, mut stream: TcpStream, outbound: bool) -> R
             | Message::Unknown { .. } => {}
         }
         if version_received && verack_received && !verack_sent {
-            wire::write_message(&mut stream, node.config.network, &Message::Verack).await?;
+            send_message(writer, node.config.network, &Message::Verack).await?;
             verack_sent = true;
         }
     }
 }
 
-async fn request_headers(node: &Arc<Node>, stream: &mut TcpStream) -> Result<()> {
+async fn request_headers(node: &Arc<Node>, writer: &PeerWriter) -> Result<()> {
     let locator = vec![node.chain.read().best_hash()];
-    wire::write_message(
-        stream,
+    send_message(
+        writer,
         node.config.network,
         &Message::GetHeaders(GetHeadersMessage {
             version: VersionMessage::PROTOCOL_VERSION,
@@ -312,4 +350,27 @@ async fn request_headers(node: &Arc<Node>, stream: &mut TcpStream) -> Result<()>
         }),
     )
     .await
+}
+
+async fn send_message(writer: &PeerWriter, network: Network, message: &Message) -> Result<()> {
+    let mut writer = writer.lock().await;
+    wire::write_message(&mut *writer, network, message).await
+}
+
+async fn broadcast_inventory(
+    peers: &PeerRegistry,
+    excluded_peer: usize,
+    network: Network,
+    item: Inventory,
+) {
+    let recipients: Vec<PeerWriter> = peers
+        .lock()
+        .iter()
+        .filter(|(peer_id, _)| **peer_id != excluded_peer)
+        .map(|(_, writer)| writer.clone())
+        .collect();
+    let message = Message::Inv(vec![item]);
+    for writer in recipients {
+        let _ = send_message(&writer, network, &message).await;
+    }
 }

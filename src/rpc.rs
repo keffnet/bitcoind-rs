@@ -38,6 +38,7 @@ use crate::validation;
 use crate::wire;
 
 const MAX_HTTP_REQUEST: usize = 8 * 1024 * 1024;
+const DEFAULT_MAX_RAW_TX_FEE_RATE_BTC_PER_KVB: f64 = 0.1;
 
 pub struct RpcServer {
     node: Arc<Node>,
@@ -4678,8 +4679,71 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let transaction: Transaction = deserialize(&bytes)?;
+    let max_fee_rate = parse_max_fee_rate(params.get(1))?;
+    let max_burn_amount = parse_max_burn_amount(params.get(2))?;
+    validate_burn_amount(&transaction, max_burn_amount)?;
+    enforce_max_fee_rate(node, &transaction, max_fee_rate)?;
     let txid = node.accept_transaction(transaction)?;
     Ok(json!(txid.to_string()))
+}
+
+fn parse_max_fee_rate(value: Option<&Value>) -> Result<Option<f64>> {
+    let max_fee_rate = value.filter(|value| !value.is_null()).map_or(
+        Ok(DEFAULT_MAX_RAW_TX_FEE_RATE_BTC_PER_KVB),
+        |value| {
+            value
+                .as_f64()
+                .ok_or_else(|| anyhow!("maxfeerate must be a number"))
+        },
+    )?;
+    if !max_fee_rate.is_finite() || !(0.0..=1.0).contains(&max_fee_rate) {
+        bail!("maxfeerate must be between 0 and 1 BTC/kvB")
+    }
+    Ok((max_fee_rate > 0.0).then_some(max_fee_rate))
+}
+
+fn parse_max_burn_amount(value: Option<&Value>) -> Result<u64> {
+    let max_burn = value
+        .filter(|value| !value.is_null())
+        .map_or(Ok(0.0), |value| {
+            value
+                .as_f64()
+                .ok_or_else(|| anyhow!("maxburnamount must be a number"))
+        })?;
+    if !max_burn.is_finite() || max_burn < 0.0 {
+        bail!("maxburnamount must be a non-negative amount")
+    }
+    Ok(Amount::from_btc(max_burn)?.to_sat())
+}
+
+fn validate_burn_amount(transaction: &Transaction, max_burn_amount: u64) -> Result<()> {
+    if transaction.output.iter().any(|output| {
+        output.script_pubkey.is_op_return() && output.value.to_sat() > max_burn_amount
+    }) {
+        bail!("Unspendable output exceeds maximum configured by user (maxburnamount)")
+    }
+    Ok(())
+}
+
+fn enforce_max_fee_rate(
+    node: &Arc<Node>,
+    transaction: &Transaction,
+    max_fee_rate: Option<f64>,
+) -> Result<()> {
+    let Some(max_fee_rate) = max_fee_rate else {
+        return Ok(());
+    };
+    let chain = node.chain.read();
+    let mut candidate = node.mempool.read().clone();
+    let txid = candidate.accept(transaction.clone(), &chain)?;
+    let entry = candidate
+        .get(&txid)
+        .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
+    let maximum_fee = max_fee_rate * 100_000_000.0 * entry.vsize as f64 / 1_000.0;
+    if entry.fee_sat as f64 > maximum_fee {
+        bail!("Fee exceeds maximum configured by user (e.g. maxfeerate)")
+    }
+    Ok(())
 }
 
 struct SigningPrevout {
@@ -5667,6 +5731,7 @@ fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("testmempoolaccept expects an array of hex transactions"))?;
     let chain = node.chain.read();
     let mut candidate = node.mempool.read().clone();
+    let max_fee_rate = parse_max_fee_rate(params.get(1))?;
     let mut result = Vec::with_capacity(transactions.len());
     for raw in transactions {
         let raw = raw
@@ -5689,13 +5754,28 @@ fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     .get(&txid)
                     .map(|entry| entry.fee_sat)
                     .unwrap_or_default();
-                result.push(json!({
-                    "txid": txid.to_string(),
-                    "wtxid": transaction.compute_wtxid().to_string(),
-                    "allowed": true,
-                    "vsize": transaction.vsize(),
-                    "fees": {"base": sat_to_btc(fee_sat)},
-                }));
+                let exceeds_max_fee = candidate.get(&txid).is_some_and(|entry| {
+                    max_fee_rate.is_some_and(|max_fee_rate| {
+                        entry.fee_sat as f64
+                            > max_fee_rate * 100_000_000.0 * entry.vsize as f64 / 1_000.0
+                    })
+                });
+                if exceeds_max_fee {
+                    result.push(json!({
+                        "txid": txid.to_string(),
+                        "wtxid": transaction.compute_wtxid().to_string(),
+                        "allowed": false,
+                        "reject-reason": "max-fee-exceeded",
+                    }));
+                } else {
+                    result.push(json!({
+                        "txid": txid.to_string(),
+                        "wtxid": transaction.compute_wtxid().to_string(),
+                        "allowed": true,
+                        "vsize": transaction.vsize(),
+                        "fees": {"base": sat_to_btc(fee_sat)},
+                    }));
+                }
             }
             Err(error) => result.push(json!({
                 "txid": txid.to_string(),
@@ -6942,6 +7022,27 @@ mod tests {
         let detailed = dispatch_method(&node, "getorphantxs", &json!([2])).unwrap();
         assert_eq!(detailed[0]["hex"], raw);
         assert!(dispatch_method(&node, "getorphantxs", &json!([3])).is_err());
+    }
+
+    #[test]
+    fn raw_transaction_fee_and_burn_limits_validate_rpc_arguments() {
+        assert_eq!(parse_max_fee_rate(None).unwrap(), Some(0.1));
+        assert_eq!(parse_max_fee_rate(Some(&json!(0))).unwrap(), None);
+        assert!(parse_max_fee_rate(Some(&json!(-1))).is_err());
+        assert!(parse_max_fee_rate(Some(&json!(1.1))).is_err());
+        assert_eq!(parse_max_burn_amount(None).unwrap(), 0);
+        assert_eq!(parse_max_burn_amount(Some(&json!(0.00000001))).unwrap(), 1);
+
+        let mut transaction = proof_transaction(8);
+        transaction.output.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: Builder::new()
+                .push_opcode(OP_RETURN)
+                .push_slice([1u8])
+                .into_script(),
+        });
+        assert!(validate_burn_amount(&transaction, 0).is_err());
+        assert!(validate_burn_amount(&transaction, 1).is_ok());
     }
 
     #[test]

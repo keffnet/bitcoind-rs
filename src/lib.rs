@@ -1227,7 +1227,7 @@ impl Node {
     pub(crate) fn set_peer_connection_type(&self, id: usize, connection_type: &'static str) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.connection_type = connection_type;
-            peer.addr_relay_enabled = !peer.inbound && connection_type == "outbound-full";
+            peer.addr_relay_enabled = !peer.inbound && connection_type != "block-relay-only";
         }
     }
 

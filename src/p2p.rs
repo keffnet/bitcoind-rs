@@ -64,11 +64,20 @@ const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 
 fn local_transaction_relay_enabled(connection_type: &str, blocksonly: bool) -> bool {
-    !blocksonly && matches!(connection_type, "outbound-full" | "inbound")
+    !blocksonly && matches!(connection_type, "outbound-full" | "inbound" | "addr-fetch")
+}
+
+fn connection_requests_headers(connection_type: &str) -> bool {
+    !matches!(connection_type, "addr-fetch" | "feeler")
+}
+
+fn connection_fetches_addresses(outbound: bool, connection_type: &str) -> bool {
+    outbound && connection_type != "block-relay-only" && connection_type != "feeler"
 }
 
 struct PeerState {
     writer: PeerWriter,
+    connection_type: &'static str,
     local_relay_transactions: bool,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
@@ -843,6 +852,7 @@ async fn serve_peer(
     node.set_peer_connection_type(peer_id, options.connection_type);
     let peer_state = Arc::new(PeerState {
         writer: Arc::new(Mutex::new(writer_half)),
+        connection_type: options.connection_type,
         local_relay_transactions: local_transaction_relay_enabled(
             options.connection_type,
             node.config.blocksonly,
@@ -1037,6 +1047,9 @@ async fn serve_peer_loop(
                 if version.nonce == local_nonce {
                     anyhow::bail!("peer connected to itself");
                 }
+                if peer_state.connection_type == "feeler" {
+                    anyhow::bail!("feeler connection completed");
+                }
                 peer_version = version.version;
                 node.update_peer_version(
                     peer_id,
@@ -1089,16 +1102,20 @@ async fn serve_peer_loop(
                     peer_version,
                 )
                 .await?;
-                request_headers(node, peer_id, writer).await?;
-                send_message(
-                    node,
-                    peer_id,
-                    writer,
-                    node.config.network,
-                    &Message::GetAddr,
-                )
-                .await?;
-                node.grant_peer_address_tokens(peer_id, MAX_ADDR_TO_SEND);
+                if connection_requests_headers(peer_state.connection_type) {
+                    request_headers(node, peer_id, writer).await?;
+                }
+                if connection_fetches_addresses(outbound, peer_state.connection_type) {
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::GetAddr,
+                    )
+                    .await?;
+                    node.grant_peer_address_tokens(peer_id, MAX_ADDR_TO_SEND);
+                }
             }
             Message::SendAddrV2 => {
                 if verack_received {
@@ -1800,6 +1817,9 @@ async fn serve_peer_loop(
                 if addresses.len() > MAX_ADDR_TO_SEND {
                     bail!("addr message contains too many addresses");
                 }
+                if peer_state.connection_type == "addr-fetch" && addresses.len() > 1 {
+                    bail!("addr-fetch connection received too many addresses");
+                }
                 node.enable_peer_address_relay(peer_id);
                 let mut relay_addresses = Vec::new();
                 for entry in addresses {
@@ -1815,6 +1835,9 @@ async fn serve_peer_loop(
             Message::AddrV2(addresses) => {
                 if addresses.len() > MAX_ADDR_TO_SEND {
                     bail!("addrv2 message contains too many addresses");
+                }
+                if peer_state.connection_type == "addr-fetch" && addresses.len() > 1 {
+                    bail!("addr-fetch connection received too many addresses");
                 }
                 node.enable_peer_address_relay(peer_id);
                 let mut relay_addresses = Vec::new();
@@ -2216,6 +2239,8 @@ async fn send_peer_extensions(
         if node.config.zmq.tx_reconciliation
             && *peer_state.relay_transactions.lock()
             && peer_state.local_relay_transactions
+            && peer_state.connection_type != "addr-fetch"
+            && peer_state.connection_type != "feeler"
         {
             let salt = random::<u64>();
             send_message(
@@ -2618,13 +2643,28 @@ mod tests {
     use crate::{Config, Node};
 
     #[test]
-    fn non_full_connection_types_disable_local_transaction_relay() {
+    fn connection_types_match_local_transaction_relay_policy() {
         assert!(local_transaction_relay_enabled("outbound-full", false));
         assert!(local_transaction_relay_enabled("inbound", false));
-        for connection_type in ["block-relay-only", "addr-fetch", "feeler"] {
+        assert!(local_transaction_relay_enabled("addr-fetch", false));
+        for connection_type in ["block-relay-only", "feeler"] {
             assert!(!local_transaction_relay_enabled(connection_type, false));
         }
         assert!(!local_transaction_relay_enabled("outbound-full", true));
+    }
+
+    #[test]
+    fn connection_types_match_core_sync_and_address_policies() {
+        assert!(connection_requests_headers("outbound-full"));
+        assert!(connection_requests_headers("block-relay-only"));
+        assert!(!connection_requests_headers("addr-fetch"));
+        assert!(!connection_requests_headers("feeler"));
+
+        assert!(connection_fetches_addresses(true, "outbound-full"));
+        assert!(connection_fetches_addresses(true, "addr-fetch"));
+        assert!(!connection_fetches_addresses(true, "block-relay-only"));
+        assert!(!connection_fetches_addresses(true, "feeler"));
+        assert!(!connection_fetches_addresses(false, "inbound"));
     }
 
     #[test]
@@ -3415,6 +3455,7 @@ mod tests {
         let writer = Arc::new(Mutex::new(PeerWriterKind::V1(client_writer)));
         let peer_state = PeerState {
             writer: writer.clone(),
+            connection_type: "outbound-full",
             local_relay_transactions: true,
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),

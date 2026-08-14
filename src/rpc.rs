@@ -1521,9 +1521,13 @@ fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .transpose()?;
     const BASIC_FILTER_INDEX: &str = "basic block filter index";
     const TX_INDEX: &str = "txindex";
+    const TX_SPENDER_INDEX: &str = "txospenderindex";
     const COIN_STATS_INDEX: &str = "coinstatsindex";
     if requested.is_some_and(|name| {
-        name != BASIC_FILTER_INDEX && name != TX_INDEX && name != COIN_STATS_INDEX
+        name != BASIC_FILTER_INDEX
+            && name != TX_INDEX
+            && name != TX_SPENDER_INDEX
+            && name != COIN_STATS_INDEX
     }) {
         return Ok(json!({}));
     }
@@ -1531,6 +1535,12 @@ fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let mut result = json!({});
     if node.config.txindex && requested.is_none_or(|name| name == TX_INDEX) {
         result[TX_INDEX] = json!({
+            "synced": true,
+            "best_block_height": height,
+        });
+    }
+    if node.config.txospenderindex && requested.is_none_or(|name| name == TX_SPENDER_INDEX) {
+        result[TX_SPENDER_INDEX] = json!({
             "synced": true,
             "best_block_height": height,
         });
@@ -9417,7 +9427,7 @@ fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .ok_or_else(|| anyhow!("mempool_only must be a boolean"))
         })
         .transpose()?
-        .unwrap_or(false);
+        .unwrap_or(!node.config.txospenderindex);
     let return_spending_tx = options
         .get("return_spending_tx")
         .map(|value| {
@@ -9446,6 +9456,20 @@ fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     drop(mempool);
     if !mempool_only {
+        if !node.config.txospenderindex {
+            if let Some(outpoint) = outpoints.iter().enumerate().find_map(|(index, outpoint)| {
+                result[index]
+                    .get("spendingtxid")
+                    .is_none()
+                    .then_some(outpoint)
+            }) {
+                bail!(
+                    "No spending transaction for the outpoint {}:{} in mempool, and txospenderindex is unavailable.",
+                    outpoint.txid,
+                    outpoint.vout
+                );
+            }
+        }
         let mut chain = node.chain.write();
         for (index, outpoint) in outpoints.iter().enumerate() {
             if result[index].get("spendingtxid").is_some() {
@@ -9859,6 +9883,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10017,6 +10042,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10090,6 +10116,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10122,6 +10149,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10159,6 +10187,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: true,
             persist_mempool: true,
@@ -10227,6 +10256,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: true,
             persist_mempool: true,
@@ -10274,6 +10304,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10383,6 +10414,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10438,6 +10470,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10471,6 +10504,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10507,6 +10541,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10552,6 +10587,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10590,6 +10626,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10622,6 +10659,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10651,6 +10689,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10755,6 +10794,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10806,6 +10846,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10879,6 +10920,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10919,6 +10961,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -10985,6 +11028,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: true,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11072,6 +11116,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11161,6 +11206,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11194,6 +11240,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11232,6 +11279,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11276,6 +11324,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11327,6 +11376,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11369,6 +11419,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11411,6 +11462,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11445,6 +11497,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11478,6 +11531,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11557,6 +11611,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11616,6 +11671,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11669,6 +11725,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -11832,6 +11889,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -12002,6 +12060,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: true,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -12043,6 +12102,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -12134,6 +12194,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -12249,6 +12310,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -12290,6 +12352,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -12369,6 +12432,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -12580,6 +12644,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -12925,6 +12990,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -12984,6 +13050,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -13052,6 +13119,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -13164,6 +13232,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,
@@ -13198,6 +13267,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,

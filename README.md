@@ -44,6 +44,8 @@ Inbound P2P listening can be disabled with `--listen=false`; DNS seed lookup can
 
 Use `--txindex` to enable confirmed transaction lookup without supplying a block hash to `getrawtransaction`; Core-style pruning and `--txindex` are mutually exclusive.
 
+Use `--txospenderindex` to enable historical spender lookup for `gettxspendingprevout`; transaction lookup indexes are unavailable in prune mode.
+
 `--maxmempool=<MB>` sets the transaction pool's byte limit (300 MB by default); admission uses the existing package-aware eviction policy when the limit is reached.
 
 `--coinstatsindex` persists incremental UTXO statistics and enables historical `gettxoutsetinfo` queries by block hash or height.

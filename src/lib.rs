@@ -294,6 +294,7 @@ impl Node {
             config.signet_challenge.as_deref(),
         )?;
         chain.configure_pruning(config.prune)?;
+        chain.configure_txospender_index(config.txospenderindex)?;
         chain.configure_coinstats_index(config.coinstatsindex)?;
         chain.maybe_auto_prune()?;
         let mempool_path = config.datadir.join("mempool.json");
@@ -1473,6 +1474,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
             persist_mempool: true,

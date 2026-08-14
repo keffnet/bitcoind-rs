@@ -200,6 +200,7 @@ pub struct ChainState {
     pub store: BlockStore,
     filter_store: FilterStore,
     coinstats_store: CoinStatsStore,
+    txospender_index_enabled: bool,
     coinstats_index_enabled: bool,
     coin_stats: Option<CoinStatsState>,
     active_chain: Vec<BlockHash>,
@@ -291,6 +292,7 @@ impl ChainState {
             store,
             filter_store,
             coinstats_store,
+            txospender_index_enabled: false,
             coinstats_index_enabled: false,
             coin_stats: None,
             active_chain: Vec::new(),
@@ -331,11 +333,15 @@ impl ChainState {
             let persisted_spent_by = snapshot.spent_by;
             let headers = state.headers.clone();
             state.index_active_headers(&headers)?;
-            if let Some(spent_by) = persisted_spent_by {
-                state.spent_by = spent_by;
-                state.validate_persisted_spent_index()?;
+            if state.txospender_index_enabled {
+                if let Some(spent_by) = persisted_spent_by {
+                    state.spent_by = spent_by;
+                    state.validate_persisted_spent_index()?;
+                } else {
+                    state.rebuild_spent_index()?;
+                }
             } else {
-                state.rebuild_spent_index()?;
+                state.spent_by.clear();
             }
         } else {
             let mut blocks = Vec::with_capacity(active_chain.len());
@@ -413,6 +419,23 @@ impl ChainState {
 
     pub fn coinstats_index_enabled(&self) -> bool {
         self.coinstats_index_enabled
+    }
+
+    pub fn txospender_index_enabled(&self) -> bool {
+        self.txospender_index_enabled
+    }
+
+    /// Enable or disable the durable transaction-output spender index.
+    /// Rebuilding it is independent from the active UTXO set and therefore
+    /// remains useful for historical `gettxspendingprevout` queries.
+    pub fn configure_txospender_index(&mut self, enabled: bool) -> Result<()> {
+        self.txospender_index_enabled = enabled;
+        if enabled {
+            self.rebuild_spent_index()?;
+        } else {
+            self.spent_by.clear();
+        }
+        Ok(())
     }
 
     /// Enable or disable the durable coinstats index. Enabling it builds any
@@ -1391,7 +1414,9 @@ impl ChainState {
         &self,
         outpoint: &OutPoint,
     ) -> Option<(Txid, usize, BlockHash, u32)> {
-        self.spent_by.get(outpoint).copied()
+        self.txospender_index_enabled
+            .then(|| self.spent_by.get(outpoint).copied())
+            .flatten()
     }
 
     pub fn get_history(&self, script_hash: &str) -> Vec<HistoryEntry> {
@@ -2162,7 +2187,9 @@ impl ChainState {
                 },
             );
         }
-        self.index_block_spends(block, height);
+        if self.txospender_index_enabled {
+            self.index_block_spends(block, height);
+        }
         self.active_chain.push(hash);
         self.headers.push(block.header);
         let parent_work = self
@@ -2535,7 +2562,9 @@ impl ChainState {
                 },
             );
         }
-        self.index_block_spends(block, height);
+        if self.txospender_index_enabled {
+            self.index_block_spends(block, height);
+        }
     }
 
     fn index_block_spends(&mut self, block: &Block, height: u32) {
@@ -2555,6 +2584,9 @@ impl ChainState {
 
     fn rebuild_spent_index(&mut self) -> Result<()> {
         self.spent_by.clear();
+        if !self.txospender_index_enabled {
+            return Ok(());
+        }
         let active_chain = self.active_chain.clone();
         for hash in active_chain {
             let height = self
@@ -2868,7 +2900,7 @@ impl ChainState {
             tx_index: self.tx_index.clone(),
             tx_index_all: self.tx_index_all.clone(),
             history: self.history.clone(),
-            spent_by: Some(self.spent_by.clone()),
+            spent_by: self.txospender_index_enabled.then(|| self.spent_by.clone()),
             prune_height: self.prune_height,
         }
     }
@@ -3639,6 +3671,7 @@ mod tests {
     fn accepts_transactions_spending_outputs_created_in_the_same_block() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_txospender_index(true).unwrap();
         let mut funding_block = None;
         for height in 1..=100 {
             let block = mine_block(&state, height);
@@ -3744,7 +3777,8 @@ mod tests {
         );
         state.persist_snapshot().unwrap();
         drop(state);
-        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        reopened.configure_txospender_index(true).unwrap();
         assert_eq!(
             reopened.spending_transaction(&funding_outpoint),
             Some((first_txid, 0, block_hash, 101))

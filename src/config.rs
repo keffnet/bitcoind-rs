@@ -177,6 +177,9 @@ pub struct Args {
     pub txindex: bool,
 
     #[arg(long, default_value_t = false)]
+    pub txospenderindex: bool,
+
+    #[arg(long, default_value_t = false)]
     pub coinstatsindex: bool,
 
     #[arg(long = "maxmempool", default_value_t = DEFAULT_MAX_MEMPOOL_MB)]
@@ -243,6 +246,7 @@ pub struct Config {
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
     pub prune: u64,
     pub txindex: bool,
+    pub txospenderindex: bool,
     pub coinstatsindex: bool,
     /// Maximum mempool size in decimal megabytes, matching Core's option.
     pub max_mempool_mb: u64,
@@ -259,8 +263,8 @@ impl Config {
         if args.prune != 0 && args.prune != 1 && args.prune < MIN_AUTO_PRUNE_TARGET_MIB {
             bail!("--prune automatic target must be at least {MIN_AUTO_PRUNE_TARGET_MIB} MiB");
         }
-        if args.txindex && args.prune != 0 {
-            bail!("Prune mode is incompatible with --txindex.");
+        if (args.txindex || args.txospenderindex) && args.prune != 0 {
+            bail!("Prune mode is incompatible with transaction indexes.");
         }
         if args.max_mempool == 0 {
             bail!("--maxmempool must be greater than zero");
@@ -309,6 +313,7 @@ impl Config {
             blocksonly: args.blocksonly,
             prune: args.prune,
             txindex: args.txindex,
+            txospenderindex: args.txospenderindex,
             coinstatsindex: args.coinstatsindex,
             max_mempool_mb: args.max_mempool,
             persist_mempool: args.persistmempool,
@@ -436,8 +441,27 @@ mod tests {
             "bitcoind-rs",
             "--datadir",
             directory.path().to_str().unwrap(),
+            "--txospenderindex",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().txospenderindex);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
             "--prune=1",
             "--txindex",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--prune=1",
+            "--txospenderindex",
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());

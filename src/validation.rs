@@ -869,6 +869,7 @@ pub fn validate_transaction_scripts_at_time_with_block_hash(
     Ok(())
 }
 
+pub(crate) const MAX_BLOCK_SERIALIZED_SIZE: usize = 4_000_000;
 pub(crate) const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 pub(crate) const MAX_BLOCK_SIGOP_COST: usize = 80_000;
 

@@ -7892,7 +7892,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
             Bip9State::Defined | Bip9State::Failed => {}
         }
     }
-    Ok(json!({
+    let mut result = json!({
         "capabilities": ["proposal"],
         "version": version,
         "rules": rules,
@@ -7907,15 +7907,26 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "curtime": curtime,
         "mutable": ["time", "transactions", "prevblock"],
         "noncerange": "00000000ffffffff",
-        "sigoplimit": 80_000,
-        "sizelimit": node.config.block_max_weight,
-        "weightlimit": node.config.block_max_weight,
+        "sigoplimit": if segwit_active {
+            validation::MAX_BLOCK_SIGOP_COST
+        } else {
+            validation::MAX_BLOCK_SIGOP_COST / 4
+        },
+        "sizelimit": if segwit_active {
+            validation::MAX_BLOCK_SERIALIZED_SIZE
+        } else {
+            validation::MAX_BLOCK_SERIALIZED_SIZE / 4
+        },
         "longpollid": format!("{}:{}", tip.hash, mempool.sequence()),
         "height": height,
         "bits": format!("{:08x}", bits),
         "default_witness_commitment": default_witness_commitment,
         "signet_challenge": chain.signet_challenge().map(hex::encode),
-    }))
+    });
+    if segwit_active {
+        result["weightlimit"] = json!(validation::MAX_BLOCK_WEIGHT);
+    }
+    Ok(result)
 }
 
 async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -11490,7 +11501,9 @@ mod tests {
         .unwrap();
         let template = get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
         assert_eq!(template["height"], 1);
-        assert_eq!(template["weightlimit"], 120_000);
+        assert_eq!(template["sigoplimit"], 80_000);
+        assert_eq!(template["sizelimit"], 4_000_000);
+        assert_eq!(template["weightlimit"], 4_000_000);
         assert_eq!(template["rules"], json!(["csv", "!segwit", "taproot"]));
         assert_eq!(
             template["longpollid"],

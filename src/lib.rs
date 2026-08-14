@@ -417,11 +417,36 @@ impl Node {
         transaction: Transaction,
     ) -> std::result::Result<Txid, MempoolError> {
         let chain = self.chain.read();
-        self.mempool.write().accept(transaction, &chain)
+        let (result, removed) = {
+            let mut mempool = self.mempool.write();
+            let before = mempool
+                .transaction_order()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let result = mempool.accept(transaction, &chain);
+            let removed = if result.is_ok() {
+                before
+                    .into_iter()
+                    .filter(|txid| mempool.get(txid).is_none())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            (result, removed)
+        };
+        self.announce_mempool_changes(removed);
+        result
     }
 
     fn announce_mempool_transaction(&self, txid: Txid) {
         let _ = self.mempool_events.send(txid);
+    }
+
+    fn announce_mempool_changes(&self, mut removed: Vec<Txid>) {
+        removed.sort_by_key(ToString::to_string);
+        for txid in removed {
+            self.announce_mempool_transaction(txid);
+        }
     }
 
     pub(crate) fn notify_mempool_transaction(&self, transaction: Transaction) {
@@ -988,7 +1013,31 @@ impl Node {
 
     pub fn import_mempool(&self, path: impl AsRef<Path>) -> Result<()> {
         let chain = self.chain.read();
-        self.mempool.write().load_from_file(path.as_ref(), &chain)
+        let (result, changed) = {
+            let mut mempool = self.mempool.write();
+            let before = mempool
+                .transaction_order()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let result = mempool.load_from_file(path.as_ref(), &chain);
+            let after = mempool
+                .transaction_order()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let changed = before
+                .symmetric_difference(&after)
+                .copied()
+                .collect::<Vec<_>>();
+            (result, changed)
+        };
+        if result.is_ok() {
+            let mut changed = changed;
+            changed.sort_by_key(ToString::to_string);
+            for txid in changed {
+                self.announce_mempool_transaction(txid);
+            }
+        }
+        result
     }
 
     fn persist_banlist(&self) -> Result<()> {

@@ -12492,6 +12492,7 @@ mod tests {
         let funding_hash: BlockHash = hashes[0].as_str().unwrap().parse().unwrap();
         let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
         let outpoint = OutPoint::new(funding.txdata[0].compute_txid(), 0);
+        let mut mempool_events = node.subscribe_mempool();
         let old = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -12507,6 +12508,7 @@ mod tests {
             }],
         };
         let old_txid = node.accept_transaction(old).unwrap();
+        assert_eq!(mempool_events.try_recv().unwrap(), old_txid);
         let replacement = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
@@ -12522,6 +12524,8 @@ mod tests {
             }],
         };
         let replacement_txid = node.accept_transaction(replacement).unwrap();
+        assert_eq!(mempool_events.try_recv().unwrap(), old_txid);
+        assert_eq!(mempool_events.try_recv().unwrap(), replacement_txid);
         let mempool = node.mempool.read();
         assert!(mempool.get(&old_txid).is_none());
         assert!(mempool.get(&replacement_txid).is_some());

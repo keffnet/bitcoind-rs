@@ -3549,7 +3549,10 @@ impl ChainState {
     fn best_valid_tip_hash(&self) -> Option<BlockHash> {
         self.block_index
             .iter()
-            .filter(|(hash, _)| !self.has_invalid_ancestor(**hash))
+            .filter(|(hash, _)| {
+                !self.has_invalid_ancestor(**hash)
+                    && self.has_full_block_data_to_active_fork(**hash)
+            })
             .max_by(|(left_hash, left), (right_hash, right)| {
                 left.chain_work
                     .cmp(&right.chain_work)
@@ -3560,6 +3563,20 @@ impl ChainState {
                     .then_with(|| right_hash.to_string().cmp(&left_hash.to_string()))
             })
             .map(|(hash, _)| *hash)
+    }
+
+    fn has_full_block_data_to_active_fork(&self, hash: BlockHash) -> bool {
+        let mut cursor = hash;
+        while !self.is_active_block(&cursor) {
+            if !self.store.contains(&cursor) {
+                return false;
+            }
+            let Some(node) = self.block_index.get(&cursor) else {
+                return false;
+            };
+            cursor = node.header.prev_blockhash;
+        }
+        true
     }
 
     fn precious_priority(&self, hash: &BlockHash) -> u64 {
@@ -5832,6 +5849,34 @@ mod tests {
             .expect("header-only fork is reported");
         assert_eq!(header_only.status, "headers-only");
         assert_eq!(header_only.branch_len, 1);
+    }
+
+    #[test]
+    fn invalidation_does_not_activate_a_header_only_fork() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let active = mine_block(&state, 1);
+        let active_hash = active.block_hash();
+        state.connect_block(active).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 41);
+        let side_two = mine_block_from_header(&side_one.header, 2, 42);
+        state
+            .accept_headers(&[side_one.header, side_two.header])
+            .unwrap();
+
+        let tip = state.invalidate_block(&active_hash).unwrap();
+        assert_eq!(tip.hash, genesis.block_hash());
+        assert_eq!(state.height(), 0);
+        assert_eq!(
+            state
+                .chain_tips()
+                .into_iter()
+                .find(|candidate| candidate.hash == side_two.block_hash())
+                .map(|candidate| candidate.status),
+            Some("headers-only")
+        );
     }
 
     #[test]

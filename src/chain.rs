@@ -2934,6 +2934,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_nonfinal_coinbase_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut block = mine_block(&state, 1);
+        block.txdata[0].lock_time = LockTime::from_consensus(2);
+        block.txdata[0].input[0].sequence = Sequence::ZERO;
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block.header.nonce = 0;
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        assert!(state.connect_block(block).is_err());
+        assert_eq!(state.height(), 0);
+    }
+
+    #[test]
     fn replays_known_child_after_parent_block_arrives() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();

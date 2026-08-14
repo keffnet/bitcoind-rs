@@ -1223,6 +1223,16 @@ async fn serve_peer_loop(
                 }
             }
             Message::Inv(items) => {
+                if !peer_state.local_relay_transactions
+                    && items.iter().any(|item| {
+                        matches!(
+                            item.kind,
+                            InventoryType::Transaction | InventoryType::WitnessTransaction
+                        )
+                    })
+                {
+                    anyhow::bail!("transaction inventory sent to a non-relaying connection");
+                }
                 let wtxid_relay = *peer_state.wtxid_relay.lock();
                 {
                     let mut known = peer_state.known_tx_inventory.lock();
@@ -1717,8 +1727,8 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::Transaction(transaction) => {
-                if node.config.blocksonly {
-                    continue;
+                if !peer_state.local_relay_transactions {
+                    anyhow::bail!("transaction sent to a non-relaying connection");
                 }
                 let known_hash = if *peer_state.wtxid_relay.lock() {
                     BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash())

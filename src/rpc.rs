@@ -1875,7 +1875,29 @@ fn derive_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .filter(|value| !value.is_null())
         .map(parse_descriptor_range)
         .transpose()?;
-    let scripts = expand_descriptor_scripts(node, &descriptor, range)?;
+    let descriptor_body = if descriptor.contains('#') {
+        descriptor_payload(&descriptor)?.0
+    } else {
+        descriptor.as_str()
+    };
+    let multipath_payloads = expand_descriptor_multipath(descriptor_body)?;
+    if multipath_payloads.len() > 1 {
+        let addresses = multipath_payloads
+            .iter()
+            .map(|payload| derive_addresses_for_descriptor(node, payload, range))
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(json!(addresses));
+    }
+    let addresses = derive_addresses_for_descriptor(node, descriptor_body, range)?;
+    Ok(json!(addresses))
+}
+
+fn derive_addresses_for_descriptor(
+    node: &Arc<Node>,
+    descriptor: &str,
+    range: Option<(u32, u32)>,
+) -> Result<Vec<String>> {
+    let scripts = expand_descriptor_scripts(node, descriptor, range)?;
     let multipath_or_combo = scripts.len() > 1;
     let addresses = scripts
         .into_iter()
@@ -1890,7 +1912,7 @@ fn derive_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
             )
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(json!(addresses))
+    Ok(addresses)
 }
 
 fn descriptor_checksum(descriptor: &str) -> Option<String> {
@@ -1958,6 +1980,37 @@ fn descriptor_payload(descriptor: &str) -> Result<(&str, String)> {
     Ok((payload, checksum))
 }
 
+fn expand_descriptor_multipath(payload: &str) -> Result<Vec<String>> {
+    const MAX_EXPANSIONS: usize = 64;
+    let Some(start) = payload.find('<') else {
+        return Ok(vec![payload.to_owned()]);
+    };
+    let end = payload[start + 1..]
+        .find('>')
+        .map(|offset| start + 1 + offset)
+        .ok_or_else(|| anyhow!("descriptor multipath specifier is missing a closing bracket"))?;
+    let values = &payload[start + 1..end];
+    let values = values.split(';').collect::<Vec<_>>();
+    if values.len() < 2 || values.iter().any(|value| value.is_empty()) {
+        bail!("descriptor multipath specifier must contain at least two values")
+    }
+    let mut seen = HashSet::new();
+    if values.iter().any(|value| !seen.insert(*value)) {
+        bail!("descriptor multipath specifier contains duplicate values")
+    }
+    let mut expansions = Vec::new();
+    for value in values {
+        let replacement = format!("{}{}{}", &payload[..start], value, &payload[end + 1..]);
+        for expansion in expand_descriptor_multipath(&replacement)? {
+            expansions.push(expansion);
+            if expansions.len() > MAX_EXPANSIONS {
+                bail!("descriptor multipath expansion is too large")
+            }
+        }
+    }
+    Ok(expansions)
+}
+
 fn canonicalize_descriptor_private_keys(payload: &str) -> Result<String> {
     let mut canonical = String::with_capacity(payload.len());
     let mut index = 0;
@@ -1993,8 +2046,13 @@ fn canonicalize_descriptor_private_keys(payload: &str) -> Result<String> {
 fn get_descriptor_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let descriptor = param::<String>(params, 0)?;
     let (payload, checksum) = descriptor_payload(&descriptor)?;
-    let canonical_payload = canonicalize_descriptor_private_keys(payload)?;
-    let canonical_checksum = descriptor_checksum(&canonical_payload)
+    let multipath_payloads = expand_descriptor_multipath(payload)?;
+    let canonical_payloads = multipath_payloads
+        .iter()
+        .map(|payload| canonicalize_descriptor_private_keys(payload))
+        .collect::<Result<Vec<_>>>()?;
+    let canonical_payload = &canonical_payloads[0];
+    let canonical_checksum = descriptor_checksum(canonical_payload)
         .ok_or_else(|| anyhow!("descriptor contains invalid characters"))?;
     let isrange = payload.contains('*');
     let range = isrange.then_some((0, 0));
@@ -2003,14 +2061,27 @@ fn get_descriptor_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     ]
     .iter()
     .any(|prefix| payload.contains(prefix));
-    let issolvable = expand_descriptor_scripts(node, payload, range).is_ok();
-    Ok(json!({
+    let issolvable = expand_descriptor_scripts(node, &multipath_payloads[0], range).is_ok();
+    let mut result = json!({
         "descriptor": format!("{canonical_payload}#{canonical_checksum}"),
         "checksum": checksum,
         "isrange": isrange,
         "issolvable": issolvable,
         "hasprivatekeys": has_private_keys,
-    }))
+    });
+    if canonical_payloads.len() > 1 {
+        result["multipath_expansion"] = json!(
+            canonical_payloads
+                .iter()
+                .map(|payload| {
+                    let checksum = descriptor_checksum(payload)
+                        .expect("canonical descriptor payload has valid characters");
+                    format!("{payload}#{checksum}")
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+    Ok(result)
 }
 
 fn parse_descriptor_range(value: &Value) -> Result<(u32, u32)> {
@@ -8799,6 +8870,14 @@ fn expand_descriptor_scripts(
     } else {
         descriptor
     };
+    let multipath_payloads = expand_descriptor_multipath(descriptor)?;
+    if multipath_payloads.len() > 1 {
+        return multipath_payloads
+            .iter()
+            .map(|payload| expand_descriptor_scripts(node, payload, range))
+            .collect::<Result<Vec<Vec<ScriptBuf>>>>()
+            .map(|scripts| scripts.into_iter().flatten().collect());
+    }
     if let Some(address) = descriptor
         .strip_prefix("addr(")
         .and_then(|value| value.strip_suffix(')'))
@@ -11192,6 +11271,22 @@ mod tests {
         let ranged_info =
             get_descriptor_info(&node, &json!([format!("wpkh({xpub}/0/*)")])).unwrap();
         assert_eq!(ranged_info["isrange"], true);
+        let multipath_descriptor = format!("wpkh({xpub}/<0;1>/*)");
+        let multipath_info =
+            get_descriptor_info(&node, &json!([multipath_descriptor.clone()])).unwrap();
+        assert_eq!(
+            multipath_info["multipath_expansion"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(!multipath_info["descriptor"].as_str().unwrap().contains('<'));
+        let multipath_addresses =
+            derive_addresses(&node, &json!([multipath_descriptor, [0, 1]])).unwrap();
+        assert_eq!(multipath_addresses.as_array().unwrap().len(), 2);
+        assert!(multipath_addresses[0].as_array().unwrap().len() == 2);
+        assert!(multipath_addresses[1].as_array().unwrap().len() == 2);
         let xpriv = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[6; 32]).unwrap();
         let private_info = get_descriptor_info(&node, &json!([format!("wpkh({xpriv})")])).unwrap();
         assert_eq!(private_info["hasprivatekeys"], true);

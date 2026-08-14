@@ -8309,6 +8309,36 @@ fn get_orphan_transactions(node: &Arc<Node>, params: &Value) -> Result<Value> {
     ))
 }
 
+#[derive(Clone, Debug)]
+struct MempoolChunk {
+    txids: Vec<Txid>,
+    weight: u64,
+    fee: i64,
+}
+
+fn append_mempool_chunk(chunks: &mut Vec<MempoolChunk>, txid: Txid, weight: u64, fee: i64) {
+    chunks.push(MempoolChunk {
+        txids: vec![txid],
+        weight,
+        fee,
+    });
+    while chunks.len() >= 2 {
+        let right_index = chunks.len() - 1;
+        let left_index = right_index - 1;
+        let (left, right) = (&chunks[left_index], &chunks[right_index]);
+        let should_merge = i128::from(left.fee) * i128::from(right.weight)
+            < i128::from(right.fee) * i128::from(left.weight);
+        if !should_merge {
+            break;
+        }
+        let right = chunks.pop().expect("right chunk exists");
+        let left = chunks.last_mut().expect("left chunk exists");
+        left.weight = left.weight.saturating_add(right.weight);
+        left.fee = left.fee.saturating_add(right.fee);
+        left.txids.extend(right.txids);
+    }
+}
+
 fn mempool_cluster_transaction_ids(mempool: &Mempool, txid: &Txid) -> Option<Vec<Txid>> {
     mempool.get(txid)?;
     let mut cluster = HashSet::new();
@@ -8338,57 +8368,83 @@ fn modified_mempool_fee_sat(mempool: &Mempool, txid: &Txid) -> i64 {
         .saturating_add(mempool.fee_delta(txid))
 }
 
-fn mempool_cluster_metrics(mempool: &Mempool, txid: &Txid) -> Option<(Vec<Txid>, u64, i64)> {
+fn mempool_cluster_chunks(mempool: &Mempool, txid: &Txid) -> Option<(u64, Vec<MempoolChunk>)> {
     let transaction_ids = mempool_cluster_transaction_ids(mempool, txid)?;
-    let (weight, fee) = transaction_ids
+    let cluster = transaction_ids.iter().copied().collect::<HashSet<_>>();
+    let mut chunks = Vec::new();
+    for candidate in mempool.mining_order(u64::MAX, 0) {
+        if !cluster.contains(&candidate) {
+            continue;
+        }
+        let Some(entry) = mempool.get(&candidate) else {
+            continue;
+        };
+        append_mempool_chunk(
+            &mut chunks,
+            candidate,
+            entry.transaction.weight().to_wu(),
+            modified_mempool_fee_sat(mempool, &candidate),
+        );
+    }
+    let weight = chunks
         .iter()
-        .fold((0u64, 0i64), |(weight, fee), txid| {
-            let Some(entry) = mempool.get(txid) else {
-                return (weight, fee);
-            };
-            (
-                weight.saturating_add(entry.transaction.weight().to_wu()),
-                fee.saturating_add(modified_mempool_fee_sat(mempool, txid)),
-            )
-        });
-    Some((transaction_ids, weight, fee))
+        .map(|chunk| chunk.weight)
+        .fold(0u64, u64::saturating_add);
+    Some((weight, chunks))
 }
 
 fn get_mempool_cluster(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let mempool = node.mempool.read();
-    let (transaction_ids, weight, fee) = mempool_cluster_metrics(&mempool, &txid)
+    let (weight, chunks) = mempool_cluster_chunks(&mempool, &txid)
         .ok_or_else(|| anyhow!("Transaction not in mempool"))?;
+    let txcount = chunks.iter().map(|chunk| chunk.txids.len()).sum::<usize>();
     Ok(json!({
         "clusterweight": weight,
-        "txcount": transaction_ids.len(),
-        "chunks": [{
-            "chunkfee": sat_to_btc_signed(fee),
-            "chunkweight": weight,
-            "txs": transaction_ids
-                .into_iter()
-                .map(|txid| txid.to_string())
-                .collect::<Vec<_>>(),
-        }],
+        "txcount": txcount,
+        "chunks": chunks
+            .into_iter()
+            .map(|chunk| {
+                json!({
+                    "chunkfee": sat_to_btc_signed(chunk.fee),
+                    "chunkweight": chunk.weight,
+                    "txs": chunk
+                        .txids
+                        .into_iter()
+                        .map(|txid| txid.to_string())
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>(),
     }))
 }
 
 fn get_mempool_fee_rate_diagram(node: &Arc<Node>) -> Result<Value> {
     let mempool = node.mempool.read();
-    let (weight, fee) = mempool
-        .transaction_order()
-        .into_iter()
-        .filter_map(|txid| mempool.get(&txid))
-        .fold((0u64, 0u64), |(weight, fee), entry| {
-            (
-                weight.saturating_add(entry.transaction.weight().to_wu()),
-                fee.saturating_add(entry.fee_sat),
-            )
-        });
-    if weight == 0 {
-        return Ok(json!([]));
+    let mut chunks = Vec::new();
+    for txid in mempool.mining_order(u64::MAX, 0) {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        append_mempool_chunk(
+            &mut chunks,
+            txid,
+            entry.transaction.weight().to_wu(),
+            modified_mempool_fee_sat(&mempool, &txid),
+        );
     }
-    Ok(json!([{"weight": weight, "fee": sat_to_btc(fee)}]))
+    let mut weight = 0u64;
+    let mut fee = 0i64;
+    let mut diagram = vec![json!({"weight": 0, "fee": 0.0})];
+    for chunk in chunks {
+        weight = weight.saturating_add(chunk.weight);
+        fee = fee.saturating_add(chunk.fee);
+        diagram.push(json!({
+            "weight": weight,
+            "fee": sat_to_btc_signed(fee),
+        }));
+    }
+    Ok(Value::Array(diagram))
 }
 
 fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
@@ -8418,8 +8474,12 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
     let (ancestor_size, ancestor_modified_fee) = aggregate(&ancestor_ids);
     let (descendant_size, descendant_modified_fee) = aggregate(&descendant_ids);
     let modified_fee = modified_mempool_fee_sat(mempool, txid);
-    let (_, chunk_weight, chunk_fee) =
-        mempool_cluster_metrics(mempool, txid).expect("mempool entry must have a cluster");
+    let (_, chunks) =
+        mempool_cluster_chunks(mempool, txid).expect("mempool entry must have a cluster");
+    let chunk = chunks
+        .iter()
+        .find(|chunk| chunk.txids.contains(txid))
+        .expect("mempool entry must have a chunk");
     let parents = mempool
         .parents(txid)
         .into_iter()
@@ -8439,7 +8499,7 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
         "descendantsize": descendant_size,
         "ancestorcount": ancestor_ids.len(),
         "ancestorsize": ancestor_size,
-        "chunkweight": chunk_weight,
+        "chunkweight": chunk.weight,
         "wtxid": entry.transaction.compute_wtxid().to_string(),
         "fee": sat_to_btc(entry.fee_sat),
         "fees": {
@@ -8447,7 +8507,7 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
             "modified": sat_to_btc_signed(modified_fee),
             "ancestor": sat_to_btc_signed(ancestor_modified_fee),
             "descendant": sat_to_btc_signed(descendant_modified_fee),
-            "chunk": sat_to_btc_signed(chunk_fee),
+            "chunk": sat_to_btc_signed(chunk.fee),
         },
         "depends": parents,
         "spentby": children,
@@ -11418,6 +11478,24 @@ mod tests {
     }
 
     #[test]
+    fn mempool_chunks_merge_when_a_later_fee_rate_is_higher() {
+        let first = Txid::from_byte_array([1; 32]);
+        let second = Txid::from_byte_array([2; 32]);
+        let third = Txid::from_byte_array([3; 32]);
+        let mut chunks = Vec::new();
+
+        append_mempool_chunk(&mut chunks, first, 100, 100);
+        append_mempool_chunk(&mut chunks, second, 100, 10);
+        append_mempool_chunk(&mut chunks, third, 100, 90);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].txids, vec![first]);
+        assert_eq!(chunks[1].txids, vec![second, third]);
+        assert_eq!(chunks[1].fee, 100);
+        assert_eq!(chunks[1].weight, 200);
+    }
+
+    #[test]
     fn mempool_cluster_and_fee_diagram_report_a_transaction() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
@@ -11505,9 +11583,10 @@ mod tests {
         assert_eq!(cluster["chunks"][0]["txs"], json!([txid.to_string()]));
 
         let diagram = dispatch_method(&node, "getmempoolfeeratediagram", &json!([])).unwrap();
-        assert_eq!(diagram.as_array().unwrap().len(), 1);
-        assert!(diagram[0]["weight"].as_u64().unwrap() > 0);
-        assert!(diagram[0]["fee"].as_f64().unwrap() > 0.0);
+        assert_eq!(diagram.as_array().unwrap().len(), 2);
+        assert_eq!(diagram[0], json!({"weight": 0, "fee": 0.0}));
+        assert!(diagram[1]["weight"].as_u64().unwrap() > 0);
+        assert!(diagram[1]["fee"].as_f64().unwrap() > 0.0);
     }
 
     #[test]

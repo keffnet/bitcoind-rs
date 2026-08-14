@@ -1298,6 +1298,14 @@ impl Node {
                 .collect::<HashSet<_>>();
             let chain = self.chain.read();
             let mut mempool = self.mempool.write();
+            for block in &activated_blocks {
+                mempool.remove_confirmed(block);
+            }
+            for block in &disconnected_blocks {
+                for transaction in block.txdata.iter().skip(1) {
+                    let _ = mempool.accept_reorg(transaction.clone(), &chain, time::unix_time());
+                }
+            }
             mempool.revalidate(&chain);
             let after = mempool
                 .transaction_order()
@@ -1341,6 +1349,14 @@ impl Node {
                 .collect::<HashSet<_>>();
             let chain = self.chain.read();
             let mut mempool = self.mempool.write();
+            for block in &activated_blocks {
+                mempool.remove_confirmed(block);
+            }
+            for block in &disconnected_blocks {
+                for transaction in block.txdata.iter().skip(1) {
+                    let _ = mempool.accept_reorg(transaction.clone(), &chain, time::unix_time());
+                }
+            }
             mempool.revalidate(&chain);
             let after = mempool
                 .transaction_order()
@@ -3511,6 +3527,34 @@ mod tests {
         assert!(mempool.get(&child.compute_txid()).is_some());
         assert!(mempool.get(&grandchild.compute_txid()).is_some());
         assert_eq!(node.orphan_count(), 0);
+    }
+
+    #[test]
+    fn invalidate_and_reconsider_restore_disconnected_transactions() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let transaction = private_broadcast_test_transaction(&node);
+        let txid = transaction.compute_txid();
+        node.accept_transaction(transaction.clone()).unwrap();
+
+        let previous = *node.chain.read().header(101).unwrap();
+        let mut block = mine_test_block(&previous, 102, 102);
+        block.txdata.push(transaction);
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        let block_hash = block.block_hash();
+        node.connect_block(block).unwrap();
+        assert!(node.mempool.read().get(&txid).is_none());
+
+        node.invalidate_block(block_hash).unwrap();
+        assert_eq!(node.chain.read().height(), 101);
+        assert!(node.mempool.read().get(&txid).is_some());
+
+        node.reconsider_block(block_hash).unwrap();
+        assert_eq!(node.chain.read().height(), 102);
+        assert!(node.mempool.read().get(&txid).is_none());
     }
 
     #[test]

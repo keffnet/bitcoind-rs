@@ -932,18 +932,10 @@ impl ChainState {
     }
 
     pub fn next_block_hash(&self, hash: &BlockHash) -> Option<BlockHash> {
-        if let Some(position) = self
-            .active_chain
+        self.active_chain
             .iter()
             .position(|candidate| candidate == hash)
-        {
-            return self.active_chain.get(position + 1).copied();
-        }
-        self.block_index
-            .iter()
-            .filter(|(_, node)| node.header.prev_blockhash == *hash)
-            .map(|(candidate, _)| *candidate)
-            .min_by_key(ToString::to_string)
+            .and_then(|position| self.active_chain.get(position + 1).copied())
     }
 
     pub fn median_time_past_for_hash(&self, hash: &BlockHash) -> Option<u32> {
@@ -3803,6 +3795,39 @@ mod tests {
         assert_eq!(reopened.best_hash(), side_three_hash);
         assert_eq!(reopened.block_hash(1), Some(side_one_hash));
         assert!(reopened.transaction(&main_two_coinbase).unwrap().is_some());
+    }
+
+    #[test]
+    fn next_block_hash_only_reports_the_active_chain_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let main_one = mine_block(&state, 1);
+        let main_one_hash = main_one.block_hash();
+        state.connect_block(main_one).unwrap();
+        let main_two = mine_block(&state, 2);
+        let main_two_hash = main_two.block_hash();
+        state.connect_block(main_two).unwrap();
+        let main_three = mine_block(&state, 3);
+        let main_three_hash = main_three.block_hash();
+        state.connect_block(main_three).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 1);
+        let side_one_hash = side_one.block_hash();
+        state.connect_block(side_one).unwrap();
+        let side_one_header = *state.block_index.get(&side_one_hash).unwrap();
+        let side_two = mine_block_from_header(&side_one_header.header, 2, 2);
+        let side_two_hash = side_two.block_hash();
+        state.connect_block(side_two).unwrap();
+
+        assert_eq!(
+            state.next_block_hash(&state.network_genesis_hash()),
+            Some(main_one_hash)
+        );
+        assert_eq!(state.next_block_hash(&main_one_hash), Some(main_two_hash));
+        assert_eq!(state.next_block_hash(&main_three_hash), None);
+        assert_eq!(state.next_block_hash(&side_one_hash), None);
+        assert_eq!(state.next_block_hash(&side_two_hash), None);
     }
 
     #[test]

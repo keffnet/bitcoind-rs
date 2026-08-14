@@ -3262,11 +3262,7 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     };
     let hash_string = hash.to_string();
     let undo = if verbosity >= 3 {
-        Some(
-            chain
-                .spent_outputs_by_transaction(&hash)?
-                .ok_or_else(|| anyhow!("Block undo not found"))?,
-        )
+        chain.spent_outputs_by_transaction(&hash)?
     } else {
         None
     };

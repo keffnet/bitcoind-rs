@@ -6986,11 +6986,17 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .and_then(Value::as_array)
         .map(|rules| rules.iter().filter_map(Value::as_str).collect::<Vec<_>>())
         .unwrap_or_default();
-    if node.config.network == Network::Signet
-        && !requested_rules.contains(&"signet")
-        && request.contains_key("rules")
-    {
-        bail!("getblocktemplate must be called with the signet rule set")
+    if !requested_rules.contains(&"segwit") {
+        bail!(
+            "{}",
+            "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"
+        )
+    }
+    if node.config.network == Network::Signet && !requested_rules.contains(&"signet") {
+        bail!(
+            "{}",
+            "getblocktemplate must be called with the signet rule set (call with {\"rules\": [\"segwit\", \"signet\"]})"
+        )
     }
     let chain = node.chain.read();
     let tip = chain.tip();
@@ -7063,7 +7069,11 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .map(|output| hex::encode(output.script_pubkey.as_bytes()));
     let coinbase_value =
         validation::block_subsidy_for_network(chain.network, height).saturating_add(fees);
-    let mut rules = vec!["csv", "segwit"];
+    let segwit_active = height >= validation::buried_deployment_heights(chain.network).segwit;
+    let mut rules = vec!["csv"];
+    if segwit_active {
+        rules.push("!segwit");
+    }
     if chain.network == Network::Signet {
         rules.push("!signet");
     }
@@ -7078,7 +7088,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "coinbaseaux": {},
         "coinbasevalue": coinbase_value,
         "target": format!("{:064x}", bitcoin::pow::Target::from_compact(bitcoin::pow::CompactTarget::from_consensus(bits))),
-        "mintime": parent.time.saturating_add(1),
+        "mintime": chain.median_time_past_value().saturating_add(1),
         "curtime": curtime,
         "mutable": ["time", "transactions", "prevblock"],
         "noncerange": "00000000ffffffff",
@@ -9831,6 +9841,7 @@ mod tests {
         let template = get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
         assert_eq!(template["height"], 1);
         assert_eq!(template["weightlimit"], 4_000_000);
+        assert_eq!(template["rules"], json!(["csv", "!segwit"]));
         assert_eq!(
             template["longpollid"],
             current_block_template_longpoll_id(&node)
@@ -9840,6 +9851,7 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| value.starts_with("6a24aa21a9ed"))
         );
+        assert!(get_block_template(&node, &json!([{}])).is_err());
     }
 
     #[tokio::test]
@@ -9859,9 +9871,10 @@ mod tests {
         })
         .unwrap();
         let stale = format!("{}:999", node.chain.read().best_hash());
-        let template = get_block_template_async(&node, &json!([{"longpollid": stale}]))
-            .await
-            .unwrap();
+        let template =
+            get_block_template_async(&node, &json!([{"longpollid": stale, "rules": ["segwit"]}]))
+                .await
+                .unwrap();
         assert_eq!(template["height"], 1);
     }
 

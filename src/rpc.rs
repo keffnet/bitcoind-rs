@@ -3593,10 +3593,7 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
             spent_output_index += 1;
             let size = utxo_stat_size(previous_output);
             utxo_size_inc = utxo_size_inc.saturating_sub(size);
-            if !previous_output.script_pubkey.is_op_return() {
-                utxo_count_actual = utxo_count_actual.saturating_sub(1);
-                utxo_size_inc_actual = utxo_size_inc_actual.saturating_sub(size);
-            }
+            utxo_size_inc_actual = utxo_size_inc_actual.saturating_sub(size);
         }
     }
     let non_coinbase = block.txdata.len().saturating_sub(1);
@@ -9097,6 +9094,33 @@ mod tests {
                 "feerate_percentiles": [0, 0, 0, 0, 0],
             })
         );
+
+        let mined = generate_to_descriptor(&node, &json!([101, "raw(51)"])).unwrap();
+        let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
+        let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        let funding_outpoint = OutPoint::new(funding.txdata[0].compute_txid(), 0);
+        let spend = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding_outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(funding.txdata[0].output[0].value.to_sat() - 1_000),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+        let block = generate_block(
+            &node,
+            &json!(["raw(51)", [hex::encode(serialize(&spend))], true]),
+        )
+        .unwrap();
+        let stats = get_block_stats(&node, &json!([block["hash"].clone()])).unwrap();
+        assert_eq!(stats["totalfee"], json!(1_000));
+        assert_eq!(stats["utxo_increase_actual"], json!(1));
     }
 
     #[test]

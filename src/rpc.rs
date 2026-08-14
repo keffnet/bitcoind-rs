@@ -41,6 +41,7 @@ use tokio::sync::broadcast;
 use tracing::debug;
 
 use crate::chain;
+use crate::config::OnlyNet;
 use crate::mempool::{
     MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool,
     MempoolError, MempoolLoadOptions, package_is_child_with_parents_tree,
@@ -1649,43 +1650,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "connections_in": node.peer_infos().iter().filter(|peer| peer.inbound).count(),
             "connections_out": node.peer_infos().iter().filter(|peer| !peer.inbound).count(),
             "networkactive": node.network_active(),
-            "networks": [
-                {
-                    "name": "ipv4",
-                    "limited": false,
-                    "reachable": true,
-                    "proxy": "",
-                    "proxy_randomize_credentials": false,
-                },
-                {
-                    "name": "ipv6",
-                    "limited": false,
-                    "reachable": true,
-                    "proxy": "",
-                    "proxy_randomize_credentials": false,
-                },
-                {
-                    "name": "onion",
-                    "limited": true,
-                    "reachable": false,
-                    "proxy": "",
-                    "proxy_randomize_credentials": false,
-                },
-                {
-                    "name": "i2p",
-                    "limited": true,
-                    "reachable": false,
-                    "proxy": "",
-                    "proxy_randomize_credentials": false,
-                },
-                {
-                    "name": "cjdns",
-                    "limited": true,
-                    "reachable": false,
-                    "proxy": "",
-                    "proxy_randomize_credentials": false,
-                },
-            ],
+            "networks": network_info(node),
             "localaddresses": local_addresses(node),
             "relayfee": sat_to_btc(mempool.min_relay_fee_sat_per_kvb()),
             "incrementalfee": sat_to_btc(mempool.incremental_relay_fee_sat_per_kvb()),
@@ -2155,7 +2120,7 @@ fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
 fn local_addresses(node: &Arc<Node>) -> Value {
     let Some(address) = node
         .listen_address()
-        .filter(|address| is_routable_ip(address.ip()))
+        .filter(|address| is_routable_ip(address.ip()) && node.config.allows_address(*address))
     else {
         return json!([]);
     };
@@ -2164,6 +2129,37 @@ fn local_addresses(node: &Arc<Node>) -> Value {
         "port": address.port(),
         "score": 2,
     }])
+}
+
+fn network_info(node: &Arc<Node>) -> Value {
+    let proxy = node
+        .config
+        .proxy
+        .map_or_else(String::new, |proxy| proxy.to_string());
+    let networks = [("ipv4", OnlyNet::Ipv4), ("ipv6", OnlyNet::Ipv6)]
+        .into_iter()
+        .map(|(name, network)| {
+            let reachable =
+                node.config.onlynet.is_empty() || node.config.onlynet.contains(&network);
+            json!({
+                "name": name,
+                "limited": !reachable,
+                "reachable": reachable,
+                "proxy": proxy.as_str(),
+                "proxy_randomize_credentials": false,
+            })
+        })
+        .chain(["onion", "i2p", "cjdns"].into_iter().map(|name| {
+            json!({
+                "name": name,
+                "limited": true,
+                "reachable": false,
+                "proxy": "",
+                "proxy_randomize_credentials": false,
+            })
+        }))
+        .collect::<Vec<_>>();
+    json!(networks)
 }
 
 fn is_routable_ip(address: std::net::IpAddr) -> bool {
@@ -13620,8 +13616,8 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
-            onlynet: Vec::new(),
-            proxy: None,
+            onlynet: vec![OnlyNet::Ipv4],
+            proxy: Some("127.0.0.1:9050".parse().unwrap()),
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
             reindex: false,
@@ -13666,6 +13662,24 @@ mod tests {
             vec!["ipv4", "ipv6", "onion", "i2p", "cjdns"]
         );
         let networks = dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap();
+        let ipv4 = networks["networks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|network| network["name"] == "ipv4")
+            .unwrap();
+        assert_eq!(ipv4["limited"], json!(false));
+        assert_eq!(ipv4["reachable"], json!(true));
+        assert_eq!(ipv4["proxy"], json!("127.0.0.1:9050"));
+        let ipv6 = networks["networks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|network| network["name"] == "ipv6")
+            .unwrap();
+        assert_eq!(ipv6["limited"], json!(true));
+        assert_eq!(ipv6["reachable"], json!(false));
+        assert_eq!(ipv6["proxy"], json!("127.0.0.1:9050"));
         for name in ["onion", "i2p", "cjdns"] {
             let network = networks["networks"]
                 .as_array()
@@ -13682,6 +13696,11 @@ mod tests {
         assert_eq!(
             dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["localaddresses"],
             json!([{"address": "8.8.8.8", "port": 18444, "score": 2}])
+        );
+        node.set_listen_address("[2001:4860:4860::8888]:18444".parse().unwrap());
+        assert_eq!(
+            dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["localaddresses"],
+            json!([])
         );
         node.set_listen_address("127.0.0.1:18444".parse().unwrap());
         assert_eq!(

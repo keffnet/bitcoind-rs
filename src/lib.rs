@@ -209,6 +209,7 @@ pub struct PeerInfo {
     pub user_agent: String,
     pub start_height: i32,
     pub relay_transactions: bool,
+    pub min_fee_filter: i64,
     pub connected_at: u64,
     pub last_send: u64,
     pub last_recv: u64,
@@ -601,6 +602,7 @@ impl Node {
             user_agent: String::new(),
             start_height: 0,
             relay_transactions: true,
+            min_fee_filter: 0,
             connected_at,
             last_send: connected_at,
             last_recv: connected_at,
@@ -642,6 +644,16 @@ impl Node {
         }
     }
 
+    pub fn update_peer_fee_filter(&self, id: usize, min_fee_filter: i64) {
+        let min_fee_filter = min_fee_filter.max(0);
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.min_fee_filter = min_fee_filter;
+            if let Some(known) = self.known_addresses.write().get_mut(&peer.address) {
+                known.min_fee_filter = min_fee_filter;
+            }
+        }
+    }
+
     pub fn unregister_peer(&self, id: usize) {
         self.peers.write().remove(&id);
         self.peer_commands.write().remove(&id);
@@ -678,6 +690,7 @@ impl Node {
                 user_agent: String::new(),
                 start_height: 0,
                 relay_transactions: true,
+                min_fee_filter: 0,
                 connected_at: now,
                 last_send: now,
                 last_recv: now,
@@ -708,6 +721,7 @@ impl Node {
             user_agent: String::new(),
             start_height: 0,
             relay_transactions: true,
+            min_fee_filter: 0,
             connected_at: time,
             last_send: time,
             last_recv: time,
@@ -1003,6 +1017,7 @@ fn load_known_addresses(
                 user_agent: String::new(),
                 start_height: 0,
                 relay_transactions: true,
+                min_fee_filter: 0,
                 connected_at: entry.time,
                 last_send: entry.time,
                 last_recv: entry.time,

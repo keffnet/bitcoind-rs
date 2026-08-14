@@ -1319,6 +1319,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     "connection_type": if peer.inbound { "inbound" } else { "outbound-full" },
                     "permissions": [],
                     "startingheight": peer.start_height,
+                    "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
                     "synced_headers": node.chain.read().best_header_tip().height,
                     "synced_blocks": node.chain.read().height(),
                     "inflight": [],

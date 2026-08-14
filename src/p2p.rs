@@ -51,6 +51,8 @@ const MAX_BLOOM_ELEMENT_SIZE: usize = 520;
 struct PeerState {
     writer: PeerWriter,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
+    fee_filter: parking_lot::Mutex<i64>,
+    relay_transactions: parking_lot::Mutex<bool>,
 }
 
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, Arc<PeerState>>>>;
@@ -534,6 +536,8 @@ async fn serve_peer(
     let peer_state = Arc::new(PeerState {
         writer: Arc::new(Mutex::new(writer_half)),
         bloom_filter: parking_lot::Mutex::new(None),
+        fee_filter: parking_lot::Mutex::new(0),
+        relay_transactions: parking_lot::Mutex::new(true),
     });
     peers.lock().insert(peer_id, peer_state.clone());
     let result = serve_peer_loop(
@@ -581,6 +585,8 @@ async fn serve_peer_loop(
 ) -> Result<()> {
     let writer = &peer_state.writer;
     let bloom_filter = &peer_state.bloom_filter;
+    let fee_filter = &peer_state.fee_filter;
+    let relay_transactions = &peer_state.relay_transactions;
     let height = node.chain.read().height() as i32;
     send_message(
         node,
@@ -667,6 +673,7 @@ async fn serve_peer_loop(
                     version.start_height,
                     version.relay,
                 );
+                *relay_transactions.lock() = version.relay;
                 if !verack_sent {
                     send_message(node, peer_id, writer, node.config.network, &Message::Verack)
                         .await?;
@@ -1228,9 +1235,13 @@ async fn serve_peer_loop(
             | Message::CFCheckpt(_)
             | Message::SendHeaders
             | Message::WtxidRelay
-            | Message::FeeFilter(_)
             | Message::NotFound(_)
             | Message::Unknown { .. } => {}
+            Message::FeeFilter(rate) => {
+                let rate = rate.max(0);
+                *fee_filter.lock() = rate;
+                node.update_peer_fee_filter(peer_id, rate);
+            }
             Message::SendCmpct {
                 announce: _,
                 version,
@@ -1292,13 +1303,28 @@ async fn serve_peer_loop(
                 }
             }
             Message::Mempool => {
+                if !*relay_transactions.lock() {
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Inv(Vec::new()),
+                    )
+                    .await?;
+                    continue;
+                }
                 let transactions = {
                     let mempool = node.mempool.read();
+                    let minimum_fee = *fee_filter.lock();
                     mempool
                         .transaction_order()
                         .into_iter()
                         .filter_map(|txid| {
-                            mempool.get(&txid).map(|entry| entry.transaction.clone())
+                            mempool.get(&txid).and_then(|entry| {
+                                let fee_rate = fee_rate_sat_per_kvb(entry.fee_sat, entry.vsize);
+                                (fee_rate >= minimum_fee).then(|| entry.transaction.clone())
+                            })
                         })
                         .take(50_000)
                         .collect::<Vec<_>>()
@@ -1666,6 +1692,20 @@ async fn broadcast_inventory(
         .map(|(peer_id, state)| (*peer_id, state.clone()))
         .collect();
     for (peer_id, state) in recipients {
+        if matches!(
+            item.kind,
+            InventoryType::Transaction | InventoryType::WitnessTransaction
+        ) {
+            if !*state.relay_transactions.lock() {
+                continue;
+            }
+            let minimum_fee = *state.fee_filter.lock();
+            if let Some((fee_sat, vsize)) = transaction_fee_for_inventory(node, &item)
+                && fee_rate_sat_per_kvb(fee_sat, vsize) < minimum_fee
+            {
+                continue;
+            }
+        }
         if let Some(transaction) = transaction_for_inventory(node, &item) {
             let mut filter = state.bloom_filter.lock();
             if let Some(filter) = filter.as_mut()
@@ -1677,6 +1717,26 @@ async fn broadcast_inventory(
         let message = Message::Inv(vec![item.clone()]);
         let _ = send_message(node, peer_id, &state.writer, network, &message).await;
     }
+}
+
+fn transaction_fee_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<(u64, u64)> {
+    let mempool = node.mempool.read();
+    match item.kind {
+        InventoryType::WitnessTransaction => mempool
+            .get_by_wtxid(&Wtxid::from_byte_array(item.hash.to_byte_array()))
+            .map(|entry| (entry.fee_sat, entry.vsize)),
+        InventoryType::Transaction => mempool
+            .get(&Txid::from_byte_array(item.hash.to_byte_array()))
+            .map(|entry| (entry.fee_sat, entry.vsize)),
+        _ => None,
+    }
+}
+
+fn fee_rate_sat_per_kvb(fee_sat: u64, vsize: u64) -> i64 {
+    if vsize == 0 {
+        return i64::MAX;
+    }
+    i64::try_from(fee_sat.saturating_mul(1_000).saturating_div(vsize)).unwrap_or(i64::MAX)
 }
 
 fn transaction_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<Transaction> {
@@ -1751,6 +1811,12 @@ mod tests {
     }
 
     #[test]
+    fn fee_filter_rates_are_measured_in_sat_per_kilobyte() {
+        assert_eq!(fee_rate_sat_per_kvb(1_000, 250), 4_000);
+        assert_eq!(fee_rate_sat_per_kvb(1, 0), i64::MAX);
+    }
+
+    #[test]
     fn bloom_filter_matches_script_elements_and_updates_spends() {
         use bitcoin::Amount;
         use bitcoin::absolute::LockTime;
@@ -1819,11 +1885,15 @@ mod tests {
         node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
         node.record_bytes_sent(7, 42);
         node.record_bytes_received(7, 19);
+        node.update_peer_version(7, 70016, 0, "/peer/", 0, false);
+        node.update_peer_fee_filter(7, 4_000);
         assert_eq!(node.total_bytes_sent(), 42);
         assert_eq!(node.total_bytes_received(), 19);
         let peer = node.peer_infos().pop().expect("registered peer");
         assert_eq!(peer.bytes_sent, 42);
         assert_eq!(peer.bytes_received, 19);
+        assert!(!peer.relay_transactions);
+        assert_eq!(peer.min_fee_filter, 4_000);
 
         node.ping_peers();
         let PeerCommand::Ping(nonce) = receiver.try_recv().unwrap() else {

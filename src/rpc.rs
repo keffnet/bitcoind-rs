@@ -6638,11 +6638,19 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .push_int(key_count as i64)
         .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
         .into_script();
-    let address_type = params
+    let requested_address_type = params
         .get(2)
         .filter(|value| !value.is_null())
         .and_then(Value::as_str)
         .unwrap_or("legacy");
+    if requested_address_type == "bech32m" {
+        bail!("createmultisig cannot create bech32m multisig addresses")
+    }
+    let address_type = if public_keys.iter().any(|key| !key.compressed) {
+        "legacy"
+    } else {
+        requested_address_type
+    };
     let key_list = public_keys
         .iter()
         .map(ToString::to_string)
@@ -6664,11 +6672,17 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "bech32" => Address::p2wsh(&redeem_script, node.config.network),
         _ => bail!("unsupported multisig address type: {address_type}"),
     };
-    Ok(json!({
+    let mut result = json!({
         "address": address.to_string(),
         "redeemScript": hex::encode(redeem_script.as_bytes()),
         "descriptor": descriptor,
-    }))
+    });
+    if address_type != requested_address_type {
+        result["warnings"] = json!([
+            "Unable to make chosen address type, please ensure no uncompressed public keys are present."
+        ]);
+    }
+    Ok(result)
 }
 
 fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -11546,6 +11560,29 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("wsh(multi(1,")
+        );
+
+        let uncompressed = bitcoin::PrivateKey::new_uncompressed(
+            bitcoin::secp256k1::SecretKey::from_slice(&[5; 32]).unwrap(),
+            Network::Regtest,
+        );
+        let fallback = create_multisig(
+            &node,
+            &json!([1, [uncompressed.public_key(&secp).to_string()], "bech32"]),
+        )
+        .unwrap();
+        assert!(fallback["address"].as_str().unwrap().starts_with('2'));
+        assert!(
+            fallback["descriptor"]
+                .as_str()
+                .unwrap()
+                .starts_with("sh(multi(1,")
+        );
+        assert_eq!(
+            fallback["warnings"][0],
+            json!(
+                "Unable to make chosen address type, please ensure no uncompressed public keys are present."
+            )
         );
     }
 

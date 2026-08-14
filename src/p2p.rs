@@ -1656,6 +1656,13 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetData(items) => {
+                if items.len() > MAX_GETDATA_BATCH {
+                    anyhow::bail!(
+                        "getdata message contains {} items (maximum {})",
+                        items.len(),
+                        MAX_GETDATA_BATCH
+                    );
+                }
                 let mut missing = Vec::new();
                 for item in items {
                     match item.kind {

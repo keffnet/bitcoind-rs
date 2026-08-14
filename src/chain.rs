@@ -2,15 +2,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use bitcoin::bip158::{BlockFilter, FilterHeader};
 use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::consensus::encode::serialize;
+use bitcoin::consensus::encode::{Decodable, VarInt, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::pow::{CompactTarget, Target, Work};
-use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, Script, Transaction, TxOut, Txid};
+use bitcoin::{
+    Amount, Block, BlockHash, Network, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -27,6 +30,8 @@ const MIN_BLOCKS_TO_KEEP: u32 = 288;
 const MAX_ORPHAN_BLOCKS: usize = 128;
 const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 const MAX_UNSPENDABLE_SCRIPT_SIZE: usize = 10_000;
+const CORE_UTXO_SNAPSHOT_MAGIC: [u8; 5] = [b'u', b't', b'x', b'o', 0xff];
+const CORE_UTXO_SNAPSHOT_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
@@ -1781,10 +1786,7 @@ impl ChainState {
     }
 
     pub fn dump_utxo_set(&self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {
-        let snapshot = self.current_snapshot();
-        let bytes = serde_json::to_vec(&snapshot)?;
-        fs::write(path.as_ref(), bytes)
-            .with_context(|| format!("writing UTXO snapshot {}", path.as_ref().display()))?;
+        write_core_utxo_snapshot(path.as_ref(), self.network, self.best_hash(), &self.utxos)?;
         Ok((self.utxos.len() as u64, self.best_hash(), self.height()))
     }
 
@@ -1877,13 +1879,8 @@ impl ChainState {
             .context("historical UTXO hash was not calculated")?;
         let coins_written = snapshot.utxos.len() as u64;
         let nchaintx = snapshot.tx_index_all.len();
-        let bytes = serde_json::to_vec(&snapshot)?;
         let path = path.as_ref();
-        let temporary = PathBuf::from(format!("{}.incomplete", path.display()));
-        fs::write(&temporary, bytes)
-            .with_context(|| format!("writing UTXO snapshot {}", temporary.display()))?;
-        fs::rename(&temporary, path)
-            .with_context(|| format!("installing UTXO snapshot {}", path.display()))?;
+        write_core_utxo_snapshot(path, self.network, target_hash, &snapshot.utxos)?;
         Ok((
             coins_written,
             target_hash,
@@ -1896,6 +1893,9 @@ impl ChainState {
     pub fn load_utxo_set(&mut self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {
         let bytes = fs::read(path.as_ref())
             .with_context(|| format!("reading UTXO snapshot {}", path.as_ref().display()))?;
+        if bytes.starts_with(&CORE_UTXO_SNAPSHOT_MAGIC) {
+            return self.load_core_utxo_set(&bytes);
+        }
         let snapshot: ChainSnapshot = serde_json::from_slice(&bytes)
             .with_context(|| format!("decoding UTXO snapshot {}", path.as_ref().display()))?;
         if snapshot.tip != self.best_hash().to_string()
@@ -1922,6 +1922,46 @@ impl ChainState {
         self.block_undo_cache.clear();
         self.persist_snapshot()?;
         Ok((self.utxos.len() as u64, self.best_hash(), self.height()))
+    }
+
+    fn load_core_utxo_set(&mut self, bytes: &[u8]) -> Result<(u64, BlockHash, u32)> {
+        let mut snapshot = read_core_utxo_snapshot(bytes, self.network)?;
+        let base_height = self
+            .block_height_by_hash(&snapshot.base_hash)
+            .context("UTXO snapshot base block is not in the headers chain")?;
+        if snapshot.base_hash != self.best_hash() {
+            bail!(
+                "UTXO snapshot base {} is not the active tip {}; loading snapshots at a different base requires AssumeUTXO chainstate support",
+                snapshot.base_hash,
+                self.best_hash()
+            )
+        }
+        for entry in snapshot.utxos.values_mut() {
+            if entry.height > base_height {
+                bail!("UTXO snapshot contains an output from the future")
+            }
+            entry.median_time_past = if entry.height == 0 {
+                0
+            } else {
+                self.median_time_past_for_parent(self.active_chain[entry.height as usize - 1])
+            };
+        }
+        self.validate_snapshot_utxos(&snapshot.utxos)?;
+        if self.prune_height.is_none() {
+            let expected = self
+                .replay_utxos_for_block(self.best_hash(), false)?
+                .context("cannot verify UTXO snapshot because active block data is unavailable")?;
+            if expected != snapshot.utxos {
+                bail!("UTXO snapshot contents do not match the active chain")
+            }
+        }
+        let coins_count = snapshot.coins_count;
+        let base_hash = snapshot.base_hash;
+        self.utxos = snapshot.utxos;
+        self.rebuild_utxo_index();
+        self.block_undo_cache.clear();
+        self.persist_snapshot()?;
+        Ok((coins_count, base_hash, base_height))
     }
 
     fn validate_snapshot_utxos(&mut self, utxos: &HashMap<OutPoint, UtxoEntry>) -> Result<()> {
@@ -3479,6 +3519,335 @@ fn snapshot_checksum(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+struct CoreUtxoSnapshot {
+    base_hash: BlockHash,
+    coins_count: u64,
+    utxos: HashMap<OutPoint, UtxoEntry>,
+}
+
+fn write_core_utxo_snapshot(
+    path: &Path,
+    network: Network,
+    base_hash: BlockHash,
+    utxos: &HashMap<OutPoint, UtxoEntry>,
+) -> Result<()> {
+    let temporary = PathBuf::from(format!("{}.incomplete", path.display()));
+    let mut file = fs::File::create(&temporary)
+        .with_context(|| format!("writing UTXO snapshot {}", temporary.display()))?;
+    file.write_all(&CORE_UTXO_SNAPSHOT_MAGIC)?;
+    file.write_all(&CORE_UTXO_SNAPSHOT_VERSION.to_le_bytes())?;
+    file.write_all(&crate::wire::network_magic(network))?;
+    file.write_all(&base_hash.to_byte_array())?;
+    file.write_all(&(utxos.len() as u64).to_le_bytes())?;
+
+    let mut entries: Vec<(&OutPoint, &UtxoEntry)> = utxos.iter().collect();
+    entries.sort_unstable_by(|(left, _), (right, _)| {
+        left.txid
+            .to_byte_array()
+            .cmp(&right.txid.to_byte_array())
+            .then_with(|| left.vout.cmp(&right.vout))
+    });
+    let mut offset = 0usize;
+    while offset < entries.len() {
+        let txid = entries[offset].0.txid;
+        let end = offset
+            + entries[offset..]
+                .iter()
+                .take_while(|(outpoint, _)| outpoint.txid == txid)
+                .count();
+        file.write_all(&txid.to_byte_array())?;
+        write_snapshot_compact_size(&mut file, (end - offset) as u64)?;
+        for (outpoint, entry) in &entries[offset..end] {
+            write_snapshot_compact_size(&mut file, u64::from(outpoint.vout))?;
+            write_core_coin(&mut file, entry)?;
+        }
+        offset = end;
+    }
+    file.flush()?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(&temporary, path)
+        .with_context(|| format!("installing UTXO snapshot {}", path.display()))?;
+    Ok(())
+}
+
+fn write_snapshot_compact_size(writer: &mut impl Write, value: u64) -> Result<()> {
+    writer.write_all(&serialize(&VarInt(value)))?;
+    Ok(())
+}
+
+fn write_snapshot_varint(writer: &mut impl Write, mut value: u64) -> Result<()> {
+    let mut digits = Vec::with_capacity(10);
+    loop {
+        let continuation = if digits.is_empty() { 0 } else { 0x80 };
+        digits.push((value as u8 & 0x7f) | continuation);
+        if value <= 0x7f {
+            break;
+        }
+        value = (value >> 7) - 1;
+    }
+    for digit in digits.into_iter().rev() {
+        writer.write_all(&[digit])?;
+    }
+    Ok(())
+}
+
+fn write_core_coin(writer: &mut impl Write, entry: &UtxoEntry) -> Result<()> {
+    let code = u64::from(entry.height)
+        .checked_mul(2)
+        .and_then(|code| code.checked_add(u64::from(entry.coinbase)))
+        .context("UTXO snapshot height is too large")?;
+    write_snapshot_varint(writer, code)?;
+    write_snapshot_varint(
+        writer,
+        compress_snapshot_amount(entry.output.value.to_sat()),
+    )?;
+    write_compressed_snapshot_script(writer, &entry.output.script_pubkey)
+}
+
+fn write_compressed_snapshot_script(writer: &mut impl Write, script: &Script) -> Result<()> {
+    let bytes = script.as_bytes();
+    if bytes.len() == 25 && bytes[0..3] == [0x76, 0xa9, 0x14] && bytes[23..] == [0x88, 0xac] {
+        writer.write_all(&[0])?;
+        writer.write_all(&bytes[3..23])?;
+    } else if bytes.len() == 23 && bytes[0..2] == [0xa9, 0x14] && bytes[22] == 0x87 {
+        writer.write_all(&[1])?;
+        writer.write_all(&bytes[2..22])?;
+    } else if bytes.len() == 35
+        && bytes[0] == 33
+        && matches!(bytes[1], 0x02 | 0x03)
+        && bytes[34] == 0xac
+    {
+        writer.write_all(&bytes[1..34])?;
+    } else if bytes.len() == 67
+        && bytes[0] == 65
+        && bytes[1] == 0x04
+        && bytes[66] == 0xac
+        && bitcoin::secp256k1::PublicKey::from_slice(&bytes[1..66])
+            .is_ok_and(|key| key.serialize_uncompressed().as_slice() == &bytes[1..66])
+    {
+        let key = &bytes[1..66];
+        let prefix = 0x04 | (key[64] & 1);
+        writer.write_all(&[prefix])?;
+        writer.write_all(&key[1..33])?;
+    } else {
+        let size = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|size| size.checked_add(6))
+            .context("script is too large for UTXO snapshot serialization")?;
+        write_snapshot_varint(writer, size)?;
+        writer.write_all(bytes)?;
+    }
+    Ok(())
+}
+
+fn read_core_utxo_snapshot(bytes: &[u8], network: Network) -> Result<CoreUtxoSnapshot> {
+    let mut cursor = Cursor::new(bytes);
+    let magic = read_snapshot_array::<5>(&mut cursor)?;
+    if magic != CORE_UTXO_SNAPSHOT_MAGIC {
+        bail!("invalid UTXO snapshot magic")
+    }
+    let version = read_snapshot_u16(&mut cursor)?;
+    if version != CORE_UTXO_SNAPSHOT_VERSION {
+        bail!("unsupported UTXO snapshot version {version}")
+    }
+    let network_magic = read_snapshot_array::<4>(&mut cursor)?;
+    if network_magic != crate::wire::network_magic(network) {
+        bail!("UTXO snapshot network does not match this node")
+    }
+    let base_hash = BlockHash::from_byte_array(read_snapshot_array::<32>(&mut cursor)?);
+    let coins_count = read_snapshot_u64(&mut cursor)?;
+    if coins_count > bytes.len() as u64 {
+        bail!("UTXO snapshot coin count exceeds its file size")
+    }
+    let capacity = usize::try_from(coins_count.min(1_000_000)).unwrap_or(0);
+    let mut utxos = HashMap::with_capacity(capacity);
+    let mut coins_left = coins_count;
+    while coins_left != 0 {
+        let txid = Txid::from_byte_array(read_snapshot_array::<32>(&mut cursor)?);
+        let group_count = read_snapshot_compact_size(&mut cursor)?;
+        if group_count == 0 || group_count > coins_left {
+            bail!("UTXO snapshot has an invalid coin group size")
+        }
+        for _ in 0..group_count {
+            let vout = read_snapshot_compact_size(&mut cursor)?;
+            let vout = u32::try_from(vout).context("UTXO snapshot output index is too large")?;
+            if vout == u32::MAX {
+                bail!("UTXO snapshot output index is too large")
+            }
+            let entry = read_core_coin(&mut cursor)?;
+            if utxos.insert(OutPoint::new(txid, vout), entry).is_some() {
+                bail!("UTXO snapshot contains a duplicate outpoint")
+            }
+            coins_left -= 1;
+        }
+    }
+    if cursor.position() as usize != bytes.len() {
+        bail!("UTXO snapshot contains trailing data")
+    }
+    Ok(CoreUtxoSnapshot {
+        base_hash,
+        coins_count,
+        utxos,
+    })
+}
+
+fn read_core_coin(cursor: &mut Cursor<&[u8]>) -> Result<UtxoEntry> {
+    let code = u32::try_from(read_snapshot_varint(cursor)?)
+        .context("UTXO snapshot coin metadata is too large")?;
+    let height = code >> 1;
+    let coinbase = code & 1 != 0;
+    let value = decompress_snapshot_amount(read_snapshot_varint(cursor)?)?;
+    let script_pubkey = read_compressed_snapshot_script(cursor)?;
+    Ok(UtxoEntry {
+        output: TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey,
+        },
+        height,
+        median_time_past: 0,
+        coinbase,
+    })
+}
+
+fn read_compressed_snapshot_script(cursor: &mut Cursor<&[u8]>) -> Result<ScriptBuf> {
+    let size = read_snapshot_varint(cursor)?;
+    if size < 6 {
+        let length = match size {
+            0 | 1 => 20,
+            2..=5 => 32,
+            _ => unreachable!(),
+        };
+        let data = read_snapshot_vec(cursor, length)?;
+        let mut script = Vec::with_capacity(length + 5);
+        match size {
+            0 => {
+                script.extend_from_slice(&[0x76, 0xa9, 0x14]);
+                script.extend_from_slice(&data);
+                script.extend_from_slice(&[0x88, 0xac]);
+            }
+            1 => {
+                script.extend_from_slice(&[0xa9, 0x14]);
+                script.extend_from_slice(&data);
+                script.push(0x87);
+            }
+            2 | 3 => {
+                script.push(33);
+                script.push(size as u8);
+                script.extend_from_slice(&data);
+                script.push(0xac);
+            }
+            4 | 5 => {
+                let mut compressed = Vec::with_capacity(33);
+                compressed.push((size - 2) as u8);
+                compressed.extend_from_slice(&data);
+                let key = bitcoin::secp256k1::PublicKey::from_slice(&compressed)
+                    .context("invalid compressed public key in UTXO snapshot")?;
+                script.push(65);
+                script.extend_from_slice(&key.serialize_uncompressed());
+                script.push(0xac);
+            }
+            _ => unreachable!(),
+        }
+        return Ok(ScriptBuf::from_bytes(script));
+    }
+    let length = usize::try_from(size - 6).context("UTXO snapshot script is too large")?;
+    if length > MAX_UNSPENDABLE_SCRIPT_SIZE {
+        bail!("UTXO snapshot script exceeds the maximum script size")
+    }
+    Ok(ScriptBuf::from_bytes(read_snapshot_vec(cursor, length)?))
+}
+
+fn compress_snapshot_amount(mut value: u64) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+    let mut exponent = 0u64;
+    while value % 10 == 0 && exponent < 9 {
+        value /= 10;
+        exponent += 1;
+    }
+    if exponent < 9 {
+        let digit = value % 10;
+        value /= 10;
+        1 + (value * 9 + digit - 1) * 10 + exponent
+    } else {
+        1 + (value - 1) * 10 + 9
+    }
+}
+
+fn decompress_snapshot_amount(mut value: u64) -> Result<u64> {
+    if value == 0 {
+        return Ok(0);
+    }
+    value -= 1;
+    let exponent = value % 10;
+    value /= 10;
+    let mut number = if exponent < 9 {
+        let digit = value % 9 + 1;
+        value /= 9;
+        value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(digit))
+            .context("UTXO snapshot amount overflows")?
+    } else {
+        value
+            .checked_add(1)
+            .context("UTXO snapshot amount overflows")?
+    };
+    for _ in 0..exponent {
+        number = number
+            .checked_mul(10)
+            .context("UTXO snapshot amount overflows")?;
+    }
+    Ok(number)
+}
+
+fn read_snapshot_array<const N: usize>(cursor: &mut Cursor<&[u8]>) -> Result<[u8; N]> {
+    let mut bytes = [0; N];
+    cursor.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_snapshot_vec(cursor: &mut Cursor<&[u8]>, length: usize) -> Result<Vec<u8>> {
+    let mut bytes = vec![0; length];
+    cursor.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn read_snapshot_u16(cursor: &mut Cursor<&[u8]>) -> Result<u16> {
+    Ok(u16::from_le_bytes(read_snapshot_array(cursor)?))
+}
+
+fn read_snapshot_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
+    Ok(u64::from_le_bytes(read_snapshot_array(cursor)?))
+}
+
+fn read_snapshot_compact_size(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
+    Ok(VarInt::consensus_decode(cursor)
+        .map_err(|error| anyhow::anyhow!("invalid UTXO snapshot compact size: {error}"))?
+        .0)
+}
+
+fn read_snapshot_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
+    let mut value = 0u64;
+    loop {
+        let digit = read_snapshot_array::<1>(cursor)?[0];
+        if value > (u64::MAX >> 7) {
+            bail!("UTXO snapshot VARINT is too large")
+        }
+        value = (value << 7) | u64::from(digit & 0x7f);
+        if digit & 0x80 != 0 {
+            if value == u64::MAX {
+                bail!("UTXO snapshot VARINT is too large")
+            }
+            value += 1;
+        } else {
+            return Ok(value);
+        }
+    }
+}
+
 fn is_unspendable_script(script: &Script) -> bool {
     script.is_op_return() || script.len() > MAX_UNSPENDABLE_SCRIPT_SIZE
 }
@@ -3780,14 +4149,141 @@ mod tests {
         let path = directory.path().join("external.snapshot");
         state.dump_utxo_set(&path).unwrap();
 
-        let bytes = fs::read(&path).unwrap();
-        let mut snapshot: ChainSnapshot = serde_json::from_slice(&bytes).unwrap();
-        let entry = snapshot.utxos.values_mut().next().unwrap();
-        entry.output.value = Amount::from_sat(entry.output.value.to_sat().saturating_sub(1));
-        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.pop();
+        fs::write(&path, bytes).unwrap();
 
         assert!(state.load_utxo_set(&path).is_err());
         assert_eq!(state.utxo_stats().2, 5_000_000_000);
+    }
+
+    #[test]
+    fn core_utxo_snapshot_round_trips_with_compressed_coin_encoding() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let block = mine_block(&state, 1);
+        state.connect_block(block).unwrap();
+        let path = directory.path().join("core-utxo.dat");
+
+        let expected = state.utxo_stats();
+        let (written, base_hash, base_height) = state.dump_utxo_set(&path).unwrap();
+        assert_eq!(written as usize, expected.1);
+        assert_eq!(base_hash, state.best_hash());
+        assert_eq!(base_height, state.height());
+        assert!(
+            fs::read(&path)
+                .unwrap()
+                .starts_with(&CORE_UTXO_SNAPSHOT_MAGIC)
+        );
+
+        let (loaded, loaded_hash, loaded_height) = state.load_utxo_set(&path).unwrap();
+        assert_eq!(loaded, written);
+        assert_eq!(loaded_hash, base_hash);
+        assert_eq!(loaded_height, base_height);
+        assert_eq!(state.utxo_stats(), expected);
+    }
+
+    #[test]
+    fn core_snapshot_script_compression_matches_core_special_cases() {
+        for (value, expected) in [
+            (0, vec![0x00]),
+            (127, vec![0x7f]),
+            (128, vec![0x80, 0x00]),
+            (255, vec![0x80, 0x7f]),
+            (16_384, vec![0xff, 0x00]),
+        ] {
+            let mut encoded = Vec::new();
+            write_snapshot_varint(&mut encoded, value).unwrap();
+            assert_eq!(encoded, expected);
+            let mut cursor = Cursor::new(encoded.as_slice());
+            assert_eq!(read_snapshot_varint(&mut cursor).unwrap(), value);
+        }
+
+        let compressed_key = [
+            0x02, 0x79, 0xbe, 0x66, 0x7e, 0xf9, 0xdc, 0xbb, 0xac, 0x55, 0xa0, 0x62, 0x95, 0xce,
+            0x87, 0x0b, 0x07, 0x02, 0x9b, 0xfc, 0xdb, 0x2d, 0xce, 0x28, 0xd9, 0x59, 0xf2, 0x81,
+            0x5b, 0x16, 0xf8, 0x17, 0x98,
+        ];
+        let uncompressed_key = bitcoin::secp256k1::PublicKey::from_slice(&compressed_key)
+            .unwrap()
+            .serialize_uncompressed();
+        let scripts = [
+            ScriptBuf::from_bytes({
+                let mut bytes = vec![0x76, 0xa9, 0x14];
+                bytes.extend_from_slice(&[3; 20]);
+                bytes.extend_from_slice(&[0x88, 0xac]);
+                bytes
+            }),
+            ScriptBuf::from_bytes({
+                let mut bytes = vec![0xa9, 0x14];
+                bytes.extend_from_slice(&[4; 20]);
+                bytes.push(0x87);
+                bytes
+            }),
+            ScriptBuf::from_bytes({
+                let mut bytes = vec![33];
+                bytes.extend_from_slice(&compressed_key);
+                bytes.push(0xac);
+                bytes
+            }),
+            ScriptBuf::from_bytes({
+                let mut bytes = vec![65];
+                bytes.extend_from_slice(&uncompressed_key);
+                bytes.push(0xac);
+                bytes
+            }),
+            ScriptBuf::from_bytes(vec![0x51; 37]),
+        ];
+
+        for script in scripts {
+            let mut encoded = Vec::new();
+            write_compressed_snapshot_script(&mut encoded, &script).unwrap();
+            let mut cursor = Cursor::new(encoded.as_slice());
+            assert_eq!(
+                read_compressed_snapshot_script(&mut cursor).unwrap(),
+                script
+            );
+            assert_eq!(cursor.position() as usize, encoded.len());
+        }
+        for amount in [0, 1, 10, 100_000_000, 5_000_000_000] {
+            assert_eq!(
+                decompress_snapshot_amount(compress_snapshot_amount(amount)).unwrap(),
+                amount
+            );
+        }
+    }
+
+    #[test]
+    fn core_utxo_snapshot_rejects_truncation_duplicates_and_trailing_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        let path = directory.path().join("core-utxo.dat");
+        state.dump_utxo_set(&path).unwrap();
+        let valid = fs::read(&path).unwrap();
+        assert_eq!(
+            read_core_utxo_snapshot(&valid, Network::Regtest)
+                .unwrap()
+                .coins_count,
+            1
+        );
+
+        let mut truncated = valid.clone();
+        truncated.pop();
+        assert!(read_core_utxo_snapshot(&truncated, Network::Regtest).is_err());
+
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert!(read_core_utxo_snapshot(&trailing, Network::Regtest).is_err());
+
+        let metadata_len = CORE_UTXO_SNAPSHOT_MAGIC.len() + 2 + 4 + 32 + 8;
+        let group_offset = metadata_len + 32;
+        assert_eq!(valid[group_offset], 1);
+        let mut duplicate = valid.clone();
+        duplicate[metadata_len - 8..metadata_len].copy_from_slice(&2u64.to_le_bytes());
+        duplicate[group_offset] = 2;
+        duplicate.extend_from_slice(&valid[group_offset + 1..]);
+        assert!(read_core_utxo_snapshot(&duplicate, Network::Regtest).is_err());
     }
 
     #[test]

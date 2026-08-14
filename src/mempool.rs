@@ -1537,6 +1537,10 @@ impl Mempool {
         Ok(())
     }
 
+    pub(crate) fn enforce_size_limit(&mut self) {
+        let _ = self.ensure_space(0, &HashSet::new());
+    }
+
     fn decay_rolling_min_fee(&mut self) {
         if !self.block_since_last_rolling_fee_bump || self.rolling_min_fee_sat_per_kvb == 0.0 {
             return;
@@ -2801,7 +2805,7 @@ mod tests {
         let low_size = bitcoin::consensus::encode::serialize(&low).len();
         let high_size = bitcoin::consensus::encode::serialize(&high).len();
         let mut pool = Mempool::new(Network::Regtest);
-        pool.max_bytes = low_size.saturating_add(high_size);
+        pool.max_bytes = low_size.saturating_add(high_size).saturating_sub(1);
         for (transaction, fee_sat) in [(low, 1), (high, 100)] {
             let txid = transaction.compute_txid();
             let wtxid = transaction.compute_wtxid();
@@ -2820,8 +2824,7 @@ mod tests {
             );
             pool.wtxids.insert(wtxid, txid);
         }
-        let candidate_size = low_size;
-        pool.ensure_space(candidate_size, &HashSet::new()).unwrap();
+        pool.enforce_size_limit();
         assert!(!pool.entries.contains_key(&low_id));
         assert!(pool.entries.contains_key(&high_id));
         assert!(pool.mempool_min_fee_sat_per_kvb() > pool.min_relay_fee_sat_per_kvb());

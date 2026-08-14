@@ -773,6 +773,7 @@ impl Node {
             }
         }
         mempool.revalidate(&chain);
+        mempool.enforce_size_limit();
         let mempool_after = mempool
             .transaction_order()
             .into_iter()

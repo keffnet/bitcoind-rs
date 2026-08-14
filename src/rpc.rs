@@ -4118,17 +4118,28 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .transpose()?
         .unwrap_or(LockTime::ZERO);
-    let replaceable = params.get(3).and_then(Value::as_bool).unwrap_or(true);
-    let version = params
-        .get(4)
+    let replaceable = params
+        .get(3)
         .filter(|value| !value.is_null())
-        .and_then(Value::as_i64)
-        .map(|version| {
-            i32::try_from(version).map_err(|_| anyhow!("transaction version is out of range"))
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("replaceable must be a boolean"))
         })
         .transpose()?
-        .map(Version::non_standard)
-        .unwrap_or(Version::TWO);
+        .unwrap_or(true);
+    let version = match params.get(4).filter(|value| !value.is_null()) {
+        Some(value) => {
+            let version = value
+                .as_u64()
+                .ok_or_else(|| anyhow!("transaction version must be an unsigned integer"))?;
+            if !(1..=3).contains(&version) {
+                bail!("transaction version is out of range (1~3)")
+            }
+            Version::non_standard(i32::try_from(version).expect("version is at most three"))
+        }
+        None => Version::TWO,
+    };
     let default_sequence = if replaceable {
         0xffff_fffd
     } else if lock_time != LockTime::ZERO {
@@ -4150,16 +4161,18 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .ok_or_else(|| anyhow!("transaction input vout is missing"))?;
             let vout = u32::try_from(vout)
                 .map_err(|_| anyhow!("transaction input vout is out of range"))?;
-            let sequence = value
-                .get("sequence")
-                .filter(|value| !value.is_null())
-                .and_then(Value::as_u64)
-                .map(|sequence| {
+            let sequence = match value.get("sequence").filter(|value| !value.is_null()) {
+                Some(value) if value.is_number() => {
+                    let sequence = value
+                        .as_u64()
+                        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+                        .ok_or_else(|| anyhow!("transaction input sequence is out of range"))?;
                     u32::try_from(sequence)
-                        .map_err(|_| anyhow!("transaction input sequence is out of range"))
-                })
-                .transpose()?
-                .unwrap_or(default_sequence);
+                        .map_err(|_| anyhow!("transaction input sequence is out of range"))?
+                }
+                Some(_) => default_sequence,
+                None => default_sequence,
+            };
             Ok(TxIn {
                 previous_output: OutPoint::new(txid, vout),
                 script_sig: ScriptBuf::new(),
@@ -4168,6 +4181,14 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    if replaceable
+        && !transaction_inputs.is_empty()
+        && transaction_inputs
+            .iter()
+            .all(|input| input.sequence.to_consensus_u32() > 0xffff_fffd)
+    {
+        bail!("Invalid parameter combination: Sequence number(s) contradict replaceable option")
+    }
     let transaction_outputs = create_transaction_outputs(node, outputs)?;
     let transaction = Transaction {
         version,
@@ -4197,10 +4218,16 @@ fn create_transaction_outputs(node: &Arc<Node>, outputs: &Value) -> Result<Vec<T
     } else {
         bail!("transaction outputs must be an object or array")
     };
+    let mut seen_scripts = HashSet::new();
+    let mut seen_data = false;
     entries
         .into_iter()
         .map(|(destination, value)| {
             if destination == "data" {
+                if seen_data {
+                    bail!("Invalid parameter, duplicate key: data")
+                }
+                seen_data = true;
                 let data = value
                     .as_str()
                     .ok_or_else(|| anyhow!("data output must be hexadecimal"))?;
@@ -4222,9 +4249,13 @@ fn create_transaction_outputs(node: &Arc<Node>, outputs: &Value) -> Result<Vec<T
             if amount > Amount::MAX_MONEY {
                 bail!("transaction output amount exceeds MAX_MONEY")
             }
+            let script_pubkey = address.script_pubkey();
+            if !seen_scripts.insert(script_pubkey.as_bytes().to_vec()) {
+                bail!("Invalid parameter, duplicated address: {destination}")
+            }
             Ok(TxOut {
                 value: amount,
-                script_pubkey: address.script_pubkey(),
+                script_pubkey,
             })
         })
         .collect()
@@ -11321,6 +11352,30 @@ mod tests {
         assert_eq!(
             default_transaction.input[0].sequence.to_consensus_u32(),
             0xffff_fffd
+        );
+        assert!(create_raw_transaction(&node, &json!([[], {"data": "00"}, null, "yes"])).is_err());
+        assert!(
+            create_raw_transaction(&node, &json!([[], {"data": "00"}, null, true, 4])).is_err()
+        );
+        assert!(create_raw_transaction(
+            &node,
+            &json!([[
+                {"txid": Txid::from_byte_array([7; 32]).to_string(), "vout": 1, "sequence": u32::MAX}
+            ], {"data": "00"}, null, true])
+        )
+        .is_err());
+        assert!(
+            create_raw_transaction(
+                &node,
+                &json!([[], [
+                    {"bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl": 0.1},
+                    {"bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl": 0.2}
+                ]])
+            )
+            .is_err()
+        );
+        assert!(
+            create_raw_transaction(&node, &json!([[], [{"data": "00"}, {"data": "01"}]])).is_err()
         );
         assert_eq!(parse_transaction_verbosity(Some(&json!(1))).unwrap(), 1);
         assert_eq!(parse_transaction_verbosity(Some(&json!(true))).unwrap(), 1);

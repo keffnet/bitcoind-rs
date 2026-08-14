@@ -3664,9 +3664,11 @@ fn rpc_timeout(params: &Value, index: usize) -> Result<Option<tokio::time::Insta
                 .ok_or_else(|| anyhow!("timeout must be a non-negative integer"))
         })
         .transpose()?;
-    Ok(timeout.map(|milliseconds| {
-        tokio::time::Instant::now() + std::time::Duration::from_millis(milliseconds)
-    }))
+    Ok(timeout
+        .filter(|milliseconds| *milliseconds != 0)
+        .map(|milliseconds| {
+            tokio::time::Instant::now() + std::time::Duration::from_millis(milliseconds)
+        }))
 }
 
 async fn receive_chain_event(
@@ -11117,6 +11119,13 @@ mod tests {
         assert_eq!(rpc_connection_type("addr-fetch"), "addr-fetch");
     }
 
+    #[test]
+    fn wait_rpc_zero_timeout_means_no_deadline() {
+        assert!(rpc_timeout(&json!([0]), 0).unwrap().is_none());
+        assert!(rpc_timeout(&json!([null]), 0).unwrap().is_none());
+        assert!(rpc_timeout(&json!([1]), 0).unwrap().is_some());
+    }
+
     #[tokio::test]
     async fn json_rpc_two_notifications_have_no_response() {
         let directory = tempfile::tempdir().unwrap();
@@ -12370,7 +12379,7 @@ mod tests {
         let tip = node.chain.read().tip();
         let first_block = node.chain.read().block_hash(1).unwrap();
 
-        let by_hash = wait_for_block(&node, &json!([first_block.to_string(), 0]))
+        let by_hash = wait_for_block(&node, &json!([first_block.to_string(), 1]))
             .await
             .unwrap();
         assert_eq!(by_hash["hash"], tip.hash.to_string());

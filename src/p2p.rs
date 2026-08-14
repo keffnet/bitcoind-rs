@@ -211,6 +211,7 @@ const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
+const MAX_GETDATA_BATCH: usize = 1_000;
 
 fn local_transaction_relay_enabled(connection_type: &str, blocksonly: bool) -> bool {
     !blocksonly && matches!(connection_type, "outbound-full" | "inbound" | "addr-fetch")
@@ -222,6 +223,10 @@ fn connection_requests_headers(connection_type: &str) -> bool {
 
 fn connection_fetches_addresses(outbound: bool, connection_type: &str) -> bool {
     outbound && connection_type != "block-relay-only" && connection_type != "feeler"
+}
+
+fn getdata_batches(requests: &[Inventory]) -> impl Iterator<Item = &[Inventory]> {
+    requests.chunks(MAX_GETDATA_BATCH)
 }
 
 fn block_request_inventory_type(peer_services: u64) -> InventoryType {
@@ -1496,14 +1501,8 @@ async fn serve_peer_loop(
                     for request in &requests {
                         node.track_peer_block_request(peer_id, request.hash);
                     }
-                    send_message(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &Message::GetData(requests),
-                    )
-                    .await?;
+                    send_getdata_batches(node, peer_id, writer, node.config.network, &requests)
+                        .await?;
                 } else {
                     request_headers(node, peer_id, writer).await?;
                 }
@@ -1582,14 +1581,8 @@ async fn serve_peer_loop(
                             node.track_peer_block_request(peer_id, request.hash);
                         }
                     }
-                    send_message(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &Message::GetData(requests),
-                    )
-                    .await?;
+                    send_getdata_batches(node, peer_id, writer, node.config.network, &requests)
+                        .await?;
                 }
             }
             Message::GetData(items) => {
@@ -2372,6 +2365,26 @@ async fn request_full_block(
     .await
 }
 
+async fn send_getdata_batches(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    network: Network,
+    requests: &[Inventory],
+) -> Result<()> {
+    for batch in getdata_batches(requests) {
+        send_message(
+            node,
+            peer_id,
+            writer,
+            network,
+            &Message::GetData(batch.to_vec()),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 fn reconstruct_compact_block(
     compact: &HeaderAndShortIds,
     node: &Arc<Node>,
@@ -3014,6 +3027,20 @@ mod tests {
             block_request_inventory_type(wire::NODE_NETWORK),
             InventoryType::Block
         );
+    }
+
+    #[test]
+    fn outbound_getdata_batches_match_core_limit() {
+        let requests = (0..2_001)
+            .map(|index| Inventory {
+                kind: InventoryType::Block,
+                hash: BlockHash::from_byte_array([index as u8; 32]),
+            })
+            .collect::<Vec<_>>();
+        let lengths = getdata_batches(&requests)
+            .map(<[Inventory]>::len)
+            .collect::<Vec<_>>();
+        assert_eq!(lengths, [1_000, 1_000, 1]);
     }
 
     #[test]

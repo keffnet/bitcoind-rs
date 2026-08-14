@@ -18,7 +18,7 @@ use bitcoin::p2p::message_filter::{
 use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
+pub const MAX_MESSAGE_SIZE: usize = 4_000_000;
 const HEADER_SIZE: usize = 24;
 const MAX_INVENTORY_ITEMS: usize = 50_000;
 const MAX_LOCATOR_HASHES: usize = 101;
@@ -1081,6 +1081,21 @@ mod tests {
         put_compact_size(102, &mut locator).unwrap();
         locator.extend_from_slice(&[0; 32 * 103]);
         assert!(decode_getheaders(&mut Reader::new(&locator)).is_err());
+    }
+
+    #[test]
+    fn uses_core_legacy_protocol_message_size_limit() {
+        assert_eq!(MAX_MESSAGE_SIZE, 4_000_000);
+        let at_limit = Message::Unknown {
+            command: "mystery".to_owned(),
+            payload: vec![0; MAX_MESSAGE_SIZE],
+        };
+        assert!(encode_message(Network::Regtest, &at_limit).is_ok());
+        let over_limit = Message::Unknown {
+            command: "mystery".to_owned(),
+            payload: vec![0; MAX_MESSAGE_SIZE + 1],
+        };
+        assert!(encode_message(Network::Regtest, &over_limit).is_err());
     }
 
     #[test]

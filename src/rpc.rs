@@ -301,7 +301,7 @@ fn rest_blockhash_by_height(
         .block_hash(height)
         .ok_or_else(|| anyhow!("block height out of range"))?;
     match format {
-        "json" => rest_json(json!(hash.to_string())),
+        "json" => rest_json(json!({"blockhash": hash.to_string()})),
         "bin" => Ok(("application/octet-stream", hash.to_byte_array().to_vec())),
         "hex" => Ok(("text/plain", format!("{}\n", hash).into_bytes())),
         _ => bail!("unsupported REST output format"),
@@ -478,7 +478,7 @@ fn rest_block_filter(
         bail!("only the basic REST block filter is available")
     }
     let hash: BlockHash = hash_text.parse()?;
-    let (content, header) = node
+    let (content, _header) = node
         .chain
         .write()
         .basic_filter_chain(&hash)?
@@ -490,13 +490,16 @@ fn rest_block_filter(
         })
         .ok_or_else(|| anyhow!("block filter not found"))?;
     match format {
-        "bin" | "hex" => rest_format_bytes(content, format),
-        "json" => rest_json(json!({
-            "filter": hex::encode(content),
-            "header": header.to_string(),
-        })),
+        "bin" | "hex" => rest_format_bytes(serialize_block_filter(&content), format),
+        "json" => rest_json(json!({"filter": hex::encode(content)})),
         _ => bail!("unsupported REST output format"),
     }
+}
+
+fn serialize_block_filter(content: &[u8]) -> Vec<u8> {
+    let mut bytes = serialize(&VarInt::from(content.len() as u64));
+    bytes.extend_from_slice(content);
+    bytes
 }
 
 fn rest_block_filter_headers(
@@ -9142,6 +9145,11 @@ mod tests {
         );
         let (_, hash) = dispatch_rest(&node, "/rest/blockhashbyheight/0.hex").unwrap();
         assert_eq!(hash.len(), 65);
+        let (_, hash_json) = dispatch_rest(&node, "/rest/blockhashbyheight/0.json").unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&hash_json).unwrap(),
+            json!({"blockhash": node.chain.read().block_hash(0).unwrap().to_string()})
+        );
         let (_, headers) = dispatch_rest(
             &node,
             &format!(
@@ -9172,6 +9180,14 @@ mod tests {
         .unwrap();
         let filter = serde_json::from_slice::<Value>(&filter).unwrap();
         assert!(filter["filter"].as_str().is_some());
+        let (_, filter_hex) = dispatch_rest(
+            &node,
+            &format!("/rest/blockfilter/basic/{genesis_hash}.hex"),
+        )
+        .unwrap();
+        let filter_bytes = hex::decode(std::str::from_utf8(&filter_hex).unwrap().trim()).unwrap();
+        let raw_filter = hex::decode(filter["filter"].as_str().unwrap()).unwrap();
+        assert_eq!(filter_bytes, serialize_block_filter(&raw_filter));
         let (_, filter_headers) = dispatch_rest(
             &node,
             &format!("/rest/blockfilterheaders/basic/{genesis_hash}.json?count=1"),

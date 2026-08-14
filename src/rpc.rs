@@ -8972,9 +8972,6 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let action = param::<String>(params, 0)?;
     match action.as_str() {
         "start" => {
-            if !node.config.blockfilterindex {
-                bail!("scanblocks requires blockfilterindex")
-            }
             let scan_objects = params
                 .get(1)
                 .and_then(Value::as_array)
@@ -12347,8 +12344,8 @@ mod tests {
             max_mempool_mb: 300,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
-            blockfilterindex: true,
-            peer_block_filters: true,
+            blockfilterindex: false,
+            peer_block_filters: false,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,

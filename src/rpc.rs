@@ -1204,7 +1204,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getchaintxstats" => get_chain_tx_stats(node, params),
         "getnetworkhashps" => get_network_hash_ps(node, params),
         "gettxoutproof" => get_txout_proof(node, params),
-        "verifytxoutproof" => verify_txout_proof(params),
+        "verifytxoutproof" => verify_txout_proof(node, params),
         "submitheader" => submit_header(node, params),
         "getblockfrompeer" => get_block_from_peer(node, params),
         "invalidateblock" => invalidate_block(node, params),
@@ -3874,7 +3874,30 @@ fn get_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(hex::encode(proof)))
 }
 
-fn verify_txout_proof(params: &Value) -> Result<Value> {
+fn verify_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let Some((header, matches, total)) = parse_merkle_proof(params)? else {
+        return Ok(json!([]));
+    };
+    let block_hash = header.block_hash();
+    let mut chain = node.chain.write();
+    if !chain.is_active_block(&block_hash) {
+        bail!("Block not found in chain");
+    }
+    let transaction_count = chain
+        .block_transaction_count(&block_hash)?
+        .ok_or_else(|| anyhow!("Block not found in chain"))?;
+    if transaction_count != total {
+        return Ok(json!([]));
+    }
+    Ok(json!(
+        matches
+            .into_iter()
+            .map(|txid| txid.to_string())
+            .collect::<Vec<_>>()
+    ))
+}
+
+fn parse_merkle_proof(params: &Value) -> Result<Option<(Header, Vec<Txid>, usize)>> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     if bytes.len() < 84 {
         bail!("invalid merkle proof");
@@ -3906,15 +3929,13 @@ fn verify_txout_proof(params: &Value) -> Result<Value> {
     };
     let height = merkle_tree_height(total);
     let (root, matches) = extract_merkle_node(height, 0, total, &mut cursor)?;
-    if root.to_raw_hash() != header.merkle_root.to_raw_hash() || cursor.hash_index != hashes.len() {
+    if cursor.flag_index.div_ceil(8) != flags.len() || cursor.hash_index != hashes.len() {
         bail!("invalid merkle proof");
     }
-    Ok(json!(
-        matches
-            .into_iter()
-            .map(|txid| txid.to_string())
-            .collect::<Vec<_>>()
-    ))
+    if root.to_raw_hash() != header.merkle_root.to_raw_hash() {
+        return Ok(None);
+    }
+    Ok(Some((header, matches, total)))
 }
 
 fn serialize_merkle_proof(block: &bitcoin::Block, requested: &[Txid]) -> Result<Vec<u8>> {
@@ -4057,7 +4078,12 @@ fn extract_merkle_node(
     }
     let (left, mut matches) = extract_merkle_node(height - 1, position * 2, total, cursor)?;
     let (right, right_matches) = if position * 2 + 1 < merkle_tree_width(total, height - 1) {
-        extract_merkle_node(height - 1, position * 2 + 1, total, cursor)?
+        let (right, right_matches) =
+            extract_merkle_node(height - 1, position * 2 + 1, total, cursor)?;
+        if right == left {
+            bail!("invalid merkle proof");
+        }
+        (right, right_matches)
     } else {
         (left, Vec::new())
     };
@@ -10770,16 +10796,11 @@ mod tests {
             block.txdata[2].compute_txid(),
         ];
         let proof = serialize_merkle_proof(&block, &requested).unwrap();
-        let result = verify_txout_proof(&json!([hex::encode(proof)])).unwrap();
-        assert_eq!(
-            result,
-            json!(
-                requested
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-            )
-        );
+        let (_, matches, total) = parse_merkle_proof(&json!([hex::encode(proof)]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(total, block.txdata.len());
+        assert_eq!(matches, requested,);
     }
 
     #[test]
@@ -10799,7 +10820,11 @@ mod tests {
         let txid = block.txdata[1].compute_txid();
         let mut proof = serialize_merkle_proof(&block, &[txid]).unwrap();
         proof[36] ^= 1;
-        assert!(verify_txout_proof(&json!([hex::encode(proof)])).is_err());
+        assert!(
+            parse_merkle_proof(&json!([hex::encode(proof)]))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -10817,9 +10842,85 @@ mod tests {
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         let proof = serialize_merkle_proof(&block, &[]).unwrap();
+        let (_, matches, _) = parse_merkle_proof(&json!([hex::encode(proof)]))
+            .unwrap()
+            .unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn verify_merkle_proof_requires_an_active_chain_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
+            persist_mempool: true,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let genesis = {
+            let hash = node.chain.read().best_hash();
+            node.chain.write().block(&hash).unwrap().unwrap()
+        };
+        let txid = genesis.txdata[0].compute_txid();
+        let proof = serialize_merkle_proof(&genesis, &[txid]).unwrap();
         assert_eq!(
-            verify_txout_proof(&json!([hex::encode(proof)])).unwrap(),
-            json!([])
+            dispatch_method(&node, "verifytxoutproof", &json!([hex::encode(proof)]),).unwrap(),
+            json!([txid.to_string()])
+        );
+
+        let mut off_chain = bitcoin::Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![proof_transaction(8)],
+        };
+        off_chain.header.merkle_root = off_chain.compute_merkle_root().unwrap();
+        let off_chain_proof =
+            serialize_merkle_proof(&off_chain, &[off_chain.txdata[0].compute_txid()]).unwrap();
+        assert!(
+            dispatch_method(
+                &node,
+                "verifytxoutproof",
+                &json!([hex::encode(off_chain_proof)]),
+            )
+            .is_err()
         );
     }
 

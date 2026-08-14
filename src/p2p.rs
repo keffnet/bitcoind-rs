@@ -1608,11 +1608,7 @@ async fn serve_peer_loop(
                     let addresses = peer_infos
                         .into_iter()
                         .map(|peer| {
-                            network_address_v2(
-                                peer.address,
-                                peer.connected_at,
-                                node.config.peer_bloom_filters,
-                            )
+                            network_address_v2(peer.address, peer.connected_at, peer.services)
                         })
                         .collect::<Vec<_>>();
                     send_message(
@@ -1628,14 +1624,7 @@ async fn serve_peer_loop(
                         .into_iter()
                         .map(|peer| wire::NetworkAddress {
                             time: u32::try_from(peer.connected_at).unwrap_or(u32::MAX),
-                            services: wire::NODE_NETWORK
-                                | wire::NODE_WITNESS
-                                | wire::NODE_P2P_V2
-                                | if node.config.peer_bloom_filters {
-                                    wire::NODE_BLOOM
-                                } else {
-                                    0
-                                },
+                            services: peer.services,
                             address: socket_address_bytes(peer.address),
                             port: peer.address.port(),
                         })
@@ -1926,7 +1915,7 @@ fn socket_address_from_v2(address: &wire::NetworkAddressV2) -> Option<std::net::
 fn network_address_v2(
     address: std::net::SocketAddr,
     connected_at: u64,
-    bloom_filters: bool,
+    services: u64,
 ) -> wire::NetworkAddressV2 {
     let port = address.port();
     let (network, address) = match address.ip() {
@@ -1935,10 +1924,7 @@ fn network_address_v2(
     };
     wire::NetworkAddressV2 {
         time: u32::try_from(connected_at).unwrap_or(u32::MAX),
-        services: wire::NODE_NETWORK
-            | wire::NODE_WITNESS
-            | wire::NODE_P2P_V2
-            | if bloom_filters { wire::NODE_BLOOM } else { 0 },
+        services,
         network,
         address,
         port,
@@ -2499,7 +2485,11 @@ mod tests {
         };
         let legacy_socket = socket_address_from_legacy(&legacy).unwrap();
         node.remember_address(legacy_socket, legacy.services, u64::from(legacy.time));
-        let v2 = network_address_v2("[2001:db8::10]:18444".parse().unwrap(), 456, false);
+        let v2 = network_address_v2(
+            "[2001:db8::10]:18444".parse().unwrap(),
+            456,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
         let v2_socket = socket_address_from_v2(&v2).unwrap();
         node.remember_address(v2_socket, v2.services, u64::from(v2.time));
 

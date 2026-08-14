@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{Hash, sha256d};
-use bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Address, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -66,9 +66,23 @@ impl Default for ElectrumSession {
 
 #[derive(Clone, Debug)]
 enum Subscription {
-    Scripthash { script_hash: String, status: Value },
-    Scriptpubkey { script_hash: String, status: Value },
-    Outpoint { outpoint: OutPoint, status: Value },
+    Address {
+        address: String,
+        script_hash: String,
+        status: Value,
+    },
+    Scripthash {
+        script_hash: String,
+        status: Value,
+    },
+    Scriptpubkey {
+        script_hash: String,
+        status: Value,
+    },
+    Outpoint {
+        outpoint: OutPoint,
+        status: Value,
+    },
 }
 
 pub struct ElectrumServer {
@@ -273,6 +287,46 @@ fn dispatch_with_session(
             Ok(Value::Bool(
                 subscriptions
                     .remove(&format!("scripthash:{script_hash}"))
+                    .is_some(),
+            ))
+        }
+        "blockchain.address.get_history" => {
+            let (_, script_hash) = address_param(node, params, 0)?;
+            Ok(json!(history_for_script(node, &script_hash)))
+        }
+        "blockchain.address.get_balance" => {
+            let (_, script_hash) = address_param(node, params, 0)?;
+            let (confirmed, unconfirmed) = balance_for_script(node, &script_hash);
+            Ok(json!({"confirmed": confirmed, "unconfirmed": unconfirmed}))
+        }
+        "blockchain.address.listunspent" => {
+            let (_, script_hash) = address_param(node, params, 0)?;
+            Ok(json!(unspent_for_script(node, &script_hash)))
+        }
+        "blockchain.address.get_mempool" => {
+            let (_, script_hash) = address_param(node, params, 0)?;
+            Ok(json!(mempool_for_script(node, &script_hash)))
+        }
+        "blockchain.address.subscribe" => {
+            let (address, script_hash) = address_param(node, params, 0)?;
+            let status = history_status_for_script(node, &script_hash)
+                .map(Value::String)
+                .unwrap_or(Value::Null);
+            subscriptions.insert(
+                format!("address:{address}"),
+                Subscription::Address {
+                    address,
+                    script_hash,
+                    status: status.clone(),
+                },
+            );
+            Ok(status)
+        }
+        "blockchain.address.unsubscribe" => {
+            let (address, _) = address_param(node, params, 0)?;
+            Ok(Value::Bool(
+                subscriptions
+                    .remove(&format!("address:{address}"))
                     .is_some(),
             ))
         }
@@ -1064,6 +1118,28 @@ async fn send_status_notifications(
 ) -> Result<()> {
     for subscription in subscriptions.values_mut() {
         let notification = match subscription {
+            Subscription::Address {
+                address,
+                script_hash,
+                status,
+            } => {
+                if !refresh_history {
+                    continue;
+                }
+                let current = history_status_for_script(node, script_hash)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null);
+                if status_notification_needed(status, &current, false) {
+                    *status = current.clone();
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "blockchain.address.subscribe",
+                        "params": [address, current],
+                    })
+                } else {
+                    continue;
+                }
+            }
             Subscription::Scripthash {
                 script_hash,
                 status,
@@ -1331,6 +1407,15 @@ fn scriptpubkey_hash_param(params: &Value, index: usize) -> Result<String> {
     Ok(chain::electrum_script_hash(&script))
 }
 
+fn address_param(node: &Arc<Node>, params: &Value, index: usize) -> Result<(String, String)> {
+    let value = param::<String>(params, index)?;
+    let address = value
+        .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
+        .require_network(node.config.network)?;
+    let script_hash = chain::electrum_script_hash(&address.script_pubkey());
+    Ok((address.to_string(), script_hash))
+}
+
 fn outpoint_param(params: &Value) -> Result<OutPoint> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let vout = param::<u32>(params, 1)?;
@@ -1476,6 +1561,66 @@ mod tests {
         .unwrap();
         assert_eq!(features["protocol_max"], json!("1.7"));
         assert!(features.get("hash_function").is_none());
+        let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
+        let address_balance = dispatch_with_session(
+            &node,
+            "blockchain.address.get_balance",
+            &json!([address]),
+            &mut subscriptions,
+            &mut session,
+        )
+        .unwrap();
+        let checked_address = address
+            .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+            .unwrap()
+            .require_network(Network::Regtest)
+            .unwrap();
+        let script_hash = chain::electrum_script_hash(&checked_address.script_pubkey());
+        assert_eq!(
+            address_balance,
+            dispatch_with_session(
+                &node,
+                "blockchain.scripthash.get_balance",
+                &json!([script_hash]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "blockchain.address.get_history",
+                &json!([address]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "blockchain.address.subscribe",
+                &json!([address]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            Value::Null
+        );
+        assert!(subscriptions.contains_key(&format!("address:{address}")));
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "blockchain.address.unsubscribe",
+                &json!([address]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            Value::Bool(true)
+        );
         assert_eq!(
             dispatch_with_session(
                 &node,

@@ -1022,7 +1022,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "dumptxoutset" => Some(&["path", "type"]),
         "loadtxoutset" => Some(&["path"]),
         "pruneblockchain" => Some(&["height"]),
-        "waitfornewblock" => Some(&["timeout"]),
+        "waitfornewblock" => Some(&["timeout", "current_tip"]),
         "waitforblock" => Some(&["blockhash", "timeout"]),
         "waitforblockheight" => Some(&["height", "timeout"]),
         "scantxoutset" => Some(&["action", "scanobjects"]),
@@ -3024,13 +3024,28 @@ fn prune_blockchain(_node: &Arc<Node>, _params: &Value) -> Result<Value> {
 
 async fn wait_for_new_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let timeout = rpc_timeout(params, 0)?;
+    let current_tip = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("current_tip must be a block hash"))?
+                .parse::<BlockHash>()
+                .map_err(|error| anyhow!("invalid current_tip: {error}"))
+        })
+        .transpose()?;
     let mut events = node.subscribe_chain();
-    let start_height = node.chain.read().height();
+    let current_tip = current_tip.unwrap_or_else(|| node.chain.read().best_hash());
     loop {
+        let tip = node.chain.read().tip();
+        if tip.hash != current_tip {
+            return Ok(json!({"hash": tip.hash.to_string(), "height": tip.height}));
+        }
         let Some(tip) = receive_chain_event(&mut events, timeout).await? else {
             return current_tip_json(node);
         };
-        if tip.height > start_height {
+        if tip.hash != current_tip {
             return Ok(json!({"hash": tip.hash.to_string(), "height": tip.height}));
         }
     }
@@ -9942,6 +9957,35 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(template["height"], 1);
+    }
+
+    #[tokio::test]
+    async fn waitfornewblock_honors_current_tip_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+        })
+        .unwrap();
+        let old_tip = node.chain.read().best_hash();
+        generate_to_address(
+            &node,
+            &json!([1, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"]),
+        )
+        .unwrap();
+        let result = wait_for_new_block(&node, &json!([0, old_tip.to_string()]))
+            .await
+            .unwrap();
+        assert_eq!(result["height"], 1);
+        assert_ne!(result["hash"], old_tip.to_string());
     }
 
     #[test]

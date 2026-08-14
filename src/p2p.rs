@@ -13,7 +13,7 @@ use bip324::futures::{Protocol, ProtocolReader, ProtocolWriter};
 use bip324::io::Payload;
 use bip324::{PacketType, Role};
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
-use bitcoin::bip158::{FilterHash, FilterHeader};
+use bitcoin::bip158::FilterHash;
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
@@ -29,6 +29,7 @@ use tokio::net::{
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
+use crate::chain::BasicFilterRange;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
 };
@@ -317,12 +318,6 @@ struct PendingCompactBlock {
     compact: HeaderAndShortIds,
     transactions: Vec<Option<Transaction>>,
     requested_indexes: Vec<u64>,
-}
-
-struct BasicFilterRange {
-    stop_hash: BlockHash,
-    previous_filter_header: FilterHeader,
-    filters: Vec<(BlockHash, Vec<u8>, FilterHeader)>,
 }
 
 pub struct PeerManager {
@@ -1724,34 +1719,10 @@ fn basic_filter_range(
     if !chain.is_active_block(&stop_hash) || start_height > stop_height {
         return Ok(None);
     }
-    let end_height = start_height
-        .saturating_add(u32::try_from(limit.saturating_sub(1)).unwrap_or(u32::MAX))
-        .min(stop_height);
-    let end_hash = chain
-        .block_hash(end_height)
-        .ok_or_else(|| anyhow::anyhow!("compact filter height is out of range"))?;
-    let all_filters = chain
-        .basic_filter_chain(&end_hash)?
-        .ok_or_else(|| anyhow::anyhow!("compact filters are not available"))?;
-    let previous_filter_header = if start_height == 0 {
-        FilterHeader::all_zeros()
-    } else {
-        all_filters
-            .get(start_height as usize - 1)
-            .map(|(_, _, header)| *header)
-            .ok_or_else(|| anyhow::anyhow!("compact filter predecessor is unavailable"))?
+    let Some(range) = chain.basic_filter_range(start_height, stop_hash, limit)? else {
+        return Ok(None);
     };
-    let filters = all_filters
-        .into_iter()
-        .skip(start_height as usize)
-        .take(limit)
-        .map(|(hash, filter, header)| (hash, filter.content, header))
-        .collect();
-    Ok(Some(BasicFilterRange {
-        stop_hash: end_hash,
-        previous_filter_header,
-        filters,
-    }))
+    Ok(Some(range))
 }
 
 async fn handle_received_block(
@@ -2263,6 +2234,7 @@ fn transaction_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<Trans
 mod tests {
     use super::*;
     use bitcoin::Network;
+    use bitcoin::bip158::FilterHeader;
 
     use crate::{Config, Node};
 

@@ -9,6 +9,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use bitcoin::absolute::LockTime;
 use bitcoin::address::AddressType;
+use bitcoin::bip158::BlockFilter;
 use bitcoin::block::{Header, Version as BlockVersion};
 use bitcoin::blockdata::opcodes::all::OP_RETURN;
 use bitcoin::blockdata::script::{Builder, Instruction, PushBytesBuf};
@@ -552,13 +553,7 @@ fn rest_block_filter(
     let (content, _header) = node
         .chain
         .write()
-        .basic_filter_chain(&hash)?
-        .and_then(|filters| {
-            filters
-                .into_iter()
-                .next_back()
-                .map(|(_, filter, header)| (filter.content, header))
-        })
+        .basic_filter_for_block(&hash)?
         .ok_or_else(|| anyhow!("block filter not found"))?;
     match format {
         "bin" | "hex" => rest_format_bytes(serialize_block_filter(&content), format),
@@ -608,21 +603,14 @@ fn rest_block_filter_headers(
         let mut chain = node.chain.write();
         match chain.block_height_by_hash(&hash) {
             Some(start_height) if chain.is_active_block(&hash) => {
-                let end_height = start_height
-                    .saturating_add(u32::try_from(count.saturating_sub(1)).unwrap_or(u32::MAX))
-                    .min(chain.height());
-                let end_hash = chain
-                    .block_hash(end_height)
-                    .ok_or_else(|| anyhow!("block height out of range"))?;
-                let filters = chain
-                    .basic_filter_chain(&end_hash)?
-                    .ok_or_else(|| anyhow!("block filter headers are not available"))?;
-                filters
-                    .into_iter()
-                    .skip(start_height as usize)
-                    .take(count)
-                    .map(|(_, _, filter_header)| filter_header)
-                    .collect::<Vec<_>>()
+                match chain.basic_filter_range(start_height, hash, count)? {
+                    Some(range) => range
+                        .filters
+                        .into_iter()
+                        .map(|(_, _, filter_header)| filter_header)
+                        .collect::<Vec<_>>(),
+                    None => Vec::new(),
+                }
             }
             _ => Vec::new(),
         }
@@ -3190,13 +3178,7 @@ fn get_block_filter(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let (content, header) = node
         .chain
         .write()
-        .basic_filter_chain(&hash)?
-        .and_then(|filters| {
-            filters
-                .into_iter()
-                .next_back()
-                .map(|(_, filter, header)| (filter.content, header))
-        })
+        .basic_filter_for_block(&hash)?
         .ok_or_else(|| anyhow!("Block filter not found"))?;
     Ok(json!({
         "filter": hex::encode(content),
@@ -8682,20 +8664,15 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 bail!("invalid scan height range")
             }
             let mut chain = node.chain.write();
-            let stop_hash = chain
-                .block_hash(stop_height)
-                .ok_or_else(|| anyhow!("stop_height is out of range"))?;
-            let filters = chain
-                .basic_filter_chain(&stop_hash)?
-                .ok_or_else(|| anyhow!("block filters are not available"))?;
             let mut relevant_blocks = Vec::new();
             for height in start_height..=stop_height {
                 let hash = chain
                     .block_hash(height)
                     .ok_or_else(|| anyhow!("scan height is out of range"))?;
-                let (_, filter, _) = filters
-                    .get(height as usize)
+                let (content, _) = chain
+                    .basic_filter_for_block(&hash)?
                     .ok_or_else(|| anyhow!("block filter is missing"))?;
+                let filter = BlockFilter::new(&content);
                 if filter.match_any(&hash, scripts.iter().map(|script| script.as_bytes()))?
                     && (!filter_false_positives
                         || block_matches_scripts(&mut chain, &hash, &scripts)?)

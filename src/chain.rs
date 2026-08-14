@@ -61,6 +61,13 @@ pub struct BlockFeeStats {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BasicFilterRange {
+    pub stop_hash: BlockHash,
+    pub previous_filter_header: FilterHeader,
+    pub filters: Vec<(BlockHash, Vec<u8>, FilterHeader)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UtxoSetStats {
     pub transactions: usize,
     pub outputs: usize,
@@ -831,6 +838,85 @@ impl ChainState {
             }
         }
         Ok(Some(filters))
+    }
+
+    /// Return one durable BIP158 basic filter without rebuilding the chain
+    /// from genesis. Older stores may not have a record for the requested
+    /// block, so retain the full-chain computation as a compatibility
+    /// fallback.
+    pub fn basic_filter_for_block(
+        &mut self,
+        hash: &BlockHash,
+    ) -> Result<Option<(Vec<u8>, FilterHeader)>> {
+        if !self.block_index.contains_key(hash) {
+            return Ok(None);
+        }
+        if let Some((content, filter_header)) = self.basic_filter_cache.get(hash) {
+            return Ok(Some((content.clone(), *filter_header)));
+        }
+        if let Some((content, filter_header)) = self.filter_store.get(hash)? {
+            self.basic_filter_cache
+                .insert(*hash, (content.clone(), filter_header));
+            return Ok(Some((content, filter_header)));
+        }
+        Ok(self.basic_filter_chain(hash)?.and_then(|filters| {
+            filters
+                .into_iter()
+                .next_back()
+                .map(|(_, filter, filter_header)| (filter.content, filter_header))
+        }))
+    }
+
+    /// Return a bounded active-chain range of BIP158 basic filters. The
+    /// durable index is consulted one block at a time; only a store missing a
+    /// requested record falls back to the legacy genesis-to-tip computation.
+    pub fn basic_filter_range(
+        &mut self,
+        start_height: u32,
+        stop_hash: BlockHash,
+        limit: usize,
+    ) -> Result<Option<BasicFilterRange>> {
+        let Some(stop_height) = self.block_height_by_hash(&stop_hash) else {
+            return Ok(None);
+        };
+        if self.block_hash(stop_height) != Some(stop_hash) || start_height > stop_height {
+            return Ok(None);
+        }
+        let end_height = start_height
+            .saturating_add(u32::try_from(limit.saturating_sub(1)).unwrap_or(u32::MAX))
+            .min(stop_height);
+        let end_hash = self
+            .block_hash(end_height)
+            .ok_or_else(|| anyhow::anyhow!("compact filter height is out of range"))?;
+        let previous_filter_header = if start_height == 0 {
+            FilterHeader::all_zeros()
+        } else {
+            let previous_hash = self
+                .block_hash(start_height - 1)
+                .ok_or_else(|| anyhow::anyhow!("compact filter predecessor is unavailable"))?;
+            self.basic_filter_for_block(&previous_hash)?
+                .map(|(_, filter_header)| filter_header)
+                .ok_or_else(|| anyhow::anyhow!("compact filter predecessor is unavailable"))?
+        };
+        let mut filters = Vec::new();
+        if limit != 0 {
+            let range_len = end_height.saturating_sub(start_height).saturating_add(1);
+            filters.reserve(usize::try_from(range_len).unwrap_or(usize::MAX));
+            for height in start_height..=end_height {
+                let block_hash = self
+                    .block_hash(height)
+                    .ok_or_else(|| anyhow::anyhow!("compact filter height is out of range"))?;
+                let (content, filter_header) = self
+                    .basic_filter_for_block(&block_hash)?
+                    .ok_or_else(|| anyhow::anyhow!("compact filter is missing"))?;
+                filters.push((block_hash, content, filter_header));
+            }
+        }
+        Ok(Some(BasicFilterRange {
+            stop_hash: end_hash,
+            previous_filter_header,
+            filters,
+        }))
     }
 
     /// Return the outputs spent by each transaction in a block, with an empty
@@ -1750,14 +1836,10 @@ impl ChainState {
         let application =
             self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?;
         self.cache_block_undo(block, &application.spent_entries)?;
-        let previous_filter_header =
-            if let Some((_, header)) = self.basic_filter_cache.get(&previous) {
-                *header
-            } else {
-                self.basic_filter_chain(&previous)?
-                    .and_then(|filters| filters.last().map(|(_, _, header)| *header))
-                    .unwrap_or(FilterHeader::all_zeros())
-            };
+        let previous_filter_header = self
+            .basic_filter_for_block(&previous)?
+            .map(|(_, header)| header)
+            .unwrap_or(FilterHeader::all_zeros());
         self.cache_basic_filter_for_block(
             block,
             &application.spent_entries,
@@ -2661,6 +2743,49 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn indexed_basic_filter_lookups_survive_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            let block = mine_block(&state, height);
+            state.connect_block(block).unwrap();
+        }
+        let tip_hash = state.best_hash();
+        let expected = state
+            .basic_filter_for_block(&tip_hash)
+            .unwrap()
+            .expect("tip filter");
+        state.persist_snapshot().unwrap();
+        drop(state);
+
+        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert!(reopened.basic_filter_cache.is_empty());
+        assert_eq!(
+            reopened.basic_filter_for_block(&tip_hash).unwrap(),
+            Some(expected)
+        );
+        assert_eq!(reopened.basic_filter_cache.len(), 1);
+
+        let range = reopened
+            .basic_filter_range(1, tip_hash, 2)
+            .unwrap()
+            .expect("filter range");
+        assert_eq!(range.stop_hash, reopened.block_hash(2).unwrap());
+        assert_eq!(range.filters.len(), 2);
+        assert_eq!(range.filters[0].0, reopened.block_hash(1).unwrap());
+        assert_eq!(range.filters[1].0, range.stop_hash);
+        let genesis_hash = reopened.block_hash(0).unwrap();
+        assert_eq!(
+            range.previous_filter_header,
+            reopened
+                .basic_filter_for_block(&genesis_hash)
+                .unwrap()
+                .unwrap()
+                .1
+        );
     }
 
     #[test]

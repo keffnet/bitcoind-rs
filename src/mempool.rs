@@ -319,6 +319,7 @@ pub struct Mempool {
     policy: MempoolPolicy,
     max_bytes: usize,
     bytes: usize,
+    vbytes: u64,
     rolling_min_fee_sat_per_kvb: f64,
     rolling_fee_last_updated: u64,
     block_since_last_rolling_fee_bump: bool,
@@ -428,6 +429,7 @@ impl Mempool {
             policy,
             max_bytes: max_bytes.max(1),
             bytes: 0,
+            vbytes: 0,
             rolling_min_fee_sat_per_kvb: 0.0,
             rolling_fee_last_updated: time::unix_time(),
             block_since_last_rolling_fee_bump: false,
@@ -452,6 +454,11 @@ impl Mempool {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Sum of virtual transaction sizes, matching Core's `getmempoolinfo.bytes`.
+    pub fn vbytes(&self) -> u64 {
+        self.vbytes
     }
 
     pub fn max_bytes(&self) -> usize {
@@ -1431,6 +1438,7 @@ impl Mempool {
             }
         }
         self.bytes += size;
+        self.vbytes = self.vbytes.saturating_add(vsize);
         self.entries.insert(txid, entry);
         self.wtxids.insert(wtxid, txid);
         if record_sequence {
@@ -1740,6 +1748,7 @@ impl Mempool {
         self.children.clear();
         self.wtxids.clear();
         self.bytes = 0;
+        self.vbytes = 0;
         let unbroadcast = std::mem::take(&mut self.unbroadcast);
         for (added_at, transaction) in ordered {
             let txid = transaction.compute_txid();
@@ -1764,6 +1773,7 @@ impl Mempool {
         self.wtxids.remove(&entry.transaction.compute_wtxid());
         let size = bitcoin::consensus::encode::serialize(&entry.transaction).len();
         self.bytes = self.bytes.saturating_sub(size);
+        self.vbytes = self.vbytes.saturating_sub(entry.vsize);
         for input in &entry.transaction.input {
             self.spent.remove(&input.previous_output);
             if let Some(children) = self.children.get_mut(&input.previous_output.txid) {

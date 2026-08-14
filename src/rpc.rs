@@ -1244,7 +1244,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             Ok(json!({
                 "loaded": true,
                 "size": mempool.len(),
-                "bytes": mempool.bytes(),
+                "bytes": mempool.vbytes(),
                 "usage": mempool.bytes(),
                 "maxmempool": mempool.max_bytes(),
                 "mempoolminfee": sat_to_btc(mempool.mempool_min_fee_sat_per_kvb()),
@@ -11492,6 +11492,8 @@ mod tests {
         assert_eq!(entry["height"], json!(node.chain.read().height()));
         assert_eq!(entry["chunkweight"], entry["weight"]);
         assert_eq!(entry["fees"]["chunk"], entry["fees"]["modified"]);
+        let mempool_info = dispatch_method(&node, "getmempoolinfo", &json!([])).unwrap();
+        assert_eq!(mempool_info["bytes"], entry["vsize"]);
 
         let cluster =
             dispatch_method(&node, "getmempoolcluster", &json!([txid.to_string()])).unwrap();

@@ -411,7 +411,8 @@ impl PeerManager {
                 .await;
             }
         });
-        let seed_nodes = if self.node.config.seed_nodes.is_empty() {
+        let configured_seed_nodes = !self.node.config.seed_nodes.is_empty();
+        let seed_nodes = if !configured_seed_nodes {
             let addresses = discover_dns_seeds(self.node.config.network).await;
             for address in &addresses {
                 self.node.remember_address(
@@ -430,33 +431,35 @@ impl PeerManager {
         }
         let discovery_node = self.node.clone();
         let discovery_outbound = outbound.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(30));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                ticker.tick().await;
-                if !discovery_node.network_active() {
-                    continue;
+        if !configured_seed_nodes {
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(30));
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    if !discovery_node.network_active() {
+                        continue;
+                    }
+                    let available = discovery_outbound.slots.available_permits().min(8);
+                    if available == 0 {
+                        continue;
+                    }
+                    for address in select_discovery_addresses(
+                        &discovery_node,
+                        available,
+                        &discovery_outbound.attempts,
+                    ) {
+                        spawn_outbound_loop(
+                            discovery_node.clone(),
+                            address,
+                            discovery_outbound.clone(),
+                            false,
+                            None,
+                        );
+                    }
                 }
-                let available = discovery_outbound.slots.available_permits().min(8);
-                if available == 0 {
-                    continue;
-                }
-                for address in select_discovery_addresses(
-                    &discovery_node,
-                    available,
-                    &discovery_outbound.attempts,
-                ) {
-                    spawn_outbound_loop(
-                        discovery_node.clone(),
-                        address,
-                        discovery_outbound.clone(),
-                        false,
-                        None,
-                    );
-                }
-            }
-        });
+            });
+        }
         let dynamic_node = self.node.clone();
         let dynamic_outbound = outbound.clone();
         tokio::spawn(async move {

@@ -336,6 +336,7 @@ pub struct OrphanTransaction {
 pub struct PeerInfo {
     pub id: usize,
     pub address: std::net::SocketAddr,
+    pub endpoint: NetworkEndpoint,
     pub local_address: Option<std::net::SocketAddr>,
     pub reported_local_address: Option<std::net::SocketAddr>,
     pub inbound: bool,
@@ -1784,9 +1785,9 @@ impl Node {
         inbound: bool,
         commands: tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>,
     ) {
-        self.register_peer_with_permissions(
+        self.register_peer_with_endpoint(
             id,
-            address,
+            NetworkEndpoint::Ip(address),
             inbound,
             commands,
             None,
@@ -1794,19 +1795,21 @@ impl Node {
         );
     }
 
-    pub(crate) fn register_peer_with_permissions(
+    pub(crate) fn register_peer_with_endpoint(
         &self,
         id: usize,
-        address: SocketAddr,
+        endpoint: NetworkEndpoint,
         inbound: bool,
         commands: tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>,
         local_address: Option<SocketAddr>,
         permissions: PeerPermissions,
     ) {
+        let address = endpoint.peer_socket_addr();
         let connected_at = time::unix_time();
         let peer = PeerInfo {
             id,
             address,
+            endpoint: endpoint.clone(),
             local_address,
             reported_local_address: None,
             inbound,
@@ -1849,10 +1852,25 @@ impl Node {
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
-        let mut known = self.known_addresses.write();
-        if self.reserve_known_address(&mut known, address) {
-            known.insert(address, peer);
-            self.tried_addresses.write().insert(address);
+        if let Some(address) = endpoint.legacy_socket_addr() {
+            let mut known = self.known_addresses.write();
+            if self.reserve_known_address(&mut known, address) {
+                known.insert(address, peer);
+                self.tried_addresses.write().insert(address);
+            }
+        } else {
+            let mut known = self.network_addresses.write();
+            if self.reserve_network_address(&mut known, &endpoint) {
+                known.insert(
+                    endpoint.clone(),
+                    KnownNetworkAddress {
+                        endpoint: endpoint.clone(),
+                        services: peer.services,
+                        time: connected_at,
+                    },
+                );
+                self.network_tried_addresses.write().insert(endpoint);
+            }
         }
     }
 
@@ -1871,12 +1889,16 @@ impl Node {
             peer.user_agent = user_agent.to_owned();
             peer.start_height = start_height;
             peer.relay_transactions = relay_transactions;
-            if let Some(known) = self.known_addresses.write().get_mut(&peer.address) {
-                known.version = Some(version);
-                known.services = services;
-                known.user_agent = user_agent.to_owned();
-                known.start_height = start_height;
-                known.relay_transactions = relay_transactions;
+            if let Some(address) = peer.endpoint.legacy_socket_addr() {
+                if let Some(known) = self.known_addresses.write().get_mut(&address) {
+                    known.version = Some(version);
+                    known.services = services;
+                    known.user_agent = user_agent.to_owned();
+                    known.start_height = start_height;
+                    known.relay_transactions = relay_transactions;
+                }
+            } else if let Some(known) = self.network_addresses.write().get_mut(&peer.endpoint) {
+                known.services |= services;
             }
         }
     }
@@ -1884,7 +1906,9 @@ impl Node {
     pub(crate) fn update_peer_relay_transactions(&self, id: usize, relay_transactions: bool) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.relay_transactions = relay_transactions;
-            if let Some(known) = self.known_addresses.write().get_mut(&peer.address) {
+            if let Some(address) = peer.endpoint.legacy_socket_addr()
+                && let Some(known) = self.known_addresses.write().get_mut(&address)
+            {
                 known.relay_transactions = relay_transactions;
             }
         }
@@ -1894,7 +1918,9 @@ impl Node {
         let min_fee_filter = min_fee_filter.max(0);
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.min_fee_filter = min_fee_filter;
-            if let Some(known) = self.known_addresses.write().get_mut(&peer.address) {
+            if let Some(address) = peer.endpoint.legacy_socket_addr()
+                && let Some(known) = self.known_addresses.write().get_mut(&address)
+            {
                 known.min_fee_filter = min_fee_filter;
             }
         }
@@ -2006,18 +2032,20 @@ impl Node {
     }
 
     pub fn unregister_peer(&self, id: usize) {
-        let address = self.peers.write().remove(&id).map(|peer| peer.address);
+        let endpoint = self.peers.write().remove(&id).map(|peer| peer.endpoint);
         self.peer_commands.write().remove(&id);
         self.block_stalling_since.write().remove(&id);
-        if let Some(address) = address
-            && let Some(known) = self.known_addresses.write().get_mut(&address)
-            && known.id == id
-        {
-            known.id = 0;
-            known.inbound = false;
-            known.local_address = None;
-            known.ping_nonce = None;
-            known.ping_sent_at = None;
+        if let Some(endpoint) = endpoint {
+            if let Some(address) = endpoint.legacy_socket_addr()
+                && let Some(known) = self.known_addresses.write().get_mut(&address)
+                && known.id == id
+            {
+                known.id = 0;
+                known.inbound = false;
+                known.local_address = None;
+                known.ping_nonce = None;
+                known.ping_sent_at = None;
+            }
         }
         self.orphans.lock().erase_for_peer(id);
     }
@@ -2150,6 +2178,7 @@ impl Node {
             PeerInfo {
                 id: 0,
                 address,
+                endpoint: NetworkEndpoint::Ip(address),
                 local_address: None,
                 reported_local_address: None,
                 inbound: false,
@@ -2207,6 +2236,7 @@ impl Node {
         let entry = known.entry(address).or_insert_with(|| PeerInfo {
             id: 0,
             address,
+            endpoint: NetworkEndpoint::Ip(address),
             local_address: None,
             reported_local_address: None,
             inbound: false,
@@ -2789,6 +2819,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                     PeerInfo {
                         id: 0,
                         address,
+                        endpoint: NetworkEndpoint::Ip(address),
                         local_address: None,
                         reported_local_address: None,
                         inbound: false,

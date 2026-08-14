@@ -1676,8 +1676,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     };
                     let mut info = json!({
                         "id": peer.id,
-                        "addr": peer.address.to_string(),
-                        "network": peer_network_name(peer.address.ip()),
+                        "addr": peer.endpoint.to_string(),
+                        "network": peer_network_name(&peer.endpoint),
                         "services": format!("{:016x}", peer.services),
                         "servicesnames": peer_services_names(peer.services),
                         "relaytxes": peer.relay_transactions,
@@ -2375,11 +2375,17 @@ fn peer_services_names(services: u64) -> Vec<&'static str> {
     .collect()
 }
 
-fn peer_network_name(ip: IpAddr) -> &'static str {
-    if is_publicly_routable(ip) {
-        if ip.is_ipv4() { "ipv4" } else { "ipv6" }
-    } else {
-        "not_publicly_routable"
+fn peer_network_name(endpoint: &NetworkEndpoint) -> &'static str {
+    match endpoint {
+        NetworkEndpoint::Ip(address) => {
+            let ip = address.ip();
+            if is_publicly_routable(ip) {
+                if ip.is_ipv4() { "ipv4" } else { "ipv6" }
+            } else {
+                "not_publicly_routable"
+            }
+        }
+        _ => endpoint.network_name(),
     }
 }
 
@@ -13973,9 +13979,9 @@ mod tests {
         assert_eq!(raw["tried"].as_object().unwrap().len(), 1);
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        node.register_peer_with_permissions(
+        node.register_peer_with_endpoint(
             7,
-            "127.0.0.1:18444".parse().unwrap(),
+            crate::address::NetworkEndpoint::Ip("127.0.0.1:18444".parse().unwrap()),
             false,
             sender,
             None,

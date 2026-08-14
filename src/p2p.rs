@@ -905,7 +905,7 @@ impl KnownTxInventory {
 }
 
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, Arc<PeerState>>>>;
-type OutboundAttempts = Arc<parking_lot::Mutex<HashSet<SocketAddr>>>;
+type OutboundAttempts = Arc<parking_lot::Mutex<HashSet<NetworkEndpoint>>>;
 
 #[derive(Clone)]
 struct OutboundContext {
@@ -1242,8 +1242,8 @@ impl PeerManager {
             let addresses = discover_dns_seeds(self.node.config.network).await;
             for address in &addresses {
                 if self.node.config.allows_address(*address) {
-                    self.node.remember_address(
-                        *address,
+                    self.node.remember_network_address(
+                        NetworkEndpoint::Ip(*address),
                         wire::NODE_NETWORK | wire::NODE_WITNESS,
                         unix_time_seconds(),
                     );
@@ -1251,17 +1251,25 @@ impl PeerManager {
             }
             Vec::new()
         } else {
-            self.node.config.seed_nodes.clone()
+            self.node
+                .config
+                .seed_nodes
+                .iter()
+                .copied()
+                .map(NetworkEndpoint::Ip)
+                .collect()
         };
-        for address in seed_nodes {
-            if !self.node.config.allows_address(address) {
-                debug!(%address, "skipping peer outside onlynet policy");
+        for endpoint in seed_nodes {
+            if !self.node.config.allows_network_endpoint(&endpoint) {
+                debug!(endpoint = %endpoint, "skipping peer outside onlynet policy");
                 continue;
             }
-            self.node.ensure_node_added(address);
+            if let Some(address) = endpoint.legacy_socket_addr() {
+                self.node.ensure_node_added(address);
+            }
             spawn_outbound_loop(
                 self.node.clone(),
-                address,
+                endpoint,
                 outbound.clone(),
                 true,
                 None,
@@ -1283,14 +1291,14 @@ impl PeerManager {
                     if available == 0 {
                         continue;
                     }
-                    for address in select_discovery_addresses(
+                    for endpoint in select_discovery_endpoints(
                         &discovery_node,
                         available,
                         &discovery_outbound.attempts,
                     ) {
                         spawn_outbound_loop(
                             discovery_node.clone(),
-                            address,
+                            endpoint,
                             discovery_outbound.clone(),
                             false,
                             None,
@@ -1311,10 +1319,10 @@ impl PeerManager {
                         let Some(request) = request else {
                             break;
                         };
-                        let (address, persistent, transport_v2, connection_type) = match request {
-                            PeerManagerRequest::Add(address) => (address, true, None, "outbound-full"),
+                        let (endpoint, persistent, transport_v2, connection_type) = match request {
+                            PeerManagerRequest::Add(address) => (NetworkEndpoint::Ip(address), true, None, "outbound-full"),
                             PeerManagerRequest::OneTry(address, transport_v2, connection_type) => {
-                                (address, false, transport_v2, connection_type)
+                                (NetworkEndpoint::Ip(address), false, transport_v2, connection_type)
                             }
                             PeerManagerRequest::PrivateBroadcast { address, transaction } => {
                                 spawn_private_broadcast_loop(
@@ -1328,7 +1336,7 @@ impl PeerManager {
                         };
                         spawn_outbound_loop(
                             dynamic_node.clone(),
-                            address,
+                            endpoint,
                             dynamic_outbound.clone(),
                             persistent,
                             transport_v2,
@@ -1402,7 +1410,7 @@ async fn run_inbound_listener(
             if let Err(error) = serve_peer(
                 node,
                 stream,
-                address,
+                NetworkEndpoint::Ip(address),
                 PeerConnectionOptions {
                     outbound: false,
                     transport_v2: None,
@@ -1424,7 +1432,7 @@ async fn run_inbound_listener(
 
 fn spawn_outbound_loop(
     node: Arc<Node>,
-    address: std::net::SocketAddr,
+    endpoint: NetworkEndpoint,
     outbound: OutboundContext,
     persistent: bool,
     transport_v2: Option<bool>,
@@ -1432,7 +1440,7 @@ fn spawn_outbound_loop(
 ) {
     {
         let mut attempts = outbound.attempts.lock();
-        if !attempts.insert(address) {
+        if !attempts.insert(endpoint.clone()) {
             return;
         }
     }
@@ -1445,39 +1453,47 @@ fn spawn_outbound_loop(
     } = outbound;
     tokio::spawn(async move {
         struct AttemptGuard {
-            address: SocketAddr,
+            endpoint: NetworkEndpoint,
             attempts: OutboundAttempts,
         }
 
         impl Drop for AttemptGuard {
             fn drop(&mut self) {
-                self.attempts.lock().remove(&self.address);
+                self.attempts.lock().remove(&self.endpoint);
             }
         }
 
         let _attempt = AttemptGuard {
-            address,
+            endpoint: endpoint.clone(),
             attempts: outbound_attempts,
         };
         let Ok(_permit) = slots.acquire_owned().await else {
             return;
         };
-        if !node.config.allows_address(address) {
-            debug!(%address, "skipping outbound peer outside onlynet policy");
+        if !node.config.allows_network_endpoint(&endpoint) {
+            debug!(endpoint = %endpoint, "skipping outbound peer outside onlynet policy");
             return;
         }
         loop {
-            if persistent && !node.is_node_added(address) {
+            if persistent
+                && endpoint
+                    .legacy_socket_addr()
+                    .is_some_and(|address| !node.is_node_added(address))
+            {
                 return;
             }
-            if !node.network_active() || node.is_banned_for_peer(address, false) {
+            if !node.network_active()
+                || endpoint
+                    .socket_addr()
+                    .is_some_and(|address| node.is_banned_for_peer(address, false))
+            {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
             if node
                 .peer_infos()
                 .into_iter()
-                .any(|peer| peer.address == address)
+                .any(|peer| peer.endpoint == endpoint)
             {
                 if !persistent {
                     return;
@@ -1485,13 +1501,13 @@ fn spawn_outbound_loop(
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
-            match connect_peer(address, node.config.proxy).await {
+            match connect_peer_endpoint(&endpoint, node.config.proxy).await {
                 Ok(stream) => {
-                    info!(%address, "connected to configured peer");
+                    info!(endpoint = %endpoint, "connected to configured peer");
                     if let Err(error) = serve_peer(
                         node.clone(),
                         stream,
-                        address,
+                        endpoint.clone(),
                         PeerConnectionOptions {
                             outbound: true,
                             transport_v2,
@@ -1504,7 +1520,7 @@ fn spawn_outbound_loop(
                     )
                     .await
                     {
-                        debug!(%address, %error, "outbound peer ended");
+                        debug!(endpoint = %endpoint, %error, "outbound peer ended");
                     }
                     if !persistent {
                         return;
@@ -1512,10 +1528,10 @@ fn spawn_outbound_loop(
                 }
                 Err(error) => {
                     if !persistent {
-                        debug!(%address, %error, "one-shot peer connection failed");
+                        debug!(endpoint = %endpoint, %error, "one-shot peer connection failed");
                         return;
                     }
-                    warn!(%address, %error, "unable to connect to configured peer");
+                    warn!(endpoint = %endpoint, %error, "unable to connect to configured peer");
                 }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1529,9 +1545,10 @@ fn spawn_private_broadcast_loop(
     outbound: OutboundContext,
     transaction: Transaction,
 ) {
+    let endpoint = NetworkEndpoint::Ip(address);
     {
         let mut attempts = outbound.attempts.lock();
-        if !attempts.insert(address) {
+        if !attempts.insert(endpoint.clone()) {
             return;
         }
     }
@@ -1544,18 +1561,18 @@ fn spawn_private_broadcast_loop(
     } = outbound;
     tokio::spawn(async move {
         struct AttemptGuard {
-            address: SocketAddr,
+            endpoint: NetworkEndpoint,
             attempts: OutboundAttempts,
         }
 
         impl Drop for AttemptGuard {
             fn drop(&mut self) {
-                self.attempts.lock().remove(&self.address);
+                self.attempts.lock().remove(&self.endpoint);
             }
         }
 
         let _attempt = AttemptGuard {
-            address,
+            endpoint: endpoint.clone(),
             attempts: outbound_attempts,
         };
         let Ok(_permit) = slots.acquire_owned().await else {
@@ -1567,13 +1584,13 @@ fn spawn_private_broadcast_loop(
         {
             return;
         }
-        match connect_peer(address, node.config.proxy).await {
+        match connect_peer_endpoint(&endpoint, node.config.proxy).await {
             Ok(stream) => {
                 info!(%address, "connected to private-broadcast peer");
                 if let Err(error) = serve_peer(
                     node.clone(),
                     stream,
-                    address,
+                    endpoint.clone(),
                     PeerConnectionOptions {
                         outbound: true,
                         transport_v2: None,
@@ -1596,64 +1613,84 @@ fn spawn_private_broadcast_loop(
     });
 }
 
-fn select_discovery_addresses(
+fn select_discovery_endpoints(
     node: &Arc<Node>,
     limit: usize,
     outbound_attempts: &OutboundAttempts,
-) -> Vec<SocketAddr> {
+) -> Vec<NetworkEndpoint> {
     if limit == 0 {
         return Vec::new();
     }
     let connected: HashSet<_> = node
         .peer_infos()
         .into_iter()
-        .map(|peer| peer.address)
+        .map(|peer| peer.endpoint)
         .collect();
     let added: HashSet<_> = node.added_nodes().into_iter().collect();
     let attempts = outbound_attempts.lock();
     let mut candidates = node
-        .known_addresses()
+        .known_network_addresses()
         .into_iter()
-        .filter(|peer| {
-            peer.address.port() != 0
-                && !peer.address.ip().is_unspecified()
-                && node.config.allows_address(peer.address)
-                && !connected.contains(&peer.address)
-                && !added.contains(&peer.address)
-                && !attempts.contains(&peer.address)
-                && !node.is_banned_for_peer(peer.address, false)
+        .filter(|entry| {
+            entry.endpoint.port() != 0
+                && (entry.endpoint.socket_addr().is_some() || node.config.proxy.is_some())
+                && node.config.allows_network_endpoint(&entry.endpoint)
+                && !connected.contains(&entry.endpoint)
+                && !entry.endpoint.legacy_socket_addr().is_some_and(|address| {
+                    address.ip().is_unspecified()
+                        || added.contains(&address)
+                        || node.is_banned_for_peer(address, false)
+                })
+                && !attempts.contains(&entry.endpoint)
         })
         .collect::<Vec<_>>();
     drop(attempts);
     candidates.sort_by(|left, right| {
-        node.is_address_tried(right.address)
-            .cmp(&node.is_address_tried(left.address))
-            .then_with(|| right.connected_at.cmp(&left.connected_at))
-            .then_with(|| left.address.cmp(&right.address))
+        node.is_network_address_tried(&right.endpoint)
+            .cmp(&node.is_network_address_tried(&left.endpoint))
+            .then_with(|| right.time.cmp(&left.time))
+            .then_with(|| left.endpoint.cmp(&right.endpoint))
     });
     candidates
         .into_iter()
         .take(limit)
-        .map(|peer| peer.address)
+        .map(|entry| entry.endpoint)
         .collect()
 }
 
-async fn connect_peer(address: SocketAddr, proxy: Option<SocketAddr>) -> Result<TcpStream> {
-    let mut stream = TcpStream::connect(proxy.unwrap_or(address))
-        .await
-        .with_context(|| {
-            proxy.map_or_else(
-                || format!("connecting to {address}"),
-                |proxy| format!("connecting to {address} through proxy {proxy}"),
-            )
-        })?;
+#[cfg(test)]
+fn select_discovery_addresses(
+    node: &Arc<Node>,
+    limit: usize,
+    outbound_attempts: &OutboundAttempts,
+) -> Vec<SocketAddr> {
+    select_discovery_endpoints(node, limit, outbound_attempts)
+        .into_iter()
+        .filter_map(|endpoint| endpoint.legacy_socket_addr())
+        .collect()
+}
+
+async fn connect_peer_endpoint(
+    endpoint: &NetworkEndpoint,
+    proxy: Option<SocketAddr>,
+) -> Result<TcpStream> {
+    let target = proxy
+        .or_else(|| endpoint.socket_addr())
+        .ok_or_else(|| anyhow::anyhow!("endpoint {endpoint} requires a SOCKS5 proxy"))?;
+    let mut stream = TcpStream::connect(target).await.with_context(|| {
+        proxy.map_or_else(
+            || format!("connecting to {endpoint}"),
+            |proxy| format!("connecting to {endpoint} through proxy {proxy}"),
+        )
+    })?;
     stream.set_nodelay(true)?;
     if proxy.is_some() {
-        socks5_connect(&mut stream, address).await?;
+        socks5_connect_endpoint(&mut stream, endpoint).await?;
     }
     Ok(stream)
 }
 
+#[cfg(test)]
 async fn socks5_connect(stream: &mut TcpStream, address: SocketAddr) -> Result<()> {
     socks5_connect_endpoint(stream, &NetworkEndpoint::Ip(address)).await
 }
@@ -1777,7 +1814,7 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
 
 async fn establish_transport(
     stream: TcpStream,
-    address: SocketAddr,
+    endpoint: &NetworkEndpoint,
     outbound: bool,
     network: Network,
     transport_v2: Option<bool>,
@@ -1800,10 +1837,10 @@ async fn establish_transport(
                 return Ok((reader, writer, local_address, session_id));
             }
             Err(error) => {
-                debug!(%address, %error, "BIP324 handshake failed; retrying with v1");
-                let fallback = connect_peer(address, proxy)
+                debug!(%endpoint, %error, "BIP324 handshake failed; retrying with v1");
+                let fallback = connect_peer_endpoint(endpoint, proxy)
                     .await
-                    .with_context(|| format!("reconnecting to {address} with v1 transport"))?;
+                    .with_context(|| format!("reconnecting to {endpoint} with v1 transport"))?;
                 return establish_v1(fallback);
             }
         }
@@ -1937,7 +1974,7 @@ struct PeerConnectionOptions {
 async fn serve_peer(
     node: Arc<Node>,
     stream: TcpStream,
-    address: std::net::SocketAddr,
+    endpoint: NetworkEndpoint,
     options: PeerConnectionOptions,
     peers: PeerRegistry,
     peer_id: usize,
@@ -1946,7 +1983,7 @@ async fn serve_peer(
     stream.set_nodelay(true)?;
     let (mut reader, writer_half, local_address, session_id) = establish_transport(
         stream,
-        address,
+        &endpoint,
         options.outbound,
         node.config.network,
         options.transport_v2,
@@ -1955,12 +1992,16 @@ async fn serve_peer(
     .await?;
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
     let (commands, command_receiver) = mpsc::unbounded_channel();
-    let permissions = options
-        .permissions
-        .unwrap_or_else(|| node.permissions_for_peer(address, !options.outbound));
-    node.register_peer_with_permissions(
+    let permissions = options.permissions.unwrap_or_else(|| {
+        endpoint
+            .socket_addr()
+            .map_or(PeerPermissions::empty(), |address| {
+                node.permissions_for_peer(address, !options.outbound)
+            })
+    });
+    node.register_peer_with_endpoint(
         peer_id,
-        address,
+        endpoint,
         !options.outbound,
         commands,
         local_address,
@@ -4677,7 +4718,7 @@ mod tests {
         let source_task = tokio::spawn(serve_peer(
             source.clone(),
             client,
-            target_address,
+            NetworkEndpoint::Ip(target_address),
             PeerConnectionOptions {
                 outbound: true,
                 transport_v2: Some(false),
@@ -4691,7 +4732,7 @@ mod tests {
         let target_task = tokio::spawn(serve_peer(
             target.clone(),
             server,
-            target_peer_address,
+            NetworkEndpoint::Ip(target_peer_address),
             PeerConnectionOptions {
                 outbound: false,
                 transport_v2: Some(false),
@@ -4847,8 +4888,7 @@ mod tests {
                 .unwrap();
         });
 
-        let mut stream = TcpStream::connect(proxy_address).await.unwrap();
-        socks5_connect_endpoint(&mut stream, &endpoint)
+        let _stream = connect_peer_endpoint(&endpoint, Some(proxy_address))
             .await
             .unwrap();
         server.await.unwrap();
@@ -5950,12 +5990,75 @@ mod tests {
         assert!(node.add_node(added));
         let (sender, _receiver) = mpsc::unbounded_channel();
         node.register_peer(7, connected, false, sender);
-        let attempts = Arc::new(parking_lot::Mutex::new(HashSet::from([in_flight])));
+        let attempts = Arc::new(parking_lot::Mutex::new(HashSet::from([
+            NetworkEndpoint::Ip(in_flight),
+        ])));
 
         assert_eq!(
             select_discovery_addresses(&node, 4, &attempts),
             vec![eligible]
         );
+    }
+
+    #[test]
+    fn typed_discovery_candidates_preserve_non_ip_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(crate::config::Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: false,
+            onlynet: Vec::new(),
+            proxy: Some("127.0.0.1:9050".parse().unwrap()),
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
+            blocksonly: false,
+            private_broadcast: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: false,
+            peer_block_filters: false,
+            persist_mempool: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 4,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let onion = NetworkEndpoint::OnionV3 {
+            address: [8; 32],
+            port: 18444,
+        };
+        let i2p = NetworkEndpoint::I2p {
+            address: [9; 32],
+            port: 18445,
+        };
+        assert!(node.remember_network_address(onion.clone(), 1, 10));
+        assert!(node.remember_network_address(i2p.clone(), 1, 11));
+        let attempts = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        let selected = select_discovery_endpoints(&node, 4, &attempts);
+        assert!(selected.contains(&onion));
+        assert!(selected.contains(&i2p));
     }
 
     #[tokio::test]

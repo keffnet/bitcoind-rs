@@ -102,6 +102,13 @@ impl NetworkEndpoint {
         }
     }
 
+    /// Socket-shaped identity used by the legacy peer facade when a remote
+    /// endpoint is represented by a hostname rather than an IP literal.
+    pub fn peer_socket_addr(&self) -> SocketAddr {
+        self.socket_addr()
+            .unwrap_or_else(|| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), self.port()))
+    }
+
     /// Return a socket address only when the endpoint is valid for legacy
     /// `addr` messages, which have no network discriminator.
     pub fn legacy_socket_addr(&self) -> Option<SocketAddr> {

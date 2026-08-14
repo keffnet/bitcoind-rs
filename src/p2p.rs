@@ -53,6 +53,8 @@ struct PeerState {
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     fee_filter: parking_lot::Mutex<i64>,
     relay_transactions: parking_lot::Mutex<bool>,
+    compact_block_version: parking_lot::Mutex<Option<u64>>,
+    compact_block_announce: parking_lot::Mutex<bool>,
 }
 
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, Arc<PeerState>>>>;
@@ -538,6 +540,8 @@ async fn serve_peer(
         bloom_filter: parking_lot::Mutex::new(None),
         fee_filter: parking_lot::Mutex::new(0),
         relay_transactions: parking_lot::Mutex::new(true),
+        compact_block_version: parking_lot::Mutex::new(None),
+        compact_block_announce: parking_lot::Mutex::new(false),
     });
     peers.lock().insert(peer_id, peer_state.clone());
     let result = serve_peer_loop(
@@ -802,6 +806,7 @@ async fn serve_peer_loop(
                             InventoryType::Block | InventoryType::WitnessBlock => {
                                 !chain.store.contains(&item.hash)
                             }
+                            InventoryType::CompactBlock => !chain.store.contains(&item.hash),
                             InventoryType::Transaction | InventoryType::WitnessTransaction => {
                                 if item.kind == InventoryType::WitnessTransaction {
                                     mempool
@@ -849,6 +854,27 @@ async fn serve_peer_loop(
                             } else {
                                 missing.push(item);
                             }
+                        }
+                        InventoryType::CompactBlock => {
+                            let block = node.chain.write().block(&item.hash)?;
+                            let Some(block) = block else {
+                                missing.push(item);
+                                continue;
+                            };
+                            let compact = HeaderAndShortIds::from_block(
+                                &block,
+                                random(),
+                                compact_block_version as u32,
+                                &[],
+                            )?;
+                            send_message(
+                                node,
+                                peer_id,
+                                writer,
+                                node.config.network,
+                                &Message::CompactBlock(compact),
+                            )
+                            .await?;
                         }
                         InventoryType::FilteredBlock => {
                             let block = node.chain.write().block(&item.hash)?;
@@ -1242,12 +1268,11 @@ async fn serve_peer_loop(
                 *fee_filter.lock() = rate;
                 node.update_peer_fee_filter(peer_id, rate);
             }
-            Message::SendCmpct {
-                announce: _,
-                version,
-            } => {
+            Message::SendCmpct { announce, version } => {
                 if version == 1 || version == 2 {
                     compact_block_version = version;
+                    *peer_state.compact_block_version.lock() = Some(version);
+                    *peer_state.compact_block_announce.lock() = announce;
                 }
             }
             Message::GetAddr => {
@@ -1694,6 +1719,23 @@ async fn broadcast_inventory(
     for (peer_id, state) in recipients {
         if matches!(
             item.kind,
+            InventoryType::Block | InventoryType::WitnessBlock | InventoryType::CompactBlock
+        ) {
+            let compact_version = *state.compact_block_version.lock();
+            let announce_compact = *state.compact_block_announce.lock();
+            if announce_compact
+                && let Some(version) = compact_version
+                && let Some(compact) = compact_block_for_inventory(node, &item, version)
+                    .ok()
+                    .flatten()
+            {
+                let message = Message::CompactBlock(compact);
+                let _ = send_message(node, peer_id, &state.writer, network, &message).await;
+                continue;
+            }
+        }
+        if matches!(
+            item.kind,
             InventoryType::Transaction | InventoryType::WitnessTransaction
         ) {
             if !*state.relay_transactions.lock() {
@@ -1717,6 +1759,25 @@ async fn broadcast_inventory(
         let message = Message::Inv(vec![item.clone()]);
         let _ = send_message(node, peer_id, &state.writer, network, &message).await;
     }
+}
+
+fn compact_block_for_inventory(
+    node: &Arc<Node>,
+    item: &Inventory,
+    version: u64,
+) -> Result<Option<HeaderAndShortIds>> {
+    if !matches!(
+        item.kind,
+        InventoryType::Block | InventoryType::WitnessBlock | InventoryType::CompactBlock
+    ) {
+        return Ok(None);
+    }
+    let block = node.chain.write().block(&item.hash)?;
+    block
+        .map(|block| {
+            HeaderAndShortIds::from_block(&block, random(), version as u32, &[]).map_err(Into::into)
+        })
+        .transpose()
 }
 
 fn transaction_fee_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<(u64, u64)> {
@@ -1814,6 +1875,50 @@ mod tests {
     fn fee_filter_rates_are_measured_in_sat_per_kilobyte() {
         assert_eq!(fee_rate_sat_per_kvb(1_000, 250), 4_000);
         assert_eq!(fee_rate_sat_per_kvb(1, 0), i64::MAX);
+    }
+
+    #[test]
+    fn compact_block_announcements_prefill_the_coinbase() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+        })
+        .unwrap();
+        let hash = node.chain.read().best_hash();
+        let compact = compact_block_for_inventory(
+            &node,
+            &Inventory {
+                kind: InventoryType::WitnessBlock,
+                hash,
+            },
+            2,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(compact.header.block_hash(), hash);
+        assert_eq!(compact.prefilled_txs.len(), 1);
+        assert_eq!(compact.prefilled_txs[0].idx, 0);
+        assert!(
+            compact_block_for_inventory(
+                &node,
+                &Inventory {
+                    kind: InventoryType::WitnessTransaction,
+                    hash,
+                },
+                2,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]

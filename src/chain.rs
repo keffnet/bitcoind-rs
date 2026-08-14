@@ -1551,6 +1551,12 @@ impl ChainState {
         let mut spent_entries = Vec::new();
         let mut created = HashMap::new();
         let mut total_fees = 0u64;
+        let sigop_flags =
+            validation::script_flags_for_block(self.network, height, block.header.time);
+        let mut sigop_cost = validation::transaction_sigop_cost(&block.txdata[0], &[], sigop_flags);
+        if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
+            return Err(ValidationError::TooManySigops.into());
+        }
         for transaction in block.txdata.iter().skip(1) {
             let txid = transaction.compute_txid();
             let mut input_total = 0u64;
@@ -1577,6 +1583,14 @@ impl ChainState {
                 previous_outputs.push(entry.output.clone());
                 previous_entries.push(entry.clone());
                 spent_entries.push((outpoint, entry));
+            }
+            sigop_cost = sigop_cost.saturating_add(validation::transaction_sigop_cost(
+                transaction,
+                &previous_outputs,
+                sigop_flags,
+            ));
+            if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
+                return Err(ValidationError::TooManySigops.into());
             }
             validation::validate_transaction_finality(
                 transaction,

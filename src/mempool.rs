@@ -18,6 +18,8 @@ const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
 const MIN_RELAY_SAT_PER_VBYTE: u64 = 1;
 const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
+const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
+const MAX_TX_LEGACY_SIGOPS: usize = 2_500;
 const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
 const MAX_DATACARRIER_BYTES: usize = 100_000;
@@ -188,6 +190,10 @@ impl Mempool {
 
     pub fn fee_delta(&self, txid: &Txid) -> i64 {
         self.priorities.get(txid).copied().unwrap_or(0)
+    }
+
+    fn modified_fee_sat(&self, txid: &Txid, base_fee_sat: u64) -> i128 {
+        i128::from(base_fee_sat) + i128::from(self.fee_delta(txid))
     }
 
     pub fn transaction_order(&self) -> Vec<Txid> {
@@ -473,7 +479,7 @@ impl Mempool {
         let added_at = time::unix_time();
         let mut candidate = self.clone();
         let mut accepted = Vec::with_capacity(transactions.len());
-        let mut package_fee = 0u64;
+        let mut package_fee = 0i128;
         let mut package_vsize = 0u64;
         let allow_low_fee_parent = package_is_child_with_parents_tree(transactions);
         let mut new_count = 0usize;
@@ -493,7 +499,8 @@ impl Mempool {
                 !allow_low_fee_parent,
             )?;
             let entry = candidate.get(&txid).ok_or(MempoolError::BadOutput)?;
-            package_fee = package_fee.saturating_add(entry.fee_sat);
+            package_fee =
+                package_fee.saturating_add(candidate.modified_fee_sat(&txid, entry.fee_sat));
             package_vsize = package_vsize.saturating_add(entry.vsize);
             accepted.push(txid);
             new_count += 1;
@@ -504,11 +511,15 @@ impl Mempool {
                 .ok_or(MempoolError::Empty)?
                 .compute_txid();
             let child = candidate.get(&child_txid).ok_or(MempoolError::BadOutput)?;
-            if child.fee_sat < child.vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
+            if candidate.modified_fee_sat(&child_txid, child.fee_sat)
+                < i128::from(child.vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE))
+            {
                 return Err(MempoolError::FeeRate);
             }
         }
-        if new_count > 0 && package_fee < package_vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
+        if new_count > 0
+            && package_fee < i128::from(package_vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE))
+        {
             return Err(MempoolError::FeeRate);
         }
         validate_ephemeral_spends(transactions, &candidate)?;
@@ -560,9 +571,8 @@ impl Mempool {
         let conflict_fees = removal
             .iter()
             .filter_map(|txid| self.entries.get(txid))
-            .map(|entry| entry.fee_sat)
-            .try_fold(0u64, u64::checked_add)
-            .ok_or(MempoolError::BadOutput)?;
+            .map(|entry| self.modified_fee_sat(&entry.transaction.compute_txid(), entry.fee_sat))
+            .fold(0i128, i128::saturating_add);
         let mut candidate = self.clone();
         for txid in &removal {
             candidate.remove(txid);
@@ -570,17 +580,15 @@ impl Mempool {
         let txid = candidate.accept_at(transaction, chain, added_at)?;
         let replacement_fee = candidate
             .get(&txid)
-            .map(|entry| entry.fee_sat)
+            .map(|entry| candidate.modified_fee_sat(&txid, entry.fee_sat))
             .ok_or(MempoolError::BadOutput)?;
-        let required_fee = conflict_fees
-            .checked_add(
-                candidate
-                    .get(&txid)
-                    .map(|entry| entry.vsize)
-                    .unwrap_or_default()
-                    .saturating_mul(MIN_RELAY_SAT_PER_VBYTE),
-            )
-            .ok_or(MempoolError::BadOutput)?;
+        let required_fee = conflict_fees.saturating_add(i128::from(
+            candidate
+                .get(&txid)
+                .map(|entry| entry.vsize)
+                .unwrap_or_default()
+                .saturating_mul(MIN_RELAY_SAT_PER_VBYTE),
+        ));
         if replacement_fee < required_fee {
             return Err(MempoolError::ReplacementFee);
         }
@@ -594,10 +602,9 @@ impl Mempool {
                 .filter(|conflict| !direct_conflicts.contains(conflict))
             {
                 let sibling_entry = self.get(sibling).ok_or(MempoolError::BadOutput)?;
-                let replacement_fee_rate =
-                    i128::from(replacement_fee) * i128::from(sibling_entry.vsize);
-                let sibling_fee_rate =
-                    i128::from(sibling_entry.fee_sat) * i128::from(replacement_vsize);
+                let replacement_fee_rate = replacement_fee * i128::from(sibling_entry.vsize);
+                let sibling_fee_rate = self.modified_fee_sat(sibling, sibling_entry.fee_sat)
+                    * i128::from(replacement_vsize);
                 if replacement_fee_rate <= sibling_fee_rate {
                     return Err(MempoolError::ReplacementFee);
                 }
@@ -785,10 +792,21 @@ impl Mempool {
         if transaction.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
             return Err(MempoolError::NonStandard("tx-size-small".to_owned()));
         }
+        let modified_fee_sat = i64::try_from(fee_sat)
+            .unwrap_or(i64::MAX)
+            .saturating_add(self.fee_delta(&txid));
         if chain.network != Network::Regtest {
-            validate_standard_policy(&transaction, &previous_outputs, fee_sat)?;
+            validate_standard_policy_with_modified_fee(
+                &transaction,
+                &previous_outputs,
+                fee_sat,
+                modified_fee_sat,
+            )?;
         }
-        if enforce_fee_rate && fee_sat < vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
+        if enforce_fee_rate
+            && i128::from(modified_fee_sat)
+                < i128::from(vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE))
+        {
             return Err(MempoolError::FeeRate);
         }
         if enforce_mempool_policy {
@@ -1139,10 +1157,25 @@ impl Mempool {
     }
 }
 
+#[cfg(test)]
 fn validate_standard_policy(
     transaction: &Transaction,
     previous_outputs: &[TxOut],
     fee_sat: u64,
+) -> Result<(), MempoolError> {
+    validate_standard_policy_with_modified_fee(
+        transaction,
+        previous_outputs,
+        fee_sat,
+        i64::try_from(fee_sat).unwrap_or(i64::MAX),
+    )
+}
+
+fn validate_standard_policy_with_modified_fee(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+    base_fee_sat: u64,
+    modified_fee_sat: i64,
 ) -> Result<(), MempoolError> {
     if !(1..=3).contains(&transaction.version.0) {
         return Err(MempoolError::NonStandard("version".to_owned()));
@@ -1182,11 +1215,38 @@ fn validate_standard_policy(
             dust_outputs = dust_outputs.saturating_add(1);
         }
     }
-    if dust_outputs > 1 || (fee_sat != 0 && dust_outputs != 0) {
+    if dust_outputs > 1 || ((base_fee_sat != 0 || modified_fee_sat != 0) && dust_outputs != 0) {
         return Err(MempoolError::NonStandard("dust".to_owned()));
     }
 
     validate_standard_inputs(transaction, previous_outputs)?;
+    let mut legacy_sigops = 0usize;
+    for (input, previous) in transaction.input.iter().zip(previous_outputs) {
+        legacy_sigops = legacy_sigops
+            .saturating_add(input.script_sig.count_sigops())
+            .saturating_add(if previous.script_pubkey.is_p2sh() {
+                last_push_data(&input.script_sig)
+                    .map(|redeem| Script::from_bytes(redeem).count_sigops())
+                    .unwrap_or_default()
+            } else {
+                previous.script_pubkey.count_sigops()
+            });
+        if legacy_sigops > MAX_TX_LEGACY_SIGOPS {
+            return Err(MempoolError::NonStandard(
+                "bad-txns-nonstandard-inputs".to_owned(),
+            ));
+        }
+    }
+    let sigop_cost = validation::transaction_sigop_cost(
+        transaction,
+        previous_outputs,
+        bitcoinconsensus::VERIFY_P2SH | bitcoinconsensus::VERIFY_WITNESS,
+    );
+    if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST {
+        return Err(MempoolError::NonStandard(
+            "bad-txns-too-many-sigops".to_owned(),
+        ));
+    }
     validate_standard_witnesses(transaction, previous_outputs)
 }
 
@@ -1962,6 +2022,86 @@ mod tests {
 
         nonstandard.output[0].value = Amount::from_sat(1);
         assert!(is_dust_output(&nonstandard.output[0]));
+    }
+
+    #[test]
+    fn standard_policy_limits_legacy_input_sigops() {
+        let mut p2sh_script = vec![0xa9, 0x14];
+        p2sh_script.extend([0u8; 20]);
+        p2sh_script.push(0x87);
+        let previous_outputs = (0..167)
+            .map(|_| TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(p2sh_script.clone()),
+            })
+            .collect::<Vec<_>>();
+        let mut redeem_script = vec![0x0f];
+        redeem_script.extend([0xac; 15]);
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: (0..167)
+                .map(|index| TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([index as u8; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(redeem_script.clone()),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes({
+                    let mut bytes = vec![0x00, 0x14];
+                    bytes.extend([0u8; 20]);
+                    bytes
+                }),
+            }],
+        };
+        assert!(matches!(
+            validate_standard_policy(&transaction, &previous_outputs, 1),
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-txns-nonstandard-inputs"
+        ));
+    }
+
+    #[test]
+    fn standard_policy_limits_total_sigop_cost() {
+        let p2pkh = || {
+            let mut bytes = vec![0x76, 0xa9, 0x14];
+            bytes.extend([0u8; 20]);
+            bytes.extend([0x88, 0xac]);
+            ScriptBuf::from_bytes(bytes)
+        };
+        let witness_script = vec![0xac; 3_600];
+        let previous_outputs = (0..5)
+            .map(|_| TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes({
+                    let mut bytes = vec![0x00, 0x20];
+                    bytes.extend([0u8; 32]);
+                    bytes
+                }),
+            })
+            .collect::<Vec<_>>();
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: (0..5)
+                .map(|index| TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([index as u8; 32]), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::from_slice(&[witness_script.as_slice()]),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: p2pkh(),
+            }],
+        };
+        assert!(matches!(
+            validate_standard_policy(&transaction, &previous_outputs, 1),
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-txns-too-many-sigops"
+        ));
     }
 
     #[test]

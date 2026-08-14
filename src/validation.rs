@@ -69,6 +69,8 @@ pub enum ValidationError {
     BadSignetSolution,
     #[error("block weight exceeds the consensus limit")]
     OversizedBlock,
+    #[error("block sigop cost exceeds the consensus limit")]
+    TooManySigops,
     #[error("coinbase transaction is missing or malformed")]
     BadCoinbase,
     #[error("non-coinbase transaction appears in the coinbase position")]
@@ -390,6 +392,7 @@ pub fn validate_block_structure_with_signet(
         .ok_or(ValidationError::OutputTotalOverflow)?;
     let mut txids = HashSet::with_capacity(block.txdata.len());
     let mut total_output_sat = 0u64;
+    let mut legacy_sigop_cost = 0usize;
     for (position, tx) in block.txdata.iter().enumerate() {
         let txid = tx.compute_txid();
         if !txids.insert(txid) {
@@ -426,6 +429,10 @@ pub fn validate_block_structure_with_signet(
         total_output_sat = total_output_sat
             .checked_add(tx_total)
             .ok_or(ValidationError::OutputTotalOverflow)?;
+        legacy_sigop_cost = legacy_sigop_cost.saturating_add(legacy_sigop_cost_for_transaction(tx));
+        if legacy_sigop_cost > MAX_BLOCK_SIGOP_COST {
+            return Err(ValidationError::TooManySigops);
+        }
     }
     if coinbase_total > expected_coinbase_value {
         return Err(ValidationError::CoinbaseOverpay {
@@ -723,13 +730,89 @@ pub fn validate_transaction_scripts_at_time(
     Ok(())
 }
 
+pub(crate) const MAX_BLOCK_SIGOP_COST: usize = 80_000;
+
+fn legacy_sigop_cost_for_transaction(transaction: &Transaction) -> usize {
+    transaction
+        .input
+        .iter()
+        .map(|input| input.script_sig.count_sigops_legacy())
+        .chain(
+            transaction
+                .output
+                .iter()
+                .map(|output| output.script_pubkey.count_sigops_legacy()),
+        )
+        .sum::<usize>()
+        .saturating_mul(4)
+}
+
+/// Count the contextual sigop cost used by ConnectBlock. Taproot spends do
+/// not contribute to the legacy block-wide sigop budget; P2SH and witness
+/// spends do when their respective consensus deployments are active.
+pub(crate) fn transaction_sigop_cost(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+    flags: u32,
+) -> usize {
+    let mut cost = legacy_sigop_cost_for_transaction(transaction);
+    if transaction.is_coinbase() || previous_outputs.len() != transaction.input.len() {
+        return cost;
+    }
+
+    if flags & bitcoinconsensus::VERIFY_P2SH != 0 {
+        for (input, previous_output) in transaction.input.iter().zip(previous_outputs) {
+            if previous_output.script_pubkey.is_p2sh()
+                && let Some(redeem_script) = last_push_bytes(&input.script_sig)
+            {
+                cost = cost.saturating_add(
+                    ScriptBuf::from_bytes(redeem_script)
+                        .count_sigops()
+                        .saturating_mul(4),
+                );
+            }
+        }
+    }
+
+    if flags & bitcoinconsensus::VERIFY_WITNESS != 0 {
+        for (input, previous_output) in transaction.input.iter().zip(previous_outputs) {
+            let witness_program = if previous_output.script_pubkey.is_witness_program() {
+                Some(previous_output.script_pubkey.clone())
+            } else if previous_output.script_pubkey.is_p2sh() && input.script_sig.is_push_only() {
+                last_push_bytes(&input.script_sig).map(ScriptBuf::from_bytes)
+            } else {
+                None
+            };
+            let Some(witness_program) = witness_program else {
+                continue;
+            };
+            if witness_program.is_p2wpkh() {
+                cost = cost.saturating_add(1);
+            } else if witness_program.is_p2wsh()
+                && let Some(witness_script) = input.witness.last()
+            {
+                cost = cost
+                    .saturating_add(ScriptBuf::from_bytes(witness_script.to_vec()).count_sigops());
+            }
+        }
+    }
+    cost
+}
+
+fn last_push_bytes(script: &ScriptBuf) -> Option<Vec<u8>> {
+    match script.instructions().last()? {
+        Ok(Instruction::PushBytes(bytes)) => Some(bytes.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bitcoin::Block;
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version as BlockVersion};
-    use bitcoin::blockdata::script::ScriptBuf;
+    use bitcoin::blockdata::script::{Builder, ScriptBuf};
     use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
     use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
@@ -767,6 +850,58 @@ mod tests {
             }],
         };
         validate_transaction_scripts(Network::Regtest, 1, &transaction, &[previous]).unwrap();
+    }
+
+    #[test]
+    fn rejects_blocks_over_the_sigop_cost_limit() {
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Builder::new().push_int(1).push_int(0).into_script(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut sigop_script = ScriptBuf::new();
+        for _ in 0..20_001 {
+            sigop_script.push_opcode(bitcoin::opcodes::all::OP_CHECKSIG);
+        }
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: sigop_script,
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, transaction],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(matches!(
+            validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
+            Err(ValidationError::TooManySigops)
+        ));
     }
 
     #[test]

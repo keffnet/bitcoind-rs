@@ -8106,7 +8106,9 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
 }
 
 fn package_policy_error(transactions: &[Transaction]) -> Option<&'static str> {
-    if transactions.len() > MAX_PACKAGE_COUNT || package_weight(transactions) > MAX_PACKAGE_WEIGHT {
+    if transactions.len() > MAX_PACKAGE_COUNT
+        || (transactions.len() > 1 && package_weight(transactions) > MAX_PACKAGE_WEIGHT)
+    {
         return Some("package-too-large");
     }
     let mut txids = HashSet::with_capacity(transactions.len());
@@ -12612,6 +12614,26 @@ mod tests {
             .position(|entry| entry["txid"] == child.compute_txid().to_string())
             .expect("package child is in the template");
         assert!(parent_position < child_position);
+    }
+
+    #[test]
+    fn single_oversized_transaction_is_not_rejected_as_a_package() {
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(vec![0u8; 405_000]),
+            }],
+        };
+        assert!(package_weight(std::slice::from_ref(&transaction)) > MAX_PACKAGE_WEIGHT);
+        assert_eq!(package_policy_error(&[transaction]), None);
     }
 
     #[test]

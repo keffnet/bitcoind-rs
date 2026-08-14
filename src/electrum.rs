@@ -51,6 +51,7 @@ const PROTOCOL_1_7: ProtocolVersion = ProtocolVersion {
 struct ElectrumSession {
     protocol_version: ProtocolVersion,
     version_negotiated: bool,
+    request_seen: bool,
 }
 
 impl Default for ElectrumSession {
@@ -58,6 +59,7 @@ impl Default for ElectrumSession {
         Self {
             protocol_version: MIN_PROTOCOL_VERSION,
             version_negotiated: false,
+            request_seen: false,
         }
     }
 }
@@ -150,6 +152,10 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                 let method = request.get("method").and_then(Value::as_str).unwrap_or("");
                 let params = request.get("params").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
                 let is_notification = request.get("id").is_none();
+                if !session.request_seen && method != "server.version" {
+                    bail!("server.version must be the first Electrum request");
+                }
+                session.request_seen = true;
                 let result = dispatch_with_session(
                     &node,
                     method,

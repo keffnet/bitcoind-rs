@@ -212,6 +212,7 @@ const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
 const MAX_GETDATA_BATCH: usize = 1_000;
+const MAX_BLOCKS_TO_ANNOUNCE: usize = 8;
 const INVENTORY_BROADCAST_TARGET: usize = 70;
 const INVENTORY_BROADCAST_MAX: usize = 1_000;
 
@@ -568,19 +569,33 @@ impl PeerManager {
         let block_relay_peers = peers.clone();
         let block_relay_network = self.node.config.network;
         tokio::spawn(async move {
+            let mut last_announced_tip = block_relay_node.chain.read().best_hash();
             loop {
                 let tip = match chain_events.recv().await {
                     Ok(tip) => tip,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                let block = block_relay_node
-                    .chain
-                    .write()
-                    .block(&tip.hash)
-                    .ok()
-                    .flatten();
-                if block.is_some() {
+                let hashes = {
+                    let mut chain = block_relay_node.chain.write();
+                    let hashes = chain
+                        .active_blocks_after(last_announced_tip)
+                        .map(|blocks| {
+                            blocks
+                                .into_iter()
+                                .take(MAX_BLOCKS_TO_ANNOUNCE)
+                                .map(|block| block.block_hash())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|_| vec![tip.hash]);
+                    last_announced_tip = tip.hash;
+                    hashes
+                };
+                for hash in hashes {
+                    let available = block_relay_node.chain.read().store.contains(&hash);
+                    if !available {
+                        continue;
+                    }
                     broadcast_inventory(
                         &block_relay_node,
                         &block_relay_peers,
@@ -588,7 +603,7 @@ impl PeerManager {
                         block_relay_network,
                         Inventory {
                             kind: InventoryType::WitnessBlock,
-                            hash: tip.hash,
+                            hash,
                         },
                     )
                     .await;

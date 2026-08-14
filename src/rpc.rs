@@ -943,7 +943,8 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
         if name == "args" {
             continue;
         }
-        let Some(index) = names.iter().position(|candidate| candidate == name) else {
+        let lookup_name = rpc_parameter_alias(method, name).unwrap_or(name);
+        let Some(index) = names.iter().position(|candidate| *candidate == lookup_name) else {
             bail!("unknown named parameter {name} for {method}")
         };
         if specified[index] {
@@ -953,6 +954,13 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
         specified[index] = true;
     }
     Ok(Value::Array(values))
+}
+
+fn rpc_parameter_alias(method: &str, name: &str) -> Option<&'static str> {
+    match (method, name) {
+        ("getblock" | "getrawtransaction", "verbose") => Some("verbosity"),
+        _ => None,
+    }
 }
 
 fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
@@ -1018,13 +1026,13 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "verifychain" => Some(&["checklevel", "nblocks"]),
         "getmemoryinfo" => Some(&["mode"]),
         "gettxout" => Some(&["txid", "n", "include_mempool"]),
-        "gettxspendingprevout" => Some(&["outputs"]),
+        "gettxspendingprevout" => Some(&["outputs", "options"]),
         "getrawmempool" => Some(&["verbose", "mempool_sequence"]),
         "getmempoolentry" | "getmempoolancestors" | "getmempooldescendants" => {
             Some(&["txid", "verbose"])
         }
         "getmempoolcluster" => Some(&["txid"]),
-        "importmempool" => Some(&["filename"]),
+        "importmempool" => Some(&["filepath"]),
         "gettxoutsetinfo" => Some(&["hash_type", "hash_or_height", "use_index"]),
         "dumptxoutset" => Some(&["path", "type"]),
         "loadtxoutset" => Some(&["path"]),
@@ -1050,7 +1058,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "disconnectnode" => Some(&["address", "nodeid"]),
         "getaddednodeinfo" => Some(&["node"]),
         "setban" => Some(&["command", "subnet", "bantime", "absolute"]),
-        "setnetworkactive" => Some(&["active"]),
+        "setnetworkactive" => Some(&["state"]),
         "estimatesmartfee" => Some(&["conf_target", "estimate_mode"]),
         "estimaterawfee" => Some(&["conf_target", "threshold"]),
         "logging" => Some(&["include", "exclude"]),
@@ -9952,6 +9960,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(normalized, json!(["00", false]));
+        let normalized = normalize_rpc_params("getblock", &json!({"verbose": false})).unwrap();
+        assert_eq!(normalized, json!([null, false]));
+        let normalized = normalize_rpc_params(
+            "gettxspendingprevout",
+            &json!({"outputs": [], "options": {"return_spending_tx": true}}),
+        )
+        .unwrap();
+        assert_eq!(normalized, json!([[], {"return_spending_tx": true}]));
+        let normalized =
+            normalize_rpc_params("setnetworkactive", &json!({"state": false})).unwrap();
+        assert_eq!(normalized, json!([false]));
 
         let normalized = normalize_rpc_params("gettxout", &json!({"txid": "00", "n": 1})).unwrap();
         assert_eq!(normalized, json!(["00", 1, null]));

@@ -1274,7 +1274,9 @@ impl Mempool {
         chain: &ChainState,
         added_at: u64,
     ) -> Result<Txid, MempoolError> {
-        self.accept_at_with_options(transaction, chain, added_at, false, false)
+        let txid = self.accept_at_with_options(transaction, chain, added_at, false, false)?;
+        self.relay_sequences.insert(txid, 0);
+        Ok(txid)
     }
 
     fn accept_at_with_options(
@@ -2594,6 +2596,14 @@ mod tests {
 
         assert_eq!(pool.relay_sequences[&txid], sequence);
         assert!(pool.get_for_relay(&txid, sequence + 1).is_some());
+
+        let transaction = pool
+            .remove(&txid)
+            .expect("retained transaction")
+            .transaction;
+        pool.take_changes();
+        pool.accept_reorg(transaction, &chain, 1).unwrap();
+        assert_eq!(pool.relay_sequences[&txid], 0);
     }
 
     #[test]

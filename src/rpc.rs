@@ -17,9 +17,10 @@ use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::ecdsa::Signature as EcdsaSignature;
 use bitcoin::hashes::Hash;
+use bitcoin::key::TapTweak;
 use bitcoin::psbt::{Input as PsbtInput, Psbt};
 use bitcoin::secp256k1::{Message, Secp256k1};
-use bitcoin::sighash::{EcdsaSighashType, SighashCache};
+use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::sign_message::{MessageSignature, signed_msg_hash};
 use bitcoin::{
     Address, Amount, Block, BlockHash, Denomination, Network, OutPoint, ScriptBuf, Transaction,
@@ -4092,6 +4093,11 @@ fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
     if input.final_script_sig.is_some() || input.final_script_witness.is_some() {
         return true;
     }
+    if let Some(signature) = input.tap_key_sig {
+        psbt.inputs[input_index].final_script_witness =
+            Some(Witness::from_slice(&[signature.to_vec()]));
+        return true;
+    }
     let Some(prevout) = psbt_prevout(psbt, input_index) else {
         return false;
     };
@@ -4261,7 +4267,14 @@ struct DescriptorCandidate {
     script_pubkey: ScriptBuf,
     redeem_script: Option<ScriptBuf>,
     witness_script: Option<ScriptBuf>,
+    tap_internal_key: Option<bitcoin::XOnlyPublicKey>,
     keys: Vec<DescriptorDerivedKey>,
+}
+
+#[derive(Clone, Copy)]
+struct DescriptorSighashType {
+    ecdsa: EcdsaSighashType,
+    taproot: TapSighashType,
 }
 
 fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -4326,6 +4339,9 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
         if let Some(witness_script) = &candidate.witness_script {
             psbt.inputs[input_index].witness_script = Some(witness_script.clone());
         }
+        if let Some(tap_internal_key) = candidate.tap_internal_key {
+            psbt.inputs[input_index].tap_internal_key = Some(tap_internal_key);
+        }
         if include_bip32_derivations {
             for key in &candidate.keys {
                 if let (Some(public_key), Some(origin)) = (key.public_key, &key.origin) {
@@ -4334,6 +4350,15 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .entry(public_key.inner)
                         .or_insert_with(|| (origin.0, origin.1.clone()));
                 }
+            }
+            if let Some(tap_internal_key) = candidate.tap_internal_key
+                && let Some((fingerprint, path)) =
+                    candidate.keys.iter().find_map(|key| key.origin.as_ref())
+            {
+                psbt.inputs[input_index]
+                    .tap_key_origins
+                    .entry(tap_internal_key)
+                    .or_insert_with(|| (Vec::new(), (*fingerprint, path.clone())));
             }
         }
         sign_descriptor_psbt_input(&mut psbt, input_index, &prevout, candidate, sighash_type)?;
@@ -4356,6 +4381,9 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
         if let Some(witness_script) = &candidate.witness_script {
             psbt.outputs[output_index].witness_script = Some(witness_script.clone());
         }
+        if let Some(tap_internal_key) = candidate.tap_internal_key {
+            psbt.outputs[output_index].tap_internal_key = Some(tap_internal_key);
+        }
         if include_bip32_derivations {
             for key in &candidate.keys {
                 if let (Some(public_key), Some(origin)) = (key.public_key, &key.origin) {
@@ -4364,6 +4392,15 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .entry(public_key.inner)
                         .or_insert_with(|| (origin.0, origin.1.clone()));
                 }
+            }
+            if let Some(tap_internal_key) = candidate.tap_internal_key
+                && let Some((fingerprint, path)) =
+                    candidate.keys.iter().find_map(|key| key.origin.as_ref())
+            {
+                psbt.outputs[output_index]
+                    .tap_key_origins
+                    .entry(tap_internal_key)
+                    .or_insert_with(|| (Vec::new(), (*fingerprint, path.clone())));
             }
         }
     }
@@ -4384,20 +4421,28 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(result)
 }
 
-fn parse_descriptor_sighash_type(value: &str) -> Result<EcdsaSighashType> {
+fn parse_descriptor_sighash_type(value: &str) -> Result<DescriptorSighashType> {
     let uppercase = value.to_ascii_uppercase();
-    let normalized = match uppercase.as_str() {
-        "DEFAULT" | "ALL" => "SIGHASH_ALL",
-        "NONE" => "SIGHASH_NONE",
-        "SINGLE" => "SIGHASH_SINGLE",
-        "ALL|ANYONECANPAY" => "SIGHASH_ALL|SIGHASH_ANYONECANPAY",
-        "NONE|ANYONECANPAY" => "SIGHASH_NONE|SIGHASH_ANYONECANPAY",
-        "SINGLE|ANYONECANPAY" => "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY",
-        other => other,
+    let (ecdsa, taproot) = match uppercase.as_str() {
+        "DEFAULT" | "SIGHASH_DEFAULT" => (EcdsaSighashType::All, TapSighashType::Default),
+        "ALL" | "SIGHASH_ALL" => (EcdsaSighashType::All, TapSighashType::All),
+        "NONE" | "SIGHASH_NONE" => (EcdsaSighashType::None, TapSighashType::None),
+        "SINGLE" | "SIGHASH_SINGLE" => (EcdsaSighashType::Single, TapSighashType::Single),
+        "ALL|ANYONECANPAY" | "SIGHASH_ALL|SIGHASH_ANYONECANPAY" => (
+            EcdsaSighashType::AllPlusAnyoneCanPay,
+            TapSighashType::AllPlusAnyoneCanPay,
+        ),
+        "NONE|ANYONECANPAY" | "SIGHASH_NONE|SIGHASH_ANYONECANPAY" => (
+            EcdsaSighashType::NonePlusAnyoneCanPay,
+            TapSighashType::NonePlusAnyoneCanPay,
+        ),
+        "SINGLE|ANYONECANPAY" | "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY" => (
+            EcdsaSighashType::SinglePlusAnyoneCanPay,
+            TapSighashType::SinglePlusAnyoneCanPay,
+        ),
+        _ => bail!("invalid sighash type: {value}"),
     };
-    normalized
-        .parse::<EcdsaSighashType>()
-        .map_err(|error| anyhow!("invalid sighash type: {error}"))
+    Ok(DescriptorSighashType { ecdsa, taproot })
 }
 
 fn parse_descriptor_spec(value: &Value) -> Result<(String, Option<(u32, u32)>)> {
@@ -4472,6 +4517,7 @@ fn descriptor_candidates_inner(
                 .script_pubkey(),
             redeem_script: None,
             witness_script: None,
+            tap_internal_key: None,
             keys: Vec::new(),
         }]);
     }
@@ -4486,6 +4532,7 @@ fn descriptor_candidates_inner(
             script_pubkey: ScriptBuf::from_bytes(hex::decode(script)?),
             redeem_script: None,
             witness_script: None,
+            tap_internal_key: None,
             keys: Vec::new(),
         }]);
     }
@@ -4505,6 +4552,7 @@ fn descriptor_candidates_inner(
                                 .script_pubkey(),
                             redeem_script: Some(redeem_script),
                             witness_script: child.witness_script,
+                            tap_internal_key: None,
                             keys: child.keys,
                         })
                     } else {
@@ -4514,6 +4562,7 @@ fn descriptor_candidates_inner(
                                 .script_pubkey(),
                             redeem_script: None,
                             witness_script: Some(witness_script),
+                            tap_internal_key: None,
                             keys: child.keys,
                         })
                     }
@@ -4564,12 +4613,14 @@ fn descriptor_candidates_inner(
                     .into_script(),
                 redeem_script: None,
                 witness_script: None,
+                tap_internal_key: None,
                 keys: vec![derived_key.clone()],
             });
             candidates.push(DescriptorCandidate {
                 script_pubkey: Address::p2pkh(public_key, node.config.network).script_pubkey(),
                 redeem_script: None,
                 witness_script: None,
+                tap_internal_key: None,
                 keys: vec![derived_key.clone()],
             });
             if let Ok(compressed) = bitcoin::CompressedPublicKey::try_from(public_key) {
@@ -4578,6 +4629,7 @@ fn descriptor_candidates_inner(
                         .script_pubkey(),
                     redeem_script: None,
                     witness_script: None,
+                    tap_internal_key: None,
                     keys: vec![derived_key.clone()],
                 });
                 candidates.push(DescriptorCandidate {
@@ -4587,6 +4639,7 @@ fn descriptor_candidates_inner(
                         Address::p2wpkh(&compressed, node.config.network).script_pubkey(),
                     ),
                     witness_script: None,
+                    tap_internal_key: None,
                     keys: vec![derived_key],
                 });
             }
@@ -4630,6 +4683,7 @@ fn descriptor_candidates_inner(
                     .script_pubkey(),
                 redeem_script: None,
                 witness_script: None,
+                tap_internal_key: Some(xonly),
                 keys: vec![derived_key],
             });
         }
@@ -4676,6 +4730,7 @@ where
                 script_pubkey: script(public_key)?,
                 redeem_script: None,
                 witness_script: None,
+                tap_internal_key: None,
                 keys: vec![descriptor_derived_key(
                     node,
                     &key,
@@ -4763,6 +4818,7 @@ fn multisig_descriptor_candidates(
                     .into_script(),
                 redeem_script: None,
                 witness_script: None,
+                tap_internal_key: None,
                 keys: derived.into_iter().map(|(_, key)| key).collect(),
             })
         })
@@ -4810,8 +4866,40 @@ fn sign_descriptor_psbt_input(
     input_index: usize,
     prevout: &TxOut,
     candidate: &DescriptorCandidate,
-    sighash_type: EcdsaSighashType,
+    sighash_type: DescriptorSighashType,
 ) -> Result<()> {
+    if let Some(tap_internal_key) = candidate.tap_internal_key {
+        let Some(private_key) = candidate.keys.iter().find_map(|key| {
+            let private_key = key.private_key.as_ref()?;
+            let public_key = key.public_key?;
+            (bitcoin::XOnlyPublicKey::from(public_key) == tap_internal_key).then_some(private_key)
+        }) else {
+            return Ok(());
+        };
+        let prevouts = (0..psbt.inputs.len())
+            .map(|index| psbt_prevout(psbt, index))
+            .collect::<Option<Vec<_>>>();
+        let Some(prevouts) = prevouts else {
+            return Ok(());
+        };
+        let sighash = SighashCache::new(&psbt.unsigned_tx).taproot_key_spend_signature_hash(
+            input_index,
+            &Prevouts::All(&prevouts),
+            sighash_type.taproot,
+        )?;
+        let keypair =
+            bitcoin::secp256k1::Keypair::from_secret_key(&Secp256k1::new(), &private_key.inner)
+                .tap_tweak(&Secp256k1::new(), psbt.inputs[input_index].tap_merkle_root)
+                .to_keypair();
+        let secp = Secp256k1::new();
+        psbt.inputs[input_index].tap_key_sig = Some(bitcoin::taproot::Signature {
+            signature: secp.sign_schnorr_no_aux_rand(&Message::from(sighash), &keypair),
+            sighash_type: sighash_type.taproot,
+        });
+        return Ok(());
+    }
+
+    let sighash_type = sighash_type.ecdsa;
     let signing_script = candidate
         .witness_script
         .as_ref()
@@ -9206,6 +9294,62 @@ mod tests {
             &Address::p2wpkh(&compressed, Network::Regtest).script_pubkey()
         );
         assert_eq!(nested_processed["complete"], false);
+
+        let taproot_descriptor = format!("tr([d34db33f/86'/0'/0']{xpriv})");
+        let internal_key = bitcoin::XOnlyPublicKey::from(public_key);
+        let taproot_script =
+            Address::p2tr(&secp, internal_key, None, Network::Regtest).script_pubkey();
+        let taproot_unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([22; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut taproot_psbt = Psbt::from_unsigned_tx(taproot_unsigned).unwrap();
+        taproot_psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: taproot_script,
+        });
+        let taproot_processed = descriptor_process_psbt(
+            &node,
+            &json!([
+                encode_psbt(&taproot_psbt),
+                [taproot_descriptor],
+                "SIGHASH_DEFAULT",
+                true,
+                true
+            ]),
+        )
+        .unwrap();
+        assert_eq!(taproot_processed["complete"], true);
+        let taproot_processed_psbt =
+            parse_psbt(&json!([taproot_processed["psbt"].clone()]), 0).unwrap();
+        assert_eq!(
+            taproot_processed_psbt.inputs[0].tap_internal_key,
+            Some(internal_key)
+        );
+        assert!(taproot_processed_psbt.inputs[0].tap_key_sig.is_some());
+        assert_eq!(
+            taproot_processed_psbt.inputs[0]
+                .final_script_witness
+                .as_ref()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            taproot_processed_psbt.inputs[0]
+                .tap_key_origins
+                .contains_key(&internal_key)
+        );
     }
 
     #[test]

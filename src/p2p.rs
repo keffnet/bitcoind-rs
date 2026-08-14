@@ -53,6 +53,7 @@ struct PeerState {
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     fee_filter: parking_lot::Mutex<i64>,
     relay_transactions: parking_lot::Mutex<bool>,
+    send_headers: parking_lot::Mutex<bool>,
     compact_block_version: parking_lot::Mutex<Option<u64>>,
     compact_block_announce: parking_lot::Mutex<bool>,
 }
@@ -711,6 +712,7 @@ async fn serve_peer(
         bloom_filter: parking_lot::Mutex::new(None),
         fee_filter: parking_lot::Mutex::new(0),
         relay_transactions: parking_lot::Mutex::new(true),
+        send_headers: parking_lot::Mutex::new(false),
         compact_block_version: parking_lot::Mutex::new(None),
         compact_block_announce: parking_lot::Mutex::new(false),
     });
@@ -1427,10 +1429,12 @@ async fn serve_peer_loop(
                     }
                 }
             }
+            Message::SendHeaders => {
+                *peer_state.send_headers.lock() = true;
+            }
             Message::CFilter(_)
             | Message::CFHeaders(_)
             | Message::CFCheckpt(_)
-            | Message::SendHeaders
             | Message::WtxidRelay
             | Message::NotFound(_)
             | Message::Unknown { .. } => {}
@@ -1912,6 +1916,30 @@ async fn broadcast_inventory(
                 let message = Message::CompactBlock(compact);
                 let _ = send_message(node, peer_id, &state.writer, network, &message).await;
                 continue;
+            }
+            if matches!(
+                item.kind,
+                InventoryType::Block | InventoryType::WitnessBlock
+            ) && *state.send_headers.lock()
+            {
+                let header = node
+                    .chain
+                    .write()
+                    .block(&item.hash)
+                    .ok()
+                    .flatten()
+                    .map(|block| block.header);
+                if let Some(header) = header {
+                    let _ = send_message(
+                        node,
+                        peer_id,
+                        &state.writer,
+                        network,
+                        &Message::Headers(vec![header]),
+                    )
+                    .await;
+                    continue;
+                }
             }
         }
         if matches!(

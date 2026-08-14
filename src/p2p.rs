@@ -52,6 +52,7 @@ const MAX_BLOOM_FILTER_SIZE: usize = 36_000;
 const MAX_BLOOM_HASH_FUNCS: u32 = 50;
 const MAX_BLOOM_ELEMENT_SIZE: usize = 520;
 const MAX_ADDR_TO_SEND: usize = 1_000;
+const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 const MAX_BLOCKTXN_DEPTH: u32 = 10;
 const SENDHEADERS_VERSION: i32 = 70_012;
 const FEEFILTER_VERSION: i32 = 70_013;
@@ -1313,11 +1314,30 @@ async fn serve_peer_loop(
                             }
                         }
                         InventoryType::CompactBlock => {
-                            let block = node.chain.write().block(&item.hash)?;
-                            let Some(block) = block else {
-                                missing.push(item);
-                                continue;
+                            let (block, recent) = {
+                                let mut chain = node.chain.write();
+                                let Some(height) = chain.block_height_by_hash(&item.hash) else {
+                                    missing.push(item);
+                                    continue;
+                                };
+                                let recent = compact_block_is_recent(height, chain.height());
+                                let Some(block) = chain.block(&item.hash)? else {
+                                    missing.push(item);
+                                    continue;
+                                };
+                                (block, recent)
                             };
+                            if !recent {
+                                send_message(
+                                    node,
+                                    peer_id,
+                                    writer,
+                                    node.config.network,
+                                    &Message::Block(block),
+                                )
+                                .await?;
+                                continue;
+                            }
                             let compact = HeaderAndShortIds::from_block(
                                 &block,
                                 random(),
@@ -2522,6 +2542,10 @@ fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
     height >= tip_height.saturating_sub(MAX_BLOCKTXN_DEPTH)
 }
 
+fn compact_block_is_recent(height: u32, tip_height: u32) -> bool {
+    height >= tip_height.saturating_sub(MAX_CMPCTBLOCK_DEPTH)
+}
+
 fn fee_rate_sat_per_kvb(fee_sat: u64, vsize: u64) -> i64 {
     if vsize == 0 {
         return i64::MAX;
@@ -2630,6 +2654,11 @@ mod tests {
         assert!(blocktxn_block_is_recent(100, 100));
         assert!(!blocktxn_block_is_recent(89, 100));
         assert!(blocktxn_block_is_recent(0, 5));
+
+        assert!(compact_block_is_recent(95, 100));
+        assert!(compact_block_is_recent(100, 100));
+        assert!(!compact_block_is_recent(94, 100));
+        assert!(compact_block_is_recent(0, 5));
     }
 
     #[test]

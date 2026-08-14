@@ -3898,10 +3898,14 @@ fn transaction_has_witness_serialization(bytes: &[u8]) -> bool {
     bytes.get(4).copied() == Some(0) && bytes.get(5).is_some_and(|flag| *flag != 0)
 }
 
-fn decode_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let bytes = hex::decode(param::<String>(params, 0)?).context("TX decode failed")?;
+fn decode_transaction_from_params(
+    params: &Value,
+    hex_index: usize,
+    witness_index: usize,
+) -> Result<Transaction> {
+    let bytes = hex::decode(param::<String>(params, hex_index)?).context("TX decode failed")?;
     if let Some(iswitness) = params
-        .get(1)
+        .get(witness_index)
         .filter(|value| !value.is_null())
         .map(|value| {
             value
@@ -3914,6 +3918,11 @@ fn decode_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("TX decode failed")
     }
     let transaction: Transaction = deserialize(&bytes).context("TX decode failed")?;
+    Ok(transaction)
+}
+
+fn decode_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let transaction = decode_transaction_from_params(params, 0, 1)?;
     Ok(decoded_transaction_json(&transaction, node.config.network))
 }
 
@@ -4378,7 +4387,7 @@ fn descriptor_with_checksum(body: &str) -> String {
     format!("{body}#{}", descriptor_checksum(body).unwrap_or_default())
 }
 
-fn inferred_script_descriptor(node: &Arc<Node>, script: &bitcoin::Script) -> String {
+fn inferred_script_descriptor_for_network(network: Network, script: &bitcoin::Script) -> String {
     let body = if script.is_p2tr() {
         script
             .as_bytes()
@@ -4390,12 +4399,16 @@ fn inferred_script_descriptor(node: &Arc<Node>, script: &bitcoin::Script) -> Str
         format!("pk({public_key})")
     } else if let Some(multisig) = multisig_descriptor_body(script) {
         multisig
-    } else if let Ok(address) = Address::from_script(script, node.config.network) {
+    } else if let Ok(address) = Address::from_script(script, network) {
         format!("addr({address})")
     } else {
         format!("raw({})", hex::encode(script.as_bytes()))
     };
     descriptor_with_checksum(&body)
+}
+
+fn inferred_script_descriptor(node: &Arc<Node>, script: &bitcoin::Script) -> String {
+    inferred_script_descriptor_for_network(node.config.network, script)
 }
 
 fn decoded_script_json(node: &Arc<Node>, script: &bitcoin::Script, include_hex: bool) -> Value {
@@ -4491,9 +4504,17 @@ fn create_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn convert_to_psbt(params: &Value) -> Result<Value> {
-    let bytes = hex::decode(param::<String>(params, 0)?)?;
-    let transaction: Transaction = deserialize(&bytes)?;
-    let permitsigdata = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let transaction = decode_transaction_from_params(params, 0, 2)?;
+    let permitsigdata = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("permitsigdata must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
     let has_signature_data = transaction
         .input
         .iter()
@@ -4506,17 +4527,7 @@ fn convert_to_psbt(params: &Value) -> Result<Value> {
         input.script_sig = ScriptBuf::new();
         input.witness = Witness::default();
     }
-    let mut psbt = Psbt::from_unsigned_tx(unsigned)?;
-    if permitsigdata {
-        for (index, input) in transaction.input.iter().enumerate() {
-            if !input.script_sig.is_empty() {
-                psbt.inputs[index].final_script_sig = Some(input.script_sig.clone());
-            }
-            if !input.witness.is_empty() {
-                psbt.inputs[index].final_script_witness = Some(input.witness.clone());
-            }
-        }
-    }
+    let psbt = Psbt::from_unsigned_tx(unsigned)?;
     Ok(json!(encode_psbt(&psbt)))
 }
 
@@ -9097,45 +9108,19 @@ fn add_prevout_details(
 }
 
 fn script_json_with_network(script: &bitcoin::Script, network: Option<Network>) -> Value {
-    let (script_type, address) = if script.is_p2pkh() {
-        (
-            "pubkeyhash",
-            network.and_then(|network| Address::from_script(script, network).ok()),
-        )
-    } else if script.is_p2sh() {
-        (
-            "scripthash",
-            network.and_then(|network| Address::from_script(script, network).ok()),
-        )
-    } else if script.is_p2wpkh() {
-        (
-            "witness_v0_keyhash",
-            network.and_then(|network| Address::from_script(script, network).ok()),
-        )
-    } else if script.is_p2wsh() {
-        (
-            "witness_v0_scripthash",
-            network.and_then(|network| Address::from_script(script, network).ok()),
-        )
-    } else if script.is_p2tr() {
-        (
-            "witness_v1_taproot",
-            network.and_then(|network| Address::from_script(script, network).ok()),
-        )
-    } else if script.is_op_return() {
-        ("nulldata", None)
-    } else if script.is_p2pk() {
-        ("pubkey", None)
-    } else {
-        ("nonstandard", None)
-    };
+    let script_type = script_type_for_decode(script);
     let mut result = json!({
         "asm": script.to_asm_string(),
         "hex": hex::encode(script.as_bytes()),
         "type": script_type,
     });
-    if let Some(address) = address {
-        result["address"] = json!(address.to_string());
+    if let Some(network) = network {
+        result["desc"] = json!(inferred_script_descriptor_for_network(network, script));
+        if script_type != "pubkey"
+            && let Ok(address) = Address::from_script(script, network)
+        {
+            result["address"] = json!(address.to_string());
+        }
     }
     result
 }
@@ -11453,14 +11438,20 @@ mod tests {
         assert!(extracted["hex"].as_str().is_some());
         let converted = convert_to_psbt(&json!([extracted["hex"].clone(), true])).unwrap();
         let converted_psbt = parse_psbt(&json!([converted]), 0).unwrap();
-        assert!(converted_psbt.inputs[0].final_script_witness.is_some());
+        assert!(converted_psbt.inputs[0].final_script_witness.is_none());
         let decoded_converted = decode_psbt(&node, &json!([encode_psbt(&converted_psbt)])).unwrap();
-        assert!(decoded_converted["inputs"][0]["final_scriptwitness"].is_array());
+        assert!(
+            decoded_converted["inputs"][0]
+                .get("final_scriptwitness")
+                .is_none()
+        );
         assert!(
             decoded_converted["inputs"][0]
                 .get("final_scriptWitness")
                 .is_none()
         );
+        assert!(convert_to_psbt(&json!([extracted["hex"].clone(), true, false])).is_err());
+        assert!(convert_to_psbt(&json!([extracted["hex"].clone(), false, true])).is_err());
 
         let multisig_script = Builder::new()
             .push_int(1)

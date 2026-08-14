@@ -1543,7 +1543,7 @@ mod tests {
     #[tokio::test]
     async fn history_notifications_refresh_after_mempool_activity() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let node = Arc::new(Node::open(Config {
+        let node = Node::open(Config {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
@@ -1583,7 +1583,7 @@ mod tests {
             max_datacarrier_bytes: Some(100_000),
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
-        })?);
+        })?;
         let genesis = *node.chain.read().header(0).expect("genesis header exists");
         let mut funding_outpoint = None;
         let mut previous = genesis;
@@ -2220,5 +2220,87 @@ mod tests {
             .unwrap(),
             Value::Bool(true)
         );
+    }
+
+    #[tokio::test]
+    async fn electrum_tcp_session_negotiates_and_serves_features() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: false,
+            dnsseed: false,
+            onlynet: Vec::new(),
+            proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
+            blocksonly: false,
+            private_broadcast: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: false,
+            peer_block_filters: false,
+            persist_mempool: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server_node = node.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            handle_client(server_node, stream).await
+        });
+
+        let mut client = TcpStream::connect(address).await?;
+        client
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"server.version","params":["test-client","1.4"]}
+"#,
+            )
+            .await?;
+        let mut reader = BufReader::new(client);
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["result"], json!([SERVER_NAME, "1.4"]));
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":2,"method":"server.features","params":[]}
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["result"]["protocol_min"], json!("1.4"));
+        assert_eq!(response["result"]["protocol_max"], json!("1.7"));
+        drop(reader);
+        server.await??;
+        Ok(())
     }
 }

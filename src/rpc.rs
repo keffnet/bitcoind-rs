@@ -2785,6 +2785,11 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "add" => {
             let requested_duration = optional_u64(params, 2, 86_400, "bantime")?;
             let absolute = optional_bool(params, 3, false, "absolute")?;
+            let (requested_duration, absolute) = if requested_duration == 0 {
+                (86_400, false)
+            } else {
+                (requested_duration, absolute)
+            };
             let now = unix_time();
             let ban_until = if absolute {
                 requested_duration
@@ -2809,6 +2814,7 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn list_banned(node: &Arc<Node>) -> Result<Value> {
+    let now = unix_time();
     Ok(json!(
         node.banned_addresses()
             .into_iter()
@@ -2816,7 +2822,8 @@ fn list_banned(node: &Arc<Node>) -> Result<Value> {
                 "address": entry.address.to_string(),
                 "ban_created": entry.ban_created,
                 "banned_until": entry.ban_until,
-                "ban_reason": entry.reason,
+                "ban_duration": entry.ban_until.saturating_sub(entry.ban_created),
+                "time_remaining": entry.ban_until.saturating_sub(now),
             }))
             .collect::<Vec<_>>()
     ))
@@ -13065,7 +13072,24 @@ mod tests {
         assert_eq!(added[0]["addednode"], "127.0.0.1:18444");
         assert!(set_ban(&node, &json!(["add", "192.0.2.2", "60"])).is_err());
         set_ban(&node, &json!(["add", "192.0.2.1", 60])).unwrap();
-        assert_eq!(list_banned(&node).unwrap().as_array().unwrap().len(), 1);
+        let banned = list_banned(&node).unwrap();
+        assert_eq!(banned.as_array().unwrap().len(), 1);
+        assert_eq!(banned[0]["ban_duration"], json!(60));
+        assert!(
+            banned[0]["time_remaining"]
+                .as_u64()
+                .is_some_and(|remaining| (1..=60).contains(&remaining))
+        );
+        assert!(banned[0].get("ban_reason").is_none());
+        set_ban(&node, &json!(["add", "192.0.2.3", 0])).unwrap();
+        let default_duration = list_banned(&node)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["address"] == "192.0.2.3")
+            .and_then(|entry| entry["ban_duration"].as_u64());
+        assert_eq!(default_duration, Some(86_400));
         clear_banned(&node).unwrap();
         assert_eq!(list_banned(&node).unwrap(), json!([]));
         add_node(&node, &json!(["127.0.0.1:18444", "remove"])).unwrap();

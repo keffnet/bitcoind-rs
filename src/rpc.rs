@@ -9942,8 +9942,7 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
                            verificationprogress: f64,
                            coins_tip_cache_bytes: u64,
                            validated: bool,
-                           snapshot_base: Option<BlockHash>,
-                           validation_error: Option<String>|
+                           snapshot_base: Option<BlockHash>|
      -> Result<Value> {
         let header = chain
             .header(height)
@@ -9962,14 +9961,10 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
         if let Some(snapshot_base) = snapshot_base {
             chainstate["snapshot_blockhash"] = json!(snapshot_base.to_string());
         }
-        if let Some(validation_error) = validation_error {
-            chainstate["validation_error"] = json!(validation_error);
-        }
         Ok(chainstate)
     };
 
-    if let Some((progress_height, progress_hash, snapshot_base, validation_error)) =
-        chain.background_chainstate()
+    if let Some((progress_height, progress_hash, snapshot_base, _)) = chain.background_chainstate()
     {
         let progress = if tip.height == 0 {
             0.0
@@ -9983,7 +9978,6 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
             0,
             false,
             None,
-            None,
         )?);
         chainstates.push(make_chainstate(
             tip.height,
@@ -9992,7 +9986,6 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
             chain.utxo_bogo_size(),
             false,
             Some(snapshot_base),
-            validation_error,
         )?);
     } else {
         let (snapshot_base, validated) = chain
@@ -10005,7 +9998,6 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
             chain.utxo_bogo_size(),
             validated,
             snapshot_base,
-            chain.snapshot_validation_error(),
         )?);
     }
     Ok(json!({

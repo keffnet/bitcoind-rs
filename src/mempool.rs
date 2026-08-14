@@ -16,7 +16,7 @@ use crate::validation::{self, ValidationError};
 
 const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
 const MIN_RELAY_SAT_PER_VBYTE: u64 = 1;
-const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+pub(crate) const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
 const MAX_TX_LEGACY_SIGOPS: usize = 2_500;
@@ -1734,6 +1734,34 @@ mod tests {
         )));
         assert_eq!(changes[0].sequence, 0);
         assert_eq!(changes[1].sequence, 1);
+    }
+
+    #[test]
+    fn expires_old_entries_and_records_removal_sequence() {
+        let transaction = graph_transaction(Txid::from_byte_array([1; 32]), 1);
+        let txid = transaction.compute_txid();
+        let wtxid = transaction.compute_wtxid();
+        let mut pool = Mempool::new(Network::Regtest);
+        pool.entries.insert(
+            txid,
+            MempoolEntry {
+                transaction,
+                fee_sat: 1,
+                vsize: 1,
+                added_at: 1,
+                height: 0,
+            },
+        );
+        pool.wtxids.insert(wtxid, txid);
+        pool.clear_expired(2 + MEMPOOL_EXPIRY.as_secs(), MEMPOOL_EXPIRY);
+        assert!(pool.is_empty());
+        let changes = pool.take_changes();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].sequence, 0);
+        assert!(matches!(
+            changes[0].kind,
+            MempoolChangeKind::Removed { notify_zmq: true }
+        ));
     }
 
     #[test]

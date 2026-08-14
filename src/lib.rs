@@ -40,6 +40,7 @@ const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_KNOWN_ADDRESSES: usize = 256_000;
+const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 
 struct OrphanEntry {
     transaction: Transaction,
@@ -484,6 +485,26 @@ impl Node {
         for txid in removed {
             self.announce_mempool_transaction(txid);
         }
+    }
+
+    fn expire_mempool(&self) {
+        let changes = {
+            let mut mempool = self.mempool.write();
+            mempool.clear_expired(time::unix_time(), mempool::MEMPOOL_EXPIRY);
+            mempool.take_changes()
+        };
+        if changes.is_empty() {
+            return;
+        }
+        let removed = changes
+            .iter()
+            .filter_map(|change| {
+                matches!(change.kind, MempoolChangeKind::Removed { .. })
+                    .then_some(change.transaction.compute_txid())
+            })
+            .collect();
+        self.announce_mempool_changes(removed);
+        self.notify_zmq_mempool_changes(changes);
     }
 
     #[cfg(test)]
@@ -1239,6 +1260,15 @@ impl Node {
         let mut p2p_task = tokio::spawn(p2p.run());
         let mut rpc_task = tokio::spawn(rpc.run());
         let mut electrum_task = tokio::spawn(electrum.run());
+        let expiry_node = self.clone();
+        let mempool_expiry_task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(MEMPOOL_EXPIRY_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                expiry_node.expire_mempool();
+            }
+        });
 
         tokio::select! {
             result = &mut p2p_task => result??,
@@ -1253,6 +1283,7 @@ impl Node {
         rpc_task.abort();
         electrum_task.abort();
         zmq_task.abort();
+        mempool_expiry_task.abort();
         self.persist_mempool()?;
         self.persist_known_addresses()?;
         Ok(())

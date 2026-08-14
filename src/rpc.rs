@@ -8309,14 +8309,10 @@ fn get_orphan_transactions(node: &Arc<Node>, params: &Value) -> Result<Value> {
     ))
 }
 
-fn get_mempool_cluster(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let txid: Txid = param::<String>(params, 0)?.parse()?;
-    let mempool = node.mempool.read();
-    if mempool.get(&txid).is_none() {
-        bail!("Transaction not in mempool")
-    }
+fn mempool_cluster_transaction_ids(mempool: &Mempool, txid: &Txid) -> Option<Vec<Txid>> {
+    mempool.get(txid)?;
     let mut cluster = HashSet::new();
-    let mut pending = vec![txid];
+    let mut pending = vec![*txid];
     while let Some(current) = pending.pop() {
         if !cluster.insert(current) {
             continue;
@@ -8324,27 +8320,50 @@ fn get_mempool_cluster(node: &Arc<Node>, params: &Value) -> Result<Value> {
         pending.extend(mempool.parents(&current));
         pending.extend(mempool.children(&current));
     }
-    let transaction_ids = mempool
-        .transaction_order()
-        .into_iter()
-        .filter(|candidate| cluster.contains(candidate))
-        .collect::<Vec<_>>();
+    Some(
+        mempool
+            .transaction_order()
+            .into_iter()
+            .filter(|candidate| cluster.contains(candidate))
+            .collect(),
+    )
+}
+
+fn modified_mempool_fee_sat(mempool: &Mempool, txid: &Txid) -> i64 {
+    let Some(entry) = mempool.get(txid) else {
+        return 0;
+    };
+    i64::try_from(entry.fee_sat)
+        .unwrap_or(i64::MAX)
+        .saturating_add(mempool.fee_delta(txid))
+}
+
+fn mempool_cluster_metrics(mempool: &Mempool, txid: &Txid) -> Option<(Vec<Txid>, u64, i64)> {
+    let transaction_ids = mempool_cluster_transaction_ids(mempool, txid)?;
     let (weight, fee) = transaction_ids
         .iter()
-        .fold((0u64, 0u64), |(weight, fee), txid| {
+        .fold((0u64, 0i64), |(weight, fee), txid| {
             let Some(entry) = mempool.get(txid) else {
                 return (weight, fee);
             };
             (
                 weight.saturating_add(entry.transaction.weight().to_wu()),
-                fee.saturating_add(entry.fee_sat),
+                fee.saturating_add(modified_mempool_fee_sat(mempool, txid)),
             )
         });
+    Some((transaction_ids, weight, fee))
+}
+
+fn get_mempool_cluster(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let txid: Txid = param::<String>(params, 0)?.parse()?;
+    let mempool = node.mempool.read();
+    let (transaction_ids, weight, fee) = mempool_cluster_metrics(&mempool, &txid)
+        .ok_or_else(|| anyhow!("Transaction not in mempool"))?;
     Ok(json!({
         "clusterweight": weight,
         "txcount": transaction_ids.len(),
         "chunks": [{
-            "chunkfee": sat_to_btc(fee),
+            "chunkfee": sat_to_btc_signed(fee),
             "chunkweight": weight,
             "txs": transaction_ids
                 .into_iter()
@@ -8398,9 +8417,9 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
     };
     let (ancestor_size, ancestor_modified_fee) = aggregate(&ancestor_ids);
     let (descendant_size, descendant_modified_fee) = aggregate(&descendant_ids);
-    let modified_fee = i64::try_from(entry.fee_sat)
-        .unwrap_or(i64::MAX)
-        .saturating_add(mempool.fee_delta(txid));
+    let modified_fee = modified_mempool_fee_sat(mempool, txid);
+    let (_, chunk_weight, chunk_fee) =
+        mempool_cluster_metrics(mempool, txid).expect("mempool entry must have a cluster");
     let parents = mempool
         .parents(txid)
         .into_iter()
@@ -8420,6 +8439,7 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
         "descendantsize": descendant_size,
         "ancestorcount": ancestor_ids.len(),
         "ancestorsize": ancestor_size,
+        "chunkweight": chunk_weight,
         "wtxid": entry.transaction.compute_wtxid().to_string(),
         "fee": sat_to_btc(entry.fee_sat),
         "fees": {
@@ -8427,6 +8447,7 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
             "modified": sat_to_btc_signed(modified_fee),
             "ancestor": sat_to_btc_signed(ancestor_modified_fee),
             "descendant": sat_to_btc_signed(descendant_modified_fee),
+            "chunk": sat_to_btc_signed(chunk_fee),
         },
         "depends": parents,
         "spentby": children,
@@ -11469,6 +11490,8 @@ mod tests {
 
         let entry = dispatch_method(&node, "getmempoolentry", &json!([txid.to_string()])).unwrap();
         assert_eq!(entry["height"], json!(node.chain.read().height()));
+        assert_eq!(entry["chunkweight"], entry["weight"]);
+        assert_eq!(entry["fees"]["chunk"], entry["fees"]["modified"]);
 
         let cluster =
             dispatch_method(&node, "getmempoolcluster", &json!([txid.to_string()])).unwrap();

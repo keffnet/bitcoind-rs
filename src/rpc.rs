@@ -3211,21 +3211,20 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         let spacing = node.config.network.params().pow_target_spacing;
         i64::try_from((30 * 24 * 60 * 60) / spacing).unwrap_or(i64::MAX)
     };
-    let requested_window = if explicit_window {
-        params
-            .get(0)
-            .and_then(Value::as_i64)
-            .ok_or_else(|| anyhow!("window must be an integer"))?
-    } else {
-        default_window
-    };
+    let requested_window = optional_i64(params, 0, default_window, "nblocks")?;
     if requested_window < 0 {
         bail!("window must not be negative");
     }
     let requested_hash = params
         .get(1)
-        .and_then(Value::as_str)
-        .map(str::parse::<BlockHash>)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("blockhash must be a string"))?
+                .parse::<BlockHash>()
+                .map_err(|error| anyhow!("invalid blockhash: {error}"))
+        })
         .transpose()?;
     let mut chain = node.chain.write();
     let end_height = if let Some(hash) = requested_hash {
@@ -3305,19 +3304,11 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_network_hash_ps(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let nblocks = params
-        .get(0)
-        .filter(|value| !value.is_null())
-        .and_then(Value::as_i64)
-        .unwrap_or(120);
+    let nblocks = optional_i64(params, 0, 120, "nblocks")?;
     if nblocks < -1 || nblocks == 0 {
         bail!("Invalid nblocks. Must be a positive number or -1.");
     }
-    let requested_height = params
-        .get(1)
-        .filter(|value| !value.is_null())
-        .and_then(Value::as_i64)
-        .unwrap_or(-1);
+    let requested_height = optional_i64(params, 1, -1, "height")?;
     if requested_height < -1 {
         bail!("Block does not exist at specified height");
     }
@@ -9239,24 +9230,18 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 bail!("scanblocks requires at least one descriptor")
             }
             let chain_height = node.chain.read().height();
-            let start_height = params
-                .get(2)
-                .filter(|value| !value.is_null())
-                .and_then(Value::as_u64)
-                .map(|height| {
-                    u32::try_from(height).map_err(|_| anyhow!("start_height is too large"))
-                })
-                .transpose()?
-                .unwrap_or(0);
-            let stop_height = params
-                .get(3)
-                .filter(|value| !value.is_null())
-                .and_then(Value::as_u64)
-                .map(|height| {
-                    u32::try_from(height).map_err(|_| anyhow!("stop_height is too large"))
-                })
-                .transpose()?
-                .unwrap_or(chain_height);
+            let start_height = optional_i64(params, 2, 0, "start_height")?;
+            if start_height < 0 {
+                bail!("start_height must not be negative")
+            }
+            let start_height =
+                u32::try_from(start_height).map_err(|_| anyhow!("start_height is out of range"))?;
+            let stop_height = optional_i64(params, 3, i64::from(chain_height), "stop_height")?;
+            if stop_height < 0 {
+                bail!("stop_height must not be negative")
+            }
+            let stop_height =
+                u32::try_from(stop_height).map_err(|_| anyhow!("stop_height is out of range"))?;
             let filter_type = optional_str(params, 4, "basic", "filtertype")?;
             if filter_type != "basic" {
                 bail!("only the basic block filter is available")
@@ -10278,6 +10263,15 @@ fn optional_str<'a>(
         .ok_or_else(|| anyhow!("{name} must be a string"))
 }
 
+fn optional_i64(params: &Value, index: usize, default: i64, name: &str) -> Result<i64> {
+    let Some(value) = params.get(index).filter(|value| !value.is_null()) else {
+        return Ok(default);
+    };
+    value
+        .as_i64()
+        .ok_or_else(|| anyhow!("{name} must be an integer"))
+}
+
 fn rpc_error(error: &anyhow::Error) -> Value {
     json!({"code": -1, "message": error.to_string()})
 }
@@ -11224,6 +11218,10 @@ mod tests {
             "value"
         );
         assert!(optional_str(&json!([1]), 0, "default", "field").is_err());
+        assert_eq!(optional_i64(&json!([]), 0, 7, "number").unwrap(), 7);
+        assert_eq!(optional_i64(&json!([null]), 0, 7, "number").unwrap(), 7);
+        assert_eq!(optional_i64(&json!([-2]), 0, 7, "number").unwrap(), -2);
+        assert!(optional_i64(&json!(["7"]), 0, 7, "number").is_err());
     }
 
     #[test]
@@ -11354,6 +11352,8 @@ mod tests {
         .unwrap();
         assert!(get_network_hash_ps(&node, &json!([0])).is_err());
         assert!(get_network_hash_ps(&node, &json!([-2])).is_err());
+        assert!(get_network_hash_ps(&node, &json!(["120"])).is_err());
+        assert!(get_chain_tx_stats(&node, &json!([null, 1])).is_err());
         assert_eq!(
             get_network_hash_ps(&node, &json!([-1])).unwrap(),
             json!(0.0)
@@ -14967,7 +14967,28 @@ mod tests {
         .unwrap()
         .to_owned();
         let descriptor = format!("addr({address})");
+        assert!(
+            scan_blocks(
+                &node,
+                &json!(["start", [descriptor.clone()], -1, 1, "basic"])
+            )
+            .is_err()
+        );
+        assert!(
+            scan_blocks(
+                &node,
+                &json!(["start", [descriptor.clone()], "0", 1, "basic"])
+            )
+            .is_err()
+        );
         assert!(scan_blocks(&node, &json!(["start", [descriptor.clone()], 0, 1, 1])).is_err());
+        assert!(
+            scan_blocks(
+                &node,
+                &json!(["start", [descriptor.clone()], 0, 1, "basic", 1])
+            )
+            .is_err()
+        );
         let scan = scan_blocks(
             &node,
             &json!(["start", [descriptor.clone()], 0, 1, "basic"]),

@@ -49,6 +49,16 @@ const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_EXTERNAL_BLOCK_RECORD_SIZE: usize = 4 * 1024 * 1024;
 
+fn core_block_download_timeout(
+    block_interval: Duration,
+    other_downloading_peers: usize,
+) -> Duration {
+    let per_peer = Duration::from_secs(block_interval.as_secs() / 2);
+    block_interval.saturating_add(
+        per_peer.saturating_mul(u32::try_from(other_downloading_peers).unwrap_or(u32::MAX)),
+    )
+}
+
 fn import_external_block_file(
     chain: &mut ChainState,
     path: &Path,
@@ -326,7 +336,7 @@ pub struct PeerInfo {
     pub(crate) last_common_block: Option<BlockHash>,
     pub(crate) bip152_highbandwidth_to: bool,
     pub(crate) bip152_highbandwidth_from: bool,
-    inflight_blocks: Vec<(BlockHash, u32)>,
+    inflight_blocks: Vec<InflightBlock>,
     pub time_offset: i64,
     pub addr_processed: u64,
     pub addr_rate_limited: u64,
@@ -340,6 +350,13 @@ pub struct PeerInfo {
     ping_sent_at: Option<Instant>,
 }
 
+#[derive(Clone, Debug)]
+struct InflightBlock {
+    hash: BlockHash,
+    height: u32,
+    requested_at: Instant,
+}
+
 impl PeerInfo {
     pub(crate) fn ping_wait(&self) -> Option<f64> {
         self.ping_sent_at
@@ -349,7 +366,7 @@ impl PeerInfo {
     pub(crate) fn inflight_heights(&self) -> Vec<u32> {
         self.inflight_blocks
             .iter()
-            .map(|(_, height)| *height)
+            .map(|block| block.height)
             .collect()
     }
 }
@@ -1219,12 +1236,16 @@ impl Node {
             && !peer
                 .inflight_blocks
                 .iter()
-                .any(|(inflight_hash, _)| *inflight_hash == hash)
+                .any(|inflight| inflight.hash == hash)
         {
             if peer.inflight_blocks.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER {
                 return false;
             }
-            peer.inflight_blocks.push((hash, height));
+            peer.inflight_blocks.push(InflightBlock {
+                hash,
+                height,
+                requested_at: Instant::now(),
+            });
             return true;
         }
         false
@@ -1241,14 +1262,97 @@ impl Node {
         self.peers.read().get(&peer_id).is_some_and(|peer| {
             peer.inflight_blocks
                 .iter()
-                .any(|(inflight_hash, _)| *inflight_hash == hash)
+                .any(|inflight| inflight.hash == hash)
         })
+    }
+
+    /// Return true when the oldest validated block request for a peer has
+    /// exceeded Core's block-interval timeout. The timeout is extended for
+    /// each other peer that is actively downloading validated blocks so a
+    /// saturated local link is not mistaken for a single stalled peer.
+    pub(crate) fn peer_block_download_timed_out(&self, peer_id: usize) -> bool {
+        let block_interval = Duration::from_secs(self.config.network.params().pow_target_spacing);
+        let peers = self.peers.read();
+        let Some(peer) = peers.get(&peer_id) else {
+            return false;
+        };
+        let Some(oldest) = peer.inflight_blocks.first() else {
+            return false;
+        };
+        let other_downloading_peers = peers
+            .values()
+            .filter(|candidate| candidate.id != peer_id && !candidate.inflight_blocks.is_empty())
+            .count();
+        let timeout = core_block_download_timeout(block_interval, other_downloading_peers);
+        oldest.requested_at.elapsed() > timeout
+    }
+
+    /// Return the next contiguous header-chain window whose full blocks are
+    /// absent locally. This is used after a peer disconnects or times out;
+    /// the headers-first state remains durable, so another connected peer can
+    /// resume without needing to re-announce the same headers.
+    pub(crate) fn next_block_download_requests(
+        &self,
+        limit: usize,
+        peer_services: u64,
+    ) -> Vec<wire::Inventory> {
+        if limit == 0 || peer_services & (wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED) == 0 {
+            return Vec::new();
+        }
+        let max_scan = {
+            let peer_count = self.peers.read().len();
+            limit.saturating_add(
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_mul(peer_count.saturating_add(1)),
+            )
+        };
+        let limited_peer = peer_services & wire::NODE_NETWORK == 0;
+        let candidates = {
+            let chain = self.chain.read();
+            let best_header = chain.best_header_tip().hash;
+            chain
+                .headers_to_hash(&best_header)
+                .into_iter()
+                .flatten()
+                .skip(1)
+                .map(|header| header.block_hash())
+                .filter(|hash| !chain.store.contains(hash))
+                .filter(|hash| {
+                    !limited_peer
+                        || chain
+                            .block_height_by_hash(hash)
+                            .is_some_and(|height| height.saturating_add(290) >= chain.height())
+                })
+                .take(max_scan)
+                .collect::<Vec<_>>()
+        };
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let peers = self.peers.read();
+        candidates
+            .into_iter()
+            .filter(|hash| {
+                !peers
+                    .values()
+                    .flat_map(|peer| peer.inflight_blocks.iter())
+                    .any(|inflight| inflight.hash == *hash)
+            })
+            .map(|hash| wire::Inventory {
+                kind: if peer_services & wire::NODE_WITNESS != 0 {
+                    wire::InventoryType::WitnessBlock
+                } else {
+                    wire::InventoryType::Block
+                },
+                hash,
+            })
+            .collect()
     }
 
     pub(crate) fn clear_peer_block_request(&self, peer_id: usize, hash: BlockHash) {
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
             peer.inflight_blocks
-                .retain(|(inflight_hash, _)| *inflight_hash != hash);
+                .retain(|inflight| inflight.hash != hash);
         }
     }
 
@@ -2280,6 +2384,56 @@ mod tests {
         );
         assert_eq!(chain.height(), 1);
         assert_eq!(chain.best_hash(), block.block_hash());
+    }
+
+    #[test]
+    fn block_download_timeout_matches_core_parallel_peer_window() {
+        let interval = Duration::from_secs(600);
+        assert_eq!(core_block_download_timeout(interval, 0), interval);
+        assert_eq!(
+            core_block_download_timeout(interval, 2),
+            Duration::from_secs(1_200)
+        );
+        assert_eq!(
+            core_block_download_timeout(interval, 10),
+            Duration::from_secs(3_600)
+        );
+    }
+
+    #[test]
+    fn block_download_queue_resumes_from_persisted_headers() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 1);
+        let second = mine_test_block(&first.header, 2, 2);
+        node.chain
+            .write()
+            .accept_headers(&[first.header, second.header])
+            .unwrap();
+
+        let requests =
+            node.next_block_download_requests(16, wire::NODE_NETWORK | wire::NODE_WITNESS);
+        assert_eq!(
+            requests.iter().map(|item| item.hash).collect::<Vec<_>>(),
+            vec![first.block_hash(), second.block_hash()]
+        );
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        assert!(node.track_peer_block_request(1, first.block_hash()));
+        let remaining =
+            node.next_block_download_requests(16, wire::NODE_NETWORK | wire::NODE_WITNESS);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].hash, second.block_hash());
+
+        node.unregister_peer(1);
+        assert_eq!(
+            node.next_block_download_requests(16, wire::NODE_NETWORK)
+                .into_iter()
+                .map(|item| item.hash)
+                .collect::<Vec<_>>(),
+            vec![first.block_hash(), second.block_hash()]
+        );
     }
 
     #[test]

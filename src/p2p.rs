@@ -1481,6 +1481,25 @@ async fn serve_peer_loop(
                 continue;
             }
             _ = tx_inventory_interval.tick(), if version_received && verack_received => {
+                if node.peer_block_download_timed_out(peer_id) {
+                    anyhow::bail!("peer timed out downloading blocks");
+                }
+                let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                    .saturating_sub(node.peer_inflight_block_count(peer_id));
+                if available > 0 {
+                    queue_block_requests(
+                        &mut pending_block_requests,
+                        node.next_block_download_requests(available, peer_services),
+                    );
+                    flush_pending_block_requests(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &mut pending_block_requests,
+                    )
+                    .await?;
+                }
                 flush_peer_transaction_inventory(
                     node,
                     peer_id,

@@ -353,6 +353,23 @@ impl ChainState {
         self.active_chain.contains(hash)
     }
 
+    /// Return the BIP22 proposal result for a block already known to the
+    /// node. Full blocks that passed validation are duplicates; headers that
+    /// have not received a body yet are inconclusive.
+    pub fn proposal_duplicate_status(&self, hash: &BlockHash) -> Option<&'static str> {
+        if !self.block_index.contains_key(hash) {
+            return None;
+        }
+        if self.has_invalid_ancestor(*hash) {
+            return Some("duplicate-invalid");
+        }
+        if self.store.contains(hash) {
+            Some("duplicate")
+        } else {
+            Some("duplicate-inconclusive")
+        }
+    }
+
     pub fn invalidate_block(&mut self, hash: &BlockHash) -> Result<ChainTip> {
         let node = self
             .block_index

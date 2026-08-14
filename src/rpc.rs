@@ -7001,9 +7001,11 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .ok_or_else(|| anyhow!("proposal mode requires a data string"))?;
         let bytes = hex::decode(data).context("block decode failed")?;
         let block: Block = deserialize(&bytes).context("block decode failed")?;
-        node.chain
-            .read()
-            .validate_candidate_block_without_pow(&block)?;
+        let chain = node.chain.read();
+        if let Some(status) = chain.proposal_duplicate_status(&block.block_hash()) {
+            return Ok(json!(status));
+        }
+        chain.validate_candidate_block_without_pow(&block)?;
         return Ok(Value::Null);
     }
     if mode != "template" {
@@ -9981,6 +9983,25 @@ mod tests {
             )
             .unwrap(),
             Value::Null
+        );
+
+        let mined_hash = generate_to_address(
+            &node,
+            &json!([1, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"]),
+        )
+        .unwrap()[0]
+            .as_str()
+            .unwrap()
+            .parse::<BlockHash>()
+            .unwrap();
+        let mined = node.chain.write().block(&mined_hash).unwrap().unwrap();
+        assert_eq!(
+            get_block_template(
+                &node,
+                &json!([{"mode": "proposal", "data": hex::encode(serialize(&mined))}]),
+            )
+            .unwrap(),
+            json!("duplicate")
         );
     }
 

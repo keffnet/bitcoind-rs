@@ -66,9 +66,9 @@ impl Default for ElectrumSession {
 
 #[derive(Clone, Debug)]
 enum Subscription {
-    Scripthash(String),
-    Scriptpubkey(String),
-    Outpoint(OutPoint),
+    Scripthash { script_hash: String, status: Value },
+    Scriptpubkey { script_hash: String, status: Value },
+    Outpoint { outpoint: OutPoint, status: Value },
 }
 
 pub struct ElectrumServer {
@@ -132,12 +132,12 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         write_half.write_all(&encoded).await?;
                     }
                 }
-                send_status_notifications(&node, &subscriptions, &mut write_half).await?;
+                send_status_notifications(&node, &mut subscriptions, &mut write_half).await?;
             }
             event = mempool_events.recv() => {
                 match event {
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        send_status_notifications(&node, &subscriptions, &mut write_half).await?;
+                        send_status_notifications(&node, &mut subscriptions, &mut write_half).await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
@@ -236,13 +236,17 @@ fn dispatch_with_session(
         }
         "blockchain.scripthash.subscribe" => {
             let script_hash = script_hash_param(params, 0)?;
+            let status = history_status_for_script(node, &script_hash)
+                .map(Value::String)
+                .unwrap_or(Value::Null);
             subscriptions.insert(
                 format!("scripthash:{script_hash}"),
-                Subscription::Scripthash(script_hash.clone()),
+                Subscription::Scripthash {
+                    script_hash,
+                    status: status.clone(),
+                },
             );
-            Ok(history_status_for_script(node, &script_hash)
-                .map(Value::String)
-                .unwrap_or(Value::Null))
+            Ok(status)
         }
         "blockchain.scripthash.unsubscribe" => {
             let script_hash = script_hash_param(params, 0)?;
@@ -271,13 +275,17 @@ fn dispatch_with_session(
         }
         "blockchain.scriptpubkey.subscribe" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
+            let status = history_status_for_script(node, &script_hash)
+                .map(Value::String)
+                .unwrap_or(Value::Null);
             subscriptions.insert(
                 format!("scriptpubkey:{script_hash}"),
-                Subscription::Scriptpubkey(script_hash.clone()),
+                Subscription::Scriptpubkey {
+                    script_hash,
+                    status: status.clone(),
+                },
             );
-            Ok(history_status_for_script(node, &script_hash)
-                .map(Value::String)
-                .unwrap_or(Value::Null))
+            Ok(status)
         }
         "blockchain.scriptpubkey.unsubscribe" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
@@ -297,11 +305,15 @@ fn dispatch_with_session(
         "blockchain.outpoint.subscribe" => {
             let outpoint = outpoint_param(params)?;
             let _ = scriptpubkey_param(params, 2)?;
+            let status = outpoint_status(node, &outpoint)?;
             subscriptions.insert(
                 outpoint_subscription_key(&outpoint),
-                Subscription::Outpoint(outpoint),
+                Subscription::Outpoint {
+                    outpoint,
+                    status: status.clone(),
+                },
             );
-            outpoint_status(node, &outpoint)
+            Ok(status)
         }
         "blockchain.outpoint.get_status" => {
             let outpoint = outpoint_param(params)?;
@@ -1019,30 +1031,57 @@ fn transaction_test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<V
 
 async fn send_status_notifications(
     node: &Arc<Node>,
-    subscriptions: &HashMap<String, Subscription>,
+    subscriptions: &mut HashMap<String, Subscription>,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
 ) -> Result<()> {
-    for subscription in subscriptions.values() {
+    for subscription in subscriptions.values_mut() {
         let notification = match subscription {
-            Subscription::Scripthash(script_hash) => json!({
-                "jsonrpc": "2.0",
-                "method": "blockchain.scripthash.subscribe",
-                "params": [script_hash, history_status_for_script(node, script_hash)],
-            }),
-            Subscription::Scriptpubkey(script_hash) => json!({
-                "jsonrpc": "2.0",
-                "method": "blockchain.scriptpubkey.subscribe",
-                "params": [script_hash, history_status_for_script(node, script_hash)],
-            }),
-            Subscription::Outpoint(outpoint) => json!({
-                "jsonrpc": "2.0",
-                "method": "blockchain.outpoint.subscribe",
-                "params": [
-                    outpoint.txid.to_string(),
-                    outpoint.vout,
-                    outpoint_status(node, outpoint)?,
-                ],
-            }),
+            Subscription::Scripthash {
+                script_hash,
+                status,
+            } => {
+                let current = history_status_for_script(node, script_hash)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null);
+                if *status == current {
+                    continue;
+                }
+                *status = current.clone();
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "blockchain.scripthash.subscribe",
+                    "params": [script_hash, current],
+                })
+            }
+            Subscription::Scriptpubkey {
+                script_hash,
+                status,
+            } => {
+                let current = history_status_for_script(node, script_hash)
+                    .map(Value::String)
+                    .unwrap_or(Value::Null);
+                if *status == current {
+                    continue;
+                }
+                *status = current.clone();
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "blockchain.scriptpubkey.subscribe",
+                    "params": [script_hash, current],
+                })
+            }
+            Subscription::Outpoint { outpoint, status } => {
+                let current = outpoint_status(node, outpoint)?;
+                if *status == current {
+                    continue;
+                }
+                *status = current.clone();
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "blockchain.outpoint.subscribe",
+                    "params": [outpoint.txid.to_string(), outpoint.vout, current],
+                })
+            }
         };
         let mut encoded = serde_json::to_vec(&notification)?;
         encoded.push(b'\n');

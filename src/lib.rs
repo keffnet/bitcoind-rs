@@ -35,7 +35,9 @@ use tracing::info;
 
 use crate::chain::ChainState;
 use crate::config::Config;
-use crate::mempool::{Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolPolicy};
+use crate::mempool::{
+    Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
+};
 
 const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
@@ -388,7 +390,7 @@ impl Node {
             import_external_block_file(&mut chain, path, config.network)?;
         }
         chain.maybe_auto_prune()?;
-        let mempool_path = config.datadir.join("mempool.json");
+        let mempool_path = config.datadir.join("mempool.dat");
         let mempool_policy = MempoolPolicy {
             min_relay_fee_sat_per_kvb: config.min_relay_tx_fee_sat_per_kvb,
             incremental_relay_fee_sat_per_kvb: config.incremental_relay_fee_sat_per_kvb,
@@ -400,7 +402,18 @@ impl Node {
             Mempool::with_max_bytes_and_policy(config.network, max_mempool_bytes, mempool_policy);
         if config.persist_mempool {
             let expiry = Duration::from_secs(config.mempool_expiry_hours.saturating_mul(60 * 60));
-            mempool.load_from_file_with_expiry(&mempool_path, &chain, expiry)?;
+            let legacy_mempool_path = config.datadir.join("mempool.json");
+            let load_path = mempool_path
+                .exists()
+                .then_some(mempool_path.as_path())
+                .or_else(|| {
+                    legacy_mempool_path
+                        .exists()
+                        .then_some(legacy_mempool_path.as_path())
+                });
+            if let Some(load_path) = load_path {
+                mempool.load_from_file_with_expiry(load_path, &chain, expiry)?;
+            }
         }
         let _ = mempool.take_changes();
         let banned_addresses = load_banlist(&config.datadir)?;
@@ -1420,6 +1433,20 @@ impl Node {
     }
 
     pub fn import_mempool(&self, path: impl AsRef<Path>) -> Result<()> {
+        self.import_mempool_with_options(
+            path,
+            MempoolLoadOptions {
+                use_current_time: true,
+                apply_fee_delta_priority: false,
+            },
+        )
+    }
+
+    pub fn import_mempool_with_options(
+        &self,
+        path: impl AsRef<Path>,
+        options: MempoolLoadOptions,
+    ) -> Result<()> {
         let chain = self.chain.read();
         let (result, changed, changes) = {
             let mut mempool = self.mempool.write();
@@ -1429,7 +1456,12 @@ impl Node {
                 .collect::<HashSet<_>>();
             let expiry =
                 Duration::from_secs(self.config.mempool_expiry_hours.saturating_mul(60 * 60));
-            let result = mempool.load_from_file_with_expiry(path.as_ref(), &chain, expiry);
+            let result = mempool.load_from_file_with_expiry_and_options(
+                path.as_ref(),
+                &chain,
+                expiry,
+                options,
+            );
             let after = mempool
                 .transaction_order()
                 .into_iter()

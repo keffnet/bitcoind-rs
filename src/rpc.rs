@@ -44,8 +44,8 @@ use crate::Node;
 use crate::chain;
 use crate::mempool::{
     MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool,
-    MempoolError, package_is_child_with_parents_tree, package_is_topologically_sorted,
-    package_weight,
+    MempoolError, MempoolLoadOptions, package_is_child_with_parents_tree,
+    package_is_topologically_sorted, package_weight,
 };
 use crate::validation;
 use crate::wire;
@@ -1093,7 +1093,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
             Some(&["txid", "verbose"])
         }
         "getmempoolcluster" => Some(&["txid"]),
-        "importmempool" => Some(&["filepath"]),
+        "importmempool" => Some(&["filepath", "options"]),
         "gettxoutsetinfo" => Some(&["hash_type", "hash_or_height", "use_index"]),
         "dumptxoutset" => Some(&["path", "type"]),
         "loadtxoutset" => Some(&["path"]),
@@ -1304,14 +1304,32 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getmempoolfeeratediagram" => get_mempool_fee_rate_diagram(node),
         "savemempool" => {
             node.persist_mempool()?;
-            Ok(json!(
-                node.config.datadir.join("mempool.json").to_string_lossy()
-            ))
+            Ok(json!({
+                "filename": node.config.datadir.join("mempool.dat").to_string_lossy(),
+            }))
         }
         "importmempool" => {
             let path = param::<String>(params, 0)?;
-            node.import_mempool(path)?;
-            Ok(Value::Null)
+            let options = params
+                .get(1)
+                .filter(|value| !value.is_null())
+                .and_then(Value::as_object);
+            let use_current_time = options
+                .and_then(|options| options.get("use_current_time"))
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let apply_fee_delta_priority = options
+                .and_then(|options| options.get("apply_fee_delta_priority"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            node.import_mempool_with_options(
+                path,
+                MempoolLoadOptions {
+                    use_current_time,
+                    apply_fee_delta_priority,
+                },
+            )?;
+            Ok(json!({}))
         }
         "gettxoutsetinfo" => get_txout_set_info(node, params),
         "dumptxoutset" => dump_txoutset(node, params),
@@ -13884,7 +13902,7 @@ mod tests {
     }
 
     #[test]
-    fn importmempool_round_trips_the_wallet_free_json_pool() {
+    fn importmempool_round_trips_a_wallet_free_pool() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
             network: Network::Regtest,
@@ -13953,7 +13971,7 @@ mod tests {
                 &json!([path.to_string_lossy().to_string()]),
             )
             .unwrap(),
-            Value::Null
+            json!({})
         );
         assert!(node.mempool.read().get(&txid).is_some());
     }

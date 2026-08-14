@@ -6,9 +6,11 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bitcoin::blockdata::script::Instruction;
+use bitcoin::consensus::encode::{VarInt, deserialize_partial, serialize};
 use bitcoin::{Amount, Network, OutPoint, PublicKey, Script, Transaction, TxOut, Txid, Wtxid};
+use rand::random;
 use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainState;
@@ -22,6 +24,11 @@ use crate::validation::{self, ValidationError};
 
 const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300_000_000;
 pub(crate) const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const CORE_MEMPOOL_DUMP_VERSION_V1: u64 = 1;
+const CORE_MEMPOOL_DUMP_VERSION_V2: u64 = 2;
+const CORE_MEMPOOL_OBFUSCATION_KEY_SIZE: usize = 8;
+const MAX_CORE_MEMPOOL_TRANSACTIONS: usize = 1_000_000;
+const MAX_CORE_MEMPOOL_FILE_SIZE: usize = 2 * 1024 * 1024 * 1024;
 const ROLLING_FEE_HALFLIFE_SECS: f64 = 12.0 * 60.0 * 60.0;
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
@@ -70,6 +77,213 @@ pub const MAX_DATACARRIER_SIZE: usize = DEFAULT_MAX_DATACARRIER_BYTES as usize;
 struct DiskMempoolEntry {
     transaction: Transaction,
     added_at: u64,
+}
+
+struct CoreMempoolEntry {
+    transaction: Transaction,
+    added_at: u64,
+    fee_delta: i64,
+}
+
+type CoreMempoolDeltas = Vec<(Txid, i64)>;
+type DecodedCoreMempool = (Vec<CoreMempoolEntry>, CoreMempoolDeltas);
+
+#[derive(Clone, Copy, Debug)]
+pub struct MempoolLoadOptions {
+    pub use_current_time: bool,
+    pub apply_fee_delta_priority: bool,
+}
+
+impl Default for MempoolLoadOptions {
+    fn default() -> Self {
+        Self {
+            use_current_time: false,
+            apply_fee_delta_priority: true,
+        }
+    }
+}
+
+fn append_u64(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn append_i64(bytes: &mut Vec<u8>, value: i64) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_bytes<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+    what: &str,
+) -> Result<&'a [u8]> {
+    let end = offset
+        .checked_add(length)
+        .context("mempool file offset overflow")?;
+    if end > bytes.len() {
+        bail!("mempool file ended while reading {what}");
+    }
+    let result = &bytes[*offset..end];
+    *offset = end;
+    Ok(result)
+}
+
+fn read_u64(bytes: &[u8], offset: &mut usize, what: &str) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        read_bytes(bytes, offset, 8, what)?
+            .try_into()
+            .expect("read_bytes returned eight bytes"),
+    ))
+}
+
+fn read_i64(bytes: &[u8], offset: &mut usize, what: &str) -> Result<i64> {
+    Ok(i64::from_le_bytes(
+        read_bytes(bytes, offset, 8, what)?
+            .try_into()
+            .expect("read_bytes returned eight bytes"),
+    ))
+}
+
+fn read_varint(bytes: &[u8], offset: &mut usize, what: &str) -> Result<u64> {
+    let (value, consumed) = deserialize_partial::<VarInt>(
+        bytes
+            .get(*offset..)
+            .ok_or_else(|| anyhow::anyhow!("mempool file ended while reading {what}"))?,
+    )
+    .with_context(|| format!("decoding {what}"))?;
+    *offset = offset
+        .checked_add(consumed)
+        .context("mempool file offset overflow")?;
+    Ok(value.0)
+}
+
+fn xor_obfuscate(
+    bytes: &mut [u8],
+    key: &[u8; CORE_MEMPOOL_OBFUSCATION_KEY_SIZE],
+    file_offset: usize,
+) {
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        *byte ^= key[(file_offset + index) % CORE_MEMPOOL_OBFUSCATION_KEY_SIZE];
+    }
+}
+
+fn decode_core_mempool_payload(bytes: &[u8]) -> Result<DecodedCoreMempool> {
+    let mut offset = 0;
+    let transaction_count =
+        usize::try_from(read_u64(bytes, &mut offset, "mempool transaction count")?)
+            .context("mempool transaction count does not fit usize")?;
+    if transaction_count > MAX_CORE_MEMPOOL_TRANSACTIONS {
+        bail!("mempool transaction count is unreasonable");
+    }
+
+    let mut entries = Vec::with_capacity(transaction_count);
+    for _ in 0..transaction_count {
+        let (transaction, consumed) = deserialize_partial::<Transaction>(
+            bytes
+                .get(offset..)
+                .ok_or_else(|| anyhow::anyhow!("mempool file ended before a transaction"))?,
+        )
+        .context("decoding mempool transaction")?;
+        if consumed == 0 {
+            bail!("mempool transaction decoder consumed no bytes");
+        }
+        offset = offset
+            .checked_add(consumed)
+            .context("mempool file offset overflow")?;
+        let added_at = read_i64(bytes, &mut offset, "mempool transaction timestamp")?;
+        if added_at < 0 {
+            bail!("mempool transaction timestamp is negative");
+        }
+        let fee_delta = read_i64(bytes, &mut offset, "mempool transaction fee delta")?;
+        entries.push(CoreMempoolEntry {
+            transaction,
+            added_at: added_at as u64,
+            fee_delta,
+        });
+    }
+
+    let delta_count = usize::try_from(read_varint(bytes, &mut offset, "mempool fee-delta count")?)
+        .context("mempool fee-delta count does not fit usize")?;
+    if delta_count > MAX_CORE_MEMPOOL_TRANSACTIONS {
+        bail!("mempool fee-delta count is unreasonable");
+    }
+    let mut deltas = Vec::with_capacity(delta_count);
+    for _ in 0..delta_count {
+        let (txid, consumed) = deserialize_partial::<Txid>(
+            bytes
+                .get(offset..)
+                .ok_or_else(|| anyhow::anyhow!("mempool file ended before a fee delta"))?,
+        )
+        .context("decoding mempool fee-delta transaction id")?;
+        offset = offset
+            .checked_add(consumed)
+            .context("mempool file offset overflow")?;
+        deltas.push((txid, read_i64(bytes, &mut offset, "mempool fee delta")?));
+    }
+
+    let unbroadcast_count = usize::try_from(read_varint(
+        bytes,
+        &mut offset,
+        "mempool unbroadcast count",
+    )?)
+    .context("mempool unbroadcast count does not fit usize")?;
+    if unbroadcast_count > MAX_CORE_MEMPOOL_TRANSACTIONS {
+        bail!("mempool unbroadcast count is unreasonable");
+    }
+    for _ in 0..unbroadcast_count {
+        let (_, consumed) = deserialize_partial::<Txid>(
+            bytes
+                .get(offset..)
+                .ok_or_else(|| anyhow::anyhow!("mempool file ended before an unbroadcast id"))?,
+        )
+        .context("decoding mempool unbroadcast transaction id")?;
+        offset = offset
+            .checked_add(consumed)
+            .context("mempool file offset overflow")?;
+    }
+
+    if offset != bytes.len() {
+        bail!("mempool file contains trailing data");
+    }
+    Ok((entries, deltas))
+}
+
+fn decode_core_mempool(bytes: &[u8]) -> Result<DecodedCoreMempool> {
+    if bytes.len() > MAX_CORE_MEMPOOL_FILE_SIZE {
+        bail!("mempool file is too large");
+    }
+    let mut offset = 0;
+    let version = read_u64(bytes, &mut offset, "mempool dump version")?;
+    match version {
+        CORE_MEMPOOL_DUMP_VERSION_V1 => decode_core_mempool_payload(
+            bytes
+                .get(offset..)
+                .ok_or_else(|| anyhow::anyhow!("mempool file has no payload"))?,
+        ),
+        CORE_MEMPOOL_DUMP_VERSION_V2 => {
+            let key_length = usize::try_from(read_varint(
+                bytes,
+                &mut offset,
+                "mempool obfuscation key length",
+            )?)
+            .context("mempool obfuscation key length does not fit usize")?;
+            if key_length != CORE_MEMPOOL_OBFUSCATION_KEY_SIZE {
+                bail!("mempool obfuscation key must be eight bytes");
+            }
+            let key: [u8; CORE_MEMPOOL_OBFUSCATION_KEY_SIZE] =
+                read_bytes(bytes, &mut offset, key_length, "mempool obfuscation key")?
+                    .try_into()
+                    .expect("obfuscation key length was checked");
+            let payload_offset = offset;
+            let mut payload = bytes
+                .get(payload_offset..)
+                .ok_or_else(|| anyhow::anyhow!("mempool file has no payload"))?
+                .to_vec();
+            xor_obfuscate(&mut payload, &key, payload_offset);
+            decode_core_mempool_payload(&payload)
+        }
+        _ => bail!("unsupported mempool dump version {version}"),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -598,31 +812,106 @@ impl Mempool {
         chain: &ChainState,
         expiry: Duration,
     ) -> Result<()> {
+        self.load_from_file_with_expiry_and_options(
+            path,
+            chain,
+            expiry,
+            MempoolLoadOptions::default(),
+        )
+    }
+
+    pub fn load_from_file_with_expiry_and_options(
+        &mut self,
+        path: &Path,
+        chain: &ChainState,
+        expiry: Duration,
+        options: MempoolLoadOptions,
+    ) -> Result<()> {
         if !path.exists() {
             return Ok(());
         }
         let bytes = fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-        let entries: Vec<DiskMempoolEntry> = serde_json::from_slice(&bytes)
-            .with_context(|| format!("decoding {}", path.display()))?;
-        for entry in entries {
-            let _ = self.accept_at(entry.transaction, chain, entry.added_at);
-        }
         let now = time::unix_time();
+        if bytes.first() == Some(&b'[') {
+            let entries: Vec<DiskMempoolEntry> = serde_json::from_slice(&bytes)
+                .with_context(|| format!("decoding legacy JSON mempool {}", path.display()))?;
+            for entry in entries {
+                let added_at = if options.use_current_time {
+                    now
+                } else {
+                    entry.added_at
+                };
+                let _ = self.accept_at(entry.transaction, chain, added_at);
+            }
+        } else {
+            let (entries, deltas) = decode_core_mempool(&bytes)
+                .with_context(|| format!("decoding Core mempool {}", path.display()))?;
+            let cutoff = now.saturating_sub(expiry.as_secs());
+            for entry in entries {
+                let added_at = if options.use_current_time {
+                    now
+                } else {
+                    entry.added_at
+                };
+                if added_at > cutoff {
+                    let txid = entry.transaction.compute_txid();
+                    if self.accept_at(entry.transaction, chain, added_at).is_ok()
+                        && options.apply_fee_delta_priority
+                        && entry.fee_delta != 0
+                    {
+                        self.prioritise(txid, entry.fee_delta);
+                    }
+                }
+            }
+            if options.apply_fee_delta_priority {
+                for (txid, fee_delta) in deltas {
+                    self.prioritise(txid, fee_delta);
+                }
+            }
+        }
         self.clear_expired(now, expiry);
         Ok(())
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
-        let entries = self
-            .transaction_order()
-            .into_iter()
-            .filter_map(|txid| self.entries.get(&txid))
-            .map(|entry| DiskMempoolEntry {
-                transaction: entry.transaction.clone(),
-                added_at: entry.added_at,
-            })
+        let mut payload = Vec::new();
+        let transaction_ids = self.transaction_order();
+        append_u64(&mut payload, transaction_ids.len() as u64);
+        let mut serialized_transactions = HashSet::with_capacity(transaction_ids.len());
+        for txid in transaction_ids {
+            let Some(entry) = self.entries.get(&txid) else {
+                continue;
+            };
+            payload.extend_from_slice(&serialize(&entry.transaction));
+            append_i64(
+                &mut payload,
+                i64::try_from(entry.added_at).unwrap_or(i64::MAX),
+            );
+            append_i64(&mut payload, self.fee_delta(&txid));
+            serialized_transactions.insert(txid);
+        }
+
+        let deltas = self
+            .priorities
+            .iter()
+            .filter(|(txid, _)| !serialized_transactions.contains(*txid))
             .collect::<Vec<_>>();
-        let bytes = serde_json::to_vec(&entries)?;
+        payload.extend_from_slice(&serialize(&VarInt(deltas.len() as u64)));
+        for (txid, fee_delta) in deltas {
+            payload.extend_from_slice(&serialize(txid));
+            append_i64(&mut payload, *fee_delta);
+        }
+        // The node does not maintain Core's unbroadcast set yet, but the
+        // empty set is part of the v2 mempool.dat wire format.
+        payload.extend_from_slice(&serialize(&VarInt(0)));
+
+        let key = random::<[u8; CORE_MEMPOOL_OBFUSCATION_KEY_SIZE]>();
+        let mut bytes = Vec::with_capacity(17 + payload.len());
+        append_u64(&mut bytes, CORE_MEMPOOL_DUMP_VERSION_V2);
+        bytes.extend_from_slice(&serialize(&key.to_vec()));
+        let payload_offset = bytes.len();
+        xor_obfuscate(&mut payload, &key, payload_offset);
+        bytes.extend_from_slice(&payload);
         let temp = path.with_file_name(format!(
             "{}.tmp",
             path.file_name().unwrap_or_default().to_string_lossy()
@@ -2031,12 +2320,52 @@ mod tests {
     fn persists_and_loads_an_empty_pool() {
         let directory = tempfile::tempdir().unwrap();
         let chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
-        let path = directory.path().join("mempool.json");
+        let path = directory.path().join("mempool.dat");
         let pool = Mempool::new(Network::Regtest);
         pool.save_to_file(&path).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 2);
         let mut loaded = Mempool::new(Network::Regtest);
         loaded.load_from_file(&path, &chain).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn round_trips_core_v2_entries_and_fee_deltas() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mempool.dat");
+        let transaction = graph_transaction(Txid::from_byte_array([7; 32]), 7);
+        let txid = transaction.compute_txid();
+        let mut pool = Mempool::new(Network::Regtest);
+        let inserted = insert_policy_entry(&mut pool, transaction.clone());
+        assert_eq!(inserted, txid);
+        pool.prioritise(txid, 123);
+
+        pool.save_to_file(&path).unwrap();
+        let bytes = fs::read(path).unwrap();
+        let (entries, deltas) = decode_core_mempool(&bytes).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].transaction, transaction);
+        assert_eq!(entries[0].fee_delta, 123);
+        assert!(deltas.is_empty());
+    }
+
+    #[test]
+    fn decodes_core_v1_fee_delta_records_without_obfuscation() {
+        let txid = Txid::from_byte_array([8; 32]);
+        let mut payload = Vec::new();
+        append_u64(&mut payload, 0);
+        payload.extend_from_slice(&serialize(&VarInt(1)));
+        payload.extend_from_slice(&serialize(&txid));
+        append_i64(&mut payload, -42);
+        payload.extend_from_slice(&serialize(&VarInt(0)));
+
+        let mut bytes = Vec::new();
+        append_u64(&mut bytes, CORE_MEMPOOL_DUMP_VERSION_V1);
+        bytes.extend_from_slice(&payload);
+        let (entries, deltas) = decode_core_mempool(&bytes).unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(deltas, vec![(txid, -42)]);
     }
 
     #[test]

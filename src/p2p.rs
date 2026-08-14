@@ -211,6 +211,8 @@ const KNOWN_TX_FILTER_BITS: usize = 1 << 20;
 const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
+const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(2 * 60);
+const HEADERS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
 const MAX_PEER_TX_ANNOUNCEMENTS: usize = 5_000;
 const MAX_PEER_TX_REQUEST_IN_FLIGHT: usize = 100;
@@ -274,6 +276,14 @@ fn addr_fetch_timed_out(connected_at: u64, now: u64) -> bool {
     now.saturating_sub(connected_at) > ADDR_FETCH_TIMEOUT_SECS
 }
 
+fn headers_request_is_due(last_request: Option<Instant>) -> bool {
+    last_request.is_none_or(|sent| sent.elapsed() >= HEADERS_RESPONSE_TIME)
+}
+
+fn headers_download_timed_out(last_request: Option<Instant>) -> bool {
+    last_request.is_some_and(|sent| sent.elapsed() > HEADERS_DOWNLOAD_TIMEOUT)
+}
+
 struct PeerState {
     writer: PeerWriter,
     connection_type: &'static str,
@@ -286,6 +296,7 @@ struct PeerState {
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
+    last_headers_request: parking_lot::Mutex<Option<Instant>>,
     compact_block_version: parking_lot::Mutex<Option<u64>>,
     compact_block_announce: parking_lot::Mutex<bool>,
     tx_reconciliation_salt: parking_lot::Mutex<Option<u64>>,
@@ -1281,6 +1292,7 @@ async fn serve_peer(
         relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
+        last_headers_request: parking_lot::Mutex::new(None),
         compact_block_version: parking_lot::Mutex::new(None),
         compact_block_announce: parking_lot::Mutex::new(false),
         tx_reconciliation_salt: parking_lot::Mutex::new(None),
@@ -1481,6 +1493,9 @@ async fn serve_peer_loop(
                 continue;
             }
             _ = tx_inventory_interval.tick(), if version_received && verack_received => {
+                if headers_download_timed_out(*peer_state.last_headers_request.lock()) {
+                    anyhow::bail!("peer timed out responding to getheaders");
+                }
                 if node.peer_block_download_timed_out(peer_id) {
                     anyhow::bail!("peer timed out downloading blocks");
                 }
@@ -1599,7 +1614,7 @@ async fn serve_peer_loop(
                 )
                 .await?;
                 if connection_requests_headers(peer_state.connection_type) {
-                    request_headers(node, peer_id, writer).await?;
+                    request_headers(node, peer_id, writer, peer_state).await?;
                 }
                 if connection_fetches_addresses(outbound, peer_state.connection_type) {
                     send_message(
@@ -1704,6 +1719,8 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::Headers(headers) => {
+                let request_more_headers = headers.len() == 2_000;
+                *peer_state.last_headers_request.lock() = None;
                 if headers.is_empty() {
                     continue;
                 }
@@ -1732,8 +1749,9 @@ async fn serve_peer_loop(
                         &mut pending_block_requests,
                     )
                     .await?;
-                } else {
-                    request_headers(node, peer_id, writer).await?;
+                }
+                if request_more_headers {
+                    request_headers(node, peer_id, writer, peer_state).await?;
                 }
             }
             Message::Inv(items) => {
@@ -1841,7 +1859,7 @@ async fn serve_peer_loop(
                 )
                 .await?;
                 if needs_headers {
-                    request_headers(node, peer_id, writer).await?;
+                    request_headers(node, peer_id, writer, peer_state).await?;
                 }
             }
             Message::GetData(items) => {
@@ -2044,7 +2062,6 @@ async fn serve_peer_loop(
                     &mut pending_block_requests,
                 )
                 .await?;
-                request_headers(node, peer_id, writer).await?;
             }
             Message::CompactBlock(compact) => {
                 let hash = compact.header.block_hash();
@@ -2068,7 +2085,6 @@ async fn serve_peer_loop(
                                 if handle_received_block(node, peers, peer_id, block).await {
                                     node.record_peer_block(peer_id, block_hash);
                                 }
-                                request_headers(node, peer_id, writer).await?;
                             }
                             Err(error) => {
                                 debug!(%hash, %error, "invalid compact block reconstruction");
@@ -2219,7 +2235,6 @@ async fn serve_peer_loop(
                         if handle_received_block(node, peers, peer_id, block).await {
                             node.record_peer_block(peer_id, block_hash);
                         }
-                        request_headers(node, peer_id, writer).await?;
                     }
                     Err(error) => {
                         let hash = pending.compact.header.block_hash();
@@ -3008,7 +3023,19 @@ async fn send_peer_extensions(
     Ok(())
 }
 
-async fn request_headers(node: &Arc<Node>, peer_id: usize, writer: &PeerWriter) -> Result<()> {
+async fn request_headers(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    peer_state: &PeerState,
+) -> Result<()> {
+    {
+        let mut last_request = peer_state.last_headers_request.lock();
+        if !headers_request_is_due(*last_request) {
+            return Ok(());
+        }
+        *last_request = Some(Instant::now());
+    }
     let locator = node.chain.read().block_locator_hashes();
     send_message(
         node,
@@ -3637,6 +3664,7 @@ mod tests {
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(true),
             send_headers: parking_lot::Mutex::new(false),
+            last_headers_request: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),
             compact_block_announce: parking_lot::Mutex::new(false),
             tx_reconciliation_salt: parking_lot::Mutex::new(None),
@@ -3701,6 +3729,21 @@ mod tests {
         assert!(!addr_fetch_timed_out(1_000, 1_300));
         assert!(addr_fetch_timed_out(1_000, 1_301));
         assert!(!addr_fetch_timed_out(1_000, 999));
+    }
+
+    #[test]
+    fn headers_request_rate_limit_and_timeout_match_core_windows() {
+        assert!(headers_request_is_due(None));
+        let now = Instant::now();
+        assert!(!headers_request_is_due(Some(now)));
+        assert!(headers_request_is_due(Some(
+            now.checked_sub(HEADERS_RESPONSE_TIME).unwrap()
+        )));
+
+        assert!(!headers_download_timed_out(Some(now)));
+        assert!(headers_download_timed_out(Some(
+            now.checked_sub(HEADERS_DOWNLOAD_TIMEOUT).unwrap()
+        )));
     }
 
     #[test]
@@ -4503,6 +4546,7 @@ mod tests {
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(false),
             send_headers: parking_lot::Mutex::new(false),
+            last_headers_request: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),
             compact_block_announce: parking_lot::Mutex::new(false),
             tx_reconciliation_salt: parking_lot::Mutex::new(None),

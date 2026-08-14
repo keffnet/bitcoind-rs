@@ -1564,6 +1564,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     if let Some(min_ping) = peer.min_ping {
                         info["minping"] = json!(min_ping);
                     }
+                    if let Some(ping_wait) = peer.ping_wait().filter(|wait| *wait > 0.0) {
+                        info["pingwait"] = json!(ping_wait);
+                    }
                     info
                 })
                 .collect::<Vec<_>>()
@@ -12975,6 +12978,22 @@ mod tests {
         assert_eq!(
             dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["timeoffset"],
             json!(42)
+        );
+        node.ping_peers();
+        let pinging = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
+        assert!(
+            pinging[0]["pingwait"]
+                .as_f64()
+                .is_some_and(|wait| wait > 0.0)
+        );
+        let crate::p2p::PeerCommand::Ping(nonce) = receiver.try_recv().unwrap() else {
+            panic!("expected ping command");
+        };
+        node.record_pong(7, nonce);
+        assert!(
+            dispatch_method(&node, "getpeerinfo", &json!([])).unwrap()[0]
+                .get("pingwait")
+                .is_none()
         );
         assert_eq!(
             dispatch_method(&node, "sendmsgtopeer", &json!([7, "test", "0102"]),).unwrap(),

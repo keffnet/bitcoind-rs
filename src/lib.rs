@@ -331,6 +331,13 @@ pub struct PeerInfo {
     ping_sent_at: Option<Instant>,
 }
 
+impl PeerInfo {
+    pub(crate) fn ping_wait(&self) -> Option<f64> {
+        self.ping_sent_at
+            .map(|sent_at| sent_at.elapsed().as_secs_f64())
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BannedAddress {
     pub address: IpAddr,

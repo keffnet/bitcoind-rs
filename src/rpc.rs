@@ -1495,7 +1495,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                         "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
                         "bytessent_per_msg": peer.bytes_sent_per_msg,
                         "bytesrecv_per_msg": peer.bytes_received_per_msg,
-                        "connection_type": peer.connection_type,
+                        "connection_type": rpc_connection_type(peer.connection_type),
                         "transport_protocol_type": peer.transport_protocol_type,
                         "session_id": "",
                     });
@@ -10220,6 +10220,13 @@ fn network_name(network: Network) -> &'static str {
     }
 }
 
+fn rpc_connection_type(connection_type: &str) -> &str {
+    match connection_type {
+        "outbound-full" => "outbound-full-relay",
+        other => other,
+    }
+}
+
 fn method_params_string(params: &Value) -> &str {
     params.get(0).and_then(Value::as_str).unwrap_or("")
 }
@@ -11101,6 +11108,13 @@ mod tests {
         assert!(optional_bool(&json!([true]), 0, false, "flag").unwrap());
         assert!(optional_bool(&json!([1]), 0, true, "flag").is_err());
         assert!(optional_bool(&json!(["true"]), 0, true, "flag").is_err());
+    }
+
+    #[test]
+    fn rpc_connection_types_use_core_names() {
+        assert_eq!(rpc_connection_type("outbound-full"), "outbound-full-relay");
+        assert_eq!(rpc_connection_type("block-relay-only"), "block-relay-only");
+        assert_eq!(rpc_connection_type("addr-fetch"), "addr-fetch");
     }
 
     #[tokio::test]
@@ -12778,7 +12792,10 @@ mod tests {
         node.update_peer_time_offset(7, 42);
         let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(peer_info[0]["id"], json!(7));
-        assert_eq!(peer_info[0]["connection_type"], json!("outbound-full"));
+        assert_eq!(
+            peer_info[0]["connection_type"],
+            json!("outbound-full-relay")
+        );
         assert_eq!(peer_info[0]["presynced_headers"], json!(-1));
         assert_eq!(peer_info[0]["transport_protocol_type"], json!("v1"));
         assert!(peer_info[0].get("startingheight").is_none());

@@ -844,7 +844,7 @@ async fn serve_peer(
         bloom_filter: parking_lot::Mutex::new(None),
         known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
         fee_filter: parking_lot::Mutex::new(0),
-        relay_transactions: parking_lot::Mutex::new(true),
+        relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
         compact_block_version: parking_lot::Mutex::new(None),

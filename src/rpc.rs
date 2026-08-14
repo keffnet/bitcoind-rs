@@ -1438,6 +1438,14 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             node.peer_infos()
                 .into_iter()
                 .map(|peer| {
+                    let (synced_headers, synced_blocks) = {
+                        let chain = node.chain.read();
+                        if peer.version.is_some() {
+                            (chain.best_header_tip().height as i64, chain.height() as i64)
+                        } else {
+                            (-1, -1)
+                        }
+                    };
                     let mut info = json!({
                         "id": peer.id,
                         "addr": peer.address.to_string(),
@@ -1461,8 +1469,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                         "bip152_hb_to": false,
                         "bip152_hb_from": false,
                         "presynced_headers": -1,
-                        "synced_headers": node.chain.read().best_header_tip().height,
-                        "synced_blocks": node.chain.read().height(),
+                        "synced_headers": synced_headers,
+                        "synced_blocks": synced_blocks,
                         "inflight": [],
                         "addr_relay_enabled": true,
                         "addr_processed": peer.addr_processed,
@@ -12348,6 +12356,10 @@ mod tests {
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
+        let unversioned_peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
+        assert_eq!(unversioned_peer_info[0]["relaytxes"], json!(false));
+        assert_eq!(unversioned_peer_info[0]["synced_headers"], json!(-1));
+        assert_eq!(unversioned_peer_info[0]["synced_blocks"], json!(-1));
         node.update_peer_version(7, 70016, 0, "/test-peer/", 0, true);
         node.update_peer_time_offset(7, 42);
         let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();

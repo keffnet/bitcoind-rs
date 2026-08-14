@@ -2783,6 +2783,11 @@ mod tests {
         let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert!(reopened.basic_filter_cache.is_empty());
         assert_eq!(
+            reopened.basic_filter_header_for_block(&tip_hash).unwrap(),
+            Some(expected.1)
+        );
+        assert!(reopened.basic_filter_cache.is_empty());
+        assert_eq!(
             reopened.basic_filter_for_block(&tip_hash).unwrap(),
             Some(expected)
         );

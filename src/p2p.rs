@@ -62,6 +62,7 @@ const TX_RECONCILIATION_VERSION: u32 = 1;
 const KNOWN_TX_FILTER_BITS: usize = 1 << 20;
 const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
+const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 
 fn local_transaction_relay_enabled(connection_type: &str, blocksonly: bool) -> bool {
     !blocksonly && matches!(connection_type, "outbound-full" | "inbound" | "addr-fetch")
@@ -73,6 +74,10 @@ fn connection_requests_headers(connection_type: &str) -> bool {
 
 fn connection_fetches_addresses(outbound: bool, connection_type: &str) -> bool {
     outbound && connection_type != "block-relay-only" && connection_type != "feeler"
+}
+
+fn addr_fetch_timed_out(connected_at: u64, now: u64) -> bool {
+    now.saturating_sub(connected_at) > ADDR_FETCH_TIMEOUT_SECS
 }
 
 struct PeerState {
@@ -954,6 +959,9 @@ async fn serve_peer_loop(
     let peer_timeout = Duration::from_secs(node.config.peer_timeout_secs);
     let mut ping_interval = tokio::time::interval(Duration::from_secs(120));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let addr_fetch_started_at = unix_time_seconds();
+    let mut addr_fetch_interval = tokio::time::interval(Duration::from_secs(1));
+    addr_fetch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if !node.network_active() {
             anyhow::bail!("networking is disabled");
@@ -1025,6 +1033,12 @@ async fn serve_peer_loop(
                         &Message::Ping(nonce),
                     )
                     .await?;
+                }
+                continue;
+            }
+            _ = addr_fetch_interval.tick(), if peer_state.connection_type == "addr-fetch" => {
+                if addr_fetch_timed_out(addr_fetch_started_at, unix_time_seconds()) {
+                    anyhow::bail!("addr-fetch connection timed out");
                 }
                 continue;
             }
@@ -2665,6 +2679,13 @@ mod tests {
         assert!(!connection_fetches_addresses(true, "block-relay-only"));
         assert!(!connection_fetches_addresses(true, "feeler"));
         assert!(!connection_fetches_addresses(false, "inbound"));
+    }
+
+    #[test]
+    fn addr_fetch_timeout_matches_core_boundary() {
+        assert!(!addr_fetch_timed_out(1_000, 1_300));
+        assert!(addr_fetch_timed_out(1_000, 1_301));
+        assert!(!addr_fetch_timed_out(1_000, 999));
     }
 
     #[test]

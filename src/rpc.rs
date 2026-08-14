@@ -7539,6 +7539,7 @@ fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Val
                     .redeem_script
                     .as_ref()
                     .is_some_and(|script| script.is_witness_program()))
+            && !is_p2a_script(&prevout.output.script_pubkey)
         {
             bail!("Missing amount")
         }
@@ -7690,6 +7691,10 @@ fn sign_transaction_input(
     } else {
         (&prevout.output.script_pubkey, false)
     };
+
+    if is_p2a_script(signing_script) {
+        return Ok(());
+    }
 
     if signing_script.is_p2tr() {
         let previous_outputs = previous_outputs
@@ -14373,6 +14378,42 @@ mod tests {
         assert_eq!(
             taproot_explicit_signed.input[0].witness.to_vec()[0].len(),
             65
+        );
+
+        let anchor_previous_txid = Txid::from_byte_array([11; 32]);
+        let anchor_previous_script = ScriptBuf::new_p2a();
+        let anchor_unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(anchor_previous_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let anchor_raw = hex::encode(serialize(&anchor_unsigned));
+        let anchor_result = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                anchor_raw,
+                [],
+                [{
+                    "txid": anchor_previous_txid.to_string(),
+                    "vout": 0,
+                    "scriptPubKey": hex::encode(anchor_previous_script.as_bytes()),
+                }],
+            ]),
+        )
+        .unwrap();
+        assert_eq!(anchor_result["complete"], true);
+        assert_eq!(
+            anchor_result["hex"],
+            hex::encode(serialize(&anchor_unsigned))
         );
 
         let second_secret = bitcoin::secp256k1::SecretKey::from_slice(&[2; 32]).unwrap();

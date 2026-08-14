@@ -1011,6 +1011,9 @@ fn transaction_test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<V
         .get(0)
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("testmempoolaccept expects an array of transactions"))?;
+    if raw_transactions.is_empty() {
+        return Ok(json!([]));
+    }
     crate::rpc::test_mempool_accept(node, &json!([raw_transactions]))
 }
 

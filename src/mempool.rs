@@ -17,6 +17,10 @@ const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
 const MIN_RELAY_SAT_PER_VBYTE: u64 = 1;
 const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
+/// Core's context-free package limits.
+pub const MAX_PACKAGE_COUNT: usize = 25;
+pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
+
 #[derive(Deserialize, Serialize)]
 struct DiskMempoolEntry {
     transaction: Transaction,
@@ -409,8 +413,17 @@ impl Mempool {
         let mut accepted = Vec::with_capacity(transactions.len());
         let mut package_fee = 0u64;
         let mut package_vsize = 0u64;
-        let allow_low_fee_parent = is_one_parent_one_child_package(transactions);
+        let allow_low_fee_parent = package_is_child_with_parents_tree(transactions);
+        let mut new_count = 0usize;
         for transaction in transactions {
+            let txid = transaction.compute_txid();
+            if let Some(existing) = candidate.get(&txid) {
+                if existing.transaction.compute_wtxid() != transaction.compute_wtxid() {
+                    return Err(MempoolError::AlreadyPresent);
+                }
+                accepted.push(txid);
+                continue;
+            }
             let txid = candidate.accept_at_with_policy(
                 transaction.clone(),
                 chain,
@@ -421,14 +434,19 @@ impl Mempool {
             package_fee = package_fee.saturating_add(entry.fee_sat);
             package_vsize = package_vsize.saturating_add(entry.vsize);
             accepted.push(txid);
+            new_count += 1;
         }
-        if allow_low_fee_parent {
-            let child = candidate.get(&accepted[1]).ok_or(MempoolError::BadOutput)?;
+        if allow_low_fee_parent && new_count > 0 {
+            let child_txid = transactions
+                .last()
+                .ok_or(MempoolError::Empty)?
+                .compute_txid();
+            let child = candidate.get(&child_txid).ok_or(MempoolError::BadOutput)?;
             if child.fee_sat < child.vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
                 return Err(MempoolError::FeeRate);
             }
         }
-        if package_fee < package_vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
+        if new_count > 0 && package_fee < package_vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
             return Err(MempoolError::FeeRate);
         }
         *self = candidate;
@@ -819,15 +837,51 @@ fn signals_replaceability(transaction: &Transaction) -> bool {
         .any(|input| input.sequence.to_consensus_u32() < 0xffff_fffe)
 }
 
-fn is_one_parent_one_child_package(transactions: &[Transaction]) -> bool {
-    if transactions.len() != 2 {
+pub fn package_is_topologically_sorted(transactions: &[Transaction]) -> bool {
+    let positions = transactions
+        .iter()
+        .enumerate()
+        .map(|(index, transaction)| (transaction.compute_txid(), index))
+        .collect::<HashMap<_, _>>();
+    transactions.iter().enumerate().all(|(index, transaction)| {
+        transaction.input.iter().all(|input| {
+            positions
+                .get(&input.previous_output.txid)
+                .is_none_or(|parent_index| *parent_index < index)
+        })
+    })
+}
+
+pub fn package_is_child_with_parents_tree(transactions: &[Transaction]) -> bool {
+    if transactions.len() < 2 || !package_is_topologically_sorted(transactions) {
         return false;
     }
-    let parent_txid = transactions[0].compute_txid();
-    transactions[1]
-        .input
+    let child = transactions.last().expect("package length checked");
+    let parent_txids = transactions[..transactions.len() - 1]
         .iter()
-        .any(|input| input.previous_output.txid == parent_txid)
+        .map(Transaction::compute_txid)
+        .collect::<HashSet<_>>();
+    if parent_txids.len() != transactions.len() - 1 {
+        return false;
+    }
+    transactions[..transactions.len() - 1].iter().all(|parent| {
+        parent
+            .input
+            .iter()
+            .all(|input| !parent_txids.contains(&input.previous_output.txid))
+    }) && transactions[..transactions.len() - 1].iter().all(|parent| {
+        child
+            .input
+            .iter()
+            .any(|input| input.previous_output.txid == parent.compute_txid())
+    })
+}
+
+pub fn package_weight(transactions: &[Transaction]) -> u64 {
+    transactions
+        .iter()
+        .map(|transaction| transaction.weight().to_wu())
+        .sum()
 }
 
 impl From<ValidationError> for MempoolError {

@@ -40,7 +40,10 @@ use tracing::debug;
 
 use crate::Node;
 use crate::chain;
-use crate::mempool::Mempool;
+use crate::mempool::{
+    MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool, MempoolError,
+    package_is_child_with_parents_tree, package_is_topologically_sorted, package_weight,
+};
 use crate::validation;
 use crate::wire;
 
@@ -7420,138 +7423,259 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
     }))
 }
 
+fn package_policy_error(transactions: &[Transaction]) -> Option<&'static str> {
+    if transactions.len() > MAX_PACKAGE_COUNT || package_weight(transactions) > MAX_PACKAGE_WEIGHT {
+        return Some("package-too-large");
+    }
+    let mut txids = HashSet::with_capacity(transactions.len());
+    if transactions
+        .iter()
+        .any(|transaction| !txids.insert(transaction.compute_txid()))
+    {
+        return Some("package-contains-duplicates");
+    }
+    if !package_is_topologically_sorted(transactions) {
+        return Some("package-not-sorted");
+    }
+    let mut spent = HashMap::new();
+    for transaction in transactions {
+        let txid = transaction.compute_txid();
+        for input in &transaction.input {
+            if let Some(previous) = spent.insert(input.previous_output, txid)
+                && previous != txid
+            {
+                return Some("conflict-in-package");
+            }
+        }
+    }
+    None
+}
+
+fn mempool_reject_reason(error: &MempoolError) -> String {
+    match error {
+        MempoolError::AlreadyPresent => "txn-already-in-mempool".to_owned(),
+        MempoolError::Conflict(_) => "txn-mempool-conflict".to_owned(),
+        MempoolError::MissingInput(_) => "missing-inputs".to_owned(),
+        MempoolError::FeeRate => "mempool min fee not met".to_owned(),
+        MempoolError::Script(reason) => reason.clone(),
+        _ => error.to_string(),
+    }
+}
+
+fn package_fee_calculation(
+    transaction: &Transaction,
+    package: &[Transaction],
+    mempool: &Mempool,
+) -> (i64, u64, Vec<String>) {
+    let by_txid = package
+        .iter()
+        .map(|candidate| (candidate.compute_txid(), candidate))
+        .collect::<HashMap<_, _>>();
+    let mut seen = HashSet::new();
+    let mut ordered = Vec::new();
+
+    fn visit(
+        txid: Txid,
+        by_txid: &HashMap<Txid, &Transaction>,
+        seen: &mut HashSet<Txid>,
+        ordered: &mut Vec<Txid>,
+    ) {
+        if !seen.insert(txid) {
+            return;
+        }
+        if let Some(transaction) = by_txid.get(&txid) {
+            for input in &transaction.input {
+                if by_txid.contains_key(&input.previous_output.txid) {
+                    visit(input.previous_output.txid, by_txid, seen, ordered);
+                }
+            }
+        }
+        ordered.push(txid);
+    }
+
+    visit(
+        transaction.compute_txid(),
+        &by_txid,
+        &mut seen,
+        &mut ordered,
+    );
+    let mut fee = 0i64;
+    let mut vsize = 0u64;
+    let mut includes = Vec::with_capacity(ordered.len());
+    for txid in ordered {
+        if let Some(entry) = mempool.get(&txid) {
+            fee = fee
+                .saturating_add(i64::try_from(entry.fee_sat).unwrap_or(i64::MAX))
+                .saturating_add(mempool.fee_delta(&txid));
+            vsize = vsize.saturating_add(entry.vsize);
+            includes.push(entry.transaction.compute_wtxid().to_string());
+        }
+    }
+    (fee, vsize, includes)
+}
+
+fn accepted_transaction_json(
+    transaction: &Transaction,
+    package: &[Transaction],
+    mempool: &Mempool,
+    include_allowed: bool,
+    include_wtxid: bool,
+    include_effective_fee: bool,
+) -> Result<Value> {
+    let txid = transaction.compute_txid();
+    let entry = mempool
+        .get(&txid)
+        .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
+    let (effective_fee, effective_vsize, effective_includes) =
+        package_fee_calculation(transaction, package, mempool);
+    let effective_rate = if effective_vsize == 0 {
+        0
+    } else {
+        effective_fee
+            .saturating_mul(1_000)
+            .checked_div(i64::try_from(effective_vsize).unwrap_or(i64::MAX))
+            .unwrap_or_default()
+    };
+    let mut result = serde_json::Map::new();
+    result.insert("txid".to_owned(), json!(txid.to_string()));
+    if include_wtxid {
+        result.insert(
+            "wtxid".to_owned(),
+            json!(transaction.compute_wtxid().to_string()),
+        );
+    }
+    if include_allowed {
+        result.insert("allowed".to_owned(), Value::Bool(true));
+    }
+    result.insert("vsize".to_owned(), json!(entry.vsize));
+    let mut fees = json!({"base": sat_to_btc(entry.fee_sat)});
+    if include_effective_fee {
+        fees["effective-feerate"] = json!(sat_to_btc_signed(effective_rate));
+        fees["effective-includes"] = json!(effective_includes);
+    }
+    result.insert("fees".to_owned(), fees);
+    Ok(Value::Object(result))
+}
+
+fn rejected_transaction_json(transaction: &Transaction, error: &MempoolError) -> Value {
+    json!({
+        "txid": transaction.compute_txid().to_string(),
+        "wtxid": transaction.compute_wtxid().to_string(),
+        "allowed": false,
+        "reject-reason": mempool_reject_reason(error),
+    })
+}
+
+fn exceeds_max_fee(fee_sat: u64, vsize: u64, max_fee_rate: Option<f64>) -> bool {
+    max_fee_rate.is_some_and(|max_fee_rate| {
+        fee_sat as f64 > max_fee_rate * 100_000_000.0 * vsize as f64 / 1_000.0
+    })
+}
+
 pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let transactions = params
+    let raw_transactions = params
         .as_array()
         .and_then(|values| values.first())
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("testmempoolaccept expects an array of hex transactions"))?;
-    let chain = node.chain.read();
-    let mut candidate = node.mempool.read().clone();
+    if raw_transactions.is_empty() || raw_transactions.len() > MAX_PACKAGE_COUNT {
+        bail!("Array must contain between 1 and {MAX_PACKAGE_COUNT} transactions.");
+    }
     let max_fee_rate = parse_max_fee_rate(params.get(1))?;
-    if transactions.len() > 1 {
-        let decoded = transactions
-            .iter()
-            .map(|raw| {
-                raw.as_str()
-                    .and_then(|raw| hex::decode(raw).ok())
-                    .and_then(|bytes| deserialize(&bytes).ok())
-            })
-            .collect::<Vec<Option<Transaction>>>();
-        if decoded.iter().any(Option::is_none) {
-            return Ok(json!(decoded
-                .into_iter()
-                .map(|transaction| {
-                    transaction.map_or_else(
-                        || json!({"txid": Value::Null, "allowed": false, "reject-reason": "decode failed"}),
-                        |transaction| json!({
-                            "txid": transaction.compute_txid().to_string(),
-                            "wtxid": transaction.compute_wtxid().to_string(),
-                            "allowed": false,
-                            "reject-reason": "package contains a transaction that failed to decode",
-                        }),
-                    )
-                })
-                .collect::<Vec<_>>()));
-        }
-        let package = decoded.into_iter().map(Option::unwrap).collect::<Vec<_>>();
-        if let Err(error) = candidate.accept_package(&package, &chain) {
-            return Ok(json!(
-                package
-                    .into_iter()
-                    .map(|transaction| json!({
-                        "txid": transaction.compute_txid().to_string(),
-                        "wtxid": transaction.compute_wtxid().to_string(),
-                        "allowed": false,
-                        "reject-reason": error.to_string(),
-                    }))
-                    .collect::<Vec<_>>()
-            ));
-        }
+    let transactions = raw_transactions
+        .iter()
+        .map(|raw| {
+            let raw = raw
+                .as_str()
+                .ok_or_else(|| anyhow!("TX decode failed: transaction must be hex"))?;
+            let bytes = hex::decode(raw).context("TX decode failed")?;
+            deserialize(&bytes).context("TX decode failed")
+        })
+        .collect::<Result<Vec<Transaction>>>()?;
+    if let Some(error) = package_policy_error(&transactions) {
         return Ok(json!(
-            package
-                .into_iter()
-                .map(|transaction| {
-                    let txid = transaction.compute_txid();
-                    let entry = candidate.get(&txid).expect("accepted package entry exists");
-                    let exceeds_max_fee = max_fee_rate.is_some_and(|max_fee_rate| {
-                        entry.fee_sat as f64
-                            > max_fee_rate * 100_000_000.0 * entry.vsize as f64 / 1_000.0
-                    });
-                    if exceeds_max_fee {
-                        json!({
-                            "txid": txid.to_string(),
-                            "wtxid": transaction.compute_wtxid().to_string(),
-                            "allowed": false,
-                            "reject-reason": "max-fee-exceeded",
-                        })
-                    } else {
-                        json!({
-                            "txid": txid.to_string(),
-                            "wtxid": transaction.compute_wtxid().to_string(),
-                            "allowed": true,
-                            "vsize": entry.vsize,
-                            "fees": {"base": sat_to_btc(entry.fee_sat)},
-                        })
-                    }
-                })
+            transactions
+                .iter()
+                .map(|transaction| json!({
+                    "txid": transaction.compute_txid().to_string(),
+                    "wtxid": transaction.compute_wtxid().to_string(),
+                    "package-error": error,
+                }))
                 .collect::<Vec<_>>()
         ));
     }
-    let mut result = Vec::with_capacity(transactions.len());
-    for raw in transactions {
-        let raw = raw
-            .as_str()
-            .ok_or_else(|| anyhow!("transaction must be hex"))?;
-        let transaction: Transaction = match hex::decode(raw)
-            .ok()
-            .and_then(|bytes| deserialize(&bytes).ok())
-        {
-            Some(transaction) => transaction,
-            None => {
-                result.push(json!({"txid": Value::Null, "allowed": false, "reject-reason": "decode failed"}));
+
+    let chain = node.chain.read();
+    let mut candidate = node.mempool.read().clone();
+    if transactions.len() > 1 {
+        if let Err(error) = candidate.accept_package(&transactions, &chain) {
+            return Ok(json!(
+                transactions
+                    .iter()
+                    .map(|transaction| rejected_transaction_json(transaction, &error))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let mut result = Vec::with_capacity(transactions.len());
+        let mut exit_early = false;
+        for transaction in &transactions {
+            if exit_early {
+                result.push(json!({
+                    "txid": transaction.compute_txid().to_string(),
+                    "wtxid": transaction.compute_wtxid().to_string(),
+                }));
                 continue;
             }
-        };
-        let txid = transaction.compute_txid();
-        match candidate.accept(transaction.clone(), &chain) {
-            Ok(_) => {
-                let fee_sat = candidate
-                    .get(&txid)
-                    .map(|entry| entry.fee_sat)
-                    .unwrap_or_default();
-                let exceeds_max_fee = candidate.get(&txid).is_some_and(|entry| {
-                    max_fee_rate.is_some_and(|max_fee_rate| {
-                        entry.fee_sat as f64
-                            > max_fee_rate * 100_000_000.0 * entry.vsize as f64 / 1_000.0
-                    })
-                });
-                if exceeds_max_fee {
-                    result.push(json!({
-                        "txid": txid.to_string(),
-                        "wtxid": transaction.compute_wtxid().to_string(),
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
-                } else {
-                    result.push(json!({
-                        "txid": txid.to_string(),
-                        "wtxid": transaction.compute_wtxid().to_string(),
-                        "allowed": true,
-                        "vsize": transaction.vsize(),
-                        "fees": {"base": sat_to_btc(fee_sat)},
-                    }));
-                }
+            let entry = candidate
+                .get(&transaction.compute_txid())
+                .ok_or_else(|| anyhow!("accepted package transaction disappeared"))?;
+            if exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate) {
+                result.push(json!({
+                    "txid": transaction.compute_txid().to_string(),
+                    "wtxid": transaction.compute_wtxid().to_string(),
+                    "allowed": false,
+                    "reject-reason": "max-fee-exceeded",
+                }));
+                exit_early = true;
+            } else {
+                result.push(accepted_transaction_json(
+                    transaction,
+                    &transactions,
+                    &candidate,
+                    true,
+                    true,
+                    true,
+                )?);
             }
-            Err(error) => result.push(json!({
-                "txid": txid.to_string(),
-                "wtxid": transaction.compute_wtxid().to_string(),
-                "allowed": false,
-                "reject-reason": error.to_string(),
-            })),
         }
+        return Ok(Value::Array(result));
     }
-    Ok(json!(result))
+
+    match candidate.accept(transactions[0].clone(), &chain) {
+        Ok(txid) => {
+            let entry = candidate
+                .get(&txid)
+                .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
+            if exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate) {
+                Ok(json!([{
+                    "txid": txid.to_string(),
+                    "wtxid": transactions[0].compute_wtxid().to_string(),
+                    "allowed": false,
+                    "reject-reason": "max-fee-exceeded",
+                }]))
+            } else {
+                Ok(json!([accepted_transaction_json(
+                    &transactions[0],
+                    &transactions,
+                    &candidate,
+                    true,
+                    true,
+                    true,
+                )?]))
+            }
+        }
+        Err(error) => Ok(json!([rejected_transaction_json(&transactions[0], &error)])),
+    }
 }
 
 pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -7559,92 +7683,118 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         .get(0)
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("submitpackage expects an array of transactions"))?;
-    if raw_transactions.is_empty() {
-        bail!("submitpackage requires at least one transaction")
+    if raw_transactions.is_empty() || raw_transactions.len() > MAX_PACKAGE_COUNT {
+        bail!("Array must contain between 1 and {MAX_PACKAGE_COUNT} transactions.");
     }
+    let max_fee_rate = parse_max_fee_rate(params.get(1))?;
+    let max_burn_amount = parse_max_burn_amount(params.get(2))?;
     let mut transactions = Vec::with_capacity(raw_transactions.len());
-    let mut transaction_ids = std::collections::HashSet::new();
+    let mut transaction_ids = HashSet::new();
     for raw in raw_transactions {
         let raw = raw
             .as_str()
-            .ok_or_else(|| anyhow!("package transactions must be hexadecimal strings"))?;
-        let transaction: Transaction =
-            deserialize(&hex::decode(raw)?).context("package transaction decode failed")?;
+            .ok_or_else(|| anyhow!("TX decode failed: package transaction must be hex"))?;
+        let transaction: Transaction = deserialize(&hex::decode(raw).context("TX decode failed")?)
+            .context("TX decode failed")?;
+        validate_burn_amount(&transaction, max_burn_amount)?;
         let txid = transaction.compute_txid();
         if !transaction_ids.insert(txid) {
             bail!("package contains duplicate transaction {txid}")
         }
-        transactions.push((txid, transaction));
+        transactions.push(transaction);
     }
-
-    let mut ordered = Vec::with_capacity(transactions.len());
-    let mut remaining = transactions;
-    while !remaining.is_empty() {
-        let Some(index) = remaining.iter().position(|(_, transaction)| {
-            transaction.input.iter().all(|input| {
-                !remaining.iter().any(|(txid, _)| {
-                    *txid == input.previous_output.txid && *txid != transaction.compute_txid()
-                }) || ordered
-                    .iter()
-                    .any(|(txid, _): &(Txid, Transaction)| *txid == input.previous_output.txid)
-            })
-        }) else {
-            bail!("package contains a dependency cycle")
-        };
-        ordered.push(remaining.remove(index));
+    if let Some(error) = package_policy_error(&transactions)
+        && error != "package-not-sorted"
+        && error != "package-contains-duplicates"
+    {
+        bail!("{error}");
+    }
+    if transactions.len() > 1 && !package_is_child_with_parents_tree(&transactions) {
+        bail!(
+            "package topology disallowed. not child-with-parents or parents depend on each other."
+        );
     }
 
     let chain = node.chain.read();
     let mut candidate = node.mempool.read().clone();
-    let package_transactions = ordered
+    let preexisting = transactions
         .iter()
-        .map(|(_, transaction)| transaction.clone())
-        .collect::<Vec<_>>();
+        .filter_map(|transaction| {
+            candidate
+                .get(&transaction.compute_txid())
+                .map(|_| transaction.compute_txid())
+        })
+        .collect::<HashSet<_>>();
     let mut results = serde_json::Map::new();
-    if let Err(error) = candidate.accept_package(&package_transactions, &chain) {
-        for (txid, transaction) in &ordered {
+    if let Err(error) = candidate.accept_package(&transactions, &chain) {
+        let reason = mempool_reject_reason(&error);
+        for transaction in &transactions {
+            let txid = transaction.compute_txid();
             results.insert(
-                txid.to_string(),
+                transaction.compute_wtxid().to_string(),
                 json!({
                     "txid": txid.to_string(),
-                    "wtxid": transaction.compute_wtxid().to_string(),
-                    "allowed": false,
-                    "reject-reason": error.to_string(),
+                    "error": reason,
                 }),
             );
         }
         return Ok(json!({
-            "package_msg": error.to_string(),
+            "package_msg": "transaction failed",
             "tx-results": results,
+            "replaced-transactions": [],
         }));
     }
-    for (txid, transaction) in &ordered {
+
+    let mut max_fee_exceeded = false;
+    for transaction in &transactions {
         let entry = candidate
-            .get(txid)
+            .get(&transaction.compute_txid())
             .ok_or_else(|| anyhow!("accepted package transaction disappeared"))?;
-        results.insert(
-            txid.to_string(),
-            json!({
-                "txid": txid.to_string(),
-                "wtxid": transaction.compute_wtxid().to_string(),
-                "allowed": true,
-                "vsize": entry.vsize,
-                "fees": {"base": sat_to_btc(entry.fee_sat)},
-            }),
-        );
+        if exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate) {
+            max_fee_exceeded = true;
+            results.insert(
+                transaction.compute_wtxid().to_string(),
+                json!({
+                    "txid": transaction.compute_txid().to_string(),
+                    "error": "max feerate exceeded",
+                }),
+            );
+        } else {
+            results.insert(
+                transaction.compute_wtxid().to_string(),
+                accepted_transaction_json(
+                    transaction,
+                    &transactions,
+                    &candidate,
+                    false,
+                    false,
+                    !preexisting.contains(&transaction.compute_txid()),
+                )?,
+            );
+        }
     }
-    let accepted = ordered
+    if max_fee_exceeded {
+        return Ok(json!({
+            "package_msg": "transaction failed",
+            "tx-results": results,
+            "replaced-transactions": [],
+        }));
+    }
+
+    let accepted = transactions
         .iter()
-        .map(|(txid, transaction)| (*txid, transaction.clone()))
+        .filter(|transaction| !preexisting.contains(&transaction.compute_txid()))
+        .cloned()
         .collect::<Vec<_>>();
     drop(chain);
     *node.mempool.write() = candidate;
-    for (_, transaction) in accepted {
+    for transaction in accepted {
         node.notify_mempool_transaction(transaction);
     }
     Ok(json!({
         "package_msg": "success",
         "tx-results": results,
+        "replaced-transactions": [],
     }))
 }
 
@@ -11478,7 +11628,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_package_orders_parent_and_child_atomically() {
+    fn submit_package_requires_topologically_sorted_parent_and_child() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
             network: Network::Regtest,
@@ -11529,19 +11679,19 @@ mod tests {
         let result = submit_package(
             &node,
             &json!([[
-                hex::encode(serialize(&child)),
                 hex::encode(serialize(&parent)),
+                hex::encode(serialize(&child)),
             ]]),
         )
         .unwrap();
         assert_eq!(result["package_msg"], "success");
         assert_eq!(
-            result["tx-results"][parent.compute_txid().to_string()]["allowed"],
-            true
+            result["tx-results"][parent.compute_wtxid().to_string()]["txid"],
+            parent.compute_txid().to_string()
         );
         assert_eq!(
-            result["tx-results"][child.compute_txid().to_string()]["allowed"],
-            true
+            result["tx-results"][child.compute_wtxid().to_string()]["txid"],
+            child.compute_txid().to_string()
         );
         let mempool = node.mempool.read();
         assert!(mempool.get(&parent.compute_txid()).is_some());

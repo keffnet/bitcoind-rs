@@ -2534,9 +2534,7 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let tip = chain.tip();
     let header_tip = chain.best_header_tip();
     let header = chain.header(tip.height).expect("tip header exists");
-    let headers = chain
-        .headers_to_hash(&tip.hash)
-        .expect("active tip header chain exists");
+    let headers = chain.active_headers();
     let mut result = json!({
         "chain": network_name(chain.network),
         "blocks": tip.height,
@@ -2553,7 +2551,7 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "pruned": chain.prune_height().is_some(),
         "pruneheight": chain.prune_height().unwrap_or_default(),
         "size_on_disk": std::fs::metadata(chain.store.path()).map(|m| m.len()).unwrap_or(0),
-        "softforks": softforks_json(&headers, tip.height, chain.network),
+        "softforks": softforks_json(headers, tip.height, chain.network),
         "warnings": [],
     });
     if let Some(challenge) = chain.signet_challenge() {
@@ -7798,12 +7796,12 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if chain.network == Network::Signet {
         rules.push("!signet");
     }
-    let headers = chain.headers_to_hash(&tip.hash).unwrap_or_default();
+    let headers = chain.active_headers();
     let [testdummy, taproot] = validation::bip9_deployments(chain.network);
     let mut version = 0x2000_0000u32;
     let mut vbavailable = serde_json::Map::new();
     for (name, deployment) in [("testdummy", testdummy), ("taproot", taproot)] {
-        let (state, _) = bip9_state_at_height(&headers, deployment, tip.height);
+        let (state, _) = bip9_state_at_height(headers, deployment, tip.height);
         match state {
             Bip9State::Started | Bip9State::LockedIn => {
                 version |= 1u32 << deployment.bit;

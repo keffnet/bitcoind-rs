@@ -533,6 +533,10 @@ impl ChainState {
         self.headers.get(height as usize)
     }
 
+    pub fn active_headers(&self) -> &[bitcoin::block::Header] {
+        &self.headers
+    }
+
     pub fn header_by_hash(&self, hash: &BlockHash) -> Option<bitcoin::block::Header> {
         self.block_index.get(hash).map(|node| node.header)
     }

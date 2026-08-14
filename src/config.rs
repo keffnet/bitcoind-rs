@@ -6,6 +6,7 @@ use bitcoin::Network;
 use clap::{Parser, ValueEnum};
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
+pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 
 #[derive(Clone, Debug)]
@@ -174,6 +175,9 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub txindex: bool,
 
+    #[arg(long = "maxmempool", default_value_t = DEFAULT_MAX_MEMPOOL_MB)]
+    pub max_mempool: u64,
+
     #[arg(long, default_value_t = false, hide = true)]
     pub tx_reconciliation: bool,
 
@@ -226,6 +230,8 @@ pub struct Config {
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
     pub prune: u64,
     pub txindex: bool,
+    /// Maximum mempool size in decimal megabytes, matching Core's option.
+    pub max_mempool_mb: u64,
     pub zmq: ZmqConfig,
 }
 
@@ -239,6 +245,9 @@ impl Config {
         }
         if args.txindex && args.prune != 0 {
             bail!("Prune mode is incompatible with --txindex.");
+        }
+        if args.max_mempool == 0 {
+            bail!("--maxmempool must be greater than zero");
         }
         if [
             args.zmq_pub_hash_tx_hwm,
@@ -284,6 +293,7 @@ impl Config {
             blocksonly: args.blocksonly,
             prune: args.prune,
             txindex: args.txindex,
+            max_mempool_mb: args.max_mempool,
             zmq: ZmqConfig {
                 tx_reconciliation: args.tx_reconciliation,
                 pub_hash_tx: args.zmq_pub_hash_tx,
@@ -354,6 +364,25 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--prune",
             "549",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--maxmempool",
+            "12",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().max_mempool_mb, 12);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--maxmempool=0",
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());

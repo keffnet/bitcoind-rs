@@ -15,7 +15,7 @@ use crate::chain::ChainState;
 use crate::time;
 use crate::validation::{self, ValidationError};
 
-const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
+const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300_000_000;
 const MIN_RELAY_SAT_PER_VBYTE: u64 = 1;
 pub(crate) const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
@@ -162,9 +162,13 @@ pub enum MempoolError {
 
 impl Mempool {
     pub fn new(network: Network) -> Self {
+        Self::with_max_bytes(network, DEFAULT_MAX_MEMPOOL_BYTES)
+    }
+
+    pub fn with_max_bytes(network: Network, max_bytes: usize) -> Self {
         Self {
             network,
-            max_bytes: DEFAULT_MAX_MEMPOOL_BYTES,
+            max_bytes: max_bytes.max(1),
             bytes: 0,
             sequence: 0,
             entries: HashMap::new(),
@@ -1841,6 +1845,14 @@ mod tests {
         let mut loaded = Mempool::new(Network::Regtest);
         loaded.load_from_file(&path, &chain).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn configurable_mempool_size_uses_the_requested_byte_limit() {
+        let pool = Mempool::with_max_bytes(Network::Regtest, 12_345);
+        assert_eq!(pool.max_bytes(), 12_345);
+        let nonzero = Mempool::with_max_bytes(Network::Regtest, 0);
+        assert_eq!(nonzero.max_bytes(), 1);
     }
 
     #[test]

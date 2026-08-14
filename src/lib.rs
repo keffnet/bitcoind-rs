@@ -23,7 +23,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use bitcoin::Block;
 use bitcoin::{OutPoint, Transaction, Txid};
 use parking_lot::RwLock;
@@ -282,6 +282,12 @@ pub struct Node {
 impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
         let added_nodes = config.seed_nodes.iter().copied().collect();
+        let max_mempool_bytes = config
+            .max_mempool_mb
+            .checked_mul(1_000_000)
+            .context("--maxmempool is too large")?;
+        let max_mempool_bytes =
+            usize::try_from(max_mempool_bytes).context("--maxmempool does not fit usize")?;
         let mut chain = ChainState::open_with_signet_challenge(
             config.network,
             &config.datadir,
@@ -290,7 +296,7 @@ impl Node {
         chain.configure_pruning(config.prune)?;
         chain.maybe_auto_prune()?;
         let mempool_path = config.datadir.join("mempool.json");
-        let mut mempool = Mempool::new(config.network);
+        let mut mempool = Mempool::with_max_bytes(config.network, max_mempool_bytes);
         mempool.load_from_file(&mempool_path, &chain)?;
         let _ = mempool.take_changes();
         let banned_addresses = load_banlist(&config.datadir)?;
@@ -1462,6 +1468,7 @@ mod tests {
             blocksonly: false,
             prune: 0,
             txindex: false,
+            max_mempool_mb: 300,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,

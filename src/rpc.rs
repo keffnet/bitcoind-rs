@@ -1191,37 +1191,80 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if !matches!(hash_type, "hash_serialized_3" | "muhash" | "none") {
         bail!("unknown hash_type: {hash_type}")
     }
-    if let Some(value) = params.get(1)
-        && !value.is_null()
-    {
-        bail!("hash_or_height requires a coinstatsindex, which is not enabled")
+    let use_index = params
+        .get(2)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("use_index must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(true);
+    let target = params.get(1).filter(|value| !value.is_null());
+    if target.is_some() && hash_type == "hash_serialized_3" {
+        bail!("hash_serialized_3 hash type cannot be queried for a specific block")
     }
-    if let Some(value) = params.get(2)
-        && !value.is_null()
-        && value.as_bool().is_none()
-    {
-        bail!("use_index must be a boolean")
+    if target.is_some() && !use_index {
+        bail!("Cannot set use_index to false when querying for a specific block")
     }
-    let chain = node.chain.read();
-    let (transactions, outputs, total) = chain.utxo_stats();
-    let disk_size = std::fs::metadata(chain.store.path())
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
+
+    let mut chain = node.chain.write();
+    let include_serialized_hash = hash_type == "hash_serialized_3";
+    let include_muhash = hash_type == "muhash";
+    let (height, bestblock, stats, disk_size) = if let Some(value) = target {
+        let target_hash = if let Some(height) = value.as_u64() {
+            let height = u32::try_from(height).context("hash_or_height is too large")?;
+            chain
+                .block_hash(height)
+                .ok_or_else(|| anyhow!("block height out of range"))?
+        } else if let Some(text) = value.as_str() {
+            if let Ok(hash) = text.parse::<BlockHash>() {
+                hash
+            } else {
+                let height = text
+                    .parse::<u32>()
+                    .context("hash_or_height must be a block hash or height")?;
+                chain
+                    .block_hash(height)
+                    .ok_or_else(|| anyhow!("block height out of range"))?
+            }
+        } else {
+            bail!("hash_or_height must be a block hash or height")
+        };
+        if !chain.is_active_block(&target_hash) {
+            bail!("hash_or_height is not on the active chain")
+        }
+        let (height, stats) = chain
+            .utxo_statistics_at(target_hash, include_serialized_hash, include_muhash)?
+            .ok_or_else(|| anyhow!("block is not available"))?;
+        (height, target_hash, stats, 0)
+    } else {
+        let stats = chain.utxo_statistics(include_serialized_hash, include_muhash);
+        let disk_size = std::fs::metadata(chain.store.path())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        (chain.height(), chain.best_hash(), stats, disk_size)
+    };
     let mut result = json!({
-        "height": chain.height(),
-        "bestblock": chain.best_hash().to_string(),
-        "transactions": transactions,
-        "txouts": outputs,
-        "bogosize": chain.utxo_bogo_size(),
+        "height": height,
+        "bestblock": bestblock.to_string(),
+        "transactions": stats.transactions,
+        "txouts": stats.outputs,
+        "bogosize": stats.bogo_size,
         "disk_size": disk_size,
-        "total_amount": sat_to_btc(total),
+        "total_amount": sat_to_btc(stats.total_amount_sat),
     });
     match hash_type {
         "hash_serialized_3" => {
-            result["hash_serialized_3"] = json!(chain.utxo_serialized_hash());
+            result["hash_serialized_3"] = json!(
+                stats
+                    .serialized_hash
+                    .expect("serialized hash was requested")
+            );
         }
         "muhash" => {
-            result["muhash"] = json!(chain.utxo_muhash());
+            result["muhash"] = json!(stats.muhash.expect("MuHash was requested"));
         }
         "none" => {}
         _ => unreachable!("hash_type was validated above"),
@@ -8050,7 +8093,22 @@ mod tests {
         let muhash = dispatch_method(&node, "gettxoutsetinfo", &json!(["muhash"])).unwrap();
         assert!(muhash["muhash"].is_string());
         assert!(muhash.get("hash_serialized_3").is_none());
-        assert!(dispatch_method(&node, "gettxoutsetinfo", &json!(["none", 0])).is_err());
+        let at_genesis = dispatch_method(&node, "gettxoutsetinfo", &json!(["none", 0])).unwrap();
+        assert_eq!(at_genesis["height"], json!(0));
+        let genesis_hash = node.chain.read().block_hash(0).unwrap();
+        assert_eq!(at_genesis["bestblock"], genesis_hash.to_string());
+        let best_hash = node.chain.read().best_hash();
+        let by_hash = dispatch_method(
+            &node,
+            "gettxoutsetinfo",
+            &json!(["muhash", best_hash.to_string()]),
+        )
+        .unwrap();
+        assert!(by_hash["muhash"].is_string());
+        assert!(
+            dispatch_method(&node, "gettxoutsetinfo", &json!(["hash_serialized_3", 0]),).is_err()
+        );
+        assert!(dispatch_method(&node, "gettxoutsetinfo", &json!(["none", 0, false])).is_err());
         assert_eq!(
             dispatch_method(&node, "getzmqnotifications", &json!([])).unwrap(),
             json!([])
@@ -8059,6 +8117,38 @@ mod tests {
             dispatch_method(&node, "syncwithvalidationinterfacequeue", &json!([])).unwrap(),
             Value::Null
         );
+    }
+
+    #[test]
+    fn txoutset_info_replays_requested_active_height() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+        let mined = generate_to_address(
+            &node,
+            &json!([1, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"]),
+        )
+        .unwrap();
+        let tip_hash = mined[0].as_str().unwrap();
+
+        let genesis = dispatch_method(&node, "gettxoutsetinfo", &json!(["none", 0])).unwrap();
+        assert_eq!(genesis["height"], json!(0));
+        assert_eq!(genesis["txouts"], json!(0));
+
+        let tip = dispatch_method(&node, "gettxoutsetinfo", &json!(["none", tip_hash])).unwrap();
+        assert_eq!(tip["height"], json!(1));
+        assert_eq!(tip["txouts"], json!(2));
+        assert_eq!(tip["total_amount"], json!(50.0));
     }
 
     #[test]

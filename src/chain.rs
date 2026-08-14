@@ -20,6 +20,7 @@ use crate::validation::{self, ValidationError};
 
 const COINBASE_MATURITY: u32 = 100;
 const DIFFICULTY_INTERVAL: u32 = 2016;
+const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const SNAPSHOT_INTERVAL: u32 = 1_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
@@ -1567,7 +1568,7 @@ impl ChainState {
         utxos: &HashMap<OutPoint, UtxoEntry>,
         block_median_time_past: u32,
     ) -> Result<BlockApplication> {
-        if !is_bip30_repeat(self.network, height, block.block_hash()) {
+        if self.enforce_bip30(height, block.block_hash(), block.header.prev_blockhash) {
             for transaction in &block.txdata {
                 let txid = transaction.compute_txid();
                 if transaction
@@ -1593,6 +1594,13 @@ impl ChainState {
         } else {
             block.header.time
         };
+        validation::validate_transaction_finality(
+            &block.txdata[0],
+            height,
+            lock_time_cutoff,
+            csv_active,
+            &[],
+        )?;
         let mut sigop_cost = validation::transaction_sigop_cost(&block.txdata[0], &[], sigop_flags);
         if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
             return Err(ValidationError::TooManySigops.into());
@@ -1691,6 +1699,24 @@ impl ChainState {
             .into());
         }
         Ok(BlockApplication { spent_entries })
+    }
+
+    fn enforce_bip30(&self, height: u32, block_hash: BlockHash, parent_hash: BlockHash) -> bool {
+        if height >= BIP34_IMPLIES_BIP30_LIMIT {
+            return true;
+        }
+        if is_bip30_repeat(self.network, height, block_hash) {
+            return false;
+        }
+        let Some(expected_bip34_hash) = bip34_activation_hash(self.network) else {
+            return true;
+        };
+        self.ancestor_hash(
+            parent_hash,
+            validation::buried_deployment_heights(self.network).bip34,
+        )
+        .map(|hash| hash.to_string() != expected_bip34_hash)
+        .unwrap_or(true)
     }
 
     fn connect_block_internal(&mut self, block: &Block, persist: bool) -> Result<()> {
@@ -2585,6 +2611,18 @@ pub(crate) fn is_bip30_repeat(network: Network, height: u32, hash: BlockHash) ->
     (height == 91_842 && hash == "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")
         || (height == 91_880
             && hash == "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")
+}
+
+fn bip34_activation_hash(network: Network) -> Option<&'static str> {
+    match network {
+        Network::Bitcoin => {
+            Some("000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8")
+        }
+        Network::Testnet => {
+            Some("0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8")
+        }
+        Network::Testnet4 | Network::Signet | Network::Regtest => None,
+    }
 }
 
 pub fn electrum_script_hash(script: &Script) -> String {

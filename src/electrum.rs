@@ -475,27 +475,11 @@ fn server_features_for_protocol(node: &Arc<Node>, protocol_version: ProtocolVers
     features
 }
 
-fn server_peers_for_protocol(node: &Arc<Node>, protocol_version: ProtocolVersion) -> Value {
-    let mut peers = node.known_addresses();
-    peers.sort_by_key(|peer| peer.address);
-    let advertised_version = if protocol_version >= MAX_PROTOCOL_VERSION {
-        "v1.7"
-    } else {
-        "v1.4"
-    };
-    json!(
-        peers
-            .into_iter()
-            .map(|peer| {
-                let ip = peer.address.ip().to_string();
-                json!([
-                    ip,
-                    peer.address.ip().to_string(),
-                    [advertised_version, format!("t{}", peer.address.port())]
-                ])
-            })
-            .collect::<Vec<_>>()
-    )
+fn server_peers_for_protocol(_node: &Arc<Node>, _protocol_version: ProtocolVersion) -> Value {
+    // Bitcoin P2P peers are not Electrum peers. Without a configured
+    // directory of Electrum servers, advertising the node's P2P addresses
+    // would make clients attempt Electrum connections to the wrong ports.
+    json!([])
 }
 
 fn parse_protocol_version(value: &str) -> Result<ProtocolVersion> {
@@ -1829,7 +1813,7 @@ mod tests {
                 &mut HashMap::new()
             )
             .unwrap(),
-            json!([["192.0.2.10", "192.0.2.10", ["v1.4", "t50001"]]])
+            json!([])
         );
         let result = transaction_get_batch(&node, &json!([[txid.to_string()]])).unwrap();
         assert_eq!(result.as_array().unwrap().len(), 1);

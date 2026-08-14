@@ -1,12 +1,12 @@
 //! Bitcoin peer networking and block/transaction relay.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bip324::io::Payload;
@@ -213,6 +213,11 @@ const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
 const MAX_PEER_TX_ANNOUNCEMENTS: usize = 5_000;
+const MAX_PEER_TX_REQUEST_IN_FLIGHT: usize = 100;
+const TXID_RELAY_DELAY: Duration = Duration::from_secs(2);
+const NONPREF_PEER_TX_DELAY: Duration = Duration::from_secs(2);
+const OVERLOADED_PEER_TX_DELAY: Duration = Duration::from_secs(2);
+const GETDATA_TX_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_GETDATA_BATCH: usize = 1_000;
 const MAX_BLOCKS_TO_ANNOUNCE: usize = 8;
 const INVENTORY_BROADCAST_TARGET: usize = 70;
@@ -276,7 +281,7 @@ struct PeerState {
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
     pending_tx_inventory: parking_lot::Mutex<Vec<Inventory>>,
-    pending_tx_requests: parking_lot::Mutex<HashSet<Txid>>,
+    tx_requests: parking_lot::Mutex<TxRequestState>,
     fee_filter: parking_lot::Mutex<i64>,
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
@@ -285,6 +290,131 @@ struct PeerState {
     compact_block_announce: parking_lot::Mutex<bool>,
     tx_reconciliation_salt: parking_lot::Mutex<Option<u64>>,
     tx_reconciliation_registered: parking_lot::Mutex<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct TxRequestKey {
+    witness: bool,
+    hash: BlockHash,
+}
+
+impl TxRequestKey {
+    fn from_inventory(item: &Inventory) -> Option<Self> {
+        item.kind.is_transaction().then_some(Self {
+            witness: item.kind.is_witness_transaction(),
+            hash: item.hash,
+        })
+    }
+}
+
+struct PendingTxRequest {
+    key: TxRequestKey,
+    item: Inventory,
+    ready_at: Instant,
+}
+
+/// The transaction-request half of Core's TxRequestTracker. Announcements are
+/// kept separate from requests already sent so a peer cannot force an
+/// unbounded getdata queue, and the in-flight map allows stale requests to be
+/// retried after the Core timeout.
+#[derive(Default)]
+struct TxRequestState {
+    pending: VecDeque<PendingTxRequest>,
+    pending_keys: HashSet<TxRequestKey>,
+    in_flight: HashMap<TxRequestKey, Instant>,
+}
+
+impl TxRequestState {
+    fn queue(&mut self, item: Inventory, ready_at: Instant) -> bool {
+        let Some(key) = TxRequestKey::from_inventory(&item) else {
+            return false;
+        };
+        if self.pending_keys.contains(&key) || self.in_flight.contains_key(&key) {
+            return false;
+        }
+        if self.pending.len().saturating_add(self.in_flight.len()) >= MAX_PEER_TX_ANNOUNCEMENTS {
+            return false;
+        }
+        self.pending.push_back(PendingTxRequest {
+            key,
+            item,
+            ready_at,
+        });
+        self.pending_keys.insert(key);
+        true
+    }
+
+    fn expire(&mut self, now: Instant) {
+        self.in_flight
+            .retain(|_, requested_at| now.duration_since(*requested_at) < GETDATA_TX_INTERVAL);
+    }
+
+    fn in_flight_count(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    fn has_live_in_flight(&self, key: TxRequestKey, now: Instant) -> bool {
+        self.in_flight
+            .get(&key)
+            .is_some_and(|requested_at| now.duration_since(*requested_at) < GETDATA_TX_INTERVAL)
+    }
+
+    fn take_ready(&mut self, now: Instant, limit: usize) -> Vec<PendingTxRequest> {
+        self.expire(now);
+        let mut ready = Vec::with_capacity(limit);
+        let pending_count = self.pending.len();
+        for _ in 0..pending_count {
+            let Some(request) = self.pending.pop_front() else {
+                break;
+            };
+            if request.ready_at <= now && ready.len() < limit {
+                self.pending_keys.remove(&request.key);
+                ready.push(request);
+            } else {
+                self.pending.push_back(request);
+            }
+        }
+        ready
+    }
+
+    fn mark_sent(&mut self, request: &PendingTxRequest, now: Instant) {
+        self.in_flight.insert(request.key, now);
+    }
+
+    fn requeue(&mut self, request: PendingTxRequest, ready_at: Instant) {
+        if self.pending_keys.contains(&request.key) || self.in_flight.contains_key(&request.key) {
+            return;
+        }
+        self.pending.push_back(PendingTxRequest {
+            key: request.key,
+            item: request.item,
+            ready_at,
+        });
+        self.pending_keys.insert(request.key);
+    }
+
+    fn remove(&mut self, key: TxRequestKey) {
+        self.pending.retain(|request| request.key != key);
+        self.pending_keys.remove(&key);
+        self.in_flight.remove(&key);
+    }
+
+    fn remove_transaction(&mut self, transaction: &Transaction) {
+        self.remove(TxRequestKey {
+            witness: false,
+            hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
+        });
+        self.remove(TxRequestKey {
+            witness: true,
+            hash: BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
+        });
+    }
+
+    fn remove_inventory(&mut self, item: &Inventory) {
+        if let Some(key) = TxRequestKey::from_inventory(item) {
+            self.remove(key);
+        }
+    }
 }
 
 /// A bounded rolling filter of transaction inventory already known by a peer.
@@ -1137,7 +1267,7 @@ async fn serve_peer(
         bloom_filter: parking_lot::Mutex::new(None),
         known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
         pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
-        pending_tx_requests: parking_lot::Mutex::new(HashSet::new()),
+        tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
         fee_filter: parking_lot::Mutex::new(0),
         relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
@@ -1346,6 +1476,15 @@ async fn serve_peer_loop(
                     node,
                     peer_id,
                     peer_state,
+                    writer,
+                    node.config.network,
+                )
+                .await?;
+                flush_peer_transaction_requests(
+                    node,
+                    peer_id,
+                    peer_state,
+                    peers,
                     writer,
                     node.config.network,
                 )
@@ -1597,7 +1736,7 @@ async fn serve_peer_loop(
                     }
                 }
                 let mut needs_headers = false;
-                let mut transaction_requests = {
+                let transaction_requests = {
                     let chain = node.chain.read();
                     let mempool = node.mempool.read();
                     items
@@ -1648,17 +1787,30 @@ async fn serve_peer_loop(
                 // Core tracks at most this many outstanding transaction
                 // announcements from one peer to bound announcement-driven
                 // memory and download work.
-                transaction_requests.truncate(MAX_PEER_TX_ANNOUNCEMENTS);
-                if !transaction_requests.is_empty() {
-                    send_getdata_batches(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &transaction_requests,
-                    )
-                    .await?;
+                let has_wtxid_peer = has_wtxid_relay_peer(peers);
+                let now = Instant::now();
+                for item in transaction_requests
+                    .into_iter()
+                    .take(MAX_PEER_TX_ANNOUNCEMENTS)
+                {
+                    let delay = transaction_request_delay(
+                        peer_state.connection_type == "outbound-full",
+                        item.kind.is_witness_transaction(),
+                        has_wtxid_peer,
+                        peer_state.tx_requests.lock().in_flight_count()
+                            >= MAX_PEER_TX_REQUEST_IN_FLIGHT,
+                    );
+                    peer_state.tx_requests.lock().queue(item, now + delay);
                 }
+                flush_peer_transaction_requests(
+                    node,
+                    peer_id,
+                    peer_state,
+                    peers,
+                    writer,
+                    node.config.network,
+                )
+                .await?;
                 if needs_headers {
                     request_headers(node, peer_id, writer).await?;
                 }
@@ -1848,6 +2000,9 @@ async fn serve_peer_loop(
             }
             Message::Block(block) => {
                 let hash = block.header.block_hash();
+                for transaction in &block.txdata {
+                    forget_transaction_requests(peers, transaction);
+                }
                 node.clear_peer_block_request(peer_id, hash);
                 if handle_received_block(node, peers, peer_id, block).await {
                     node.record_peer_block(peer_id, hash);
@@ -1878,6 +2033,9 @@ async fn serve_peer_loop(
                         match complete_compact_block(&compact, transactions) {
                             Ok(block) => {
                                 let block_hash = block.block_hash();
+                                for transaction in &block.txdata {
+                                    forget_transaction_requests(peers, transaction);
+                                }
                                 if handle_received_block(node, peers, peer_id, block).await {
                                     node.record_peer_block(peer_id, block_hash);
                                 }
@@ -2026,6 +2184,9 @@ async fn serve_peer_loop(
                 match complete_compact_block(&pending.compact, pending.transactions) {
                     Ok(block) => {
                         let block_hash = block.block_hash();
+                        for transaction in &block.txdata {
+                            forget_transaction_requests(peers, transaction);
+                        }
                         if handle_received_block(node, peers, peer_id, block).await {
                             node.record_peer_block(peer_id, block_hash);
                         }
@@ -2153,7 +2314,7 @@ async fn serve_peer_loop(
                     anyhow::bail!("transaction sent to a non-relaying connection");
                 }
                 let txid = transaction.compute_txid();
-                peer_state.pending_tx_requests.lock().remove(&txid);
+                forget_transaction_requests(peers, &transaction);
                 let known_hash = if *peer_state.wtxid_relay.lock() {
                     BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash())
                 } else {
@@ -2176,21 +2337,32 @@ async fn serve_peer_loop(
                             } else {
                                 node.chain.write().transaction(&parent_txid)?.is_some()
                             };
-                            if !in_chain
-                                && peer_state.pending_tx_requests.lock().insert(parent_txid)
-                            {
-                                let request = Inventory {
-                                    // Orphan parent fetching uses MSG_TX even
-                                    // when wtxid relay is negotiated.
+                            if !in_chain && {
+                                let parent = Inventory {
+                                    // Orphan parent fetching uses MSG_TX
+                                    // even when wtxid relay is negotiated.
                                     kind: InventoryType::Transaction,
                                     hash: BlockHash::from_raw_hash(parent_txid.to_raw_hash()),
                                 };
-                                send_getdata_batches(
+                                let delay = transaction_request_delay(
+                                    peer_state.connection_type == "outbound-full",
+                                    false,
+                                    has_wtxid_relay_peer(peers),
+                                    peer_state.tx_requests.lock().in_flight_count()
+                                        >= MAX_PEER_TX_REQUEST_IN_FLIGHT,
+                                );
+                                peer_state
+                                    .tx_requests
+                                    .lock()
+                                    .queue(parent, Instant::now() + delay)
+                            } {
+                                flush_peer_transaction_requests(
                                     node,
                                     peer_id,
+                                    peer_state,
+                                    peers,
                                     writer,
                                     node.config.network,
-                                    std::slice::from_ref(&request),
                                 )
                                 .await?;
                             }
@@ -2198,6 +2370,15 @@ async fn serve_peer_loop(
                         debug!(%txid, %error, "rejected peer transaction");
                     }
                 }
+                flush_peer_transaction_requests(
+                    node,
+                    peer_id,
+                    peer_state,
+                    peers,
+                    writer,
+                    node.config.network,
+                )
+                .await?;
             }
             Message::FilterLoad(filter) => {
                 if !node.config.peer_bloom_filters {
@@ -2275,10 +2456,7 @@ async fn serve_peer_loop(
             Message::NotFound(items) => {
                 for item in items {
                     if item.kind.is_transaction() {
-                        peer_state
-                            .pending_tx_requests
-                            .lock()
-                            .remove(&Txid::from_byte_array(item.hash.to_byte_array()));
+                        peer_state.tx_requests.lock().remove_inventory(&item);
                     }
                     if matches!(
                         item.kind,
@@ -2295,6 +2473,15 @@ async fn serve_peer_loop(
                     writer,
                     node.config.network,
                     &mut pending_block_requests,
+                )
+                .await?;
+                flush_peer_transaction_requests(
+                    node,
+                    peer_id,
+                    peer_state,
+                    peers,
+                    writer,
+                    node.config.network,
                 )
                 .await?;
             }
@@ -2876,6 +3063,78 @@ fn queue_peer_transaction_inventory(
     node.set_peer_inv_to_send(peer_id, count);
 }
 
+fn transaction_request_delay(
+    preferred: bool,
+    witness: bool,
+    has_wtxid_peer: bool,
+    overloaded: bool,
+) -> Duration {
+    let mut delay = Duration::ZERO;
+    if !preferred {
+        delay += NONPREF_PEER_TX_DELAY;
+    }
+    if !witness && has_wtxid_peer {
+        delay += TXID_RELAY_DELAY;
+    }
+    if overloaded {
+        delay += OVERLOADED_PEER_TX_DELAY;
+    }
+    delay
+}
+
+fn has_wtxid_relay_peer(peers: &PeerRegistry) -> bool {
+    peers.lock().values().any(|state| *state.wtxid_relay.lock())
+}
+
+fn tx_request_owned_by_other_peer(
+    peers: &PeerRegistry,
+    peer_id: usize,
+    key: TxRequestKey,
+    now: Instant,
+) -> bool {
+    peers.lock().iter().any(|(other_id, state)| {
+        *other_id != peer_id && state.tx_requests.lock().has_live_in_flight(key, now)
+    })
+}
+
+fn forget_transaction_requests(peers: &PeerRegistry, transaction: &Transaction) {
+    for state in peers.lock().values() {
+        state.tx_requests.lock().remove_transaction(transaction);
+    }
+}
+
+async fn flush_peer_transaction_requests(
+    node: &Arc<Node>,
+    peer_id: usize,
+    state: &PeerState,
+    peers: &PeerRegistry,
+    writer: &PeerWriter,
+    network: Network,
+) -> Result<()> {
+    let now = Instant::now();
+    let available = {
+        let mut requests = state.tx_requests.lock();
+        requests.expire(now);
+        MAX_PEER_TX_REQUEST_IN_FLIGHT.saturating_sub(requests.in_flight_count())
+    };
+    if available == 0 {
+        return Ok(());
+    }
+
+    let candidates = state.tx_requests.lock().take_ready(now, available);
+    let mut requests = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if tx_request_owned_by_other_peer(peers, peer_id, candidate.key, now) {
+            let ready_at = candidate.ready_at;
+            state.tx_requests.lock().requeue(candidate, ready_at);
+            continue;
+        }
+        state.tx_requests.lock().mark_sent(&candidate, now);
+        requests.push(candidate.item);
+    }
+    send_getdata_batches(node, peer_id, writer, network, &requests).await
+}
+
 async fn flush_peer_transaction_inventory(
     node: &Arc<Node>,
     peer_id: usize,
@@ -3218,6 +3477,173 @@ mod tests {
         assert_eq!(inventory_broadcast_limit(1_000), 75);
         assert_eq!(inventory_broadcast_limit(50_000), 320);
         assert_eq!(inventory_broadcast_limit(200_000), 1_000);
+    }
+
+    #[test]
+    fn transaction_request_delays_match_core_policy() {
+        assert_eq!(
+            transaction_request_delay(true, true, true, false),
+            Duration::ZERO
+        );
+        assert_eq!(
+            transaction_request_delay(false, true, true, false),
+            NONPREF_PEER_TX_DELAY
+        );
+        assert_eq!(
+            transaction_request_delay(true, false, true, false),
+            TXID_RELAY_DELAY
+        );
+        assert_eq!(
+            transaction_request_delay(false, false, true, true),
+            NONPREF_PEER_TX_DELAY + TXID_RELAY_DELAY + OVERLOADED_PEER_TX_DELAY
+        );
+    }
+
+    #[test]
+    fn transaction_requests_are_deduplicated_bounded_and_expire() {
+        let now = Instant::now();
+        let mut state = TxRequestState::default();
+        let item = Inventory {
+            kind: InventoryType::WitnessTransaction,
+            hash: BlockHash::from_byte_array([1; 32]),
+        };
+        assert!(state.queue(item.clone(), now));
+        assert!(!state.queue(item.clone(), now));
+        let ready = state.take_ready(now, MAX_PEER_TX_REQUEST_IN_FLIGHT);
+        assert_eq!(ready.len(), 1);
+        state.mark_sent(&ready[0], now);
+        assert_eq!(state.in_flight_count(), 1);
+        assert!(!state.queue(item, now));
+        state.expire(now + GETDATA_TX_INTERVAL);
+        assert_eq!(state.in_flight_count(), 0);
+
+        let mut bounded = TxRequestState::default();
+        for index in 0..MAX_PEER_TX_ANNOUNCEMENTS {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            assert!(bounded.queue(
+                Inventory {
+                    kind: InventoryType::Transaction,
+                    hash: BlockHash::from_byte_array(bytes),
+                },
+                now,
+            ));
+        }
+        assert!(!bounded.queue(
+            Inventory {
+                kind: InventoryType::Transaction,
+                hash: BlockHash::from_byte_array([0xff; 32]),
+            },
+            now,
+        ));
+    }
+
+    #[tokio::test]
+    async fn transaction_request_flush_respects_the_core_inflight_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: false,
+            blocksonly: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: false,
+            peer_block_filters: false,
+            persist_mempool: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address);
+        let server = listener.accept();
+        let (client, server) = tokio::join!(client, server);
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+        let (_, client_writer) = client.into_split();
+        let (mut server_reader, _) = server.into_split();
+        let writer = Arc::new(Mutex::new(PeerWriterKind::V1(client_writer)));
+        let state = Arc::new(PeerState {
+            writer: writer.clone(),
+            connection_type: "outbound-full",
+            local_relay_transactions: true,
+            bloom_filter: parking_lot::Mutex::new(None),
+            known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
+            pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
+            tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
+            fee_filter: parking_lot::Mutex::new(0),
+            relay_transactions: parking_lot::Mutex::new(true),
+            wtxid_relay: parking_lot::Mutex::new(true),
+            send_headers: parking_lot::Mutex::new(false),
+            compact_block_version: parking_lot::Mutex::new(None),
+            compact_block_announce: parking_lot::Mutex::new(false),
+            tx_reconciliation_salt: parking_lot::Mutex::new(None),
+            tx_reconciliation_registered: parking_lot::Mutex::new(false),
+        });
+        let peers = Arc::new(parking_lot::Mutex::new(HashMap::from([(7, state.clone())])));
+        let now = Instant::now();
+        for index in 0..=MAX_PEER_TX_REQUEST_IN_FLIGHT {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            assert!(state.tx_requests.lock().queue(
+                Inventory {
+                    kind: InventoryType::WitnessTransaction,
+                    hash: BlockHash::from_byte_array(bytes),
+                },
+                now,
+            ));
+        }
+
+        flush_peer_transaction_requests(&node, 7, &state, &peers, &writer, Network::Regtest)
+            .await
+            .unwrap();
+        let Message::GetData(items) = wire::read_message(&mut server_reader, Network::Regtest)
+            .await
+            .unwrap()
+        else {
+            panic!("expected transaction getdata");
+        };
+        assert_eq!(items.len(), MAX_PEER_TX_REQUEST_IN_FLIGHT);
+        assert_eq!(state.tx_requests.lock().in_flight_count(), 100);
+        assert_eq!(state.tx_requests.lock().pending.len(), 1);
+
+        flush_peer_transaction_requests(&node, 7, &state, &peers, &writer, Network::Regtest)
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                wire::read_message(&mut server_reader, Network::Regtest),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]
@@ -4036,7 +4462,7 @@ mod tests {
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
             pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
-            pending_tx_requests: parking_lot::Mutex::new(HashSet::new()),
+            tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
             fee_filter: parking_lot::Mutex::new(0),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(false),

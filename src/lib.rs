@@ -318,6 +318,7 @@ pub struct PeerInfo {
     pub bytes_sent_per_msg: HashMap<String, u64>,
     pub bytes_received_per_msg: HashMap<String, u64>,
     pub last_inv_sequence: u64,
+    pub inv_to_send: usize,
     pub last_transaction: u64,
     pub last_block: u64,
     pub(crate) best_known_block: Option<BlockHash>,
@@ -1137,6 +1138,12 @@ impl Node {
         }
     }
 
+    pub(crate) fn set_peer_inv_to_send(&self, peer_id: usize, count: usize) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.inv_to_send = count;
+        }
+    }
+
     pub(crate) fn record_peer_transaction(&self, peer_id: usize) {
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
             peer.last_transaction = unix_time_seconds();
@@ -1311,6 +1318,7 @@ impl Node {
             bytes_sent_per_msg: HashMap::new(),
             bytes_received_per_msg: HashMap::new(),
             last_inv_sequence: 0,
+            inv_to_send: 0,
             last_transaction: 0,
             last_block: 0,
             best_known_block: None,
@@ -1555,6 +1563,7 @@ impl Node {
                 bytes_sent_per_msg: HashMap::new(),
                 bytes_received_per_msg: HashMap::new(),
                 last_inv_sequence: 0,
+                inv_to_send: 0,
                 last_transaction: 0,
                 last_block: 0,
                 best_known_block: None,
@@ -1610,6 +1619,7 @@ impl Node {
             bytes_sent_per_msg: HashMap::new(),
             bytes_received_per_msg: HashMap::new(),
             last_inv_sequence: 0,
+            inv_to_send: 0,
             last_transaction: 0,
             last_block: 0,
             best_known_block: None,
@@ -2107,6 +2117,7 @@ fn load_known_addresses(
                 bytes_sent_per_msg: HashMap::new(),
                 bytes_received_per_msg: HashMap::new(),
                 last_inv_sequence: 0,
+                inv_to_send: 0,
                 last_transaction: 0,
                 last_block: 0,
                 best_known_block: None,

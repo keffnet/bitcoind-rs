@@ -210,6 +210,7 @@ const KNOWN_TX_FILTER_BITS: usize = 1 << 20;
 const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
+const MAX_TX_INVENTORY_BATCH: usize = 50_000;
 
 fn local_transaction_relay_enabled(connection_type: &str, blocksonly: bool) -> bool {
     !blocksonly && matches!(connection_type, "outbound-full" | "inbound" | "addr-fetch")
@@ -241,6 +242,7 @@ struct PeerState {
     local_relay_transactions: bool,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
+    pending_tx_inventory: parking_lot::Mutex<Vec<Inventory>>,
     fee_filter: parking_lot::Mutex<i64>,
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
@@ -1086,6 +1088,7 @@ async fn serve_peer(
         ),
         bloom_filter: parking_lot::Mutex::new(None),
         known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
+        pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
         fee_filter: parking_lot::Mutex::new(0),
         relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
@@ -1185,6 +1188,15 @@ async fn serve_peer_loop(
     let addr_fetch_started_at = unix_time_seconds();
     let mut addr_fetch_interval = tokio::time::interval(Duration::from_secs(1));
     addr_fetch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let tx_inventory_interval_secs = if peer_state.connection_type == "inbound" {
+        5
+    } else {
+        2
+    };
+    let mut tx_inventory_interval =
+        tokio::time::interval(Duration::from_secs(tx_inventory_interval_secs));
+    tx_inventory_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tx_inventory_interval.tick().await;
     loop {
         if !node.network_active() {
             anyhow::bail!("networking is disabled");
@@ -1264,6 +1276,17 @@ async fn serve_peer_loop(
                 if addr_fetch_timed_out(addr_fetch_started_at, unix_time_seconds()) {
                     anyhow::bail!("addr-fetch connection timed out");
                 }
+                continue;
+            }
+            _ = tx_inventory_interval.tick(), if version_received && verack_received => {
+                flush_peer_transaction_inventory(
+                    node,
+                    peer_id,
+                    peer_state,
+                    writer,
+                    node.config.network,
+                )
+                .await?;
                 continue;
             }
         };
@@ -2650,6 +2673,92 @@ async fn broadcast_inventory(
     broadcast_inventory_excluding(node, peers, &[excluded_peer], network, item).await;
 }
 
+fn queue_peer_transaction_inventory(
+    node: &Arc<Node>,
+    peer_id: usize,
+    state: &PeerState,
+    item: Inventory,
+) {
+    let count = {
+        let mut pending = state.pending_tx_inventory.lock();
+        if !pending
+            .iter()
+            .any(|candidate| candidate.kind == item.kind && candidate.hash == item.hash)
+        {
+            pending.push(item);
+        }
+        pending.len()
+    };
+    node.set_peer_inv_to_send(peer_id, count);
+}
+
+async fn flush_peer_transaction_inventory(
+    node: &Arc<Node>,
+    peer_id: usize,
+    state: &PeerState,
+    writer: &PeerWriter,
+    network: Network,
+) -> Result<()> {
+    let pending = {
+        let mut pending = state.pending_tx_inventory.lock();
+        std::mem::take(&mut *pending)
+    };
+    if pending.is_empty() {
+        return Ok(());
+    }
+    node.set_peer_inv_to_send(peer_id, 0);
+
+    if !*state.relay_transactions.lock() {
+        return Ok(());
+    }
+
+    let wtxid_relay = *state.wtxid_relay.lock();
+    let minimum_fee = *state.fee_filter.lock();
+    let mut inventory = Vec::with_capacity(pending.len());
+    for queued in pending {
+        let Some(transaction) = transaction_for_inventory(node, &queued) else {
+            continue;
+        };
+        let item = transaction_inventory(&transaction, wtxid_relay);
+        if let Some((fee_sat, vsize)) = transaction_fee_for_inventory(node, &item)
+            && fee_rate_sat_per_kvb(fee_sat, vsize) < minimum_fee
+        {
+            continue;
+        }
+        {
+            let mut filter = state.bloom_filter.lock();
+            if let Some(filter) = filter.as_mut()
+                && !filter.is_relevant_and_update(&transaction)
+            {
+                continue;
+            }
+        }
+        {
+            let mut known = state.known_tx_inventory.lock();
+            if known.contains(&item.hash) {
+                continue;
+            }
+            known.insert(&item.hash);
+        }
+        inventory.push(item);
+    }
+
+    for chunk in inventory.chunks(MAX_TX_INVENTORY_BATCH) {
+        send_message(
+            node,
+            peer_id,
+            writer,
+            network,
+            &Message::Inv(chunk.to_vec()),
+        )
+        .await?;
+    }
+    node.record_peer_inv_sequence(peer_id, node.mempool.read().sequence());
+    let remaining = state.pending_tx_inventory.lock().len();
+    node.set_peer_inv_to_send(peer_id, remaining);
+    Ok(())
+}
+
 async fn broadcast_inventory_excluding(
     node: &Arc<Node>,
     peers: &PeerRegistry,
@@ -2743,45 +2852,8 @@ async fn broadcast_inventory_excluding(
             if !state.local_relay_transactions || !*state.relay_transactions.lock() {
                 continue;
             }
-            let minimum_fee = *state.fee_filter.lock();
-            if let Some((fee_sat, vsize)) = transaction_fee_for_inventory(node, &item)
-                && fee_rate_sat_per_kvb(fee_sat, vsize) < minimum_fee
-            {
-                continue;
-            }
-        }
-        let current_transaction = if matches!(
-            item.kind,
-            InventoryType::Transaction | InventoryType::WitnessTransaction
-        ) {
-            transaction_for_inventory(node, &item)
-        } else {
-            None
-        };
-        if matches!(
-            item.kind,
-            InventoryType::Transaction | InventoryType::WitnessTransaction
-        ) && current_transaction.is_none()
-        {
+            queue_peer_transaction_inventory(node, peer_id, &state, item);
             continue;
-        }
-        if let Some(transaction) = current_transaction {
-            let mut filter = state.bloom_filter.lock();
-            if let Some(filter) = filter.as_mut()
-                && !filter.is_relevant_and_update(&transaction)
-            {
-                continue;
-            }
-        }
-        if matches!(
-            item.kind,
-            InventoryType::Transaction | InventoryType::WitnessTransaction
-        ) {
-            let mut known = state.known_tx_inventory.lock();
-            if known.contains(&item.hash) {
-                continue;
-            }
-            known.insert(&item.hash);
         }
         let message = Message::Inv(vec![item.clone()]);
         let sent = send_message(node, peer_id, &state.writer, network, &message)
@@ -3772,6 +3844,7 @@ mod tests {
             local_relay_transactions: true,
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
+            pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
             fee_filter: parking_lot::Mutex::new(0),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(false),

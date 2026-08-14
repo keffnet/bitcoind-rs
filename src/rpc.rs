@@ -1541,7 +1541,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                         "servicesnames": peer_services_names(peer.services),
                         "relaytxes": peer.relay_transactions,
                         "last_inv_sequence": peer.last_inv_sequence,
-                        "inv_to_send": 0,
+                        "inv_to_send": peer.inv_to_send,
                         "lastsend": peer.last_send,
                         "lastrecv": peer.last_recv,
                         "last_transaction": peer.last_transaction,
@@ -13414,6 +13414,7 @@ mod tests {
         node.update_peer_reported_local_address(7, Some("198.51.100.2:18444".parse().unwrap()));
         node.set_peer_transport_protocol(7, true);
         node.set_peer_session_id(7, Some("ab".repeat(32)));
+        node.set_peer_inv_to_send(7, 3);
         let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(peer_info[0]["id"], json!(7));
         assert_eq!(
@@ -13427,6 +13428,7 @@ mod tests {
         assert_eq!(peer_info[0]["addrlocal"], json!("198.51.100.2:18444"));
         assert_eq!(peer_info[0]["transport_protocol_type"], json!("v2"));
         assert_eq!(peer_info[0]["session_id"], json!("ab".repeat(32)));
+        assert_eq!(peer_info[0]["inv_to_send"], json!(3));
         assert!(peer_info[0].get("startingheight").is_none());
         assert!(peer_info[0].get("pingtime").is_none());
         assert_eq!(peer_info[0]["synced_headers"], json!(-1));

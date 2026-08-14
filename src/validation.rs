@@ -7,8 +7,7 @@
 
 use std::collections::HashSet;
 
-use bitcoin::absolute::LockTime;
-use bitcoin::blockdata::locktime::absolute::{Height, Time};
+use bitcoin::absolute::{LOCK_TIME_THRESHOLD, LockTime};
 use bitcoin::blockdata::script::{Instruction, PushBytesBuf, ScriptBuf};
 use bitcoin::blockdata::transaction::{OutPoint as TransactionOutPoint, TxIn, TxOut, Version};
 use bitcoin::blockdata::witness::Witness;
@@ -760,10 +759,23 @@ pub fn validate_transaction_finality(
     csv_active: bool,
     previous_entries: &[crate::chain::UtxoEntry],
 ) -> Result<(), ValidationError> {
-    let block_height = Height::from_consensus(height).expect("block height fits consensus range");
-    let block_time =
-        Time::from_consensus(lock_time_cutoff).expect("lock time cutoff is a valid timestamp");
-    if !transaction.is_absolute_timelock_satisfied(block_height, block_time) {
+    // Core treats nLockTime as the last invalid height/time, so equality is
+    // still non-final. Do this comparison directly instead of using the
+    // bitcoin crate's inclusive typed helper; it also remains valid once a
+    // chain height exceeds the typed block-height range.
+    let absolute_satisfied = if !transaction.is_lock_time_enabled() {
+        true
+    } else {
+        let lock_time = transaction.lock_time.to_consensus_u32();
+        lock_time == 0
+            || lock_time
+                < if lock_time < LOCK_TIME_THRESHOLD {
+                    height
+                } else {
+                    lock_time_cutoff
+                }
+    };
+    if !absolute_satisfied {
         return Err(ValidationError::NonFinalTransaction);
     }
     if !csv_active || transaction.version.0 < 2 || previous_entries.len() != transaction.input.len()
@@ -1275,6 +1287,36 @@ mod tests {
         assert_eq!(&data[0..4], &2i32.to_le_bytes());
         assert_eq!(&data[36..68], &modified_merkle.to_byte_array());
         assert_eq!(&data[68..72], &123u32.to_le_bytes());
+    }
+
+    #[test]
+    fn absolute_locktime_is_strict_and_handles_large_block_heights() {
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::from_consensus(12),
+            input: vec![TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([4u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ZERO,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        assert!(validate_transaction_finality(&transaction, 12, 500_000_001, false, &[]).is_err());
+        assert!(validate_transaction_finality(&transaction, 13, 500_000_001, false, &[]).is_ok());
+        assert!(
+            validate_transaction_finality(
+                &transaction,
+                bitcoin::absolute::LOCK_TIME_THRESHOLD,
+                500_000_001,
+                false,
+                &[],
+            )
+            .is_ok()
+        );
     }
 
     #[test]

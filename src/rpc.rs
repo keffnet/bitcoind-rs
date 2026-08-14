@@ -82,15 +82,18 @@ impl RpcServer {
     }
 }
 
-async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()> {
+async fn handle_connection(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     stream.set_nodelay(true)?;
-    let request = read_http_request(&mut stream).await?;
-    let (status, content_type, body) = match request {
-        Some(request)
-            if node.config.rest
-                && (request.method.eq_ignore_ascii_case("GET")
-                    || request.method.eq_ignore_ascii_case("POST"))
-                && request.target.starts_with("/rest/") =>
+    let mut connection = HttpConnection::new(stream);
+    loop {
+        let Some(request) = connection.read_request().await? else {
+            return Ok(());
+        };
+        let keep_alive = request.keep_alive;
+        let (status, content_type, body) = if node.config.rest
+            && (request.method.eq_ignore_ascii_case("GET")
+                || request.method.eq_ignore_ascii_case("POST"))
+            && request.target.starts_with("/rest/")
         {
             match dispatch_rest_with_body(&node, &request.target, &request.body) {
                 Ok((content_type, body)) => ("200 OK", content_type, body),
@@ -100,13 +103,11 @@ async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()>
                     format!("{error}\r\n").into_bytes(),
                 ),
             }
-        }
-        Some(request) => {
+        } else {
             if !authorized(&node, &request.headers) {
-                stream
-                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                connection
+                    .write_response("401 Unauthorized", "text/plain", &[], false)
                     .await?;
-                stream.shutdown().await?;
                 return Ok(());
             }
             let body = dispatch_json_rpc(&node, &request.body).await;
@@ -117,23 +118,122 @@ async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()>
                     .transpose()?
                     .unwrap_or_default(),
             )
+        };
+        connection
+            .write_response(status, content_type, &body, keep_alive)
+            .await?;
+        if !keep_alive {
+            return Ok(());
         }
-        None => (
-            "200 OK",
-            "application/json",
-            serde_json::to_vec(
-                &json!({"result": null, "error": {"code": -32700, "message": "empty request"}, "id": null}),
-            )?,
-        ),
-    };
-    let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(&body).await?;
-    stream.shutdown().await?;
-    Ok(())
+    }
+}
+
+struct HttpConnection {
+    stream: TcpStream,
+    buffered: Vec<u8>,
+}
+
+impl HttpConnection {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            buffered: Vec::new(),
+        }
+    }
+
+    async fn read_request(&mut self) -> Result<Option<HttpRequest>> {
+        let header_end = loop {
+            if let Some(position) = self
+                .buffered
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+            {
+                break position + 4;
+            }
+            if self.buffered.len() > MAX_HTTP_REQUEST {
+                bail!("HTTP request exceeds limit");
+            }
+            let mut chunk = [0u8; 4096];
+            let read = self.stream.read(&mut chunk).await?;
+            if read == 0 {
+                if self.buffered.is_empty() {
+                    return Ok(None);
+                }
+                bail!("truncated HTTP request headers");
+            }
+            self.buffered.extend_from_slice(&chunk[..read]);
+        };
+
+        let headers = std::str::from_utf8(&self.buffered[..header_end])?.to_owned();
+        let mut request_line = headers
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .split_whitespace();
+        let method = request_line.next().unwrap_or_default().to_owned();
+        let target = request_line.next().unwrap_or_default().to_owned();
+        let version = request_line.next().unwrap_or_default();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("Content-Length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if header_end.saturating_add(content_length) > MAX_HTTP_REQUEST {
+            bail!("HTTP request body exceeds limit");
+        }
+        while self.buffered.len() < header_end + content_length {
+            let mut chunk = [0u8; 4096];
+            let read = self.stream.read(&mut chunk).await?;
+            if read == 0 {
+                bail!("truncated HTTP request body");
+            }
+            self.buffered.extend_from_slice(&chunk[..read]);
+            if self.buffered.len() > MAX_HTTP_REQUEST {
+                bail!("HTTP request exceeds limit");
+            }
+        }
+
+        let body_end = header_end + content_length;
+        let body = self.buffered[header_end..body_end].to_vec();
+        self.buffered.drain(..body_end);
+        let keep_alive = if version.eq_ignore_ascii_case("HTTP/1.1") {
+            !header_has_token(&headers, "Connection", "close")
+        } else {
+            header_has_token(&headers, "Connection", "keep-alive")
+        };
+        Ok(Some(HttpRequest {
+            method,
+            target,
+            headers,
+            body,
+            keep_alive,
+        }))
+    }
+
+    async fn write_response(
+        &mut self,
+        status: &str,
+        content_type: &str,
+        body: &[u8],
+        keep_alive: bool,
+    ) -> Result<()> {
+        let connection = if keep_alive { "keep-alive" } else { "close" };
+        let header = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
+            body.len()
+        );
+        self.stream.write_all(header.as_bytes()).await?;
+        self.stream.write_all(body).await?;
+        self.stream.flush().await?;
+        if !keep_alive {
+            self.stream.shutdown().await?;
+        }
+        Ok(())
+    }
 }
 
 struct HttpRequest {
@@ -141,58 +241,19 @@ struct HttpRequest {
     target: String,
     headers: String,
     body: Vec<u8>,
+    keep_alive: bool,
 }
 
-async fn read_http_request(stream: &mut TcpStream) -> Result<Option<HttpRequest>> {
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let header_end;
-    loop {
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            return Ok(None);
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() > MAX_HTTP_REQUEST {
-            bail!("HTTP request exceeds limit");
-        }
-        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            header_end = position + 4;
-            break;
-        }
-    }
-    let headers = std::str::from_utf8(&bytes[..header_end])?.to_owned();
-    let mut request_line = headers
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .split_whitespace();
-    let method = request_line.next().unwrap_or_default().to_owned();
-    let target = request_line.next().unwrap_or_default().to_owned();
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("Content-Length:")
-                .or_else(|| line.strip_prefix("content-length:"))
-                .and_then(|value| value.trim().parse::<usize>().ok())
-        })
-        .unwrap_or(0);
-    if header_end.saturating_add(content_length) > MAX_HTTP_REQUEST {
-        bail!("HTTP request body exceeds limit");
-    }
-    while bytes.len() < header_end + content_length {
-        let read = stream.read(&mut chunk).await?;
-        if read == 0 {
-            bail!("truncated HTTP request body");
-        }
-        bytes.extend_from_slice(&chunk[..read]);
-    }
-    Ok(Some(HttpRequest {
-        method,
-        target,
-        headers,
-        body: bytes[header_end..header_end + content_length].to_vec(),
-    }))
+fn header_has_token(headers: &str, wanted_name: &str, wanted_value: &str) -> bool {
+    headers.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.eq_ignore_ascii_case(wanted_name)
+            && value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(wanted_value))
+    })
 }
 
 fn authorized(node: &Arc<Node>, headers: &str) -> bool {
@@ -9682,6 +9743,48 @@ mod tests {
     use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
     use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
+
+    #[test]
+    fn http_connection_token_matching_is_case_insensitive() {
+        let headers = "Connection: keep-alive, Upgrade\r\nX-Test: yes\r\n";
+        assert!(header_has_token(headers, "connection", "KEEP-ALIVE"));
+        assert!(!header_has_token(headers, "connection", "close"));
+    }
+
+    #[tokio::test]
+    async fn http_reader_preserves_pipelined_requests() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut connection = HttpConnection::new(stream);
+            let first = connection
+                .read_request()
+                .await?
+                .ok_or_else(|| anyhow!("first request missing"))?;
+            let second = connection
+                .read_request()
+                .await?
+                .ok_or_else(|| anyhow!("second request missing"))?;
+            Ok::<_, anyhow::Error>((first, second))
+        });
+        let mut client = TcpStream::connect(address).await?;
+        client
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\nabcGET /rest/chaininfo.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .await?;
+        let (first, second) = server.await??;
+        assert_eq!(first.method, "POST");
+        assert_eq!(first.target, "/");
+        assert_eq!(first.body, b"abc");
+        assert!(first.keep_alive);
+        assert_eq!(second.method, "GET");
+        assert_eq!(second.target, "/rest/chaininfo.json");
+        assert!(second.body.is_empty());
+        assert!(!second.keep_alive);
+        Ok(())
+    }
 
     fn proof_transaction(tag: u8) -> Transaction {
         Transaction {

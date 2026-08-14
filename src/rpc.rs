@@ -1838,6 +1838,8 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if target.is_some() && !use_index {
         bail!("Cannot set use_index to false when querying for a specific block")
     }
+    let use_coinstats_index =
+        node.config.coinstatsindex && use_index && matches!(hash_type, "muhash" | "none");
 
     let mut chain = node.chain.write();
     let include_serialized_hash = hash_type == "hash_serialized_3";
@@ -1870,7 +1872,11 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .ok_or_else(|| anyhow!("block is not available"))?;
         (height, target_hash, stats, 0)
     } else {
-        let stats = chain.utxo_statistics(include_serialized_hash, include_muhash);
+        let stats = if use_coinstats_index {
+            chain.utxo_statistics(include_serialized_hash, include_muhash)
+        } else {
+            chain.utxo_statistics_without_index(include_serialized_hash, include_muhash)
+        };
         let disk_size = std::fs::metadata(chain.store.path())
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -1879,12 +1885,14 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let mut result = json!({
         "height": height,
         "bestblock": bestblock.to_string(),
-        "transactions": stats.transactions,
         "txouts": stats.outputs,
         "bogosize": stats.bogo_size,
-        "disk_size": disk_size,
         "total_amount": sat_to_btc(stats.total_amount_sat),
     });
+    if !use_coinstats_index {
+        result["transactions"] = json!(stats.transactions);
+        result["disk_size"] = json!(disk_size);
+    }
     match hash_type {
         "hash_serialized_3" => {
             result["hash_serialized_3"] = json!(
@@ -1898,6 +1906,70 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }
         "none" => {}
         _ => unreachable!("hash_type was validated above"),
+    }
+    if use_coinstats_index {
+        let previous = if height == 0 {
+            crate::chain::UtxoSetStats::default()
+        } else {
+            let previous_hash = chain
+                .block_hash(height.saturating_sub(1))
+                .context("previous block is unavailable")?;
+            chain
+                .coinstats_at(&previous_hash, false)?
+                .map(|(_, stats)| stats)
+                .context("previous coinstats record is unavailable")?
+        };
+        let unspendable = stats
+            .total_unspendable_genesis_sat
+            .saturating_add(stats.total_unspendable_bip30_sat)
+            .saturating_add(stats.total_unspendable_scripts_sat)
+            .saturating_add(stats.total_unspendable_unclaimed_rewards_sat);
+        let previous_unspendable = previous
+            .total_unspendable_genesis_sat
+            .saturating_add(previous.total_unspendable_bip30_sat)
+            .saturating_add(previous.total_unspendable_scripts_sat)
+            .saturating_add(previous.total_unspendable_unclaimed_rewards_sat);
+        result["total_unspendable_amount"] = json!(sat_to_btc(unspendable));
+        result["block_info"] = json!({
+            "prevout_spent": sat_to_btc(
+                stats
+                    .total_prevout_spent_sat
+                    .saturating_sub(previous.total_prevout_spent_sat)
+            ),
+            "coinbase": sat_to_btc(
+                stats
+                    .total_coinbase_sat
+                    .saturating_sub(previous.total_coinbase_sat)
+            ),
+            "new_outputs_ex_coinbase": sat_to_btc(
+                stats
+                    .total_new_outputs_ex_coinbase_sat
+                    .saturating_sub(previous.total_new_outputs_ex_coinbase_sat)
+            ),
+            "unspendable": sat_to_btc(unspendable.saturating_sub(previous_unspendable)),
+            "unspendables": {
+                "genesis_block": sat_to_btc(
+                    stats
+                        .total_unspendable_genesis_sat
+                        .saturating_sub(previous.total_unspendable_genesis_sat)
+                ),
+                "bip30": sat_to_btc(
+                    stats
+                        .total_unspendable_bip30_sat
+                        .saturating_sub(previous.total_unspendable_bip30_sat)
+                ),
+                "scripts": sat_to_btc(
+                    stats
+                        .total_unspendable_scripts_sat
+                        .saturating_sub(previous.total_unspendable_scripts_sat)
+                ),
+                "unclaimed_rewards": sat_to_btc(
+                    stats
+                        .total_unspendable_unclaimed_rewards_sat
+                        .saturating_sub(previous.total_unspendable_unclaimed_rewards_sat)
+                ),
+            },
+        });
     }
     Ok(result)
 }
@@ -10425,11 +10497,25 @@ mod tests {
         let genesis = dispatch_method(&node, "gettxoutsetinfo", &json!(["none", 0])).unwrap();
         assert_eq!(genesis["height"], json!(0));
         assert_eq!(genesis["txouts"], json!(0));
+        assert_eq!(genesis["total_unspendable_amount"], json!(50.0));
+        assert_eq!(genesis["block_info"]["prevout_spent"], json!(0.0));
+        assert_eq!(genesis["block_info"]["coinbase"], json!(0.0));
+        assert_eq!(genesis["block_info"]["new_outputs_ex_coinbase"], json!(0.0));
+        assert_eq!(genesis["block_info"]["unspendable"], json!(50.0));
+        assert_eq!(
+            genesis["block_info"]["unspendables"]["genesis_block"],
+            json!(50.0)
+        );
 
         let tip = dispatch_method(&node, "gettxoutsetinfo", &json!(["none", tip_hash])).unwrap();
         assert_eq!(tip["height"], json!(1));
-        assert_eq!(tip["txouts"], json!(2));
+        assert_eq!(tip["txouts"], json!(1));
         assert_eq!(tip["total_amount"], json!(50.0));
+        assert_eq!(tip["total_unspendable_amount"], json!(50.0));
+        assert_eq!(tip["block_info"]["prevout_spent"], json!(0.0));
+        assert_eq!(tip["block_info"]["coinbase"], json!(50.0));
+        assert_eq!(tip["block_info"]["new_outputs_ex_coinbase"], json!(0.0));
+        assert_eq!(tip["block_info"]["unspendable"], json!(0.0));
     }
 
     #[test]

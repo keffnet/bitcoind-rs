@@ -25,6 +25,7 @@ const SNAPSHOT_INTERVAL: u32 = 1_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
 const MAX_ORPHAN_BLOCKS: usize = 128;
+const MAX_UNSPENDABLE_SCRIPT_SIZE: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
@@ -68,7 +69,7 @@ pub struct BasicFilterRange {
     pub filters: Vec<(BlockHash, Vec<u8>, FilterHeader)>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UtxoSetStats {
     pub transactions: usize,
     pub outputs: usize,
@@ -76,6 +77,23 @@ pub struct UtxoSetStats {
     pub bogo_size: u64,
     pub serialized_hash: Option<String>,
     pub muhash: Option<String>,
+    pub total_prevout_spent_sat: u64,
+    pub total_new_outputs_ex_coinbase_sat: u64,
+    pub total_coinbase_sat: u64,
+    pub total_unspendable_genesis_sat: u64,
+    pub total_unspendable_bip30_sat: u64,
+    pub total_unspendable_scripts_sat: u64,
+    pub total_unspendable_unclaimed_rewards_sat: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CoinStatsBlockMetrics {
+    prevout_spent_sat: u64,
+    new_outputs_ex_coinbase_sat: u64,
+    coinbase_sat: u64,
+    unspendable_scripts_sat: u64,
+    unspendable_bip30_sat: u64,
+    subsidy_sat: u64,
 }
 
 type SpentTransaction = (Txid, usize, BlockHash, u32);
@@ -87,6 +105,14 @@ struct CoinStatsState {
     total_amount_sat: u64,
     bogo_size: u64,
     muhash: MuHash3072,
+    total_subsidy_sat: u64,
+    total_prevout_spent_sat: u64,
+    total_new_outputs_ex_coinbase_sat: u64,
+    total_coinbase_sat: u64,
+    total_unspendable_genesis_sat: u64,
+    total_unspendable_bip30_sat: u64,
+    total_unspendable_scripts_sat: u64,
+    total_unspendable_unclaimed_rewards_sat: u64,
 }
 
 impl CoinStatsState {
@@ -132,7 +158,64 @@ impl CoinStatsState {
             total_amount_sat: self.total_amount_sat,
             bogo_size: self.bogo_size,
             muhash: self.muhash.finalize(),
+            total_subsidy_sat: self.total_subsidy_sat,
+            total_prevout_spent_sat: self.total_prevout_spent_sat,
+            total_new_outputs_ex_coinbase_sat: self.total_new_outputs_ex_coinbase_sat,
+            total_coinbase_sat: self.total_coinbase_sat,
+            total_unspendable_genesis_sat: self.total_unspendable_genesis_sat,
+            total_unspendable_bip30_sat: self.total_unspendable_bip30_sat,
+            total_unspendable_scripts_sat: self.total_unspendable_scripts_sat,
+            total_unspendable_unclaimed_rewards_sat: self.total_unspendable_unclaimed_rewards_sat,
         }
+    }
+
+    fn apply_genesis(&mut self, network: Network) {
+        let subsidy = validation::block_subsidy_for_network(network, 0);
+        self.total_subsidy_sat = self.total_subsidy_sat.saturating_add(subsidy);
+        self.total_unspendable_genesis_sat =
+            self.total_unspendable_genesis_sat.saturating_add(subsidy);
+    }
+
+    fn apply_block_metrics(&mut self, metrics: CoinStatsBlockMetrics) {
+        self.total_subsidy_sat = self.total_subsidy_sat.saturating_add(metrics.subsidy_sat);
+        self.total_prevout_spent_sat = self
+            .total_prevout_spent_sat
+            .saturating_add(metrics.prevout_spent_sat);
+        self.total_new_outputs_ex_coinbase_sat = self
+            .total_new_outputs_ex_coinbase_sat
+            .saturating_add(metrics.new_outputs_ex_coinbase_sat);
+        self.total_coinbase_sat = self.total_coinbase_sat.saturating_add(metrics.coinbase_sat);
+        self.total_unspendable_bip30_sat = self
+            .total_unspendable_bip30_sat
+            .saturating_add(metrics.unspendable_bip30_sat);
+        self.total_unspendable_scripts_sat = self
+            .total_unspendable_scripts_sat
+            .saturating_add(metrics.unspendable_scripts_sat);
+        let accounted = self
+            .total_new_outputs_ex_coinbase_sat
+            .saturating_add(self.total_coinbase_sat)
+            .saturating_add(self.total_unspendable_genesis_sat)
+            .saturating_add(self.total_unspendable_bip30_sat)
+            .saturating_add(self.total_unspendable_scripts_sat)
+            .saturating_add(self.total_unspendable_unclaimed_rewards_sat);
+        let available = self
+            .total_prevout_spent_sat
+            .saturating_add(self.total_subsidy_sat);
+        self.total_unspendable_unclaimed_rewards_sat = self
+            .total_unspendable_unclaimed_rewards_sat
+            .saturating_add(available.saturating_sub(accounted));
+    }
+
+    fn load_cumulative_from_record(&mut self, record: &CoinStatsRecord) {
+        self.total_subsidy_sat = record.total_subsidy_sat;
+        self.total_prevout_spent_sat = record.total_prevout_spent_sat;
+        self.total_new_outputs_ex_coinbase_sat = record.total_new_outputs_ex_coinbase_sat;
+        self.total_coinbase_sat = record.total_coinbase_sat;
+        self.total_unspendable_genesis_sat = record.total_unspendable_genesis_sat;
+        self.total_unspendable_bip30_sat = record.total_unspendable_bip30_sat;
+        self.total_unspendable_scripts_sat = record.total_unspendable_scripts_sat;
+        self.total_unspendable_unclaimed_rewards_sat =
+            record.total_unspendable_unclaimed_rewards_sat;
     }
 
     fn statistics(&self, include_muhash: bool) -> UtxoSetStats {
@@ -143,12 +226,20 @@ impl CoinStatsState {
             bogo_size: self.bogo_size,
             serialized_hash: None,
             muhash: include_muhash.then(|| self.muhash.finalize()),
+            total_prevout_spent_sat: self.total_prevout_spent_sat,
+            total_new_outputs_ex_coinbase_sat: self.total_new_outputs_ex_coinbase_sat,
+            total_coinbase_sat: self.total_coinbase_sat,
+            total_unspendable_genesis_sat: self.total_unspendable_genesis_sat,
+            total_unspendable_bip30_sat: self.total_unspendable_bip30_sat,
+            total_unspendable_scripts_sat: self.total_unspendable_scripts_sat,
+            total_unspendable_unclaimed_rewards_sat: self.total_unspendable_unclaimed_rewards_sat,
         }
     }
 }
 
 struct BlockApplication {
     spent_entries: Vec<(OutPoint, UtxoEntry)>,
+    metrics: CoinStatsBlockMetrics,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -534,6 +625,14 @@ impl ChainState {
                 bogo_size: record.bogo_size,
                 serialized_hash: None,
                 muhash: include_muhash.then_some(record.muhash),
+                total_prevout_spent_sat: record.total_prevout_spent_sat,
+                total_new_outputs_ex_coinbase_sat: record.total_new_outputs_ex_coinbase_sat,
+                total_coinbase_sat: record.total_coinbase_sat,
+                total_unspendable_genesis_sat: record.total_unspendable_genesis_sat,
+                total_unspendable_bip30_sat: record.total_unspendable_bip30_sat,
+                total_unspendable_scripts_sat: record.total_unspendable_scripts_sat,
+                total_unspendable_unclaimed_rewards_sat: record
+                    .total_unspendable_unclaimed_rewards_sat,
             },
         )))
     }
@@ -1556,6 +1655,14 @@ impl ChainState {
         calculate_utxo_statistics(&self.utxos, include_serialized_hash, include_muhash)
     }
 
+    pub fn utxo_statistics_without_index(
+        &self,
+        include_serialized_hash: bool,
+        include_muhash: bool,
+    ) -> UtxoSetStats {
+        calculate_utxo_statistics(&self.utxos, include_serialized_hash, include_muhash)
+    }
+
     /// Calculate UTXO statistics at a stored block. A historical state is
     /// reconstructed by replaying the validated branch from genesis; the
     /// caller holds the chain write lock because the replay reads through the
@@ -2043,6 +2150,10 @@ impl ChainState {
         let mut spent_entries = Vec::new();
         let mut created = HashMap::new();
         let mut total_fees = 0u64;
+        let mut metrics = CoinStatsBlockMetrics {
+            subsidy_sat: validation::block_subsidy_for_network(self.network, height),
+            ..CoinStatsBlockMetrics::default()
+        };
         let block_hash = block.block_hash();
         let sigop_flags =
             validation::script_flags_for_block_with_hash(self.network, height, Some(block_hash));
@@ -2086,6 +2197,9 @@ impl ChainState {
                 input_total = input_total
                     .checked_add(entry.output.value.to_sat())
                     .ok_or(ValidationError::InputTotalOverflow)?;
+                metrics.prevout_spent_sat = metrics
+                    .prevout_spent_sat
+                    .saturating_add(entry.output.value.to_sat());
                 previous_outputs.push(entry.output.clone());
                 previous_entries.push(entry.clone());
                 spent_entries.push((outpoint, entry));
@@ -2127,15 +2241,24 @@ impl ChainState {
                 .checked_add(input_total - output_total)
                 .ok_or(ValidationError::InputTotalOverflow)?;
             for (output_index, output) in transaction.output.iter().enumerate() {
-                created.insert(
-                    OutPoint::new(txid, output_index as u32),
-                    UtxoEntry {
-                        output: output.clone(),
-                        height,
-                        median_time_past: block_median_time_past,
-                        coinbase: false,
-                    },
-                );
+                if is_unspendable_script(&output.script_pubkey) {
+                    metrics.unspendable_scripts_sat = metrics
+                        .unspendable_scripts_sat
+                        .saturating_add(output.value.to_sat());
+                } else {
+                    metrics.new_outputs_ex_coinbase_sat = metrics
+                        .new_outputs_ex_coinbase_sat
+                        .saturating_add(output.value.to_sat());
+                    created.insert(
+                        OutPoint::new(txid, output_index as u32),
+                        UtxoEntry {
+                            output: output.clone(),
+                            height,
+                            median_time_past: block_median_time_past,
+                            coinbase: false,
+                        },
+                    );
+                }
             }
         }
         let allowed_coinbase = validation::checked_money_add(
@@ -2156,7 +2279,19 @@ impl ChainState {
             }
             .into());
         }
-        Ok(BlockApplication { spent_entries })
+        for output in &block.txdata[0].output {
+            if is_unspendable_script(&output.script_pubkey) {
+                metrics.unspendable_scripts_sat = metrics
+                    .unspendable_scripts_sat
+                    .saturating_add(output.value.to_sat());
+            } else {
+                metrics.coinbase_sat = metrics.coinbase_sat.saturating_add(output.value.to_sat());
+            }
+        }
+        Ok(BlockApplication {
+            spent_entries,
+            metrics,
+        })
     }
 
     fn enforce_bip30(&self, height: u32, block_hash: BlockHash, parent_hash: BlockHash) -> bool {
@@ -2233,7 +2368,9 @@ impl ChainState {
             }
             for (output_index, output) in transaction.output.iter().enumerate() {
                 let outpoint = OutPoint::new(txid, output_index as u32);
-                if !spent_outpoints.contains(&outpoint) {
+                if !spent_outpoints.contains(&outpoint)
+                    && !is_unspendable_script(&output.script_pubkey)
+                {
                     self.insert_utxo(
                         outpoint,
                         UtxoEntry {
@@ -2284,6 +2421,9 @@ impl ChainState {
                 chain_work: parent_work + block.header.work(),
             },
         );
+        if let Some(stats) = self.coin_stats.as_mut() {
+            stats.apply_block_metrics(application.metrics);
+        }
         self.persist_coinstats_record(hash, height)?;
         if persist {
             self.persist_metadata()?;
@@ -2313,6 +2453,9 @@ impl ChainState {
         self.remember_block_undo(genesis.block_hash(), vec![Vec::new()]);
         self.store
             .insert_undo(genesis.block_hash(), &[Vec::new()])?;
+        if let Some(stats) = self.coin_stats.as_mut() {
+            stats.apply_genesis(self.network);
+        }
         self.persist_coinstats_record(genesis.block_hash(), 0)?;
         Ok(())
     }
@@ -2375,8 +2518,14 @@ impl ChainState {
 
     fn rebuild_coinstats_index(&mut self) -> Result<()> {
         let tip_hash = self.best_hash();
-        if self.coinstats_store.get(&tip_hash)?.is_some() {
-            return Ok(());
+        if let Some(record) = self.coinstats_store.get(&tip_hash)? {
+            if record.total_subsidy_sat != 0 {
+                self.coin_stats
+                    .as_mut()
+                    .context("coinstats accumulator is not initialized")?
+                    .load_cumulative_from_record(&record);
+                return Ok(());
+            }
         }
         let mut stats = CoinStatsState::default();
         let mut utxos = HashMap::new();
@@ -2386,7 +2535,7 @@ impl ChainState {
                 .store
                 .get(&hash)?
                 .with_context(|| format!("coinstats index is missing block {hash}"))?;
-            apply_block_to_coin_stats(&mut utxos, &mut stats, &block, height as u32);
+            apply_block_to_coin_stats(self.network, &mut utxos, &mut stats, &block, height as u32);
             let record = stats.record(hash, height as u32);
             self.coinstats_store.insert(&record)?;
         }
@@ -2611,7 +2760,7 @@ impl ChainState {
             let mut scripts = HashSet::new();
             for (output_index, output) in transaction.output.iter().enumerate() {
                 let outpoint = OutPoint::new(txid, output_index as u32);
-                if height != 0 {
+                if height != 0 && !is_unspendable_script(&output.script_pubkey) {
                     self.insert_utxo(
                         outpoint,
                         UtxoEntry {
@@ -3119,6 +3268,13 @@ fn calculate_utxo_statistics(
         bogo_size,
         serialized_hash,
         muhash: muhash.map(|accumulator| accumulator.finalize()),
+        total_prevout_spent_sat: 0,
+        total_new_outputs_ex_coinbase_sat: 0,
+        total_coinbase_sat: 0,
+        total_unspendable_genesis_sat: 0,
+        total_unspendable_bip30_sat: 0,
+        total_unspendable_scripts_sat: 0,
+        total_unspendable_unclaimed_rewards_sat: 0,
     }
 }
 
@@ -3135,6 +3291,10 @@ fn snapshot_checksum(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
+fn is_unspendable_script(script: &Script) -> bool {
+    script.is_op_return() || script.len() > MAX_UNSPENDABLE_SCRIPT_SIZE
+}
+
 fn serialize_utxo_coin(outpoint: &OutPoint, entry: &UtxoEntry) -> Vec<u8> {
     let mut coin_bytes = Vec::new();
     coin_bytes.extend_from_slice(&serialize(outpoint));
@@ -3146,22 +3306,37 @@ fn serialize_utxo_coin(outpoint: &OutPoint, entry: &UtxoEntry) -> Vec<u8> {
 }
 
 fn apply_block_to_coin_stats(
+    network: Network,
     utxos: &mut HashMap<OutPoint, UtxoEntry>,
     stats: &mut CoinStatsState,
     block: &Block,
     height: u32,
 ) {
     if height == 0 {
+        stats.apply_genesis(network);
         return;
     }
+    let mut metrics = CoinStatsBlockMetrics {
+        subsidy_sat: validation::block_subsidy_for_network(network, height),
+        ..CoinStatsBlockMetrics::default()
+    };
     for (transaction_index, transaction) in block.txdata.iter().enumerate() {
         for input in &transaction.input {
             if let Some(entry) = utxos.remove(&input.previous_output) {
                 stats.remove(&input.previous_output, &entry);
+                metrics.prevout_spent_sat = metrics
+                    .prevout_spent_sat
+                    .saturating_add(entry.output.value.to_sat());
             }
         }
         let txid = transaction.compute_txid();
         for (output_index, output) in transaction.output.iter().enumerate() {
+            if is_unspendable_script(&output.script_pubkey) {
+                metrics.unspendable_scripts_sat = metrics
+                    .unspendable_scripts_sat
+                    .saturating_add(output.value.to_sat());
+                continue;
+            }
             let outpoint = OutPoint::new(txid, output_index as u32);
             let entry = UtxoEntry {
                 output: output.clone(),
@@ -3173,8 +3348,16 @@ fn apply_block_to_coin_stats(
                 stats.remove(&outpoint, &previous);
             }
             stats.add(&outpoint, &entry);
+            if transaction_index == 0 {
+                metrics.coinbase_sat = metrics.coinbase_sat.saturating_add(output.value.to_sat());
+            } else {
+                metrics.new_outputs_ex_coinbase_sat = metrics
+                    .new_outputs_ex_coinbase_sat
+                    .saturating_add(output.value.to_sat());
+            }
         }
     }
+    stats.apply_block_metrics(metrics);
 }
 
 fn apply_block_to_utxos(
@@ -3195,7 +3378,8 @@ fn apply_block_to_utxos(
         let txid = transaction.compute_txid();
         for (output_index, output) in transaction.output.iter().enumerate() {
             let outpoint = OutPoint::new(txid, output_index as u32);
-            if !spent_outpoints.contains(&outpoint) {
+            if !spent_outpoints.contains(&outpoint) && !is_unspendable_script(&output.script_pubkey)
+            {
                 utxos.insert(
                     outpoint,
                     UtxoEntry {
@@ -3481,6 +3665,34 @@ mod tests {
                 .muhash,
             live.muhash
         );
+    }
+
+    #[test]
+    fn coinstats_excludes_unspendable_outputs_and_tracks_unclaimed_rewards() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut block = mine_block(&state, 1);
+        block.txdata[0].output[0].value = Amount::from_sat(4_000_000_000);
+        block.txdata[0].output.push(TxOut {
+            value: Amount::from_sat(500_000_000),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x6a]),
+        });
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block.header.nonce = 0;
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        let block_hash = block.block_hash();
+        state.connect_block(block).unwrap();
+        state.configure_coinstats_index(true).unwrap();
+
+        let stats = state.coinstats_at(&block_hash, false).unwrap().unwrap().1;
+        assert_eq!(stats.outputs, 1);
+        assert_eq!(stats.total_amount_sat, 4_000_000_000);
+        assert_eq!(stats.total_coinbase_sat, 4_000_000_000);
+        assert_eq!(stats.total_unspendable_genesis_sat, 5_000_000_000);
+        assert_eq!(stats.total_unspendable_scripts_sat, 500_000_000);
+        assert_eq!(stats.total_unspendable_unclaimed_rewards_sat, 500_000_000);
     }
 
     #[test]

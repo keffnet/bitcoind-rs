@@ -476,6 +476,22 @@ pub struct CoinStatsRecord {
     pub total_amount_sat: u64,
     pub bogo_size: u64,
     pub muhash: String,
+    #[serde(default)]
+    pub total_subsidy_sat: u64,
+    #[serde(default)]
+    pub total_prevout_spent_sat: u64,
+    #[serde(default)]
+    pub total_new_outputs_ex_coinbase_sat: u64,
+    #[serde(default)]
+    pub total_coinbase_sat: u64,
+    #[serde(default)]
+    pub total_unspendable_genesis_sat: u64,
+    #[serde(default)]
+    pub total_unspendable_bip30_sat: u64,
+    #[serde(default)]
+    pub total_unspendable_scripts_sat: u64,
+    #[serde(default)]
+    pub total_unspendable_unclaimed_rewards_sat: u64,
 }
 
 const MAX_STORED_COINSTATS_SIZE: usize = 4 * 1024;
@@ -1075,6 +1091,14 @@ mod tests {
             total_amount_sat: 42,
             bogo_size: 99,
             muhash: "deadbeef".to_owned(),
+            total_subsidy_sat: 50,
+            total_prevout_spent_sat: 1,
+            total_new_outputs_ex_coinbase_sat: 2,
+            total_coinbase_sat: 3,
+            total_unspendable_genesis_sat: 4,
+            total_unspendable_bip30_sat: 5,
+            total_unspendable_scripts_sat: 6,
+            total_unspendable_unclaimed_rewards_sat: 7,
         };
         {
             let mut store = CoinStatsStore::open(directory.path()).unwrap();

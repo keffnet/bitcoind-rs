@@ -330,6 +330,9 @@ pub struct Mempool {
     wtxids: HashMap<Wtxid, Txid>,
     priorities: HashMap<Txid, i64>,
     unbroadcast: HashSet<Txid>,
+    /// Mempool sequence at which each transaction was admitted. This is
+    /// runtime-only relay metadata and is not persisted in mempool.dat.
+    relay_sequences: HashMap<Txid, u64>,
     changes: Vec<MempoolChange>,
 }
 
@@ -440,6 +443,7 @@ impl Mempool {
             wtxids: HashMap::new(),
             priorities: HashMap::new(),
             unbroadcast: HashSet::new(),
+            relay_sequences: HashMap::new(),
             changes: Vec::new(),
         }
     }
@@ -510,6 +514,24 @@ impl Mempool {
         self.wtxids
             .get(wtxid)
             .and_then(|txid| self.entries.get(txid))
+    }
+
+    /// Return a transaction only when it entered the mempool before the
+    /// peer's most recent inventory announcement. This mirrors Core's
+    /// `info_for_relay` gate for GETDATA transaction requests.
+    pub fn get_for_relay(&self, txid: &Txid, last_sequence: u64) -> Option<&MempoolEntry> {
+        let entry = self.entries.get(txid)?;
+        let sequence = self.relay_sequences.get(txid).copied().unwrap_or(0);
+        (sequence < last_sequence).then_some(entry)
+    }
+
+    pub fn get_by_wtxid_for_relay(
+        &self,
+        wtxid: &Wtxid,
+        last_sequence: u64,
+    ) -> Option<&MempoolEntry> {
+        let txid = self.wtxids.get(wtxid)?;
+        self.get_for_relay(txid, last_sequence)
     }
 
     pub fn is_spent(&self, outpoint: &OutPoint) -> bool {
@@ -1441,6 +1463,7 @@ impl Mempool {
         self.vbytes = self.vbytes.saturating_add(vsize);
         self.entries.insert(txid, entry);
         self.wtxids.insert(wtxid, txid);
+        self.relay_sequences.insert(txid, self.sequence);
         if record_sequence {
             let sequence = self.sequence;
             self.sequence = self.sequence.saturating_add(1);
@@ -1747,6 +1770,7 @@ impl Mempool {
         self.spent.clear();
         self.children.clear();
         self.wtxids.clear();
+        self.relay_sequences.clear();
         self.bytes = 0;
         self.vbytes = 0;
         let unbroadcast = std::mem::take(&mut self.unbroadcast);
@@ -1771,6 +1795,7 @@ impl Mempool {
         let entry = self.entries.remove(txid)?;
         self.unbroadcast.remove(txid);
         self.wtxids.remove(&entry.transaction.compute_wtxid());
+        self.relay_sequences.remove(txid);
         let size = bitcoin::consensus::encode::serialize(&entry.transaction).len();
         self.bytes = self.bytes.saturating_sub(size);
         self.vbytes = self.vbytes.saturating_sub(entry.vsize);
@@ -2426,6 +2451,30 @@ mod tests {
         assert_eq!(pool.max_bytes(), 12_345);
         let nonzero = Mempool::with_max_bytes(Network::Regtest, 0);
         assert_eq!(nonzero.max_bytes(), 1);
+    }
+
+    #[test]
+    fn relay_lookup_obeys_mempool_sequence_boundary() {
+        let transaction = graph_transaction(Txid::from_byte_array([9; 32]), 9);
+        let txid = transaction.compute_txid();
+        let wtxid = transaction.compute_wtxid();
+        let mut pool = Mempool::new(Network::Regtest);
+        pool.entries.insert(
+            txid,
+            MempoolEntry {
+                transaction,
+                fee_sat: 1,
+                vsize: 1,
+                added_at: 1,
+                height: 0,
+            },
+        );
+        pool.wtxids.insert(wtxid, txid);
+        pool.relay_sequences.insert(txid, 4);
+
+        assert!(pool.get_for_relay(&txid, 4).is_none());
+        assert!(pool.get_for_relay(&txid, 5).is_some());
+        assert!(pool.get_by_wtxid_for_relay(&wtxid, 5).is_some());
     }
 
     #[test]

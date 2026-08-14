@@ -19,7 +19,7 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_bloom::{BloomFlags, FilterAdd, FilterLoad};
 use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
-use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction, Txid, Wtxid};
+use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction, Txid, Witness, Wtxid};
 use rand::random;
 use rand::seq::SliceRandom;
 use tokio::io::BufReader;
@@ -1048,6 +1048,12 @@ async fn serve_peer_loop(
                     version.start_height,
                     version.relay,
                 );
+                if peer_state.local_relay_transactions {
+                    // Core initializes TxRelay's inventory boundary to one
+                    // only after the VERSION handshake creates the relay
+                    // state. Keep unversioned getpeerinfo at its zero value.
+                    node.record_peer_inv_sequence(peer_id, 1);
+                }
                 let now = i64::try_from(crate::time::unix_time()).unwrap_or(i64::MAX);
                 node.update_peer_time_offset(peer_id, version.timestamp.saturating_sub(now));
                 *relay_transactions.lock() = version.relay;
@@ -1322,10 +1328,13 @@ async fn serve_peer_loop(
                             };
                             let matching = {
                                 let mut filter = bloom_filter.lock();
-                                filter
-                                    .as_mut()
-                                    .map(|filter| filter.matched_transaction_ids(&block))
-                                    .unwrap_or_default()
+                                let Some(filter) = filter.as_mut() else {
+                                    // Core sends no response when a peer asks
+                                    // for a filtered block without first
+                                    // loading a bloom filter.
+                                    continue;
+                                };
+                                filter.matched_transaction_ids(&block)
                             };
                             let matching: HashSet<Txid> = matching.into_iter().collect();
                             let merkle = MerkleBlock::from_block_with_predicate(&block, |txid| {
@@ -1347,42 +1356,50 @@ async fn serve_peer_loop(
                                     peer_id,
                                     writer,
                                     node.config.network,
-                                    &Message::Transaction(transaction.clone()),
+                                    &Message::Transaction(transaction_without_witness(transaction)),
                                 )
                                 .await?;
                             }
                         }
                         InventoryType::Transaction | InventoryType::WitnessTransaction => {
-                            if node.config.blocksonly {
+                            if node.config.blocksonly
+                                || !peer_state.local_relay_transactions
+                                || !*relay_transactions.lock()
+                            {
                                 missing.push(item);
                                 continue;
                             }
+                            let last_inv_sequence = node
+                                .peer_infos()
+                                .into_iter()
+                                .find(|peer| peer.id == peer_id)
+                                .map(|peer| peer.last_inv_sequence)
+                                .unwrap_or(1);
                             let transaction = {
                                 let mempool = node.mempool.read();
                                 if item.kind == InventoryType::WitnessTransaction {
                                     mempool
-                                        .get_by_wtxid(&Wtxid::from_byte_array(
-                                            item.hash.to_byte_array(),
-                                        ))
+                                        .get_by_wtxid_for_relay(
+                                            &Wtxid::from_byte_array(item.hash.to_byte_array()),
+                                            last_inv_sequence,
+                                        )
                                         .map(|entry| entry.transaction.clone())
                                 } else {
                                     mempool
-                                        .get(&Txid::from_byte_array(item.hash.to_byte_array()))
+                                        .get_for_relay(
+                                            &Txid::from_byte_array(item.hash.to_byte_array()),
+                                            last_inv_sequence,
+                                        )
                                         .map(|entry| entry.transaction.clone())
                                 }
                             };
-                            let transaction = if transaction.is_some() {
-                                transaction
-                            } else if item.kind == InventoryType::Transaction {
-                                node.chain
-                                    .write()
-                                    .transaction(&Txid::from_byte_array(item.hash.to_byte_array()))?
-                                    .map(|(transaction, _)| transaction)
-                            } else {
-                                None
-                            };
                             if let Some(transaction) = transaction {
                                 let txid = transaction.compute_txid();
+                                let transaction = if item.kind == InventoryType::Transaction {
+                                    transaction_without_witness(&transaction)
+                                } else {
+                                    transaction
+                                };
                                 send_message(
                                     node,
                                     peer_id,
@@ -1470,6 +1487,9 @@ async fn serve_peer_loop(
                 if request.indexes.len() > 100_000 {
                     debug!("compact block transaction request is too large");
                     continue;
+                }
+                if !compact_block_indexes_are_strictly_increasing(&request.indexes) {
+                    anyhow::bail!("compact block transaction indexes are not strictly increasing");
                 }
                 let block = node.chain.write().block(&request.block_hash)?;
                 let Some(block) = block else {
@@ -2453,6 +2473,18 @@ fn transaction_inventory(transaction: &Transaction, wtxid_relay: bool) -> Invent
     }
 }
 
+fn transaction_without_witness(transaction: &Transaction) -> Transaction {
+    let mut transaction = transaction.clone();
+    for input in &mut transaction.input {
+        input.witness = Witness::default();
+    }
+    transaction
+}
+
+fn compact_block_indexes_are_strictly_increasing(indexes: &[u64]) -> bool {
+    indexes.windows(2).all(|pair| pair[0] < pair[1])
+}
+
 fn fee_rate_sat_per_kvb(fee_sat: u64, vsize: u64) -> i64 {
     if vsize == 0 {
         return i64::MAX;
@@ -2489,6 +2521,36 @@ mod tests {
             assert!(!local_transaction_relay_enabled(connection_type, false));
         }
         assert!(!local_transaction_relay_enabled("outbound-full", true));
+    }
+
+    #[test]
+    fn legacy_transaction_getdata_strips_witness_data() {
+        let transaction = Transaction {
+            version: bitcoin::blockdata::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::from_slice(&[&[1u8, 2u8][..]]),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let legacy = transaction_without_witness(&transaction);
+
+        assert_eq!(legacy.compute_txid(), transaction.compute_txid());
+        assert_ne!(legacy.compute_wtxid(), transaction.compute_wtxid());
+        assert!(legacy.input.iter().all(|input| input.witness.is_empty()));
+    }
+
+    #[test]
+    fn compact_block_indexes_must_be_strictly_increasing() {
+        assert!(compact_block_indexes_are_strictly_increasing(&[0, 1, 4, 9]));
+        assert!(!compact_block_indexes_are_strictly_increasing(&[0, 1, 1]));
+        assert!(!compact_block_indexes_are_strictly_increasing(&[2, 1]));
     }
 
     #[test]

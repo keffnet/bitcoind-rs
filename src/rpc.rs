@@ -8504,7 +8504,6 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
         "ancestorsize": ancestor_size,
         "chunkweight": chunk.weight,
         "wtxid": entry.transaction.compute_wtxid().to_string(),
-        "fee": sat_to_btc(entry.fee_sat),
         "fees": {
             "base": sat_to_btc(entry.fee_sat),
             "modified": sat_to_btc_signed(modified_fee),

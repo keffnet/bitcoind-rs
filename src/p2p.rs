@@ -212,6 +212,8 @@ const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
 const MAX_GETDATA_BATCH: usize = 1_000;
+const INVENTORY_BROADCAST_TARGET: usize = 70;
+const INVENTORY_BROADCAST_MAX: usize = 1_000;
 
 fn local_transaction_relay_enabled(connection_type: &str, blocksonly: bool) -> bool {
     !blocksonly && matches!(connection_type, "outbound-full" | "inbound" | "addr-fetch")
@@ -227,6 +229,12 @@ fn connection_fetches_addresses(outbound: bool, connection_type: &str) -> bool {
 
 fn getdata_batches(requests: &[Inventory]) -> impl Iterator<Item = &[Inventory]> {
     requests.chunks(MAX_GETDATA_BATCH)
+}
+
+fn inventory_broadcast_limit(pending: usize) -> usize {
+    INVENTORY_BROADCAST_TARGET
+        .saturating_add((pending / 1_000).saturating_mul(5))
+        .min(INVENTORY_BROADCAST_MAX)
 }
 
 fn queue_block_requests(
@@ -2811,18 +2819,22 @@ async fn flush_peer_transaction_inventory(
     writer: &PeerWriter,
     network: Network,
 ) -> Result<()> {
+    if !*state.relay_transactions.lock() {
+        state.pending_tx_inventory.lock().clear();
+        node.set_peer_inv_to_send(peer_id, 0);
+        return Ok(());
+    }
+
     let pending = {
         let mut pending = state.pending_tx_inventory.lock();
-        std::mem::take(&mut *pending)
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let limit = inventory_broadcast_limit(pending.len());
+        let count = pending.len().min(limit);
+        pending.drain(..count).collect::<Vec<_>>()
     };
-    if pending.is_empty() {
-        return Ok(());
-    }
-    node.set_peer_inv_to_send(peer_id, 0);
-
-    if !*state.relay_transactions.lock() {
-        return Ok(());
-    }
+    node.set_peer_inv_to_send(peer_id, state.pending_tx_inventory.lock().len());
 
     let wtxid_relay = *state.wtxid_relay.lock();
     let minimum_fee = *state.fee_filter.lock();
@@ -3133,6 +3145,15 @@ mod tests {
             block_request_inventory_type(wire::NODE_NETWORK),
             InventoryType::Block
         );
+    }
+
+    #[test]
+    fn transaction_inventory_budget_matches_core_trickle_limits() {
+        assert_eq!(inventory_broadcast_limit(0), 70);
+        assert_eq!(inventory_broadcast_limit(999), 70);
+        assert_eq!(inventory_broadcast_limit(1_000), 75);
+        assert_eq!(inventory_broadcast_limit(50_000), 320);
+        assert_eq!(inventory_broadcast_limit(200_000), 1_000);
     }
 
     #[test]

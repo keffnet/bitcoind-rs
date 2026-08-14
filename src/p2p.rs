@@ -936,7 +936,7 @@ async fn serve_peer_loop(
             }
             message = reader.read_message(node.config.network) => {
                 let (message, bytes) = message?;
-                node.record_bytes_received(peer_id, bytes);
+                node.record_bytes_received(peer_id, bytes, message.command());
                 message
             },
             _ = ping_interval.tick(), if version_received && verack_received => {
@@ -984,6 +984,8 @@ async fn serve_peer_loop(
                     version.start_height,
                     version.relay,
                 );
+                let now = i64::try_from(crate::time::unix_time()).unwrap_or(i64::MAX);
+                node.update_peer_time_offset(peer_id, version.timestamp.saturating_sub(now));
                 *relay_transactions.lock() = version.relay;
                 if !verack_sent {
                     send_peer_extensions(
@@ -1638,6 +1640,7 @@ async fn serve_peer_loop(
             }
             Message::MerkleBlock(_) => {}
             Message::Addr(addresses) => {
+                node.record_peer_addresses(peer_id, addresses.len());
                 for entry in addresses {
                     if let Some(address) = socket_address_from_legacy(&entry) {
                         node.remember_address(address, entry.services, u64::from(entry.time));
@@ -1645,6 +1648,7 @@ async fn serve_peer_loop(
                 }
             }
             Message::AddrV2(addresses) => {
+                node.record_peer_addresses(peer_id, addresses.len());
                 for address in addresses {
                     if let Some(socket) = socket_address_from_v2(&address) {
                         node.remember_address(socket, address.services, u64::from(address.time));
@@ -2107,7 +2111,7 @@ async fn send_message(
             bytes
         }
     };
-    node.record_bytes_sent(peer_id, bytes);
+    node.record_bytes_sent(peer_id, bytes, message.command());
     Ok(())
 }
 
@@ -2597,8 +2601,8 @@ mod tests {
         .unwrap();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
-        node.record_bytes_sent(7, 42);
-        node.record_bytes_received(7, 19);
+        node.record_bytes_sent(7, 42, "ping");
+        node.record_bytes_received(7, 19, "tx");
         node.update_peer_version(7, 70016, 0, "/peer/", 0, false);
         node.update_peer_fee_filter(7, 4_000);
         assert_eq!(node.total_bytes_sent(), 42);
@@ -2606,6 +2610,9 @@ mod tests {
         let peer = node.peer_infos().pop().expect("registered peer");
         assert_eq!(peer.bytes_sent, 42);
         assert_eq!(peer.bytes_received, 19);
+        assert_eq!(peer.bytes_sent_per_msg.get("ping"), Some(&42));
+        assert_eq!(peer.bytes_received_per_msg.get("tx"), Some(&19));
+        assert!(peer.last_transaction > 0);
         assert!(!peer.relay_transactions);
         assert_eq!(peer.min_fee_filter, 4_000);
 

@@ -311,6 +311,13 @@ pub struct PeerInfo {
     pub last_recv: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    pub bytes_sent_per_msg: HashMap<String, u64>,
+    pub bytes_received_per_msg: HashMap<String, u64>,
+    pub last_inv_sequence: u64,
+    pub last_transaction: u64,
+    pub last_block: u64,
+    pub time_offset: i64,
+    pub addr_processed: u64,
     pub ping_time: Option<f64>,
     pub min_ping: Option<f64>,
     ping_nonce: Option<u64>,
@@ -920,22 +927,41 @@ impl Node {
         self.total_bytes_received.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn record_bytes_sent(&self, peer_id: usize, bytes: usize) {
+    pub(crate) fn record_bytes_sent(&self, peer_id: usize, bytes: usize, command: &str) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.total_bytes_sent.fetch_add(bytes, Ordering::Relaxed);
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
             peer.bytes_sent = peer.bytes_sent.saturating_add(bytes);
             peer.last_send = unix_time_seconds();
+            let total = peer
+                .bytes_sent_per_msg
+                .entry(command.to_owned())
+                .or_default();
+            *total = total.saturating_add(bytes);
+            if command == "inv" {
+                peer.last_inv_sequence = peer.last_inv_sequence.saturating_add(1);
+            }
         }
     }
 
-    pub(crate) fn record_bytes_received(&self, peer_id: usize, bytes: usize) {
+    pub(crate) fn record_bytes_received(&self, peer_id: usize, bytes: usize, command: &str) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.total_bytes_received
             .fetch_add(bytes, Ordering::Relaxed);
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            let now = unix_time_seconds();
             peer.bytes_received = peer.bytes_received.saturating_add(bytes);
-            peer.last_recv = unix_time_seconds();
+            peer.last_recv = now;
+            let total = peer
+                .bytes_received_per_msg
+                .entry(command.to_owned())
+                .or_default();
+            *total = total.saturating_add(bytes);
+            match command {
+                "tx" => peer.last_transaction = now,
+                "block" | "cmpctblock" | "merkleblock" => peer.last_block = now,
+                _ => {}
+            }
         }
     }
 
@@ -1003,6 +1029,13 @@ impl Node {
             last_recv: connected_at,
             bytes_sent: 0,
             bytes_received: 0,
+            bytes_sent_per_msg: HashMap::new(),
+            bytes_received_per_msg: HashMap::new(),
+            last_inv_sequence: 0,
+            last_transaction: 0,
+            last_block: 0,
+            time_offset: 0,
+            addr_processed: 0,
             ping_time: None,
             min_ping: None,
             ping_nonce: None,
@@ -1049,6 +1082,19 @@ impl Node {
             if let Some(known) = self.known_addresses.write().get_mut(&peer.address) {
                 known.min_fee_filter = min_fee_filter;
             }
+        }
+    }
+
+    pub(crate) fn update_peer_time_offset(&self, id: usize, time_offset: i64) {
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.time_offset = time_offset;
+        }
+    }
+
+    pub(crate) fn record_peer_addresses(&self, id: usize, count: usize) {
+        let count = u64::try_from(count).unwrap_or(u64::MAX);
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.addr_processed = peer.addr_processed.saturating_add(count);
         }
     }
 
@@ -1114,6 +1160,13 @@ impl Node {
                 last_recv: now,
                 bytes_sent: 0,
                 bytes_received: 0,
+                bytes_sent_per_msg: HashMap::new(),
+                bytes_received_per_msg: HashMap::new(),
+                last_inv_sequence: 0,
+                last_transaction: 0,
+                last_block: 0,
+                time_offset: 0,
+                addr_processed: 0,
                 ping_time: None,
                 min_ping: None,
                 ping_nonce: None,
@@ -1149,6 +1202,13 @@ impl Node {
             last_recv: time,
             bytes_sent: 0,
             bytes_received: 0,
+            bytes_sent_per_msg: HashMap::new(),
+            bytes_received_per_msg: HashMap::new(),
+            last_inv_sequence: 0,
+            last_transaction: 0,
+            last_block: 0,
+            time_offset: 0,
+            addr_processed: 0,
             ping_time: None,
             min_ping: None,
             ping_nonce: None,
@@ -1565,6 +1625,13 @@ fn load_known_addresses(
                 last_recv: entry.time,
                 bytes_sent: 0,
                 bytes_received: 0,
+                bytes_sent_per_msg: HashMap::new(),
+                bytes_received_per_msg: HashMap::new(),
+                last_inv_sequence: 0,
+                last_transaction: 0,
+                last_block: 0,
+                time_offset: 0,
+                addr_processed: 0,
                 ping_time: None,
                 min_ping: None,
                 ping_nonce: None,

@@ -1337,7 +1337,12 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             ))
         }
         "getnetworkinfo" => {
-            let local_services = wire::NODE_NETWORK
+            let network_service = if node.chain.read().is_pruned() {
+                wire::NODE_NETWORK_LIMITED
+            } else {
+                wire::NODE_NETWORK
+            };
+            let local_services = network_service
                 | wire::NODE_WITNESS
                 | wire::NODE_P2P_V2
                 | if node.config.blockfilterindex && node.config.peer_block_filters {
@@ -1900,6 +1905,7 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn peer_services_names(services: u64) -> Vec<&'static str> {
     [
         (wire::NODE_NETWORK, "NETWORK"),
+        (wire::NODE_NETWORK_LIMITED, "NETWORK_LIMITED"),
         (wire::NODE_BLOOM, "BLOOM"),
         (wire::NODE_WITNESS, "WITNESS"),
         (wire::NODE_COMPACT_FILTERS, "COMPACT_FILTERS"),

@@ -856,6 +856,14 @@ async fn serve_peer_loop(
     let local_nonce = random();
     let mut version =
         VersionMessage::with_bloom(height, local_nonce, node.config.peer_bloom_filters);
+    if node.chain.read().is_pruned() {
+        version.services &= !wire::NODE_NETWORK;
+        version.services |= wire::NODE_NETWORK_LIMITED;
+        version.receiver_services &= !wire::NODE_NETWORK;
+        version.receiver_services |= wire::NODE_NETWORK_LIMITED;
+        version.sender_services &= !wire::NODE_NETWORK;
+        version.sender_services |= wire::NODE_NETWORK_LIMITED;
+    }
     if !(node.config.blockfilterindex && node.config.peer_block_filters) {
         version.services &= !wire::NODE_COMPACT_FILTERS;
         version.receiver_services &= !wire::NODE_COMPACT_FILTERS;

@@ -24,6 +24,7 @@ const HEADER_SIZE: usize = 24;
 pub const NODE_NETWORK: u64 = 1;
 pub const NODE_BLOOM: u64 = 1 << 2;
 pub const NODE_WITNESS: u64 = 1 << 3;
+pub const NODE_NETWORK_LIMITED: u64 = 1 << 10;
 pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
 pub const NODE_P2P_V2: u64 = 1 << 11;
 

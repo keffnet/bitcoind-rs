@@ -2127,15 +2127,8 @@ fn calculate_utxo_statistics(
     let mut transactions = HashSet::new();
     let mut total_amount_sat = 0u64;
     let mut bogo_size = 0u64;
-    let mut serialized_engine =
-        include_serialized_hash.then(bitcoin::hashes::sha256d::Hash::engine);
-    let mut muhash = include_muhash.then(MuHash3072::default);
 
-    let mut entries: Vec<(&OutPoint, &UtxoEntry)> = utxos.iter().collect();
-    if include_serialized_hash {
-        entries.sort_by_key(|(outpoint, _)| (outpoint.txid.to_byte_array(), outpoint.vout));
-    }
-    for (outpoint, entry) in entries {
+    let mut accumulate_stats = |outpoint: &OutPoint, entry: &UtxoEntry| {
         transactions.insert(outpoint.txid);
         total_amount_sat = total_amount_sat.saturating_add(entry.output.value.to_sat());
         bogo_size = bogo_size.saturating_add(
@@ -2146,30 +2139,56 @@ fn calculate_utxo_statistics(
                 .saturating_add(2)
                 .saturating_add(entry.output.script_pubkey.len() as u64),
         );
+    };
 
-        let mut coin_bytes = Vec::new();
-        coin_bytes.extend_from_slice(&serialize(outpoint));
-        coin_bytes.extend_from_slice(
-            &(entry.height.saturating_mul(2) | u32::from(entry.coinbase)).to_le_bytes(),
-        );
-        coin_bytes.extend_from_slice(&serialize(&entry.output));
-        if let Some(engine) = serialized_engine.as_mut() {
-            engine.input(&coin_bytes);
+    let (serialized_hash, muhash) = if include_serialized_hash {
+        let mut entries: Vec<(&OutPoint, &UtxoEntry)> = utxos.iter().collect();
+        entries.sort_by_key(|(outpoint, _)| (outpoint.txid.to_byte_array(), outpoint.vout));
+        let mut serialized_engine = bitcoin::hashes::sha256d::Hash::engine();
+        let mut muhash = include_muhash.then(MuHash3072::default);
+        for (outpoint, entry) in entries {
+            accumulate_stats(outpoint, entry);
+            let coin_bytes = serialize_utxo_coin(outpoint, entry);
+            use bitcoin::hashes::HashEngine;
+            serialized_engine.input(&coin_bytes);
+            if let Some(accumulator) = muhash.as_mut() {
+                accumulator.insert(&coin_bytes);
+            }
         }
-        if let Some(accumulator) = muhash.as_mut() {
-            accumulator.insert(&coin_bytes);
+        (
+            Some(bitcoin::hashes::sha256d::Hash::from_engine(serialized_engine).to_string()),
+            muhash,
+        )
+    } else {
+        let mut muhash = include_muhash.then(MuHash3072::default);
+        for (outpoint, entry) in utxos {
+            accumulate_stats(outpoint, entry);
+            if let Some(accumulator) = muhash.as_mut() {
+                let coin_bytes = serialize_utxo_coin(outpoint, entry);
+                accumulator.insert(&coin_bytes);
+            }
         }
-    }
+        (None, muhash)
+    };
 
     UtxoSetStats {
         transactions: transactions.len(),
         outputs: utxos.len(),
         total_amount_sat,
         bogo_size,
-        serialized_hash: serialized_engine
-            .map(|engine| bitcoin::hashes::sha256d::Hash::from_engine(engine).to_string()),
+        serialized_hash,
         muhash: muhash.map(|accumulator| accumulator.finalize()),
     }
+}
+
+fn serialize_utxo_coin(outpoint: &OutPoint, entry: &UtxoEntry) -> Vec<u8> {
+    let mut coin_bytes = Vec::new();
+    coin_bytes.extend_from_slice(&serialize(outpoint));
+    coin_bytes.extend_from_slice(
+        &(entry.height.saturating_mul(2) | u32::from(entry.coinbase)).to_le_bytes(),
+    );
+    coin_bytes.extend_from_slice(&serialize(&entry.output));
+    coin_bytes
 }
 
 fn apply_block_to_utxos(

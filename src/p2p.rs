@@ -1986,7 +1986,7 @@ async fn send_peer_extensions(
 }
 
 async fn request_headers(node: &Arc<Node>, peer_id: usize, writer: &PeerWriter) -> Result<()> {
-    let locator = vec![node.chain.read().best_hash()];
+    let locator = node.chain.read().block_locator_hashes();
     send_message(
         node,
         peer_id,

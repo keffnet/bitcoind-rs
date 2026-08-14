@@ -1015,6 +1015,29 @@ impl ChainState {
         self.active_chain.get(height as usize).copied()
     }
 
+    /// Build the exponentially backed-off locator used by `getheaders` and
+    /// `getblocks`. Keeping the first ten entries dense makes short reorgs
+    /// cheap while the older entries still let a peer find a common ancestor
+    /// without sending the entire active chain.
+    pub fn block_locator_hashes(&self) -> Vec<BlockHash> {
+        let mut locator = Vec::new();
+        let mut height = self.height();
+        let mut step = 1u32;
+        loop {
+            if let Some(hash) = self.block_hash(height) {
+                locator.push(hash);
+            }
+            if height == 0 {
+                break;
+            }
+            if locator.len() > 10 {
+                step = step.saturating_mul(2);
+            }
+            height = height.saturating_sub(step);
+        }
+        locator
+    }
+
     pub fn headers_after_locator(
         &self,
         locator: &[BlockHash],
@@ -1038,7 +1061,11 @@ impl ChainState {
                     position.saturating_add(1)
                 })
         };
-        self.headers[start..stop.min(self.headers.len())]
+        let stop = stop.min(self.headers.len());
+        if start >= stop {
+            return Vec::new();
+        }
+        self.headers[start..stop]
             .iter()
             .take(2_000)
             .copied()
@@ -2900,6 +2927,30 @@ mod tests {
                 .unwrap()
                 .1
         );
+    }
+
+    #[test]
+    fn block_locators_back_off_and_reverse_ranges_are_empty() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=20 {
+            let block = mine_block(&state, height);
+            state.connect_block(block).unwrap();
+        }
+
+        let locator_heights = state
+            .block_locator_hashes()
+            .into_iter()
+            .map(|hash| state.block_height_by_hash(&hash).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            locator_heights,
+            vec![20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 8, 4, 0]
+        );
+
+        let locator = vec![state.block_hash(15).unwrap()];
+        let stop_hash = state.block_hash(10).unwrap();
+        assert!(state.headers_after_locator(&locator, stop_hash).is_empty());
     }
 
     #[test]

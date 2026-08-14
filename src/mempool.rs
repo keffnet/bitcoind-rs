@@ -1370,6 +1370,9 @@ impl Mempool {
             input_total = input_total
                 .checked_add(previous.value.to_sat())
                 .ok_or(MempoolError::BadOutput)?;
+            if input_total > Amount::MAX_MONEY.to_sat() {
+                return Err(MempoolError::BadOutput);
+            }
             previous_outputs.push(previous.clone());
         }
         validation::validate_transaction_finality(
@@ -2116,7 +2119,9 @@ fn is_standard_output_script(script: &Script, permit_bare_multisig: bool) -> boo
     script.is_p2pkh()
         || script.is_p2sh()
         || script.p2pk_public_key().is_some()
-        || script.is_witness_program()
+        || script.is_p2wpkh()
+        || script.is_p2wsh()
+        || script.is_p2tr()
         || (permit_bare_multisig && is_standard_bare_multisig(script))
 }
 
@@ -2947,6 +2952,17 @@ mod tests {
 
         nonstandard.output[0].value = Amount::from_sat(1);
         assert!(is_dust_output(&nonstandard.output[0]));
+
+        nonstandard.output[0].value = Amount::from_sat(100_000);
+        nonstandard.output[0].script_pubkey = ScriptBuf::from_bytes({
+            let mut bytes = vec![0x52, 0x20];
+            bytes.extend([0u8; 32]);
+            bytes
+        });
+        assert!(matches!(
+            validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1),
+            Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
+        ));
     }
 
     #[test]

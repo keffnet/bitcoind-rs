@@ -5052,6 +5052,7 @@ pub fn transaction_hex(transaction: &Transaction) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mempool::Mempool;
     use bitcoin::Sequence;
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version as BlockVersion};
@@ -6070,6 +6071,56 @@ mod tests {
         }
         assert!(state.connect_block(block).is_err());
         assert_eq!(state.height(), 0);
+    }
+
+    #[test]
+    fn mempool_rejects_transaction_input_total_above_max_money() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let first_outpoint = OutPoint::new(Txid::from_byte_array([3; 32]), 0);
+        let second_outpoint = OutPoint::new(Txid::from_byte_array([4; 32]), 0);
+        let half_money = Amount::MAX_MONEY.to_sat() / 2;
+        for outpoint in [first_outpoint, second_outpoint] {
+            state.utxos.insert(
+                outpoint,
+                UtxoEntry {
+                    output: TxOut {
+                        value: Amount::from_sat(half_money.saturating_add(1)),
+                        script_pubkey: Builder::new().push_int(1).into_script(),
+                    },
+                    height: 0,
+                    median_time_past: 0,
+                    coinbase: false,
+                },
+            );
+        }
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: first_outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::default(),
+                },
+                TxIn {
+                    previous_output: second_outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::default(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::MAX_MONEY,
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+        let mut mempool = Mempool::new(Network::Regtest);
+        assert!(matches!(
+            mempool.accept(transaction, &state),
+            Err(crate::mempool::MempoolError::BadOutput)
+        ));
     }
 
     #[test]

@@ -52,6 +52,7 @@ const MAX_BLOOM_FILTER_SIZE: usize = 36_000;
 const MAX_BLOOM_HASH_FUNCS: u32 = 50;
 const MAX_BLOOM_ELEMENT_SIZE: usize = 520;
 const MAX_ADDR_TO_SEND: usize = 1_000;
+const MAX_BLOCKTXN_DEPTH: u32 = 10;
 const SENDHEADERS_VERSION: i32 = 70_012;
 const FEEFILTER_VERSION: i32 = 70_013;
 const SHORT_IDS_BLOCKS_VERSION: i32 = 70_014;
@@ -1496,36 +1497,49 @@ async fn serve_peer_loop(
                 if !compact_block_indexes_are_strictly_increasing(&request.indexes) {
                     anyhow::bail!("compact block transaction indexes are not strictly increasing");
                 }
-                let block = node.chain.write().block(&request.block_hash)?;
-                let Some(block) = block else {
-                    continue;
+                let (block, recent) = {
+                    let mut chain = node.chain.write();
+                    let Some(height) = chain.block_height_by_hash(&request.block_hash) else {
+                        continue;
+                    };
+                    let recent = blocktxn_block_is_recent(height, chain.height());
+                    let Some(block) = chain.block(&request.block_hash)? else {
+                        continue;
+                    };
+                    (block, recent)
                 };
-                let mut transactions = Vec::with_capacity(request.indexes.len());
-                let mut valid = true;
-                for index in &request.indexes {
-                    let Ok(index) = usize::try_from(*index) else {
-                        valid = false;
-                        break;
-                    };
-                    let Some(transaction) = block.txdata.get(index) else {
-                        valid = false;
-                        break;
-                    };
-                    transactions.push(transaction.clone());
-                }
-                if valid {
+                if !recent {
                     send_message(
                         node,
                         peer_id,
                         writer,
                         node.config.network,
-                        &Message::BlockTxn(BlockTransactions {
-                            block_hash: request.block_hash,
-                            transactions,
-                        }),
+                        &Message::Block(block),
                     )
                     .await?;
+                    continue;
                 }
+                let mut transactions = Vec::with_capacity(request.indexes.len());
+                for index in &request.indexes {
+                    let Ok(index) = usize::try_from(*index) else {
+                        anyhow::bail!("compact block transaction index is too large");
+                    };
+                    let Some(transaction) = block.txdata.get(index) else {
+                        anyhow::bail!("compact block transaction index is out of bounds");
+                    };
+                    transactions.push(transaction.clone());
+                }
+                send_message(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &Message::BlockTxn(BlockTransactions {
+                        block_hash: request.block_hash,
+                        transactions,
+                    }),
+                )
+                .await?;
             }
             Message::BlockTxn(response) => {
                 let Some(mut pending) = pending_compact.take() else {
@@ -2490,6 +2504,10 @@ fn compact_block_indexes_are_strictly_increasing(indexes: &[u64]) -> bool {
     indexes.windows(2).all(|pair| pair[0] < pair[1])
 }
 
+fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
+    height >= tip_height.saturating_sub(MAX_BLOCKTXN_DEPTH)
+}
+
 fn fee_rate_sat_per_kvb(fee_sat: u64, vsize: u64) -> i64 {
     if vsize == 0 {
         return i64::MAX;
@@ -2572,6 +2590,14 @@ mod tests {
         assert!(compact_block_indexes_are_strictly_increasing(&[0, 1, 4, 9]));
         assert!(!compact_block_indexes_are_strictly_increasing(&[0, 1, 1]));
         assert!(!compact_block_indexes_are_strictly_increasing(&[2, 1]));
+    }
+
+    #[test]
+    fn compact_block_transaction_serving_uses_core_recency_window() {
+        assert!(blocktxn_block_is_recent(90, 100));
+        assert!(blocktxn_block_is_recent(100, 100));
+        assert!(!blocktxn_block_is_recent(89, 100));
+        assert!(blocktxn_block_is_recent(0, 5));
     }
 
     #[test]

@@ -3111,6 +3111,15 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .map(str::parse::<BlockHash>)
         .transpose()?;
     let mut chain = node.chain.write();
+    if let Some(genesis_hash) = chain.block_hash(0)
+        && let Some(genesis) = chain.block(&genesis_hash)?
+        && genesis
+            .txdata
+            .first()
+            .is_some_and(|transaction| transaction.compute_txid() == txid)
+    {
+        bail!("The genesis block coinbase is not considered an ordinary transaction")
+    }
     let found = if let Some(block_hash) = requested_block {
         let block = chain
             .block(&block_hash)?
@@ -3176,6 +3185,9 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         block_time,
         node.config.network,
     );
+    if let Some(block_hash) = requested_block {
+        result["in_active_chain"] = json!(chain.is_active_block(&block_hash));
+    }
     if verbosity >= 2 {
         if location.block_hash != BlockHash::all_zeros() {
             if let Some(undo) = chain
@@ -8543,6 +8555,16 @@ mod tests {
             max_peers: 1,
         })
         .unwrap();
+        let genesis_hash = node.chain.read().best_hash();
+        let genesis_txid = node
+            .chain
+            .write()
+            .block(&genesis_hash)
+            .unwrap()
+            .unwrap()
+            .txdata[0]
+            .compute_txid();
+        assert!(get_raw_transaction(&node, &json!([genesis_txid.to_string(), 1])).is_err());
         let raw = create_raw_transaction(
             &node,
             &json!([

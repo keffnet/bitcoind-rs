@@ -8181,7 +8181,9 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let block: bitcoin::Block = deserialize(&bytes)?;
     let hash = block.block_hash();
-    if let Some(status) = node.chain.read().proposal_duplicate_status(&hash) {
+    if let Some(status) = node.chain.read().proposal_duplicate_status(&hash)
+        && status != "duplicate-inconclusive"
+    {
         return Ok(json!(status));
     }
     let result = node.connect_block(block);
@@ -13001,6 +13003,19 @@ mod tests {
             submit_block(&node, &json!([block_hex])).unwrap(),
             json!("duplicate")
         );
+        let header_first = generate_block(&node, &json!(["raw(51)", [], false])).unwrap();
+        let header_first_block: Block =
+            deserialize(&hex::decode(header_first["hex"].as_str().unwrap()).unwrap()).unwrap();
+        submit_header(
+            &node,
+            &json!([hex::encode(serialize(&header_first_block.header))]),
+        )
+        .unwrap();
+        assert_eq!(
+            submit_block(&node, &json!([header_first["hex"].clone()])).unwrap(),
+            Value::Null
+        );
+        assert_eq!(node.chain.read().height(), 3);
         let combo_block = generate_block(
             &node,
             &json!([

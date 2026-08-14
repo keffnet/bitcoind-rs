@@ -7784,6 +7784,7 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
         fees,
         extra_nonce,
     } = template;
+    let segwit_active = height >= validation::buried_deployment_heights(network).segwit;
     let mut coinbase = Transaction {
         version: Version::ONE,
         lock_time: LockTime::ZERO,
@@ -7803,7 +7804,9 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
             script_pubkey,
         }],
     };
-    coinbase.input[0].witness = Witness::from_slice(&[vec![0u8; 32]]);
+    if segwit_active {
+        coinbase.input[0].witness = Witness::from_slice(&[vec![0u8; 32]]);
+    }
     let mut block = Block {
         header: Header {
             version: BlockVersion::from_consensus(0x2000_0000),
@@ -7815,16 +7818,18 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
         },
         txdata: std::iter::once(coinbase).chain(transactions).collect(),
     };
-    let witness_root = block
-        .witness_root()
-        .ok_or_else(|| anyhow!("cannot calculate witness merkle root"))?;
-    let commitment = Block::compute_witness_commitment(&witness_root, &[0u8; 32]);
-    let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
-    script.extend_from_slice(&commitment.to_byte_array());
-    block.txdata[0].output.push(TxOut {
-        value: Amount::ZERO,
-        script_pubkey: ScriptBuf::from_bytes(script),
-    });
+    if segwit_active {
+        let witness_root = block
+            .witness_root()
+            .ok_or_else(|| anyhow!("cannot calculate witness merkle root"))?;
+        let commitment = Block::compute_witness_commitment(&witness_root, &[0u8; 32]);
+        let mut script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        script.extend_from_slice(&commitment.to_byte_array());
+        block.txdata[0].output.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(script),
+        });
+    }
     block.header.merkle_root = block
         .compute_merkle_root()
         .ok_or_else(|| anyhow!("cannot calculate transaction merkle root"))?;
@@ -7897,8 +7902,15 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let tip = chain.tip();
     let parent = chain.header(tip.height).expect("tip header exists");
     let height = tip.height + 1;
+    let segwit_active = height >= validation::buried_deployment_heights(chain.network).segwit;
     let now = crate::time::unix_time() as u32;
-    let curtime = now.max(parent.time.saturating_add(1));
+    let mintime = minimum_block_time(
+        chain.network,
+        parent,
+        height,
+        chain.median_time_past_value(),
+    );
+    let curtime = now.max(mintime);
     let bits = chain.next_bits(curtime);
     let mempool = node.mempool.read();
     let mut fees = 0u64;
@@ -7941,7 +7953,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
                                 .and_then(|entry| entry.transaction.output.get(outpoint.vout as usize))
                                 .cloned()
                         })
-                }),
+                }) / if segwit_active { 1 } else { 4 },
                 "weight": transaction.weight().to_wu(),
             })
         })
@@ -7961,14 +7973,16 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         fees,
         extra_nonce: 0,
     })?;
-    let default_witness_commitment = template_block
-        .txdata
-        .first()
-        .and_then(|coinbase| coinbase.output.last())
-        .map(|output| hex::encode(output.script_pubkey.as_bytes()));
+    let default_witness_commitment = segwit_active.then(|| {
+        template_block
+            .txdata
+            .first()
+            .and_then(|coinbase| coinbase.output.last())
+            .map(|output| hex::encode(output.script_pubkey.as_bytes()))
+            .unwrap_or_default()
+    });
     let coinbase_value =
         validation::block_subsidy_for_network(chain.network, height).saturating_add(fees);
-    let segwit_active = height >= validation::buried_deployment_heights(chain.network).segwit;
     let mut rules = vec!["csv"];
     if segwit_active {
         rules.push("!segwit");
@@ -8002,7 +8016,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "coinbaseaux": {},
         "coinbasevalue": coinbase_value,
         "target": format!("{:064x}", bitcoin::pow::Target::from_compact(bitcoin::pow::CompactTarget::from_consensus(bits))),
-        "mintime": chain.median_time_past_value().saturating_add(1),
+        "mintime": mintime,
         "curtime": curtime,
         "mutable": ["time", "transactions", "prevblock"],
         "noncerange": "00000000ffffffff",
@@ -8016,12 +8030,16 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         } else {
             validation::MAX_BLOCK_SERIALIZED_SIZE / 4
         },
-        "longpollid": format!("{}:{}", tip.hash, mempool.sequence()),
+        "longpollid": format!("{}{}", tip.hash, mempool.sequence()),
         "height": height,
         "bits": format!("{:08x}", bits),
-        "default_witness_commitment": default_witness_commitment,
-        "signet_challenge": chain.signet_challenge().map(hex::encode),
     });
+    if let Some(default_witness_commitment) = default_witness_commitment {
+        result["default_witness_commitment"] = json!(default_witness_commitment);
+    }
+    if let Some(challenge) = chain.signet_challenge() {
+        result["signet_challenge"] = json!(hex::encode(challenge));
+    }
     if segwit_active {
         result["weightlimit"] = json!(validation::MAX_BLOCK_WEIGHT);
     }
@@ -8062,7 +8080,21 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
 fn current_block_template_longpoll_id(node: &Arc<Node>) -> String {
     let tip = node.chain.read().tip();
     let sequence = node.mempool.read().sequence();
-    format!("{}:{}", tip.hash, sequence)
+    format!("{}{}", tip.hash, sequence)
+}
+
+fn minimum_block_time(
+    network: Network,
+    parent: &Header,
+    height: u32,
+    median_time_past: u32,
+) -> u32 {
+    let mut minimum = median_time_past.saturating_add(1);
+    let interval = network.params().difficulty_adjustment_interval();
+    if u64::from(height) % interval == 0 {
+        minimum = minimum.max(parent.time.saturating_sub(600));
+    }
+    minimum
 }
 
 fn prioritise_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -11628,11 +11660,31 @@ mod tests {
             template["longpollid"],
             current_block_template_longpoll_id(&node)
         );
+        let longpollid = template["longpollid"].as_str().unwrap();
+        assert_eq!(&longpollid[..64], node.chain.read().best_hash().to_string());
+        assert!(longpollid[64..].parse::<u64>().is_ok());
+        assert!(template.get("signet_challenge").is_none());
         assert!(
             template["default_witness_commitment"]
                 .as_str()
                 .is_some_and(|value| value.starts_with("6a24aa21a9ed"))
         );
+
+        let bitcoin_genesis = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin);
+        let pre_segwit_block = mining_block(MiningBlockTemplate {
+            network: Network::Bitcoin,
+            parent: bitcoin_genesis.header,
+            height: 1,
+            time: bitcoin_genesis.header.time.saturating_add(1),
+            bits: bitcoin_genesis.header.bits.to_consensus(),
+            script_pubkey: ScriptBuf::new(),
+            transactions: Vec::new(),
+            fees: 0,
+            extra_nonce: 0,
+        })
+        .unwrap();
+        assert!(pre_segwit_block.txdata[0].input[0].witness.is_empty());
+        assert_eq!(pre_segwit_block.txdata[0].output.len(), 1);
         assert!(get_block_template(&node, &json!([{}])).is_err());
 
         let (parent, bits) = {

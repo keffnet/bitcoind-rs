@@ -1385,7 +1385,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "protocolversion": 70016,
             "localservices": format!("{local_services:016x}"),
             "localservicesnames": peer_services_names(local_services),
-            "timeoffset": 0,
+            "timeoffset": node.median_outbound_time_offset(),
             "localrelay": !node.config.blocksonly,
             "connections": node.peer_count(),
             "connections_in": node.peer_infos().iter().filter(|peer| peer.inbound).count(),
@@ -12331,6 +12331,8 @@ mod tests {
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
+        node.update_peer_version(7, 70016, 0, "/test-peer/", 0, true);
+        node.update_peer_time_offset(7, 42);
         let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(peer_info[0]["id"], json!(7));
         assert_eq!(peer_info[0]["connection_type"], json!("outbound-full"));
@@ -12338,6 +12340,10 @@ mod tests {
         assert_eq!(peer_info[0]["transport_protocol_type"], json!("v1"));
         assert!(peer_info[0].get("startingheight").is_none());
         assert!(peer_info[0].get("pingtime").is_none());
+        assert_eq!(
+            dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["timeoffset"],
+            json!(42)
+        );
         assert_eq!(
             dispatch_method(&node, "sendmsgtopeer", &json!([7, "test", "0102"]),).unwrap(),
             json!({})

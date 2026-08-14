@@ -1135,6 +1135,25 @@ impl Node {
         self.peers.read().values().cloned().collect()
     }
 
+    /// Return the median clock offset reported by connected outbound peers.
+    ///
+    /// Bitcoin Core uses only outbound handshake samples for the node-wide
+    /// network time offset; inbound peers must not be able to influence it.
+    pub fn median_outbound_time_offset(&self) -> i64 {
+        let mut offsets = self
+            .peers
+            .read()
+            .values()
+            .filter(|peer| !peer.inbound && peer.version.is_some())
+            .map(|peer| peer.time_offset)
+            .collect::<Vec<_>>();
+        if offsets.is_empty() {
+            return 0;
+        }
+        offsets.sort_unstable();
+        offsets[offsets.len() / 2]
+    }
+
     pub fn known_addresses(&self) -> Vec<PeerInfo> {
         self.known_addresses.read().values().cloned().collect()
     }
@@ -1771,6 +1790,30 @@ mod tests {
             node.zmq_mempool_sequence.load(Ordering::Relaxed),
             initial + 2
         );
+    }
+
+    #[test]
+    fn median_outbound_time_offset_ignores_inbound_and_unnegotiated_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender.clone());
+        node.register_peer(2, "192.0.2.2:18444".parse().unwrap(), false, sender.clone());
+        node.register_peer(3, "192.0.2.3:18444".parse().unwrap(), false, sender.clone());
+        node.register_peer(4, "192.0.2.4:18444".parse().unwrap(), true, sender);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(5, "192.0.2.5:18444".parse().unwrap(), false, sender);
+
+        node.update_peer_version(1, 70016, 0, "/one/", 0, true);
+        node.update_peer_version(2, 70016, 0, "/two/", 0, true);
+        node.update_peer_version(3, 70016, 0, "/three/", 0, true);
+        node.update_peer_version(4, 70016, 0, "/inbound/", 0, true);
+        node.update_peer_time_offset(1, -10);
+        node.update_peer_time_offset(2, 20);
+        node.update_peer_time_offset(3, 1);
+        node.update_peer_time_offset(4, 500);
+
+        assert_eq!(node.median_outbound_time_offset(), 1);
     }
 
     #[test]

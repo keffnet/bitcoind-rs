@@ -298,7 +298,9 @@ impl Node {
         chain.maybe_auto_prune()?;
         let mempool_path = config.datadir.join("mempool.json");
         let mut mempool = Mempool::with_max_bytes(config.network, max_mempool_bytes);
-        mempool.load_from_file(&mempool_path, &chain)?;
+        if config.persist_mempool {
+            mempool.load_from_file(&mempool_path, &chain)?;
+        }
         let _ = mempool.take_changes();
         let banned_addresses = load_banlist(&config.datadir)?;
         let (known_addresses, tried_addresses) = load_known_addresses(&config.datadir)?;
@@ -1294,7 +1296,9 @@ impl Node {
         electrum_task.abort();
         zmq_task.abort();
         mempool_expiry_task.abort();
-        self.persist_mempool()?;
+        if self.config.persist_mempool {
+            self.persist_mempool()?;
+        }
         self.persist_known_addresses()?;
         Ok(())
     }
@@ -1471,6 +1475,7 @@ mod tests {
             txindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -1725,5 +1730,19 @@ mod tests {
         assert_eq!(peer.id, 0);
         assert_eq!(peer.services, crate::wire::NODE_NETWORK);
         assert_eq!(peer.connected_at, 123);
+    }
+
+    #[test]
+    fn disabled_mempool_persistence_skips_loading_the_disk_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let mempool_path = directory.path().join("mempool.json");
+        std::fs::write(&mempool_path, b"not-json").unwrap();
+        let mut config = test_config(directory.path());
+        config.persist_mempool = false;
+
+        let node = Node::open(config).unwrap();
+
+        assert!(node.mempool.read().is_empty());
+        assert_eq!(std::fs::read(&mempool_path).unwrap(), b"not-json");
     }
 }

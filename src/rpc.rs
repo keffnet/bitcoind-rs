@@ -3522,7 +3522,7 @@ fn get_block_filter(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("blockfilterindex is not enabled")
     }
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
-    let filter_type = params.get(1).and_then(Value::as_str).unwrap_or("basic");
+    let filter_type = optional_str(params, 1, "basic", "filtertype")?;
     if filter_type != "basic" {
         bail!("only the basic block filter is available")
     }
@@ -3564,7 +3564,7 @@ fn precious_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let path = snapshot_path(node, &param::<String>(params, 0)?);
-    let dump_type = params.get(1).and_then(Value::as_str).unwrap_or("latest");
+    let dump_type = optional_str(params, 1, "latest", "type")?;
     if dump_type != "latest" {
         bail!("only the latest UTXO snapshot type is supported")
     }
@@ -7228,11 +7228,7 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .push_int(key_count as i64)
         .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
         .into_script();
-    let requested_address_type = params
-        .get(2)
-        .filter(|value| !value.is_null())
-        .and_then(Value::as_str)
-        .unwrap_or("legacy");
+    let requested_address_type = optional_str(params, 2, "legacy", "address_type")?;
     if requested_address_type == "bech32m" {
         bail!("createmultisig cannot create bech32m multisig addresses")
     }
@@ -7385,11 +7381,7 @@ fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Val
         })
         .collect::<Result<Vec<_>>>()?;
     let prevouts = parse_signing_prevouts(params.get(2))?;
-    let sighash_name = params
-        .get(3)
-        .filter(|value| !value.is_null())
-        .and_then(Value::as_str)
-        .unwrap_or("SIGHASH_ALL");
+    let sighash_name = optional_str(params, 3, "SIGHASH_ALL", "sighashtype")?;
     let sighash_type = if sighash_name == "DEFAULT" {
         EcdsaSighashType::All
     } else {
@@ -8088,7 +8080,13 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("getblocktemplate request must be an object"))?;
     let mode = request
         .get("mode")
-        .and_then(Value::as_str)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("getblocktemplate mode must be a string"))
+        })
+        .transpose()?
         .unwrap_or("template");
     if mode == "proposal" {
         let data = request
@@ -9259,18 +9257,29 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 })
                 .transpose()?
                 .unwrap_or(chain_height);
-            let filter_type = params.get(4).and_then(Value::as_str).unwrap_or("basic");
+            let filter_type = optional_str(params, 4, "basic", "filtertype")?;
             if filter_type != "basic" {
                 bail!("only the basic block filter is available")
             }
             let filter_false_positives = match params.get(5).filter(|value| !value.is_null()) {
                 None => false,
-                Some(options) => options
-                    .get("filter_false_positives")
-                    .and_then(Value::as_bool)
-                    .ok_or_else(|| {
-                        anyhow!("scanblocks options.filter_false_positives must be a boolean")
-                    })?,
+                Some(options) => {
+                    let options = options
+                        .as_object()
+                        .ok_or_else(|| anyhow!("scanblocks options must be an object"))?;
+                    options
+                        .get("filter_false_positives")
+                        .filter(|value| !value.is_null())
+                        .map(|value| {
+                            value.as_bool().ok_or_else(|| {
+                                anyhow!(
+                                    "scanblocks options.filter_false_positives must be a boolean"
+                                )
+                            })
+                        })
+                        .transpose()?
+                        .unwrap_or(false)
+                }
             };
             if start_height > stop_height || stop_height > chain_height {
                 bail!("invalid scan height range")
@@ -10255,6 +10264,20 @@ pub(crate) fn optional_bool(
         .ok_or_else(|| anyhow!("{name} must be a boolean"))
 }
 
+fn optional_str<'a>(
+    params: &'a Value,
+    index: usize,
+    default: &'a str,
+    name: &str,
+) -> Result<&'a str> {
+    let Some(value) = params.get(index).filter(|value| !value.is_null()) else {
+        return Ok(default);
+    };
+    value
+        .as_str()
+        .ok_or_else(|| anyhow!("{name} must be a string"))
+}
+
 fn rpc_error(error: &anyhow::Error) -> Value {
     json!({"code": -1, "message": error.to_string()})
 }
@@ -11188,6 +11211,19 @@ mod tests {
         assert!(optional_bool(&json!([true]), 0, false, "flag").unwrap());
         assert!(optional_bool(&json!([1]), 0, true, "flag").is_err());
         assert!(optional_bool(&json!(["true"]), 0, true, "flag").is_err());
+        assert_eq!(
+            optional_str(&json!([]), 0, "default", "field").unwrap(),
+            "default"
+        );
+        assert_eq!(
+            optional_str(&json!([null]), 0, "default", "field").unwrap(),
+            "default"
+        );
+        assert_eq!(
+            optional_str(&json!(["value"]), 0, "default", "field").unwrap(),
+            "value"
+        );
+        assert!(optional_str(&json!([1]), 0, "default", "field").is_err());
     }
 
     #[test]
@@ -11539,6 +11575,7 @@ mod tests {
         assert!(filter["filter"].as_str().is_some());
         assert_eq!(filter["header"].as_str().unwrap().len(), 64);
         assert!(get_block_filter(&node, &json!([hash.to_string(), "extended"])).is_err());
+        assert!(get_block_filter(&node, &json!([hash.to_string(), 1])).is_err());
     }
 
     #[test]
@@ -12238,6 +12275,7 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| value.starts_with("6a24aa21a9ed"))
         );
+        assert!(get_block_template(&node, &json!([{"mode": 1, "rules": ["segwit"]}])).is_err());
 
         let bitcoin_genesis = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin);
         let pre_segwit_block = mining_block(MiningBlockTemplate {
@@ -13838,6 +13876,7 @@ mod tests {
             first.public_key(&secp).to_string(),
             second.public_key(&secp).to_string(),
         ]);
+        assert!(create_multisig(&node, &json!([1, keys, 1])).is_err());
         let legacy = create_multisig(&node, &json!([1, keys])).unwrap();
         let redeem_script =
             ScriptBuf::from_bytes(hex::decode(legacy["redeemScript"].as_str().unwrap()).unwrap());
@@ -14858,6 +14897,7 @@ mod tests {
         })
         .unwrap();
         let path = directory.path().join("utxos.snapshot");
+        assert!(dump_txoutset(&node, &json!([path.to_string_lossy(), 1])).is_err());
         let dumped = dump_txoutset(&node, &json!([path.to_string_lossy()])).unwrap();
         assert_eq!(dumped["base_height"], 0);
         assert_eq!(dumped["coins_written"], 0);
@@ -14927,6 +14967,7 @@ mod tests {
         .unwrap()
         .to_owned();
         let descriptor = format!("addr({address})");
+        assert!(scan_blocks(&node, &json!(["start", [descriptor.clone()], 0, 1, 1])).is_err());
         let scan = scan_blocks(
             &node,
             &json!(["start", [descriptor.clone()], 0, 1, "basic"]),

@@ -60,6 +60,14 @@ struct PeerState {
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, Arc<PeerState>>>>;
 type OutboundAttempts = Arc<parking_lot::Mutex<HashSet<SocketAddr>>>;
 
+#[derive(Clone)]
+struct OutboundContext {
+    slots: Arc<Semaphore>,
+    peers: PeerRegistry,
+    next_peer_id: Arc<AtomicUsize>,
+    attempts: OutboundAttempts,
+}
+
 #[derive(Clone, Debug)]
 struct BloomFilter {
     data: Vec<u8>,
@@ -263,11 +271,48 @@ impl PeerManager {
             .with_context(|| format!("binding P2P listener {}", self.node.config.p2p_bind))?;
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
         let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let outbound_attempts: OutboundAttempts = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let next_peer_id = Arc::new(AtomicUsize::new(1));
+        let outbound = OutboundContext {
+            slots: slots.clone(),
+            peers: peers.clone(),
+            next_peer_id: next_peer_id.clone(),
+            attempts: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+        };
         let (add_node_sender, mut add_node_receiver) = mpsc::unbounded_channel();
         self.node.set_peer_manager_sender(add_node_sender);
+        let mut chain_events = self.node.subscribe_chain();
         let mut mempool_events = self.node.subscribe_mempool();
+        let block_relay_node = self.node.clone();
+        let block_relay_peers = peers.clone();
+        let block_relay_network = self.node.config.network;
+        tokio::spawn(async move {
+            loop {
+                let tip = match chain_events.recv().await {
+                    Ok(tip) => tip,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
+                let block = block_relay_node
+                    .chain
+                    .write()
+                    .block(&tip.hash)
+                    .ok()
+                    .flatten();
+                if block.is_some() {
+                    broadcast_inventory(
+                        &block_relay_node,
+                        &block_relay_peers,
+                        0,
+                        block_relay_network,
+                        Inventory {
+                            kind: InventoryType::WitnessBlock,
+                            hash: tip.hash,
+                        },
+                    )
+                    .await;
+                }
+            }
+        });
         let relay_peers = peers.clone();
         let relay_node = self.node.clone();
         let relay_network = self.node.config.network;
@@ -312,22 +357,10 @@ impl PeerManager {
         };
         for address in seed_nodes {
             self.node.ensure_node_added(address);
-            spawn_outbound_loop(
-                self.node.clone(),
-                address,
-                slots.clone(),
-                peers.clone(),
-                next_peer_id.clone(),
-                true,
-                None,
-                outbound_attempts.clone(),
-            );
+            spawn_outbound_loop(self.node.clone(), address, outbound.clone(), true, None);
         }
         let discovery_node = self.node.clone();
-        let discovery_slots = slots.clone();
-        let discovery_peers = peers.clone();
-        let discovery_ids = next_peer_id.clone();
-        let discovery_attempts = outbound_attempts.clone();
+        let discovery_outbound = outbound.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -336,31 +369,27 @@ impl PeerManager {
                 if !discovery_node.network_active() {
                     continue;
                 }
-                let available = discovery_slots.available_permits().min(8);
+                let available = discovery_outbound.slots.available_permits().min(8);
                 if available == 0 {
                     continue;
                 }
-                for address in
-                    select_discovery_addresses(&discovery_node, available, &discovery_attempts)
-                {
+                for address in select_discovery_addresses(
+                    &discovery_node,
+                    available,
+                    &discovery_outbound.attempts,
+                ) {
                     spawn_outbound_loop(
                         discovery_node.clone(),
                         address,
-                        discovery_slots.clone(),
-                        discovery_peers.clone(),
-                        discovery_ids.clone(),
+                        discovery_outbound.clone(),
                         false,
                         None,
-                        discovery_attempts.clone(),
                     );
                 }
             }
         });
         let dynamic_node = self.node.clone();
-        let dynamic_slots = slots.clone();
-        let dynamic_peers = peers.clone();
-        let dynamic_ids = next_peer_id.clone();
-        let dynamic_attempts = outbound_attempts.clone();
+        let dynamic_outbound = outbound.clone();
         tokio::spawn(async move {
             while let Some(request) = add_node_receiver.recv().await {
                 let (address, persistent, transport_v2) = match request {
@@ -372,12 +401,9 @@ impl PeerManager {
                 spawn_outbound_loop(
                     dynamic_node.clone(),
                     address,
-                    dynamic_slots.clone(),
-                    dynamic_peers.clone(),
-                    dynamic_ids.clone(),
+                    dynamic_outbound.clone(),
                     persistent,
                     transport_v2,
-                    dynamic_attempts.clone(),
                 );
             }
         });
@@ -410,20 +436,23 @@ impl PeerManager {
 fn spawn_outbound_loop(
     node: Arc<Node>,
     address: std::net::SocketAddr,
-    slots: Arc<Semaphore>,
-    peers: PeerRegistry,
-    next_peer_id: Arc<AtomicUsize>,
+    outbound: OutboundContext,
     persistent: bool,
     transport_v2: Option<bool>,
-    outbound_attempts: OutboundAttempts,
 ) {
     {
-        let mut attempts = outbound_attempts.lock();
+        let mut attempts = outbound.attempts.lock();
         if !attempts.insert(address) {
             return;
         }
     }
-    let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
+    let peer_id = outbound.next_peer_id.fetch_add(1, Ordering::Relaxed);
+    let OutboundContext {
+        slots,
+        peers,
+        attempts: outbound_attempts,
+        ..
+    } = outbound;
     tokio::spawn(async move {
         struct AttemptGuard {
             address: SocketAddr,
@@ -1587,20 +1616,29 @@ async fn handle_received_block(
     block: Block,
 ) {
     let hash = block.block_hash();
+    let (was_stored, previous_tip) = {
+        let chain = node.chain.read();
+        (chain.store.contains(&hash), chain.best_hash())
+    };
     match node.connect_block(block) {
         Ok(tip) => {
             info!(%hash, height = tip.height, "accepted peer block");
-            broadcast_inventory(
-                node,
-                peers,
-                peer_id,
-                node.config.network,
-                Inventory {
-                    kind: InventoryType::WitnessBlock,
-                    hash,
-                },
-            )
-            .await;
+            // Active-tip updates are announced by the chain-event relay. A
+            // side-chain block has no tip event, so relay a newly accepted
+            // side-chain block here. Avoid announcing duplicate blocks.
+            if !was_stored && tip.hash == previous_tip && hash != previous_tip {
+                broadcast_inventory(
+                    node,
+                    peers,
+                    peer_id,
+                    node.config.network,
+                    Inventory {
+                        kind: InventoryType::WitnessBlock,
+                        hash,
+                    },
+                )
+                .await;
+            }
         }
         Err(error) => debug!(%hash, %error, "rejected peer block"),
     }

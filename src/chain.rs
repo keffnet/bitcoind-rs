@@ -1321,6 +1321,8 @@ impl ChainState {
     }
 
     fn validate_snapshot_utxos(&mut self, utxos: &HashMap<OutPoint, UtxoEntry>) -> Result<()> {
+        let mut entries_by_block: HashMap<BlockHash, Vec<(&OutPoint, &UtxoEntry, TxLocation)>> =
+            HashMap::new();
         for (outpoint, entry) in utxos {
             if entry.height > self.height() {
                 bail!("UTXO snapshot contains an output from the future")
@@ -1344,7 +1346,17 @@ impl ChainState {
             {
                 bail!("UTXO snapshot references an inactive or mismatched transaction")
             }
-            if let Some(block) = self.store.get(&location.block_hash)? {
+            entries_by_block
+                .entry(location.block_hash)
+                .or_default()
+                .push((outpoint, entry, location.clone()));
+        }
+
+        for (block_hash, entries) in entries_by_block {
+            let Some(block) = self.store.get(&block_hash)? else {
+                continue;
+            };
+            for (outpoint, entry, location) in entries {
                 let transaction =
                     block
                         .txdata

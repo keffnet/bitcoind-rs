@@ -657,10 +657,11 @@ impl ChainState {
             }
         }
         let active: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
+        let active_tip = self.best_hash();
         let mut tips = self
             .block_index
             .iter()
-            .filter(|(hash, _)| !parents.contains(*hash))
+            .filter(|(hash, _)| **hash == active_tip || !parents.contains(*hash))
             .map(|(hash, node)| {
                 if active.contains(hash) {
                     return KnownChainTip {
@@ -682,7 +683,11 @@ impl ChainState {
                 }
                 let mut cursor = *hash;
                 let mut branch_len: u32 = 0;
+                let mut has_full_blocks = true;
                 while !active.contains(&cursor) {
+                    if !self.store.contains(&cursor) {
+                        has_full_blocks = false;
+                    }
                     let Some(current) = self.block_index.get(&cursor) else {
                         break;
                     };
@@ -693,7 +698,11 @@ impl ChainState {
                     hash: *hash,
                     height: node.height,
                     branch_len,
-                    status: "valid-fork",
+                    status: if has_full_blocks {
+                        "valid-fork"
+                    } else {
+                        "headers-only"
+                    },
                     work: node.chain_work,
                 }
             })
@@ -3587,6 +3596,30 @@ mod tests {
         assert_eq!(reopened.best_hash(), side_three_hash);
         assert_eq!(reopened.block_hash(1), Some(side_one_hash));
         assert!(reopened.transaction(&main_two_coinbase).unwrap().is_some());
+    }
+
+    #[test]
+    fn chain_tips_keep_the_active_tip_when_a_header_only_fork_extends_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let side = mine_block(&state, 1);
+        let side_hash = side.block_hash();
+        state
+            .accept_headers(std::slice::from_ref(&side.header))
+            .unwrap();
+
+        let tips = state.chain_tips();
+        let active = tips
+            .iter()
+            .find(|tip| tip.status == "active")
+            .expect("active tip is always reported");
+        assert_eq!(active.hash, state.network_genesis_hash());
+        let header_only = tips
+            .iter()
+            .find(|tip| tip.hash == side_hash)
+            .expect("header-only fork is reported");
+        assert_eq!(header_only.status, "headers-only");
+        assert_eq!(header_only.branch_len, 1);
     }
 
     #[test]

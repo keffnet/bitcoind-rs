@@ -10640,12 +10640,48 @@ pub(crate) fn optional_u64(params: &Value, index: usize, default: u64, name: &st
 
 fn rpc_error(error: &anyhow::Error) -> Value {
     let message = error.to_string();
-    let code = if message == "Method not found" {
-        -32601
-    } else {
-        -1
-    };
+    let code = rpc_error_code(&message);
     json!({"code": code, "message": message})
+}
+
+fn rpc_error_code(message: &str) -> i32 {
+    let lower = message.to_ascii_lowercase();
+    if message == "Method not found" {
+        return -32601;
+    }
+    if lower.contains("tx decode failed")
+        || lower.contains("transaction decode failed")
+        || lower.contains("block decode failed")
+    {
+        return -22;
+    }
+    if lower == "block not found"
+        || lower == "block not found in chain"
+        || lower == "transaction not found"
+        || lower == "transaction not in mempool"
+        || lower.contains("not in private broadcast queue")
+    {
+        return -5;
+    }
+    if lower == "mallocinfo mode not available"
+        || lower.starts_with("unknown mode ")
+        || lower.starts_with("missing parameter ")
+        || lower.starts_with("too many positional arguments ")
+        || lower.starts_with("unknown named parameter ")
+        || lower.contains("specified more than once")
+        || lower.contains("must be between ")
+        || lower.contains("must not be negative")
+    {
+        return -8;
+    }
+    if lower.contains(" must be a ")
+        || lower.contains(" must be an ")
+        || lower.starts_with("params must be ")
+        || lower.contains(" expects an array")
+    {
+        return -3;
+    }
+    -1
 }
 
 fn sat_to_btc(satoshis: u64) -> f64 {
@@ -10863,6 +10899,10 @@ mod tests {
             rpc_error(&anyhow!("Method not found"))["code"],
             json!(-32601)
         );
+        assert_eq!(rpc_error_code("unknown mode foobar"), -8);
+        assert_eq!(rpc_error_code("mode must be a string"), -3);
+        assert_eq!(rpc_error_code("TX decode failed"), -22);
+        assert_eq!(rpc_error_code("Block not found"), -5);
     }
 
     #[test]

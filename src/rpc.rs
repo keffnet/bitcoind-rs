@@ -7765,11 +7765,7 @@ fn generate_to_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let address = param::<String>(params, 1)?
         .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
         .require_network(node.config.network)?;
-    let max_tries = params
-        .get(2)
-        .filter(|value| !value.is_null())
-        .and_then(Value::as_i64)
-        .unwrap_or(1_000_000);
+    let max_tries = optional_i64(params, 2, 1_000_000, "maxtries")?;
     if max_tries < 0 {
         bail!("maxtries must not be negative");
     }
@@ -7784,11 +7780,7 @@ fn generate_to_descriptor(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     let descriptor = param::<String>(params, 1)?;
     let script = mining_descriptor_script(node, &descriptor)?;
-    let max_tries = params
-        .get(2)
-        .filter(|value| !value.is_null())
-        .and_then(Value::as_i64)
-        .unwrap_or(1_000_000);
+    let max_tries = optional_i64(params, 2, 1_000_000, "maxtries")?;
     if max_tries < 0 {
         bail!("maxtries must not be negative");
     }
@@ -8105,11 +8097,18 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if mode != "template" {
         bail!("invalid getblocktemplate mode")
     }
-    let requested_rules = request
-        .get("rules")
-        .and_then(Value::as_array)
-        .map(|rules| rules.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-        .unwrap_or_default();
+    let requested_rules = match request.get("rules").filter(|value| !value.is_null()) {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| anyhow!("getblocktemplate rules must be an array"))?
+            .iter()
+            .map(|rule| {
+                rule.as_str()
+                    .ok_or_else(|| anyhow!("getblocktemplate rules must contain strings"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
     if !requested_rules.contains(&"segwit") {
         bail!(
             "{}",
@@ -12039,6 +12038,13 @@ mod tests {
         })
         .unwrap();
 
+        assert!(
+            generate_to_address(
+                &node,
+                &json!([0, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl", "100"])
+            )
+            .is_err()
+        );
         let result = generate_to_address(
             &node,
             &json!([1, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"]),
@@ -12299,6 +12305,8 @@ mod tests {
                 .is_some_and(|value| value.starts_with("6a24aa21a9ed"))
         );
         assert!(get_block_template(&node, &json!([{"mode": 1, "rules": ["segwit"]}])).is_err());
+        assert!(get_block_template(&node, &json!([{"rules": 1}])).is_err());
+        assert!(get_block_template(&node, &json!([{"rules": [1]}])).is_err());
 
         let bitcoin_genesis = bitcoin::blockdata::constants::genesis_block(Network::Bitcoin);
         let pre_segwit_block = mining_block(MiningBlockTemplate {

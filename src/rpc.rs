@@ -6718,9 +6718,14 @@ fn generate_blocks_to_script(
 }
 
 fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let output = param::<String>(params, 0)?
-        .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
-        .require_network(node.config.network)?;
+    let output = param::<String>(params, 0)?;
+    let output_script = scan_descriptor_script(node, &output).or_else(|_| {
+        output
+            .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
+            .require_network(node.config.network)
+            .map(|address| address.script_pubkey())
+            .map_err(anyhow::Error::from)
+    })?;
     let requested = params
         .get(1)
         .and_then(Value::as_array)
@@ -6746,7 +6751,7 @@ fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .collect::<Result<Vec<Transaction>>>()?;
     drop(mempool);
 
-    let block = build_mining_block_with_transactions(node, output.script_pubkey(), transactions)?;
+    let block = build_mining_block_with_transactions(node, output_script, transactions)?;
     let Some(block) = mine_block(block, 1_000_000) else {
         bail!("failed to make block")
     };
@@ -9742,6 +9747,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(node.chain.read().height(), 1);
+
+        let descriptor_block = generate_block(&node, &json!(["raw(51)", [], false])).unwrap();
+        assert!(descriptor_block["hex"].as_str().is_some());
     }
 
     #[test]

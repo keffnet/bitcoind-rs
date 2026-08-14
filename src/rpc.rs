@@ -103,25 +103,42 @@ async fn handle_connection(node: Arc<Node>, stream: TcpStream) -> Result<()> {
             match dispatch_rest_with_body(&node, &request.target, &request.body) {
                 Ok((content_type, body)) => ("200 OK", content_type, body),
                 Err(error) => (
-                    "404 Not Found",
+                    rest_error_status(&error),
                     "text/plain",
                     format!("{error}\r\n").into_bytes(),
                 ),
             }
         } else {
+            if !request.method.eq_ignore_ascii_case("POST") {
+                connection
+                    .write_response(
+                        "405 Method Not Allowed",
+                        "text/plain",
+                        b"JSON-RPC server handles only POST requests\r\n",
+                        false,
+                    )
+                    .await?;
+                return Ok(());
+            }
             if !authorized(&node, &request.headers) {
                 connection
                     .write_response("401 Unauthorized", "text/plain", &[], false)
                     .await?;
                 return Ok(());
             }
-            let body = dispatch_json_rpc(&node, &request.body).await;
+            let response = dispatch_json_rpc_http(&node, &request.body).await;
+            let body = response
+                .body
+                .map(|value| {
+                    let mut body = serde_json::to_vec(&value)?;
+                    body.push(b'\n');
+                    Ok::<_, serde_json::Error>(body)
+                })
+                .transpose()?;
             (
-                "200 OK",
+                response.status,
                 "application/json",
-                body.map(|value| serde_json::to_vec(&value))
-                    .transpose()?
-                    .unwrap_or_default(),
+                body.unwrap_or_default(),
             )
         };
         connection
@@ -333,6 +350,30 @@ fn dispatch_rest_with_body(
         route if route.starts_with("getutxos/") => rest_get_utxos(node, route, format, body),
         _ => bail!("unsupported REST endpoint"),
     }
+}
+
+fn rest_error_status(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("internal")
+        || message.contains("i/o")
+        || message.contains("io error")
+        || message.contains("failed to read")
+    {
+        return "500 Internal Server Error";
+    }
+    if message.contains("not found")
+        || message.contains("not available")
+        || message.contains("out of range")
+        || message.contains("disabled")
+        || message.contains("unsupported rest endpoint")
+        || message.contains("unsupported rest output format")
+        || message.contains("only the basic rest block filter is available")
+        || message.contains("rest blockpart supports binary and hex output only")
+        || message.contains("rest deploymentinfo supports json output only")
+    {
+        return "404 Not Found";
+    }
+    "400 Bad Request"
 }
 
 fn rest_json(value: Value) -> Result<(&'static str, Vec<u8>)> {
@@ -917,20 +958,34 @@ fn deserialize_get_utxos_request(bytes: &[u8]) -> Result<(bool, Vec<OutPoint>)> 
     Ok((check_mempool, outpoints))
 }
 
+struct JsonRpcHttpResponse {
+    status: &'static str,
+    body: Option<Value>,
+}
+
+#[cfg(test)]
 async fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Option<Value> {
+    dispatch_json_rpc_http(node, body).await.body
+}
+
+async fn dispatch_json_rpc_http(node: &Arc<Node>, body: &[u8]) -> JsonRpcHttpResponse {
     let request: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
-            return Some(
-                json!({"result": null, "error": {"code": -32700, "message": error.to_string()}, "id": null}),
-            );
+            return JsonRpcHttpResponse {
+                status: "500 Internal Server Error",
+                body: Some(
+                    json!({"result": null, "error": {"code": -32700, "message": error.to_string()}, "id": null}),
+                ),
+            };
         }
     };
     if let Some(batch) = request.as_array() {
         if batch.is_empty() {
-            return Some(
-                json!({"result": null, "error": {"code": -32600, "message": "empty batch"}, "id": null}),
-            );
+            return JsonRpcHttpResponse {
+                status: "200 OK",
+                body: Some(Value::Array(Vec::new())),
+            };
         }
         let mut responses = Vec::with_capacity(batch.len());
         for request in batch {
@@ -938,30 +993,75 @@ async fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Option<Value> {
                 responses.push(response);
             }
         }
-        return (!responses.is_empty()).then_some(Value::Array(responses));
+        return if responses.is_empty() {
+            JsonRpcHttpResponse {
+                status: "204 No Content",
+                body: None,
+            }
+        } else {
+            JsonRpcHttpResponse {
+                status: "200 OK",
+                body: Some(Value::Array(responses)),
+            }
+        };
     }
-    dispatch_request(node, &request).await
+    let body = dispatch_request(node, &request).await;
+    let status = match body.as_ref() {
+        Some(response) => {
+            let is_json_rpc_2 = request.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
+            let is_invalid_request = response
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_i64)
+                == Some(-32600);
+            if is_json_rpc_2 && !is_invalid_request {
+                "200 OK"
+            } else {
+                json_rpc_error_status(response)
+            }
+        }
+        None => "204 No Content",
+    };
+    JsonRpcHttpResponse { status, body }
 }
 
 async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Option<Value> {
     let Some(request_object) = request.as_object() else {
-        return Some(json!({
-            "result": null,
-            "error": {"code": -32600, "message": "invalid Request object"},
-            "id": null,
-        }));
+        return Some(json_rpc_invalid_request(
+            Value::Null,
+            false,
+            "Invalid Request object",
+        ));
     };
     let id = request.get("id").cloned().unwrap_or(Value::Null);
-    let json_rpc_2 = request.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
+    let json_rpc_2 = match request.get("jsonrpc") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(value)) if value == "1.0" => false,
+        Some(Value::String(value)) if value == "2.0" => true,
+        Some(_) => {
+            return Some(json_rpc_invalid_request(
+                id,
+                false,
+                "JSON-RPC version not supported",
+            ));
+        }
+    };
     let is_notification = json_rpc_2 && !request_object.contains_key("id");
-    let method = request_object
-        .get("method")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let params = request_object
-        .get("params")
-        .cloned()
-        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let Some(method) = request_object.get("method").and_then(Value::as_str) else {
+        return Some(json_rpc_invalid_request(id, json_rpc_2, "Missing method"));
+    };
+    let params = match request_object.get("params") {
+        None | Some(Value::Null) => Value::Array(Vec::new()),
+        Some(Value::Array(values)) => Value::Array(values.clone()),
+        Some(Value::Object(values)) => Value::Object(values.clone()),
+        Some(_) => {
+            return Some(json_rpc_invalid_request(
+                id,
+                json_rpc_2,
+                "Params must be an array or object",
+            ));
+        }
+    };
     let response = match dispatch_method_async(node, method, &params).await {
         Ok(result) if json_rpc_2 => json!({
             "jsonrpc": "2.0",
@@ -977,6 +1077,36 @@ async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Option<Value> {
         Err(error) => json!({"result": null, "error": rpc_error(&error), "id": id}),
     };
     (!is_notification).then_some(response)
+}
+
+fn json_rpc_invalid_request(id: Value, json_rpc_2: bool, message: &str) -> Value {
+    if json_rpc_2 {
+        json!({
+            "jsonrpc": "2.0",
+            "error": {"code": -32600, "message": message},
+            "id": id,
+        })
+    } else {
+        json!({
+            "result": null,
+            "error": {"code": -32600, "message": message},
+            "id": id,
+        })
+    }
+}
+
+fn json_rpc_error_status(response: &Value) -> &'static str {
+    match response
+        .get("error")
+        .and_then(Value::as_object)
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_i64)
+    {
+        Some(-32600) => "400 Bad Request",
+        Some(-32601) => "404 Not Found",
+        Some(_) => "500 Internal Server Error",
+        None => "200 OK",
+    }
 }
 
 async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
@@ -10509,7 +10639,13 @@ pub(crate) fn optional_u64(params: &Value, index: usize, default: u64, name: &st
 }
 
 fn rpc_error(error: &anyhow::Error) -> Value {
-    json!({"code": -1, "message": error.to_string()})
+    let message = error.to_string();
+    let code = if message == "Method not found" {
+        -32601
+    } else {
+        -1
+    };
+    json!({"code": code, "message": message})
 }
 
 fn sat_to_btc(satoshis: u64) -> f64 {
@@ -10703,6 +10839,46 @@ mod tests {
             "X-Authorization: Basic secret\r\n",
             "Basic secret"
         ));
+    }
+
+    #[test]
+    fn http_statuses_match_core_json_rpc_error_classes() {
+        assert_eq!(
+            json_rpc_error_status(&json!({"error": {"code": -32600}})),
+            "400 Bad Request"
+        );
+        assert_eq!(
+            json_rpc_error_status(&json!({"error": {"code": -32601}})),
+            "404 Not Found"
+        );
+        assert_eq!(
+            json_rpc_error_status(&json!({"error": {"code": -1}})),
+            "500 Internal Server Error"
+        );
+        assert_eq!(
+            json_rpc_error_status(&json!({"result": 1, "error": null})),
+            "200 OK"
+        );
+        assert_eq!(
+            rpc_error(&anyhow!("Method not found"))["code"],
+            json!(-32601)
+        );
+    }
+
+    #[test]
+    fn rest_error_status_distinguishes_bad_requests_and_missing_resources() {
+        assert_eq!(
+            rest_error_status(&anyhow!("invalid hash")),
+            "400 Bad Request"
+        );
+        assert_eq!(
+            rest_error_status(&anyhow!("block not found")),
+            "404 Not Found"
+        );
+        assert_eq!(
+            rest_error_status(&anyhow!("I/O error reading block")),
+            "500 Internal Server Error"
+        );
     }
 
     #[tokio::test]

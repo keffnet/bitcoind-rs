@@ -841,6 +841,7 @@ async fn serve_peer_loop(
     let fee_filter = &peer_state.fee_filter;
     let relay_transactions = &peer_state.relay_transactions;
     let height = node.chain.read().height() as i32;
+    let local_nonce = random();
     send_message(
         node,
         peer_id,
@@ -848,7 +849,7 @@ async fn serve_peer_loop(
         node.config.network,
         &Message::Version(VersionMessage::with_bloom(
             height,
-            random(),
+            local_nonce,
             node.config.peer_bloom_filters,
         )),
     )
@@ -943,6 +944,9 @@ async fn serve_peer_loop(
                 version_received = true;
                 if version.version < 70001 {
                     anyhow::bail!("peer protocol version is too old");
+                }
+                if version.nonce == local_nonce {
+                    anyhow::bail!("peer connected to itself");
                 }
                 peer_version = version.version;
                 node.update_peer_version(

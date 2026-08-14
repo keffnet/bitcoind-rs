@@ -319,6 +319,8 @@ pub struct PeerInfo {
     pub last_inv_sequence: u64,
     pub last_transaction: u64,
     pub last_block: u64,
+    pub(crate) best_known_block: Option<BlockHash>,
+    pub(crate) last_common_block: Option<BlockHash>,
     pub(crate) bip152_highbandwidth_to: bool,
     pub(crate) bip152_highbandwidth_from: bool,
     inflight_blocks: Vec<(BlockHash, u32)>,
@@ -1140,9 +1142,47 @@ impl Node {
         }
     }
 
-    pub(crate) fn record_peer_block(&self, peer_id: usize) {
+    pub(crate) fn record_peer_block(&self, peer_id: usize, hash: BlockHash) {
+        let current_common = self
+            .peers
+            .read()
+            .get(&peer_id)
+            .and_then(|peer| peer.last_common_block);
+        let (height, active, common_height) = {
+            let chain = self.chain.read();
+            (
+                chain.block_height_by_hash(&hash),
+                chain.is_active_block(&hash),
+                current_common.and_then(|common| chain.block_height_by_hash(&common)),
+            )
+        };
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
             peer.last_block = unix_time_seconds();
+            if active
+                && height
+                    .is_some_and(|height| common_height.is_none_or(|current| height >= current))
+            {
+                peer.last_common_block = Some(hash);
+            }
+        }
+    }
+
+    pub(crate) fn update_peer_best_known_block(&self, peer_id: usize, hash: BlockHash) {
+        let chain = self.chain.read();
+        let Some(candidate_work) = chain.chain_work_by_hash(&hash) else {
+            return;
+        };
+        let mut peers = self.peers.write();
+        let Some(peer) = peers.get_mut(&peer_id) else {
+            return;
+        };
+        let should_update = peer.best_known_block.is_none_or(|current| {
+            chain
+                .chain_work_by_hash(&current)
+                .is_none_or(|current_work| candidate_work >= current_work)
+        });
+        if should_update {
+            peer.best_known_block = Some(hash);
         }
     }
 
@@ -1271,6 +1311,8 @@ impl Node {
             last_inv_sequence: 0,
             last_transaction: 0,
             last_block: 0,
+            best_known_block: None,
+            last_common_block: None,
             bip152_highbandwidth_to: false,
             bip152_highbandwidth_from: false,
             inflight_blocks: Vec::new(),
@@ -1506,6 +1548,8 @@ impl Node {
                 last_inv_sequence: 0,
                 last_transaction: 0,
                 last_block: 0,
+                best_known_block: None,
+                last_common_block: None,
                 bip152_highbandwidth_to: false,
                 bip152_highbandwidth_from: false,
                 inflight_blocks: Vec::new(),
@@ -1558,6 +1602,8 @@ impl Node {
             last_inv_sequence: 0,
             last_transaction: 0,
             last_block: 0,
+            best_known_block: None,
+            last_common_block: None,
             bip152_highbandwidth_to: false,
             bip152_highbandwidth_from: false,
             inflight_blocks: Vec::new(),
@@ -2052,6 +2098,8 @@ fn load_known_addresses(
                 last_inv_sequence: 0,
                 last_transaction: 0,
                 last_block: 0,
+                best_known_block: None,
+                last_common_block: None,
                 bip152_highbandwidth_to: false,
                 bip152_highbandwidth_from: false,
                 inflight_blocks: Vec::new(),

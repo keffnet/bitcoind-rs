@@ -1239,6 +1239,9 @@ async fn serve_peer_loop(
                     continue;
                 }
                 let hashes = node.chain.write().accept_headers(&headers)?;
+                if let Some(hash) = hashes.last().copied() {
+                    node.update_peer_best_known_block(peer_id, hash);
+                }
                 let requests = {
                     let chain = node.chain.read();
                     hashes
@@ -1287,6 +1290,16 @@ async fn serve_peer_loop(
                         if matching_kind {
                             known.insert(&item.hash);
                         }
+                    }
+                }
+                for item in &items {
+                    if matches!(
+                        item.kind,
+                        InventoryType::Block
+                            | InventoryType::WitnessBlock
+                            | InventoryType::CompactBlock
+                    ) {
+                        node.update_peer_best_known_block(peer_id, item.hash);
                     }
                 }
                 let requests = {
@@ -1524,9 +1537,10 @@ async fn serve_peer_loop(
                 }
             }
             Message::Block(block) => {
-                node.clear_peer_block_request(peer_id, block.header.block_hash());
+                let hash = block.header.block_hash();
+                node.clear_peer_block_request(peer_id, hash);
                 if handle_received_block(node, peers, peer_id, block).await {
-                    node.record_peer_block(peer_id);
+                    node.record_peer_block(peer_id, hash);
                 }
                 request_headers(node, peer_id, writer).await?;
             }
@@ -1537,8 +1551,9 @@ async fn serve_peer_loop(
                     Ok((transactions, missing)) if missing.is_empty() => {
                         match complete_compact_block(&compact, transactions) {
                             Ok(block) => {
+                                let block_hash = block.block_hash();
                                 if handle_received_block(node, peers, peer_id, block).await {
-                                    node.record_peer_block(peer_id);
+                                    node.record_peer_block(peer_id, block_hash);
                                 }
                                 request_headers(node, peer_id, writer).await?;
                             }
@@ -1684,8 +1699,9 @@ async fn serve_peer_loop(
                 }
                 match complete_compact_block(&pending.compact, pending.transactions) {
                     Ok(block) => {
+                        let block_hash = block.block_hash();
                         if handle_received_block(node, peers, peer_id, block).await {
-                            node.record_peer_block(peer_id);
+                            node.record_peer_block(peer_id, block_hash);
                         }
                         request_headers(node, peer_id, writer).await?;
                     }
@@ -2077,6 +2093,7 @@ async fn handle_received_block(
     match node.connect_block(block) {
         Ok(tip) => {
             info!(%hash, height = tip.height, "accepted peer block");
+            node.update_peer_best_known_block(peer_id, hash);
             // Active-tip updates are announced by the chain-event relay. A
             // side-chain block has no tip event, so relay a newly accepted
             // side-chain block here. Avoid announcing duplicate blocks.
@@ -3252,7 +3269,7 @@ mod tests {
         node.record_bytes_sent(7, 42, "ping");
         node.record_bytes_received(7, 19, "tx");
         node.record_peer_transaction(7);
-        node.record_peer_block(7);
+        node.record_peer_block(7, node.chain.read().best_hash());
         node.record_peer_inv_sequence(7, 12);
         node.update_peer_version(7, 70016, 0, "/peer/", 0, false);
         node.update_peer_fee_filter(7, 4_000);

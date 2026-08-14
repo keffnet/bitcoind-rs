@@ -1512,11 +1512,15 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 .map(|peer| {
                     let (synced_headers, synced_blocks) = {
                         let chain = node.chain.read();
-                        if peer.version.is_some() {
-                            (chain.best_header_tip().height as i64, chain.height() as i64)
-                        } else {
-                            (-1, -1)
-                        }
+                        let synced_headers = peer
+                            .best_known_block
+                            .and_then(|hash| chain.block_height_by_hash(&hash))
+                            .map_or(-1, i64::from);
+                        let synced_blocks = peer
+                            .last_common_block
+                            .and_then(|hash| chain.block_height_by_hash(&hash))
+                            .map_or(-1, i64::from);
+                        (synced_headers, synced_blocks)
                     };
                     let mut info = json!({
                         "id": peer.id,
@@ -13129,6 +13133,7 @@ mod tests {
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
+        let genesis = node.chain.read().best_hash();
         let unversioned_peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(unversioned_peer_info[0]["relaytxes"], json!(false));
         assert_eq!(
@@ -13156,6 +13161,16 @@ mod tests {
         assert_eq!(peer_info[0]["transport_protocol_type"], json!("v1"));
         assert!(peer_info[0].get("startingheight").is_none());
         assert!(peer_info[0].get("pingtime").is_none());
+        assert_eq!(peer_info[0]["synced_headers"], json!(-1));
+        assert_eq!(peer_info[0]["synced_blocks"], json!(-1));
+        node.update_peer_best_known_block(7, genesis);
+        let announced = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
+        assert_eq!(announced[0]["synced_headers"], json!(0));
+        assert_eq!(announced[0]["synced_blocks"], json!(-1));
+        node.record_peer_block(7, genesis);
+        let received = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
+        assert_eq!(received[0]["synced_headers"], json!(0));
+        assert_eq!(received[0]["synced_blocks"], json!(0));
         node.set_peer_connection_type(7, "block-relay-only");
         assert_eq!(
             dispatch_method(&node, "getpeerinfo", &json!([])).unwrap()[0]["connection_type"],
@@ -13193,7 +13208,6 @@ mod tests {
         assert_eq!(command, "test");
         assert_eq!(payload, vec![1, 2]);
 
-        let genesis = node.chain.read().best_hash();
         assert_eq!(
             dispatch_method(&node, "getblockfrompeer", &json!([genesis.to_string(), 7]),).unwrap(),
             json!({})

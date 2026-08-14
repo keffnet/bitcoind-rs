@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use bitcoin::absolute::LockTime;
+use bitcoin::address::AddressType;
 use bitcoin::block::{Header, Version as BlockVersion};
 use bitcoin::blockdata::opcodes::all::OP_RETURN;
 use bitcoin::blockdata::script::{Builder, Instruction, PushBytesBuf};
@@ -1804,10 +1805,41 @@ fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "isvalid": true,
         "address": address.to_string(),
         "scriptPubKey": hex::encode(address.script_pubkey().as_bytes()),
-        "isscript": address.script_hash().is_some(),
-        "iswitness": witness_program.is_some(),
     });
-    if let Some(program) = witness_program {
+    match address.address_type() {
+        Some(AddressType::P2pkh) => {
+            result["isscript"] = json!(false);
+            result["iswitness"] = json!(false);
+        }
+        Some(AddressType::P2sh) => {
+            result["isscript"] = json!(true);
+            result["iswitness"] = json!(false);
+        }
+        Some(AddressType::P2wpkh) => {
+            result["isscript"] = json!(false);
+            result["iswitness"] = json!(true);
+        }
+        Some(AddressType::P2wsh | AddressType::P2tr | AddressType::P2a) => {
+            result["isscript"] = json!(true);
+            result["iswitness"] = json!(true);
+        }
+        Some(_) => {
+            if witness_program.is_some() {
+                result["iswitness"] = json!(true);
+            }
+        }
+        None => {
+            // Future witness versions are valid addresses but do not have a
+            // known script classification yet, matching Core's optional
+            // `isscript` field for WitnessUnknown destinations.
+            if witness_program.is_some() {
+                result["iswitness"] = json!(true);
+            }
+        }
+    }
+    if !matches!(address.address_type(), Some(AddressType::P2a))
+        && let Some(program) = witness_program
+    {
         result["witness_version"] = json!(program.version().to_num());
         result["witness_program"] = json!(hex::encode(program.program().as_bytes()));
     }
@@ -1822,12 +1854,18 @@ fn derive_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .map(parse_descriptor_range)
         .transpose()?;
     let scripts = expand_descriptor_scripts(node, &descriptor, range)?;
+    let multipath_or_combo = scripts.len() > 1;
     let addresses = scripts
         .into_iter()
-        .map(|script| {
-            Address::from_script(&script, node.config.network)
-                .map(|address| address.to_string())
-                .map_err(|_| anyhow!("descriptor does not encode a standard address"))
+        .filter_map(|script| {
+            if multipath_or_combo && script.is_p2pk() {
+                return None;
+            }
+            Some(
+                Address::from_script(&script, node.config.network)
+                    .map(|address| address.to_string())
+                    .map_err(|_| anyhow!("descriptor does not encode a standard address")),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(json!(addresses))
@@ -6262,6 +6300,21 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .filter(|value| !value.is_null())
         .and_then(Value::as_str)
         .unwrap_or("legacy");
+    let key_list = public_keys
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let descriptor_body = match address_type {
+        "legacy" => format!("sh(multi({required},{key_list}))"),
+        "p2sh-segwit" => format!("sh(wsh(multi({required},{key_list})))"),
+        "bech32" => format!("wsh(multi({required},{key_list}))"),
+        _ => bail!("unsupported multisig address type: {address_type}"),
+    };
+    let descriptor = format!(
+        "{descriptor_body}#{}",
+        descriptor_checksum(&descriptor_body).context("creating multisig descriptor checksum")?
+    );
     let address = match address_type {
         "legacy" => Address::p2sh(&redeem_script, node.config.network)?,
         "p2sh-segwit" => Address::p2shwsh(&redeem_script, node.config.network),
@@ -6271,6 +6324,7 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!({
         "address": address.to_string(),
         "redeemScript": hex::encode(redeem_script.as_bytes()),
+        "descriptor": descriptor,
     }))
 }
 
@@ -10611,7 +10665,23 @@ mod tests {
         let validated = validate_address(&node, &json!([address])).unwrap();
         assert_eq!(validated["isvalid"], true);
         assert_eq!(validated["iswitness"], true);
+        let witness_script = ScriptBuf::from_bytes(vec![0x51]);
+        let p2wsh = Address::p2wsh(&witness_script, Network::Regtest);
+        let validated_p2wsh = validate_address(&node, &json!([p2wsh.to_string()])).unwrap();
+        assert_eq!(validated_p2wsh["isscript"], true);
         let public_key = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let p2tr = Address::p2tr(
+            &Secp256k1::new(),
+            bitcoin::XOnlyPublicKey::from(
+                public_key
+                    .parse::<bitcoin::PublicKey>()
+                    .expect("test public key is valid"),
+            ),
+            None,
+            Network::Regtest,
+        );
+        let validated_p2tr = validate_address(&node, &json!([p2tr.to_string()])).unwrap();
+        assert_eq!(validated_p2tr["isscript"], true);
         let derived = derive_addresses(&node, &json!([format!("pkh({public_key})")])).unwrap();
         assert_eq!(derived.as_array().unwrap().len(), 1);
         let scripts =
@@ -11024,8 +11094,17 @@ mod tests {
             ScriptBuf::from_bytes(hex::decode(legacy["redeemScript"].as_str().unwrap()).unwrap());
         assert!(redeem_script.is_multisig());
         assert!(legacy["address"].as_str().unwrap().starts_with('2'));
+        let legacy_descriptor = legacy["descriptor"].as_str().unwrap();
+        assert!(legacy_descriptor.starts_with("sh(multi(1,"));
+        assert_eq!(legacy_descriptor.matches('#').count(), 1);
         let segwit = create_multisig(&node, &json!([1, keys, "bech32"])).unwrap();
         assert!(segwit["address"].as_str().unwrap().starts_with("bcrt1q"));
+        assert!(
+            segwit["descriptor"]
+                .as_str()
+                .unwrap()
+                .starts_with("wsh(multi(1,")
+        );
     }
 
     #[test]

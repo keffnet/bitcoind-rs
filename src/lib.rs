@@ -1129,8 +1129,10 @@ impl Node {
             .collect();
         for (peer_id, sender) in commands {
             let nonce = random();
-            if sender.send(p2p::PeerCommand::Ping(nonce)).is_ok() {
-                self.record_ping(peer_id, nonce);
+            if self.record_ping(peer_id, nonce)
+                && sender.send(p2p::PeerCommand::Ping(nonce)).is_err()
+            {
+                self.cancel_ping(peer_id, nonce);
             }
         }
     }
@@ -1146,6 +1148,23 @@ impl Node {
         peer.ping_nonce = Some(nonce);
         peer.ping_sent_at = Some(Instant::now());
         true
+    }
+
+    pub(crate) fn cancel_ping(&self, peer_id: usize, nonce: u64) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id)
+            && peer.ping_nonce == Some(nonce)
+        {
+            peer.ping_nonce = None;
+            peer.ping_sent_at = None;
+        }
+    }
+
+    pub(crate) fn ping_timed_out(&self, peer_id: usize, timeout: Duration) -> bool {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .and_then(|peer| peer.ping_sent_at)
+            .is_some_and(|sent_at| sent_at.elapsed() >= timeout)
     }
 
     pub fn is_banned(&self, address: IpAddr) -> bool {

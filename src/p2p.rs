@@ -58,6 +58,7 @@ const TX_RECONCILIATION_VERSION: u32 = 1;
 const KNOWN_TX_FILTER_BITS: usize = 1 << 20;
 const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
+pub(crate) const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 struct PeerState {
     writer: PeerWriter,
@@ -911,6 +912,9 @@ async fn serve_peer_loop(
                 message
             },
             _ = ping_interval.tick(), if version_received && verack_received => {
+                if node.ping_timed_out(peer_id, PING_TIMEOUT) {
+                    anyhow::bail!("peer ping timed out");
+                }
                 let nonce = random();
                 if node.record_ping(peer_id, nonce) {
                     send_message(
@@ -2465,6 +2469,9 @@ mod tests {
         let PeerCommand::Ping(nonce) = receiver.try_recv().unwrap() else {
             panic!("expected a ping command");
         };
+        assert!(node.ping_timed_out(7, Duration::ZERO));
+        node.ping_peers();
+        assert!(receiver.try_recv().is_err());
         node.record_pong(7, nonce);
         assert!(node.peer_infos()[0].ping_time.is_some());
         assert!(node.peer_infos()[0].min_ping.is_some());

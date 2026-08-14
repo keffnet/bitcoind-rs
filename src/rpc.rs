@@ -6184,7 +6184,7 @@ fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Bloc
     let mempool = node.mempool.read();
     let mut transactions = Vec::new();
     let mut transaction_weight = 0u64;
-    for txid in mempool.transaction_order() {
+    for txid in mempool.mining_order(4_000_000, 2_000) {
         let Some(entry) = mempool.get(&txid) else {
             continue;
         };
@@ -6372,49 +6372,6 @@ fn mine_block(mut block: Block, max_tries: u64) -> Option<Block> {
     None
 }
 
-fn select_template_transaction(
-    txid: Txid,
-    mempool: &Mempool,
-    positions: &mut HashMap<Txid, usize>,
-    selected: &mut Vec<Txid>,
-    weight: &mut u64,
-    visiting: &mut HashSet<Txid>,
-) -> bool {
-    if positions.contains_key(&txid) {
-        return true;
-    }
-    if !visiting.insert(txid) {
-        return false;
-    }
-    let Some(entry) = mempool.get(&txid) else {
-        visiting.remove(&txid);
-        return false;
-    };
-    let parents = entry
-        .transaction
-        .input
-        .iter()
-        .map(|input| input.previous_output.txid)
-        .filter(|parent| mempool.get(parent).is_some())
-        .collect::<Vec<_>>();
-    if parents.iter().any(|parent| {
-        !select_template_transaction(*parent, mempool, positions, selected, weight, visiting)
-    }) {
-        visiting.remove(&txid);
-        return false;
-    }
-    let next_weight = weight.saturating_add(entry.transaction.weight().to_wu());
-    if next_weight.saturating_add(4_000) > 4_000_000 {
-        visiting.remove(&txid);
-        return false;
-    }
-    *weight = next_weight;
-    positions.insert(txid, selected.len() + 1);
-    selected.push(txid);
-    visiting.remove(&txid);
-    true
-}
-
 fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let request = params
         .get(0)
@@ -6461,21 +6418,12 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bits = chain.next_bits(curtime);
     let mempool = node.mempool.read();
     let mut fees = 0u64;
-    let mut weight = 0u64;
-    let order = mempool.transaction_order();
-    let mut positions = HashMap::new();
-    let mut selected = Vec::new();
-    let mut visiting = HashSet::new();
-    for txid in order {
-        select_template_transaction(
-            txid,
-            &mempool,
-            &mut positions,
-            &mut selected,
-            &mut weight,
-            &mut visiting,
-        );
-    }
+    let selected = mempool.mining_order(4_000_000, 4_000);
+    let positions = selected
+        .iter()
+        .enumerate()
+        .map(|(index, txid)| (*txid, index + 1))
+        .collect::<HashMap<_, _>>();
     let transactions = selected
         .iter()
         .filter_map(|txid| mempool.get(txid).map(|entry| (txid, entry)))

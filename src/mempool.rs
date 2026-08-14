@@ -213,6 +213,69 @@ impl Mempool {
         ordered
     }
 
+    /// Return transactions in ancestor-package feerate order for block
+    /// assembly. A package consists of an unselected transaction and all of
+    /// its unselected ancestors. Packages are scored by effective fee
+    /// (including prioritisation deltas) per weight, while the returned list
+    /// remains topologically ordered.
+    pub fn mining_order(&self, max_weight: u64, reserved_weight: u64) -> Vec<Txid> {
+        let weight_limit = max_weight.saturating_sub(reserved_weight);
+        let mut selected = HashSet::new();
+        let mut ordered = Vec::new();
+        let mut selected_weight = 0u64;
+
+        while selected.len() < self.entries.len() {
+            let mut best: Option<(Txid, HashSet<Txid>, u64, i128)> = None;
+            for txid in self.entries.keys().copied() {
+                if selected.contains(&txid) {
+                    continue;
+                }
+                let mut package = HashSet::new();
+                if !collect_mining_package(self, txid, &selected, &mut package, &mut HashSet::new())
+                {
+                    continue;
+                }
+                let package_weight = package
+                    .iter()
+                    .filter_map(|candidate| self.entries.get(candidate))
+                    .map(|entry| entry.transaction.weight().to_wu())
+                    .fold(0u64, u64::saturating_add);
+                if selected_weight.saturating_add(package_weight) > weight_limit {
+                    continue;
+                }
+                let package_fee = package
+                    .iter()
+                    .filter_map(|candidate| {
+                        self.entries.get(candidate).map(|entry| {
+                            i128::from(entry.fee_sat) + i128::from(self.fee_delta(candidate))
+                        })
+                    })
+                    .fold(0i128, i128::saturating_add);
+                let better = match &best {
+                    None => true,
+                    Some((best_txid, _, best_weight, best_fee)) => {
+                        let left = package_fee.saturating_mul(i128::from(*best_weight));
+                        let right = best_fee.saturating_mul(i128::from(package_weight));
+                        left > right || (left == right && txid.to_string() < best_txid.to_string())
+                    }
+                };
+                if better {
+                    best = Some((txid, package, package_weight, package_fee));
+                }
+            }
+
+            let Some((txid, package, package_weight, _)) = best else {
+                break;
+            };
+            let mut package_order = Vec::with_capacity(package.len());
+            append_mining_package(self, txid, &package, &mut selected, &mut package_order);
+            selected_weight = selected_weight.saturating_add(package_weight);
+            ordered.extend(package_order);
+        }
+
+        ordered
+    }
+
     pub fn parents(&self, txid: &Txid) -> Vec<Txid> {
         let Some(entry) = self.entries.get(txid) else {
             return Vec::new();
@@ -689,6 +752,51 @@ impl Mempool {
     }
 }
 
+fn collect_mining_package(
+    mempool: &Mempool,
+    txid: Txid,
+    selected: &HashSet<Txid>,
+    package: &mut HashSet<Txid>,
+    visiting: &mut HashSet<Txid>,
+) -> bool {
+    if selected.contains(&txid) {
+        return true;
+    }
+    if package.contains(&txid) {
+        return true;
+    }
+    if mempool.get(&txid).is_none() || !visiting.insert(txid) {
+        return false;
+    }
+    for parent in mempool.parents(&txid) {
+        if !collect_mining_package(mempool, parent, selected, package, visiting) {
+            visiting.remove(&txid);
+            return false;
+        }
+    }
+    visiting.remove(&txid);
+    package.insert(txid);
+    true
+}
+
+fn append_mining_package(
+    mempool: &Mempool,
+    txid: Txid,
+    package: &HashSet<Txid>,
+    selected: &mut HashSet<Txid>,
+    ordered: &mut Vec<Txid>,
+) {
+    if selected.contains(&txid) || !package.contains(&txid) {
+        return;
+    }
+    for parent in mempool.parents(&txid) {
+        append_mining_package(mempool, parent, package, selected, ordered);
+    }
+    if selected.insert(txid) {
+        ordered.push(txid);
+    }
+}
+
 fn signals_replaceability(transaction: &Transaction) -> bool {
     transaction
         .input
@@ -787,6 +895,36 @@ mod tests {
         assert_eq!(pool.ancestors(&grandchild_id), vec![root_id, child_id]);
         assert_eq!(pool.descendants(&root_id), vec![child_id, grandchild_id]);
         assert_eq!(pool.get_by_wtxid(&grandchild_wtxid).unwrap().added_at, 3);
+    }
+
+    #[test]
+    fn mining_order_prefers_high_feerate_ancestor_packages() {
+        let parent = graph_transaction(Txid::from_byte_array([1; 32]), 1);
+        let parent_id = parent.compute_txid();
+        let child = graph_transaction(parent_id, 2);
+        let child_id = child.compute_txid();
+        let independent = graph_transaction(Txid::from_byte_array([3; 32]), 3);
+        let independent_id = independent.compute_txid();
+        let mut pool = Mempool::new(Network::Regtest);
+        for (transaction, fee_sat) in [(parent, 1), (child, 200), (independent, 20)] {
+            let txid = transaction.compute_txid();
+            let wtxid = transaction.compute_wtxid();
+            pool.entries.insert(
+                txid,
+                MempoolEntry {
+                    vsize: transaction.vsize() as u64,
+                    fee_sat,
+                    added_at: 1,
+                    transaction,
+                },
+            );
+            pool.wtxids.insert(wtxid, txid);
+        }
+
+        assert_eq!(
+            pool.mining_order(4_000_000, 0),
+            vec![parent_id, child_id, independent_id]
+        );
     }
 
     #[test]

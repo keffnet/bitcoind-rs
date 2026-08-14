@@ -842,28 +842,210 @@ async fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {
 
 async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Value {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let json_rpc_2 = request.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
     let method = request.get("method").and_then(Value::as_str).unwrap_or("");
     let params = request
         .get("params")
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
     match dispatch_method_async(node, method, &params).await {
+        Ok(result) if json_rpc_2 => json!({
+            "jsonrpc": "2.0",
+            "result": result,
+            "id": id,
+        }),
+        Err(error) if json_rpc_2 => json!({
+            "jsonrpc": "2.0",
+            "error": rpc_error(&error),
+            "id": id,
+        }),
         Ok(result) => json!({"result": result, "error": null, "id": id}),
         Err(error) => json!({"result": null, "error": rpc_error(&error), "id": id}),
     }
 }
 
 async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
+    let normalized_params = normalize_rpc_params(method, params)?;
     let command_id = node.begin_rpc_command(method);
     let result = match method {
-        "waitfornewblock" => wait_for_new_block(node, params).await,
-        "waitforblock" => wait_for_block(node, params).await,
-        "waitforblockheight" => wait_for_block_height(node, params).await,
-        "getblocktemplate" => get_block_template_async(node, params).await,
-        _ => dispatch_method(node, method, params),
+        "waitfornewblock" => wait_for_new_block(node, &normalized_params).await,
+        "waitforblock" => wait_for_block(node, &normalized_params).await,
+        "waitforblockheight" => wait_for_block_height(node, &normalized_params).await,
+        "getblocktemplate" => get_block_template_async(node, &normalized_params).await,
+        _ => dispatch_method(node, method, &normalized_params),
     };
     node.end_rpc_command(command_id);
     result
+}
+
+fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
+    if params.is_array() {
+        return Ok(params.clone());
+    }
+    let Some(object) = params.as_object() else {
+        bail!("RPC params must be an array or object")
+    };
+    let Some(names) = rpc_parameter_names(method) else {
+        bail!("named parameters are not supported for {method}")
+    };
+    let mut values = vec![Value::Null; names.len()];
+    let mut specified = vec![false; names.len()];
+    if let Some(args) = object.get("args") {
+        let args = args
+            .as_array()
+            .ok_or_else(|| anyhow!("RPC args must be an array"))?;
+        if args.len() > names.len() {
+            bail!("too many positional arguments for {method}")
+        }
+        for (index, value) in args.iter().enumerate() {
+            values[index] = value.clone();
+            specified[index] = true;
+        }
+    }
+    for (name, value) in object {
+        if name == "args" {
+            continue;
+        }
+        let Some(index) = names.iter().position(|candidate| candidate == name) else {
+            bail!("unknown named parameter {name} for {method}")
+        };
+        if specified[index] {
+            bail!("parameter {name} specified more than once")
+        }
+        values[index] = value.clone();
+        specified[index] = true;
+    }
+    Ok(Value::Array(values))
+}
+
+fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
+    match method {
+        "stop" => Some(&["wait"]),
+        "help" => Some(&["command"]),
+        "getdeploymentinfo" => Some(&["blockhash"]),
+        "getblockhash" => Some(&["height"]),
+        "getblockheader" => Some(&["blockhash", "verbose"]),
+        "getblock" => Some(&["blockhash", "verbosity"]),
+        "getblockfilter" => Some(&["blockhash", "filtertype"]),
+        "getblockstats" => Some(&["hash_or_height", "stats"]),
+        "getchaintxstats" => Some(&["nblocks", "blockhash"]),
+        "getnetworkhashps" => Some(&["nblocks", "height"]),
+        "gettxoutproof" => Some(&["txids", "blockhash"]),
+        "verifytxoutproof" => Some(&["proof"]),
+        "submitheader" => Some(&["hexdata"]),
+        "getblockfrompeer" => Some(&["blockhash", "peer_id"]),
+        "invalidateblock" | "reconsiderblock" | "preciousblock" => Some(&["blockhash"]),
+        "getrawtransaction" => Some(&["txid", "verbosity", "blockhash"]),
+        "decoderawtransaction" => Some(&["hexstring", "iswitness"]),
+        "createrawtransaction" => {
+            Some(&["inputs", "outputs", "locktime", "replaceable", "version"])
+        }
+        "decodescript" => Some(&["hexstring"]),
+        "combinerawtransaction" => Some(&["txs"]),
+        "createpsbt" => Some(&["inputs", "outputs", "locktime", "replaceable"]),
+        "decodepsbt" | "analyzepsbt" => Some(&["psbt"]),
+        "finalizepsbt" => Some(&["psbt", "extract"]),
+        "converttopsbt" => Some(&["hexstring", "permitsigdata", "iswitness"]),
+        "combinepsbt" | "joinpsbts" => Some(&["txs"]),
+        "utxoupdatepsbt" => Some(&["psbt", "descriptors"]),
+        "descriptorprocesspsbt" => Some(&[
+            "psbt",
+            "descriptors",
+            "sighashtype",
+            "bip32derivs",
+            "finalize",
+        ]),
+        "signmessagewithprivkey" => Some(&["privkey", "message"]),
+        "verifymessage" => Some(&["address", "signature", "message"]),
+        "createmultisig" => Some(&["nrequired", "keys", "address_type"]),
+        "sendrawtransaction" => Some(&["hexstring", "maxfeerate", "maxburnamount"]),
+        "abortprivatebroadcast" => Some(&["txid"]),
+        "signrawtransactionwithkey" => Some(&[
+            "hexstring",
+            "privkeys",
+            "prevtxs",
+            "sighashtype",
+            "maxfeerate",
+        ]),
+        "submitblock" => Some(&["hexdata", "dummy"]),
+        "getblocktemplate" => Some(&["template_request"]),
+        "prioritisetransaction" => Some(&["txid", "dummy", "fee_delta"]),
+        "generatetoaddress" => Some(&["nblocks", "address", "maxtries"]),
+        "generatetodescriptor" => Some(&["nblocks", "descriptor", "maxtries"]),
+        "generateblock" => Some(&["output", "transactions", "submit"]),
+        "submitpackage" => Some(&["package", "maxfeerate", "maxburnamount"]),
+        "testmempoolaccept" => Some(&["rawtxs", "maxfeerate"]),
+        "setmocktime" => Some(&["timestamp"]),
+        "mockscheduler" => Some(&["delta_time"]),
+        "verifychain" => Some(&["checklevel", "nblocks"]),
+        "getmemoryinfo" => Some(&["mode"]),
+        "gettxout" => Some(&["txid", "n", "include_mempool"]),
+        "gettxspendingprevout" => Some(&["outputs"]),
+        "getrawmempool" => Some(&["verbose", "mempool_sequence"]),
+        "getmempoolentry" | "getmempoolancestors" | "getmempooldescendants" => {
+            Some(&["txid", "verbose"])
+        }
+        "getmempoolcluster" => Some(&["txid"]),
+        "importmempool" => Some(&["filename"]),
+        "gettxoutsetinfo" => Some(&["hash_type", "hash_or_height", "use_index"]),
+        "dumptxoutset" => Some(&["path", "type"]),
+        "loadtxoutset" => Some(&["path"]),
+        "pruneblockchain" => Some(&["height"]),
+        "waitfornewblock" => Some(&["timeout"]),
+        "waitforblock" => Some(&["blockhash", "timeout"]),
+        "waitforblockheight" => Some(&["height", "timeout"]),
+        "scantxoutset" => Some(&["action", "scanobjects"]),
+        "scanblocks" => Some(&[
+            "action",
+            "scanobjects",
+            "start_height",
+            "stop_height",
+            "filtertype",
+            "options",
+        ]),
+        "getdescriptoractivity" => Some(&["blockhashes", "scanobjects", "include_mempool"]),
+        "getnodeaddresses" => Some(&["count", "network"]),
+        "addpeeraddress" => Some(&["address", "port", "tried"]),
+        "sendmsgtopeer" => Some(&["peer_id", "msg_type", "msg"]),
+        "addconnection" => Some(&["address", "connection_type", "v2transport"]),
+        "addnode" => Some(&["node", "command"]),
+        "disconnectnode" => Some(&["address", "nodeid"]),
+        "getaddednodeinfo" => Some(&["node"]),
+        "setban" => Some(&["command", "subnet", "bantime", "absolute"]),
+        "setnetworkactive" => Some(&["active"]),
+        "estimatesmartfee" => Some(&["conf_target", "estimate_mode"]),
+        "logging" => Some(&["include", "exclude"]),
+        "validateaddress" => Some(&["address"]),
+        "deriveaddresses" => Some(&["descriptor", "range"]),
+        "getdescriptorinfo" => Some(&["descriptor"]),
+        "getblockchaininfo"
+        | "getblockcount"
+        | "getbestblockhash"
+        | "getmininginfo"
+        | "getprioritisedtransactions"
+        | "getmempoolinfo"
+        | "getmempoolfeeratediagram"
+        | "savemempool"
+        | "getchainstates"
+        | "getchaintips"
+        | "getnetworkinfo"
+        | "getpeerinfo"
+        | "getnettotals"
+        | "getaddrmaninfo"
+        | "getrawaddrman"
+        | "listbanned"
+        | "clearbanned"
+        | "ping"
+        | "getrpcinfo"
+        | "getdifficulty"
+        | "getconnectioncount"
+        | "uptime"
+        | "getzmqnotifications"
+        | "syncwithvalidationinterfacequeue"
+        | "getprivatebroadcastinfo" => Some(&[]),
+        "getindexinfo" => Some(&["index_name"]),
+        _ => None,
+    }
 }
 
 fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
@@ -8428,6 +8610,20 @@ mod tests {
         );
         assert!(dispatch_method(&node, "mockscheduler", &json!([0])).is_err());
         assert!(dispatch_method(&node, "setmocktime", &json!([-1])).is_err());
+    }
+
+    #[test]
+    fn named_rpc_parameters_are_normalized_with_holes_and_strict_names() {
+        let normalized = normalize_rpc_params(
+            "getblockheader",
+            &json!({"verbose": false, "blockhash": "00"}),
+        )
+        .unwrap();
+        assert_eq!(normalized, json!(["00", false]));
+
+        let normalized = normalize_rpc_params("gettxout", &json!({"txid": "00", "n": 1})).unwrap();
+        assert_eq!(normalized, json!(["00", 1, null]));
+        assert!(normalize_rpc_params("getblockhash", &json!({"height": 0, "extra": 1})).is_err());
     }
 
     #[test]

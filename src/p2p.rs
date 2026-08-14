@@ -8,7 +8,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bip324::futures::{Protocol, ProtocolReader, ProtocolWriter};
 use bip324::io::Payload;
 use bip324::{PacketType, Role};
@@ -50,6 +50,7 @@ type PeerWriter = Arc<Mutex<PeerWriterKind>>;
 const MAX_BLOOM_FILTER_SIZE: usize = 36_000;
 const MAX_BLOOM_HASH_FUNCS: u32 = 50;
 const MAX_BLOOM_ELEMENT_SIZE: usize = 520;
+const MAX_ADDR_TO_SEND: usize = 1_000;
 const SENDHEADERS_VERSION: i32 = 70_012;
 const FEEFILTER_VERSION: i32 = 70_013;
 const SHORT_IDS_BLOCKS_VERSION: i32 = 70_014;
@@ -314,10 +315,8 @@ pub(crate) enum PeerCommand {
         command: String,
         payload: Vec<u8>,
     },
-    RelayAddress {
-        address: SocketAddr,
-        services: u64,
-        time: u64,
+    RelayAddresses {
+        addresses: Vec<(SocketAddr, u64, u64)>,
     },
 }
 
@@ -987,21 +986,11 @@ async fn serve_peer_loop(
                         .await?;
                         continue;
                     }
-                    Some(PeerCommand::RelayAddress {
-                        address,
-                        services,
-                        time,
-                    }) => {
-                        let message = if addrv2_received {
-                            Message::AddrV2(vec![network_address_v2(address, time, services)])
-                        } else {
-                            Message::Addr(vec![wire::NetworkAddress {
-                                time: u32::try_from(time).unwrap_or(u32::MAX),
-                                services,
-                                address: socket_address_bytes(address),
-                                port: address.port(),
-                            }])
-                        };
+                    Some(PeerCommand::RelayAddresses { addresses }) => {
+                        if addresses.is_empty() {
+                            continue;
+                        }
+                        let message = relay_address_message(&addresses, addrv2_received);
                         send_message(node, peer_id, writer, node.config.network, &message).await?;
                         continue;
                     }
@@ -1722,32 +1711,39 @@ async fn serve_peer_loop(
             }
             Message::MerkleBlock(_) => {}
             Message::Addr(addresses) => {
+                if addresses.len() > MAX_ADDR_TO_SEND {
+                    bail!("addr message contains too many addresses");
+                }
                 node.record_peer_addresses(peer_id, addresses.len());
+                let mut relay_addresses = Vec::new();
                 for entry in addresses {
                     if let Some(address) = socket_address_from_legacy(&entry) {
-                        node.remember_address(address, entry.services, u64::from(entry.time));
-                        node.relay_peer_address(
-                            peer_id,
-                            address,
-                            entry.services,
-                            u64::from(entry.time),
-                        );
+                        if node.remember_address(address, entry.services, u64::from(entry.time)) {
+                            relay_addresses.push((address, entry.services, u64::from(entry.time)));
+                        }
                     }
                 }
+                node.relay_peer_addresses(peer_id, relay_addresses);
             }
             Message::AddrV2(addresses) => {
+                if addresses.len() > MAX_ADDR_TO_SEND {
+                    bail!("addrv2 message contains too many addresses");
+                }
                 node.record_peer_addresses(peer_id, addresses.len());
+                let mut relay_addresses = Vec::new();
                 for address in addresses {
                     if let Some(socket) = socket_address_from_v2(&address) {
-                        node.remember_address(socket, address.services, u64::from(address.time));
-                        node.relay_peer_address(
-                            peer_id,
-                            socket,
-                            address.services,
-                            u64::from(address.time),
-                        );
+                        if node.remember_address(socket, address.services, u64::from(address.time))
+                        {
+                            relay_addresses.push((
+                                socket,
+                                address.services,
+                                u64::from(address.time),
+                            ));
+                        }
                     }
                 }
+                node.relay_peer_addresses(peer_id, relay_addresses);
             }
             Message::SendHeaders => {
                 *peer_state.send_headers.lock() = true;
@@ -2216,6 +2212,29 @@ async fn send_message(
     Ok(())
 }
 
+fn relay_address_message(addresses: &[(SocketAddr, u64, u64)], addrv2_received: bool) -> Message {
+    if addrv2_received {
+        Message::AddrV2(
+            addresses
+                .iter()
+                .map(|(address, services, time)| network_address_v2(*address, *time, *services))
+                .collect(),
+        )
+    } else {
+        Message::Addr(
+            addresses
+                .iter()
+                .map(|(address, services, time)| wire::NetworkAddress {
+                    time: u32::try_from(*time).unwrap_or(u32::MAX),
+                    services: *services,
+                    address: socket_address_bytes(*address),
+                    port: address.port(),
+                })
+                .collect(),
+        )
+    }
+}
+
 async fn broadcast_inventory(
     node: &Arc<Node>,
     peers: &PeerRegistry,
@@ -2513,18 +2532,39 @@ mod tests {
         node.record_peer_addresses(3, 0);
         node.set_peer_connection_type(4, "block-relay-only");
 
-        node.relay_peer_address(1, "192.0.2.10:18444".parse().unwrap(), 9, 123);
+        node.relay_peer_addresses(1, vec![("192.0.2.10:18444".parse().unwrap(), 9, 123)]);
 
         assert!(origin_receiver.try_recv().is_err());
         assert!(matches!(
             outbound_receiver.try_recv().unwrap(),
-            PeerCommand::RelayAddress { .. }
+            PeerCommand::RelayAddresses { ref addresses } if addresses.len() == 1
         ));
         assert!(matches!(
             inbound_receiver.try_recv().unwrap(),
-            PeerCommand::RelayAddress { .. }
+            PeerCommand::RelayAddresses { ref addresses } if addresses.len() == 1
         ));
         assert!(block_receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn address_relay_batches_legacy_and_addrv2_payloads() {
+        let addresses = vec![
+            ("192.0.2.10:18444".parse().unwrap(), 1, 123),
+            ("[2001:db8::10]:18444".parse().unwrap(), 8, 456),
+        ];
+        let Message::Addr(legacy) = relay_address_message(&addresses, false) else {
+            panic!("expected legacy address message");
+        };
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(legacy[0].services, 1);
+        assert_eq!(legacy[1].time, 456);
+
+        let Message::AddrV2(addrv2) = relay_address_message(&addresses, true) else {
+            panic!("expected ADDRv2 message");
+        };
+        assert_eq!(addrv2.len(), 2);
+        assert_eq!(addrv2[0].services, 1);
+        assert_eq!(addrv2[1].time, 456);
     }
 
     #[test]
@@ -2880,7 +2920,8 @@ mod tests {
             port: 18444,
         };
         let legacy_socket = socket_address_from_legacy(&legacy).unwrap();
-        node.remember_address(legacy_socket, legacy.services, u64::from(legacy.time));
+        assert!(node.remember_address(legacy_socket, legacy.services, u64::from(legacy.time)));
+        assert!(!node.remember_address(legacy_socket, legacy.services, u64::from(legacy.time)));
         let v2 = network_address_v2(
             "[2001:db8::10]:18444".parse().unwrap(),
             456,

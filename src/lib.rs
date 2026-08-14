@@ -1124,13 +1124,14 @@ impl Node {
         }
     }
 
-    pub(crate) fn relay_peer_address(
+    pub(crate) fn relay_peer_addresses(
         &self,
         origin_peer_id: usize,
-        address: SocketAddr,
-        services: u64,
-        time: u64,
+        addresses: Vec<(SocketAddr, u64, u64)>,
     ) {
+        if addresses.is_empty() {
+            return;
+        }
         let recipients = self
             .peers
             .read()
@@ -1143,10 +1144,8 @@ impl Node {
         let commands = self.peer_commands.read();
         for peer_id in recipients {
             if let Some(sender) = commands.get(&peer_id) {
-                let _ = sender.send(p2p::PeerCommand::RelayAddress {
-                    address,
-                    services,
-                    time,
+                let _ = sender.send(p2p::PeerCommand::RelayAddresses {
+                    addresses: addresses.clone(),
                 });
             }
         }
@@ -1262,11 +1261,12 @@ impl Node {
         true
     }
 
-    pub(crate) fn remember_address(&self, address: SocketAddr, services: u64, time: u64) {
+    pub(crate) fn remember_address(&self, address: SocketAddr, services: u64, time: u64) -> bool {
         let mut known = self.known_addresses.write();
         if !self.reserve_known_address(&mut known, address) {
-            return;
+            return false;
         }
+        let is_new = !known.contains_key(&address);
         let entry = known.entry(address).or_insert_with(|| PeerInfo {
             id: 0,
             address,
@@ -1304,6 +1304,7 @@ impl Node {
             entry.last_send = entry.last_send.max(time);
             entry.last_recv = entry.last_recv.max(time);
         }
+        is_new
     }
 
     fn reserve_known_address(

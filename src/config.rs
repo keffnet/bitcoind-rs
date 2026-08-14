@@ -9,6 +9,7 @@ pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
+    pub tx_reconciliation: bool,
     pub pub_hash_tx: Vec<String>,
     pub pub_hash_block: Vec<String>,
     pub pub_raw_tx: Vec<String>,
@@ -24,6 +25,7 @@ pub struct ZmqConfig {
 impl Default for ZmqConfig {
     fn default() -> Self {
         Self {
+            tx_reconciliation: false,
             pub_hash_tx: Vec::new(),
             pub_hash_block: Vec::new(),
             pub_raw_tx: Vec::new(),
@@ -138,6 +140,9 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub peer_bloom_filters: bool,
 
+    #[arg(long, default_value_t = false, hide = true)]
+    pub tx_reconciliation: bool,
+
     #[arg(long = "zmqpubhashtx", value_name = "ADDRESS")]
     pub zmq_pub_hash_tx: Vec<String>,
 
@@ -226,6 +231,7 @@ impl Config {
             max_peers: args.max_peers,
             peer_bloom_filters: args.peer_bloom_filters,
             zmq: ZmqConfig {
+                tx_reconciliation: args.tx_reconciliation,
                 pub_hash_tx: args.zmq_pub_hash_tx,
                 pub_hash_block: args.zmq_pub_hash_block,
                 pub_raw_tx: args.zmq_pub_raw_tx,

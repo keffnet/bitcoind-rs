@@ -29,7 +29,9 @@ use tokio::net::{
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::wire::{self, GetHeadersMessage, Inventory, InventoryType, Message, VersionMessage};
+use crate::wire::{
+    self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
+};
 use crate::{Node, unix_time_seconds};
 
 enum PeerReader {
@@ -51,6 +53,7 @@ const SENDHEADERS_VERSION: i32 = 70_012;
 const FEEFILTER_VERSION: i32 = 70_013;
 const SHORT_IDS_BLOCKS_VERSION: i32 = 70_014;
 const WTXID_RELAY_VERSION: i32 = 70_016;
+const TX_RECONCILIATION_VERSION: u32 = 1;
 const KNOWN_TX_FILTER_BITS: usize = 1 << 20;
 const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
@@ -65,6 +68,8 @@ struct PeerState {
     send_headers: parking_lot::Mutex<bool>,
     compact_block_version: parking_lot::Mutex<Option<u64>>,
     compact_block_announce: parking_lot::Mutex<bool>,
+    tx_reconciliation_salt: parking_lot::Mutex<Option<u64>>,
+    tx_reconciliation_registered: parking_lot::Mutex<bool>,
 }
 
 /// A bounded rolling filter of transaction inventory already known by a peer.
@@ -785,6 +790,8 @@ async fn serve_peer(
         send_headers: parking_lot::Mutex::new(false),
         compact_block_version: parking_lot::Mutex::new(None),
         compact_block_announce: parking_lot::Mutex::new(false),
+        tx_reconciliation_salt: parking_lot::Mutex::new(None),
+        tx_reconciliation_registered: parking_lot::Mutex::new(false),
     });
     peers.lock().insert(peer_id, peer_state.clone());
     let result = serve_peer_loop(
@@ -930,19 +937,20 @@ async fn serve_peer_loop(
                 );
                 *relay_transactions.lock() = version.relay;
                 if !verack_sent {
+                    send_peer_extensions(
+                        node,
+                        peer_id,
+                        writer,
+                        peer_state,
+                        node.config.network,
+                        &mut extensions_sent,
+                        peer_version,
+                    )
+                    .await?;
                     send_message(node, peer_id, writer, node.config.network, &Message::Verack)
                         .await?;
                     verack_sent = true;
                 }
-                send_peer_extensions(
-                    node,
-                    peer_id,
-                    writer,
-                    node.config.network,
-                    &mut extensions_sent,
-                    peer_version,
-                )
-                .await?;
                 if outbound {
                     debug!(user_agent = %version.user_agent, height = version.start_height, "completed outbound version exchange");
                 }
@@ -956,6 +964,7 @@ async fn serve_peer_loop(
                     node,
                     peer_id,
                     writer,
+                    peer_state,
                     node.config.network,
                     &mut extensions_sent,
                     peer_version,
@@ -986,6 +995,32 @@ async fn serve_peer_loop(
                 if peer_version >= WTXID_RELAY_VERSION {
                     *peer_state.wtxid_relay.lock() = true;
                 }
+            }
+            Message::SendTxRcncl(message) => {
+                if !node.config.zmq.tx_reconciliation {
+                    // Core ignores the offer when reconciliation support is
+                    // disabled, preserving compatibility with default nodes.
+                    continue;
+                }
+                if verack_received {
+                    anyhow::bail!("sendtxrcncl received after verack");
+                }
+                if peer_version < WTXID_RELAY_VERSION
+                    || peer_state.tx_reconciliation_salt.lock().is_none()
+                {
+                    continue;
+                }
+                if !*relay_transactions.lock() {
+                    anyhow::bail!("sendtxrcncl received from a non-relaying peer");
+                }
+                if message.version < TX_RECONCILIATION_VERSION {
+                    anyhow::bail!("unsupported transaction reconciliation version");
+                }
+                let mut registered = peer_state.tx_reconciliation_registered.lock();
+                if *registered {
+                    anyhow::bail!("duplicate sendtxrcncl message");
+                }
+                *registered = true;
             }
             Message::Ping(nonce) => {
                 send_message(
@@ -1929,6 +1964,7 @@ async fn send_peer_extensions(
     node: &Arc<Node>,
     peer_id: usize,
     writer: &PeerWriter,
+    peer_state: &PeerState,
     network: Network,
     sent: &mut bool,
     peer_version: i32,
@@ -1940,8 +1976,23 @@ async fn send_peer_extensions(
         send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
     }
     if peer_version >= WTXID_RELAY_VERSION {
-        send_message(node, peer_id, writer, network, &Message::SendAddrV2).await?;
         send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
+        send_message(node, peer_id, writer, network, &Message::SendAddrV2).await?;
+        if node.config.zmq.tx_reconciliation && *peer_state.relay_transactions.lock() {
+            let salt = random::<u64>();
+            send_message(
+                node,
+                peer_id,
+                writer,
+                network,
+                &Message::SendTxRcncl(SendTxRcnclMessage {
+                    version: TX_RECONCILIATION_VERSION,
+                    salt,
+                }),
+            )
+            .await?;
+            *peer_state.tx_reconciliation_salt.lock() = Some(salt);
+        }
     }
     if peer_version >= SHORT_IDS_BLOCKS_VERSION {
         send_message(
@@ -2565,5 +2616,119 @@ mod tests {
             wire::decode_v2_message(payload.contents()).unwrap(),
             server_message
         );
+    }
+
+    #[tokio::test]
+    async fn tx_reconciliation_extensions_precede_verack_and_use_core_ordering() {
+        let directory = tempfile::tempdir().unwrap();
+        let zmq = crate::config::ZmqConfig {
+            tx_reconciliation: true,
+            ..Default::default()
+        };
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            zmq,
+        })
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address);
+        let server = listener.accept();
+        let (client, server) = tokio::join!(client, server);
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+        let (_, client_writer) = client.into_split();
+        let (mut server_reader, _) = server.into_split();
+        let writer = Arc::new(Mutex::new(PeerWriterKind::V1(client_writer)));
+        let peer_state = PeerState {
+            writer: writer.clone(),
+            bloom_filter: parking_lot::Mutex::new(None),
+            known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
+            fee_filter: parking_lot::Mutex::new(0),
+            relay_transactions: parking_lot::Mutex::new(true),
+            wtxid_relay: parking_lot::Mutex::new(false),
+            send_headers: parking_lot::Mutex::new(false),
+            compact_block_version: parking_lot::Mutex::new(None),
+            compact_block_announce: parking_lot::Mutex::new(false),
+            tx_reconciliation_salt: parking_lot::Mutex::new(None),
+            tx_reconciliation_registered: parking_lot::Mutex::new(false),
+        };
+        let mut sent = false;
+        send_peer_extensions(
+            &node,
+            1,
+            &writer,
+            &peer_state,
+            Network::Regtest,
+            &mut sent,
+            WTXID_RELAY_VERSION,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            wire::read_message(&mut server_reader, Network::Regtest)
+                .await
+                .unwrap(),
+            Message::SendHeaders
+        );
+        assert_eq!(
+            wire::read_message(&mut server_reader, Network::Regtest)
+                .await
+                .unwrap(),
+            Message::WtxidRelay
+        );
+        assert_eq!(
+            wire::read_message(&mut server_reader, Network::Regtest)
+                .await
+                .unwrap(),
+            Message::SendAddrV2
+        );
+        let Message::SendTxRcncl(reconciliation) =
+            wire::read_message(&mut server_reader, Network::Regtest)
+                .await
+                .unwrap()
+        else {
+            panic!("expected sendtxrcncl extension");
+        };
+        assert_eq!(reconciliation.version, TX_RECONCILIATION_VERSION);
+        assert_eq!(
+            *peer_state.tx_reconciliation_salt.lock(),
+            Some(reconciliation.salt)
+        );
+        assert_eq!(
+            wire::read_message(&mut server_reader, Network::Regtest)
+                .await
+                .unwrap(),
+            Message::SendCmpct {
+                announce: false,
+                version: 2,
+            }
+        );
+        assert_eq!(
+            wire::read_message(&mut server_reader, Network::Regtest)
+                .await
+                .unwrap(),
+            Message::FeeFilter(1_000)
+        );
+        send_message(&node, 1, &writer, Network::Regtest, &Message::Verack)
+            .await
+            .unwrap();
+        assert_eq!(
+            wire::read_message(&mut server_reader, Network::Regtest)
+                .await
+                .unwrap(),
+            Message::Verack
+        );
+        assert!(sent);
     }
 }

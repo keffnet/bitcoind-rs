@@ -145,6 +145,12 @@ pub struct GetHeadersMessage {
     pub stop_hash: BlockHash,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SendTxRcnclMessage {
+    pub version: u32,
+    pub salt: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
     Version(VersionMessage),
@@ -155,6 +161,7 @@ pub enum Message {
     SendAddrV2,
     SendHeaders,
     WtxidRelay,
+    SendTxRcncl(SendTxRcnclMessage),
     Ping(u64),
     Pong(u64),
     GetHeaders(GetHeadersMessage),
@@ -195,6 +202,7 @@ impl Message {
             Self::SendAddrV2 => "sendaddrv2",
             Self::SendHeaders => "sendheaders",
             Self::WtxidRelay => "wtxidrelay",
+            Self::SendTxRcncl(_) => "sendtxrcncl",
             Self::Ping(_) => "ping",
             Self::Pong(_) => "pong",
             Self::GetHeaders(_) => "getheaders",
@@ -362,6 +370,10 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
         | Message::WtxidRelay
         | Message::FilterClear
         | Message::Mempool => {}
+        Message::SendTxRcncl(message) => {
+            put_u32(message.version, &mut out);
+            put_u64(message.salt, &mut out);
+        }
         Message::Addr(entries) => {
             if entries.len() > 1_000 {
                 return Err(WireError::Payload("too many address records".to_owned()).into());
@@ -568,6 +580,10 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
         "sendaddrv2" => Message::SendAddrV2,
         "sendheaders" => Message::SendHeaders,
         "wtxidrelay" => Message::WtxidRelay,
+        "sendtxrcncl" => Message::SendTxRcncl(SendTxRcnclMessage {
+            version: reader.u32_le()?,
+            salt: reader.u64_le()?,
+        }),
         "mempool" => Message::Mempool,
         "addr" => Message::Addr(decode_addr(&mut reader)?),
         "addrv2" => Message::AddrV2(decode_addr_v2(&mut reader)?),
@@ -948,6 +964,23 @@ mod tests {
         let message = Message::Version(VersionMessage::new(12, 99));
         let frame = encode_message(Network::Bitcoin, &message).unwrap();
         assert_eq!(decode_message(Network::Bitcoin, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn tx_reconciliation_round_trip_uses_core_payload_layout() {
+        let message = Message::SendTxRcncl(SendTxRcnclMessage {
+            version: 1,
+            salt: 2,
+        });
+        let frame = encode_message(Network::Regtest, &message).unwrap();
+        assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+
+        let mut malformed = frame;
+        malformed[16..20].copy_from_slice(&13u32.to_le_bytes());
+        malformed.push(0);
+        let checksum = bitcoin::hashes::sha256d::Hash::hash(&malformed[24..]).to_byte_array();
+        malformed[20..24].copy_from_slice(&checksum[..4]);
+        assert!(decode_message(Network::Regtest, &malformed).is_err());
     }
 
     #[test]

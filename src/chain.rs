@@ -3297,6 +3297,7 @@ mod tests {
                 script_pubkey: Builder::new().push_int(1).into_script(),
             }],
         };
+        let second_txid = second.compute_txid();
         let previous = *state.header(100).expect("height 100 header");
         let mut block = Block {
             header: Header {
@@ -3350,6 +3351,26 @@ mod tests {
                     .checked_div(samples[0].1)
                     .unwrap()
             )
+        );
+        assert_eq!(
+            state.spending_transaction(&funding_outpoint),
+            Some((first_txid, 0, block_hash, 101))
+        );
+        let first_output = OutPoint::new(first_txid, 0);
+        assert_eq!(
+            state.spending_transaction(&first_output),
+            Some((second_txid, 0, block_hash, 101))
+        );
+        state.persist_snapshot().unwrap();
+        drop(state);
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(
+            reopened.spending_transaction(&funding_outpoint),
+            Some((first_txid, 0, block_hash, 101))
+        );
+        assert_eq!(
+            reopened.spending_transaction(&first_output),
+            Some((second_txid, 0, block_hash, 101))
         );
     }
 

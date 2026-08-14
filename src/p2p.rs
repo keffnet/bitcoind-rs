@@ -36,6 +36,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::chain::BasicFilterRange;
+use crate::config::PeerPermissions;
 use crate::mempool::MempoolError;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
@@ -229,8 +230,16 @@ const MAX_BLOCKS_TO_ANNOUNCE: usize = 8;
 const INVENTORY_BROADCAST_TARGET: usize = 70;
 const INVENTORY_BROADCAST_MAX: usize = 1_000;
 
-fn local_transaction_relay_enabled(connection_type: &str, blocksonly: bool) -> bool {
-    !blocksonly && matches!(connection_type, "outbound-full" | "inbound" | "addr-fetch")
+fn local_transaction_relay_enabled(
+    connection_type: &str,
+    blocksonly: bool,
+    permissions: PeerPermissions,
+) -> bool {
+    if matches!(connection_type, "block-relay-only" | "feeler") {
+        return false;
+    }
+    (!blocksonly && matches!(connection_type, "outbound-full" | "inbound" | "addr-fetch"))
+        || permissions.contains(PeerPermissions::RELAY)
 }
 
 fn connection_requests_headers(connection_type: &str) -> bool {
@@ -693,6 +702,7 @@ fn headers_sync_work_threshold(chain: &crate::chain::ChainState) -> Work {
 struct PeerState {
     writer: PeerWriter,
     connection_type: &'static str,
+    permissions: PeerPermissions,
     local_relay_transactions: bool,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
@@ -1177,9 +1187,7 @@ impl PeerManager {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                if relay_node.config.blocksonly
-                    || relay_node.chain.read().is_initial_block_download()
-                {
+                if relay_node.chain.read().is_initial_block_download() {
                     continue;
                 }
                 let Some(hash) = relay_node
@@ -1198,6 +1206,7 @@ impl PeerManager {
                     &relay_peers,
                     &event.excluded_peers,
                     relay_network,
+                    event.force_relay,
                     Inventory {
                         kind: InventoryType::WitnessTransaction,
                         hash: BlockHash::from_raw_hash(hash.to_raw_hash()),
@@ -1296,7 +1305,7 @@ impl PeerManager {
         loop {
             let (stream, address) = listener.accept().await?;
             if !self.node.network_active()
-                || self.node.is_banned(address.ip())
+                || self.node.is_banned_for_peer(address, true)
                 || !self.node.config.allows_address(address)
             {
                 continue;
@@ -1380,7 +1389,7 @@ fn spawn_outbound_loop(
             if persistent && !node.is_node_added(address) {
                 return;
             }
-            if !node.network_active() || node.is_banned(address.ip()) {
+            if !node.network_active() || node.is_banned_for_peer(address, false) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -1456,7 +1465,7 @@ fn select_discovery_addresses(
                 && !connected.contains(&peer.address)
                 && !added.contains(&peer.address)
                 && !attempts.contains(&peer.address)
-                && !node.is_banned(peer.address.ip())
+                && !node.is_banned_for_peer(peer.address, false)
         })
         .collect::<Vec<_>>();
     drop(attempts);
@@ -1766,16 +1775,26 @@ async fn serve_peer(
     .await?;
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
     let (commands, command_receiver) = mpsc::unbounded_channel();
-    node.register_peer_with_local(peer_id, address, !options.outbound, commands, local_address);
+    let permissions = node.permissions_for_peer(address, !options.outbound);
+    node.register_peer_with_permissions(
+        peer_id,
+        address,
+        !options.outbound,
+        commands,
+        local_address,
+        permissions,
+    );
     node.set_peer_transport_protocol(peer_id, transport_v2);
     node.set_peer_session_id(peer_id, session_id);
     node.set_peer_connection_type(peer_id, options.connection_type);
     let peer_state = Arc::new(PeerState {
         writer: Arc::new(Mutex::new(writer_half)),
         connection_type: options.connection_type,
+        permissions,
         local_relay_transactions: local_transaction_relay_enabled(
             options.connection_type,
             node.config.blocksonly,
+            permissions,
         ),
         bloom_filter: parking_lot::Mutex::new(None),
         known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
@@ -1841,8 +1860,14 @@ async fn serve_peer_loop(
     let relay_transactions = &peer_state.relay_transactions;
     let height = node.chain.read().height() as i32;
     let local_nonce = random();
-    let mut version =
-        VersionMessage::with_bloom(height, local_nonce, node.config.peer_bloom_filters);
+    let mut version = VersionMessage::with_bloom(
+        height,
+        local_nonce,
+        node.config.peer_bloom_filters
+            || peer_state
+                .permissions
+                .contains(PeerPermissions::BLOOM_FILTER),
+    );
     if node.chain.read().is_pruned() {
         version.services &= !wire::NODE_NETWORK;
         version.services |= wire::NODE_NETWORK_LIMITED;
@@ -2148,7 +2173,7 @@ async fn serve_peer_loop(
                 if verack_received {
                     anyhow::bail!("wtxidrelay received after verack");
                 }
-                if peer_version >= WTXID_RELAY_VERSION && !node.config.blocksonly {
+                if peer_version >= WTXID_RELAY_VERSION && peer_state.local_relay_transactions {
                     *peer_state.wtxid_relay.lock() = true;
                 }
             }
@@ -2190,6 +2215,19 @@ async fn serve_peer_loop(
             }
             Message::Pong(nonce) => node.record_pong(peer_id, nonce),
             Message::GetHeaders(request) => {
+                if node.chain.read().is_initial_block_download()
+                    && !peer_state.permissions.contains(PeerPermissions::DOWNLOAD)
+                {
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Headers(Vec::new()),
+                    )
+                    .await?;
+                    continue;
+                }
                 let headers = node
                     .chain
                     .read()
@@ -2413,7 +2451,7 @@ async fn serve_peer_loop(
                                 None
                             }
                             kind if kind.is_transaction() => {
-                                if node.config.blocksonly || initial_block_download {
+                                if initial_block_download {
                                     return None;
                                 }
                                 if (wtxid_relay && item.kind == InventoryType::Transaction)
@@ -2584,10 +2622,7 @@ async fn serve_peer_loop(
                             }
                         }
                         kind if kind.is_transaction() => {
-                            if node.config.blocksonly
-                                || !peer_state.local_relay_transactions
-                                || !*relay_transactions.lock()
-                            {
+                            if !peer_state.local_relay_transactions || !*relay_transactions.lock() {
                                 missing.push(item);
                                 continue;
                             }
@@ -2977,12 +3012,23 @@ async fn serve_peer_loop(
                     BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash())
                 };
                 peer_state.known_tx_inventory.lock().insert(&known_hash);
+                let transaction_for_force_relay = transaction.clone();
                 match node.accept_peer_transaction_from(peer_id, transaction) {
                     Ok(_) => {
                         node.record_peer_transaction(peer_id);
                         debug!(%txid, "accepted peer transaction");
                     }
                     Err(error) => {
+                        if peer_state
+                            .permissions
+                            .contains(PeerPermissions::FORCE_RELAY)
+                            && node.mempool.read().get(&txid).is_some()
+                        {
+                            node.notify_mempool_transaction_force_from_peer(
+                                transaction_for_force_relay,
+                                peer_id,
+                            );
+                        }
                         if let Some(MempoolError::MissingInput(outpoint)) =
                             error.downcast_ref::<MempoolError>()
                         {
@@ -3037,14 +3083,22 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::FilterLoad(filter) => {
-                if !node.config.peer_bloom_filters {
+                if !node.config.peer_bloom_filters
+                    && !peer_state
+                        .permissions
+                        .contains(PeerPermissions::BLOOM_FILTER)
+                {
                     anyhow::bail!("filterload received while bloom filters are disabled");
                 }
                 install_bloom_filter(bloom_filter, relay_transactions, filter)?;
                 node.update_peer_relay_transactions(peer_id, true);
             }
             Message::FilterAdd(FilterAdd { data }) => {
-                if !node.config.peer_bloom_filters {
+                if !node.config.peer_bloom_filters
+                    && !peer_state
+                        .permissions
+                        .contains(PeerPermissions::BLOOM_FILTER)
+                {
                     anyhow::bail!("filteradd received while bloom filters are disabled");
                 }
                 if data.len() > MAX_BLOOM_ELEMENT_SIZE {
@@ -3057,7 +3111,11 @@ async fn serve_peer_loop(
                 filter.insert(&data);
             }
             Message::FilterClear => {
-                if !node.config.peer_bloom_filters {
+                if !node.config.peer_bloom_filters
+                    && !peer_state
+                        .permissions
+                        .contains(PeerPermissions::BLOOM_FILTER)
+                {
                     anyhow::bail!("filterclear received while bloom filters are disabled");
                 }
                 clear_bloom_filter(bloom_filter, relay_transactions);
@@ -3142,6 +3200,12 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::FeeFilter(rate) => {
+                if peer_state
+                    .permissions
+                    .contains(PeerPermissions::FORCE_RELAY)
+                {
+                    continue;
+                }
                 let rate = rate.max(0);
                 *fee_filter.lock() = rate;
                 node.update_peer_fee_filter(peer_id, rate);
@@ -3199,23 +3263,24 @@ async fn serve_peer_loop(
                 }
             }
             Message::Mempool => {
-                if !node.config.peer_bloom_filters {
+                if !node.config.peer_bloom_filters
+                    && !peer_state.permissions.contains(PeerPermissions::MEMPOOL)
+                    && !peer_state
+                        .permissions
+                        .contains(PeerPermissions::BLOOM_FILTER)
+                {
                     anyhow::bail!("mempool request received while bloom filters are disabled");
-                }
-                if !peer_state.local_relay_transactions || !*relay_transactions.lock() {
-                    send_message(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &Message::Inv(Vec::new()),
-                    )
-                    .await?;
-                    continue;
                 }
                 let transactions = {
                     let mempool = node.mempool.read();
-                    let minimum_fee = *fee_filter.lock();
+                    let minimum_fee = if peer_state
+                        .permissions
+                        .contains(PeerPermissions::FORCE_RELAY)
+                    {
+                        0
+                    } else {
+                        *fee_filter.lock()
+                    };
                     mempool
                         .transaction_order()
                         .into_iter()
@@ -3724,7 +3789,7 @@ async fn broadcast_inventory(
     network: Network,
     item: Inventory,
 ) {
-    broadcast_inventory_excluding(node, peers, &[excluded_peer], network, item).await;
+    broadcast_inventory_excluding(node, peers, &[excluded_peer], network, false, item).await;
 }
 
 fn queue_peer_transaction_inventory(
@@ -3843,7 +3908,11 @@ async fn flush_peer_transaction_inventory(
     node.set_peer_inv_to_send(peer_id, state.pending_tx_inventory.lock().len());
 
     let wtxid_relay = *state.wtxid_relay.lock();
-    let minimum_fee = *state.fee_filter.lock();
+    let minimum_fee = if state.permissions.contains(PeerPermissions::FORCE_RELAY) {
+        0
+    } else {
+        *state.fee_filter.lock()
+    };
     let mut inventory = Vec::with_capacity(pending.len());
     for queued in pending {
         let Some(transaction) = transaction_for_inventory(node, &queued) else {
@@ -3894,11 +3963,9 @@ async fn broadcast_inventory_excluding(
     peers: &PeerRegistry,
     excluded_peers: &[usize],
     network: Network,
+    force_relay: bool,
     item: Inventory,
 ) {
-    if node.config.blocksonly && item.kind.is_transaction() {
-        return;
-    }
     let transaction = if item.kind.is_transaction() {
         transaction_for_inventory(node, &item)
     } else {
@@ -3967,7 +4034,22 @@ async fn broadcast_inventory_excluding(
             if !state.local_relay_transactions || !*state.relay_transactions.lock() {
                 continue;
             }
-            queue_peer_transaction_inventory(node, peer_id, &state, item);
+            if force_relay {
+                let sent = send_message(
+                    node,
+                    peer_id,
+                    &state.writer,
+                    network,
+                    &Message::Inv(vec![item.clone()]),
+                )
+                .await
+                .is_ok();
+                if sent {
+                    node.record_peer_inv_sequence(peer_id, node.mempool.read().sequence());
+                }
+            } else {
+                queue_peer_transaction_inventory(node, peer_id, &state, item);
+            }
             continue;
         }
         let message = Message::Inv(vec![item.clone()]);
@@ -4121,13 +4203,43 @@ mod tests {
 
     #[test]
     fn connection_types_match_local_transaction_relay_policy() {
-        assert!(local_transaction_relay_enabled("outbound-full", false));
-        assert!(local_transaction_relay_enabled("inbound", false));
-        assert!(local_transaction_relay_enabled("addr-fetch", false));
+        assert!(local_transaction_relay_enabled(
+            "outbound-full",
+            false,
+            PeerPermissions::empty()
+        ));
+        assert!(local_transaction_relay_enabled(
+            "inbound",
+            false,
+            PeerPermissions::empty()
+        ));
+        assert!(local_transaction_relay_enabled(
+            "addr-fetch",
+            false,
+            PeerPermissions::empty()
+        ));
         for connection_type in ["block-relay-only", "feeler"] {
-            assert!(!local_transaction_relay_enabled(connection_type, false));
+            assert!(!local_transaction_relay_enabled(
+                connection_type,
+                false,
+                PeerPermissions::empty()
+            ));
         }
-        assert!(!local_transaction_relay_enabled("outbound-full", true));
+        assert!(!local_transaction_relay_enabled(
+            "outbound-full",
+            true,
+            PeerPermissions::empty()
+        ));
+        assert!(local_transaction_relay_enabled(
+            "outbound-full",
+            true,
+            PeerPermissions::FORCE_RELAY
+        ));
+        assert!(!local_transaction_relay_enabled(
+            "block-relay-only",
+            true,
+            PeerPermissions::FORCE_RELAY
+        ));
     }
 
     #[test]
@@ -4187,6 +4299,7 @@ mod tests {
             dnsseed: false,
             onlynet: vec![OnlyNet::Ipv4],
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4320,6 +4433,7 @@ mod tests {
             dnsseed: false,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4362,6 +4476,7 @@ mod tests {
         let state = Arc::new(PeerState {
             writer: writer.clone(),
             connection_type: "outbound-full",
+            permissions: PeerPermissions::empty(),
             local_relay_transactions: true,
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
@@ -4639,6 +4754,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4731,6 +4847,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4836,6 +4953,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -5027,6 +5145,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -5116,6 +5235,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -5182,6 +5302,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -5309,6 +5430,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -5351,6 +5473,7 @@ mod tests {
         let peer_state = PeerState {
             writer: writer.clone(),
             connection_type: "outbound-full",
+            permissions: PeerPermissions::empty(),
             local_relay_transactions: true,
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),

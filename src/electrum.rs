@@ -1554,6 +1554,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -1651,6 +1652,7 @@ mod tests {
                 dnsseed: true,
                 onlynet: Vec::new(),
                 proxy: None,
+                peer_permissions: crate::config::PeerPermissionConfig::default(),
                 blocksonly: false,
                 prune: 0,
                 reindex: false,
@@ -1738,6 +1740,7 @@ mod tests {
                 dnsseed: true,
                 onlynet: Vec::new(),
                 proxy: None,
+                peer_permissions: crate::config::PeerPermissionConfig::default(),
                 blocksonly: false,
                 // Block pruning must not be advertised as Electrum history
                 // pruning in server.features.
@@ -2002,6 +2005,7 @@ mod tests {
                 dnsseed: true,
                 onlynet: Vec::new(),
                 proxy: None,
+                peer_permissions: crate::config::PeerPermissionConfig::default(),
                 blocksonly: false,
                 prune: 0,
                 reindex: false,

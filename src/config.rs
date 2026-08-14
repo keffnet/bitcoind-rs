@@ -116,6 +116,280 @@ pub enum OnlyNet {
     Cjdns,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PeerPermissions(u32);
+
+impl PeerPermissions {
+    pub const BLOOM_FILTER: Self = Self(1 << 0);
+    pub const RELAY: Self = Self(1 << 1);
+    pub const FORCE_RELAY: Self = Self((1 << 2) | (1 << 1));
+    pub const NO_BAN: Self = Self((1 << 3) | (1 << 5));
+    pub const MEMPOOL: Self = Self(1 << 4);
+    pub const DOWNLOAD: Self = Self(1 << 5);
+    pub const ADDR: Self = Self(1 << 6);
+    const IMPLICIT: Self = Self(1 << 31);
+
+    const ALL: Self = Self(
+        Self::BLOOM_FILTER.0
+            | Self::FORCE_RELAY.0
+            | Self::NO_BAN.0
+            | Self::MEMPOOL.0
+            | Self::ADDR.0,
+    );
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn contains(self, permission: Self) -> bool {
+        self.0 & permission.0 == permission.0
+    }
+
+    const fn union(self, permission: Self) -> Self {
+        Self(self.0 | permission.0)
+    }
+
+    const fn without(self, permission: Self) -> Self {
+        Self(self.0 & !permission.0)
+    }
+
+    pub fn to_strings(self) -> Vec<&'static str> {
+        let mut permissions = Vec::new();
+        if self.contains(Self::BLOOM_FILTER) {
+            permissions.push("bloomfilter");
+        }
+        if self.contains(Self::NO_BAN) {
+            permissions.push("noban");
+        }
+        if self.contains(Self::FORCE_RELAY) {
+            permissions.push("forcerelay");
+        }
+        if self.contains(Self::RELAY) {
+            permissions.push("relay");
+        }
+        if self.contains(Self::MEMPOOL) {
+            permissions.push("mempool");
+        }
+        if self.contains(Self::DOWNLOAD) {
+            permissions.push("download");
+        }
+        if self.contains(Self::ADDR) {
+            permissions.push("addr");
+        }
+        permissions
+    }
+
+    fn parse_flags(value: &str) -> Result<(Self, bool, bool)> {
+        let mut flags = Self::empty();
+        let mut incoming = false;
+        let mut outgoing = false;
+        for name in value.split(',') {
+            match name {
+                "" => {}
+                "bloom" | "bloomfilter" => flags = flags.union(Self::BLOOM_FILTER),
+                "noban" => flags = flags.union(Self::NO_BAN),
+                "forcerelay" => flags = flags.union(Self::FORCE_RELAY),
+                "relay" => flags = flags.union(Self::RELAY),
+                "mempool" => flags = flags.union(Self::MEMPOOL),
+                "download" => flags = flags.union(Self::DOWNLOAD),
+                "addr" => flags = flags.union(Self::ADDR),
+                "all" => flags = flags.union(Self::ALL),
+                "in" => incoming = true,
+                "out" => outgoing = true,
+                name => bail!("invalid P2P permission: '{name}'"),
+            }
+        }
+        if !incoming && !outgoing {
+            incoming = true;
+        } else if flags == Self::empty() {
+            bail!("only direction was set, no permissions: '{value}'");
+        }
+        Ok((flags, incoming, outgoing))
+    }
+
+    fn implicit() -> Self {
+        Self::IMPLICIT
+    }
+
+    fn resolve(self, whitelist_relay: bool, whitelist_force_relay: bool) -> Self {
+        if !self.contains(Self::IMPLICIT) {
+            return self;
+        }
+        let mut resolved = self.without(Self::IMPLICIT);
+        if whitelist_force_relay {
+            resolved = resolved.union(Self::FORCE_RELAY);
+        }
+        if whitelist_relay {
+            resolved = resolved.union(Self::RELAY);
+        }
+        resolved.union(Self::MEMPOOL).union(Self::NO_BAN)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WhitelistSubnet {
+    address: IpAddr,
+    prefix: u8,
+}
+
+impl WhitelistSubnet {
+    fn parse(value: &str) -> Result<Self> {
+        let mut parts = value.split('/');
+        let address = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid IP/Subnet"))?
+            .parse::<IpAddr>()
+            .map_err(|_| anyhow::anyhow!("invalid IP/Subnet"))?;
+        let prefix = match parts.next() {
+            Some(prefix) => prefix
+                .parse::<u8>()
+                .map_err(|_| anyhow::anyhow!("invalid IP/Subnet"))?,
+            None => match address {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            },
+        };
+        if parts.next().is_some() {
+            bail!("invalid IP/Subnet");
+        }
+        let bits = match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix > bits {
+            bail!("invalid IP/Subnet");
+        }
+        Ok(Self {
+            address: mask_address(address, prefix),
+            prefix,
+        })
+    }
+
+    fn contains(self, address: IpAddr) -> bool {
+        let bits = match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if bits
+            != match self.address {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            }
+        {
+            return false;
+        }
+        mask_address(address, self.prefix) == self.address
+    }
+}
+
+fn mask_address(address: IpAddr, prefix: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(address) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix))
+            };
+            IpAddr::V4(std::net::Ipv4Addr::from(u32::from(address) & mask))
+        }
+        IpAddr::V6(address) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(prefix))
+            };
+            IpAddr::V6(std::net::Ipv6Addr::from(u128::from(address) & mask))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhitelistRule {
+    pub subnet: WhitelistSubnet,
+    pub permissions: PeerPermissions,
+    pub incoming: bool,
+    pub outgoing: bool,
+}
+
+impl WhitelistRule {
+    fn parse(value: &str) -> Result<Self> {
+        let (permission_text, subnet_text) = value
+            .split_once('@')
+            .map_or((None, value), |(permissions, subnet)| {
+                (Some(permissions), subnet)
+            });
+        let subnet = WhitelistSubnet::parse(subnet_text)
+            .with_context(|| format!("parsing --whitelist subnet '{subnet_text}'"))?;
+        let (permissions, incoming, outgoing) = match permission_text {
+            Some(permissions) => PeerPermissions::parse_flags(permissions)?,
+            None => (PeerPermissions::implicit(), true, false),
+        };
+        Ok(Self {
+            subnet,
+            permissions,
+            incoming,
+            outgoing,
+        })
+    }
+
+    fn applies(&self, address: IpAddr, incoming: bool) -> bool {
+        self.subnet.contains(address)
+            && if incoming {
+                self.incoming
+            } else {
+                self.outgoing
+            }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerPermissionConfig {
+    pub whitelist: Vec<WhitelistRule>,
+    pub whitelist_relay: bool,
+    pub whitelist_force_relay: bool,
+}
+
+impl Default for PeerPermissionConfig {
+    fn default() -> Self {
+        Self {
+            whitelist: Vec::new(),
+            whitelist_relay: true,
+            whitelist_force_relay: false,
+        }
+    }
+}
+
+impl PeerPermissionConfig {
+    fn from_args(
+        whitelist: &[String],
+        whitelist_relay: Option<bool>,
+        whitelist_force_relay: bool,
+        blocksonly: bool,
+    ) -> Result<Self> {
+        let whitelist = whitelist
+            .iter()
+            .map(|value| WhitelistRule::parse(value))
+            .collect::<Result<Vec<_>>>()?;
+        let whitelist_relay = whitelist_relay.unwrap_or(!blocksonly);
+        Ok(Self {
+            whitelist,
+            whitelist_relay: whitelist_relay || whitelist_force_relay,
+            whitelist_force_relay,
+        })
+    }
+
+    pub fn permissions_for(&self, address: IpAddr, incoming: bool) -> PeerPermissions {
+        let flags = self
+            .whitelist
+            .iter()
+            .filter(|rule| rule.applies(address, incoming))
+            .fold(PeerPermissions::empty(), |flags, rule| {
+                flags.union(rule.permissions)
+            });
+        flags.resolve(self.whitelist_relay, self.whitelist_force_relay)
+    }
+}
+
 impl OnlyNet {
     pub fn matches(self, address: SocketAddr) -> bool {
         match self {
@@ -192,6 +466,26 @@ pub struct Args {
 
     #[arg(long, value_name = "IP:PORT")]
     pub proxy: Option<SocketAddr>,
+
+    #[arg(long = "whitelist", value_name = "PERMISSIONS@IP[/PREFIX]")]
+    pub whitelist: Vec<String>,
+
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub whitelistrelay: Option<bool>,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub whitelistforcerelay: bool,
 
     #[arg(long, value_name = "HEX")]
     pub signet_challenge: Option<String>,
@@ -365,6 +659,7 @@ pub struct Config {
     pub dnsseed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
+    pub peer_permissions: PeerPermissionConfig,
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
     pub peer_timeout_secs: u64,
@@ -408,6 +703,12 @@ impl Config {
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
             bail!("--proxy must use a non-zero port");
         }
+        let peer_permissions = PeerPermissionConfig::from_args(
+            &args.whitelist,
+            args.whitelistrelay,
+            args.whitelistforcerelay,
+            args.blocksonly,
+        )?;
         if args.blockmaxweight > DEFAULT_BLOCK_MAX_WEIGHT {
             bail!(
                 "--blockmaxweight must not exceed the consensus maximum of {DEFAULT_BLOCK_MAX_WEIGHT}"
@@ -511,6 +812,7 @@ impl Config {
             dnsseed: args.dnsseed,
             onlynet: args.onlynet,
             proxy: args.proxy,
+            peer_permissions,
             signet_challenge,
             max_peers: args.max_peers,
             peer_timeout_secs: args.peertimeout,
@@ -559,6 +861,10 @@ impl Config {
                 .iter()
                 .copied()
                 .any(|network| network.matches(address))
+    }
+
+    pub fn peer_permissions(&self, address: IpAddr, incoming: bool) -> PeerPermissions {
+        self.peer_permissions.permissions_for(address, incoming)
     }
 }
 
@@ -641,6 +947,40 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+    }
+
+    #[test]
+    fn parses_whitelist_permissions_and_directions() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--blocksonly",
+            "--whitelist=192.0.2.0/24",
+            "--whitelist=relay@203.0.113.0/24",
+            "--whitelist=out,noban@198.51.100.0/24",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+
+        let implicit = config.peer_permissions("192.0.2.7".parse().unwrap(), true);
+        assert!(implicit.contains(PeerPermissions::NO_BAN));
+        assert!(implicit.contains(PeerPermissions::DOWNLOAD));
+        assert!(implicit.contains(PeerPermissions::MEMPOOL));
+        assert!(!implicit.contains(PeerPermissions::RELAY));
+
+        let explicit = config.peer_permissions("203.0.113.7".parse().unwrap(), true);
+        assert_eq!(explicit.to_strings(), vec!["relay"]);
+        assert!(
+            config
+                .peer_permissions("198.51.100.7".parse().unwrap(), false)
+                .contains(PeerPermissions::NO_BAN)
+        );
+        assert_eq!(
+            config.peer_permissions("198.51.100.7".parse().unwrap(), true),
+            PeerPermissions::empty()
+        );
     }
 
     #[test]

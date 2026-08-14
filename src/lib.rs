@@ -34,7 +34,7 @@ use tokio::sync::{Notify, broadcast};
 use tracing::info;
 
 use crate::chain::ChainState;
-use crate::config::Config;
+use crate::config::{Config, PeerPermissions};
 use crate::mempool::{
     Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
 };
@@ -300,6 +300,7 @@ pub type MempoolEvent = Txid;
 pub(crate) struct PeerMempoolEvent {
     pub txid: Txid,
     pub excluded_peers: Vec<usize>,
+    pub force_relay: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +321,7 @@ pub struct PeerInfo {
     pub user_agent: String,
     pub start_height: i32,
     pub relay_transactions: bool,
+    pub permissions: PeerPermissions,
     pub min_fee_filter: i64,
     pub transport_protocol_type: &'static str,
     pub(crate) session_id: String,
@@ -824,12 +826,22 @@ impl Node {
         let _ = self.mempool_events.send(txid);
     }
 
-    fn announce_peer_mempool_transaction(&self, txid: Txid, mut excluded_peers: Vec<usize>) {
+    fn announce_peer_mempool_transaction(&self, txid: Txid, excluded_peers: Vec<usize>) {
+        self.announce_peer_mempool_transaction_with_force(txid, excluded_peers, false);
+    }
+
+    fn announce_peer_mempool_transaction_with_force(
+        &self,
+        txid: Txid,
+        mut excluded_peers: Vec<usize>,
+        force_relay: bool,
+    ) {
         excluded_peers.sort_unstable();
         excluded_peers.dedup();
         let _ = self.peer_mempool_events.send(PeerMempoolEvent {
             txid,
             excluded_peers,
+            force_relay,
         });
     }
 
@@ -965,8 +977,22 @@ impl Node {
         self.notify_mempool_transaction_with_exclusions(transaction, Vec::new());
     }
 
-    fn notify_mempool_transaction_from_peer(&self, transaction: Transaction, peer_id: usize) {
+    pub(crate) fn notify_mempool_transaction_from_peer(
+        &self,
+        transaction: Transaction,
+        peer_id: usize,
+    ) {
         self.notify_mempool_transaction_with_exclusions(transaction, vec![peer_id]);
+    }
+
+    pub(crate) fn notify_mempool_transaction_force_from_peer(
+        &self,
+        transaction: Transaction,
+        peer_id: usize,
+    ) {
+        let txid = transaction.compute_txid();
+        self.announce_mempool_transaction(txid);
+        self.announce_peer_mempool_transaction_with_force(txid, vec![peer_id], true);
     }
 
     fn notify_mempool_transaction_with_exclusions(
@@ -1519,16 +1545,24 @@ impl Node {
         inbound: bool,
         commands: tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>,
     ) {
-        self.register_peer_with_local(id, address, inbound, commands, None);
+        self.register_peer_with_permissions(
+            id,
+            address,
+            inbound,
+            commands,
+            None,
+            PeerPermissions::empty(),
+        );
     }
 
-    pub(crate) fn register_peer_with_local(
+    pub(crate) fn register_peer_with_permissions(
         &self,
         id: usize,
         address: SocketAddr,
         inbound: bool,
         commands: tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>,
         local_address: Option<SocketAddr>,
+        permissions: PeerPermissions,
     ) {
         let connected_at = time::unix_time();
         let peer = PeerInfo {
@@ -1542,6 +1576,7 @@ impl Node {
             user_agent: String::new(),
             start_height: -1,
             relay_transactions: false,
+            permissions,
             min_fee_filter: 0,
             transport_protocol_type: "v1",
             session_id: String::new(),
@@ -1565,7 +1600,7 @@ impl Node {
             time_offset: 0,
             addr_processed: 0,
             addr_rate_limited: 0,
-            addr_relay_enabled: !inbound,
+            addr_relay_enabled: !inbound || permissions.contains(PeerPermissions::ADDR),
             ping_time: None,
             min_ping: None,
             ping_nonce: None,
@@ -1645,6 +1680,10 @@ impl Node {
         let Some(peer) = peers.get_mut(&id) else {
             return false;
         };
+        if peer.permissions.contains(PeerPermissions::ADDR) {
+            peer.addr_processed = peer.addr_processed.saturating_add(1);
+            return true;
+        }
         let now = Instant::now();
         if peer.addr_token_bucket < MAX_ADDR_PROCESSING_TOKEN_BUCKET {
             let elapsed = now
@@ -1714,8 +1753,17 @@ impl Node {
     pub(crate) fn set_peer_connection_type(&self, id: usize, connection_type: &'static str) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.connection_type = connection_type;
-            peer.addr_relay_enabled = !peer.inbound && connection_type != "block-relay-only";
+            peer.addr_relay_enabled = (!peer.inbound && connection_type != "block-relay-only")
+                || peer.permissions.contains(PeerPermissions::ADDR);
         }
+    }
+
+    pub(crate) fn permissions_for_peer(
+        &self,
+        address: SocketAddr,
+        inbound: bool,
+    ) -> PeerPermissions {
+        self.config.peer_permissions(address.ip(), inbound)
     }
 
     pub fn unregister_peer(&self, id: usize) {
@@ -1788,6 +1836,7 @@ impl Node {
                 user_agent: String::new(),
                 start_height: 0,
                 relay_transactions: true,
+                permissions: PeerPermissions::empty(),
                 min_fee_filter: 0,
                 transport_protocol_type: "v1",
                 session_id: String::new(),
@@ -1844,6 +1893,7 @@ impl Node {
             user_agent: String::new(),
             start_height: 0,
             relay_transactions: true,
+            permissions: PeerPermissions::empty(),
             min_fee_filter: 0,
             transport_protocol_type: "v1",
             session_id: String::new(),
@@ -2073,6 +2123,11 @@ impl Node {
         let mut banned = self.banned_addresses.write();
         remove_expired_bans(&mut banned, now);
         banned.keys().any(|subnet| subnet.contains(address))
+    }
+
+    pub(crate) fn is_banned_for_peer(&self, address: SocketAddr, inbound: bool) -> bool {
+        let permissions = self.permissions_for_peer(address, inbound);
+        !permissions.contains(PeerPermissions::NO_BAN) && self.is_banned(address.ip())
     }
 
     pub fn banned_addresses(&self) -> Vec<BannedAddress> {
@@ -2348,6 +2403,7 @@ fn load_known_addresses(
                 user_agent: String::new(),
                 start_height: 0,
                 relay_transactions: true,
+                permissions: PeerPermissions::empty(),
                 min_fee_filter: 0,
                 transport_protocol_type: "v1",
                 session_id: String::new(),
@@ -2415,6 +2471,7 @@ mod tests {
     use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
     use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
+    use clap::Parser;
 
     fn test_config(datadir: &Path) -> Config {
         Config {
@@ -2428,6 +2485,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -2484,6 +2542,27 @@ mod tests {
             loaded[&legacy_subnet].address,
             "192.0.2.7".parse::<IpAddr>().unwrap()
         );
+    }
+
+    #[test]
+    fn whitelisted_noban_peers_bypass_admission_bans() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--whitelist=192.0.2.0/24",
+        ])
+        .unwrap();
+        let node = Node::open(Config::from_args(args).unwrap()).unwrap();
+        let until = time::unix_time().saturating_add(600);
+        node.ban_address("192.0.2.1".parse().unwrap(), until, "test".to_owned())
+            .unwrap();
+        node.ban_address("198.51.100.1".parse().unwrap(), until, "test".to_owned())
+            .unwrap();
+
+        assert!(!node.is_banned_for_peer("192.0.2.7:18444".parse().unwrap(), true));
+        assert!(node.is_banned_for_peer("198.51.100.1:18444".parse().unwrap(), true));
     }
 
     #[test]

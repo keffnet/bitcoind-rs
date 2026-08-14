@@ -25,9 +25,11 @@ use bitcoin::{
     Address, Amount, Block, BlockHash, Denomination, Network, OutPoint, ScriptBuf, Transaction,
     TxOut, Txid,
 };
+use miniscript::descriptor::DescriptorType as MiniscriptDescriptorType;
 use miniscript::psbt::PsbtExt;
 use miniscript::{
-    Descriptor as MiniscriptDescriptor, DescriptorPublicKey as MiniscriptPublicKey, Miniscript, Tap,
+    Descriptor as MiniscriptDescriptor, DescriptorPublicKey as MiniscriptPublicKey, Legacy,
+    Miniscript, Segwitv0, Tap,
 };
 use rand::random;
 use serde_json::{Value, json};
@@ -4723,10 +4725,8 @@ fn multisig_script_keys(script: &bitcoin::Script) -> Option<(usize, Vec<bitcoin:
 }
 
 fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
-    if psbt
-        .inputs
-        .get(input_index)
-        .is_some_and(|input| !input.tap_scripts.is_empty())
+    if let Some(input) = psbt.inputs.get(input_index)
+        && (input.witness_script.is_some() || !input.tap_scripts.is_empty())
         && psbt
             .finalize_inp_mut(&Secp256k1::verification_only(), input_index)
             .is_ok()
@@ -5277,6 +5277,98 @@ fn miniscript_taproot_candidates(
     Ok(Some(candidates))
 }
 
+fn miniscript_v0_candidates(
+    descriptor: &str,
+    range: Option<(u32, u32)>,
+) -> Result<Option<Vec<DescriptorCandidate>>> {
+    let secp = Secp256k1::new();
+    let Ok((parsed, keymap)) =
+        MiniscriptDescriptor::<MiniscriptPublicKey>::parse_descriptor(&secp, descriptor)
+    else {
+        return Ok(None);
+    };
+    if !matches!(
+        &parsed,
+        MiniscriptDescriptor::Sh(_) | MiniscriptDescriptor::Wsh(_)
+    ) {
+        return Ok(None);
+    }
+
+    let indices = descriptor_indices(parsed.has_wildcard(), range)?;
+    let verification = Secp256k1::verification_only();
+    let signing = Secp256k1::new();
+    let candidates = indices
+        .into_iter()
+        .map(|index| {
+            let definite = parsed.at_derivation_index(index.unwrap_or(0))?;
+            let derived = definite.derived_descriptor(&verification);
+            let descriptor_keys = definite.iter_pk().collect::<Vec<_>>();
+            let public_keys = derived.iter_pk().collect::<Vec<_>>();
+            if descriptor_keys.len() != public_keys.len() {
+                bail!("miniscript descriptor key derivation is inconsistent")
+            }
+            let keys = descriptor_keys
+                .into_iter()
+                .zip(public_keys)
+                .map(|(descriptor_key, public_key)| {
+                    let origin = descriptor_key
+                        .full_derivation_path()
+                        .map(|path| (descriptor_key.master_fingerprint(), path));
+                    let private_key = origin
+                        .as_ref()
+                        .and_then(|(_, path)| {
+                            keymap
+                                .get_key(
+                                    KeyRequest::Bip32((
+                                        descriptor_key.master_fingerprint(),
+                                        path.clone(),
+                                    )),
+                                    &signing,
+                                )
+                                .ok()
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            keymap
+                                .get_key(KeyRequest::Pubkey(public_key), &signing)
+                                .ok()
+                                .flatten()
+                        });
+                    DescriptorDerivedKey {
+                        public_key: Some(public_key),
+                        private_key,
+                        origin,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let explicit = derived.explicit_script()?;
+            let (redeem_script, witness_script) = match derived.desc_type() {
+                MiniscriptDescriptorType::Wsh | MiniscriptDescriptorType::WshSortedMulti => {
+                    (None, Some(explicit))
+                }
+                MiniscriptDescriptorType::ShWsh | MiniscriptDescriptorType::ShWshSortedMulti => {
+                    (Some(explicit.to_p2wsh()), Some(explicit))
+                }
+                MiniscriptDescriptorType::Sh
+                | MiniscriptDescriptorType::ShSortedMulti
+                | MiniscriptDescriptorType::ShWpkh => (Some(explicit), None),
+                _ => bail!("unsupported Miniscript v0 descriptor type"),
+            };
+            Ok(DescriptorCandidate {
+                script_pubkey: derived.script_pubkey(),
+                redeem_script,
+                witness_script,
+                tap_internal_key: None,
+                tap_merkle_root: None,
+                tap_tree: None,
+                tap_scripts: Vec::new(),
+                keys,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(candidates))
+}
+
 fn descriptor_candidates_inner(
     node: &Arc<Node>,
     descriptor: &str,
@@ -5320,6 +5412,9 @@ fn descriptor_candidates_inner(
             tap_scripts: Vec::new(),
             keys: Vec::new(),
         }]);
+    }
+    if let Some(candidates) = miniscript_v0_candidates(descriptor, range)? {
+        return Ok(candidates);
     }
     for kind in ["sh", "wsh"] {
         if let Some(inner) = descriptor
@@ -5723,15 +5818,40 @@ fn sign_descriptor_psbt_input(
         .as_ref()
         .or(candidate.redeem_script.as_ref())
         .unwrap_or(&prevout.script_pubkey);
+    let miniscript_keys = candidate
+        .witness_script
+        .as_ref()
+        .and_then(|script| {
+            Miniscript::<bitcoin::PublicKey, Segwitv0>::decode_consensus(script)
+                .ok()
+                .map(|miniscript| miniscript.iter_pk().collect::<Vec<_>>())
+        })
+        .or_else(|| {
+            candidate
+                .redeem_script
+                .as_ref()
+                .filter(|script| !script.is_p2wsh())
+                .and_then(|script| {
+                    Miniscript::<bitcoin::PublicKey, Legacy>::decode_consensus(script)
+                        .ok()
+                        .map(|miniscript| miniscript.iter_pk().collect::<Vec<_>>())
+                })
+        });
     let keys = candidate
         .keys
         .iter()
         .filter_map(|key| key.private_key.as_ref().map(|private| (key, private)))
         .filter_map(|(key, private)| key.public_key.map(|public| (public, private)))
-        .filter(|(public_key, _)| descriptor_public_key_matches_script(public_key, signing_script))
+        .filter(|(public_key, _)| {
+            miniscript_keys.as_ref().map_or_else(
+                || descriptor_public_key_matches_script(public_key, signing_script),
+                |keys| keys.contains(public_key),
+            )
+        })
         .collect::<Vec<_>>();
     if keys.is_empty()
-        || !(signing_script.is_p2pk()
+        || !(miniscript_keys.is_some()
+            || signing_script.is_p2pk()
             || signing_script.is_p2pkh()
             || signing_script.is_p2wpkh()
             || multisig_script_keys(signing_script).is_some())
@@ -7771,6 +7891,12 @@ fn expand_descriptor_scripts(
             bail!("raw descriptors do not accept a range")
         }
         return Ok(vec![ScriptBuf::from_bytes(hex::decode(script)?)]);
+    }
+    if let Some(candidates) = miniscript_v0_candidates(descriptor, range)? {
+        return Ok(candidates
+            .into_iter()
+            .map(|candidate| candidate.script_pubkey)
+            .collect());
     }
     for kind in ["multi", "sortedmulti"] {
         if let Some(arguments) = descriptor
@@ -9889,6 +10015,34 @@ mod tests {
         let wrapped_multisig =
             expand_descriptor_scripts(&node, &format!("wsh({multisig})"), None).unwrap();
         assert!(wrapped_multisig[0].is_p2wsh());
+        let miniscript = format!("wsh(and_v(v:pk({public_key}),older(1)))");
+        let miniscript_script = expand_descriptor_scripts(&node, &miniscript, None)
+            .unwrap()
+            .remove(0);
+        assert!(miniscript_script.is_p2wsh());
+        let miniscript_candidate = descriptor_candidates(&node, &miniscript, None)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            miniscript_candidate
+                .witness_script
+                .as_ref()
+                .unwrap()
+                .to_p2wsh(),
+            miniscript_script
+        );
+        let nested_miniscript = format!("sh({miniscript})");
+        let nested_miniscript_candidate = descriptor_candidates(&node, &nested_miniscript, None)
+            .unwrap()
+            .remove(0);
+        assert!(nested_miniscript_candidate.script_pubkey.is_p2sh());
+        assert!(
+            nested_miniscript_candidate
+                .redeem_script
+                .as_ref()
+                .is_some_and(|script| script.is_p2wsh())
+        );
+        assert!(nested_miniscript_candidate.witness_script.is_some());
         let wrapped = derive_addresses(&node, &json!([format!("sh(wpkh({public_key}))")])).unwrap();
         assert_eq!(wrapped.as_array().unwrap().len(), 1);
         let taproot_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
@@ -10511,6 +10665,52 @@ mod tests {
             &Address::p2wpkh(&compressed, Network::Regtest).script_pubkey()
         );
         assert_eq!(nested_processed["complete"], false);
+
+        let miniscript_descriptor = format!("wsh(and_v(v:pk({xpriv}),older(1)))");
+        let miniscript_script = expand_descriptor_scripts(&node, &miniscript_descriptor, None)
+            .unwrap()
+            .remove(0);
+        let miniscript_unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([24; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::from_consensus(1),
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut miniscript_psbt = Psbt::from_unsigned_tx(miniscript_unsigned).unwrap();
+        miniscript_psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: miniscript_script,
+        });
+        let miniscript_processed = descriptor_process_psbt(
+            &node,
+            &json!([
+                encode_psbt(&miniscript_psbt),
+                [miniscript_descriptor],
+                "SIGHASH_ALL",
+                true,
+                true
+            ]),
+        )
+        .unwrap();
+        assert_eq!(miniscript_processed["complete"], true);
+        let miniscript_processed =
+            parse_psbt(&json!([miniscript_processed["psbt"].clone()]), 0).unwrap();
+        assert_eq!(
+            miniscript_processed.inputs[0]
+                .final_script_witness
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
 
         let taproot_descriptor = format!("tr([d34db33f/86'/0'/0']{xpriv})");
         let internal_key = bitcoin::XOnlyPublicKey::from(public_key);

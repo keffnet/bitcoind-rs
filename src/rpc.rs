@@ -8336,7 +8336,7 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
         return Ok(Value::Array(result));
     }
 
-    match candidate.accept(transactions[0].clone(), &chain) {
+    match candidate.accept_without_sibling(transactions[0].clone(), &chain) {
         Ok(txid) => {
             let entry = candidate
                 .get(&txid)

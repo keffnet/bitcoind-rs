@@ -411,9 +411,49 @@ impl Mempool {
         transaction: Transaction,
         chain: &ChainState,
     ) -> Result<Txid, MempoolError> {
+        self.accept_with_sibling(transaction, chain, true)
+    }
+
+    /// Validate a transaction without Core's single-transaction TRUC sibling
+    /// eviction carve-out. `testmempoolaccept` uses this mode because it must
+    /// not mutate even a cloned mempool's replacement set.
+    pub(crate) fn accept_without_sibling(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_with_sibling(transaction, chain, false)
+    }
+
+    fn accept_with_sibling(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        allow_sibling_eviction: bool,
+    ) -> Result<Txid, MempoolError> {
         let added_at = time::unix_time();
         match self.accept_at(transaction.clone(), chain, added_at) {
-            Err(MempoolError::Conflict(_)) => self.replace(transaction, chain, added_at),
+            Err(MempoolError::Conflict(_)) => {
+                let mut conflicts = self.conflicts_for(&transaction);
+                let sibling = allow_sibling_eviction
+                    .then(|| self.truc_sibling_for(&transaction))
+                    .flatten();
+                if let Some(sibling) = sibling
+                    && !conflicts.contains(&sibling)
+                {
+                    conflicts.push(sibling);
+                    self.replace_with_conflicts(transaction, chain, added_at, conflicts, true)
+                } else {
+                    self.replace(transaction, chain, added_at)
+                }
+            }
+            Err(error @ MempoolError::Truc(_)) if allow_sibling_eviction => {
+                if let Some(sibling) = self.truc_sibling_for(&transaction) {
+                    self.replace_with_conflicts(transaction, chain, added_at, vec![sibling], true)
+                } else {
+                    Err(error)
+                }
+            }
             result => result,
         }
     }
@@ -483,16 +523,36 @@ impl Mempool {
         added_at: u64,
     ) -> Result<Txid, MempoolError> {
         let conflicts = self.conflicts_for(&transaction);
+        self.replace_with_conflicts(transaction, chain, added_at, conflicts, false)
+    }
+
+    fn replace_with_conflicts(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
+        conflicts: Vec<Txid>,
+        sibling_eviction: bool,
+    ) -> Result<Txid, MempoolError> {
         if conflicts.is_empty() {
             return Err(MempoolError::Conflict(transaction.compute_txid()));
         }
-        if conflicts.iter().any(|txid| !self.is_replaceable(txid)) {
+        let direct_conflicts = self.conflicts_for(&transaction);
+        if direct_conflicts
+            .iter()
+            .any(|txid| !self.is_replaceable(txid))
+        {
             return Err(MempoolError::ReplacementNotSignaled);
         }
         let removal = self.conflicts_and_descendants(&conflicts);
+        let mut allowed_unconfirmed = HashSet::new();
+        for conflict in &conflicts {
+            allowed_unconfirmed.extend(self.ancestors(conflict));
+        }
         for input in &transaction.input {
             if self.entries.contains_key(&input.previous_output.txid)
                 && !removal.contains(&input.previous_output.txid)
+                && !allowed_unconfirmed.contains(&input.previous_output.txid)
             {
                 return Err(MempoolError::ReplacementUnconfirmedInput);
             }
@@ -524,6 +584,25 @@ impl Mempool {
         if replacement_fee < required_fee {
             return Err(MempoolError::ReplacementFee);
         }
+        if sibling_eviction {
+            let replacement_vsize = candidate
+                .get(&txid)
+                .map(|entry| entry.vsize)
+                .ok_or(MempoolError::BadOutput)?;
+            for sibling in conflicts
+                .iter()
+                .filter(|conflict| !direct_conflicts.contains(conflict))
+            {
+                let sibling_entry = self.get(sibling).ok_or(MempoolError::BadOutput)?;
+                let replacement_fee_rate =
+                    i128::from(replacement_fee) * i128::from(sibling_entry.vsize);
+                let sibling_fee_rate =
+                    i128::from(sibling_entry.fee_sat) * i128::from(replacement_vsize);
+                if replacement_fee_rate <= sibling_fee_rate {
+                    return Err(MempoolError::ReplacementFee);
+                }
+            }
+        }
         *self = candidate;
         Ok(txid)
     }
@@ -549,6 +628,38 @@ impl Mempool {
             pending.extend(self.children(&txid));
         }
         removal
+    }
+
+    fn truc_sibling_for(&self, transaction: &Transaction) -> Option<Txid> {
+        if transaction.version.0 != TRUC_VERSION
+            || transaction.vsize() as u64 > TRUC_CHILD_MAX_VSIZE
+        {
+            return None;
+        }
+        let mut parent_ids = transaction
+            .input
+            .iter()
+            .map(|input| input.previous_output.txid)
+            .filter(|parent| self.entries.contains_key(parent))
+            .collect::<Vec<_>>();
+        parent_ids.sort_by_key(ToString::to_string);
+        parent_ids.dedup();
+        if parent_ids.len() != 1 {
+            return None;
+        }
+        let parent_id = parent_ids[0];
+        let parent = self.entries.get(&parent_id)?;
+        if parent.transaction.version.0 != TRUC_VERSION
+            || self.ancestors(&parent_id).len().saturating_add(2) > TRUC_ANCESTOR_LIMIT
+        {
+            return None;
+        }
+        let descendants = self.descendants(&parent_id);
+        if descendants.len() != 1 {
+            return None;
+        }
+        let sibling = descendants[0];
+        self.descendants(&sibling).is_empty().then_some(sibling)
     }
 
     fn accept_at(
@@ -1751,6 +1862,52 @@ mod tests {
             pool.check_truc_policy(&large_child, large_child.vsize() as u64),
             Err(MempoolError::Truc(reason)) if reason.contains("child tx")
         ));
+    }
+
+    #[test]
+    fn single_transaction_truc_acceptance_can_evict_a_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut pool = Mempool::new(Network::Regtest);
+        let mut parent = graph_transaction(Txid::from_byte_array([40; 32]), 40);
+        parent.version = Version::non_standard(TRUC_VERSION);
+        parent.input[0].script_sig = ScriptBuf::from_bytes(vec![0; 8]);
+        parent.output = vec![
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        ];
+        let parent_id = insert_policy_entry(&mut pool, parent);
+
+        let mut sibling = graph_transaction(parent_id, 41);
+        sibling.version = Version::non_standard(TRUC_VERSION);
+        sibling.input[0].previous_output.vout = 0;
+        sibling.input[0].script_sig = ScriptBuf::from_bytes(vec![0; 8]);
+        sibling.output[0].value = Amount::from_sat(99_900);
+        let sibling_id = insert_policy_entry(&mut pool, sibling);
+
+        let mut replacement = graph_transaction(parent_id, 42);
+        replacement.version = Version::non_standard(TRUC_VERSION);
+        replacement.input[0].previous_output.vout = 1;
+        replacement.input[0].script_sig = ScriptBuf::from_bytes(vec![0; 8]);
+        replacement.output[0].value = Amount::from_sat(98_000);
+        let replacement_id = replacement.compute_txid();
+
+        let mut test_pool = pool.clone();
+        assert!(matches!(
+            test_pool.accept_without_sibling(replacement.clone(), &chain),
+            Err(MempoolError::Truc(reason)) if reason.contains("descendant count limit")
+        ));
+        assert_eq!(pool.truc_sibling_for(&replacement), Some(sibling_id));
+        assert_eq!(pool.accept(replacement, &chain).unwrap(), replacement_id);
+        assert!(pool.get(&sibling_id).is_none());
+        assert!(pool.get(&replacement_id).is_some());
+        assert_eq!(pool.children(&parent_id), vec![replacement_id]);
     }
 
     #[test]

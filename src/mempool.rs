@@ -29,6 +29,8 @@ pub struct MempoolEntry {
     pub fee_sat: u64,
     pub vsize: u64,
     pub added_at: u64,
+    /// Active-chain height when the transaction entered the mempool.
+    pub height: u32,
 }
 
 #[derive(Clone)]
@@ -443,11 +445,7 @@ impl Mempool {
         if conflicts.is_empty() {
             return Err(MempoolError::Conflict(transaction.compute_txid()));
         }
-        if conflicts.iter().any(|txid| {
-            self.entries
-                .get(txid)
-                .is_none_or(|entry| !signals_replaceability(&entry.transaction))
-        }) {
+        if conflicts.iter().any(|txid| !self.is_replaceable(txid)) {
             return Err(MempoolError::ReplacementNotSignaled);
         }
         let removal = self.conflicts_and_descendants(&conflicts);
@@ -624,6 +622,7 @@ impl Mempool {
             fee_sat,
             vsize,
             added_at,
+            height: chain.height(),
         };
         let wtxid = entry.transaction.compute_wtxid();
         for input in &entry.transaction.input {
@@ -746,9 +745,25 @@ impl Mempool {
     }
 
     pub fn is_replaceable(&self, txid: &Txid) -> bool {
-        self.entries
-            .get(txid)
-            .is_some_and(|entry| signals_replaceability(&entry.transaction))
+        fn signals_with_ancestors(
+            mempool: &Mempool,
+            txid: Txid,
+            visiting: &mut HashSet<Txid>,
+        ) -> bool {
+            if !visiting.insert(txid) {
+                return false;
+            }
+            let Some(entry) = mempool.entries.get(&txid) else {
+                return false;
+            };
+            signals_replaceability(&entry.transaction)
+                || entry.transaction.input.iter().any(|input| {
+                    mempool.entries.contains_key(&input.previous_output.txid)
+                        && signals_with_ancestors(mempool, input.previous_output.txid, visiting)
+                })
+        }
+
+        signals_with_ancestors(self, *txid, &mut HashSet::new())
     }
 }
 
@@ -879,6 +894,7 @@ mod tests {
                     vsize: transaction.vsize() as u64,
                     fee_sat: 10,
                     added_at: time,
+                    height: 0,
                     transaction,
                 },
             );
@@ -895,6 +911,35 @@ mod tests {
         assert_eq!(pool.ancestors(&grandchild_id), vec![root_id, child_id]);
         assert_eq!(pool.descendants(&root_id), vec![child_id, grandchild_id]);
         assert_eq!(pool.get_by_wtxid(&grandchild_wtxid).unwrap().added_at, 3);
+    }
+
+    #[test]
+    fn inherited_rbf_signal_marks_descendants_replaceable() {
+        let mut parent = graph_transaction(Txid::from_byte_array([4; 32]), 4);
+        parent.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+        let parent_id = parent.compute_txid();
+        let child = graph_transaction(parent_id, 5);
+        let child_id = child.compute_txid();
+        let mut pool = Mempool::new(Network::Regtest);
+        for transaction in [parent, child] {
+            let txid = transaction.compute_txid();
+            let wtxid = transaction.compute_wtxid();
+            pool.entries.insert(
+                txid,
+                MempoolEntry {
+                    vsize: transaction.vsize() as u64,
+                    fee_sat: 10,
+                    added_at: 1,
+                    height: 0,
+                    transaction,
+                },
+            );
+            pool.wtxids.insert(wtxid, txid);
+        }
+        pool.children.entry(parent_id).or_default().insert(child_id);
+
+        assert!(pool.is_replaceable(&parent_id));
+        assert!(pool.is_replaceable(&child_id));
     }
 
     #[test]
@@ -915,6 +960,7 @@ mod tests {
                     vsize: transaction.vsize() as u64,
                     fee_sat,
                     added_at: 1,
+                    height: 0,
                     transaction,
                 },
             );
@@ -938,6 +984,7 @@ mod tests {
                 vsize: transaction.vsize() as u64,
                 fee_sat: 10,
                 added_at: 1,
+                height: 0,
                 transaction,
             },
         );

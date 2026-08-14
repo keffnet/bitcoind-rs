@@ -1190,19 +1190,13 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             if verbose && include_sequence {
                 bail!("Verbose results cannot contain mempool sequence values.")
             }
-            let height = node.chain.read().height();
             let mempool = node.mempool.read();
             let order = mempool.transaction_order();
             if verbose {
                 Ok(Value::Object(
                     order
                         .iter()
-                        .map(|txid| {
-                            Ok((
-                                txid.to_string(),
-                                mempool_entry_json(&mempool, txid, height)?,
-                            ))
-                        })
+                        .map(|txid| Ok((txid.to_string(), mempool_entry_json(&mempool, txid)?)))
                         .collect::<Result<Vec<(String, Value)>>>()?
                         .into_iter()
                         .collect(),
@@ -1225,9 +1219,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getorphantxs" => get_orphan_transactions(node, params),
         "getmempoolentry" => {
             let txid: Txid = param::<String>(params, 0)?.parse()?;
-            let height = node.chain.read().height();
             let mempool = node.mempool.read();
-            mempool_entry_json(&mempool, &txid, height)
+            mempool_entry_json(&mempool, &txid)
         }
         "getmempoolancestors" => get_mempool_relationship(node, params, true),
         "getmempooldescendants" => get_mempool_relationship(node, params, false),
@@ -7224,7 +7217,6 @@ fn get_prioritised_transactions(node: &Arc<Node>) -> Result<Value> {
 fn get_mempool_relationship(node: &Arc<Node>, params: &Value, ancestors: bool) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
-    let height = node.chain.read().height();
     let mempool = node.mempool.read();
     let related = if ancestors {
         mempool.ancestors(&txid)
@@ -7236,7 +7228,7 @@ fn get_mempool_relationship(node: &Arc<Node>, params: &Value, ancestors: bool) -
         for related_txid in related {
             result.insert(
                 related_txid.to_string(),
-                mempool_entry_json(&mempool, &related_txid, height)?,
+                mempool_entry_json(&mempool, &related_txid)?,
             );
         }
         Ok(Value::Object(result))
@@ -7354,7 +7346,7 @@ fn get_mempool_fee_rate_diagram(node: &Arc<Node>) -> Result<Value> {
     Ok(json!([{"weight": weight, "fee": sat_to_btc(fee)}]))
 }
 
-fn mempool_entry_json(mempool: &Mempool, txid: &Txid, height: u32) -> Result<Value> {
+fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
     let entry = mempool
         .get(txid)
         .ok_or_else(|| anyhow!("Transaction not in mempool"))?;
@@ -7369,15 +7361,20 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid, height: u32) -> Result<Val
     let aggregate = |ids: &[Txid]| {
         ids.iter()
             .filter_map(|candidate| mempool.get(candidate))
-            .fold((0u64, 0u64), |(fee, size), candidate| {
+            .fold((0u64, 0i64), |(size, modified), candidate| {
                 (
-                    fee.saturating_add(candidate.fee_sat),
                     size.saturating_add(candidate.vsize),
+                    modified
+                        .saturating_add(i64::try_from(candidate.fee_sat).unwrap_or(i64::MAX))
+                        .saturating_add(mempool.fee_delta(&candidate.transaction.compute_txid())),
                 )
             })
     };
-    let (ancestor_fee, ancestor_size) = aggregate(&ancestor_ids);
-    let (descendant_fee, descendant_size) = aggregate(&descendant_ids);
+    let (ancestor_size, ancestor_modified_fee) = aggregate(&ancestor_ids);
+    let (descendant_size, descendant_modified_fee) = aggregate(&descendant_ids);
+    let modified_fee = i64::try_from(entry.fee_sat)
+        .unwrap_or(i64::MAX)
+        .saturating_add(mempool.fee_delta(txid));
     let parents = mempool
         .parents(txid)
         .into_iter()
@@ -7392,7 +7389,7 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid, height: u32) -> Result<Val
         "vsize": entry.vsize,
         "weight": entry.transaction.weight().to_wu(),
         "time": entry.added_at,
-        "height": height,
+        "height": entry.height,
         "descendantcount": descendant_ids.len(),
         "descendantsize": descendant_size,
         "ancestorcount": ancestor_ids.len(),
@@ -7401,9 +7398,9 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid, height: u32) -> Result<Val
         "fee": sat_to_btc(entry.fee_sat),
         "fees": {
             "base": sat_to_btc(entry.fee_sat),
-            "modified": sat_to_btc(entry.fee_sat),
-            "ancestor": sat_to_btc(ancestor_fee),
-            "descendant": sat_to_btc(descendant_fee),
+            "modified": sat_to_btc_signed(modified_fee),
+            "ancestor": sat_to_btc_signed(ancestor_modified_fee),
+            "descendant": sat_to_btc_signed(descendant_modified_fee),
         },
         "depends": parents,
         "spentby": children,
@@ -9741,6 +9738,9 @@ mod tests {
             }],
         };
         let txid = node.accept_transaction(transaction).unwrap();
+
+        let entry = dispatch_method(&node, "getmempoolentry", &json!([txid.to_string()])).unwrap();
+        assert_eq!(entry["height"], json!(node.chain.read().height()));
 
         let cluster =
             dispatch_method(&node, "getmempoolcluster", &json!([txid.to_string()])).unwrap();

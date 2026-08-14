@@ -5,7 +5,7 @@
 //! decoding the append-only file on normal restarts; truncated, stale, or
 //! corrupt index files fall back to a complete record scan.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -210,6 +210,94 @@ impl BlockStore {
     pub fn hashes(&self) -> impl Iterator<Item = &BlockHash> {
         self.index.keys()
     }
+
+    /// Rewrite the append-only files, retaining only the supplied records.
+    /// This is used by manual pruning after the chainstate snapshot has made
+    /// the retained active tip restartable without old block bodies.
+    pub fn prune(
+        &mut self,
+        retained_blocks: &HashSet<BlockHash>,
+        retained_undo: &HashSet<BlockHash>,
+    ) -> Result<()> {
+        let block_hashes = self
+            .index
+            .keys()
+            .copied()
+            .filter(|hash| retained_blocks.contains(hash))
+            .collect::<Vec<_>>();
+        let mut block_records = Vec::with_capacity(block_hashes.len());
+        for hash in block_hashes {
+            let block = self
+                .get(&hash)?
+                .with_context(|| format!("block {hash} disappeared during pruning"))?;
+            block_records.push((hash, serialize(&block)));
+        }
+        let (file, index, data_len) = rewrite_record_file(&self.path, &block_records)?;
+        self.file = file;
+        self.index = index;
+        rewrite_index(&mut self.index_file, data_len, &self.index)?;
+
+        let undo_path = self
+            .path
+            .parent()
+            .context("block store has no parent directory")?
+            .join("undo.dat");
+        let undo_hashes = self
+            .undo_index
+            .keys()
+            .copied()
+            .filter(|hash| retained_undo.contains(hash))
+            .collect::<Vec<_>>();
+        let mut undo_records = Vec::with_capacity(undo_hashes.len());
+        for hash in undo_hashes {
+            let undo = self
+                .get_undo(&hash)?
+                .with_context(|| format!("undo for block {hash} disappeared during pruning"))?;
+            undo_records.push((hash, encode_undo_record(hash, &undo)?));
+        }
+        let (undo_file, undo_index, undo_data_len) =
+            rewrite_record_file(&undo_path, &undo_records)?;
+        self.undo_file = undo_file;
+        self.undo_index = undo_index;
+        rewrite_index(&mut self.undo_index_file, undo_data_len, &self.undo_index)?;
+        Ok(())
+    }
+}
+
+fn rewrite_record_file(
+    path: &Path,
+    records: &[(BlockHash, Vec<u8>)],
+) -> Result<(File, HashMap<BlockHash, Record>, u64)> {
+    let temp_path = path.with_file_name(format!(
+        "{}.prune.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let mut temp = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&temp_path)
+        .with_context(|| format!("opening temporary store {}", temp_path.display()))?;
+    let mut index = HashMap::with_capacity(records.len());
+    for (hash, bytes) in records {
+        let offset = temp.seek(SeekFrom::End(0))?;
+        let length = u32::try_from(bytes.len()).context("record length does not fit u32")?;
+        temp.write_all(&length.to_le_bytes())?;
+        temp.write_all(bytes)?;
+        index.insert(*hash, Record { offset, length });
+    }
+    temp.sync_all()?;
+    drop(temp);
+    std::fs::rename(&temp_path, path)
+        .with_context(|| format!("replacing pruned store {}", path.display()))?;
+    let data_len = std::fs::metadata(path)?.len();
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("reopening pruned store {}", path.display()))?;
+    Ok((file, index, data_len))
 }
 
 /// Durable BIP158 filter content and filter-header storage.
@@ -621,6 +709,7 @@ mod tests {
     use super::*;
     use bitcoin::Network;
     use bitcoin::blockdata::constants::genesis_block;
+    use std::collections::HashSet;
 
     #[test]
     fn persists_and_reopens_genesis() {
@@ -672,5 +761,29 @@ mod tests {
         }
         let mut reopened = FilterStore::open(directory.path()).unwrap();
         assert_eq!(reopened.get(&hash).unwrap(), Some((vec![1, 2, 3], header)));
+    }
+
+    #[test]
+    fn pruning_rewrites_block_and_undo_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = genesis_block(Network::Regtest);
+        let mut second = first.clone();
+        second.header.nonce = 1;
+        let first_hash = first.block_hash();
+        let second_hash = second.block_hash();
+        let retained = HashSet::from([second_hash]);
+        let mut store = BlockStore::open(directory.path()).unwrap();
+        store.insert(&first).unwrap();
+        store.insert(&second).unwrap();
+        store.insert_undo(first_hash, &[Vec::new()]).unwrap();
+        store.insert_undo(second_hash, &[Vec::new()]).unwrap();
+        store.prune(&retained, &retained).unwrap();
+        assert!(!store.contains(&first_hash));
+        assert_eq!(store.get(&second_hash).unwrap(), Some(second));
+        assert!(store.get_undo(&first_hash).unwrap().is_none());
+        assert_eq!(
+            store.get_undo(&second_hash).unwrap(),
+            Some(vec![Vec::new()])
+        );
     }
 }

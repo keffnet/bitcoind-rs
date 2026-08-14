@@ -2315,7 +2315,8 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "mediantime": chain.median_time_past_value(),
         "verificationprogress": if header_tip.height == 0 { 1.0 } else { tip.height as f64 / header_tip.height as f64 },
         "initialblockdownload": tip.height < header_tip.height,
-        "pruned": false,
+        "pruned": chain.prune_height().is_some(),
+        "pruneheight": chain.prune_height().unwrap_or_default(),
         "size_on_disk": std::fs::metadata(chain.store.path()).map(|m| m.len()).unwrap_or(0),
         "softforks": softforks_json(&headers, tip.height, chain.network),
         "warnings": [],
@@ -3017,8 +3018,12 @@ fn load_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }))
 }
 
-fn prune_blockchain(_node: &Arc<Node>, _params: &Value) -> Result<Value> {
-    bail!("blockchain pruning is disabled for the append-only block store")
+fn prune_blockchain(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let requested = param::<i64>(params, 0)?;
+    if requested < 0 {
+        bail!("Negative block height.");
+    }
+    Ok(json!(node.chain.write().prune(requested as u64)?))
 }
 
 async fn wait_for_new_block(node: &Arc<Node>, params: &Value) -> Result<Value> {

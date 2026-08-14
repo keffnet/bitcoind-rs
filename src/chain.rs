@@ -22,6 +22,7 @@ const COINBASE_MATURITY: u32 = 100;
 const DIFFICULTY_INTERVAL: u32 = 2016;
 const SNAPSHOT_INTERVAL: u32 = 1_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
+const MIN_BLOCKS_TO_KEEP: u32 = 288;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
@@ -97,6 +98,8 @@ struct ChainMetadata {
     headers: Vec<bitcoin::block::Header>,
     #[serde(default)]
     invalid_blocks: Vec<String>,
+    #[serde(default)]
+    prune_height: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,6 +111,8 @@ struct ChainSnapshot {
     #[serde(default)]
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
+    #[serde(default)]
+    prune_height: Option<u32>,
 }
 
 pub struct ChainState {
@@ -121,6 +126,7 @@ pub struct ChainState {
     block_index: HashMap<BlockHash, BlockNode>,
     orphans: HashMap<BlockHash, Vec<Block>>,
     invalid_blocks: HashSet<BlockHash>,
+    prune_height: Option<u32>,
     utxos: HashMap<OutPoint, UtxoEntry>,
     utxos_by_script: HashMap<String, HashSet<OutPoint>>,
     tx_index: HashMap<Txid, TxLocation>,
@@ -155,31 +161,37 @@ impl ChainState {
         }
 
         let metadata_path = data_dir.join("chainstate.json");
-        let (active_chain, persisted_headers, invalid_blocks) = if metadata_path.exists() {
-            let bytes = fs::read(&metadata_path)
-                .with_context(|| format!("reading {}", metadata_path.display()))?;
-            let metadata: ChainMetadata = serde_json::from_slice(&bytes)
-                .with_context(|| format!("decoding {}", metadata_path.display()))?;
-            let active_chain = metadata
-                .active_chain
-                .into_iter()
-                .map(|hash| {
-                    hash.parse()
-                        .with_context(|| format!("invalid block hash {hash}"))
-                })
-                .collect::<Result<Vec<BlockHash>>>()?;
-            let invalid_blocks = metadata
-                .invalid_blocks
-                .into_iter()
-                .map(|hash| {
-                    hash.parse()
-                        .with_context(|| format!("invalid invalidated block hash {hash}"))
-                })
-                .collect::<Result<HashSet<BlockHash>>>()?;
-            (active_chain, metadata.headers, invalid_blocks)
-        } else {
-            (vec![genesis_hash], Vec::new(), HashSet::new())
-        };
+        let (active_chain, persisted_headers, invalid_blocks, prune_height) =
+            if metadata_path.exists() {
+                let bytes = fs::read(&metadata_path)
+                    .with_context(|| format!("reading {}", metadata_path.display()))?;
+                let metadata: ChainMetadata = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("decoding {}", metadata_path.display()))?;
+                let active_chain = metadata
+                    .active_chain
+                    .into_iter()
+                    .map(|hash| {
+                        hash.parse()
+                            .with_context(|| format!("invalid block hash {hash}"))
+                    })
+                    .collect::<Result<Vec<BlockHash>>>()?;
+                let invalid_blocks = metadata
+                    .invalid_blocks
+                    .into_iter()
+                    .map(|hash| {
+                        hash.parse()
+                            .with_context(|| format!("invalid invalidated block hash {hash}"))
+                    })
+                    .collect::<Result<HashSet<BlockHash>>>()?;
+                (
+                    active_chain,
+                    metadata.headers,
+                    invalid_blocks,
+                    metadata.prune_height,
+                )
+            } else {
+                (vec![genesis_hash], Vec::new(), HashSet::new(), None)
+            };
         if active_chain.first().copied() != Some(genesis_hash) {
             bail!("chainstate does not start at the configured network genesis block");
         }
@@ -199,6 +211,7 @@ impl ChainState {
             block_index: HashMap::new(),
             orphans: HashMap::new(),
             invalid_blocks,
+            prune_height,
             utxos: HashMap::new(),
             utxos_by_script: HashMap::new(),
             tx_index: HashMap::new(),
@@ -223,6 +236,7 @@ impl ChainState {
                 snapshot.tx_index_all
             };
             state.history = snapshot.history;
+            state.prune_height = snapshot.prune_height.or(state.prune_height);
             let headers = state.headers.clone();
             state.index_active_headers(&headers)?;
             state.rebuild_spent_index()?;
@@ -271,6 +285,59 @@ impl ChainState {
 
     pub fn height(&self) -> u32 {
         self.active_chain.len().saturating_sub(1) as u32
+    }
+
+    pub fn prune_height(&self) -> Option<u32> {
+        self.prune_height
+    }
+
+    /// Permanently remove old block and undo records while retaining enough
+    /// recent history for normal reorg handling. The active chainstate is
+    /// snapshotted before returning so a pruned node can restart without the
+    /// removed block bodies.
+    pub fn prune(&mut self, requested: u64) -> Result<u32> {
+        let tip_height = self.height();
+        if tip_height < MIN_BLOCKS_TO_KEEP {
+            bail!("Blockchain is too short for pruning.");
+        }
+        let requested_height = if requested > 1_000_000_000 {
+            let target_time = requested.saturating_sub(2 * 60 * 60);
+            let target_time = u32::try_from(target_time).unwrap_or(u32::MAX);
+            self.headers
+                .iter()
+                .position(|header| header.time >= target_time)
+                .map(|height| height as u32)
+                .context("Could not find block with at least the specified timestamp.")?
+        } else {
+            u32::try_from(requested).context("block height is too large")?
+        };
+        if requested_height > tip_height {
+            bail!("Blockchain is shorter than the attempted prune height.");
+        }
+        let target_height = requested_height.min(tip_height - MIN_BLOCKS_TO_KEEP);
+        if let Some(previous) = self.prune_height
+            && target_height <= previous
+        {
+            return Ok(previous);
+        }
+        if target_height == 0 {
+            return Ok(self.prune_height.unwrap_or_default());
+        }
+
+        let stored_hashes = self.store.hashes().copied().collect::<HashSet<_>>();
+        let retained_blocks = self
+            .block_index
+            .iter()
+            .filter_map(|(hash, node)| {
+                (stored_hashes.contains(hash) && (node.height == 0 || node.height >= target_height))
+                    .then_some(*hash)
+            })
+            .collect::<HashSet<_>>();
+        self.store.prune(&retained_blocks, &retained_blocks)?;
+        self.prune_height = Some(target_height);
+        self.persist_metadata()?;
+        self.persist_snapshot()?;
+        Ok(target_height)
     }
 
     pub fn best_hash(&self) -> BlockHash {
@@ -1940,14 +2007,20 @@ impl ChainState {
         self.spent_by.clear();
         let active_chain = self.active_chain.clone();
         for hash in active_chain {
-            let Some(block) = self.store.get(&hash)? else {
-                bail!("active block {hash} is missing from block store")
-            };
             let height = self
                 .block_index
                 .get(&hash)
                 .map(|node| node.height)
                 .with_context(|| format!("active block {hash} is not indexed"))?;
+            let Some(block) = self.store.get(&hash)? else {
+                if self
+                    .prune_height
+                    .is_some_and(|prune_height| height < prune_height)
+                {
+                    continue;
+                }
+                bail!("active block {hash} is missing from block store")
+            };
             self.index_block_spends(&block, height);
         }
         Ok(())
@@ -2129,6 +2202,7 @@ impl ChainState {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
+            prune_height: self.prune_height,
         };
         let bytes = serde_json::to_vec_pretty(&metadata)?;
         let path = self.data_dir.join("chainstate.json");
@@ -2181,6 +2255,7 @@ impl ChainState {
             tx_index: self.tx_index.clone(),
             tx_index_all: self.tx_index_all.clone(),
             history: self.history.clone(),
+            prune_height: self.prune_height,
         }
     }
 
@@ -2403,6 +2478,33 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn pruned_chain_restarts_from_its_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut old_block_hash = None;
+        for height in 1..=300 {
+            let block = mine_block(&state, height);
+            if height == 5 {
+                old_block_hash = Some(block.block_hash());
+            }
+            state.connect_block(block).unwrap();
+        }
+        let tip_hash = state.best_hash();
+        let old_block_hash = old_block_hash.expect("prune test block");
+        assert!(state.store.contains(&old_block_hash));
+        assert_eq!(state.prune(50).unwrap(), 12);
+        assert!(!state.store.contains(&old_block_hash));
+        assert_eq!(state.prune_height(), Some(12));
+        let path = directory.path().to_owned();
+        drop(state);
+        let reopened = ChainState::open(Network::Regtest, &path).unwrap();
+        assert_eq!(reopened.best_hash(), tip_hash);
+        assert_eq!(reopened.height(), 300);
+        assert_eq!(reopened.prune_height(), Some(12));
+        assert!(!reopened.store.contains(&old_block_hash));
     }
 
     #[test]
@@ -2722,7 +2824,11 @@ mod tests {
     }
 
     fn mine_block_from_header(previous: &Header, height: u32, tag: u8) -> Block {
-        let transaction = coinbase_transaction(height, 5_000_000_000, tag);
+        let transaction = coinbase_transaction(
+            height,
+            validation::block_subsidy_for_network(Network::Regtest, height),
+            tag,
+        );
         let mut block = Block {
             header: Header {
                 version: BlockVersion::TWO,

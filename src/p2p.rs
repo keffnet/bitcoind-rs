@@ -51,16 +51,74 @@ const SENDHEADERS_VERSION: i32 = 70_012;
 const FEEFILTER_VERSION: i32 = 70_013;
 const SHORT_IDS_BLOCKS_VERSION: i32 = 70_014;
 const WTXID_RELAY_VERSION: i32 = 70_016;
+const KNOWN_TX_FILTER_BITS: usize = 1 << 20;
+const KNOWN_TX_FILTER_HASHES: u32 = 4;
+const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 
 struct PeerState {
     writer: PeerWriter,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
+    known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
     fee_filter: parking_lot::Mutex<i64>,
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
     compact_block_version: parking_lot::Mutex<Option<u64>>,
     compact_block_announce: parking_lot::Mutex<bool>,
+}
+
+/// A bounded rolling filter of transaction inventory already known by a peer.
+/// Core uses the same two-generation shape to avoid repeatedly announcing the
+/// same transaction while keeping per-peer memory bounded.
+struct KnownTxInventory {
+    generations: [Vec<u8>; 2],
+    active_generation: usize,
+    inserted_in_generation: usize,
+}
+
+impl KnownTxInventory {
+    fn new() -> Self {
+        let bytes = KNOWN_TX_FILTER_BITS / 8;
+        Self {
+            generations: [vec![0; bytes], vec![0; bytes]],
+            active_generation: 0,
+            inserted_in_generation: 0,
+        }
+    }
+
+    fn contains(&self, hash: &BlockHash) -> bool {
+        self.generations
+            .iter()
+            .any(|generation| self.generation_contains(generation, hash))
+    }
+
+    fn insert(&mut self, hash: &BlockHash) {
+        if self.contains(hash) {
+            return;
+        }
+        if self.inserted_in_generation >= KNOWN_TX_FILTER_GENERATION {
+            self.active_generation ^= 1;
+            self.generations[self.active_generation].fill(0);
+            self.inserted_in_generation = 0;
+        }
+        let generation = &mut self.generations[self.active_generation];
+        let bytes = hash.to_byte_array();
+        for index in 0..KNOWN_TX_FILTER_HASHES {
+            let bit = (murmur_hash3(index.wrapping_mul(0xfba4_c795), &bytes) as usize)
+                & (KNOWN_TX_FILTER_BITS - 1);
+            generation[bit / 8] |= 1 << (bit % 8);
+        }
+        self.inserted_in_generation += 1;
+    }
+
+    fn generation_contains(&self, generation: &[u8], hash: &BlockHash) -> bool {
+        let bytes = hash.to_byte_array();
+        (0..KNOWN_TX_FILTER_HASHES).all(|index| {
+            let bit = (murmur_hash3(index.wrapping_mul(0xfba4_c795), &bytes) as usize)
+                & (KNOWN_TX_FILTER_BITS - 1);
+            generation[bit / 8] & (1 << (bit % 8)) != 0
+        })
+    }
 }
 
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, Arc<PeerState>>>>;
@@ -720,6 +778,7 @@ async fn serve_peer(
     let peer_state = Arc::new(PeerState {
         writer: Arc::new(Mutex::new(writer_half)),
         bloom_filter: parking_lot::Mutex::new(None),
+        known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
         fee_filter: parking_lot::Mutex::new(0),
         relay_transactions: parking_lot::Mutex::new(true),
         wtxid_relay: parking_lot::Mutex::new(false),
@@ -1005,6 +1064,17 @@ async fn serve_peer_loop(
             }
             Message::Inv(items) => {
                 let wtxid_relay = *peer_state.wtxid_relay.lock();
+                {
+                    let mut known = peer_state.known_tx_inventory.lock();
+                    for item in &items {
+                        let matching_kind = (wtxid_relay
+                            && item.kind == InventoryType::WitnessTransaction)
+                            || (!wtxid_relay && item.kind == InventoryType::Transaction);
+                        if matching_kind {
+                            known.insert(&item.hash);
+                        }
+                    }
+                }
                 let requests = {
                     let chain = node.chain.read();
                     let mempool = node.mempool.read();
@@ -1417,6 +1487,12 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::Transaction(transaction) => {
+                let known_hash = if *peer_state.wtxid_relay.lock() {
+                    BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash())
+                } else {
+                    BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash())
+                };
+                peer_state.known_tx_inventory.lock().insert(&known_hash);
                 let txid = transaction.compute_txid();
                 let accepted = node
                     .accept_peer_transaction_from(peer_id, transaction)
@@ -1560,6 +1636,7 @@ async fn serve_peer_loop(
                 let inventory = {
                     let mut filter = bloom_filter.lock();
                     let wtxid_relay = *peer_state.wtxid_relay.lock();
+                    let mut known = peer_state.known_tx_inventory.lock();
                     transactions
                         .into_iter()
                         .filter_map(|transaction| {
@@ -1568,7 +1645,12 @@ async fn serve_peer_loop(
                             {
                                 return None;
                             }
-                            Some(transaction_inventory(&transaction, wtxid_relay))
+                            let item = transaction_inventory(&transaction, wtxid_relay);
+                            if known.contains(&item.hash) {
+                                return None;
+                            }
+                            known.insert(&item.hash);
+                            Some(item)
                         })
                         .collect::<Vec<_>>()
                 };
@@ -2022,13 +2104,38 @@ async fn broadcast_inventory_excluding(
                 continue;
             }
         }
-        if let Some(transaction) = transaction_for_inventory(node, &item) {
+        let current_transaction = if matches!(
+            item.kind,
+            InventoryType::Transaction | InventoryType::WitnessTransaction
+        ) {
+            transaction_for_inventory(node, &item)
+        } else {
+            None
+        };
+        if matches!(
+            item.kind,
+            InventoryType::Transaction | InventoryType::WitnessTransaction
+        ) && current_transaction.is_none()
+        {
+            continue;
+        }
+        if let Some(transaction) = current_transaction {
             let mut filter = state.bloom_filter.lock();
             if let Some(filter) = filter.as_mut()
                 && !filter.is_relevant_and_update(&transaction)
             {
                 continue;
             }
+        }
+        if matches!(
+            item.kind,
+            InventoryType::Transaction | InventoryType::WitnessTransaction
+        ) {
+            let mut known = state.known_tx_inventory.lock();
+            if known.contains(&item.hash) {
+                continue;
+            }
+            known.insert(&item.hash);
         }
         let message = Message::Inv(vec![item.clone()]);
         let _ = send_message(node, peer_id, &state.writer, network, &message).await;
@@ -2156,6 +2263,27 @@ mod tests {
         assert_eq!(filter.data, hex::decode("614e9b").unwrap());
         assert!(
             !filter.contains(&hex::decode("19108ad8ed9bb6274d3980bab5a85c048f0950c8").unwrap())
+        );
+    }
+
+    #[test]
+    fn known_transaction_inventory_is_bounded_and_deduplicated() {
+        let first = BlockHash::from_byte_array([1; 32]);
+        let second = BlockHash::from_byte_array([2; 32]);
+        let mut known = KnownTxInventory::new();
+        assert!(!known.contains(&first));
+        known.insert(&first);
+        assert!(known.contains(&first));
+        assert_eq!(known.inserted_in_generation, 1);
+        known.insert(&first);
+        assert_eq!(known.inserted_in_generation, 1);
+        known.insert(&second);
+        assert!(known.contains(&second));
+        assert!(
+            known
+                .generations
+                .iter()
+                .all(|generation| { generation.len() == KNOWN_TX_FILTER_BITS / 8 })
         );
     }
 

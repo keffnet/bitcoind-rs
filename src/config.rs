@@ -7,6 +7,7 @@ use clap::{Parser, ValueEnum};
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
+pub const DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB: u64 = 5;
 pub const DEFAULT_MEMPOOL_EXPIRY_HOURS: u64 = 336;
 pub const DEFAULT_PEER_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_BLOCK_MAX_WEIGHT: u64 = 4_000_000;
@@ -643,8 +644,8 @@ pub struct Args {
     )]
     pub peerblockfilters: bool,
 
-    #[arg(long = "maxmempool", default_value_t = DEFAULT_MAX_MEMPOOL_MB)]
-    pub max_mempool: u64,
+    #[arg(long = "maxmempool")]
+    pub max_mempool: Option<u64>,
 
     #[arg(long, default_value_t = DEFAULT_MEMPOOL_EXPIRY_HOURS)]
     pub mempoolexpiry: u64,
@@ -817,7 +818,12 @@ impl Config {
         if (args.txindex || args.txospenderindex) && args.prune != 0 {
             bail!("Prune mode is incompatible with transaction indexes.");
         }
-        if args.max_mempool == 0 {
+        let max_mempool = args.max_mempool.unwrap_or(if args.blocksonly {
+            DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB
+        } else {
+            DEFAULT_MAX_MEMPOOL_MB
+        });
+        if max_mempool == 0 {
             bail!("--maxmempool must be greater than zero");
         }
         if args.mempoolexpiry == 0 {
@@ -894,7 +900,7 @@ impl Config {
             coinstatsindex: args.coinstatsindex,
             blockfilterindex,
             peer_block_filters: args.peerblockfilters,
-            max_mempool_mb: args.max_mempool,
+            max_mempool_mb: max_mempool,
             mempool_expiry_hours: args.mempoolexpiry,
             persist_mempool: args.persistmempool,
             zmq: ZmqConfig {
@@ -957,6 +963,7 @@ mod tests {
         assert!(!config.listen);
         assert!(!config.dnsseed);
         assert!(config.blocksonly);
+        assert_eq!(config.max_mempool_mb, DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB);
         assert_eq!(config.onlynet, vec![OnlyNet::Ipv4]);
         assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
         assert!(config.allows_address("192.0.2.1:8333".parse().unwrap()));
@@ -1219,6 +1226,16 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--maxmempool",
             "12",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().max_mempool_mb, 12);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--blocksonly",
+            "--maxmempool=12",
         ])
         .unwrap();
         assert_eq!(Config::from_args(args).unwrap().max_mempool_mb, 12);

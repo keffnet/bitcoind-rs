@@ -1861,14 +1861,14 @@ impl Node {
         } else {
             let mut known = self.network_addresses.write();
             if self.reserve_network_address(&mut known, &endpoint) {
-                known.insert(
-                    endpoint.clone(),
-                    KnownNetworkAddress {
+                let entry = known
+                    .entry(endpoint.clone())
+                    .or_insert_with(|| KnownNetworkAddress {
                         endpoint: endpoint.clone(),
-                        services: peer.services,
+                        services: 0,
                         time: connected_at,
-                    },
-                );
+                    });
+                entry.time = entry.time.max(connected_at);
                 self.network_tried_addresses.write().insert(endpoint);
             }
         }

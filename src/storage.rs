@@ -708,7 +708,6 @@ fn load_filter_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<Bl
     }
     let count = (index_len - INDEX_HEADER_SIZE) / INDEX_RECORD_SIZE;
     let mut index = HashMap::with_capacity(count as usize);
-    let mut max_end = 0u64;
     for _ in 0..count {
         let mut hash_bytes = [0u8; 32];
         file.read_exact(&mut hash_bytes)?;
@@ -734,9 +733,8 @@ fn load_filter_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<Bl
         if index.insert(hash, record).is_some() {
             return Ok(None);
         }
-        max_end = max_end.max(record.offset + 4 + record.length as u64);
     }
-    if max_end != data_len && data_len != 0 {
+    if !index_layout_is_contiguous(&index, data_len) {
         return Ok(None);
     }
     Ok(Some(index))
@@ -800,7 +798,6 @@ fn load_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<BlockHash
     }
     let count = (index_len - INDEX_HEADER_SIZE) / INDEX_RECORD_SIZE;
     let mut index = HashMap::with_capacity(count as usize);
-    let mut max_end = 0u64;
     for _ in 0..count {
         let mut hash_bytes = [0u8; 32];
         file.read_exact(&mut hash_bytes)?;
@@ -826,9 +823,8 @@ fn load_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<BlockHash
         if index.insert(hash, record).is_some() {
             return Ok(None);
         }
-        max_end = max_end.max(record.offset + 4 + record.length as u64);
     }
-    if max_end != data_len && data_len != 0 {
+    if !index_layout_is_contiguous(&index, data_len) {
         return Ok(None);
     }
     Ok(Some(index))
@@ -863,6 +859,26 @@ fn persist_index_entry(
     file.write_all(&record.length.to_le_bytes())?;
     file.sync_data()?;
     Ok(())
+}
+
+fn index_layout_is_contiguous(index: &HashMap<BlockHash, Record>, data_len: u64) -> bool {
+    let mut records = index.values().copied().collect::<Vec<_>>();
+    records.sort_unstable_by_key(|record| record.offset);
+    let mut expected_offset = 0u64;
+    for record in records {
+        if record.offset != expected_offset {
+            return false;
+        }
+        let Some(end) = record
+            .offset
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(u64::from(record.length)))
+        else {
+            return false;
+        };
+        expected_offset = end;
+    }
+    expected_offset == data_len
 }
 
 fn scan_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
@@ -1021,6 +1037,30 @@ mod tests {
         let mut reopened = BlockStore::open(directory.path()).unwrap();
         assert!(reopened.contains(&hash));
         assert_eq!(reopened.get(&hash).unwrap().unwrap(), block);
+    }
+
+    #[test]
+    fn recovers_from_an_overlapping_block_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = genesis_block(Network::Regtest);
+        let mut second = first.clone();
+        second.header.nonce = 1;
+        let first_hash = first.block_hash();
+        let second_hash = second.block_hash();
+        {
+            let mut store = BlockStore::open(directory.path()).unwrap();
+            store.insert(&first).unwrap();
+            store.insert(&second).unwrap();
+        }
+        let index_path = directory.path().join("blocks.index");
+        let mut index = std::fs::read(&index_path).unwrap();
+        let second_offset = (INDEX_HEADER_SIZE + INDEX_RECORD_SIZE + 32) as usize;
+        index[second_offset..second_offset + 8].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(index_path, index).unwrap();
+
+        let mut reopened = BlockStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&first_hash).unwrap(), Some(first));
+        assert_eq!(reopened.get(&second_hash).unwrap(), Some(second));
     }
 
     #[test]

@@ -3489,21 +3489,12 @@ fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
 
 fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
-    let verbosity = match params.get(1).filter(|value| !value.is_null()) {
-        None => 1,
-        Some(Value::Bool(verbose)) => u64::from(*verbose),
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| anyhow!("verbosity must be an integer or boolean"))?,
-    };
-    if verbosity > 3 {
-        bail!("verbosity must be between 0 and 3")
-    }
+    let verbosity = parse_verbosity(params.get(1), 1)?;
     let mut chain = node.chain.write();
     let block = chain
         .block(&hash)?
         .ok_or_else(|| anyhow!("Block not found"))?;
-    if verbosity == 0 {
+    if verbosity <= 0 {
         return Ok(json!(hex::encode(serialize(&block))));
     }
     let height = chain.block_height_by_hash(&hash).unwrap_or(0);
@@ -3512,7 +3503,7 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     } else {
         -1
     };
-    let undo = if verbosity >= 3 {
+    let undo = if verbosity >= 2 {
         chain.spent_outputs_by_transaction(&hash)?
     } else {
         None
@@ -3529,13 +3520,17 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     let spent_outputs = undo.get(transaction_index).ok_or_else(|| {
                         anyhow!("Block undo is missing transaction {transaction_index}")
                     })?;
-                    add_prevout_details(
-                        &mut transaction_json,
-                        tx,
-                        spent_outputs,
-                        &mut chain,
-                        node.config.network,
-                    )?;
+                    if verbosity >= 3 {
+                        add_prevout_details(
+                            &mut transaction_json,
+                            tx,
+                            spent_outputs,
+                            &mut chain,
+                            node.config.network,
+                        )?;
+                    } else {
+                        add_transaction_fee(&mut transaction_json, tx, spent_outputs)?;
+                    }
                 }
                 Ok(transaction_json)
             })
@@ -4480,7 +4475,7 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     } else {
         bail!("No such mempool or blockchain transaction");
     };
-    if verbosity == 0 {
+    if verbosity <= 0 {
         return Ok(json!(chain::transaction_hex(&transaction)));
     }
     let blockhash =
@@ -4547,22 +4542,19 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(result)
 }
 
-fn parse_transaction_verbosity(value: Option<&Value>) -> Result<u8> {
+fn parse_verbosity(value: Option<&Value>, default: i64) -> Result<i64> {
     match value {
-        None | Some(Value::Null) => Ok(0),
-        Some(Value::Bool(verbose)) => Ok(u8::from(*verbose)),
-        Some(Value::Number(number)) => {
-            let verbosity = number
-                .as_u64()
-                .ok_or_else(|| anyhow!("verbosity must be a non-negative integer"))?;
-            let verbosity = u8::try_from(verbosity).map_err(|_| anyhow!("invalid verbosity"))?;
-            if verbosity > 2 {
-                bail!("invalid verbosity {verbosity}")
-            }
-            Ok(verbosity)
-        }
-        Some(_) => bail!("verbosity must be a number or boolean"),
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(verbose)) => Ok(i64::from(*verbose)),
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .ok_or_else(|| anyhow!("verbosity must be an integer")),
+        Some(_) => bail!("verbosity must be an integer or boolean"),
     }
+}
+
+fn parse_transaction_verbosity(value: Option<&Value>) -> Result<i64> {
+    parse_verbosity(value, 0)
 }
 
 fn decoded_transaction_json(transaction: &Transaction, network: Network) -> Value {
@@ -10343,6 +10335,14 @@ fn add_prevout_details(
             .ok_or_else(|| anyhow!("transaction JSON input index is inconsistent"))?;
         input_json["prevout"] = prevout;
     }
+    add_transaction_fee(transaction_json, transaction, spent_outputs)
+}
+
+fn add_transaction_fee(
+    transaction_json: &mut Value,
+    transaction: &Transaction,
+    spent_outputs: &[bitcoin::TxOut],
+) -> Result<()> {
     let input_total = spent_outputs
         .iter()
         .map(|output| output.value.to_sat())
@@ -12484,6 +12484,47 @@ mod tests {
             transaction["vin"][0]["prevout"]["scriptPubKey"]["hex"],
             "51"
         );
+        let details = get_block(&node, &json!([block_hash.to_string(), 2])).unwrap();
+        let details_transaction = details["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|transaction| transaction["txid"] == spend_txid.to_string())
+            .expect("mined transaction is present");
+        assert_eq!(details_transaction["fee"], 0.00001);
+        assert!(details_transaction["vin"][0].get("prevout").is_none());
+        let high_verbosity = get_block(&node, &json!([block_hash.to_string(), 4])).unwrap();
+        assert_eq!(
+            high_verbosity["tx"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|transaction| transaction["txid"] == spend_txid.to_string())
+                .unwrap()["fee"],
+            0.00001
+        );
+        assert!(
+            get_block(&node, &json!([block_hash.to_string(), -1]))
+                .unwrap()
+                .as_str()
+                .is_some()
+        );
+        let raw_high = get_raw_transaction(
+            &node,
+            &json!([spend_txid.to_string(), 4, block_hash.to_string()]),
+        )
+        .unwrap();
+        assert_eq!(raw_high["fee"], 0.00001);
+        assert!(raw_high["vin"][0].get("prevout").is_some());
+        assert!(
+            get_raw_transaction(
+                &node,
+                &json!([spend_txid.to_string(), -1, block_hash.to_string()]),
+            )
+            .unwrap()
+            .as_str()
+            .is_some()
+        );
         let raw = get_block(&node, &json!([block_hash.to_string(), false])).unwrap();
         assert!(raw.as_str().is_some_and(|raw| !raw.is_empty()));
         assert_eq!(
@@ -13915,7 +13956,8 @@ mod tests {
         );
         assert_eq!(parse_transaction_verbosity(Some(&json!(1))).unwrap(), 1);
         assert_eq!(parse_transaction_verbosity(Some(&json!(true))).unwrap(), 1);
-        assert!(parse_transaction_verbosity(Some(&json!(3))).is_err());
+        assert_eq!(parse_transaction_verbosity(Some(&json!(3))).unwrap(), 3);
+        assert_eq!(parse_transaction_verbosity(Some(&json!(-1))).unwrap(), -1);
     }
 
     #[test]

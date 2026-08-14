@@ -17,6 +17,50 @@ use crate::Node;
 use crate::chain;
 
 const MAX_LINE_SIZE: usize = 1024 * 1024;
+const SERVER_NAME: &str = "bitcoind-rs 0.1.0";
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProtocolVersion {
+    major: u8,
+    minor: u8,
+    patch: u8,
+}
+
+const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 4,
+    patch: 0,
+};
+const MAX_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 7,
+    patch: 0,
+};
+const PROTOCOL_1_6: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 6,
+    patch: 0,
+};
+const PROTOCOL_1_7: ProtocolVersion = ProtocolVersion {
+    major: 1,
+    minor: 7,
+    patch: 0,
+};
+
+#[derive(Clone, Copy, Debug)]
+struct ElectrumSession {
+    protocol_version: ProtocolVersion,
+    version_negotiated: bool,
+}
+
+impl Default for ElectrumSession {
+    fn default() -> Self {
+        Self {
+            protocol_version: MIN_PROTOCOL_VERSION,
+            version_negotiated: false,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 enum Subscription {
@@ -60,6 +104,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     let mut mempool_events = node.subscribe_mempool();
     let mut line = Vec::new();
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
+    let mut session = ElectrumSession::default();
     let mut headers_subscribed = false;
     loop {
         line.clear();
@@ -104,9 +149,19 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                 let id = request.get("id").cloned().unwrap_or(Value::Null);
                 let method = request.get("method").and_then(Value::as_str).unwrap_or("");
                 let params = request.get("params").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
-                let result = dispatch(&node, method, &params, &mut subscriptions);
+                let is_notification = request.get("id").is_none();
+                let result = dispatch_with_session(
+                    &node,
+                    method,
+                    &params,
+                    &mut subscriptions,
+                    &mut session,
+                );
                 if method == "blockchain.headers.subscribe" && result.is_ok() {
                     headers_subscribed = true;
+                }
+                if is_notification {
+                    continue;
                 }
                 let response = match result {
                     Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
@@ -120,17 +175,29 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn dispatch(
     node: &Arc<Node>,
     method: &str,
     params: &Value,
     subscriptions: &mut HashMap<String, Subscription>,
 ) -> Result<Value> {
+    let mut session = ElectrumSession::default();
+    dispatch_with_session(node, method, params, subscriptions, &mut session)
+}
+
+fn dispatch_with_session(
+    node: &Arc<Node>,
+    method: &str,
+    params: &Value,
+    subscriptions: &mut HashMap<String, Subscription>,
+    session: &mut ElectrumSession,
+) -> Result<Value> {
     match method {
-        "server.version" => Ok(json!(["bitcoind-rs 0.1.0", "1.4"])),
-        "server.ping" => Ok(Value::Null),
+        "server.version" => negotiate_version(params, session),
+        "server.ping" => server_ping(params, session.protocol_version),
         "server.banner" => Ok(json!("bitcoind-rs wallet-free Bitcoin node")),
-        "server.features" => Ok(server_features(node)),
+        "server.features" => Ok(server_features_for_protocol(node, session.protocol_version)),
         "blockchain.headers.subscribe" => {
             let chain = node.chain.read();
             let height = chain.height();
@@ -138,7 +205,9 @@ fn dispatch(
             Ok(json!({"height": height, "hex": hex::encode(serialize(header))}))
         }
         "blockchain.block.header" | "blockchain.block.get_header" => block_header(node, params),
-        "blockchain.block.headers" => block_headers(node, params),
+        "blockchain.block.headers" => {
+            block_headers_for_protocol(node, params, session.protocol_version)
+        }
         "blockchain.block.get_chunk" => block_chunk(node, params),
         "blockchain.scripthash.get_history" => {
             let script_hash = script_hash_param(params, 0)?;
@@ -244,12 +313,19 @@ fn dispatch(
             let mempool = node.mempool.read();
             Ok(fee_histogram(&mempool))
         }
-        "server.peers.subscribe" => Ok(server_peers(node)),
+        "mempool.get_info" => Ok(mempool_info(node)),
+        "mempool.recent" => Ok(mempool_recent(node)),
+        "server.peers.subscribe" => Ok(server_peers_for_protocol(node, session.protocol_version)),
         _ => bail!("unsupported Electrum method {method}"),
     }
 }
 
+#[cfg(test)]
 fn server_features(node: &Arc<Node>) -> Value {
+    server_features_for_protocol(node, MIN_PROTOCOL_VERSION)
+}
+
+fn server_features_for_protocol(node: &Arc<Node>, protocol_version: ProtocolVersion) -> Value {
     let mut hosts = serde_json::Map::new();
     if let Some(address) = node.config.electrum_bind {
         let host = if address.ip().is_unspecified() {
@@ -260,20 +336,28 @@ fn server_features(node: &Arc<Node>) -> Value {
         hosts.insert(host, json!({"tcp_port": address.port(), "ssl_port": null}));
     }
     let chain = node.chain.read();
-    json!({
+    let mut features = json!({
         "hosts": Value::Object(hosts),
-        "server_version": "bitcoind-rs 0.1.0",
+        "server_version": SERVER_NAME,
         "protocol_min": "1.4",
-        "protocol_max": "1.4",
+        "protocol_max": "1.7",
         "genesis_hash": chain.block_hash(0).expect("genesis exists").to_string(),
-        "hash_function": "sha256",
         "pruning": null,
-    })
+    });
+    if protocol_version < PROTOCOL_1_7 {
+        features["hash_function"] = json!("sha256");
+    }
+    features
 }
 
-fn server_peers(node: &Arc<Node>) -> Value {
+fn server_peers_for_protocol(node: &Arc<Node>, protocol_version: ProtocolVersion) -> Value {
     let mut peers = node.known_addresses();
     peers.sort_by_key(|peer| peer.address);
+    let advertised_version = if protocol_version >= MAX_PROTOCOL_VERSION {
+        "v1.7"
+    } else {
+        "v1.4"
+    };
     json!(
         peers
             .into_iter()
@@ -282,11 +366,111 @@ fn server_peers(node: &Arc<Node>) -> Value {
                 json!([
                     ip,
                     peer.address.ip().to_string(),
-                    ["v1.4", format!("t{}", peer.address.port())]
+                    [advertised_version, format!("t{}", peer.address.port())]
                 ])
             })
             .collect::<Vec<_>>()
     )
+}
+
+fn parse_protocol_version(value: &str) -> Result<ProtocolVersion> {
+    let mut components = value.split('.');
+    let major = components
+        .next()
+        .ok_or_else(|| anyhow!("invalid protocol version"))?
+        .parse::<u8>()?;
+    let minor = components
+        .next()
+        .ok_or_else(|| anyhow!("invalid protocol version"))?
+        .parse::<u8>()?;
+    let patch = components.next().unwrap_or("0").parse::<u8>()?;
+    if components.next().is_some() {
+        bail!("invalid protocol version {value}")
+    }
+    Ok(ProtocolVersion {
+        major,
+        minor,
+        patch,
+    })
+}
+
+fn protocol_version_string(version: ProtocolVersion) -> String {
+    if version.patch == 0 {
+        format!("{}.{}", version.major, version.minor)
+    } else {
+        format!("{}.{}.{}", version.major, version.minor, version.patch)
+    }
+}
+
+fn client_protocol_range(params: &Value) -> Result<(ProtocolVersion, ProtocolVersion)> {
+    let default_version = Value::String("1.4".to_owned());
+    let requested = params.get(1).unwrap_or(&default_version);
+    match requested {
+        Value::String(version) => {
+            let version = parse_protocol_version(version)?;
+            Ok((version, version))
+        }
+        Value::Array(versions) if versions.len() >= 2 => Ok((
+            parse_protocol_version(
+                versions[0]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("protocol minimum must be a string"))?,
+            )?,
+            parse_protocol_version(
+                versions[1]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("protocol maximum must be a string"))?,
+            )?,
+        )),
+        Value::Array(versions) if versions.len() == 1 => {
+            let version = parse_protocol_version(
+                versions[0]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("protocol version must be a string"))?,
+            )?;
+            Ok((version, version))
+        }
+        _ => bail!("protocol version must be a string or a two-element array"),
+    }
+}
+
+fn negotiate_version(params: &Value, session: &mut ElectrumSession) -> Result<Value> {
+    if session.version_negotiated {
+        bail!("server.version may only be called once")
+    }
+    let (client_min, client_max) = client_protocol_range(params)?;
+    if client_min > client_max {
+        bail!("client protocol minimum exceeds maximum")
+    }
+    let lower = MIN_PROTOCOL_VERSION.max(client_min);
+    let selected = MAX_PROTOCOL_VERSION.min(client_max);
+    if selected < lower {
+        bail!("no mutually supported protocol version")
+    }
+    session.protocol_version = selected;
+    session.version_negotiated = true;
+    Ok(json!([SERVER_NAME, protocol_version_string(selected)]))
+}
+
+fn server_ping(params: &Value, protocol_version: ProtocolVersion) -> Result<Value> {
+    if protocol_version < PROTOCOL_1_7 {
+        return Ok(Value::Null);
+    }
+    let Some(value) = params.get(0) else {
+        return Ok(json!({"data": ""}));
+    };
+    let length = match value {
+        Value::Number(number) => number
+            .as_u64()
+            .ok_or_else(|| anyhow!("pong_len must be a non-negative integer"))?,
+        Value::String(_) => 0,
+        _ => bail!("pong_len must be a non-negative integer"),
+    };
+    let length = usize::try_from(length).map_err(|_| anyhow!("pong_len is too large"))?;
+    if length > MAX_LINE_SIZE {
+        bail!("pong_len exceeds the server limit")
+    }
+    Ok(json!({"data": "0".repeat(length)}))
 }
 
 fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
@@ -423,7 +607,11 @@ fn block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }))
 }
 
-fn block_headers(node: &Arc<Node>, params: &Value) -> Result<Value> {
+fn block_headers_for_protocol(
+    node: &Arc<Node>,
+    params: &Value,
+    protocol_version: ProtocolVersion,
+) -> Result<Value> {
     let start = param::<u32>(params, 0)?;
     let count = param::<u32>(params, 1)?.min(2_000);
     let checkpoint = params.get(2).and_then(Value::as_u64).unwrap_or(0);
@@ -433,15 +621,22 @@ fn block_headers(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     let chain = node.chain.read();
     let mut bytes = Vec::with_capacity(count as usize * 80);
+    let mut headers = Vec::with_capacity(count as usize);
     let mut actual = 0u32;
     for height in start..start.saturating_add(count) {
         let Some(header) = chain.header(height) else {
             break;
         };
-        bytes.extend_from_slice(&serialize(header));
+        let encoded = serialize(header);
+        bytes.extend_from_slice(&encoded);
+        headers.push(hex::encode(encoded));
         actual += 1;
     }
-    let mut result = json!({"count": actual, "hex": hex::encode(bytes), "max": 2_000});
+    let mut result = if protocol_version >= PROTOCOL_1_6 {
+        json!({"count": actual, "headers": headers, "max": 2_000})
+    } else {
+        json!({"count": actual, "hex": hex::encode(bytes), "max": 2_000})
+    };
     if checkpoint != 0 && actual != 0 {
         let last_height = start + actual - 1;
         let (branch, root) = header_merkle_proof(&chain, last_height, checkpoint)?;
@@ -449,6 +644,40 @@ fn block_headers(node: &Arc<Node>, params: &Value) -> Result<Value> {
         result["root"] = json!(root.to_string());
     }
     Ok(result)
+}
+
+fn mempool_info(_node: &Arc<Node>) -> Value {
+    json!({
+        "mempoolminfee": 0.00001000,
+        "minrelaytxfee": 0.00001000,
+        "incrementalrelayfee": 0.00001000,
+    })
+}
+
+fn mempool_recent(node: &Arc<Node>) -> Value {
+    let mempool = node.mempool.read();
+    let mut entries = mempool
+        .transaction_order()
+        .into_iter()
+        .filter_map(|txid| mempool.get(&txid).map(|entry| (txid, entry)))
+        .collect::<Vec<_>>();
+    entries.sort_by(|(left_txid, left), (right_txid, right)| {
+        right
+            .added_at
+            .cmp(&left.added_at)
+            .then_with(|| left_txid.to_string().cmp(&right_txid.to_string()))
+    });
+    json!(
+        entries
+            .into_iter()
+            .take(10)
+            .map(|(txid, entry)| json!({
+                "txid": txid.to_string(),
+                "fee": entry.fee_sat,
+                "vsize": entry.vsize,
+            }))
+            .collect::<Vec<_>>()
+    )
 }
 
 fn header_merkle_proof(
@@ -1042,6 +1271,101 @@ mod tests {
             )
         );
         assert!(header_merkle_proof_from_hashes(&hashes, 3).is_err());
+    }
+
+    #[test]
+    fn negotiates_modern_protocol_shapes_and_methods() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            Node::open(Config {
+                network: Network::Regtest,
+                datadir: directory.path().to_owned(),
+                p2p_bind: "127.0.0.1:0".parse().unwrap(),
+                rpc_bind: None,
+                electrum_bind: Some("127.0.0.1:30001".parse().unwrap()),
+                rest: false,
+                seed_nodes: Vec::new(),
+                signet_challenge: None,
+                max_peers: 1,
+            })
+            .unwrap(),
+        );
+        let mut session = ElectrumSession::default();
+        let mut subscriptions = HashMap::new();
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "server.version",
+                &json!(["test-client", ["1.4", "1.7"]]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!([SERVER_NAME, "1.7"])
+        );
+        let features = dispatch_with_session(
+            &node,
+            "server.features",
+            &json!([]),
+            &mut subscriptions,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(features["protocol_max"], json!("1.7"));
+        assert!(features.get("hash_function").is_none());
+        let headers = dispatch_with_session(
+            &node,
+            "blockchain.block.headers",
+            &json!([0, 1]),
+            &mut subscriptions,
+            &mut session,
+        )
+        .unwrap();
+        assert!(headers.get("headers").is_some());
+        assert!(headers.get("hex").is_none());
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "server.ping",
+                &json!([3]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!({"data": "000"})
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "mempool.get_info",
+                &json!([]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap()["minrelaytxfee"],
+            json!(0.00001)
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "mempool.recent",
+                &json!([]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!([])
+        );
+        assert!(
+            dispatch_with_session(
+                &node,
+                "server.version",
+                &json!(["again", "1.7"]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .is_err()
+        );
     }
 
     #[test]

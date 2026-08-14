@@ -2215,6 +2215,15 @@ mod tests {
         node.record_pong(7, nonce);
         assert!(node.peer_infos()[0].ping_time.is_some());
         assert!(node.peer_infos()[0].min_ping.is_some());
+        node.unregister_peer(7);
+        assert_eq!(
+            node.known_addresses()
+                .into_iter()
+                .find(|known| known.address == "127.0.0.1:18444".parse().unwrap())
+                .expect("disconnected peer remains in address table")
+                .id,
+            0
+        );
     }
 
     #[test]

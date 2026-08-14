@@ -38,6 +38,7 @@ use crate::mempool::{Mempool, MempoolError};
 const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
+const MAX_KNOWN_ADDRESSES: usize = 256_000;
 
 struct OrphanEntry {
     transaction: Transaction,
@@ -615,8 +616,11 @@ impl Node {
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
-        self.known_addresses.write().insert(address, peer);
-        self.tried_addresses.write().insert(address);
+        let mut known = self.known_addresses.write();
+        if self.reserve_known_address(&mut known, address) {
+            known.insert(address, peer);
+            self.tried_addresses.write().insert(address);
+        }
     }
 
     pub fn update_peer_version(
@@ -655,8 +659,18 @@ impl Node {
     }
 
     pub fn unregister_peer(&self, id: usize) {
-        self.peers.write().remove(&id);
+        let address = self.peers.write().remove(&id).map(|peer| peer.address);
         self.peer_commands.write().remove(&id);
+        if let Some(address) = address
+            && let Some(known) = self.known_addresses.write().get_mut(&address)
+            && known.id == id
+        {
+            known.id = 0;
+            known.inbound = false;
+            known.local_address = None;
+            known.ping_nonce = None;
+            known.ping_sent_at = None;
+        }
         self.orphans.lock().erase_for_peer(id);
     }
 
@@ -676,6 +690,9 @@ impl Node {
         let now = unix_time_seconds();
         let mut known = self.known_addresses.write();
         if known.contains_key(&address) {
+            return false;
+        }
+        if !self.reserve_known_address(&mut known, address) {
             return false;
         }
         known.insert(
@@ -711,6 +728,9 @@ impl Node {
 
     pub(crate) fn remember_address(&self, address: SocketAddr, services: u64, time: u64) {
         let mut known = self.known_addresses.write();
+        if !self.reserve_known_address(&mut known, address) {
+            return;
+        }
         let entry = known.entry(address).or_insert_with(|| PeerInfo {
             id: 0,
             address,
@@ -737,6 +757,31 @@ impl Node {
             entry.connected_at = entry.connected_at.max(time);
             entry.last_send = entry.last_send.max(time);
             entry.last_recv = entry.last_recv.max(time);
+        }
+    }
+
+    fn reserve_known_address(
+        &self,
+        known: &mut HashMap<SocketAddr, PeerInfo>,
+        address: SocketAddr,
+    ) -> bool {
+        if known.contains_key(&address) || known.len() < MAX_KNOWN_ADDRESSES {
+            return true;
+        }
+        let tried = self.tried_addresses.read();
+        let eviction = known
+            .iter()
+            .filter(|(candidate, peer)| {
+                peer.id == 0 && !tried.contains(*candidate) && **candidate != address
+            })
+            .min_by_key(|(_, peer)| peer.connected_at)
+            .map(|(candidate, _)| *candidate);
+        drop(tried);
+        if let Some(eviction) = eviction {
+            known.remove(&eviction);
+            true
+        } else {
+            false
         }
     }
 

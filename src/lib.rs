@@ -1103,6 +1103,15 @@ impl Node {
         }
     }
 
+    pub(crate) fn update_peer_relay_transactions(&self, id: usize, relay_transactions: bool) {
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.relay_transactions = relay_transactions;
+            if let Some(known) = self.known_addresses.write().get_mut(&peer.address) {
+                known.relay_transactions = relay_transactions;
+            }
+        }
+    }
+
     pub fn update_peer_fee_filter(&self, id: usize, min_fee_filter: i64) {
         let min_fee_filter = min_fee_filter.max(0);
         if let Some(peer) = self.peers.write().get_mut(&id) {

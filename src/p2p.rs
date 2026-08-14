@@ -1751,7 +1751,8 @@ async fn serve_peer_loop(
                 if !node.config.peer_bloom_filters {
                     anyhow::bail!("filterload received while bloom filters are disabled");
                 }
-                *bloom_filter.lock() = Some(BloomFilter::from_message(filter)?);
+                install_bloom_filter(bloom_filter, relay_transactions, filter)?;
+                node.update_peer_relay_transactions(peer_id, true);
             }
             Message::FilterAdd(FilterAdd { data }) => {
                 if !node.config.peer_bloom_filters {
@@ -1770,7 +1771,8 @@ async fn serve_peer_loop(
                 if !node.config.peer_bloom_filters {
                     anyhow::bail!("filterclear received while bloom filters are disabled");
                 }
-                *bloom_filter.lock() = None;
+                clear_bloom_filter(bloom_filter, relay_transactions);
+                node.update_peer_relay_transactions(peer_id, true);
             }
             Message::MerkleBlock(_) => {}
             Message::Addr(addresses) => {
@@ -2527,6 +2529,24 @@ fn fee_rate_sat_per_kvb(fee_sat: u64, vsize: u64) -> i64 {
     i64::try_from(fee_sat.saturating_mul(1_000).saturating_div(vsize)).unwrap_or(i64::MAX)
 }
 
+fn install_bloom_filter(
+    bloom_filter: &parking_lot::Mutex<Option<BloomFilter>>,
+    relay_transactions: &parking_lot::Mutex<bool>,
+    filter: FilterLoad,
+) -> Result<()> {
+    *bloom_filter.lock() = Some(BloomFilter::from_message(filter)?);
+    *relay_transactions.lock() = true;
+    Ok(())
+}
+
+fn clear_bloom_filter(
+    bloom_filter: &parking_lot::Mutex<Option<BloomFilter>>,
+    relay_transactions: &parking_lot::Mutex<bool>,
+) {
+    *bloom_filter.lock() = None;
+    *relay_transactions.lock() = true;
+}
+
 fn transaction_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<Transaction> {
     let mempool = node.mempool.read();
     match item.kind {
@@ -2945,6 +2965,36 @@ mod tests {
     }
 
     #[test]
+    fn bloom_filter_load_and_clear_enable_transaction_relay() {
+        let bloom_filter = parking_lot::Mutex::new(None);
+        let relay_transactions = parking_lot::Mutex::new(false);
+        let filter = FilterLoad {
+            filter: vec![0; 32],
+            hash_funcs: 5,
+            tweak: 0,
+            flags: BloomFlags::All,
+        };
+        install_bloom_filter(&bloom_filter, &relay_transactions, filter).unwrap();
+        assert!(bloom_filter.lock().is_some());
+        assert!(*relay_transactions.lock());
+
+        *relay_transactions.lock() = false;
+        clear_bloom_filter(&bloom_filter, &relay_transactions);
+        assert!(bloom_filter.lock().is_none());
+        assert!(*relay_transactions.lock());
+
+        let invalid_filter = FilterLoad {
+            filter: vec![0; MAX_BLOOM_FILTER_SIZE + 1],
+            hash_funcs: 5,
+            tweak: 0,
+            flags: BloomFlags::All,
+        };
+        *relay_transactions.lock() = false;
+        assert!(install_bloom_filter(&bloom_filter, &relay_transactions, invalid_filter).is_err());
+        assert!(!*relay_transactions.lock());
+    }
+
+    #[test]
     fn peer_counters_track_wire_traffic_and_pings() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
@@ -3006,6 +3056,9 @@ mod tests {
         assert_eq!(peer.last_inv_sequence, 12);
         assert!(!peer.relay_transactions);
         assert_eq!(peer.min_fee_filter, 4_000);
+
+        node.update_peer_relay_transactions(7, true);
+        assert!(node.peer_infos()[0].relay_transactions);
 
         node.ping_peers();
         let PeerCommand::Ping(nonce) = receiver.try_recv().unwrap() else {

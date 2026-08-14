@@ -1301,6 +1301,11 @@ async fn serve_peer_loop(
                         InventoryType::Block | InventoryType::WitnessBlock => {
                             let block = node.chain.write().block(&item.hash)?;
                             if let Some(block) = block {
+                                let block = if item.kind == InventoryType::Block {
+                                    block_without_witness(&block)
+                                } else {
+                                    block
+                                };
                                 send_message(
                                     node,
                                     peer_id,
@@ -2534,6 +2539,14 @@ fn transaction_without_witness(transaction: &Transaction) -> Transaction {
     transaction
 }
 
+fn block_without_witness(block: &Block) -> Block {
+    let mut block = block.clone();
+    for transaction in &mut block.txdata {
+        *transaction = transaction_without_witness(transaction);
+    }
+    block
+}
+
 fn compact_block_indexes_are_strictly_increasing(indexes: &[u64]) -> bool {
     indexes.windows(2).all(|pair| pair[0] < pair[1])
 }
@@ -2639,6 +2652,42 @@ mod tests {
         assert_eq!(legacy.compute_txid(), transaction.compute_txid());
         assert_ne!(legacy.compute_wtxid(), transaction.compute_wtxid());
         assert!(legacy.input.iter().all(|input| input.witness.is_empty()));
+    }
+
+    #[test]
+    fn legacy_block_getdata_strips_witness_data() {
+        let transaction = Transaction {
+            version: bitcoin::blockdata::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::from_slice(&[&[1u8, 2u8][..]]),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let block = Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: transaction.compute_txid().to_raw_hash().into(),
+                time: 1,
+                bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![transaction.clone()],
+        };
+        let legacy = block_without_witness(&block);
+        assert_eq!(legacy.txdata[0].compute_txid(), transaction.compute_txid());
+        assert_ne!(
+            legacy.txdata[0].compute_wtxid(),
+            transaction.compute_wtxid()
+        );
+        assert!(legacy.txdata[0].input[0].witness.is_empty());
     }
 
     #[test]

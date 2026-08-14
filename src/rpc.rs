@@ -1445,7 +1445,20 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getconnectioncount" => Ok(json!(node.peer_count())),
         "uptime" => Ok(json!(node.started_at.elapsed().as_secs())),
         "getindexinfo" => get_index_info(node, params),
-        "getzmqnotifications" => Ok(json!([])),
+        "getzmqnotifications" => Ok(json!(
+            node.config
+                .zmq
+                .notifications()
+                .into_iter()
+                .map(|notification| {
+                    json!({
+                        "type": notification.kind,
+                        "address": notification.address,
+                        "hwm": notification.hwm,
+                    })
+                })
+                .collect::<Vec<_>>()
+        )),
         "logging" => configure_logging(params),
         "syncwithvalidationinterfacequeue" => Ok(Value::Null),
         "validateaddress" => validate_address(node, params),
@@ -8400,6 +8413,12 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
     }
 
     let chain = node.chain.read();
+    let before_transactions = node
+        .mempool
+        .read()
+        .transactions()
+        .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+        .collect::<HashMap<_, _>>();
     let mut candidate = node.mempool.read().clone();
     let preexisting = transactions
         .iter()
@@ -8471,7 +8490,12 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         .cloned()
         .collect::<Vec<_>>();
     drop(chain);
+    let removed = before_transactions
+        .into_iter()
+        .filter_map(|(txid, transaction)| candidate.get(&txid).is_none().then_some(transaction))
+        .collect::<Vec<_>>();
     *node.mempool.write() = candidate;
+    node.notify_mempool_removals(removed);
     for transaction in accepted {
         node.notify_mempool_transaction(transaction);
     }
@@ -9820,6 +9844,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let transaction = proof_transaction(7);
@@ -9969,6 +9994,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let hash = node.chain.read().best_hash();
@@ -10033,6 +10059,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let result = dispatch_method(&node, "estimatesmartfee", &json!([6])).unwrap();
@@ -10056,6 +10083,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let result = dispatch_method(&node, "estimaterawfee", &json!([6])).unwrap();
@@ -10084,6 +10112,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -10143,6 +10172,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let mined = generate_to_address(
@@ -10176,6 +10206,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -10276,6 +10307,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -10322,6 +10354,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         assert!(get_network_hash_ps(&node, &json!([0])).is_err());
@@ -10346,6 +10379,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -10373,6 +10407,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -10409,6 +10444,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -10438,6 +10474,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let hash = node.chain.read().best_hash();
@@ -10461,6 +10498,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let hash = node.chain.read().best_hash();
@@ -10481,6 +10519,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let (_, chaininfo) = dispatch_rest(&node, "/rest/chaininfo.json").unwrap();
@@ -10576,6 +10615,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -10618,6 +10658,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -10682,6 +10723,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -10713,6 +10755,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let result = generate_block(
@@ -10770,6 +10813,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let mined = generate_to_descriptor(&node, &json!([102, "raw(51)"])).unwrap();
@@ -10848,6 +10892,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let template = get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
@@ -10928,6 +10973,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let stale = format!("{}:999", node.chain.read().best_hash());
@@ -10952,6 +10998,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let old_tip = node.chain.read().best_hash();
@@ -10981,6 +11028,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         generate_to_address(
@@ -11016,6 +11064,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let outpoint = OutPoint::new(Txid::from_byte_array([0x42; 32]), 0);
@@ -11058,6 +11107,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let hash = generate_to_address(
@@ -11091,6 +11141,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
@@ -11124,6 +11175,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         dispatch_method(&node, "setnetworkactive", &json!([false])).unwrap();
@@ -11148,6 +11200,7 @@ mod tests {
             seed_nodes: Vec::new(),
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
             signet_challenge: None,
         })
         .unwrap();
@@ -11173,6 +11226,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
 
@@ -11229,6 +11283,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         assert_eq!(
@@ -11279,6 +11334,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         node.remember_address("192.0.2.20:18444".parse().unwrap(), 1, 10);
@@ -11323,6 +11379,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
@@ -11477,6 +11534,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let genesis_hash = node.chain.read().best_hash();
@@ -11689,6 +11747,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let secret = bitcoin::secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
@@ -11795,6 +11854,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let secret = bitcoin::secp256k1::SecretKey::from_slice(&[2; 32]).unwrap();
@@ -11827,6 +11887,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let secp = Secp256k1::new();
@@ -11897,6 +11958,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
@@ -12099,6 +12161,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let xpriv = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[7; 32]).unwrap();
@@ -12435,6 +12498,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let hashes = generate_to_descriptor(&node, &json!([101, "raw(51)"])).unwrap();
@@ -12485,6 +12549,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let hashes = generate_to_descriptor(&node, &json!([101, "raw(51)"])).unwrap();
@@ -12544,6 +12609,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let mined = generate_to_descriptor(&node, &json!([102, "raw(51)"])).unwrap();
@@ -12647,6 +12713,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let path = directory.path().join("utxos.snapshot");
@@ -12672,6 +12739,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";

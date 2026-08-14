@@ -12,6 +12,7 @@ pub mod storage;
 pub mod time;
 pub mod validation;
 pub mod wire;
+pub mod zmq;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -253,9 +254,11 @@ pub struct Node {
     pub events: broadcast::Sender<ChainEvent>,
     pub mempool_events: broadcast::Sender<MempoolEvent>,
     peer_mempool_events: broadcast::Sender<PeerMempoolEvent>,
+    pub(crate) zmq_events: broadcast::Sender<zmq::Event>,
     pub rpc_cookie: Option<String>,
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
+    zmq_mempool_sequence: AtomicU64,
     rpc_command_sequence: AtomicUsize,
     rpc_commands: parking_lot::RwLock<HashMap<usize, (String, Instant)>>,
     total_bytes_sent: AtomicU64,
@@ -291,6 +294,8 @@ impl Node {
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
+        let (zmq_events, _) = broadcast::channel(4_096);
+        let zmq_mempool_sequence = mempool.sequence();
         let rpc_cookie = config
             .rpc_bind
             .map(|_| load_rpc_cookie(&config.datadir))
@@ -302,9 +307,11 @@ impl Node {
             events,
             mempool_events,
             peer_mempool_events,
+            zmq_events,
             rpc_cookie,
             mempool_path,
             peer_count: AtomicUsize::new(0),
+            zmq_mempool_sequence: AtomicU64::new(zmq_mempool_sequence),
             rpc_command_sequence: AtomicUsize::new(0),
             rpc_commands: parking_lot::RwLock::new(HashMap::new()),
             total_bytes_sent: AtomicU64::new(0),
@@ -341,6 +348,12 @@ impl Node {
             (tip, activated_blocks, disconnected_blocks)
         };
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
+            let mempool_before_transactions = self
+                .mempool
+                .read()
+                .transactions()
+                .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+                .collect::<HashMap<_, _>>();
             let mempool_before = self
                 .mempool
                 .read()
@@ -366,11 +379,20 @@ impl Node {
                 .transaction_order()
                 .into_iter()
                 .collect::<HashSet<_>>();
+            let mempool_after_transactions = mempool
+                .transactions()
+                .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+                .collect::<HashMap<_, _>>();
             let _ = self.events.send(tip.clone());
 
             drop(mempool);
             drop(chain);
             self.announce_mempool_diff(mempool_before, mempool_after);
+            self.announce_zmq_mempool_diff(
+                &mempool_before_transactions,
+                &mempool_after_transactions,
+            );
+            self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             for block in &activated_blocks {
                 self.orphans.lock().erase_for_block(block);
             }
@@ -440,21 +462,28 @@ impl Node {
         let (result, removed) = {
             let mut mempool = self.mempool.write();
             let before = mempool
-                .transaction_order()
-                .into_iter()
-                .collect::<HashSet<_>>();
+                .transactions()
+                .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+                .collect::<HashMap<_, _>>();
             let result = mempool.accept(transaction, &chain);
             let removed = if result.is_ok() {
                 before
                     .into_iter()
-                    .filter(|txid| mempool.get(txid).is_none())
+                    .filter_map(|(txid, transaction)| {
+                        mempool.get(&txid).is_none().then_some(transaction)
+                    })
                     .collect::<Vec<_>>()
             } else {
                 Vec::new()
             };
             (result, removed)
         };
-        self.announce_mempool_changes(removed);
+        let removed_ids = removed
+            .iter()
+            .map(Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        self.announce_mempool_changes(removed_ids);
+        self.announce_zmq_mempool_removals(removed);
         result
     }
 
@@ -475,6 +504,83 @@ impl Node {
         removed.sort_by_key(ToString::to_string);
         for txid in removed {
             self.announce_mempool_transaction(txid);
+        }
+    }
+
+    fn announce_zmq_mempool_added(&self, transaction: Transaction) {
+        if !self.config.zmq.is_enabled() || self.zmq_events.receiver_count() == 0 {
+            return;
+        }
+        let mempool_sequence = self.zmq_mempool_sequence.fetch_add(1, Ordering::Relaxed);
+        let _ = self.zmq_events.send(zmq::Event::TransactionAdded {
+            transaction: Arc::new(transaction),
+            mempool_sequence,
+        });
+    }
+
+    fn announce_zmq_mempool_removed(&self, transaction: Transaction) {
+        if !self.config.zmq.is_enabled() || self.zmq_events.receiver_count() == 0 {
+            return;
+        }
+        let mempool_sequence = self.zmq_mempool_sequence.fetch_add(1, Ordering::Relaxed);
+        let _ = self.zmq_events.send(zmq::Event::TransactionRemoved {
+            transaction: Arc::new(transaction),
+            mempool_sequence,
+        });
+    }
+
+    fn announce_zmq_mempool_removals(&self, mut transactions: Vec<Transaction>) {
+        transactions.sort_by_key(|transaction| transaction.compute_txid().to_string());
+        for transaction in transactions {
+            self.announce_zmq_mempool_removed(transaction);
+        }
+    }
+
+    pub(crate) fn notify_mempool_removals(&self, transactions: Vec<Transaction>) {
+        self.announce_zmq_mempool_removals(transactions);
+    }
+
+    fn announce_zmq_mempool_diff(
+        &self,
+        before: &HashMap<Txid, Transaction>,
+        after: &HashMap<Txid, Transaction>,
+    ) {
+        let mut removed = before
+            .iter()
+            .filter_map(|(txid, transaction)| {
+                (!after.contains_key(txid)).then_some(transaction.clone())
+            })
+            .collect::<Vec<_>>();
+        removed.sort_by_key(|transaction| transaction.compute_txid().to_string());
+        for transaction in removed {
+            self.announce_zmq_mempool_removed(transaction);
+        }
+
+        let mut added = after
+            .iter()
+            .filter_map(|(txid, transaction)| {
+                (!before.contains_key(txid)).then_some(transaction.clone())
+            })
+            .collect::<Vec<_>>();
+        added.sort_by_key(|transaction| transaction.compute_txid().to_string());
+        for transaction in added {
+            self.announce_zmq_mempool_added(transaction);
+        }
+    }
+
+    fn announce_zmq_block_events(&self, disconnected: &[Block], connected: &[Block]) {
+        if !self.config.zmq.is_enabled() || self.zmq_events.receiver_count() == 0 {
+            return;
+        }
+        for block in disconnected {
+            let _ = self
+                .zmq_events
+                .send(zmq::Event::BlockDisconnected(Arc::new(block.clone())));
+        }
+        for block in connected {
+            let _ = self
+                .zmq_events
+                .send(zmq::Event::BlockConnected(Arc::new(block.clone())));
         }
     }
 
@@ -507,6 +613,7 @@ impl Node {
     ) {
         let txid = transaction.compute_txid();
         self.orphans.lock().remove(&txid);
+        self.announce_zmq_mempool_added(transaction.clone());
         self.announce_mempool_transaction(txid);
         self.announce_peer_mempool_transaction(txid, excluded_peers);
         self.promote_orphans_for_parent(&transaction);
@@ -523,6 +630,7 @@ impl Node {
             let transaction = entry.transaction.clone();
             match self.try_accept_transaction(transaction.clone()) {
                 Ok(txid) => {
+                    self.announce_zmq_mempool_added(transaction.clone());
                     self.announce_mempool_transaction(txid);
                     self.announce_peer_mempool_transaction(
                         txid,
@@ -539,13 +647,30 @@ impl Node {
     }
 
     pub fn invalidate_block(&self, hash: bitcoin::BlockHash) -> Result<ChainEvent> {
-        let (tip, changed) = {
+        let (tip, changed, activated_blocks, disconnected_blocks) = {
             let mut chain = self.chain.write();
             let previous = chain.best_hash();
             let tip = chain.invalidate_block(&hash)?;
-            (tip, previous != chain.best_hash())
+            let changed = previous != chain.best_hash();
+            let activated_blocks = if changed {
+                chain.active_blocks_after(previous)?
+            } else {
+                Vec::new()
+            };
+            let disconnected_blocks = if changed {
+                chain.disconnected_blocks_after(previous)?
+            } else {
+                Vec::new()
+            };
+            (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
+            let before_transactions = self
+                .mempool
+                .read()
+                .transactions()
+                .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+                .collect::<HashMap<_, _>>();
             let before = self
                 .mempool
                 .read()
@@ -559,22 +684,45 @@ impl Node {
                 .transaction_order()
                 .into_iter()
                 .collect::<HashSet<_>>();
+            let after_transactions = mempool
+                .transactions()
+                .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+                .collect::<HashMap<_, _>>();
             drop(mempool);
             drop(chain);
             self.announce_mempool_diff(before, after);
+            self.announce_zmq_mempool_diff(&before_transactions, &after_transactions);
+            self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             let _ = self.events.send(tip.clone());
         }
         Ok(tip)
     }
 
     pub fn reconsider_block(&self, hash: bitcoin::BlockHash) -> Result<ChainEvent> {
-        let (tip, changed) = {
+        let (tip, changed, activated_blocks, disconnected_blocks) = {
             let mut chain = self.chain.write();
             let previous = chain.best_hash();
             let tip = chain.reconsider_block(&hash)?;
-            (tip, previous != chain.best_hash())
+            let changed = previous != chain.best_hash();
+            let activated_blocks = if changed {
+                chain.active_blocks_after(previous)?
+            } else {
+                Vec::new()
+            };
+            let disconnected_blocks = if changed {
+                chain.disconnected_blocks_after(previous)?
+            } else {
+                Vec::new()
+            };
+            (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
+            let before_transactions = self
+                .mempool
+                .read()
+                .transactions()
+                .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+                .collect::<HashMap<_, _>>();
             let before = self
                 .mempool
                 .read()
@@ -588,9 +736,15 @@ impl Node {
                 .transaction_order()
                 .into_iter()
                 .collect::<HashSet<_>>();
+            let after_transactions = mempool
+                .transactions()
+                .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+                .collect::<HashMap<_, _>>();
             drop(mempool);
             drop(chain);
             self.announce_mempool_diff(before, after);
+            self.announce_zmq_mempool_diff(&before_transactions, &after_transactions);
+            self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             let _ = self.events.send(tip.clone());
         }
         Ok(tip)
@@ -606,6 +760,10 @@ impl Node {
 
     pub(crate) fn subscribe_peer_mempool(&self) -> broadcast::Receiver<PeerMempoolEvent> {
         self.peer_mempool_events.subscribe()
+    }
+
+    pub(crate) fn subscribe_zmq(&self) -> broadcast::Receiver<zmq::Event> {
+        self.zmq_events.subscribe()
     }
 
     pub fn peer_count(&self) -> usize {
@@ -1072,6 +1230,7 @@ impl Node {
         let p2p = p2p::PeerManager::new(self.clone());
         let rpc = rpc::RpcServer::new(self.clone());
         let electrum = electrum::ElectrumServer::new(self.clone());
+        let mut zmq_task = tokio::spawn(zmq::run(self.config.zmq.clone(), self.subscribe_zmq()));
 
         info!(
             network = ?self.config.network,
@@ -1089,6 +1248,7 @@ impl Node {
             result = &mut p2p_task => result??,
             result = &mut rpc_task => result??,
             result = &mut electrum_task => result??,
+            result = &mut zmq_task => result??,
             result = tokio::signal::ctrl_c() => result?,
             _ = self.shutdown.notified() => (),
         };
@@ -1096,6 +1256,7 @@ impl Node {
         p2p_task.abort();
         rpc_task.abort();
         electrum_task.abort();
+        zmq_task.abort();
         self.persist_mempool()?;
         self.persist_known_addresses()?;
         Ok(())
@@ -1107,8 +1268,12 @@ impl Node {
 
     pub fn import_mempool(&self, path: impl AsRef<Path>) -> Result<()> {
         let chain = self.chain.read();
-        let (result, changed) = {
+        let (result, changed, before_transactions, after_transactions) = {
             let mut mempool = self.mempool.write();
+            let before_transactions = mempool
+                .transactions()
+                .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+                .collect::<HashMap<_, _>>();
             let before = mempool
                 .transaction_order()
                 .into_iter()
@@ -1122,9 +1287,14 @@ impl Node {
                 .symmetric_difference(&after)
                 .copied()
                 .collect::<Vec<_>>();
-            (result, changed)
+            let after_transactions = mempool
+                .transactions()
+                .map(|transaction| (transaction.compute_txid(), transaction.clone()))
+                .collect::<HashMap<_, _>>();
+            (result, changed, before_transactions, after_transactions)
         };
         if result.is_ok() {
+            self.announce_zmq_mempool_diff(&before_transactions, &after_transactions);
             let mut changed = changed;
             changed.sort_by_key(ToString::to_string);
             for txid in &changed {
@@ -1268,6 +1438,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         }
     }
 

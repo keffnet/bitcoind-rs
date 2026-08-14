@@ -2229,6 +2229,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let stop_hash = node.chain.read().best_hash();
@@ -2307,6 +2308,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let hash = node.chain.read().best_hash();
@@ -2400,6 +2402,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -2448,6 +2451,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let legacy = wire::NetworkAddress {
@@ -2482,6 +2486,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 4,
             peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let added = "192.0.2.10:18444".parse().unwrap();

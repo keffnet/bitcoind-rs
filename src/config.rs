@@ -5,6 +5,81 @@ use anyhow::{Context, Result, bail};
 use bitcoin::Network;
 use clap::{Parser, ValueEnum};
 
+pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
+
+#[derive(Clone, Debug)]
+pub struct ZmqConfig {
+    pub pub_hash_tx: Vec<String>,
+    pub pub_hash_block: Vec<String>,
+    pub pub_raw_tx: Vec<String>,
+    pub pub_raw_block: Vec<String>,
+    pub pub_sequence: Vec<String>,
+    pub hash_tx_hwm: u32,
+    pub hash_block_hwm: u32,
+    pub raw_tx_hwm: u32,
+    pub raw_block_hwm: u32,
+    pub sequence_hwm: u32,
+}
+
+impl Default for ZmqConfig {
+    fn default() -> Self {
+        Self {
+            pub_hash_tx: Vec::new(),
+            pub_hash_block: Vec::new(),
+            pub_raw_tx: Vec::new(),
+            pub_raw_block: Vec::new(),
+            pub_sequence: Vec::new(),
+            hash_tx_hwm: DEFAULT_ZMQ_HWM,
+            hash_block_hwm: DEFAULT_ZMQ_HWM,
+            raw_tx_hwm: DEFAULT_ZMQ_HWM,
+            raw_block_hwm: DEFAULT_ZMQ_HWM,
+            sequence_hwm: DEFAULT_ZMQ_HWM,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ZmqNotification {
+    pub kind: &'static str,
+    pub address: String,
+    pub hwm: u32,
+}
+
+impl ZmqConfig {
+    pub fn is_enabled(&self) -> bool {
+        !self.pub_hash_tx.is_empty()
+            || !self.pub_hash_block.is_empty()
+            || !self.pub_raw_tx.is_empty()
+            || !self.pub_raw_block.is_empty()
+            || !self.pub_sequence.is_empty()
+    }
+
+    pub fn notifications(&self) -> Vec<ZmqNotification> {
+        [
+            ("pubhashblock", &self.pub_hash_block, self.hash_block_hwm),
+            ("pubhashtx", &self.pub_hash_tx, self.hash_tx_hwm),
+            ("pubrawblock", &self.pub_raw_block, self.raw_block_hwm),
+            ("pubrawtx", &self.pub_raw_tx, self.raw_tx_hwm),
+            ("pubsequence", &self.pub_sequence, self.sequence_hwm),
+        ]
+        .into_iter()
+        .flat_map(|(kind, addresses, hwm)| {
+            addresses.iter().map(move |address| ZmqNotification {
+                kind,
+                address: normalize_address(address),
+                hwm,
+            })
+        })
+        .collect()
+    }
+}
+
+fn normalize_address(address: &str) -> String {
+    address
+        .strip_prefix("unix:")
+        .map_or_else(|| address.to_owned(), |path| format!("ipc://{path}"))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum NetworkName {
     Bitcoin,
@@ -62,6 +137,36 @@ pub struct Args {
 
     #[arg(long, default_value_t = false)]
     pub peer_bloom_filters: bool,
+
+    #[arg(long = "zmqpubhashtx", value_name = "ADDRESS")]
+    pub zmq_pub_hash_tx: Vec<String>,
+
+    #[arg(long = "zmqpubhashblock", value_name = "ADDRESS")]
+    pub zmq_pub_hash_block: Vec<String>,
+
+    #[arg(long = "zmqpubrawtx", value_name = "ADDRESS")]
+    pub zmq_pub_raw_tx: Vec<String>,
+
+    #[arg(long = "zmqpubrawblock", value_name = "ADDRESS")]
+    pub zmq_pub_raw_block: Vec<String>,
+
+    #[arg(long = "zmqpubsequence", value_name = "ADDRESS")]
+    pub zmq_pub_sequence: Vec<String>,
+
+    #[arg(long = "zmqpubhashtxhwm", default_value_t = DEFAULT_ZMQ_HWM)]
+    pub zmq_pub_hash_tx_hwm: u32,
+
+    #[arg(long = "zmqpubhashblockhwm", default_value_t = DEFAULT_ZMQ_HWM)]
+    pub zmq_pub_hash_block_hwm: u32,
+
+    #[arg(long = "zmqpubrawtxhwm", default_value_t = DEFAULT_ZMQ_HWM)]
+    pub zmq_pub_raw_tx_hwm: u32,
+
+    #[arg(long = "zmqpubrawblockhwm", default_value_t = DEFAULT_ZMQ_HWM)]
+    pub zmq_pub_raw_block_hwm: u32,
+
+    #[arg(long = "zmqpubsequencehwm", default_value_t = DEFAULT_ZMQ_HWM)]
+    pub zmq_pub_sequence_hwm: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -76,12 +181,24 @@ pub struct Config {
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
     pub peer_bloom_filters: bool,
+    pub zmq: ZmqConfig,
 }
 
 impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
         if args.max_peers == 0 {
             bail!("--max-peers must be greater than zero");
+        }
+        if [
+            args.zmq_pub_hash_tx_hwm,
+            args.zmq_pub_hash_block_hwm,
+            args.zmq_pub_raw_tx_hwm,
+            args.zmq_pub_raw_block_hwm,
+            args.zmq_pub_sequence_hwm,
+        ]
+        .contains(&0)
+        {
+            bail!("ZMQ high water marks must be greater than zero");
         }
         if args.p2p.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) && args.p2p.port() == 0 {
             bail!("--p2p must use a non-zero port when binding all interfaces");
@@ -108,6 +225,18 @@ impl Config {
             signet_challenge,
             max_peers: args.max_peers,
             peer_bloom_filters: args.peer_bloom_filters,
+            zmq: ZmqConfig {
+                pub_hash_tx: args.zmq_pub_hash_tx,
+                pub_hash_block: args.zmq_pub_hash_block,
+                pub_raw_tx: args.zmq_pub_raw_tx,
+                pub_raw_block: args.zmq_pub_raw_block,
+                pub_sequence: args.zmq_pub_sequence,
+                hash_tx_hwm: args.zmq_pub_hash_tx_hwm,
+                hash_block_hwm: args.zmq_pub_hash_block_hwm,
+                raw_tx_hwm: args.zmq_pub_raw_tx_hwm,
+                raw_block_hwm: args.zmq_pub_raw_block_hwm,
+                sequence_hwm: args.zmq_pub_sequence_hwm,
+            },
         })
     }
 }

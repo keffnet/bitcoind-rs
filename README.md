@@ -9,6 +9,7 @@ The project targets the consensus and network behavior of Bitcoin Core 31.1 whil
 - `p2p`: Bitcoin peer handshake and block/transaction propagation
 - `rpc`: wallet-free JSON-RPC methods
 - `electrum`: TCP JSON-RPC server with address/scripthash history and subscriptions
+- `zmq`: Core-compatible PUB notifications for transactions, blocks, and sequences
 
 ## Status
 
@@ -18,6 +19,7 @@ The implementation is an actively developed, wallet-free Core-compatible node su
 - Bitcoin P2P handshake, header/block/transaction relay, compact blocks, BIP157 relay, optional BIP37 Bloom-filter relay and merkle blocks (`--peer-bloom-filters`), bounded peer-transaction orphan handling, peer controls, bans, dynamic connections, traffic counters, and ping measurements;
 - mining templates and proposal validation, package-aware transaction selection, raw transaction submission, wallet-free raw signing, PSBT lifecycle including descriptor-driven updates and transient descriptor-key signing, message-signing, and multisig RPCs, opt-in RBF, BIP431/TRUC topology and size policy, ephemeral-dust package checks, package submission, wallet-free descriptors (`addr`, `raw`, `pk`, `pkh`, `wpkh`, `combo`, `multi`, `sortedmulti`, `sh`, `wsh`, `tr`, and `rawtr`) with generic Miniscript v0 wrappers, multipath expansion, and checksum metadata, UTXO scans, and the implemented JSON-RPC/REST methods;
 - an Electrum protocol server with header and scripthash subscriptions, history, balances, UTXOs, mempool queries, transaction retrieval, merkle proofs, broadcasts, and fee histograms.
+- Core-compatible ZeroMQ PUB topics (`hashtx`, `hashblock`, `rawtx`, `rawblock`, and `sequence`) with multipart message and per-topic sequence framing;
 
 It is not yet a drop-in replacement for every Bitcoin Core 31.1 behavior. In particular, the storage engine uses indexed append-only records with JSON chain metadata and a lightweight JSON `peers.json` address table rather than Core's production database, mempool import/export uses this implementation's JSON format rather than Core's binary `mempool.dat`, manual pruning rewrites this implementation's block and undo stores, UTXO snapshot files use this implementation's JSON format, and Electrum indexing is in-process rather than a separate electrs database. Miniscript-backed taproot-tree derivation, PSBT leaf metadata, and transient-descriptor-key script-path signing/finalization are supported, but the broader wallet/policy satisfaction surface is not a complete wallet replacement. Full mainnet deployment still requires broader Core test-vector, reorg, fuzz, and interoperability testing.
 
@@ -36,3 +38,7 @@ JSON-RPC uses the standard cookie file at `<datadir>/.cookie`; clients should se
 For the public signet, use `--network signet`. Custom BIP325 challenges can be supplied as script hex with `--signet-challenge <hex>`.
 
 Bloom-filter peer relay is disabled by default, matching Core's default; enable it with `--peer-bloom-filters` when serving BIP37 clients.
+
+ZeroMQ topics can be enabled with the Core-style options, for example
+`--zmqpubhashtx tcp://127.0.0.1:28332 --zmqpubsequence tcp://127.0.0.1:28333`.
+`getzmqnotifications` reports the configured topic endpoints and high-water marks.

@@ -1334,6 +1334,7 @@ mod tests {
                 signet_challenge: None,
                 max_peers: 1,
                 peer_bloom_filters: false,
+                zmq: crate::config::ZmqConfig::default(),
             })
             .unwrap(),
         );
@@ -1474,6 +1475,7 @@ mod tests {
                 signet_challenge: None,
                 max_peers: 1,
                 peer_bloom_filters: false,
+                zmq: crate::config::ZmqConfig::default(),
             })
             .unwrap(),
         );

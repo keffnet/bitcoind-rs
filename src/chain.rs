@@ -138,6 +138,8 @@ pub struct ChainState {
     orphans: HashMap<BlockHash, Vec<Block>>,
     invalid_blocks: HashSet<BlockHash>,
     prune_height: Option<u32>,
+    prune_mode: bool,
+    prune_target_size: Option<u64>,
     utxos: HashMap<OutPoint, UtxoEntry>,
     utxos_by_script: HashMap<String, HashSet<OutPoint>>,
     tx_index: HashMap<Txid, TxLocation>,
@@ -223,6 +225,8 @@ impl ChainState {
             orphans: HashMap::new(),
             invalid_blocks,
             prune_height,
+            prune_mode: false,
+            prune_target_size: None,
             utxos: HashMap::new(),
             utxos_by_script: HashMap::new(),
             tx_index: HashMap::new(),
@@ -323,6 +327,56 @@ impl ChainState {
 
     pub fn prune_height(&self) -> Option<u32> {
         self.prune_height
+    }
+
+    pub fn is_pruned(&self) -> bool {
+        self.prune_mode || self.prune_height.is_some()
+    }
+
+    pub fn prune_target_size(&self) -> Option<u64> {
+        self.prune_target_size
+    }
+
+    /// Apply the startup pruning mode from the node configuration.
+    pub fn configure_pruning(&mut self, requested: u64) -> Result<()> {
+        if requested == 0 && self.prune_height.is_some() {
+            bail!(
+                "The data directory contains pruned blocks; restart with --prune or rebuild with reindex."
+            );
+        }
+        self.prune_mode = requested != 0;
+        self.prune_target_size = if requested > 1 {
+            Some(
+                requested
+                    .checked_mul(1024 * 1024)
+                    .context("prune target is too large")?,
+            )
+        } else {
+            None
+        };
+        Ok(())
+    }
+
+    /// Prune automatically when the configured block/undo target is
+    /// exceeded. Keeping the recent block window is the same safety boundary
+    /// used by manual pruning and leaves enough data for ordinary reorgs.
+    pub fn maybe_auto_prune(&mut self) -> Result<bool> {
+        let Some(target_size) = self.prune_target_size else {
+            return Ok(false);
+        };
+        if self.store.disk_usage()? <= target_size {
+            return Ok(false);
+        }
+        let maximum_height = self.height().saturating_sub(MIN_BLOCKS_TO_KEEP);
+        if maximum_height == 0
+            || self
+                .prune_height
+                .is_some_and(|previous| previous >= maximum_height)
+        {
+            return Ok(false);
+        }
+        self.prune(u64::from(maximum_height))?;
+        Ok(true)
     }
 
     /// Permanently remove old block and undo records while retaining enough
@@ -3004,6 +3058,40 @@ mod tests {
         assert_eq!(reopened.height(), 300);
         assert_eq!(reopened.prune_height(), Some(12));
         assert!(!reopened.store.contains(&old_block_hash));
+    }
+
+    #[test]
+    fn configured_pruning_reports_mode_and_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_pruning(1).unwrap();
+        assert!(state.is_pruned());
+        assert_eq!(state.prune_target_size(), None);
+
+        state.configure_pruning(550).unwrap();
+        assert!(state.is_pruned());
+        assert_eq!(state.prune_target_size(), Some(550 * 1024 * 1024));
+    }
+
+    #[test]
+    fn automatic_pruning_keeps_the_recent_reorg_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut old_block_hash = None;
+        for height in 1..=300 {
+            let block = mine_block(&state, height);
+            if height == 5 {
+                old_block_hash = Some(block.block_hash());
+            }
+            state.connect_block(block).unwrap();
+        }
+        state.prune_mode = true;
+        state.prune_target_size = Some(0);
+        assert!(state.maybe_auto_prune().unwrap());
+        assert_eq!(state.prune_height(), Some(12));
+        assert!(!state.store.contains(&old_block_hash.unwrap()));
+        assert!(state.store.contains(&state.block_hash(13).unwrap()));
+        assert!(state.store.contains(&state.block_hash(12).unwrap()));
     }
 
     #[test]

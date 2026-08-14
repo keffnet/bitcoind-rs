@@ -6,6 +6,7 @@ use bitcoin::Network;
 use clap::{Parser, ValueEnum};
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
+pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -167,6 +168,9 @@ pub struct Args {
     )]
     pub blocksonly: bool,
 
+    #[arg(long, default_value_t = 0)]
+    pub prune: u64,
+
     #[arg(long, default_value_t = false, hide = true)]
     pub tx_reconciliation: bool,
 
@@ -216,6 +220,8 @@ pub struct Config {
     pub max_peers: usize,
     pub peer_bloom_filters: bool,
     pub blocksonly: bool,
+    /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
+    pub prune: u64,
     pub zmq: ZmqConfig,
 }
 
@@ -223,6 +229,9 @@ impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
         if args.max_peers == 0 {
             bail!("--max-peers must be greater than zero");
+        }
+        if args.prune != 0 && args.prune != 1 && args.prune < MIN_AUTO_PRUNE_TARGET_MIB {
+            bail!("--prune automatic target must be at least {MIN_AUTO_PRUNE_TARGET_MIB} MiB");
         }
         if [
             args.zmq_pub_hash_tx_hwm,
@@ -266,6 +275,7 @@ impl Config {
             max_peers: args.max_peers,
             peer_bloom_filters: args.peer_bloom_filters,
             blocksonly: args.blocksonly,
+            prune: args.prune,
             zmq: ZmqConfig {
                 tx_reconciliation: args.tx_reconciliation,
                 pub_hash_tx: args.zmq_pub_hash_tx,
@@ -305,5 +315,39 @@ mod tests {
         assert!(!config.listen);
         assert!(!config.dnsseed);
         assert!(config.blocksonly);
+        assert_eq!(config.prune, 0);
+    }
+
+    #[test]
+    fn parses_and_validates_pruning_modes() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--prune=1",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().prune, 1);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--prune",
+            "550",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().prune, 550);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--prune",
+            "549",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
     }
 }

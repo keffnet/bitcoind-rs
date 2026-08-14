@@ -282,11 +282,13 @@ pub struct Node {
 impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
         let added_nodes = config.seed_nodes.iter().copied().collect();
-        let chain = ChainState::open_with_signet_challenge(
+        let mut chain = ChainState::open_with_signet_challenge(
             config.network,
             &config.datadir,
             config.signet_challenge.as_deref(),
         )?;
+        chain.configure_pruning(config.prune)?;
+        chain.maybe_auto_prune()?;
         let mempool_path = config.datadir.join("mempool.json");
         let mut mempool = Mempool::new(config.network);
         mempool.load_from_file(&mempool_path, &chain)?;
@@ -337,6 +339,7 @@ impl Node {
         let (tip, activated_blocks, disconnected_blocks) = {
             let mut chain = self.chain.write();
             let tip = chain.connect_block(block)?;
+            chain.maybe_auto_prune()?;
             let activated_blocks = if tip.hash != previous_tip {
                 chain.active_blocks_after(previous_tip)?
             } else {
@@ -1457,6 +1460,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            prune: 0,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,

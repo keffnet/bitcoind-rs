@@ -108,6 +108,19 @@ impl BlockStore {
         &self.path
     }
 
+    /// Return the bytes occupied by block and undo records.
+    ///
+    /// Core's automatic prune target covers these two files rather than the
+    /// small metadata indexes, so keep the accounting aligned with that
+    /// behavior.
+    pub fn disk_usage(&self) -> Result<u64> {
+        self.file
+            .metadata()?
+            .len()
+            .checked_add(self.undo_file.metadata()?.len())
+            .context("block store disk usage overflowed")
+    }
+
     pub fn contains(&self, hash: &BlockHash) -> bool {
         self.index.contains_key(hash)
     }

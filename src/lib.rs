@@ -529,6 +529,7 @@ pub struct Node {
     added_nodes: parking_lot::RwLock<HashSet<SocketAddr>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
     listen_address: parking_lot::RwLock<Option<SocketAddr>>,
+    last_mining_block: parking_lot::RwLock<Option<(u64, usize)>>,
     pub started_at: Instant,
     shutdown: Notify,
 }
@@ -627,6 +628,7 @@ impl Node {
             added_nodes: parking_lot::RwLock::new(added_nodes),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
             listen_address: parking_lot::RwLock::new(None),
+            last_mining_block: parking_lot::RwLock::new(None),
             started_at: Instant::now(),
             shutdown: Notify::new(),
         }))
@@ -1207,6 +1209,15 @@ impl Node {
 
     pub(crate) fn listen_address(&self) -> Option<SocketAddr> {
         *self.listen_address.read()
+    }
+
+    pub(crate) fn record_mining_block(&self, block: &Block) {
+        *self.last_mining_block.write() =
+            Some((block.weight().to_wu(), block.txdata.len().saturating_sub(1)));
+    }
+
+    pub(crate) fn last_mining_block(&self) -> Option<(u64, usize)> {
+        *self.last_mining_block.read()
     }
 
     pub fn set_network_active(&self, active: bool) {

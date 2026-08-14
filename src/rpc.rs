@@ -3464,6 +3464,10 @@ fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
         "target": format!("{:064x}", header.target()),
         "warnings": [],
     });
+    if let Some((weight, transactions)) = node.last_mining_block() {
+        result["currentblockweight"] = json!(weight);
+        result["currentblocktx"] = json!(transactions);
+    }
     if let Some(challenge) = chain.signet_challenge() {
         result["signet_challenge"] = json!(hex::encode(challenge));
     }
@@ -8027,6 +8031,7 @@ fn build_mining_block_with_transactions(
     if block.weight().to_wu() > node.config.block_max_weight {
         bail!("generated block exceeds the block weight limit")
     }
+    node.record_mining_block(&block);
     Ok(block)
 }
 
@@ -8277,6 +8282,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         fees,
         extra_nonce: 0,
     })?;
+    node.record_mining_block(&template_block);
     let default_witness_commitment = segwit_active.then(|| {
         template_block
             .txdata
@@ -11523,6 +11529,16 @@ mod tests {
         assert!(info["warnings"].is_array());
         assert!(info["bits"].as_str().is_some());
         assert!(info["target"].as_str().is_some());
+        assert!(info.get("currentblockweight").is_none());
+        assert!(info.get("currentblocktx").is_none());
+        get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
+        let info = get_mining_info(&node).unwrap();
+        assert!(
+            info["currentblockweight"]
+                .as_u64()
+                .is_some_and(|weight| weight > 0)
+        );
+        assert_eq!(info["currentblocktx"], json!(0));
     }
 
     #[test]

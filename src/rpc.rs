@@ -1026,6 +1026,7 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
 fn rpc_parameter_alias(method: &str, name: &str) -> Option<&'static str> {
     match (method, name) {
         ("getblock" | "getrawtransaction", "verbose") => Some("verbosity"),
+        ("dumptxoutset", "rollback") => Some("options"),
         _ => None,
     }
 }
@@ -1102,7 +1103,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "getmempoolcluster" => Some(&["txid"]),
         "importmempool" => Some(&["filepath", "options"]),
         "gettxoutsetinfo" => Some(&["hash_type", "hash_or_height", "use_index"]),
-        "dumptxoutset" => Some(&["path", "type"]),
+        "dumptxoutset" => Some(&["path", "type", "options"]),
         "loadtxoutset" => Some(&["path"]),
         "pruneblockchain" => Some(&["height"]),
         "waitfornewblock" => Some(&["timeout", "current_tip"]),
@@ -3500,12 +3501,28 @@ fn precious_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let path = param::<String>(params, 0)?;
+    let path = snapshot_path(node, &param::<String>(params, 0)?);
     let dump_type = params.get(1).and_then(Value::as_str).unwrap_or("latest");
     if dump_type != "latest" {
         bail!("only the latest UTXO snapshot type is supported")
     }
-    let path = std::path::PathBuf::from(path);
+    if let Some(options) = params.get(2).filter(|value| !value.is_null()) {
+        let Some(options) = options.as_object() else {
+            bail!("historical UTXO rollback snapshots are not supported")
+        };
+        if options.contains_key("rollback") {
+            bail!("historical UTXO rollback snapshots are not supported")
+        }
+        if let Some(name) = options.keys().next() {
+            bail!("unknown dumptxoutset option {name}")
+        }
+    }
+    if path.exists() {
+        bail!(
+            "{} already exists; move it out of the way before creating a snapshot",
+            path.display()
+        )
+    }
     let chain = node.chain.read();
     let (coins_written, base_hash, base_height) = chain.dump_utxo_set(&path)?;
     Ok(json!({
@@ -3513,18 +3530,29 @@ fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "base_hash": base_hash.to_string(),
         "base_height": base_height,
         "path": path.to_string_lossy(),
+        "txoutset_hash": chain.utxo_serialized_hash(),
+        "nchaintx": chain.active_transaction_count(),
     }))
 }
 
 fn load_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let path = param::<String>(params, 0)?;
-    let path = std::path::PathBuf::from(path);
+    let path = snapshot_path(node, &param::<String>(params, 0)?);
     let (coins_loaded, tip_hash, base_height) = node.chain.write().load_utxo_set(&path)?;
     Ok(json!({
         "coins_loaded": coins_loaded,
         "tip_hash": tip_hash.to_string(),
         "base_height": base_height,
+        "path": path.to_string_lossy(),
     }))
+}
+
+fn snapshot_path(node: &Arc<Node>, path: &str) -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        node.config.datadir.join(path)
+    }
 }
 
 fn prune_blockchain(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -9186,27 +9214,12 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()?;
     blocks.sort_by_key(|(height, _, _)| *height);
+    blocks.dedup_by_key(|(_, hash, _)| *hash);
 
     let mut activity = Vec::new();
     for (height, hash, block) in blocks {
         for transaction in &block.txdata {
             let txid = transaction.compute_txid();
-            for (vout, output) in transaction.output.iter().enumerate() {
-                if scripts.iter().any(|script| script == &output.script_pubkey) {
-                    activity.push(json!({
-                        "type": "receive",
-                        "amount": sat_to_btc(output.value.to_sat()),
-                        "blockhash": hash.to_string(),
-                        "height": height,
-                        "txid": txid.to_string(),
-                        "vout": vout,
-                        "output_spk": script_json_with_network(
-                            &output.script_pubkey,
-                            Some(node.config.network),
-                        ),
-                    }));
-                }
-            }
             for (vin, input) in transaction.input.iter().enumerate() {
                 if input.previous_output.is_null() {
                     continue;
@@ -9234,21 +9247,13 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     }));
                 }
             }
-        }
-    }
-
-    if include_mempool {
-        let mempool = node.mempool.read();
-        for txid in mempool.transaction_order() {
-            let Some(entry) = mempool.get(&txid) else {
-                continue;
-            };
-            for (vout, output) in entry.transaction.output.iter().enumerate() {
+            for (vout, output) in transaction.output.iter().enumerate() {
                 if scripts.iter().any(|script| script == &output.script_pubkey) {
                     activity.push(json!({
                         "type": "receive",
                         "amount": sat_to_btc(output.value.to_sat()),
-                        "spend_txid": Value::Null,
+                        "blockhash": hash.to_string(),
+                        "height": height,
                         "txid": txid.to_string(),
                         "vout": vout,
                         "output_spk": script_json_with_network(
@@ -9258,6 +9263,15 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     }));
                 }
             }
+        }
+    }
+
+    if include_mempool {
+        let mempool = node.mempool.read();
+        for txid in mempool.transaction_order() {
+            let Some(entry) = mempool.get(&txid) else {
+                continue;
+            };
             for (vin, input) in entry.transaction.input.iter().enumerate() {
                 let Some(output) = output_for_outpoint(&chain, &mempool, input.previous_output)
                 else {
@@ -9272,6 +9286,20 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         "prevout_txid": input.previous_output.txid.to_string(),
                         "prevout_vout": input.previous_output.vout,
                         "prevout_spk": script_json_with_network(
+                            &output.script_pubkey,
+                            Some(node.config.network),
+                        ),
+                    }));
+                }
+            }
+            for (vout, output) in entry.transaction.output.iter().enumerate() {
+                if scripts.iter().any(|script| script == &output.script_pubkey) {
+                    activity.push(json!({
+                        "type": "receive",
+                        "amount": sat_to_btc(output.value.to_sat()),
+                        "txid": txid.to_string(),
+                        "vout": vout,
+                        "output_spk": script_json_with_network(
                             &output.script_pubkey,
                             Some(node.config.network),
                         ),
@@ -10927,6 +10955,12 @@ mod tests {
         assert_eq!(normalized, json!(["00", 1, null]));
         let normalized = normalize_rpc_params("getorphantxs", &json!({"verbosity": 2})).unwrap();
         assert_eq!(normalized, json!([2]));
+        let normalized = normalize_rpc_params(
+            "dumptxoutset",
+            &json!({"path": "utxo.dat", "type": "latest", "options": {}}),
+        )
+        .unwrap();
+        assert_eq!(normalized, json!(["utxo.dat", "latest", {}]));
         let normalized = normalize_rpc_params(
             "createpsbt",
             &json!({"inputs": [], "outputs": [], "version": 3}),
@@ -14520,9 +14554,17 @@ mod tests {
         let dumped = dump_txoutset(&node, &json!([path.to_string_lossy()])).unwrap();
         assert_eq!(dumped["base_height"], 0);
         assert_eq!(dumped["coins_written"], 0);
+        assert_eq!(dumped["nchaintx"], 1);
+        assert!(
+            dumped["txoutset_hash"]
+                .as_str()
+                .is_some_and(|hash| !hash.is_empty())
+        );
+        assert_eq!(dumped["path"], path.to_string_lossy().as_ref());
         let loaded = load_txoutset(&node, &json!([path.to_string_lossy()])).unwrap();
         assert_eq!(loaded["base_height"], 0);
         assert_eq!(loaded["coins_loaded"], 0);
+        assert_eq!(loaded["path"], path.to_string_lossy().as_ref());
     }
 
     #[test]
@@ -14595,6 +14637,12 @@ mod tests {
         let activity =
             get_descriptor_activity(&node, &json!([[hash], [descriptor], false])).unwrap();
         assert_eq!(activity["activity"][0]["type"], "receive");
+        let duplicate_activity = get_descriptor_activity(
+            &node,
+            &json!([[hash, hash], [format!("addr({address})")], false]),
+        )
+        .unwrap();
+        assert_eq!(duplicate_activity["activity"].as_array().unwrap().len(), 1);
         assert_eq!(
             get_chain_states(&node).unwrap()["chainstates"][0]["blocks"],
             1

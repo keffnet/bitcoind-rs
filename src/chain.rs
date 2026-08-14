@@ -1643,6 +1643,12 @@ impl ChainState {
         (stats.transactions, stats.outputs, stats.total_amount_sat)
     }
 
+    /// Return the number of transactions in the active chain through the tip.
+    /// This is the chain transaction count reported by UTXO snapshot RPCs.
+    pub fn active_transaction_count(&self) -> usize {
+        self.tx_index.len()
+    }
+
     pub fn utxo_bogo_size(&self) -> u64 {
         self.utxo_statistics(false, false).bogo_size
     }

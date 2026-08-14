@@ -8475,11 +8475,13 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         .cloned()
         .collect::<Vec<_>>();
     drop(chain);
+    let changes = candidate.take_changes();
     let removed = before_transactions
         .into_iter()
         .filter_map(|(txid, transaction)| candidate.get(&txid).is_none().then_some(transaction))
         .collect::<Vec<_>>();
     *node.mempool.write() = candidate;
+    node.notify_zmq_mempool_changes(changes);
     node.notify_mempool_removals(removed);
     for transaction in accepted {
         node.notify_mempool_transaction(transaction);

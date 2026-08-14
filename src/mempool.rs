@@ -55,6 +55,19 @@ pub struct MempoolEntry {
     pub height: u32,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum MempoolChangeKind {
+    Added,
+    Removed { notify_zmq: bool },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct MempoolChange {
+    pub transaction: Transaction,
+    pub sequence: u64,
+    pub kind: MempoolChangeKind,
+}
+
 #[derive(Clone)]
 pub struct Mempool {
     pub network: Network,
@@ -66,6 +79,7 @@ pub struct Mempool {
     children: HashMap<Txid, HashSet<Txid>>,
     wtxids: HashMap<Wtxid, Txid>,
     priorities: HashMap<Txid, i64>,
+    changes: Vec<MempoolChange>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +136,7 @@ impl Mempool {
             children: HashMap::new(),
             wtxids: HashMap::new(),
             priorities: HashMap::new(),
+            changes: Vec::new(),
         }
     }
 
@@ -143,6 +158,10 @@ impl Mempool {
 
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub(crate) fn take_changes(&mut self) -> Vec<MempoolChange> {
+        std::mem::take(&mut self.changes)
     }
 
     pub fn get(&self, txid: &Txid) -> Option<&MempoolEntry> {
@@ -709,6 +728,34 @@ impl Mempool {
         enforce_fee_rate: bool,
         enforce_mempool_policy: bool,
     ) -> Result<Txid, MempoolError> {
+        self.accept_at_with_sequence(
+            transaction,
+            chain,
+            added_at,
+            enforce_fee_rate,
+            enforce_mempool_policy,
+            true,
+        )
+    }
+
+    fn accept_at_without_sequence(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_at_with_sequence(transaction, chain, added_at, false, false, false)
+    }
+
+    fn accept_at_with_sequence(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
+        enforce_fee_rate: bool,
+        enforce_mempool_policy: bool,
+        record_sequence: bool,
+    ) -> Result<Txid, MempoolError> {
         let txid = transaction.compute_txid();
         if self.entries.contains_key(&txid) {
             return Err(MempoolError::AlreadyPresent);
@@ -854,8 +901,31 @@ impl Mempool {
         self.bytes += size;
         self.entries.insert(txid, entry);
         self.wtxids.insert(wtxid, txid);
-        self.sequence = self.sequence.saturating_add(1);
+        if record_sequence {
+            let sequence = self.sequence;
+            self.sequence = self.sequence.saturating_add(1);
+            self.changes.push(MempoolChange {
+                transaction: self
+                    .entries
+                    .get(&txid)
+                    .expect("inserted mempool transaction")
+                    .transaction
+                    .clone(),
+                sequence,
+                kind: MempoolChangeKind::Added,
+            });
+        }
         Ok(txid)
+    }
+
+    fn record_removal(&mut self, transaction: Transaction, notify_zmq: bool) {
+        let sequence = self.sequence;
+        self.sequence = self.sequence.saturating_add(1);
+        self.changes.push(MempoolChange {
+            transaction,
+            sequence,
+            kind: MempoolChangeKind::Removed { notify_zmq },
+        });
     }
 
     fn ancestors_for_transaction(&self, transaction: &Transaction) -> HashSet<Txid> {
@@ -1098,20 +1168,26 @@ impl Mempool {
         for txid in transaction_ids {
             visit(txid, &entries, &mut visited, &mut visiting, &mut ordered);
         }
-        self.sequence = self
-            .sequence
-            .saturating_add(u64::try_from(self.entries.len()).unwrap_or(u64::MAX));
         self.entries.clear();
         self.spent.clear();
         self.children.clear();
         self.wtxids.clear();
         self.bytes = 0;
         for (added_at, transaction) in ordered {
-            let _ = self.accept_reorg(transaction, chain, added_at);
+            if self
+                .accept_at_without_sequence(transaction.clone(), chain, added_at)
+                .is_err()
+            {
+                self.record_removal(transaction, true);
+            }
         }
     }
 
     pub fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
+        self.remove_with_notification(txid, true)
+    }
+
+    fn remove_with_notification(&mut self, txid: &Txid, notify_zmq: bool) -> Option<MempoolEntry> {
         let entry = self.entries.remove(txid)?;
         self.wtxids.remove(&entry.transaction.compute_wtxid());
         let size = bitcoin::consensus::encode::serialize(&entry.transaction).len();
@@ -1126,14 +1202,14 @@ impl Mempool {
             }
         }
         self.children.remove(txid);
-        self.sequence = self.sequence.saturating_add(1);
+        self.record_removal(entry.transaction.clone(), notify_zmq);
         Some(entry)
     }
 
     pub fn remove_confirmed(&mut self, block: &bitcoin::Block) {
         for transaction in &block.txdata {
             let txid = transaction.compute_txid();
-            self.remove(&txid);
+            self.remove_with_notification(&txid, false);
         }
     }
 
@@ -1634,6 +1710,30 @@ mod tests {
         let mut loaded = Mempool::new(Network::Regtest);
         loaded.load_from_file(&path, &chain).unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn revalidation_sequences_only_removed_transactions() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let root = graph_transaction(Txid::from_byte_array([1; 32]), 1);
+        let child = graph_transaction(root.compute_txid(), 2);
+        let mut pool = Mempool::new(Network::Regtest);
+        insert_policy_entry(&mut pool, root);
+        insert_policy_entry(&mut pool, child);
+
+        pool.revalidate(&chain);
+
+        assert!(pool.is_empty());
+        assert_eq!(pool.sequence(), 2);
+        let changes = pool.take_changes();
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().all(|change| matches!(
+            &change.kind,
+            &MempoolChangeKind::Removed { notify_zmq: true }
+        )));
+        assert_eq!(changes[0].sequence, 0);
+        assert_eq!(changes[1].sequence, 1);
     }
 
     #[test]

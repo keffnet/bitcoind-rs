@@ -122,6 +122,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
     let mut session = ElectrumSession::default();
     let mut headers_subscribed = false;
+    let mut numblocks_subscribed = false;
     let mut last_chain_tip = node.chain.read().best_hash();
     loop {
         line.clear();
@@ -151,6 +152,15 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         encoded.push(b'\n');
                         write_half.write_all(&encoded).await?;
                     }
+                }
+                if numblocks_subscribed {
+                    let mut encoded = serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "method": "blockchain.numblocks.subscribe",
+                        "params": [tip.height],
+                    }))?;
+                    encoded.push(b'\n');
+                    write_half.write_all(&encoded).await?;
                 }
                 send_status_notifications(
                     &node,
@@ -200,6 +210,9 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                 if method == "blockchain.headers.subscribe" && result.is_ok() {
                     headers_subscribed = true;
                 }
+                if method == "blockchain.numblocks.subscribe" && result.is_ok() {
+                    numblocks_subscribed = true;
+                }
                 if is_notification {
                     continue;
                 }
@@ -246,6 +259,7 @@ fn dispatch_with_session(
             let header = chain.header(height).expect("tip header exists");
             Ok(json!({"height": height, "hex": hex::encode(serialize(header))}))
         }
+        "blockchain.numblocks.subscribe" => Ok(json!(node.chain.read().height())),
         "blockchain.block.header" | "blockchain.block.get_header" => block_header(node, params),
         "blockchain.block.headers" => {
             block_headers_for_protocol(node, params, session.protocol_version)
@@ -1561,6 +1575,17 @@ mod tests {
         .unwrap();
         assert_eq!(features["protocol_max"], json!("1.7"));
         assert!(features.get("hash_function").is_none());
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "blockchain.numblocks.subscribe",
+                &json!([]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!(0)
+        );
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
         let address_balance = dispatch_with_session(
             &node,

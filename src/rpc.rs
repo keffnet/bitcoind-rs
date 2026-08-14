@@ -491,7 +491,9 @@ fn rest_block(
     match format {
         "json" => rest_json(get_block(
             node,
-            &json!([hash.to_string(), if details { 2 } else { 1 }]),
+            // Core's /rest/block endpoint uses SHOW_DETAILS_AND_PREVOUT for
+            // the extended JSON form, which is RPC verbosity 3 here.
+            &json!([hash.to_string(), if details { 3 } else { 1 }]),
         )?),
         "bin" => Ok(("application/octet-stream", serialize(&block))),
         "hex" => rest_format_bytes(serialize(&block), format),
@@ -10079,6 +10081,7 @@ fn rpc_help(method: &str) -> String {
         "getblockstats",
         "getchaintxstats",
         "getnetworkhashps",
+        "getmemoryinfo",
         "gettxoutproof",
         "verifytxoutproof",
         "submitheader",
@@ -10161,6 +10164,7 @@ fn rpc_help(method: &str) -> String {
         "ping",
         "setnetworkactive",
         "getrpcinfo",
+        "stop",
         "estimatesmartfee",
         "estimaterawfee",
         "getdifficulty",
@@ -10707,6 +10711,10 @@ mod tests {
             dispatch_method(&node, "syncwithvalidationinterfacequeue", &json!([])).unwrap(),
             Value::Null
         );
+        let help = dispatch_method(&node, "help", &json!([])).unwrap();
+        let help = help.as_str().expect("help returns text");
+        assert!(help.lines().any(|line| line == "getmemoryinfo"));
+        assert!(help.lines().any(|line| line == "stop"));
         let generate_error = dispatch_method(&node, "generate", &json!([])).unwrap_err();
         assert!(
             generate_error

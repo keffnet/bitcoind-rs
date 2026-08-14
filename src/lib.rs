@@ -1429,6 +1429,89 @@ mod tests {
         );
     }
 
+    #[test]
+    fn zmq_mempool_sequence_preserves_confirmed_transaction_gaps() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.zmq.pub_sequence = vec!["tcp://127.0.0.1:0".to_owned()];
+        let node = Node::open(config).unwrap();
+
+        for height in 1..=101 {
+            let previous = *node.chain.read().header(height - 1).unwrap();
+            node.connect_block(mine_test_block(&previous, height, height as u8))
+                .unwrap();
+        }
+        let mut notifications = node.subscribe_zmq();
+
+        let funding_hash = node.chain.read().block_hash(1).unwrap();
+        let funding_block = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        let funding = OutPoint::new(funding_block.txdata[0].compute_txid(), 0);
+        let first = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding,
+                script_sig: ScriptBuf::from_bytes(vec![0; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        node.accept_transaction(first.clone()).unwrap();
+        let first_event = notifications.try_recv().unwrap();
+        let zmq::Event::TransactionAdded {
+            mempool_sequence, ..
+        } = first_event
+        else {
+            panic!("unexpected first ZMQ event");
+        };
+        assert!(
+            mempool_sequence == 0,
+            "first sequence was {mempool_sequence}"
+        );
+
+        let previous = *node.chain.read().header(101).unwrap();
+        let mut block = mine_test_block(&previous, 102, 102);
+        block.txdata.push(first.clone());
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block.header.nonce = 0;
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        node.connect_block(block).unwrap();
+        assert!(matches!(
+            notifications.try_recv().unwrap(),
+            zmq::Event::BlockConnected(_)
+        ));
+        assert!(notifications.try_recv().is_err());
+
+        let second = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(first.compute_txid(), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_998_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        node.accept_transaction(second).unwrap();
+        assert!(matches!(
+            notifications.try_recv().unwrap(),
+            zmq::Event::TransactionAdded {
+                mempool_sequence: 2,
+                ..
+            }
+        ));
+    }
+
     fn mine_test_block(previous: &Header, height: u32, tag: u8) -> Block {
         let mut block = Block {
             header: Header {

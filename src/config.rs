@@ -478,21 +478,19 @@ pub struct Args {
 
     #[arg(
         long,
-        default_value_t = true,
         num_args = 0..=1,
         default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    pub listen: bool,
+    pub listen: Option<bool>,
 
     #[arg(
         long,
-        default_value_t = true,
         num_args = 0..=1,
         default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    pub dnsseed: bool,
+    pub dnsseed: Option<bool>,
 
     #[arg(long, default_value = "127.0.0.1:8332")]
     pub rpc: SocketAddr,
@@ -742,18 +740,27 @@ pub struct Config {
 
 impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
-        if args.max_peers == 0 {
-            bail!("--max-peers must be greater than zero");
-        }
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
         }
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
             bail!("--proxy must use a non-zero port");
         }
-        if !args.listen && !args.whitebind.is_empty() {
+        let listen = args.listen.unwrap_or(
+            !args.whitebind.is_empty()
+                || (args.proxy.is_none() && args.connect.is_empty() && args.max_peers > 0),
+        );
+        if !listen && !args.whitebind.is_empty() {
             bail!("--whitebind cannot be used with --listen=false");
         }
+        let clearnet_reachable = args.onlynet.is_empty()
+            || args
+                .onlynet
+                .iter()
+                .any(|network| matches!(network, OnlyNet::Ipv4 | OnlyNet::Ipv6));
+        let dnsseed = args
+            .dnsseed
+            .unwrap_or(args.connect.is_empty() && args.max_peers > 0 && clearnet_reachable);
         let peer_permissions = PeerPermissionConfig::from_args(
             &args.whitelist,
             &args.whitebind,
@@ -827,7 +834,7 @@ impl Config {
         {
             bail!("ZMQ high water marks must be greater than zero");
         }
-        if args.listen
+        if listen
             && args.p2p.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
             && args.p2p.port() == 0
         {
@@ -856,12 +863,12 @@ impl Config {
             network: args.network.into(),
             datadir: args.datadir,
             p2p_bind: args.p2p,
-            listen: args.listen,
+            listen,
             rpc_bind: Some(args.rpc),
             electrum_bind: Some(args.electrum),
             rest: args.rest,
             seed_nodes: args.connect,
-            dnsseed: args.dnsseed,
+            dnsseed,
             onlynet: args.onlynet,
             proxy: args.proxy,
             peer_permissions,
@@ -955,6 +962,59 @@ mod tests {
         assert!(config.allows_address("192.0.2.1:8333".parse().unwrap()));
         assert!(!config.allows_address("[2001:db8::1]:8333".parse().unwrap()));
         assert_eq!(config.prune, 0);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--proxy=127.0.0.1:9050",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(!config.listen);
+        assert!(config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--proxy=127.0.0.1:9050",
+            "--listen=true",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().listen);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--connect=192.0.2.1:8333",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(!config.listen);
+        assert!(!config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--max-peers=0",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(!config.listen);
+        assert!(!config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--proxy=127.0.0.1:9050",
+            "--whitebind=127.0.0.1:18444",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().listen);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -166,7 +166,6 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                     &node,
                     &mut subscriptions,
                     &mut write_half,
-                    true,
                     reorg,
                 )
                     .await?;
@@ -178,7 +177,6 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                             &node,
                             &mut subscriptions,
                             &mut write_half,
-                            false,
                             false,
                         )
                             .await?;
@@ -1096,7 +1094,6 @@ async fn send_status_notifications(
     node: &Arc<Node>,
     subscriptions: &mut HashMap<String, Subscription>,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    refresh_history: bool,
     force_scriptpubkey_notification: bool,
 ) -> Result<()> {
     for subscription in subscriptions.values_mut() {
@@ -1106,9 +1103,6 @@ async fn send_status_notifications(
                 script_hash,
                 status,
             } => {
-                if !refresh_history {
-                    continue;
-                }
                 let current = history_status_for_script(node, script_hash)
                     .map(Value::String)
                     .unwrap_or(Value::Null);
@@ -1127,9 +1121,6 @@ async fn send_status_notifications(
                 script_hash,
                 status,
             } => {
-                if !refresh_history {
-                    continue;
-                }
                 let current = history_status_for_script(node, script_hash)
                     .map(Value::String)
                     .unwrap_or(Value::Null);
@@ -1148,9 +1139,6 @@ async fn send_status_notifications(
                 script_hash,
                 status,
             } => {
-                if !refresh_history {
-                    continue;
-                }
                 let current = history_status_for_script(node, script_hash)
                     .map(Value::String)
                     .unwrap_or(Value::Null);
@@ -1535,6 +1523,100 @@ mod tests {
             &json!("new-status"),
             false
         ));
+    }
+
+    #[tokio::test]
+    async fn history_notifications_refresh_after_mempool_activity() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let node = Arc::new(Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
+            persist_mempool: true,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })?);
+        let genesis = *node.chain.read().header(0).expect("genesis header exists");
+        let mut funding_outpoint = None;
+        let mut previous = genesis;
+        for height in 1..=101 {
+            let block = mine_test_block(&previous, height, height as u8);
+            if height == 1 {
+                funding_outpoint = Some(OutPoint::new(block.txdata[0].compute_txid(), 0));
+            }
+            previous = block.header;
+            node.connect_block(block)?;
+        }
+        let funding_outpoint = funding_outpoint.expect("funding output exists");
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding_outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 100]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let script_hash = chain::electrum_script_hash(&transaction.output[0].script_pubkey);
+        let key = format!("scripthash:{script_hash}");
+        let mut subscriptions = HashMap::new();
+        subscriptions.insert(
+            key.clone(),
+            Subscription::Scripthash {
+                script_hash: script_hash.clone(),
+                status: Value::Null,
+            },
+        );
+        node.accept_transaction(transaction)?;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+        let _client = client?;
+        let (server, _) = accepted?;
+        let (_, mut writer) = server.into_split();
+        send_status_notifications(&node, &mut subscriptions, &mut writer, false).await?;
+
+        let Subscription::Scripthash { status, .. } = subscriptions.get(&key).unwrap() else {
+            panic!("expected scripthash subscription")
+        };
+        assert!(status.is_string());
+        Ok(())
     }
 
     #[test]

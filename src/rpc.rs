@@ -1802,11 +1802,25 @@ fn peer_services_names(services: u64) -> Vec<&'static str> {
 
 fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let value = param::<String>(params, 0)?;
-    let Ok(unchecked) = value.parse::<Address<bitcoin::address::NetworkUnchecked>>() else {
-        return Ok(json!({"isvalid": false}));
+    let unchecked = match value.parse::<Address<bitcoin::address::NetworkUnchecked>>() {
+        Ok(address) => address,
+        Err(error) => {
+            return Ok(json!({
+                "isvalid": false,
+                "error_locations": [],
+                "error": error.to_string(),
+            }));
+        }
     };
-    let Ok(address) = unchecked.require_network(node.config.network) else {
-        return Ok(json!({"isvalid": false}));
+    let address = match unchecked.require_network(node.config.network) {
+        Ok(address) => address,
+        Err(error) => {
+            return Ok(json!({
+                "isvalid": false,
+                "error_locations": [],
+                "error": error.to_string(),
+            }));
+        }
     };
     let witness_program = address.witness_program();
     let mut result = json!({
@@ -11050,6 +11064,10 @@ mod tests {
         let validated = validate_address(&node, &json!([address])).unwrap();
         assert_eq!(validated["isvalid"], true);
         assert_eq!(validated["iswitness"], true);
+        let invalid = validate_address(&node, &json!(["not-an-address"])).unwrap();
+        assert_eq!(invalid["isvalid"], false);
+        assert!(invalid["error"].as_str().is_some());
+        assert!(invalid["error_locations"].is_array());
         let witness_script = ScriptBuf::from_bytes(vec![0x51]);
         let p2wsh = Address::p2wsh(&witness_script, Network::Regtest);
         let validated_p2wsh = validate_address(&node, &json!([p2wsh.to_string()])).unwrap();

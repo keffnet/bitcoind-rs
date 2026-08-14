@@ -5070,6 +5070,7 @@ fn enforce_max_fee_rate(
 struct SigningPrevout {
     output: TxOut,
     redeem_script: Option<ScriptBuf>,
+    witness_script: Option<ScriptBuf>,
 }
 
 fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -5167,10 +5168,18 @@ fn parse_signing_prevouts(value: Option<&Value>) -> Result<HashMap<OutPoint, Sig
                 .ok_or_else(|| anyhow!("prevtx scriptPubKey is missing"))?;
             let amount = entry
                 .get("amount")
-                .and_then(Value::as_f64)
-                .ok_or_else(|| anyhow!("prevtx amount is missing"))?;
+                .ok_or_else(|| anyhow!("prevtx amount is missing"))
+                .and_then(|value| parse_btc_amount(value, "prevtx amount"))?;
             let redeem_script = entry
                 .get("redeemScript")
+                .filter(|value| !value.is_null())
+                .and_then(Value::as_str)
+                .map(|script| -> Result<ScriptBuf> {
+                    Ok(ScriptBuf::from_bytes(hex::decode(script)?))
+                })
+                .transpose()?;
+            let witness_script = entry
+                .get("witnessScript")
                 .filter(|value| !value.is_null())
                 .and_then(Value::as_str)
                 .map(|script| -> Result<ScriptBuf> {
@@ -5181,10 +5190,11 @@ fn parse_signing_prevouts(value: Option<&Value>) -> Result<HashMap<OutPoint, Sig
                 OutPoint::new(txid, vout),
                 SigningPrevout {
                     output: TxOut {
-                        value: Amount::from_btc(amount)?,
+                        value: amount,
                         script_pubkey: ScriptBuf::from_bytes(hex::decode(script)?),
                     },
                     redeem_script,
+                    witness_script,
                 },
             ))
         })
@@ -5199,67 +5209,137 @@ fn sign_transaction_input(
     secp: &Secp256k1<bitcoin::secp256k1::All>,
     sighash_type: EcdsaSighashType,
 ) -> Result<()> {
-    let signing_script = prevout
-        .redeem_script
-        .as_ref()
-        .unwrap_or(&prevout.output.script_pubkey);
-    let key = private_keys
-        .iter()
-        .find(|key| key_matches_script(key, signing_script, secp))
-        .ok_or_else(|| anyhow!("no private key matches the prevout script"))?;
-    let public_key = key.public_key(secp);
-    if signing_script.is_p2wpkh() {
-        let sighash = SighashCache::new(&*transaction).p2wpkh_signature_hash(
+    let nested = prevout.output.script_pubkey.is_p2sh();
+    let (signing_script, segwit) = if let Some(witness_script) = &prevout.witness_script {
+        if !(prevout.output.script_pubkey.is_p2wsh()
+            || (nested
+                && prevout
+                    .redeem_script
+                    .as_ref()
+                    .is_some_and(|script| script.is_p2wsh())))
+        {
+            bail!("witnessScript does not match the prevout script")
+        }
+        (witness_script, true)
+    } else if let Some(redeem_script) = &prevout.redeem_script {
+        (redeem_script, redeem_script.is_witness_program())
+    } else {
+        (&prevout.output.script_pubkey, false)
+    };
+
+    let message = if signing_script.is_p2wpkh() {
+        Message::from(SighashCache::new(&*transaction).p2wpkh_signature_hash(
             input_index,
             signing_script,
             prevout.output.value,
             sighash_type,
-        )?;
-        let signature = secp.sign_ecdsa(&Message::from(sighash), &key.inner);
-        let signature = EcdsaSignature {
-            signature,
+        )?)
+    } else if segwit {
+        Message::from(SighashCache::new(&*transaction).p2wsh_signature_hash(
+            input_index,
+            signing_script,
+            prevout.output.value,
             sighash_type,
-        };
-        {
-            let mut cache = SighashCache::new(&mut *transaction);
-            *cache
-                .witness_mut(input_index)
-                .ok_or_else(|| anyhow!("input index is out of range"))? =
-                Witness::p2wpkh(&signature, &public_key.inner);
-        }
-        if prevout.output.script_pubkey.is_p2sh() {
-            let redeem = PushBytesBuf::try_from(signing_script.as_bytes().to_vec())
-                .map_err(|_| anyhow!("redeem script is too large"))?;
-            transaction.input[input_index].script_sig =
-                Builder::new().push_slice(redeem).into_script();
-        }
-    } else if signing_script.is_p2pkh() || signing_script.is_p2pk() {
-        let sighash = SighashCache::new(&*transaction).legacy_signature_hash(
+        )?)
+    } else {
+        Message::from(SighashCache::new(&*transaction).legacy_signature_hash(
             input_index,
             signing_script,
             sighash_type.to_u32(),
-        )?;
-        let signature = secp.sign_ecdsa(&Message::from(sighash), &key.inner);
-        let mut signature_bytes = signature.serialize_der().to_vec();
-        signature_bytes.push(sighash_type.to_u32() as u8);
-        let signature = PushBytesBuf::try_from(signature_bytes)
-            .map_err(|_| anyhow!("signature is too large"))?;
-        let public_key = PushBytesBuf::try_from(public_key.to_bytes())
-            .map_err(|_| anyhow!("public key is too large"))?;
-        let mut builder = Builder::new();
-        if signing_script.is_p2pk() {
-            builder = builder.push_slice(signature);
+        )?)
+    };
+
+    let signature_for_key = |key: &bitcoin::PrivateKey| {
+        let signature = secp.sign_ecdsa(&message, &key.inner);
+        let mut bytes = signature.serialize_der().to_vec();
+        bytes.push(sighash_type.to_u32() as u8);
+        Ok::<_, anyhow::Error>(bytes)
+    };
+
+    if let Some((required, public_keys)) = multisig_script_keys(signing_script) {
+        let mut signatures = Vec::new();
+        for public_key in public_keys {
+            let Some(key) = private_keys
+                .iter()
+                .find(|key| key.public_key(secp) == public_key)
+            else {
+                continue;
+            };
+            signatures.push(signature_for_key(key)?);
+            if signatures.len() == required {
+                break;
+            }
+        }
+        if signatures.len() < required {
+            bail!("not enough private keys match the multisig script")
+        }
+        let mut items = vec![Vec::new()];
+        items.extend(signatures);
+        if segwit {
+            items.push(signing_script.to_bytes());
+            transaction.input[input_index].witness = Witness::from_slice(&items);
+            if nested {
+                let redeem_script = prevout
+                    .redeem_script
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("nested witness spend is missing redeemScript"))?;
+                transaction.input[input_index].script_sig =
+                    push_script_items(&[redeem_script.to_bytes()])?;
+            }
         } else {
-            builder = builder.push_slice(signature).push_slice(public_key);
+            if nested {
+                items.push(signing_script.to_bytes());
+            }
+            transaction.input[input_index].script_sig = push_script_items(&items)?;
         }
-        if prevout.output.script_pubkey.is_p2sh() {
-            let redeem = PushBytesBuf::try_from(signing_script.as_bytes().to_vec())
-                .map_err(|_| anyhow!("redeem script is too large"))?;
-            builder = builder.push_slice(redeem);
+        return Ok(());
+    }
+
+    let key = private_keys
+        .iter()
+        .find(|key| key_matches_script(key, signing_script, secp))
+        .ok_or_else(|| anyhow!("no private key matches the prevout script"))?;
+    let signature = signature_for_key(key)?;
+    if signing_script.is_p2wpkh() {
+        let public_key = key.public_key(secp);
+        transaction.input[input_index].witness =
+            Witness::from_slice(&[signature, public_key.to_bytes()]);
+        if nested {
+            let redeem_script = prevout
+                .redeem_script
+                .as_ref()
+                .ok_or_else(|| anyhow!("nested witness spend is missing redeemScript"))?;
+            transaction.input[input_index].script_sig =
+                push_script_items(&[redeem_script.to_bytes()])?;
         }
-        transaction.input[input_index].script_sig = builder.into_script();
+    } else if segwit {
+        let mut items = vec![signature];
+        if signing_script.is_p2pkh() {
+            items.push(key.public_key(secp).to_bytes());
+        } else if !signing_script.is_p2pk() {
+            bail!("unsupported witnessScript template")
+        }
+        items.push(signing_script.to_bytes());
+        transaction.input[input_index].witness = Witness::from_slice(&items);
+        if nested {
+            let redeem_script = prevout
+                .redeem_script
+                .as_ref()
+                .ok_or_else(|| anyhow!("nested witness spend is missing redeemScript"))?;
+            transaction.input[input_index].script_sig =
+                push_script_items(&[redeem_script.to_bytes()])?;
+        }
+    } else if signing_script.is_p2pkh() || signing_script.is_p2pk() {
+        let mut items = vec![signature];
+        if !signing_script.is_p2pk() {
+            items.push(key.public_key(secp).to_bytes());
+        }
+        if nested {
+            items.push(signing_script.to_bytes());
+        }
+        transaction.input[input_index].script_sig = push_script_items(&items)?;
     } else {
-        bail!("only P2PK, P2PKH, P2WPKH, and nested P2SH-P2WPKH are supported")
+        bail!("unsupported signing script template")
     }
     Ok(())
 }
@@ -8744,6 +8824,53 @@ mod tests {
             deserialize(&hex::decode(result["hex"].as_str().unwrap()).unwrap()).unwrap();
         assert_eq!(signed.input[0].script_sig, ScriptBuf::new());
         assert_eq!(signed.input[0].witness.len(), 2);
+
+        let second_secret = bitcoin::secp256k1::SecretKey::from_slice(&[2; 32]).unwrap();
+        let second_public =
+            bitcoin::PrivateKey::new(second_secret, Network::Regtest).public_key(&secp);
+        let witness_script = Builder::new()
+            .push_int(1)
+            .push_key(&public_key)
+            .push_key(&second_public)
+            .push_int(2)
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
+            .into_script();
+        let witness_prevout_script = witness_script.to_p2wsh();
+        let witness_previous_txid = Txid::from_byte_array([9; 32]);
+        let witness_unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(witness_previous_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let multisig_result = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                hex::encode(serialize(&witness_unsigned)),
+                [private.to_wif()],
+                [{
+                    "txid": witness_previous_txid.to_string(),
+                    "vout": 0,
+                    "scriptPubKey": hex::encode(witness_prevout_script.as_bytes()),
+                    "witnessScript": hex::encode(witness_script.as_bytes()),
+                    "amount": "1.00000000",
+                }],
+            ]),
+        )
+        .unwrap();
+        assert_eq!(multisig_result["complete"], true);
+        let multisig_signed: Transaction =
+            deserialize(&hex::decode(multisig_result["hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(multisig_signed.input[0].script_sig.is_empty());
+        assert_eq!(multisig_signed.input[0].witness.len(), 3);
     }
 
     #[test]

@@ -228,6 +228,24 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub prune: u64,
 
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub reindex: bool,
+
+    #[arg(
+        long = "reindex-chainstate",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub reindex_chainstate: bool,
+
     #[arg(long, default_value_t = false)]
     pub txindex: bool,
 
@@ -329,6 +347,8 @@ pub struct Config {
     pub blocksonly: bool,
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
     pub prune: u64,
+    pub reindex: bool,
+    pub reindex_chainstate: bool,
     pub txindex: bool,
     pub txospenderindex: bool,
     pub coinstatsindex: bool,
@@ -466,6 +486,8 @@ impl Config {
             peer_bloom_filters: args.peer_bloom_filters,
             blocksonly: args.blocksonly,
             prune: args.prune,
+            reindex: args.reindex,
+            reindex_chainstate: args.reindex_chainstate,
             txindex: args.txindex,
             txospenderindex: args.txospenderindex,
             coinstatsindex: args.coinstatsindex,
@@ -520,6 +542,18 @@ mod tests {
         assert!(!config.dnsseed);
         assert!(config.blocksonly);
         assert_eq!(config.prune, 0);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--reindex",
+            "--reindex-chainstate=1",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.reindex);
+        assert!(config.reindex_chainstate);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

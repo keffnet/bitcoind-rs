@@ -60,6 +60,8 @@ Relay policy follows Core's fee and standardness switches: `--minrelaytxfee` and
 
 `--blockfilterindex=basic` enables the BIP157 basic compact-filter index, its RPC/REST methods, and compact-filter P2P service; it is disabled by default, matching Core.
 
+`--reindex` and `--reindex-chainstate` rebuild this implementation's chain metadata and UTXO state from the durable block store on startup. The rebuild ignores the existing JSON chainstate/snapshot files and preserves the stored block records.
+
 ZeroMQ topics can be enabled with the Core-style options, for example
 `--zmqpubhashtx tcp://127.0.0.1:28332 --zmqpubsequence tcp://127.0.0.1:28333`.
 `getzmqnotifications` reports the configured topic endpoints and high-water marks.

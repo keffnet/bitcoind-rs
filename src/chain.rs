@@ -243,6 +243,24 @@ impl ChainState {
         signet_challenge: Option<&[u8]>,
         blockfilter_index_enabled: bool,
     ) -> Result<Self> {
+        Self::open_with_options(
+            network,
+            data_dir,
+            signet_challenge,
+            blockfilter_index_enabled,
+            false,
+            false,
+        )
+    }
+
+    pub fn open_with_options(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
+        reindex: bool,
+        reindex_chainstate: bool,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
@@ -256,8 +274,25 @@ impl ChainState {
         }
 
         let metadata_path = data_dir.join("chainstate.json");
+        let rebuild_chainstate = reindex || reindex_chainstate;
+        if rebuild_chainstate {
+            for path in [
+                data_dir.join("chainstate.json"),
+                data_dir.join("chainstate.snapshot"),
+                data_dir.join("chainstate.snapshot.sha256"),
+            ] {
+                match fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error)
+                            .with_context(|| format!("removing reindex state {}", path.display()));
+                    }
+                }
+            }
+        }
         let (active_chain, persisted_headers, invalid_blocks, prune_height) =
-            if metadata_path.exists() {
+            if !rebuild_chainstate && metadata_path.exists() {
                 let bytes = fs::read(&metadata_path)
                     .with_context(|| format!("reading {}", metadata_path.display()))?;
                 let metadata: ChainMetadata = serde_json::from_slice(&bytes)
@@ -325,10 +360,23 @@ impl ChainState {
             basic_filter_cache: HashMap::new(),
             block_undo_cache: HashMap::new(),
         };
-        let snapshot = state.load_snapshot(&active_chain)?;
+        let snapshot = if rebuild_chainstate {
+            None
+        } else {
+            state.load_snapshot(&active_chain)?
+        };
         let loaded_snapshot = snapshot.is_some();
         let snapshot_verified = snapshot.as_ref().is_some_and(|(_, verified)| *verified);
-        if let Some((snapshot, _)) = snapshot {
+        if rebuild_chainstate {
+            state.initialize_genesis(&genesis)?;
+            state.rebuild_block_index()?;
+            let best = state
+                .best_valid_tip_hash()
+                .context("reindex found no valid chain tip")?;
+            if best != state.network_genesis_hash() {
+                state.activate_chain(best)?;
+            }
+        } else if let Some((snapshot, _)) = snapshot {
             state.active_chain = active_chain.clone();
             state.headers = snapshot.headers;
             state.utxos = snapshot.utxos;
@@ -368,7 +416,7 @@ impl ChainState {
                 state.connect_block_internal(block, false)?;
             }
         }
-        if state.active_chain != active_chain {
+        if !rebuild_chainstate && state.active_chain != active_chain {
             bail!("chainstate metadata does not match replayed active chain");
         }
         state.index_persisted_headers(&persisted_headers)?;
@@ -3211,6 +3259,33 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn reindex_rebuilds_chainstate_from_stored_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            let block = mine_block(&state, height);
+            state.connect_block(block).unwrap();
+        }
+        let tip_hash = state.best_hash();
+        let tip_stats = state.utxo_stats();
+        drop(state);
+
+        let rebuilt = ChainState::open_with_options(
+            Network::Regtest,
+            directory.path(),
+            None,
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(rebuilt.best_hash(), tip_hash);
+        assert_eq!(rebuilt.height(), 3);
+        assert_eq!(rebuilt.utxo_stats(), tip_stats);
+        assert!(directory.path().join("chainstate.json").exists());
     }
 
     #[test]

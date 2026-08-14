@@ -508,7 +508,7 @@ impl Node {
     }
 
     fn announce_zmq_mempool_added(&self, transaction: Transaction) {
-        if !self.config.zmq.is_enabled() || self.zmq_events.receiver_count() == 0 {
+        if !self.config.zmq.is_enabled() {
             return;
         }
         let mempool_sequence = self.zmq_mempool_sequence.fetch_add(1, Ordering::Relaxed);
@@ -519,7 +519,7 @@ impl Node {
     }
 
     fn announce_zmq_mempool_removed(&self, transaction: Transaction) {
-        if !self.config.zmq.is_enabled() || self.zmq_events.receiver_count() == 0 {
+        if !self.config.zmq.is_enabled() {
             return;
         }
         let mempool_sequence = self.zmq_mempool_sequence.fetch_add(1, Ordering::Relaxed);
@@ -1440,6 +1440,33 @@ mod tests {
             peer_bloom_filters: false,
             zmq: crate::config::ZmqConfig::default(),
         }
+    }
+
+    #[test]
+    fn zmq_mempool_sequence_advances_without_subscriber() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.zmq.pub_sequence = vec!["tcp://127.0.0.1:0".to_owned()];
+        let node = Node::open(config).unwrap();
+        let initial = node.zmq_mempool_sequence.load(Ordering::Relaxed);
+
+        node.announce_zmq_mempool_added(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        });
+        node.announce_zmq_mempool_removed(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: Vec::new(),
+        });
+
+        assert_eq!(
+            node.zmq_mempool_sequence.load(Ordering::Relaxed),
+            initial + 2
+        );
     }
 
     fn mine_test_block(previous: &Header, height: u32, tag: u8) -> Block {

@@ -9,6 +9,7 @@ pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 pub const DEFAULT_PERSIST_MEMPOOL: bool = true;
+pub const DEFAULT_BLOCKFILTERINDEX: &str = "0";
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -182,6 +183,23 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub coinstatsindex: bool,
 
+    #[arg(
+        long,
+        default_value = DEFAULT_BLOCKFILTERINDEX,
+        num_args = 0..=1,
+        default_missing_value = "basic"
+    )]
+    pub blockfilterindex: String,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub peerblockfilters: bool,
+
     #[arg(long = "maxmempool", default_value_t = DEFAULT_MAX_MEMPOOL_MB)]
     pub max_mempool: u64,
 
@@ -248,6 +266,8 @@ pub struct Config {
     pub txindex: bool,
     pub txospenderindex: bool,
     pub coinstatsindex: bool,
+    pub blockfilterindex: bool,
+    pub peer_block_filters: bool,
     /// Maximum mempool size in decimal megabytes, matching Core's option.
     pub max_mempool_mb: u64,
     /// Load and save the mempool automatically across node restarts.
@@ -295,6 +315,14 @@ impl Config {
             ),
             None => None,
         };
+        let blockfilterindex = match args.blockfilterindex.as_str() {
+            "0" | "false" => false,
+            "1" | "true" | "basic" => true,
+            value => bail!("unknown --blockfilterindex value {value}"),
+        };
+        if args.peerblockfilters && !blockfilterindex {
+            bail!("--peerblockfilters requires --blockfilterindex");
+        }
         std::fs::create_dir_all(&args.datadir)
             .with_context(|| format!("creating data directory {}", args.datadir.display()))?;
         Ok(Self {
@@ -315,6 +343,8 @@ impl Config {
             txindex: args.txindex,
             txospenderindex: args.txospenderindex,
             coinstatsindex: args.coinstatsindex,
+            blockfilterindex,
+            peer_block_filters: args.peerblockfilters,
             max_mempool_mb: args.max_mempool,
             persist_mempool: args.persistmempool,
             zmq: ZmqConfig {
@@ -395,6 +425,25 @@ mod tests {
             "bitcoind-rs",
             "--datadir",
             directory.path().to_str().unwrap(),
+            "--blockfilterindex=basic",
+            "--peerblockfilters",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().peer_block_filters);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--peerblockfilters",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
             "--coinstatsindex",
         ])
         .unwrap();
@@ -445,6 +494,24 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).unwrap().txospenderindex);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--blockfilterindex=basic",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().blockfilterindex);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--blockfilterindex=unknown",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -288,10 +288,11 @@ impl Node {
             .context("--maxmempool is too large")?;
         let max_mempool_bytes =
             usize::try_from(max_mempool_bytes).context("--maxmempool does not fit usize")?;
-        let mut chain = ChainState::open_with_signet_challenge(
+        let mut chain = ChainState::open_with_signet_challenge_and_filter_index(
             config.network,
             &config.datadir,
             config.signet_challenge.as_deref(),
+            config.blockfilterindex,
         )?;
         chain.configure_pruning(config.prune)?;
         chain.configure_txospender_index(config.txospenderindex)?;
@@ -1477,6 +1478,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,

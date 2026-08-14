@@ -199,6 +199,7 @@ pub struct ChainState {
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     filter_store: FilterStore,
+    blockfilter_index_enabled: bool,
     coinstats_store: CoinStatsStore,
     txospender_index_enabled: bool,
     coinstats_index_enabled: bool,
@@ -232,6 +233,20 @@ impl ChainState {
         network: Network,
         data_dir: impl AsRef<Path>,
         signet_challenge: Option<&[u8]>,
+    ) -> Result<Self> {
+        Self::open_with_signet_challenge_and_filter_index(
+            network,
+            data_dir,
+            signet_challenge,
+            true,
+        )
+    }
+
+    pub fn open_with_signet_challenge_and_filter_index(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
@@ -291,6 +306,7 @@ impl ChainState {
             }),
             store,
             filter_store,
+            blockfilter_index_enabled,
             coinstats_store,
             txospender_index_enabled: false,
             coinstats_index_enabled: false,
@@ -415,6 +431,10 @@ impl ChainState {
 
     pub fn prune_target_size(&self) -> Option<u64> {
         self.prune_target_size
+    }
+
+    pub fn blockfilter_index_enabled(&self) -> bool {
+        self.blockfilter_index_enabled
     }
 
     pub fn coinstats_index_enabled(&self) -> bool {
@@ -973,6 +993,9 @@ impl ChainState {
         &mut self,
         hash: &BlockHash,
     ) -> Result<Option<Vec<(BlockHash, BlockFilter, FilterHeader)>>> {
+        if !self.blockfilter_index_enabled {
+            return Ok(None);
+        }
         let Some(headers) = self.headers_to_hash(hash) else {
             return Ok(None);
         };
@@ -1057,6 +1080,9 @@ impl ChainState {
         &mut self,
         hash: &BlockHash,
     ) -> Result<Option<(Vec<u8>, FilterHeader)>> {
+        if !self.blockfilter_index_enabled {
+            return Ok(None);
+        }
         if !self.block_index.contains_key(hash) {
             return Ok(None);
         }
@@ -1081,6 +1107,9 @@ impl ChainState {
         &mut self,
         hash: &BlockHash,
     ) -> Result<Option<FilterHeader>> {
+        if !self.blockfilter_index_enabled {
+            return Ok(None);
+        }
         if !self.block_index.contains_key(hash) {
             return Ok(None);
         }
@@ -1104,6 +1133,9 @@ impl ChainState {
         stop_hash: BlockHash,
         limit: usize,
     ) -> Result<Option<BasicFilterRange>> {
+        if !self.blockfilter_index_enabled {
+            return Ok(None);
+        }
         let Some(stop_height) = self.block_height_by_hash(&stop_hash) else {
             return Ok(None);
         };
@@ -2393,6 +2425,9 @@ impl ChainState {
         spent_entries: &[(OutPoint, UtxoEntry)],
         previous_filter_header: &FilterHeader,
     ) -> Result<()> {
+        if !self.blockfilter_index_enabled {
+            return Ok(());
+        }
         let previous_outputs: HashMap<OutPoint, TxOut> = spent_entries
             .iter()
             .map(|(outpoint, entry)| (*outpoint, entry.output.clone()))

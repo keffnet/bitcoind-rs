@@ -540,6 +540,9 @@ fn rest_block_filter(
     route: &str,
     format: &str,
 ) -> Result<(&'static str, Vec<u8>)> {
+    if !node.config.blockfilterindex {
+        bail!("blockfilterindex is not enabled")
+    }
     let suffix = route
         .strip_prefix("blockfilter/")
         .ok_or_else(|| anyhow!("invalid blockfilter path"))?;
@@ -574,6 +577,9 @@ fn rest_block_filter_headers(
     format: &str,
     query: &str,
 ) -> Result<(&'static str, Vec<u8>)> {
+    if !node.config.blockfilterindex {
+        bail!("blockfilterindex is not enabled")
+    }
     let suffix = route
         .strip_prefix("blockfilterheaders/")
         .ok_or_else(|| anyhow!("invalid blockfilterheaders path"))?;
@@ -1333,8 +1339,12 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getnetworkinfo" => {
             let local_services = wire::NODE_NETWORK
                 | wire::NODE_WITNESS
-                | wire::NODE_COMPACT_FILTERS
                 | wire::NODE_P2P_V2
+                | if node.config.blockfilterindex && node.config.peer_block_filters {
+                    wire::NODE_COMPACT_FILTERS
+                } else {
+                    0
+                }
                 | if node.config.peer_bloom_filters {
                     wire::NODE_BLOOM
                 } else {
@@ -1551,7 +1561,7 @@ fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             "best_block_height": height,
         });
     }
-    if requested.is_none_or(|name| name == BASIC_FILTER_INDEX) {
+    if node.config.blockfilterindex && requested.is_none_or(|name| name == BASIC_FILTER_INDEX) {
         result[BASIC_FILTER_INDEX] = json!({
             "synced": true,
             "best_block_height": height,
@@ -3210,6 +3220,9 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_block_filter(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    if !node.config.blockfilterindex {
+        bail!("blockfilterindex is not enabled")
+    }
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
     let filter_type = params.get(1).and_then(Value::as_str).unwrap_or("basic");
     if filter_type != "basic" {
@@ -8587,6 +8600,9 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let action = param::<String>(params, 0)?;
     match action.as_str() {
         "start" => {
+            if !node.config.blockfilterindex {
+                bail!("scanblocks requires blockfilterindex")
+            }
             let scan_objects = params
                 .get(1)
                 .and_then(Value::as_array)
@@ -9886,6 +9902,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10045,6 +10063,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10119,6 +10139,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10152,6 +10174,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10190,6 +10214,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: true,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10259,6 +10285,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: true,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10307,6 +10335,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10417,6 +10447,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10473,6 +10505,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10507,6 +10541,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10544,6 +10580,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10590,6 +10628,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10629,6 +10669,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10662,6 +10704,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10692,6 +10736,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10797,6 +10843,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10849,6 +10897,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10923,6 +10973,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -10964,6 +11016,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11031,6 +11085,8 @@ mod tests {
             txospenderindex: true,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11119,6 +11175,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11209,6 +11267,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11243,6 +11303,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11282,6 +11344,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11327,6 +11391,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11379,6 +11445,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11422,6 +11490,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11465,6 +11535,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11500,6 +11572,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             max_peers: 1,
@@ -11534,6 +11608,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11614,6 +11690,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11674,6 +11752,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11728,6 +11808,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -11892,6 +11974,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -12063,6 +12147,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -12105,6 +12191,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -12197,6 +12285,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -12313,6 +12403,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -12355,6 +12447,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -12435,6 +12529,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -12647,6 +12743,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -12993,6 +13091,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -13053,6 +13153,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -13122,6 +13224,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -13235,6 +13339,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
@@ -13270,6 +13376,8 @@ mod tests {
             txospenderindex: false,
             max_mempool_mb: 300,
             coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
             persist_mempool: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,

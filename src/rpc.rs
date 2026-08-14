@@ -1954,7 +1954,6 @@ fn configure_logging(params: &Value) -> Result<Value> {
 }
 
 fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
-    let peers = node.peer_infos();
     let total_bytes_sent = node.total_bytes_sent();
     let total_bytes_recv = node.total_bytes_received();
     Ok(json!({
@@ -1969,7 +1968,6 @@ fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
             "bytes_left_in_cycle": 0,
             "time_left_in_cycle": 0,
         },
-        "connections": peers.len(),
     }))
 }
 
@@ -7796,6 +7794,11 @@ fn signing_error(transaction: &Transaction, input_index: usize, error: &str) -> 
 }
 
 fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    if let Some(dummy) = params.get(1).filter(|value| !value.is_null())
+        && !dummy.is_string()
+    {
+        bail!("dummy must be a string")
+    }
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let block: bitcoin::Block = deserialize(&bytes)?;
     let hash = block.block_hash();
@@ -11227,6 +11230,7 @@ mod tests {
         assert!(net_totals["uploadtarget"]["bytes_left_in_cycle"].is_number());
         assert!(net_totals["uploadtarget"]["time_left_in_cycle"].is_number());
         assert!(net_totals["uploadtarget"].get("bytes_left").is_none());
+        assert!(net_totals.get("connections").is_none());
         assert!(
             dispatch_method(&node, "getindexinfo", &json!([])).unwrap()["basic block filter index"]
                 ["synced"]
@@ -12228,6 +12232,7 @@ mod tests {
         let descriptor_block = generate_block(&node, &json!(["raw(51)", [], false])).unwrap();
         assert!(descriptor_block["hex"].as_str().is_some());
         let block_hex = descriptor_block["hex"].as_str().unwrap();
+        assert!(submit_block(&node, &json!([block_hex, 1])).is_err());
         assert_eq!(
             submit_block(&node, &json!([block_hex])).unwrap(),
             Value::Null

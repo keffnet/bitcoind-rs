@@ -29,8 +29,8 @@ use tokio::net::{
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
-use crate::Node;
 use crate::wire::{self, GetHeadersMessage, Inventory, InventoryType, Message, VersionMessage};
+use crate::{Node, unix_time_seconds};
 
 enum PeerReader {
     V1(OwnedReadHalf),
@@ -58,6 +58,7 @@ struct PeerState {
 }
 
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, Arc<PeerState>>>>;
+type OutboundAttempts = Arc<parking_lot::Mutex<HashSet<SocketAddr>>>;
 
 #[derive(Clone, Debug)]
 struct BloomFilter {
@@ -262,6 +263,7 @@ impl PeerManager {
             .with_context(|| format!("binding P2P listener {}", self.node.config.p2p_bind))?;
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
         let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let outbound_attempts: OutboundAttempts = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let next_peer_id = Arc::new(AtomicUsize::new(1));
         let (add_node_sender, mut add_node_receiver) = mpsc::unbounded_channel();
         self.node.set_peer_manager_sender(add_node_sender);
@@ -296,7 +298,15 @@ impl PeerManager {
             }
         });
         let seed_nodes = if self.node.config.seed_nodes.is_empty() {
-            discover_dns_seeds(self.node.config.network).await
+            let addresses = discover_dns_seeds(self.node.config.network).await;
+            for address in &addresses {
+                self.node.remember_address(
+                    *address,
+                    wire::NODE_NETWORK | wire::NODE_WITNESS,
+                    unix_time_seconds(),
+                );
+            }
+            Vec::new()
         } else {
             self.node.config.seed_nodes.clone()
         };
@@ -310,12 +320,47 @@ impl PeerManager {
                 next_peer_id.clone(),
                 true,
                 None,
+                outbound_attempts.clone(),
             );
         }
+        let discovery_node = self.node.clone();
+        let discovery_slots = slots.clone();
+        let discovery_peers = peers.clone();
+        let discovery_ids = next_peer_id.clone();
+        let discovery_attempts = outbound_attempts.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if !discovery_node.network_active() {
+                    continue;
+                }
+                let available = discovery_slots.available_permits().min(8);
+                if available == 0 {
+                    continue;
+                }
+                for address in
+                    select_discovery_addresses(&discovery_node, available, &discovery_attempts)
+                {
+                    spawn_outbound_loop(
+                        discovery_node.clone(),
+                        address,
+                        discovery_slots.clone(),
+                        discovery_peers.clone(),
+                        discovery_ids.clone(),
+                        false,
+                        None,
+                        discovery_attempts.clone(),
+                    );
+                }
+            }
+        });
         let dynamic_node = self.node.clone();
         let dynamic_slots = slots.clone();
         let dynamic_peers = peers.clone();
         let dynamic_ids = next_peer_id.clone();
+        let dynamic_attempts = outbound_attempts.clone();
         tokio::spawn(async move {
             while let Some(request) = add_node_receiver.recv().await {
                 let (address, persistent, transport_v2) = match request {
@@ -332,6 +377,7 @@ impl PeerManager {
                     dynamic_ids.clone(),
                     persistent,
                     transport_v2,
+                    dynamic_attempts.clone(),
                 );
             }
         });
@@ -369,9 +415,31 @@ fn spawn_outbound_loop(
     next_peer_id: Arc<AtomicUsize>,
     persistent: bool,
     transport_v2: Option<bool>,
+    outbound_attempts: OutboundAttempts,
 ) {
+    {
+        let mut attempts = outbound_attempts.lock();
+        if !attempts.insert(address) {
+            return;
+        }
+    }
     let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
+        struct AttemptGuard {
+            address: SocketAddr,
+            attempts: OutboundAttempts,
+        }
+
+        impl Drop for AttemptGuard {
+            fn drop(&mut self) {
+                self.attempts.lock().remove(&self.address);
+            }
+        }
+
+        let _attempt = AttemptGuard {
+            address,
+            attempts: outbound_attempts,
+        };
         let Ok(_permit) = slots.acquire_owned().await else {
             return;
         };
@@ -381,6 +449,17 @@ fn spawn_outbound_loop(
             }
             if !node.network_active() || node.is_banned(address.ip()) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            if node
+                .peer_infos()
+                .into_iter()
+                .any(|peer| peer.address == address)
+            {
+                if !persistent {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
             match TcpStream::connect(address).await {
@@ -414,6 +493,47 @@ fn spawn_outbound_loop(
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
+}
+
+fn select_discovery_addresses(
+    node: &Arc<Node>,
+    limit: usize,
+    outbound_attempts: &OutboundAttempts,
+) -> Vec<SocketAddr> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let connected: HashSet<_> = node
+        .peer_infos()
+        .into_iter()
+        .map(|peer| peer.address)
+        .collect();
+    let added: HashSet<_> = node.added_nodes().into_iter().collect();
+    let attempts = outbound_attempts.lock();
+    let mut candidates = node
+        .known_addresses()
+        .into_iter()
+        .filter(|peer| {
+            peer.address.port() != 0
+                && !peer.address.ip().is_unspecified()
+                && !connected.contains(&peer.address)
+                && !added.contains(&peer.address)
+                && !attempts.contains(&peer.address)
+                && !node.is_banned(peer.address.ip())
+        })
+        .collect::<Vec<_>>();
+    drop(attempts);
+    candidates.sort_by(|left, right| {
+        node.is_address_tried(right.address)
+            .cmp(&node.is_address_tried(left.address))
+            .then_with(|| right.connected_at.cmp(&left.connected_at))
+            .then_with(|| left.address.cmp(&right.address))
+    });
+    candidates
+        .into_iter()
+        .take(limit)
+        .map(|peer| peer.address)
+        .collect()
 }
 
 async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
@@ -2063,6 +2183,40 @@ mod tests {
         assert!(addresses.iter().any(|peer| peer.address == legacy_socket));
         assert!(addresses.iter().any(|peer| peer.address == v2_socket));
         assert_eq!(addresses.iter().filter(|peer| peer.id == 0).count(), 2);
+    }
+
+    #[test]
+    fn discovery_candidates_skip_connected_added_and_in_flight_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 4,
+            peer_bloom_filters: false,
+        })
+        .unwrap();
+        let added = "192.0.2.10:18444".parse().unwrap();
+        let connected = "192.0.2.11:18444".parse().unwrap();
+        let in_flight = "192.0.2.12:18444".parse().unwrap();
+        let eligible = "192.0.2.13:18444".parse().unwrap();
+        for address in [added, connected, in_flight, eligible] {
+            assert!(node.add_peer_address(address, false));
+        }
+        assert!(node.add_node(added));
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        node.register_peer(7, connected, false, sender);
+        let attempts = Arc::new(parking_lot::Mutex::new(HashSet::from([in_flight])));
+
+        assert_eq!(
+            select_discovery_addresses(&node, 4, &attempts),
+            vec![eligible]
+        );
     }
 
     #[tokio::test]

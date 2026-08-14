@@ -1577,24 +1577,35 @@ async fn serve_peer_loop(
                         node.update_peer_best_known_block(peer_id, item.hash);
                     }
                 }
-                let requests = {
+                let mut needs_headers = false;
+                let transaction_requests = {
                     let chain = node.chain.read();
                     let mempool = node.mempool.read();
                     items
                         .into_iter()
-                        .filter(|item| match item.kind {
-                            InventoryType::Block | InventoryType::WitnessBlock => {
-                                !chain.store.contains(&item.hash)
+                        .filter_map(|item| match item.kind {
+                            InventoryType::Block
+                            | InventoryType::WitnessBlock
+                            | InventoryType::CompactBlock => {
+                                // Core treats block inventory as an announcement
+                                // of a possible new tip, not as permission to
+                                // fetch the advertised body immediately. Asking
+                                // for headers first lets the normal headers-first
+                                // path validate the chain and schedule bounded
+                                // block downloads.
+                                if chain.block_height_by_hash(&item.hash).is_none() {
+                                    needs_headers = true;
+                                }
+                                None
                             }
-                            InventoryType::CompactBlock => !chain.store.contains(&item.hash),
                             kind if kind.is_transaction() => {
                                 if node.config.blocksonly {
-                                    return false;
+                                    return None;
                                 }
                                 if (wtxid_relay && item.kind == InventoryType::Transaction)
                                     || (!wtxid_relay && item.kind.is_witness_transaction())
                                 {
-                                    return false;
+                                    return None;
                                 }
                                 if item.kind.is_witness_transaction() {
                                     mempool
@@ -1602,28 +1613,20 @@ async fn serve_peer_loop(
                                             item.hash.to_byte_array(),
                                         ))
                                         .is_none()
+                                        .then_some(item)
                                 } else {
                                     mempool
                                         .get(&Txid::from_byte_array(item.hash.to_byte_array()))
                                         .is_none()
+                                        .then_some(item)
                                 }
                             }
-                            _ => false,
+                            _ => None,
                         })
                         .take(50_000)
                         .collect::<Vec<_>>()
                 };
-                if !requests.is_empty() {
-                    let (block_requests, transaction_requests): (Vec<Inventory>, Vec<Inventory>) =
-                        requests.into_iter().partition(|request| {
-                            matches!(
-                                request.kind,
-                                InventoryType::Block
-                                    | InventoryType::WitnessBlock
-                                    | InventoryType::CompactBlock
-                            )
-                        });
-                    queue_block_requests(&mut pending_block_requests, block_requests);
+                if !transaction_requests.is_empty() {
                     send_getdata_batches(
                         node,
                         peer_id,
@@ -1632,14 +1635,9 @@ async fn serve_peer_loop(
                         &transaction_requests,
                     )
                     .await?;
-                    flush_pending_block_requests(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &mut pending_block_requests,
-                    )
-                    .await?;
+                }
+                if needs_headers {
+                    request_headers(node, peer_id, writer).await?;
                 }
             }
             Message::GetData(items) => {

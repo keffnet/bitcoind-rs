@@ -8121,6 +8121,26 @@ fn mine_block(mut block: Block, max_tries: u64) -> Option<Block> {
     None
 }
 
+fn ensure_get_block_template_ready(node: &Arc<Node>) -> Result<()> {
+    if node.config.network != Network::Bitcoin {
+        return Ok(());
+    }
+    if node.peer_count() == 0 {
+        bail!("Bitcoin Core is not connected!")
+    }
+    let initial_block_download = {
+        let chain = node.chain.read();
+        let tip = chain.tip();
+        let header = chain.header(tip.height).expect("tip header exists");
+        let tip_recent = u64::from(header.time).saturating_add(24 * 60 * 60) >= unix_time();
+        tip.work < chain.minimum_chain_work() || !tip_recent
+    };
+    if initial_block_download {
+        bail!("Bitcoin Core is in initial sync and waiting for blocks...")
+    }
+    Ok(())
+}
+
 fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let request = params
         .get(0)
@@ -8157,6 +8177,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if mode != "template" {
         bail!("invalid getblocktemplate mode")
     }
+    ensure_get_block_template_ready(node)?;
     let requested_rules = match request.get("rules").filter(|value| !value.is_null()) {
         None => Vec::new(),
         Some(value) => value
@@ -8338,6 +8359,13 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
         .filter(|request| request.get("mode").and_then(Value::as_str) != Some("proposal"))
         .and_then(|request| request.get("longpollid"))
         .and_then(Value::as_str);
+    if request
+        .and_then(|request| request.get("mode"))
+        .and_then(Value::as_str)
+        != Some("proposal")
+    {
+        ensure_get_block_template_ready(node)?;
+    }
     if let Some(longpoll_id) = longpoll_id {
         let mut chain_events = node.subscribe_chain();
         let mut mempool_events = node.subscribe_mempool();
@@ -12435,6 +12463,53 @@ mod tests {
             .unwrap(),
             json!("duplicate")
         );
+    }
+
+    #[test]
+    fn getblocktemplate_requires_mainnet_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Bitcoin,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
+            persist_mempool: true,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let error = get_block_template(&node, &json!([{"rules": ["segwit"]}]))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "Bitcoin Core is not connected!");
     }
 
     #[tokio::test]

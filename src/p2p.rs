@@ -1900,6 +1900,9 @@ async fn serve_peer_loop(
                 continue;
             }
             _ = tx_inventory_interval.tick(), if version_received && verack_received => {
+                if let Some(staller) = node.take_stalled_block_peer() {
+                    node.disconnect_peer(staller);
+                }
                 if headers_download_timed_out(*peer_state.last_headers_request.lock()) {
                     anyhow::bail!("peer timed out responding to getheaders");
                 }
@@ -1909,9 +1912,15 @@ async fn serve_peer_loop(
                 let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER
                     .saturating_sub(node.peer_inflight_block_count(peer_id));
                 if available > 0 {
+                    let schedule = node.next_block_download_schedule(
+                        peer_id,
+                        available,
+                        peer_services,
+                    );
+                    let staller = schedule.staller;
                     queue_block_requests(
                         &mut pending_block_requests,
-                        node.next_block_download_requests(available, peer_services),
+                        schedule.requests,
                     );
                     flush_pending_block_requests(
                         node,
@@ -1921,6 +1930,11 @@ async fn serve_peer_loop(
                         &mut pending_block_requests,
                     )
                     .await?;
+                    if pending_block_requests.is_empty()
+                        && let Some(staller) = staller
+                    {
+                        node.note_block_staller(staller);
+                    }
                 }
                 flush_peer_transaction_inventory(
                     node,

@@ -44,6 +44,8 @@ const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_KNOWN_ADDRESSES: usize = 256_000;
 pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+const BLOCK_STALLING_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
+const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -357,6 +359,11 @@ struct InflightBlock {
     requested_at: Instant,
 }
 
+pub(crate) struct BlockDownloadSchedule {
+    pub(crate) requests: Vec<wire::Inventory>,
+    pub(crate) staller: Option<usize>,
+}
+
 impl PeerInfo {
     pub(crate) fn ping_wait(&self) -> Option<f64> {
         self.ping_sent_at
@@ -540,6 +547,8 @@ pub struct Node {
     total_bytes_sent: AtomicU64,
     total_bytes_received: AtomicU64,
     network_active: AtomicBool,
+    block_stalling_timeout_secs: AtomicU64,
+    block_stalling_since: parking_lot::RwLock<HashMap<usize, Instant>>,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
     peer_commands:
         parking_lot::RwLock<HashMap<usize, tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>>>,
@@ -641,6 +650,8 @@ impl Node {
             total_bytes_sent: AtomicU64::new(0),
             total_bytes_received: AtomicU64::new(0),
             network_active: AtomicBool::new(true),
+            block_stalling_timeout_secs: AtomicU64::new(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
+            block_stalling_since: parking_lot::RwLock::new(HashMap::new()),
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
@@ -674,6 +685,7 @@ impl Node {
             };
             (tip, activated_blocks, disconnected_blocks)
         };
+        self.reduce_block_stalling_timeout();
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
             let mempool_before = self
                 .mempool
@@ -728,6 +740,21 @@ impl Node {
             }
         }
         Ok(tip)
+    }
+
+    fn reduce_block_stalling_timeout(&self) {
+        let current = self.block_stalling_timeout_secs.load(Ordering::Relaxed);
+        if current <= BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs() {
+            return;
+        }
+        let reduced =
+            (current.saturating_mul(85) / 100).max(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs());
+        let _ = self.block_stalling_timeout_secs.compare_exchange(
+            current,
+            reduced,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
     }
 
     pub fn accept_transaction(&self, transaction: Transaction) -> Result<Txid> {
@@ -1291,13 +1318,36 @@ impl Node {
     /// absent locally. This is used after a peer disconnects or times out;
     /// the headers-first state remains durable, so another connected peer can
     /// resume without needing to re-announce the same headers.
+    #[cfg(test)]
     pub(crate) fn next_block_download_requests(
         &self,
         limit: usize,
         peer_services: u64,
     ) -> Vec<wire::Inventory> {
+        self.next_block_download_schedule_for(None, limit, peer_services)
+            .requests
+    }
+
+    pub(crate) fn next_block_download_schedule(
+        &self,
+        peer_id: usize,
+        limit: usize,
+        peer_services: u64,
+    ) -> BlockDownloadSchedule {
+        self.next_block_download_schedule_for(Some(peer_id), limit, peer_services)
+    }
+
+    fn next_block_download_schedule_for(
+        &self,
+        peer_id: Option<usize>,
+        limit: usize,
+        peer_services: u64,
+    ) -> BlockDownloadSchedule {
         if limit == 0 || peer_services & (wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED) == 0 {
-            return Vec::new();
+            return BlockDownloadSchedule {
+                requests: Vec::new(),
+                staller: None,
+            };
         }
         let max_scan = {
             let peer_count = self.peers.read().len();
@@ -1326,27 +1376,87 @@ impl Node {
                 .collect::<Vec<_>>()
         };
         if candidates.is_empty() {
-            return Vec::new();
+            return BlockDownloadSchedule {
+                requests: Vec::new(),
+                staller: None,
+            };
         }
 
         let peers = self.peers.read();
-        candidates
-            .into_iter()
-            .filter(|hash| {
-                !peers
-                    .values()
-                    .flat_map(|peer| peer.inflight_blocks.iter())
-                    .any(|inflight| inflight.hash == *hash)
-            })
-            .map(|hash| wire::Inventory {
+        let peer_has_inflight = peer_id.is_some_and(|id| {
+            peers
+                .get(&id)
+                .is_some_and(|peer| !peer.inflight_blocks.is_empty())
+        });
+        let mut requests = Vec::with_capacity(limit);
+        let mut waiting_for = None;
+        for hash in candidates {
+            let owner = peers.values().find_map(|peer| {
+                peer.inflight_blocks
+                    .iter()
+                    .any(|inflight| inflight.hash == hash)
+                    .then_some(peer.id)
+            });
+            if let Some(owner) = owner {
+                if waiting_for.is_none() && peer_id != Some(owner) {
+                    waiting_for = Some(owner);
+                }
+                continue;
+            }
+            if requests.len() >= limit {
+                break;
+            }
+            requests.push(wire::Inventory {
                 kind: if peer_services & wire::NODE_WITNESS != 0 {
                     wire::InventoryType::WitnessBlock
                 } else {
                     wire::InventoryType::Block
                 },
                 hash,
-            })
-            .collect()
+            });
+        }
+
+        let staller = (!peer_has_inflight && requests.is_empty())
+            .then_some(waiting_for)
+            .flatten();
+        BlockDownloadSchedule { requests, staller }
+    }
+
+    pub(crate) fn note_block_staller(&self, peer_id: usize) {
+        self.note_block_staller_at(peer_id, Instant::now());
+    }
+
+    fn note_block_staller_at(&self, peer_id: usize, since: Instant) {
+        if self.peers.read().contains_key(&peer_id) {
+            self.block_stalling_since
+                .write()
+                .entry(peer_id)
+                .or_insert(since);
+        }
+    }
+
+    pub(crate) fn take_stalled_block_peer(&self) -> Option<usize> {
+        self.take_stalled_block_peer_at(Instant::now())
+    }
+
+    fn take_stalled_block_peer_at(&self, now: Instant) -> Option<usize> {
+        let timeout = Duration::from_secs(
+            self.block_stalling_timeout_secs
+                .load(Ordering::Relaxed)
+                .max(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
+        );
+        let mut stalled = self.block_stalling_since.write();
+        let peer_id = stalled.iter().find_map(|(peer_id, since)| {
+            (now.duration_since(*since) > timeout).then_some(*peer_id)
+        })?;
+        stalled.remove(&peer_id);
+        let current = self.block_stalling_timeout_secs.load(Ordering::Relaxed);
+        let increased = current
+            .saturating_mul(2)
+            .min(BLOCK_STALLING_TIMEOUT_MAX.as_secs());
+        self.block_stalling_timeout_secs
+            .store(increased, Ordering::Relaxed);
+        Some(peer_id)
     }
 
     pub(crate) fn clear_peer_block_request(&self, peer_id: usize, hash: BlockHash) {
@@ -1354,6 +1464,7 @@ impl Node {
             peer.inflight_blocks
                 .retain(|inflight| inflight.hash != hash);
         }
+        self.block_stalling_since.write().remove(&peer_id);
     }
 
     pub(crate) fn record_pong(&self, peer_id: usize, nonce: u64) {
@@ -1610,6 +1721,7 @@ impl Node {
     pub fn unregister_peer(&self, id: usize) {
         let address = self.peers.write().remove(&id).map(|peer| peer.address);
         self.peer_commands.write().remove(&id);
+        self.block_stalling_since.write().remove(&id);
         if let Some(address) = address
             && let Some(known) = self.known_addresses.write().get_mut(&address)
             && known.id == id
@@ -2434,6 +2546,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first.block_hash(), second.block_hash()]
         );
+    }
+
+    #[test]
+    fn block_download_window_reports_the_peer_stalling_the_next_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 1);
+        node.chain
+            .write()
+            .accept_headers(std::slice::from_ref(&first.header))
+            .unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender.clone());
+        node.register_peer(2, "192.0.2.2:18444".parse().unwrap(), false, sender);
+        assert!(node.track_peer_block_request(1, first.block_hash()));
+
+        let schedule = node.next_block_download_schedule(
+            2,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
+        assert!(schedule.requests.is_empty());
+        assert_eq!(schedule.staller, Some(1));
+
+        let now = Instant::now();
+        node.note_block_staller_at(1, now - BLOCK_STALLING_TIMEOUT_DEFAULT * 2);
+        assert_eq!(node.take_stalled_block_peer_at(now), Some(1));
+        assert_eq!(
+            node.block_stalling_timeout_secs.load(Ordering::Relaxed),
+            BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs() * 2
+        );
+    }
+
+    #[test]
+    fn receiving_a_block_clears_the_stalling_timer() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 1);
+        node.chain
+            .write()
+            .accept_headers(std::slice::from_ref(&first.header))
+            .unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        assert!(node.track_peer_block_request(1, first.block_hash()));
+        let now = Instant::now();
+        node.note_block_staller_at(1, now - BLOCK_STALLING_TIMEOUT_DEFAULT * 2);
+        node.clear_peer_block_request(1, first.block_hash());
+        assert_eq!(node.take_stalled_block_peer_at(now), None);
     }
 
     #[test]

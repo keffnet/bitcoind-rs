@@ -727,7 +727,7 @@ fn block_headers_for_protocol(
 }
 
 fn mempool_info(node: &Arc<Node>) -> Value {
-    let mempool = node.mempool.read();
+    let mut mempool = node.mempool.write();
     json!({
         "mempoolminfee": mempool.mempool_min_fee_sat_per_kvb() as f64 / 100_000_000.0,
         "minrelaytxfee": mempool.min_relay_fee_sat_per_kvb() as f64 / 100_000_000.0,

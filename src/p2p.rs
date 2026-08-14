@@ -2058,7 +2058,7 @@ async fn send_peer_extensions(
     }
     if peer_version >= FEEFILTER_VERSION {
         let relay_fee =
-            i64::try_from(node.mempool.read().mempool_min_fee_sat_per_kvb()).unwrap_or(i64::MAX);
+            i64::try_from(node.mempool.write().mempool_min_fee_sat_per_kvb()).unwrap_or(i64::MAX);
         send_message(
             node,
             peer_id,

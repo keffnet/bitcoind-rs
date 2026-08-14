@@ -1234,7 +1234,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "gettxout" => get_txout(node, params),
         "gettxspendingprevout" => get_tx_spending_prevout(node, params),
         "getmempoolinfo" => {
-            let mempool = node.mempool.read();
+            let mut mempool = node.mempool.write();
             let total_fee = mempool
                 .transaction_order()
                 .into_iter()

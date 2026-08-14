@@ -22,6 +22,7 @@ use crate::validation::{self, ValidationError};
 
 const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300_000_000;
 pub(crate) const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const ROLLING_FEE_HALFLIFE_SECS: f64 = 12.0 * 60.0 * 60.0;
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
 const MAX_TX_LEGACY_SIGOPS: usize = 2_500;
@@ -100,7 +101,9 @@ pub struct Mempool {
     policy: MempoolPolicy,
     max_bytes: usize,
     bytes: usize,
-    rolling_min_fee_sat_per_kvb: u64,
+    rolling_min_fee_sat_per_kvb: f64,
+    rolling_fee_last_updated: u64,
+    block_since_last_rolling_fee_bump: bool,
     sequence: u64,
     entries: HashMap<Txid, MempoolEntry>,
     spent: HashMap<OutPoint, Txid>,
@@ -206,7 +209,9 @@ impl Mempool {
             policy,
             max_bytes: max_bytes.max(1),
             bytes: 0,
-            rolling_min_fee_sat_per_kvb: 0,
+            rolling_min_fee_sat_per_kvb: 0.0,
+            rolling_fee_last_updated: time::unix_time(),
+            block_since_last_rolling_fee_bump: false,
             sequence: 0,
             entries: HashMap::new(),
             spent: HashMap::new(),
@@ -237,10 +242,13 @@ impl Mempool {
         self.policy.min_relay_fee_sat_per_kvb
     }
 
-    pub fn mempool_min_fee_sat_per_kvb(&self) -> u64 {
-        self.policy
-            .min_relay_fee_sat_per_kvb
-            .max(self.rolling_min_fee_sat_per_kvb)
+    pub fn mempool_min_fee_sat_per_kvb(&mut self) -> u64 {
+        self.decay_rolling_min_fee();
+        self.policy.min_relay_fee_sat_per_kvb.max(
+            self.rolling_min_fee_sat_per_kvb
+                .round()
+                .clamp(0.0, u64::MAX as f64) as u64,
+        )
     }
 
     pub fn incremental_relay_fee_sat_per_kvb(&self) -> u64 {
@@ -1161,13 +1169,39 @@ impl Mempool {
             };
             let package_fee_rate = fee_rate_from_package(package_fee, package_vsize);
             self.rolling_min_fee_sat_per_kvb = self.rolling_min_fee_sat_per_kvb.max(
-                package_fee_rate.saturating_add(self.policy.incremental_relay_fee_sat_per_kvb),
+                package_fee_rate.saturating_add(self.policy.incremental_relay_fee_sat_per_kvb)
+                    as f64,
             );
+            self.block_since_last_rolling_fee_bump = false;
             for txid in package {
                 self.remove(&txid);
             }
         }
         Ok(())
+    }
+
+    fn decay_rolling_min_fee(&mut self) {
+        if !self.block_since_last_rolling_fee_bump || self.rolling_min_fee_sat_per_kvb == 0.0 {
+            return;
+        }
+        let now = time::unix_time();
+        if now <= self.rolling_fee_last_updated.saturating_add(10) {
+            return;
+        }
+        let mut halflife = ROLLING_FEE_HALFLIFE_SECS;
+        if self.bytes < self.max_bytes / 4 {
+            halflife /= 4.0;
+        } else if self.bytes < self.max_bytes / 2 {
+            halflife /= 2.0;
+        }
+        let elapsed = now.saturating_sub(self.rolling_fee_last_updated) as f64;
+        self.rolling_min_fee_sat_per_kvb /= 2.0_f64.powf(elapsed / halflife);
+        self.rolling_fee_last_updated = now;
+        if self.rolling_min_fee_sat_per_kvb
+            < self.policy.incremental_relay_fee_sat_per_kvb as f64 / 2.0
+        {
+            self.rolling_min_fee_sat_per_kvb = 0.0;
+        }
     }
 
     fn check_truc_policy(&self, transaction: &Transaction, vsize: u64) -> Result<(), MempoolError> {
@@ -1421,6 +1455,8 @@ impl Mempool {
             let txid = transaction.compute_txid();
             self.remove_with_notification(&txid, false);
         }
+        self.rolling_fee_last_updated = time::unix_time();
+        self.block_since_last_rolling_fee_bump = true;
     }
 
     pub fn clear_expired(&mut self, now: u64, age: Duration) {
@@ -2290,6 +2326,18 @@ mod tests {
             Err(MempoolError::Full)
         ));
         assert!(protected_pool.entries.contains_key(&parent_id));
+    }
+
+    #[test]
+    fn rolling_minimum_fee_decays_after_a_block() {
+        let mut pool = Mempool::new(Network::Regtest);
+        pool.rolling_min_fee_sat_per_kvb = 10_000.0;
+        pool.block_since_last_rolling_fee_bump = true;
+        pool.rolling_fee_last_updated = time::unix_time().saturating_sub(12 * 60 * 60);
+
+        let decayed = pool.mempool_min_fee_sat_per_kvb();
+        assert!(decayed < 10_000);
+        assert!(decayed >= pool.min_relay_fee_sat_per_kvb());
     }
 
     fn insert_policy_entry(pool: &mut Mempool, transaction: Transaction) -> Txid {

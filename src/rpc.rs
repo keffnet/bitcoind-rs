@@ -1449,7 +1449,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     let mut info = json!({
                         "id": peer.id,
                         "addr": peer.address.to_string(),
-                        "network": if peer.address.ip().is_ipv4() { "ipv4" } else { "ipv6" },
+                        "network": peer_network_name(peer.address.ip()),
                         "services": format!("{:016x}", peer.services),
                         "servicesnames": peer_services_names(peer.services),
                         "relaytxes": peer.relay_transactions,
@@ -1472,7 +1472,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                         "synced_headers": synced_headers,
                         "synced_blocks": synced_blocks,
                         "inflight": [],
-                        "addr_relay_enabled": true,
+                        "addr_relay_enabled": peer.addr_relay_enabled,
                         "addr_processed": peer.addr_processed,
                         "addr_rate_limited": 0,
                         "permissions": [],
@@ -2068,6 +2068,43 @@ fn peer_services_names(services: u64) -> Vec<&'static str> {
     .into_iter()
     .filter_map(|(bit, name)| (services & bit != 0).then_some(name))
     .collect()
+}
+
+fn peer_network_name(ip: IpAddr) -> &'static str {
+    if is_publicly_routable(ip) {
+        if ip.is_ipv4() { "ipv4" } else { "ipv6" }
+    } else {
+        "not_publicly_routable"
+    }
+}
+
+fn is_publicly_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [first, second, third, _] = ip.octets();
+            !(first == 0
+                || first == 127
+                || first == 10
+                || (first == 172 && (16..=31).contains(&second))
+                || (first == 192 && second == 168)
+                || (first == 169 && second == 254)
+                || (first == 100 && (64..=127).contains(&second))
+                || (first == 198 && (second == 18 || second == 19))
+                || (first == 192 && second == 0 && third == 2)
+                || (first == 198 && second == 51 && third == 100)
+                || (first == 203 && second == 0 && third == 113))
+        }
+        IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            !(ip.is_unspecified()
+                || ip.is_loopback()
+                || (octets[0] & 0xfe == 0xfc)
+                || (octets[0] == 0xfe && octets[1] & 0xc0 == 0x80)
+                || (octets[0], octets[1], octets[2], octets[3]) == (0x20, 0x01, 0x0d, 0xb8)
+                || (octets[0], octets[1], octets[2]) == (0x20, 0x01, 0x00)
+                    && (octets[3] & 0xf0 == 0x10 || octets[3] & 0xf0 == 0x20))
+        }
+    }
 }
 
 fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -12358,8 +12395,13 @@ mod tests {
         node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
         let unversioned_peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(unversioned_peer_info[0]["relaytxes"], json!(false));
+        assert_eq!(
+            unversioned_peer_info[0]["network"],
+            json!("not_publicly_routable")
+        );
         assert_eq!(unversioned_peer_info[0]["synced_headers"], json!(-1));
         assert_eq!(unversioned_peer_info[0]["synced_blocks"], json!(-1));
+        assert_eq!(unversioned_peer_info[0]["addr_relay_enabled"], json!(true));
         node.update_peer_version(7, 70016, 0, "/test-peer/", 0, true);
         node.update_peer_time_offset(7, 42);
         let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();

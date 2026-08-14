@@ -318,6 +318,7 @@ pub struct PeerInfo {
     pub last_block: u64,
     pub time_offset: i64,
     pub addr_processed: u64,
+    pub addr_relay_enabled: bool,
     pub ping_time: Option<f64>,
     pub min_ping: Option<f64>,
     pub connection_type: &'static str,
@@ -1038,8 +1039,8 @@ impl Node {
             transport_protocol_type: "v1",
             connection_type: if inbound { "inbound" } else { "outbound-full" },
             connected_at,
-            last_send: connected_at,
-            last_recv: connected_at,
+            last_send: 0,
+            last_recv: 0,
             bytes_sent: 0,
             bytes_received: 0,
             bytes_sent_per_msg: HashMap::new(),
@@ -1049,6 +1050,7 @@ impl Node {
             last_block: 0,
             time_offset: 0,
             addr_processed: 0,
+            addr_relay_enabled: !inbound,
             ping_time: None,
             min_ping: None,
             ping_nonce: None,
@@ -1108,6 +1110,17 @@ impl Node {
         let count = u64::try_from(count).unwrap_or(u64::MAX);
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.addr_processed = peer.addr_processed.saturating_add(count);
+            if peer.inbound {
+                peer.addr_relay_enabled = true;
+            }
+        }
+    }
+
+    pub(crate) fn enable_peer_address_relay(&self, id: usize) {
+        if let Some(peer) = self.peers.write().get_mut(&id)
+            && peer.inbound
+        {
+            peer.addr_relay_enabled = true;
         }
     }
 
@@ -1120,6 +1133,7 @@ impl Node {
     pub(crate) fn set_peer_connection_type(&self, id: usize, connection_type: &'static str) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.connection_type = connection_type;
+            peer.addr_relay_enabled = !peer.inbound && connection_type == "outbound-full";
         }
     }
 
@@ -1206,6 +1220,7 @@ impl Node {
                 last_block: 0,
                 time_offset: 0,
                 addr_processed: 0,
+                addr_relay_enabled: false,
                 ping_time: None,
                 min_ping: None,
                 ping_nonce: None,
@@ -1249,6 +1264,7 @@ impl Node {
             last_block: 0,
             time_offset: 0,
             addr_processed: 0,
+            addr_relay_enabled: false,
             ping_time: None,
             min_ping: None,
             ping_nonce: None,
@@ -1687,6 +1703,7 @@ fn load_known_addresses(
                 last_block: 0,
                 time_offset: 0,
                 addr_processed: 0,
+                addr_relay_enabled: false,
                 ping_time: None,
                 min_ping: None,
                 ping_nonce: None,

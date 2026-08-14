@@ -1731,6 +1731,7 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetAddr => {
+                node.enable_peer_address_relay(peer_id);
                 let peer_infos = node
                     .known_addresses()
                     .into_iter()

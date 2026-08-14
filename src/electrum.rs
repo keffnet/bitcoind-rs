@@ -1574,6 +1574,7 @@ mod tests {
         .unwrap();
         assert_eq!(features["protocol_max"], json!("1.7"));
         assert!(node.chain.read().is_pruned());
+        assert!(node.chain.read().txospender_index_enabled());
         assert_eq!(features["pruning"], Value::Null);
         assert!(features.get("hash_function").is_none());
         assert_eq!(

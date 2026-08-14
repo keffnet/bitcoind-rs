@@ -398,7 +398,12 @@ impl Node {
             config.reindex_chainstate,
         )?;
         chain.configure_pruning(config.prune)?;
-        chain.configure_txospender_index(config.txospenderindex)?;
+        // Electrum 1.7 outpoint status needs confirmed spender lookups even
+        // when the standalone Core-style txospenderindex RPC option is off.
+        // Keep this internal index enabled for Electrum without changing the
+        // user-facing getindexinfo reporting for that optional index.
+        chain
+            .configure_txospender_index(config.txospenderindex || config.electrum_bind.is_some())?;
         chain.configure_coinstats_index(config.coinstatsindex)?;
         for path in &config.load_blocks {
             import_external_block_file(&mut chain, path, config.network)?;

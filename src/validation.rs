@@ -14,9 +14,12 @@ use bitcoin::blockdata::transaction::{OutPoint as TransactionOutPoint, TxIn, TxO
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::Params;
 use bitcoin::consensus::encode::{deserialize_partial, serialize};
+use bitcoin::hashes::Hash;
 use bitcoin::opcodes::OP_0;
 use bitcoin::pow::Target;
-use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, Sequence, Transaction, Txid};
+use bitcoin::{
+    Amount, Block, BlockHash, Network, OutPoint, Sequence, Transaction, Txid, WitnessCommitment,
+};
 
 use crate::time;
 
@@ -397,6 +400,63 @@ pub fn validate_block_structure(
     )
 }
 
+fn validate_witness_commitment(
+    block: &Block,
+    expect_witness_commitment: bool,
+) -> Result<(), ValidationError> {
+    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    let commitment = block.txdata.first().and_then(|coinbase| {
+        coinbase
+            .output
+            .iter()
+            .rposition(|output| {
+                output.script_pubkey.len() >= 38 && output.script_pubkey.as_bytes()[..6] == MAGIC
+            })
+            .map(|index| &coinbase.output[index])
+    });
+
+    if expect_witness_commitment {
+        if let Some(output) = commitment {
+            let coinbase = block
+                .txdata
+                .first()
+                .ok_or(ValidationError::BadWitnessCommitment)?;
+            let witness = coinbase
+                .input
+                .first()
+                .map(|input| &input.witness)
+                .ok_or(ValidationError::BadWitnessCommitment)?;
+            if witness.len() != 1 || witness[0].len() != 32 {
+                return Err(ValidationError::BadWitnessCommitment);
+            }
+            let commitment = WitnessCommitment::from_slice(&output.script_pubkey.as_bytes()[6..38])
+                .map_err(|_| ValidationError::BadWitnessCommitment)?;
+            let witness_root = block
+                .witness_root()
+                .ok_or(ValidationError::BadWitnessCommitment)?;
+            let expected = Block::compute_witness_commitment(&witness_root, &witness[0]);
+            if commitment != expected {
+                return Err(ValidationError::BadWitnessCommitment);
+            }
+        } else if block.txdata.iter().any(|transaction| {
+            transaction
+                .input
+                .iter()
+                .any(|input| !input.witness.is_empty())
+        }) {
+            return Err(ValidationError::UnexpectedWitness);
+        }
+    } else if block.txdata.iter().any(|transaction| {
+        transaction
+            .input
+            .iter()
+            .any(|input| !input.witness.is_empty())
+    }) {
+        return Err(ValidationError::UnexpectedWitness);
+    }
+    Ok(())
+}
+
 pub fn validate_block_structure_with_signet(
     block: &Block,
     network: Network,
@@ -411,18 +471,7 @@ pub fn validate_block_structure_with_signet(
     if !block.check_merkle_root() {
         return Err(ValidationError::BadMerkleRoot);
     }
-    if height >= buried_deployment_heights(network).segwit {
-        if !block.check_witness_commitment() {
-            return Err(ValidationError::BadWitnessCommitment);
-        }
-    } else if block.txdata.iter().any(|transaction| {
-        transaction
-            .input
-            .iter()
-            .any(|input| !input.witness.is_empty())
-    }) {
-        return Err(ValidationError::UnexpectedWitness);
-    }
+    validate_witness_commitment(block, height >= buried_deployment_heights(network).segwit)?;
     if block.weight().to_wu() > MAX_BLOCK_WEIGHT as u64 {
         return Err(ValidationError::OversizedBlock);
     }
@@ -1170,6 +1219,42 @@ mod tests {
         assert!(matches!(
             validate_block_structure(&block, Network::Bitcoin, 0, Amount::MAX_MONEY.to_sat()),
             Err(ValidationError::UnexpectedWitness)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_malformed_witness_commitment_without_witness_data() {
+        let mut commitment_script = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+        commitment_script.extend([0u8; 32]);
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Builder::new().push_int(1).push_int(0).into_script(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(commitment_script),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::from_consensus(4),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(matches!(
+            validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
+            Err(ValidationError::BadWitnessCommitment)
         ));
     }
 

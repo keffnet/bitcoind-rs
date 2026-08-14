@@ -3098,7 +3098,6 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let tip = chain.tip();
     let header_tip = chain.best_header_tip();
     let header = chain.header(tip.height).expect("tip header exists");
-    let headers = chain.active_headers();
     let minimum_chain_work = chain.minimum_chain_work();
     let initial_block_download = chain.is_initial_block_download();
     let verification_progress = if !initial_block_download {
@@ -3131,7 +3130,6 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "initialblockdownload": initial_block_download,
         "pruned": chain.is_pruned(),
         "size_on_disk": chain.store.disk_usage().unwrap_or(0),
-        "softforks": softforks_json(headers, tip.height, chain.network),
         "warnings": [],
     });
     if chain.is_pruned() {
@@ -3150,41 +3148,6 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         result["signet_challenge"] = json!(hex::encode(challenge));
     }
     Ok(result)
-}
-
-fn softforks_json(
-    headers: &[bitcoin::block::Header],
-    selected_height: u32,
-    network: Network,
-) -> Value {
-    let heights = validation::buried_deployment_heights(network);
-    let mut softforks = serde_json::Map::new();
-    for (name, activation_height) in [
-        ("bip34", heights.bip34),
-        ("bip66", heights.bip66),
-        ("bip65", heights.bip65),
-        ("csv", heights.csv),
-        ("segwit", heights.segwit),
-    ] {
-        softforks.insert(
-            name.to_owned(),
-            json!({
-                "type": "buried",
-                "active": selected_height >= activation_height,
-                "height": activation_height,
-            }),
-        );
-    }
-    let [testdummy, taproot] = validation::bip9_deployments(network);
-    softforks.insert(
-        "testdummy".to_owned(),
-        bip9_deployment_json(headers, selected_height, testdummy),
-    );
-    softforks.insert(
-        "taproot".to_owned(),
-        bip9_deployment_json(headers, selected_height, taproot),
-    );
-    Value::Object(softforks)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12330,7 +12293,7 @@ mod tests {
     }
 
     #[test]
-    fn blockchain_info_reports_softforks() {
+    fn blockchain_info_omits_removed_softfork_field() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
             network: Network::Regtest,
@@ -12378,15 +12341,7 @@ mod tests {
         let info = get_blockchain_info(&node).unwrap();
         assert_eq!(info["initialblockdownload"], json!(true));
         assert_eq!(info["verificationprogress"], json!(0.0));
-        assert_eq!(info["softforks"]["bip34"]["type"], json!("buried"));
-        assert_eq!(info["softforks"]["bip34"]["height"], json!(1));
-        assert_eq!(info["softforks"]["bip34"]["active"], json!(false));
-        assert_eq!(info["softforks"]["segwit"]["active"], json!(true));
-        assert_eq!(
-            info["softforks"]["testdummy"]["bip9"]["status"],
-            json!("defined")
-        );
-        assert_eq!(info["softforks"]["taproot"]["active"], json!(true));
+        assert!(info.get("softforks").is_none());
     }
 
     #[test]

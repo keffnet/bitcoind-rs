@@ -1411,41 +1411,61 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "warnings": [],
             }))
         }
-        "getpeerinfo" => Ok(json!(
-            node.peer_infos()
-                .into_iter()
-                .map(|peer| json!({
+        "getpeerinfo" => {
+            Ok(json!(node
+            .peer_infos()
+            .into_iter()
+            .map(|peer| {
+                let mut info = json!({
                     "id": peer.id,
                     "addr": peer.address.to_string(),
-                    "addrbind": peer
-                        .local_address
-                        .map(|address| address.to_string())
-                        .unwrap_or_default(),
-                    "addrlocal": "",
                     "network": if peer.address.ip().is_ipv4() { "ipv4" } else { "ipv6" },
                     "services": format!("{:016x}", peer.services),
                     "servicesnames": peer_services_names(peer.services),
                     "relaytxes": peer.relay_transactions,
+                    "last_inv_sequence": 0,
+                    "inv_to_send": 0,
                     "lastsend": peer.last_send,
                     "lastrecv": peer.last_recv,
+                    "last_transaction": 0,
+                    "last_block": 0,
                     "bytessent": peer.bytes_sent,
                     "bytesrecv": peer.bytes_received,
                     "conntime": peer.connected_at,
-                    "pingtime": peer.ping_time,
-                    "minping": peer.min_ping,
+                    "timeoffset": 0,
                     "version": peer.version.unwrap_or_default(),
                     "subver": peer.user_agent,
                     "inbound": peer.inbound,
-                    "connection_type": if peer.inbound { "inbound" } else { "outbound-full" },
-                    "permissions": [],
-                    "startingheight": peer.start_height,
-                    "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
+                    "bip152_hb_to": false,
+                    "bip152_hb_from": false,
+                    "presynced_headers": -1,
                     "synced_headers": node.chain.read().best_header_tip().height,
                     "synced_blocks": node.chain.read().height(),
                     "inflight": [],
-                }))
-                .collect::<Vec<_>>()
-        )),
+                    "addr_relay_enabled": true,
+                    "addr_processed": 0,
+                    "addr_rate_limited": 0,
+                    "permissions": [],
+                    "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
+                    "bytessent_per_msg": {},
+                    "bytesrecv_per_msg": {},
+                    "connection_type": if peer.inbound { "inbound" } else { "outbound-full" },
+                    "transport_protocol_type": peer.transport_protocol_type,
+                    "session_id": "",
+                });
+                if let Some(address) = peer.local_address {
+                    info["addrbind"] = json!(address.to_string());
+                }
+                if let Some(ping_time) = peer.ping_time {
+                    info["pingtime"] = json!(ping_time);
+                }
+                if let Some(min_ping) = peer.min_ping {
+                    info["minping"] = json!(min_ping);
+                }
+                info
+            })
+            .collect::<Vec<_>>()))
+        }
         "getnettotals" => get_net_totals(node),
         "getnodeaddresses" => get_node_addresses(node, params),
         "getaddrmaninfo" => get_addrman_info(node),
@@ -12265,6 +12285,13 @@ mod tests {
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
+        let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
+        assert_eq!(peer_info[0]["id"], json!(7));
+        assert_eq!(peer_info[0]["connection_type"], json!("outbound-full"));
+        assert_eq!(peer_info[0]["presynced_headers"], json!(-1));
+        assert_eq!(peer_info[0]["transport_protocol_type"], json!("v1"));
+        assert!(peer_info[0].get("startingheight").is_none());
+        assert!(peer_info[0].get("pingtime").is_none());
         assert_eq!(
             dispatch_method(&node, "sendmsgtopeer", &json!([7, "test", "0102"]),).unwrap(),
             json!({})

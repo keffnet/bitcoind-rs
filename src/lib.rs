@@ -303,6 +303,7 @@ pub struct PeerInfo {
     pub start_height: i32,
     pub relay_transactions: bool,
     pub min_fee_filter: i64,
+    pub transport_protocol_type: &'static str,
     pub connected_at: u64,
     pub last_send: u64,
     pub last_recv: u64,
@@ -983,6 +984,7 @@ impl Node {
             start_height: 0,
             relay_transactions: true,
             min_fee_filter: 0,
+            transport_protocol_type: "v1",
             connected_at,
             last_send: connected_at,
             last_recv: connected_at,
@@ -1037,6 +1039,12 @@ impl Node {
         }
     }
 
+    pub(crate) fn set_peer_transport_protocol(&self, id: usize, transport_v2: bool) {
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.transport_protocol_type = if transport_v2 { "v2" } else { "v1" };
+        }
+    }
+
     pub fn unregister_peer(&self, id: usize) {
         let address = self.peers.write().remove(&id).map(|peer| peer.address);
         self.peer_commands.write().remove(&id);
@@ -1087,6 +1095,7 @@ impl Node {
                 start_height: 0,
                 relay_transactions: true,
                 min_fee_filter: 0,
+                transport_protocol_type: "v1",
                 connected_at: now,
                 last_send: now,
                 last_recv: now,
@@ -1121,6 +1130,7 @@ impl Node {
             start_height: 0,
             relay_transactions: true,
             min_fee_filter: 0,
+            transport_protocol_type: "v1",
             connected_at: time,
             last_send: time,
             last_recv: time,
@@ -1517,6 +1527,7 @@ fn load_known_addresses(
                 start_height: 0,
                 relay_transactions: true,
                 min_fee_filter: 0,
+                transport_protocol_type: "v1",
                 connected_at: entry.time,
                 last_send: entry.time,
                 last_recv: entry.time,

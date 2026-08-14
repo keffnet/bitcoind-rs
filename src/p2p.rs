@@ -789,8 +789,10 @@ async fn serve_peer(
     stream.set_nodelay(true)?;
     let (mut reader, writer_half, local_address) =
         establish_transport(stream, address, outbound, node.config.network, transport_v2).await?;
+    let transport_v2 = matches!(&reader, PeerReader::V2(_));
     let (commands, command_receiver) = mpsc::unbounded_channel();
     node.register_peer_with_local(peer_id, address, !outbound, commands, local_address);
+    node.set_peer_transport_protocol(peer_id, transport_v2);
     let peer_state = Arc::new(PeerState {
         writer: Arc::new(Mutex::new(writer_half)),
         bloom_filter: parking_lot::Mutex::new(None),

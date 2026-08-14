@@ -2271,13 +2271,20 @@ impl ChainState {
             }
             .into());
         }
-        for output in &block.txdata[0].output {
-            if is_unspendable_script(&output.script_pubkey) {
-                metrics.unspendable_scripts_sat = metrics
-                    .unspendable_scripts_sat
-                    .saturating_add(output.value.to_sat());
-            } else {
-                metrics.coinbase_sat = metrics.coinbase_sat.saturating_add(output.value.to_sat());
+        if is_bip30_unspendable(self.network, height, block_hash) {
+            metrics.unspendable_bip30_sat = metrics
+                .unspendable_bip30_sat
+                .saturating_add(metrics.subsidy_sat);
+        } else {
+            for output in &block.txdata[0].output {
+                if is_unspendable_script(&output.script_pubkey) {
+                    metrics.unspendable_scripts_sat = metrics
+                        .unspendable_scripts_sat
+                        .saturating_add(output.value.to_sat());
+                } else {
+                    metrics.coinbase_sat =
+                        metrics.coinbase_sat.saturating_add(output.value.to_sat());
+                }
             }
         }
         Ok(BlockApplication {
@@ -3313,6 +3320,12 @@ fn apply_block_to_coin_stats(
         ..CoinStatsBlockMetrics::default()
     };
     for (transaction_index, transaction) in block.txdata.iter().enumerate() {
+        if transaction_index == 0 && is_bip30_unspendable(network, height, block.block_hash()) {
+            metrics.unspendable_bip30_sat = metrics
+                .unspendable_bip30_sat
+                .saturating_add(metrics.subsidy_sat);
+            continue;
+        }
         for input in &transaction.input {
             if let Some(entry) = utxos.remove(&input.previous_output) {
                 stats.remove(&input.previous_output, &entry);
@@ -3394,6 +3407,16 @@ pub(crate) fn is_bip30_repeat(network: Network, height: u32, hash: BlockHash) ->
     (height == 91_842 && hash == "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")
         || (height == 91_880
             && hash == "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")
+}
+
+fn is_bip30_unspendable(network: Network, height: u32, hash: BlockHash) -> bool {
+    if network != Network::Bitcoin {
+        return false;
+    }
+    let hash = hash.to_string();
+    (height == 91_722 && hash == "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e")
+        || (height == 91_812
+            && hash == "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f")
 }
 
 fn bip34_activation_hash(network: Network) -> Option<&'static str> {
@@ -3699,6 +3722,25 @@ mod tests {
         assert!(!is_bip30_repeat(
             Network::Regtest,
             91_842,
+            BlockHash::all_zeros()
+        ));
+        assert!(is_bip30_unspendable(
+            Network::Bitcoin,
+            91_722,
+            "00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e"
+                .parse()
+                .unwrap()
+        ));
+        assert!(is_bip30_unspendable(
+            Network::Bitcoin,
+            91_812,
+            "00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f"
+                .parse()
+                .unwrap()
+        ));
+        assert!(!is_bip30_unspendable(
+            Network::Testnet,
+            91_722,
             BlockHash::all_zeros()
         ));
     }

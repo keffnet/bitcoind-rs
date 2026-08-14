@@ -1697,9 +1697,15 @@ async fn serve_peer_loop(
                 }
             }
             Message::FilterLoad(filter) => {
+                if !node.config.peer_bloom_filters {
+                    anyhow::bail!("filterload received while bloom filters are disabled");
+                }
                 *bloom_filter.lock() = Some(BloomFilter::from_message(filter)?);
             }
             Message::FilterAdd(FilterAdd { data }) => {
+                if !node.config.peer_bloom_filters {
+                    anyhow::bail!("filteradd received while bloom filters are disabled");
+                }
                 if data.len() > MAX_BLOOM_ELEMENT_SIZE {
                     anyhow::bail!("bloom filter element exceeds the 520-byte limit");
                 }
@@ -1710,6 +1716,9 @@ async fn serve_peer_loop(
                 filter.insert(&data);
             }
             Message::FilterClear => {
+                if !node.config.peer_bloom_filters {
+                    anyhow::bail!("filterclear received while bloom filters are disabled");
+                }
                 *bloom_filter.lock() = None;
             }
             Message::MerkleBlock(_) => {}
@@ -1810,6 +1819,9 @@ async fn serve_peer_loop(
                 }
             }
             Message::Mempool => {
+                if !node.config.peer_bloom_filters {
+                    anyhow::bail!("mempool request received while bloom filters are disabled");
+                }
                 if !peer_state.local_relay_transactions || !*relay_transactions.lock() {
                     send_message(
                         node,

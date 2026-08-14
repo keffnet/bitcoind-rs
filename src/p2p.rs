@@ -36,7 +36,7 @@ use crate::chain::BasicFilterRange;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
 };
-use crate::{Node, unix_time_seconds};
+use crate::{MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, unix_time_seconds};
 
 enum PeerReader {
     V1(OwnedReadHalf),
@@ -227,6 +227,23 @@ fn connection_fetches_addresses(outbound: bool, connection_type: &str) -> bool {
 
 fn getdata_batches(requests: &[Inventory]) -> impl Iterator<Item = &[Inventory]> {
     requests.chunks(MAX_GETDATA_BATCH)
+}
+
+fn queue_block_requests(
+    pending: &mut Vec<Inventory>,
+    requests: impl IntoIterator<Item = Inventory>,
+) {
+    for request in requests {
+        if !matches!(
+            request.kind,
+            InventoryType::Block | InventoryType::WitnessBlock | InventoryType::CompactBlock
+        ) {
+            continue;
+        }
+        if !pending.iter().any(|queued| queued.hash == request.hash) {
+            pending.push(request);
+        }
+    }
 }
 
 fn block_request_inventory_type(peer_services: u64) -> InventoryType {
@@ -1202,6 +1219,7 @@ async fn serve_peer_loop(
         tokio::time::interval(Duration::from_secs(tx_inventory_interval_secs));
     tx_inventory_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tx_inventory_interval.tick().await;
+    let mut pending_block_requests = Vec::new();
     loop {
         if !node.network_active() {
             anyhow::bail!("networking is disabled");
@@ -1211,17 +1229,30 @@ async fn serve_peer_loop(
                 match command {
                     Some(PeerCommand::Disconnect) | None => anyhow::bail!("peer disconnected by node"),
                     Some(PeerCommand::RequestBlock(hash)) => {
-                        node.track_peer_block_request(peer_id, hash);
-                        send_message(
-                            node,
-                            peer_id,
-                            writer,
-                            node.config.network,
-                            &Message::GetData(vec![Inventory {
-                                kind: InventoryType::WitnessBlock,
-                                hash,
-                            }]),
-                        ).await?;
+                        let request = Inventory {
+                            kind: InventoryType::WitnessBlock,
+                            hash,
+                        };
+                        if node.peer_has_inflight_block_request(peer_id, hash) {
+                            send_getdata_batches(
+                                node,
+                                peer_id,
+                                writer,
+                                node.config.network,
+                                std::slice::from_ref(&request),
+                            )
+                            .await?;
+                        } else {
+                            queue_block_requests(&mut pending_block_requests, [request]);
+                            flush_pending_block_requests(
+                                node,
+                                peer_id,
+                                writer,
+                                node.config.network,
+                                &mut pending_block_requests,
+                            )
+                            .await?;
+                        }
                         continue;
                     }
                     Some(PeerCommand::Ping(nonce)) => {
@@ -1498,11 +1529,15 @@ async fn serve_peer_loop(
                         .collect::<Vec<_>>()
                 };
                 if !requests.is_empty() {
-                    for request in &requests {
-                        node.track_peer_block_request(peer_id, request.hash);
-                    }
-                    send_getdata_batches(node, peer_id, writer, node.config.network, &requests)
-                        .await?;
+                    queue_block_requests(&mut pending_block_requests, requests);
+                    flush_pending_block_requests(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &mut pending_block_requests,
+                    )
+                    .await?;
                 } else {
                     request_headers(node, peer_id, writer).await?;
                 }
@@ -1571,18 +1606,32 @@ async fn serve_peer_loop(
                         .collect::<Vec<_>>()
                 };
                 if !requests.is_empty() {
-                    for request in &requests {
-                        if matches!(
-                            request.kind,
-                            InventoryType::Block
-                                | InventoryType::WitnessBlock
-                                | InventoryType::CompactBlock
-                        ) {
-                            node.track_peer_block_request(peer_id, request.hash);
-                        }
-                    }
-                    send_getdata_batches(node, peer_id, writer, node.config.network, &requests)
-                        .await?;
+                    let (block_requests, transaction_requests): (Vec<Inventory>, Vec<Inventory>) =
+                        requests.into_iter().partition(|request| {
+                            matches!(
+                                request.kind,
+                                InventoryType::Block
+                                    | InventoryType::WitnessBlock
+                                    | InventoryType::CompactBlock
+                            )
+                        });
+                    queue_block_requests(&mut pending_block_requests, block_requests);
+                    send_getdata_batches(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &transaction_requests,
+                    )
+                    .await?;
+                    flush_pending_block_requests(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &mut pending_block_requests,
+                    )
+                    .await?;
                 }
             }
             Message::GetData(items) => {
@@ -1767,11 +1816,27 @@ async fn serve_peer_loop(
                 if handle_received_block(node, peers, peer_id, block).await {
                     node.record_peer_block(peer_id, hash);
                 }
+                flush_pending_block_requests(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &mut pending_block_requests,
+                )
+                .await?;
                 request_headers(node, peer_id, writer).await?;
             }
             Message::CompactBlock(compact) => {
                 let hash = compact.header.block_hash();
                 node.clear_peer_block_request(peer_id, hash);
+                flush_pending_block_requests(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &mut pending_block_requests,
+                )
+                .await?;
                 match reconstruct_compact_block(&compact, node, compact_block_version) {
                     Ok((transactions, missing)) if missing.is_empty() => {
                         match complete_compact_block(&compact, transactions) {
@@ -2152,6 +2217,14 @@ async fn serve_peer_loop(
                         node.clear_peer_block_request(peer_id, item.hash);
                     }
                 }
+                flush_pending_block_requests(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &mut pending_block_requests,
+                )
+                .await?;
             }
             Message::FeeFilter(rate) => {
                 let rate = rate.max(0);
@@ -2351,7 +2424,9 @@ async fn request_full_block(
     network: Network,
     hash: BlockHash,
 ) -> Result<()> {
-    node.track_peer_block_request(peer_id, hash);
+    if !node.track_peer_block_request(peer_id, hash) {
+        return Ok(());
+    }
     send_message(
         node,
         peer_id,
@@ -2363,6 +2438,37 @@ async fn request_full_block(
         }]),
     )
     .await
+}
+
+async fn flush_pending_block_requests(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    network: Network,
+    pending: &mut Vec<Inventory>,
+) -> Result<()> {
+    let available =
+        MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(node.peer_inflight_block_count(peer_id));
+    if available == 0 || pending.is_empty() {
+        return Ok(());
+    }
+
+    let queued = std::mem::take(pending);
+    let mut requests = Vec::with_capacity(available);
+    let mut remaining = Vec::new();
+    for request in queued {
+        if node.peer_inflight_block_count(peer_id) >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
+            || requests.len() >= available
+        {
+            remaining.push(request);
+            continue;
+        }
+        if node.track_peer_block_request(peer_id, request.hash) {
+            requests.push(request);
+        }
+    }
+    *pending = remaining;
+    send_getdata_batches(node, peer_id, writer, network, &requests).await
 }
 
 async fn send_getdata_batches(

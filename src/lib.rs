@@ -43,6 +43,7 @@ const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_KNOWN_ADDRESSES: usize = 256_000;
+pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -1210,9 +1211,9 @@ impl Node {
         }
     }
 
-    pub(crate) fn track_peer_block_request(&self, peer_id: usize, hash: BlockHash) {
+    pub(crate) fn track_peer_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
         let Some(height) = self.chain.read().block_height_by_hash(&hash) else {
-            return;
+            return false;
         };
         if let Some(peer) = self.peers.write().get_mut(&peer_id)
             && !peer
@@ -1220,8 +1221,28 @@ impl Node {
                 .iter()
                 .any(|(inflight_hash, _)| *inflight_hash == hash)
         {
+            if peer.inflight_blocks.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER {
+                return false;
+            }
             peer.inflight_blocks.push((hash, height));
+            return true;
         }
+        false
+    }
+
+    pub(crate) fn peer_inflight_block_count(&self, peer_id: usize) -> usize {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .map_or(0, |peer| peer.inflight_blocks.len())
+    }
+
+    pub(crate) fn peer_has_inflight_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
+        self.peers.read().get(&peer_id).is_some_and(|peer| {
+            peer.inflight_blocks
+                .iter()
+                .any(|(inflight_hash, _)| *inflight_hash == hash)
+        })
     }
 
     pub(crate) fn clear_peer_block_request(&self, peer_id: usize, hash: BlockHash) {

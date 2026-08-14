@@ -1173,7 +1173,11 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
         if specified[index] {
             bail!("parameter {name} specified more than once")
         }
-        values[index] = value.clone();
+        values[index] = if method == "dumptxoutset" && name == "rollback" {
+            json!({"rollback": value})
+        } else {
+            value.clone()
+        };
         specified[index] = true;
     }
     Ok(Value::Array(values))
@@ -3768,26 +3772,54 @@ fn precious_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let path = snapshot_path(node, &param::<String>(params, 0)?);
-    let dump_type = optional_str(params, 1, "latest", "type")?;
-    if dump_type != "latest" {
-        bail!("only the latest UTXO snapshot type is supported")
+    let dump_type = optional_str(params, 1, "", "type")?;
+    let rollback = match params.get(2).filter(|value| !value.is_null()) {
+        Some(options) => {
+            let Some(options) = options.as_object() else {
+                bail!("dumptxoutset options must be an object")
+            };
+            for name in options.keys() {
+                if name != "rollback" {
+                    bail!("unknown dumptxoutset option {name}")
+                }
+            }
+            options.get("rollback")
+        }
+        None => None,
+    };
+    if rollback.is_some() && !dump_type.is_empty() && dump_type != "rollback" {
+        bail!("Invalid snapshot type \"{dump_type}\" specified with rollback option")
     }
-    if let Some(options) = params.get(2).filter(|value| !value.is_null()) {
-        let Some(options) = options.as_object() else {
-            bail!("historical UTXO rollback snapshots are not supported")
-        };
-        if options.contains_key("rollback") {
-            bail!("historical UTXO rollback snapshots are not supported")
-        }
-        if let Some(name) = options.keys().next() {
-            bail!("unknown dumptxoutset option {name}")
-        }
+    if !dump_type.is_empty() && dump_type != "latest" && dump_type != "rollback" {
+        bail!(
+            "Invalid snapshot type \"{dump_type}\" specified. Please specify \"rollback\" or \"latest\""
+        )
     }
     if path.exists() {
         bail!(
             "{} already exists; move it out of the way before creating a snapshot",
             path.display()
         )
+    }
+    let target = {
+        let chain = node.chain.read();
+        match rollback {
+            Some(value) => Some(parse_rollback_target(&chain, value)?),
+            None if dump_type == "rollback" => Some(chain.latest_snapshot_hash()),
+            None => None,
+        }
+    };
+    if let Some(target) = target {
+        let (coins_written, base_hash, base_height, txoutset_hash, nchaintx) =
+            node.chain.write().dump_utxo_set_at(&path, target)?;
+        return Ok(json!({
+            "coins_written": coins_written,
+            "base_hash": base_hash.to_string(),
+            "base_height": base_height,
+            "path": path.to_string_lossy(),
+            "txoutset_hash": txoutset_hash,
+            "nchaintx": nchaintx,
+        }));
     }
     let chain = node.chain.read();
     let (coins_written, base_hash, base_height) = chain.dump_utxo_set(&path)?;
@@ -3799,6 +3831,27 @@ fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "txoutset_hash": chain.utxo_serialized_hash(),
         "nchaintx": chain.active_transaction_count(),
     }))
+}
+
+fn parse_rollback_target(chain: &chain::ChainState, value: &Value) -> Result<BlockHash> {
+    let height = if let Some(value) = value.as_u64() {
+        u32::try_from(value).context("rollback height is too large")?
+    } else if let Some(value) = value.as_str() {
+        if let Ok(hash) = value.parse::<BlockHash>() {
+            if chain.is_active_block(&hash) {
+                return Ok(hash);
+            }
+            bail!("Could not roll back to requested height.")
+        }
+        value
+            .parse::<u32>()
+            .context("rollback must be a block height or hash")?
+    } else {
+        bail!("rollback must be a block height or hash")
+    };
+    chain
+        .block_hash(height)
+        .context("Could not roll back to requested height.")
 }
 
 fn load_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -15832,6 +15885,82 @@ mod tests {
         assert_eq!(loaded["base_height"], 0);
         assert_eq!(loaded["coins_loaded"], 0);
         assert_eq!(loaded["path"], path.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn dumptxoutset_can_dump_an_active_historical_height_without_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: false,
+            blocksonly: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: false,
+            peer_block_filters: false,
+            persist_mempool: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        generate_to_descriptor(&node, &json!([3, "raw(51)"])).unwrap();
+        let live_height = node.chain.read().height();
+        let target_hash = node.chain.read().block_hash(1).unwrap();
+        let path = directory.path().join("historical-utxos.snapshot");
+        let dumped = dump_txoutset(
+            &node,
+            &json!([
+                path.to_string_lossy(),
+                "rollback",
+                {"rollback": 1}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(dumped["base_height"], 1);
+        assert_eq!(dumped["base_hash"], target_hash.to_string());
+        assert_eq!(dumped["coins_written"], 1);
+        assert_eq!(dumped["nchaintx"], 2);
+        assert_eq!(node.chain.read().height(), live_height);
+        assert!(path.exists());
+
+        let named_path = directory.path().join("historical-utxos-named.snapshot");
+        let named = normalize_rpc_params(
+            "dumptxoutset",
+            &json!({
+                "path": named_path.to_string_lossy(),
+                "rollback": target_hash.to_string(),
+            }),
+        )
+        .unwrap();
+        let named_dump = dump_txoutset(&node, &named).unwrap();
+        assert_eq!(named_dump["base_height"], 1);
+        assert_eq!(named_dump["base_hash"], target_hash.to_string());
+        assert_eq!(node.chain.read().height(), live_height);
     }
 
     #[test]

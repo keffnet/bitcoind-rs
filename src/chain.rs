@@ -1725,12 +1725,126 @@ impl ChainState {
             .expect("MuHash was requested")
     }
 
+    /// Return the newest block at which this implementation persists a
+    /// periodic chainstate snapshot. It is the default target for a rollback
+    /// request that does not name an explicit height or hash.
+    pub fn latest_snapshot_hash(&self) -> BlockHash {
+        let height = self.height() / SNAPSHOT_INTERVAL * SNAPSHOT_INTERVAL;
+        self.block_hash(height)
+            .expect("the periodic snapshot target is on the active chain")
+    }
+
     pub fn dump_utxo_set(&self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {
         let snapshot = self.current_snapshot();
         let bytes = serde_json::to_vec(&snapshot)?;
         fs::write(path.as_ref(), bytes)
             .with_context(|| format!("writing UTXO snapshot {}", path.as_ref().display()))?;
         Ok((self.utxos.len() as u64, self.best_hash(), self.height()))
+    }
+
+    /// Write a snapshot for an active historical block without changing the
+    /// node's active chainstate. This is the equivalent of Core's temporary
+    /// rollback used by `dumptxoutset ... rollback`.
+    pub fn dump_utxo_set_at(
+        &mut self,
+        path: impl AsRef<Path>,
+        target_hash: BlockHash,
+    ) -> Result<(u64, BlockHash, u32, String, usize)> {
+        let target = self
+            .block_index
+            .get(&target_hash)
+            .copied()
+            .context("rollback target is unknown")?;
+        let target_height = target.height;
+        if !self.is_active_block(&target_hash) {
+            bail!("rollback target is not on the active chain")
+        }
+
+        let utxos = if target_hash == self.best_hash() {
+            self.utxos.clone()
+        } else {
+            self.replay_utxos_for_block(target_hash, false)?
+                .context("could not reconstruct the historical UTXO set")?
+        };
+        let active_hashes: HashSet<BlockHash> = self
+            .active_chain
+            .iter()
+            .take(target_height as usize + 1)
+            .copied()
+            .collect();
+        let tx_index = self
+            .tx_index
+            .iter()
+            .filter(|(_, location)| {
+                location.height <= target_height && active_hashes.contains(&location.block_hash)
+            })
+            .map(|(txid, location)| (*txid, location.clone()))
+            .collect();
+        let tx_index_all = self
+            .tx_index_all
+            .iter()
+            .filter(|(_, location)| {
+                location.height <= target_height && active_hashes.contains(&location.block_hash)
+            })
+            .map(|(txid, location)| (*txid, location.clone()))
+            .collect();
+        let history = self
+            .history
+            .iter()
+            .filter_map(|(script_hash, entries)| {
+                let entries = entries
+                    .iter()
+                    .filter(|entry| entry.height <= target_height)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!entries.is_empty()).then_some((script_hash.clone(), entries))
+            })
+            .collect();
+        let spent_by = self.txospender_index_enabled.then(|| {
+            self.spent_by
+                .iter()
+                .filter(|(_, (_, _, block_hash, height))| {
+                    *height <= target_height && active_hashes.contains(block_hash)
+                })
+                .map(|(outpoint, spender)| (*outpoint, *spender))
+                .collect()
+        });
+        let snapshot = ChainSnapshot {
+            tip: target_hash.to_string(),
+            headers: self
+                .headers
+                .iter()
+                .take(target_height as usize + 1)
+                .copied()
+                .collect(),
+            utxos,
+            tx_index,
+            tx_index_all,
+            history,
+            spent_by,
+            prune_height: self.prune_height,
+        };
+        let stats = calculate_utxo_statistics(&snapshot.utxos, true, false);
+        let serialized_hash = stats
+            .serialized_hash
+            .clone()
+            .context("historical UTXO hash was not calculated")?;
+        let coins_written = snapshot.utxos.len() as u64;
+        let nchaintx = snapshot.tx_index_all.len();
+        let bytes = serde_json::to_vec(&snapshot)?;
+        let path = path.as_ref();
+        let temporary = PathBuf::from(format!("{}.incomplete", path.display()));
+        fs::write(&temporary, bytes)
+            .with_context(|| format!("writing UTXO snapshot {}", temporary.display()))?;
+        fs::rename(&temporary, path)
+            .with_context(|| format!("installing UTXO snapshot {}", path.display()))?;
+        Ok((
+            coins_written,
+            target_hash,
+            target_height,
+            serialized_hash,
+            nchaintx,
+        ))
     }
 
     pub fn load_utxo_set(&mut self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {

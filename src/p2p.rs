@@ -709,6 +709,13 @@ impl PeerManager {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
+                if block_relay_node.chain.read().is_initial_block_download() {
+                    // Core does not announce blocks while IBD is active. Move
+                    // the relay boundary forward so leaving IBD does not
+                    // replay every historical tip as a fresh announcement.
+                    last_announced_tip = tip.hash;
+                    continue;
+                }
                 let hashes = {
                     let mut chain = block_relay_node.chain.write();
                     let hashes = chain
@@ -753,7 +760,9 @@ impl PeerManager {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                if relay_node.config.blocksonly {
+                if relay_node.config.blocksonly
+                    || relay_node.chain.read().is_initial_block_download()
+                {
                     continue;
                 }
                 let Some(hash) = relay_node
@@ -1739,6 +1748,7 @@ async fn serve_peer_loop(
                 let transaction_requests = {
                     let chain = node.chain.read();
                     let mempool = node.mempool.read();
+                    let initial_block_download = chain.is_initial_block_download();
                     items
                         .into_iter()
                         .filter_map(|item| match item.kind {
@@ -1757,7 +1767,7 @@ async fn serve_peer_loop(
                                 None
                             }
                             kind if kind.is_transaction() => {
-                                if node.config.blocksonly {
+                                if node.config.blocksonly || initial_block_download {
                                     return None;
                                 }
                                 if (wtxid_relay && item.kind == InventoryType::Transaction)
@@ -2315,6 +2325,9 @@ async fn serve_peer_loop(
                 }
                 let txid = transaction.compute_txid();
                 forget_transaction_requests(peers, &transaction);
+                if node.chain.read().is_initial_block_download() {
+                    continue;
+                }
                 let known_hash = if *peer_state.wtxid_relay.lock() {
                     BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash())
                 } else {
@@ -2654,7 +2667,11 @@ async fn handle_received_block(
             // Active-tip updates are announced by the chain-event relay. A
             // side-chain block has no tip event, so relay a newly accepted
             // side-chain block here. Avoid announcing duplicate blocks.
-            if !was_stored && tip.hash == previous_tip && hash != previous_tip {
+            if !was_stored
+                && tip.hash == previous_tip
+                && hash != previous_tip
+                && !node.chain.read().is_initial_block_download()
+            {
                 broadcast_inventory(
                     node,
                     peers,

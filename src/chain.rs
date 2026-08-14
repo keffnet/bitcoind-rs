@@ -768,6 +768,18 @@ impl ChainState {
         Work::from_unprefixed_hex(hex).expect("Core minimum chainwork is valid hex")
     }
 
+    /// Return the same chainwork/tip-age IBD predicate exposed by
+    /// `getblockchaininfo`. Transaction relay is intentionally paused while
+    /// this is true, but headers and blocks continue to synchronize.
+    pub fn is_initial_block_download(&self) -> bool {
+        let tip = self.tip();
+        let header = self
+            .header(tip.height)
+            .expect("the active tip header is always indexed");
+        tip.work < self.minimum_chain_work()
+            || u64::from(header.time).saturating_add(24 * 60 * 60) < crate::time::unix_time()
+    }
+
     pub fn chain_tips(&self) -> Vec<KnownChainTip> {
         let mut parents = HashSet::new();
         for node in self.block_index.values() {
@@ -3602,6 +3614,13 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn initial_block_download_is_true_for_an_old_regtest_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert!(state.is_initial_block_download());
     }
 
     #[test]

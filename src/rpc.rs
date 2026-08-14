@@ -1520,16 +1520,25 @@ fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .transpose()?;
     const BASIC_FILTER_INDEX: &str = "basic block filter index";
-    if requested.is_some_and(|name| name != BASIC_FILTER_INDEX) {
+    const TX_INDEX: &str = "txindex";
+    if requested.is_some_and(|name| name != BASIC_FILTER_INDEX && name != TX_INDEX) {
         return Ok(json!({}));
     }
     let height = node.chain.read().height();
-    Ok(json!({
-        BASIC_FILTER_INDEX: {
+    let mut result = json!({});
+    if node.config.txindex && requested.is_none_or(|name| name == TX_INDEX) {
+        result[TX_INDEX] = json!({
             "synced": true,
             "best_block_height": height,
-        }
-    }))
+        });
+    }
+    if requested.is_none_or(|name| name == BASIC_FILTER_INDEX) {
+        result[BASIC_FILTER_INDEX] = json!({
+            "synced": true,
+            "best_block_height": height,
+        });
+    }
+    Ok(result)
 }
 
 fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -3976,8 +3985,10 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 transaction_index,
             },
         ))
-    } else {
+    } else if node.config.txindex {
         chain.transaction(&txid)?
+    } else {
+        None
     };
     let (transaction, location) = if let Some(found) = found {
         found
@@ -9835,6 +9846,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -9989,6 +10001,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10058,6 +10071,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10086,6 +10100,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10119,6 +10134,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10183,6 +10199,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10221,6 +10238,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10326,6 +10344,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10377,6 +10396,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10406,6 +10426,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10438,6 +10459,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10479,6 +10501,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10513,6 +10536,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10541,6 +10565,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10566,6 +10591,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10666,6 +10692,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10713,6 +10740,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10782,6 +10810,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10818,6 +10847,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10880,6 +10910,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10963,6 +10994,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11048,6 +11080,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11077,6 +11110,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11111,6 +11145,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11151,6 +11186,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11198,6 +11234,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11236,6 +11273,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11274,6 +11312,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11304,6 +11343,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             max_peers: 1,
             peer_bloom_filters: false,
@@ -11333,6 +11373,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11408,6 +11449,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11463,6 +11505,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11512,6 +11555,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11671,6 +11715,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11824,6 +11869,81 @@ mod tests {
     }
 
     #[test]
+    fn enabled_txindex_serves_confirmed_raw_transactions_without_a_block_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
+            prune: 0,
+            txindex: true,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let mined = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap();
+        let block_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
+        let block = node.chain.write().block(&block_hash).unwrap().unwrap();
+        let txid = block.txdata[0].compute_txid();
+
+        assert_eq!(
+            get_index_info(&node, &json!(["txindex"])).unwrap()["txindex"]["synced"],
+            true
+        );
+        assert!(get_raw_transaction(&node, &json!([txid.to_string(), 1])).is_ok());
+        assert!(
+            get_raw_transaction(&node, &json!([txid.to_string(), 1, block_hash.to_string()]))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn disabled_txindex_is_not_reported_by_getindexinfo() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
+            prune: 0,
+            txindex: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let mined = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap();
+        let block_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
+        let block = node.chain.write().block(&block_hash).unwrap().unwrap();
+        let txid = block.txdata[0].compute_txid();
+        assert!(get_raw_transaction(&node, &json!([txid.to_string(), 1])).is_err());
+        assert!(
+            get_raw_transaction(&node, &json!([txid.to_string(), 1, block_hash.to_string()]))
+                .is_ok()
+        );
+        assert_eq!(
+            get_index_info(&node, &json!(["txindex"])).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
     fn combine_raw_transaction_merges_partial_inputs() {
         let previous_a = OutPoint::new(Txid::from_byte_array([8; 32]), 0);
         let previous_b = OutPoint::new(Txid::from_byte_array([9; 32]), 1);
@@ -11888,6 +12008,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11999,6 +12120,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12036,6 +12158,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12111,6 +12234,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12318,6 +12442,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12659,6 +12784,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12714,6 +12840,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12778,6 +12905,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12886,6 +13014,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12916,6 +13045,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,

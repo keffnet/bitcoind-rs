@@ -42,6 +42,8 @@ Bloom-filter peer relay is disabled by default, matching Core's default; enable 
 
 Inbound P2P listening can be disabled with `--listen=false`; DNS seed lookup can be disabled with `--dnsseed=false`. `--blocksonly` disables transaction relay while retaining block synchronization and local RPC/mempool operation. Block pruning follows Core's `--prune=1` manual mode or `--prune=<MiB>` automatic target mode (automatic targets must be at least 550 MiB); `pruneblockchain` is only available when pruning is enabled.
 
+Use `--txindex` to enable confirmed transaction lookup without supplying a block hash to `getrawtransaction`; Core-style pruning and `--txindex` are mutually exclusive.
+
 ZeroMQ topics can be enabled with the Core-style options, for example
 `--zmqpubhashtx tcp://127.0.0.1:28332 --zmqpubsequence tcp://127.0.0.1:28333`.
 `getzmqnotifications` reports the configured topic endpoints and high-water marks.

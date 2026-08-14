@@ -171,6 +171,9 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub prune: u64,
 
+    #[arg(long, default_value_t = false)]
+    pub txindex: bool,
+
     #[arg(long, default_value_t = false, hide = true)]
     pub tx_reconciliation: bool,
 
@@ -222,6 +225,7 @@ pub struct Config {
     pub blocksonly: bool,
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
     pub prune: u64,
+    pub txindex: bool,
     pub zmq: ZmqConfig,
 }
 
@@ -232,6 +236,9 @@ impl Config {
         }
         if args.prune != 0 && args.prune != 1 && args.prune < MIN_AUTO_PRUNE_TARGET_MIB {
             bail!("--prune automatic target must be at least {MIN_AUTO_PRUNE_TARGET_MIB} MiB");
+        }
+        if args.txindex && args.prune != 0 {
+            bail!("Prune mode is incompatible with --txindex.");
         }
         if [
             args.zmq_pub_hash_tx_hwm,
@@ -276,6 +283,7 @@ impl Config {
             peer_bloom_filters: args.peer_bloom_filters,
             blocksonly: args.blocksonly,
             prune: args.prune,
+            txindex: args.txindex,
             zmq: ZmqConfig {
                 tx_reconciliation: args.tx_reconciliation,
                 pub_hash_tx: args.zmq_pub_hash_tx,
@@ -346,6 +354,25 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--prune",
             "549",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--txindex",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().txindex);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--prune=1",
+            "--txindex",
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());

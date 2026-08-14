@@ -1461,6 +1461,7 @@ mod tests {
             dnsseed: true,
             blocksonly: false,
             prune: 0,
+            txindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,

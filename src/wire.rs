@@ -20,6 +20,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const HEADER_SIZE: usize = 24;
+const MAX_INVENTORY_ITEMS: usize = 50_000;
+const MAX_LOCATOR_HASHES: usize = 101;
 
 pub const NODE_NETWORK: u64 = 1;
 pub const NODE_BLOOM: u64 = 1 << 2;
@@ -738,6 +740,9 @@ fn decode_version(reader: &mut Reader<'_>) -> Result<VersionMessage, WireError> 
 }
 
 fn encode_inventory(items: &[Inventory], out: &mut Vec<u8>) -> Result<()> {
+    if items.len() > MAX_INVENTORY_ITEMS {
+        return Err(WireError::Payload("too many inventory items".to_owned()).into());
+    }
     put_compact_size(items.len(), out)?;
     for item in items {
         put_u32(item.kind.as_u32(), out);
@@ -748,6 +753,9 @@ fn encode_inventory(items: &[Inventory], out: &mut Vec<u8>) -> Result<()> {
 
 fn decode_inventory(reader: &mut Reader<'_>) -> Result<Vec<Inventory>, WireError> {
     let count = bounded_count(reader.compact_size()?)?;
+    if count > MAX_INVENTORY_ITEMS {
+        return Err(WireError::Payload("too many inventory items".to_owned()));
+    }
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
         items.push(Inventory {
@@ -810,6 +818,9 @@ fn decode_addr_v2(reader: &mut Reader<'_>) -> Result<Vec<NetworkAddressV2>, Wire
 fn decode_getheaders(reader: &mut Reader<'_>) -> Result<GetHeadersMessage, WireError> {
     let version = reader.i32_le()?;
     let count = bounded_count(reader.compact_size()?)?;
+    if count > MAX_LOCATOR_HASHES {
+        return Err(WireError::Payload("too many locator hashes".to_owned()));
+    }
     let mut locator_hashes = Vec::with_capacity(count);
     for _ in 0..count {
         locator_hashes.push(BlockHash::from_byte_array(reader.array::<32>()?));
@@ -1038,6 +1049,19 @@ mod tests {
         };
         let frame = encode_message(Network::Regtest, &message).unwrap();
         assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn rejects_oversized_inventory_and_locator_vectors() {
+        let mut inventory = Vec::new();
+        put_compact_size(50_001, &mut inventory).unwrap();
+        assert!(decode_inventory(&mut Reader::new(&inventory)).is_err());
+
+        let mut locator = Vec::new();
+        put_i32(VersionMessage::PROTOCOL_VERSION, &mut locator);
+        put_compact_size(102, &mut locator).unwrap();
+        locator.extend_from_slice(&[0; 32 * 103]);
+        assert!(decode_getheaders(&mut Reader::new(&locator)).is_err());
     }
 
     #[test]

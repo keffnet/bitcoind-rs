@@ -343,7 +343,7 @@ impl Node {
             }
             for block in &disconnected_blocks {
                 for transaction in block.txdata.iter().skip(1) {
-                    let _ = mempool.accept(transaction.clone(), &chain);
+                    let _ = mempool.accept_reorg(transaction.clone(), &chain, time::unix_time());
                 }
             }
             mempool.revalidate(&chain);

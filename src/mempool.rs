@@ -668,7 +668,7 @@ impl Mempool {
         chain: &ChainState,
         added_at: u64,
     ) -> Result<Txid, MempoolError> {
-        self.accept_at_with_policy(transaction, chain, added_at, true)
+        self.accept_at_with_options(transaction, chain, added_at, true, true)
     }
 
     fn accept_at_with_policy(
@@ -677,6 +677,26 @@ impl Mempool {
         chain: &ChainState,
         added_at: u64,
         enforce_fee_rate: bool,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_at_with_options(transaction, chain, added_at, enforce_fee_rate, true)
+    }
+
+    pub(crate) fn accept_reorg(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_at_with_options(transaction, chain, added_at, false, false)
+    }
+
+    fn accept_at_with_options(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
+        enforce_fee_rate: bool,
+        enforce_mempool_policy: bool,
     ) -> Result<Txid, MempoolError> {
         let txid = transaction.compute_txid();
         if self.entries.contains_key(&txid) {
@@ -771,12 +791,16 @@ impl Mempool {
         if enforce_fee_rate && fee_sat < vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
             return Err(MempoolError::FeeRate);
         }
-        self.check_truc_policy(&transaction, vsize)?;
-        validate_ephemeral_spends(std::slice::from_ref(&transaction), self)?;
+        if enforce_mempool_policy {
+            self.check_truc_policy(&transaction, vsize)?;
+            validate_ephemeral_spends(std::slice::from_ref(&transaction), self)?;
+        }
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
-        self.check_cluster_limits(&transaction)?;
-        let protected = self.ancestors_for_transaction(&transaction);
-        self.ensure_space(size, &protected)?;
+        if enforce_mempool_policy {
+            self.check_cluster_limits(&transaction)?;
+            let protected = self.ancestors_for_transaction(&transaction);
+            self.ensure_space(size, &protected)?;
+        }
         let entry = MempoolEntry {
             transaction,
             fee_sat,
@@ -1050,7 +1074,7 @@ impl Mempool {
         self.wtxids.clear();
         self.bytes = 0;
         for (added_at, transaction) in ordered {
-            let _ = self.accept_at(transaction, chain, added_at);
+            let _ = self.accept_reorg(transaction, chain, added_at);
         }
     }
 

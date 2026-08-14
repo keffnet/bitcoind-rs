@@ -1027,23 +1027,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             node.import_mempool(path)?;
             Ok(Value::Null)
         }
-        "gettxoutsetinfo" => {
-            let chain = node.chain.read();
-            let (transactions, outputs, total) = chain.utxo_stats();
-            let disk_size = std::fs::metadata(chain.store.path())
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
-            Ok(json!({
-                "height": chain.height(),
-                "bestblock": chain.best_hash().to_string(),
-                "transactions": transactions,
-                "txouts": outputs,
-                "bogosize": chain.utxo_bogo_size(),
-                "hash_serialized_3": chain.utxo_serialized_hash(),
-                "disk_size": disk_size,
-                "total_amount": sat_to_btc(total),
-            }))
-        }
+        "gettxoutsetinfo" => get_txout_set_info(node, params),
         "dumptxoutset" => dump_txoutset(node, params),
         "loadtxoutset" => load_txoutset(node, params),
         "pruneblockchain" => prune_blockchain(node, params),
@@ -1165,7 +1149,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getconnectioncount" => Ok(json!(node.peer_count())),
         "uptime" => Ok(json!(node.started_at.elapsed().as_secs())),
         "getindexinfo" => Ok(json!({})),
+        "getzmqnotifications" => Ok(json!([])),
         "logging" => Ok(json!({})),
+        "syncwithvalidationinterfacequeue" => Ok(Value::Null),
         "validateaddress" => validate_address(node, params),
         "deriveaddresses" => derive_addresses(node, params),
         "getdescriptorinfo" => get_descriptor_info(node, params),
@@ -1193,6 +1179,51 @@ fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
         },
         "connections": peers.len(),
     }))
+}
+
+fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let hash_type = match params.get(0) {
+        None | Some(Value::Null) => "hash_serialized_3",
+        Some(value) => value
+            .as_str()
+            .ok_or_else(|| anyhow!("hash_type must be a string"))?,
+    };
+    if !matches!(hash_type, "hash_serialized_3" | "muhash" | "none") {
+        bail!("unknown hash_type: {hash_type}")
+    }
+    if let Some(value) = params.get(1)
+        && !value.is_null()
+    {
+        bail!("hash_or_height requires a coinstatsindex, which is not enabled")
+    }
+    if let Some(value) = params.get(2)
+        && !value.is_null()
+        && value.as_bool().is_none()
+    {
+        bail!("use_index must be a boolean")
+    }
+    if hash_type == "muhash" {
+        bail!("muhash is unavailable because this node has no coinstatsindex")
+    }
+
+    let chain = node.chain.read();
+    let (transactions, outputs, total) = chain.utxo_stats();
+    let disk_size = std::fs::metadata(chain.store.path())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let mut result = json!({
+        "height": chain.height(),
+        "bestblock": chain.best_hash().to_string(),
+        "transactions": transactions,
+        "txouts": outputs,
+        "bogosize": chain.utxo_bogo_size(),
+        "disk_size": disk_size,
+        "total_amount": sat_to_btc(total),
+    });
+    if hash_type == "hash_serialized_3" {
+        result["hash_serialized_3"] = json!(chain.utxo_serialized_hash());
+    }
+    Ok(result)
 }
 
 fn peer_services_names(services: u64) -> Vec<&'static str> {
@@ -7770,6 +7801,7 @@ fn rpc_help(method: &str) -> String {
         "getconnectioncount",
         "uptime",
         "getindexinfo",
+        "getzmqnotifications",
         "logging",
         "validateaddress",
         "deriveaddresses",
@@ -7983,6 +8015,41 @@ mod tests {
                 "totalfee": 0,
                 "feerate_percentiles": [0, 0, 0, 0, 0],
             })
+        );
+    }
+
+    #[test]
+    fn txoutset_info_honors_core_hash_options() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+
+        let default = dispatch_method(&node, "gettxoutsetinfo", &json!([])).unwrap();
+        assert!(default["hash_serialized_3"].is_string());
+        let without_hash =
+            dispatch_method(&node, "gettxoutsetinfo", &json!(["none", null, false])).unwrap();
+        assert!(without_hash.get("hash_serialized_3").is_none());
+        assert_eq!(without_hash["height"], json!(0));
+        assert!(dispatch_method(&node, "gettxoutsetinfo", &json!(["invalid"])).is_err());
+        assert!(dispatch_method(&node, "gettxoutsetinfo", &json!(["muhash"])).is_err());
+        assert!(dispatch_method(&node, "gettxoutsetinfo", &json!(["none", 0])).is_err());
+        assert_eq!(
+            dispatch_method(&node, "getzmqnotifications", &json!([])).unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            dispatch_method(&node, "syncwithvalidationinterfacequeue", &json!([])).unwrap(),
+            Value::Null
         );
     }
 

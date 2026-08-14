@@ -218,7 +218,7 @@ fn dispatch(
             let mempool = node.mempool.read();
             Ok(fee_histogram(&mempool))
         }
-        "server.peers.subscribe" => Ok(json!([])),
+        "server.peers.subscribe" => Ok(server_peers(node)),
         _ => bail!("unsupported Electrum method {method}"),
     }
 }
@@ -243,6 +243,24 @@ fn server_features(node: &Arc<Node>) -> Value {
         "hash_function": "sha256",
         "pruning": null,
     })
+}
+
+fn server_peers(node: &Arc<Node>) -> Value {
+    let mut peers = node.known_addresses();
+    peers.sort_by_key(|peer| peer.address);
+    json!(
+        peers
+            .into_iter()
+            .map(|peer| {
+                let ip = peer.address.ip().to_string();
+                json!([
+                    ip,
+                    peer.address.ip().to_string(),
+                    ["v1.4", format!("t{}", peer.address.port())]
+                ])
+            })
+            .collect::<Vec<_>>()
+    )
 }
 
 fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
@@ -861,6 +879,17 @@ mod tests {
             )
             .unwrap(),
             json!([])
+        );
+        assert!(node.add_peer_address("192.0.2.10:50001".parse().unwrap(), false));
+        assert_eq!(
+            dispatch(
+                &node,
+                "server.peers.subscribe",
+                &json!([]),
+                &mut HashSet::new()
+            )
+            .unwrap(),
+            json!([["192.0.2.10", "192.0.2.10", ["v1.4", "t50001"]]])
         );
         let result = transaction_get_batch(&node, &json!([[txid.to_string()]])).unwrap();
         assert_eq!(result.as_array().unwrap().len(), 1);

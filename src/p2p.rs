@@ -310,7 +310,15 @@ pub(crate) enum PeerCommand {
     Disconnect,
     RequestBlock(BlockHash),
     Ping(u64),
-    SendMessage { command: String, payload: Vec<u8> },
+    SendMessage {
+        command: String,
+        payload: Vec<u8>,
+    },
+    RelayAddress {
+        address: SocketAddr,
+        services: u64,
+        time: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -975,7 +983,26 @@ async fn serve_peer_loop(
                             writer,
                             node.config.network,
                             &Message::Unknown { command, payload },
-                        ).await?;
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Some(PeerCommand::RelayAddress {
+                        address,
+                        services,
+                        time,
+                    }) => {
+                        let message = if addrv2_received {
+                            Message::AddrV2(vec![network_address_v2(address, time, services)])
+                        } else {
+                            Message::Addr(vec![wire::NetworkAddress {
+                                time: u32::try_from(time).unwrap_or(u32::MAX),
+                                services,
+                                address: socket_address_bytes(address),
+                                port: address.port(),
+                            }])
+                        };
+                        send_message(node, peer_id, writer, node.config.network, &message).await?;
                         continue;
                     }
                 }
@@ -1699,6 +1726,12 @@ async fn serve_peer_loop(
                 for entry in addresses {
                     if let Some(address) = socket_address_from_legacy(&entry) {
                         node.remember_address(address, entry.services, u64::from(entry.time));
+                        node.relay_peer_address(
+                            peer_id,
+                            address,
+                            entry.services,
+                            u64::from(entry.time),
+                        );
                     }
                 }
             }
@@ -1707,6 +1740,12 @@ async fn serve_peer_loop(
                 for address in addresses {
                     if let Some(socket) = socket_address_from_v2(&address) {
                         node.remember_address(socket, address.services, u64::from(address.time));
+                        node.relay_peer_address(
+                            peer_id,
+                            socket,
+                            address.services,
+                            u64::from(address.time),
+                        );
                     }
                 }
             }
@@ -2417,6 +2456,75 @@ mod tests {
             assert!(!local_transaction_relay_enabled(connection_type, false));
         }
         assert!(!local_transaction_relay_enabled("outbound-full", true));
+    }
+
+    #[test]
+    fn address_relay_targets_only_eligible_negotiated_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
+            persist_mempool: true,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 4,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let (origin_sender, mut origin_receiver) = mpsc::unbounded_channel();
+        let (outbound_sender, mut outbound_receiver) = mpsc::unbounded_channel();
+        let (inbound_sender, mut inbound_receiver) = mpsc::unbounded_channel();
+        let (block_sender, mut block_receiver) = mpsc::unbounded_channel();
+        node.register_peer(1, "127.0.0.1:18441".parse().unwrap(), true, origin_sender);
+        node.register_peer(2, "8.8.8.8:18442".parse().unwrap(), false, outbound_sender);
+        node.register_peer(3, "127.0.0.1:18443".parse().unwrap(), true, inbound_sender);
+        node.register_peer(4, "8.8.8.8:18444".parse().unwrap(), false, block_sender);
+        node.update_peer_version(2, 70016, 0, "/outbound/", 0, true);
+        node.update_peer_version(3, 70016, 0, "/inbound/", 0, true);
+        node.update_peer_version(4, 70016, 0, "/block/", 0, true);
+        node.record_peer_addresses(3, 0);
+        node.set_peer_connection_type(4, "block-relay-only");
+
+        node.relay_peer_address(1, "192.0.2.10:18444".parse().unwrap(), 9, 123);
+
+        assert!(origin_receiver.try_recv().is_err());
+        assert!(matches!(
+            outbound_receiver.try_recv().unwrap(),
+            PeerCommand::RelayAddress { .. }
+        ));
+        assert!(matches!(
+            inbound_receiver.try_recv().unwrap(),
+            PeerCommand::RelayAddress { .. }
+        ));
+        assert!(block_receiver.try_recv().is_err());
     }
 
     #[test]

@@ -1124,6 +1124,34 @@ impl Node {
         }
     }
 
+    pub(crate) fn relay_peer_address(
+        &self,
+        origin_peer_id: usize,
+        address: SocketAddr,
+        services: u64,
+        time: u64,
+    ) {
+        let recipients = self
+            .peers
+            .read()
+            .values()
+            .filter(|peer| {
+                peer.id != origin_peer_id && peer.version.is_some() && peer.addr_relay_enabled
+            })
+            .map(|peer| peer.id)
+            .collect::<Vec<_>>();
+        let commands = self.peer_commands.read();
+        for peer_id in recipients {
+            if let Some(sender) = commands.get(&peer_id) {
+                let _ = sender.send(p2p::PeerCommand::RelayAddress {
+                    address,
+                    services,
+                    time,
+                });
+            }
+        }
+    }
+
     pub(crate) fn set_peer_transport_protocol(&self, id: usize, transport_v2: bool) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.transport_protocol_type = if transport_v2 { "v2" } else { "v1" };

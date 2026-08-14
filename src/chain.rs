@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::muhash::MuHash3072;
-use crate::storage::{BlockStore, FilterStore};
+use crate::storage::{BlockStore, CoinStatsRecord, CoinStatsStore, FilterStore};
 use crate::validation::{self, ValidationError};
 
 const COINBASE_MATURITY: u32 = 100;
@@ -80,6 +80,73 @@ pub struct UtxoSetStats {
 
 type SpentTransaction = (Txid, usize, BlockHash, u32);
 
+#[derive(Clone, Default)]
+struct CoinStatsState {
+    transaction_outputs: HashMap<Txid, u64>,
+    outputs: u64,
+    total_amount_sat: u64,
+    bogo_size: u64,
+    muhash: MuHash3072,
+}
+
+impl CoinStatsState {
+    fn from_utxos(utxos: &HashMap<OutPoint, UtxoEntry>) -> Self {
+        let mut state = Self::default();
+        for (outpoint, entry) in utxos {
+            state.add(outpoint, entry);
+        }
+        state
+    }
+
+    fn add(&mut self, outpoint: &OutPoint, entry: &UtxoEntry) {
+        *self.transaction_outputs.entry(outpoint.txid).or_default() += 1;
+        self.outputs = self.outputs.saturating_add(1);
+        self.total_amount_sat = self
+            .total_amount_sat
+            .saturating_add(entry.output.value.to_sat());
+        self.bogo_size = self.bogo_size.saturating_add(utxo_bogo_size(entry));
+        self.muhash.insert(&serialize_utxo_coin(outpoint, entry));
+    }
+
+    fn remove(&mut self, outpoint: &OutPoint, entry: &UtxoEntry) {
+        if let Some(count) = self.transaction_outputs.get_mut(&outpoint.txid) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.transaction_outputs.remove(&outpoint.txid);
+            }
+        }
+        self.outputs = self.outputs.saturating_sub(1);
+        self.total_amount_sat = self
+            .total_amount_sat
+            .saturating_sub(entry.output.value.to_sat());
+        self.bogo_size = self.bogo_size.saturating_sub(utxo_bogo_size(entry));
+        self.muhash.remove(&serialize_utxo_coin(outpoint, entry));
+    }
+
+    fn record(&self, hash: BlockHash, height: u32) -> CoinStatsRecord {
+        CoinStatsRecord {
+            block_hash: hash,
+            height,
+            transactions: self.transaction_outputs.len() as u64,
+            outputs: self.outputs,
+            total_amount_sat: self.total_amount_sat,
+            bogo_size: self.bogo_size,
+            muhash: self.muhash.finalize(),
+        }
+    }
+
+    fn statistics(&self, include_muhash: bool) -> UtxoSetStats {
+        UtxoSetStats {
+            transactions: self.transaction_outputs.len(),
+            outputs: self.outputs as usize,
+            total_amount_sat: self.total_amount_sat,
+            bogo_size: self.bogo_size,
+            serialized_hash: None,
+            muhash: include_muhash.then(|| self.muhash.finalize()),
+        }
+    }
+}
+
 struct BlockApplication {
     spent_entries: Vec<(OutPoint, UtxoEntry)>,
 }
@@ -132,6 +199,9 @@ pub struct ChainState {
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     filter_store: FilterStore,
+    coinstats_store: CoinStatsStore,
+    coinstats_index_enabled: bool,
+    coin_stats: Option<CoinStatsState>,
     active_chain: Vec<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
     block_index: HashMap<BlockHash, BlockNode>,
@@ -167,6 +237,7 @@ impl ChainState {
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
         let mut store = BlockStore::open(data_dir.join("blocks"))?;
         let filter_store = FilterStore::open(data_dir.join("filters"))?;
+        let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
         let genesis = genesis_block(network);
         let genesis_hash = genesis.block_hash();
         if !store.contains(&genesis_hash) {
@@ -219,6 +290,9 @@ impl ChainState {
             }),
             store,
             filter_store,
+            coinstats_store,
+            coinstats_index_enabled: false,
+            coin_stats: None,
             active_chain: Vec::new(),
             headers: Vec::new(),
             block_index: HashMap::new(),
@@ -335,6 +409,47 @@ impl ChainState {
 
     pub fn prune_target_size(&self) -> Option<u64> {
         self.prune_target_size
+    }
+
+    pub fn coinstats_index_enabled(&self) -> bool {
+        self.coinstats_index_enabled
+    }
+
+    /// Enable or disable the durable coinstats index. Enabling it builds any
+    /// missing active-chain records in one forward pass, then keeps the live
+    /// accumulator current as blocks connect.
+    pub fn configure_coinstats_index(&mut self, enabled: bool) -> Result<()> {
+        self.coinstats_index_enabled = enabled;
+        if !enabled {
+            self.coin_stats = None;
+            return Ok(());
+        }
+        self.coin_stats = Some(CoinStatsState::from_utxos(&self.utxos));
+        self.rebuild_coinstats_index()
+    }
+
+    pub fn coinstats_at(
+        &mut self,
+        hash: &BlockHash,
+        include_muhash: bool,
+    ) -> Result<Option<(u32, UtxoSetStats)>> {
+        let Some(record) = self.coinstats_store.get(hash)? else {
+            return Ok(None);
+        };
+        if self.block_height_by_hash(hash) != Some(record.height) {
+            return Ok(None);
+        }
+        Ok(Some((
+            record.height,
+            UtxoSetStats {
+                transactions: record.transactions as usize,
+                outputs: record.outputs as usize,
+                total_amount_sat: record.total_amount_sat,
+                bogo_size: record.bogo_size,
+                serialized_hash: None,
+                muhash: include_muhash.then_some(record.muhash),
+            },
+        )))
     }
 
     /// Apply the startup pruning mode from the node configuration.
@@ -1324,6 +1439,16 @@ impl ChainState {
         include_serialized_hash: bool,
         include_muhash: bool,
     ) -> UtxoSetStats {
+        if let Some(coin_stats) = &self.coin_stats {
+            if !include_serialized_hash {
+                return coin_stats.statistics(include_muhash);
+            }
+            let mut statistics = calculate_utxo_statistics(&self.utxos, true, false);
+            if include_muhash {
+                statistics.muhash = Some(coin_stats.muhash.finalize());
+            }
+            return statistics;
+        }
         calculate_utxo_statistics(&self.utxos, include_serialized_hash, include_muhash)
     }
 
@@ -2053,6 +2178,7 @@ impl ChainState {
                 chain_work: parent_work + block.header.work(),
             },
         );
+        self.persist_coinstats_record(hash, height)?;
         if persist {
             self.persist_metadata()?;
             if self.height() % SNAPSHOT_INTERVAL == 0 {
@@ -2081,7 +2207,19 @@ impl ChainState {
         self.remember_block_undo(genesis.block_hash(), vec![Vec::new()]);
         self.store
             .insert_undo(genesis.block_hash(), &[Vec::new()])?;
+        self.persist_coinstats_record(genesis.block_hash(), 0)?;
         Ok(())
+    }
+
+    fn persist_coinstats_record(&mut self, hash: BlockHash, height: u32) -> Result<()> {
+        if !self.coinstats_index_enabled {
+            return Ok(());
+        }
+        let stats = self
+            .coin_stats
+            .as_ref()
+            .context("coinstats accumulator is not initialized")?;
+        self.coinstats_store.insert(&stats.record(hash, height))
     }
 
     fn rebuild_block_index(&mut self) -> Result<()> {
@@ -2129,6 +2267,27 @@ impl ChainState {
         Ok(())
     }
 
+    fn rebuild_coinstats_index(&mut self) -> Result<()> {
+        let tip_hash = self.best_hash();
+        if self.coinstats_store.get(&tip_hash)?.is_some() {
+            return Ok(());
+        }
+        let mut stats = CoinStatsState::default();
+        let mut utxos = HashMap::new();
+        let active_chain = self.active_chain.clone();
+        for (height, hash) in active_chain.into_iter().enumerate() {
+            let block = self
+                .store
+                .get(&hash)?
+                .with_context(|| format!("coinstats index is missing block {hash}"))?;
+            apply_block_to_coin_stats(&mut utxos, &mut stats, &block, height as u32);
+            let record = stats.record(hash, height as u32);
+            self.coinstats_store.insert(&record)?;
+        }
+        self.coin_stats = Some(stats);
+        Ok(())
+    }
+
     fn activate_chain(&mut self, tip_hash: BlockHash) -> Result<()> {
         if self.has_invalid_ancestor(tip_hash) {
             bail!("cannot activate an invalidated chain")
@@ -2168,6 +2327,7 @@ impl ChainState {
         let old_spent_by = self.spent_by.clone();
         let old_basic_filter_cache = self.basic_filter_cache.clone();
         let old_block_undo_cache = self.block_undo_cache.clone();
+        let old_coin_stats = self.coin_stats.clone();
         self.active_chain.clear();
         self.headers.clear();
         self.utxos.clear();
@@ -2175,6 +2335,7 @@ impl ChainState {
         self.tx_index.clear();
         self.history.clear();
         self.spent_by.clear();
+        self.coin_stats = self.coinstats_index_enabled.then(CoinStatsState::default);
         let replay = (|| -> Result<()> {
             self.initialize_genesis(&blocks[0])?;
             for block in blocks.iter().skip(1) {
@@ -2193,6 +2354,7 @@ impl ChainState {
             self.spent_by = old_spent_by;
             self.basic_filter_cache = old_basic_filter_cache;
             self.block_undo_cache = old_block_undo_cache;
+            self.coin_stats = old_coin_stats;
             return Err(error);
         }
         Ok(())
@@ -2460,7 +2622,10 @@ impl ChainState {
             self.remove_utxo(&outpoint);
         }
         let script_hash = electrum_script_hash(&entry.output.script_pubkey);
-        self.utxos.insert(outpoint, entry);
+        self.utxos.insert(outpoint, entry.clone());
+        if let Some(stats) = self.coin_stats.as_mut() {
+            stats.add(&outpoint, &entry);
+        }
         self.utxos_by_script
             .entry(script_hash)
             .or_default()
@@ -2469,6 +2634,9 @@ impl ChainState {
 
     fn remove_utxo(&mut self, outpoint: &OutPoint) -> Option<UtxoEntry> {
         let entry = self.utxos.remove(outpoint)?;
+        if let Some(stats) = self.coin_stats.as_mut() {
+            stats.remove(outpoint, &entry);
+        }
         let script_hash = electrum_script_hash(&entry.output.script_pubkey);
         if let Some(outpoints) = self.utxos_by_script.get_mut(&script_hash) {
             outpoints.remove(outpoint);
@@ -2840,6 +3008,15 @@ fn calculate_utxo_statistics(
     }
 }
 
+fn utxo_bogo_size(entry: &UtxoEntry) -> u64 {
+    32u64
+        .saturating_add(4)
+        .saturating_add(4)
+        .saturating_add(8)
+        .saturating_add(2)
+        .saturating_add(entry.output.script_pubkey.len() as u64)
+}
+
 fn snapshot_checksum(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -2852,6 +3029,38 @@ fn serialize_utxo_coin(outpoint: &OutPoint, entry: &UtxoEntry) -> Vec<u8> {
     );
     coin_bytes.extend_from_slice(&serialize(&entry.output));
     coin_bytes
+}
+
+fn apply_block_to_coin_stats(
+    utxos: &mut HashMap<OutPoint, UtxoEntry>,
+    stats: &mut CoinStatsState,
+    block: &Block,
+    height: u32,
+) {
+    if height == 0 {
+        return;
+    }
+    for (transaction_index, transaction) in block.txdata.iter().enumerate() {
+        for input in &transaction.input {
+            if let Some(entry) = utxos.remove(&input.previous_output) {
+                stats.remove(&input.previous_output, &entry);
+            }
+        }
+        let txid = transaction.compute_txid();
+        for (output_index, output) in transaction.output.iter().enumerate() {
+            let outpoint = OutPoint::new(txid, output_index as u32);
+            let entry = UtxoEntry {
+                output: output.clone(),
+                height,
+                median_time_past: block.header.time,
+                coinbase: transaction_index == 0,
+            };
+            if let Some(previous) = utxos.insert(outpoint, entry.clone()) {
+                stats.remove(&outpoint, &previous);
+            }
+            stats.add(&outpoint, &entry);
+        }
+    }
 }
 
 fn apply_block_to_utxos(
@@ -3092,6 +3301,45 @@ mod tests {
         assert!(!state.store.contains(&old_block_hash.unwrap()));
         assert!(state.store.contains(&state.block_hash(13).unwrap()));
         assert!(state.store.contains(&state.block_hash(12).unwrap()));
+    }
+
+    #[test]
+    fn coinstats_index_matches_live_and_historical_utxo_statistics() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let first = mine_block(&state, 1);
+        let first_hash = first.block_hash();
+        state.connect_block(first).unwrap();
+        let second = mine_block(&state, 2);
+        let second_hash = second.block_hash();
+        state.connect_block(second).unwrap();
+        state.configure_coinstats_index(true).unwrap();
+
+        let live = state.utxo_statistics(false, true);
+        let indexed = state.coinstats_at(&second_hash, true).unwrap().unwrap().1;
+        assert_eq!(indexed.transactions, live.transactions);
+        assert_eq!(indexed.outputs, live.outputs);
+        assert_eq!(indexed.total_amount_sat, live.total_amount_sat);
+        assert_eq!(indexed.bogo_size, live.bogo_size);
+        assert_eq!(indexed.muhash, live.muhash);
+
+        let first_stats = state.coinstats_at(&first_hash, true).unwrap().unwrap();
+        assert_eq!(first_stats.0, 1);
+        assert_eq!(first_stats.1.outputs, 1);
+
+        let path = directory.path().to_owned();
+        drop(state);
+        let mut reopened = ChainState::open(Network::Regtest, path).unwrap();
+        reopened.configure_coinstats_index(true).unwrap();
+        assert_eq!(
+            reopened
+                .coinstats_at(&second_hash, true)
+                .unwrap()
+                .unwrap()
+                .1
+                .muhash,
+            live.muhash
+        );
     }
 
     #[test]

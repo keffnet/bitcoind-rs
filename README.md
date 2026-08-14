@@ -46,6 +46,8 @@ Use `--txindex` to enable confirmed transaction lookup without supplying a block
 
 `--maxmempool=<MB>` sets the transaction pool's byte limit (300 MB by default); admission uses the existing package-aware eviction policy when the limit is reached.
 
+`--coinstatsindex` persists incremental UTXO statistics and enables historical `gettxoutsetinfo` queries by block hash or height.
+
 ZeroMQ topics can be enabled with the Core-style options, for example
 `--zmqpubhashtx tcp://127.0.0.1:28332 --zmqpubsequence tcp://127.0.0.1:28333`.
 `getzmqnotifications` reports the configured topic endpoints and high-water marks.

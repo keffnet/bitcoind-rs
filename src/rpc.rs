@@ -1521,13 +1521,22 @@ fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .transpose()?;
     const BASIC_FILTER_INDEX: &str = "basic block filter index";
     const TX_INDEX: &str = "txindex";
-    if requested.is_some_and(|name| name != BASIC_FILTER_INDEX && name != TX_INDEX) {
+    const COIN_STATS_INDEX: &str = "coinstatsindex";
+    if requested.is_some_and(|name| {
+        name != BASIC_FILTER_INDEX && name != TX_INDEX && name != COIN_STATS_INDEX
+    }) {
         return Ok(json!({}));
     }
     let height = node.chain.read().height();
     let mut result = json!({});
     if node.config.txindex && requested.is_none_or(|name| name == TX_INDEX) {
         result[TX_INDEX] = json!({
+            "synced": true,
+            "best_block_height": height,
+        });
+    }
+    if node.config.coinstatsindex && requested.is_none_or(|name| name == COIN_STATS_INDEX) {
+        result[COIN_STATS_INDEX] = json!({
             "synced": true,
             "best_block_height": height,
         });
@@ -1797,6 +1806,9 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if target.is_some() && hash_type == "hash_serialized_3" {
         bail!("hash_serialized_3 hash type cannot be queried for a specific block")
     }
+    if target.is_some() && !node.config.coinstatsindex {
+        bail!("Querying specific block heights requires coinstatsindex")
+    }
     if target.is_some() && !use_index {
         bail!("Cannot set use_index to false when querying for a specific block")
     }
@@ -1828,7 +1840,7 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             bail!("hash_or_height is not on the active chain")
         }
         let (height, stats) = chain
-            .utxo_statistics_at(target_hash, include_serialized_hash, include_muhash)?
+            .coinstats_at(&target_hash, include_muhash)?
             .ok_or_else(|| anyhow!("block is not available"))?;
         (height, target_hash, stats, 0)
     } else {
@@ -9848,6 +9860,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10004,6 +10017,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10075,6 +10089,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10105,6 +10120,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10140,6 +10156,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10206,6 +10223,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: true,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10213,6 +10231,11 @@ mod tests {
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
+        assert_eq!(
+            dispatch_method(&node, "getindexinfo", &json!(["coinstatsindex"])).unwrap()["coinstatsindex"]
+                ["synced"],
+            true
+        );
         let mined = generate_to_address(
             &node,
             &json!([1, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"]),
@@ -10246,6 +10269,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10353,6 +10377,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10406,6 +10431,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10437,6 +10463,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10471,6 +10498,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10514,6 +10542,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10550,6 +10579,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10580,6 +10610,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10607,6 +10638,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10709,6 +10741,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10758,6 +10791,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10829,6 +10863,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10867,6 +10902,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -10931,6 +10967,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11016,6 +11053,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11103,6 +11141,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11134,6 +11173,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11170,6 +11210,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11212,6 +11253,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11261,6 +11303,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11301,6 +11344,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11341,6 +11385,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11373,6 +11418,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             max_peers: 1,
             peer_bloom_filters: false,
@@ -11404,6 +11450,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11481,6 +11528,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11538,6 +11586,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11589,6 +11638,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11750,6 +11800,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11918,6 +11969,7 @@ mod tests {
             prune: 0,
             txindex: true,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -11957,6 +12009,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12046,6 +12099,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12159,6 +12213,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12198,6 +12253,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12275,6 +12331,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12484,6 +12541,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12827,6 +12885,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12884,6 +12943,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -12950,6 +13010,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -13060,6 +13121,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -13092,6 +13154,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,

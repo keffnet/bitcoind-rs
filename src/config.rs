@@ -175,6 +175,9 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub txindex: bool,
 
+    #[arg(long, default_value_t = false)]
+    pub coinstatsindex: bool,
+
     #[arg(long = "maxmempool", default_value_t = DEFAULT_MAX_MEMPOOL_MB)]
     pub max_mempool: u64,
 
@@ -230,6 +233,7 @@ pub struct Config {
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
     pub prune: u64,
     pub txindex: bool,
+    pub coinstatsindex: bool,
     /// Maximum mempool size in decimal megabytes, matching Core's option.
     pub max_mempool_mb: u64,
     pub zmq: ZmqConfig,
@@ -293,6 +297,7 @@ impl Config {
             blocksonly: args.blocksonly,
             prune: args.prune,
             txindex: args.txindex,
+            coinstatsindex: args.coinstatsindex,
             max_mempool_mb: args.max_mempool,
             zmq: ZmqConfig {
                 tx_reconciliation: args.tx_reconciliation,
@@ -367,6 +372,15 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--coinstatsindex",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().coinstatsindex);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

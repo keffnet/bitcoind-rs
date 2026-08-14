@@ -15,6 +15,7 @@ use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, TxOut};
+use serde::{Deserialize, Serialize};
 
 const MAX_STORED_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
@@ -465,6 +466,167 @@ impl FilterStore {
     }
 }
 
+/// Incrementally maintained UTXO statistics for the coinstats index.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CoinStatsRecord {
+    pub block_hash: BlockHash,
+    pub height: u32,
+    pub transactions: u64,
+    pub outputs: u64,
+    pub total_amount_sat: u64,
+    pub bogo_size: u64,
+    pub muhash: String,
+}
+
+const MAX_STORED_COINSTATS_SIZE: usize = 4 * 1024;
+
+/// Durable coinstats records keyed by block hash.
+pub struct CoinStatsStore {
+    path: PathBuf,
+    file: File,
+    index_file: File,
+    index: HashMap<BlockHash, Record>,
+}
+
+impl CoinStatsStore {
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref();
+        create_dir_all(directory)
+            .with_context(|| format!("creating coinstats directory {}", directory.display()))?;
+        let path = directory.join("coinstats.dat");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening coinstats store {}", path.display()))?;
+        let index_path = directory.join("coinstats.index");
+        let mut index_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&index_path)
+            .with_context(|| format!("opening coinstats index {}", index_path.display()))?;
+        let data_len = file.metadata()?.len();
+        let index = match load_index(&mut index_file, data_len)? {
+            Some(index) => index,
+            None => {
+                let index = scan_coinstats_index(&mut file)?;
+                rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
+                index
+            }
+        };
+        Ok(Self {
+            path,
+            file,
+            index_file,
+            index,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn contains(&self, hash: &BlockHash) -> bool {
+        self.index.contains_key(hash)
+    }
+
+    pub fn insert(&mut self, record: &CoinStatsRecord) -> Result<()> {
+        if self.index.contains_key(&record.block_hash) {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(record).context("encoding coinstats record")?;
+        if bytes.len() > MAX_STORED_COINSTATS_SIZE {
+            bail!("coinstats record is too large: {} bytes", bytes.len());
+        }
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        let length = u32::try_from(bytes.len()).context("coinstats length does not fit u32")?;
+        self.file.write_all(&length.to_le_bytes())?;
+        self.file.write_all(&bytes)?;
+        self.file.sync_data()?;
+        let record_index = Record { offset, length };
+        persist_index_entry(
+            &mut self.index_file,
+            offset + 4 + bytes.len() as u64,
+            record.block_hash,
+            record_index,
+        )?;
+        self.index.insert(record.block_hash, record_index);
+        Ok(())
+    }
+
+    pub fn get(&mut self, hash: &BlockHash) -> Result<Option<CoinStatsRecord>> {
+        let Some(record) = self.index.get(hash).copied() else {
+            return Ok(None);
+        };
+        if record.length as usize > MAX_STORED_COINSTATS_SIZE {
+            bail!("stored coinstats record is too large");
+        }
+        self.file.seek(SeekFrom::Start(record.offset))?;
+        let mut length = [0u8; 4];
+        self.file.read_exact(&mut length)?;
+        let actual = u32::from_le_bytes(length);
+        if actual != record.length {
+            bail!("coinstats store index disagrees with record length");
+        }
+        let mut bytes = vec![0u8; record.length as usize];
+        self.file.read_exact(&mut bytes)?;
+        let decoded: CoinStatsRecord =
+            serde_json::from_slice(&bytes).context("decoding stored coinstats record")?;
+        if decoded.block_hash != *hash {
+            bail!("stored coinstats hash does not match coinstats index");
+        }
+        Ok(Some(decoded))
+    }
+}
+
+fn scan_coinstats_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut index = HashMap::new();
+    let data_len = file.metadata()?.len();
+    loop {
+        let offset = file.stream_position()?;
+        let mut length_bytes = [0u8; 4];
+        match file.read_exact(&mut length_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                file.set_len(offset)?;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let length = u32::from_le_bytes(length_bytes);
+        let end = offset.saturating_add(4).saturating_add(u64::from(length));
+        if end > data_len {
+            file.set_len(offset)?;
+            break;
+        }
+        if length == 0 || length as usize > MAX_STORED_COINSTATS_SIZE {
+            bail!(
+                "invalid coinstats record length {} at offset {}",
+                length,
+                offset
+            );
+        }
+        let mut bytes = vec![0u8; length as usize];
+        file.read_exact(&mut bytes).map_err(|error| {
+            anyhow::anyhow!("truncated coinstats record at offset {}: {}", offset, error)
+        })?;
+        let record: CoinStatsRecord = serde_json::from_slice(&bytes)
+            .with_context(|| format!("decoding coinstats record at offset {offset}"))?;
+        if index
+            .insert(record.block_hash, Record { offset, length })
+            .is_some()
+        {
+            bail!("duplicate block hash in coinstats store");
+        }
+    }
+    file.seek(SeekFrom::End(0))?;
+    Ok(index)
+}
+
 fn load_filter_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<BlockHash, Record>>> {
     let index_len = file.metadata()?.len();
     if index_len < INDEX_HEADER_SIZE || (index_len - INDEX_HEADER_SIZE) % INDEX_RECORD_SIZE != 0 {
@@ -900,6 +1062,27 @@ mod tests {
         let mut reopened = FilterStore::open(directory.path()).unwrap();
         assert_eq!(reopened.get(&hash).unwrap(), Some((vec![1, 2, 3], header)));
         assert_eq!(reopened.get_header(&hash).unwrap(), Some(header));
+    }
+
+    #[test]
+    fn persists_and_reopens_coinstats_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let record = CoinStatsRecord {
+            block_hash: BlockHash::from_byte_array([4; 32]),
+            height: 12,
+            transactions: 3,
+            outputs: 5,
+            total_amount_sat: 42,
+            bogo_size: 99,
+            muhash: "deadbeef".to_owned(),
+        };
+        {
+            let mut store = CoinStatsStore::open(directory.path()).unwrap();
+            store.insert(&record).unwrap();
+            assert_eq!(store.get(&record.block_hash).unwrap(), Some(record.clone()));
+        }
+        let mut reopened = CoinStatsStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&record.block_hash).unwrap(), Some(record));
     }
 
     #[test]

@@ -294,6 +294,7 @@ impl Node {
             config.signet_challenge.as_deref(),
         )?;
         chain.configure_pruning(config.prune)?;
+        chain.configure_coinstats_index(config.coinstatsindex)?;
         chain.maybe_auto_prune()?;
         let mempool_path = config.datadir.join("mempool.json");
         let mut mempool = Mempool::with_max_bytes(config.network, max_mempool_bytes);
@@ -1469,6 +1470,7 @@ mod tests {
             prune: 0,
             txindex: false,
             max_mempool_mb: 300,
+            coinstatsindex: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,

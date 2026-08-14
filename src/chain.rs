@@ -1929,11 +1929,10 @@ impl ChainState {
         let base_height = self
             .block_height_by_hash(&snapshot.base_hash)
             .context("UTXO snapshot base block is not in the headers chain")?;
-        if snapshot.base_hash != self.best_hash() {
+        if !self.is_active_block(&snapshot.base_hash) {
             bail!(
-                "UTXO snapshot base {} is not the active tip {}; loading snapshots at a different base requires AssumeUTXO chainstate support",
+                "UTXO snapshot base {} is not on the active chain",
                 snapshot.base_hash,
-                self.best_hash()
             )
         }
         for entry in snapshot.utxos.values_mut() {
@@ -1943,17 +1942,69 @@ impl ChainState {
             entry.median_time_past = if entry.height == 0 {
                 0
             } else {
-                self.median_time_past_for_parent(self.active_chain[entry.height as usize - 1])
+                let parent = self
+                    .ancestor_hash(snapshot.base_hash, entry.height - 1)
+                    .context("UTXO snapshot entry is outside the base chain")?;
+                self.median_time_past_for_parent(parent)
             };
         }
-        self.validate_snapshot_utxos(&snapshot.utxos)?;
-        if self.prune_height.is_none() {
-            let expected = self
-                .replay_utxos_for_block(self.best_hash(), false)?
-                .context("cannot verify UTXO snapshot because active block data is unavailable")?;
-            if expected != snapshot.utxos {
-                bail!("UTXO snapshot contents do not match the active chain")
+        self.validate_snapshot_utxos_at(&snapshot.utxos, snapshot.base_hash)?;
+        if let Some(expected) = self.replay_utxos_for_block(snapshot.base_hash, false)?
+            && expected != snapshot.utxos
+        {
+            bail!("UTXO snapshot contents do not match the base chain")
+        }
+
+        let active_height = self.height();
+        if base_height < active_height {
+            let mut utxos = snapshot.utxos;
+            for height in base_height + 1..=active_height {
+                let block_hash = self.active_chain[height as usize];
+                let block = self
+                    .store
+                    .get(&block_hash)?
+                    .with_context(|| {
+                        format!(
+                            "cannot advance UTXO snapshot past height {base_height}: block {block_hash} is unavailable"
+                        )
+                    })?;
+                let parent_hash = block.header.prev_blockhash;
+                let parent = self
+                    .block_index
+                    .get(&parent_hash)
+                    .copied()
+                    .context("UTXO snapshot forward replay parent is not indexed")?;
+                validation::validate_bip94_timewarp(
+                    self.network,
+                    height,
+                    block.header.time,
+                    parent.header.time,
+                )?;
+                validation::validate_header(
+                    self.network,
+                    &block.header,
+                    parent_hash,
+                    self.expected_target_for_parent(parent_hash, block.header.time),
+                    self.median_time_past_for_parent(parent_hash),
+                )?;
+                self.validate_block_structure(
+                    &block,
+                    self.network,
+                    height,
+                    Amount::MAX_MONEY.to_sat(),
+                )?;
+                let median_time_past = self.median_time_past_for_parent(parent_hash);
+                let application =
+                    self.validate_block_transactions(&block, height, &utxos, median_time_past)?;
+                apply_block_to_utxos(
+                    &mut utxos,
+                    &block,
+                    height,
+                    median_time_past,
+                    application.spent_entries,
+                );
             }
+            snapshot.utxos = utxos;
         }
         let coins_count = snapshot.coins_count;
         let base_hash = snapshot.base_hash;
@@ -1965,10 +2016,24 @@ impl ChainState {
     }
 
     fn validate_snapshot_utxos(&mut self, utxos: &HashMap<OutPoint, UtxoEntry>) -> Result<()> {
+        self.validate_snapshot_utxos_at(utxos, self.best_hash())
+    }
+
+    fn validate_snapshot_utxos_at(
+        &mut self,
+        utxos: &HashMap<OutPoint, UtxoEntry>,
+        tip_hash: BlockHash,
+    ) -> Result<()> {
+        let tip_height = self
+            .block_height_by_hash(&tip_hash)
+            .context("UTXO snapshot target block is not indexed")?;
+        if !self.is_active_block(&tip_hash) {
+            bail!("UTXO snapshot target block is not on the active chain")
+        }
         let mut entries_by_block: HashMap<BlockHash, Vec<(&OutPoint, &UtxoEntry, TxLocation)>> =
             HashMap::new();
         for (outpoint, entry) in utxos {
-            if entry.height > self.height() {
+            if entry.height > tip_height {
                 bail!("UTXO snapshot contains an output from the future")
             }
             if entry.output.value > Amount::MAX_MONEY {
@@ -1985,8 +2050,7 @@ impl ChainState {
                     )
                 })?;
             if location.height != entry.height
-                || location.height as usize >= self.active_chain.len()
-                || self.active_chain[location.height as usize] != location.block_hash
+                || self.ancestor_hash(tip_hash, location.height) != Some(location.block_hash)
             {
                 bail!("UTXO snapshot references an inactive or mismatched transaction")
             }
@@ -2025,7 +2089,8 @@ impl ChainState {
                     || (location.height != 0
                         && entry.median_time_past
                             != self.median_time_past_for_parent(
-                                self.active_chain[location.height as usize - 1],
+                                self.ancestor_hash(tip_hash, location.height - 1)
+                                    .context("UTXO transaction parent is not indexed")?,
                             ))
                 {
                     bail!("UTXO snapshot output metadata does not match the active chain")
@@ -4181,6 +4246,33 @@ mod tests {
         assert_eq!(loaded_hash, base_hash);
         assert_eq!(loaded_height, base_height);
         assert_eq!(state.utxo_stats(), expected);
+    }
+
+    #[test]
+    fn core_utxo_snapshot_at_a_historical_base_advances_to_the_active_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        let expected = state.utxo_stats();
+        let base_hash = state.block_hash(1).unwrap();
+        let path = directory.path().join("historical-core-utxo.dat");
+        let (base_coins, dumped_hash, dumped_height, _, _) =
+            state.dump_utxo_set_at(&path, base_hash).unwrap();
+        assert_eq!(base_coins, 1);
+        assert_eq!(dumped_hash, base_hash);
+        assert_eq!(dumped_height, 1);
+
+        let (loaded, loaded_hash, loaded_height) = state.load_utxo_set(&path).unwrap();
+        assert_eq!(loaded, base_coins);
+        assert_eq!(loaded_hash, base_hash);
+        assert_eq!(loaded_height, 1);
+        assert_eq!(state.utxo_stats(), expected);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), state.best_hash());
+        assert_eq!(reopened.utxo_stats(), expected);
     }
 
     #[test]

@@ -15994,6 +15994,11 @@ mod tests {
         assert_eq!(dumped["nchaintx"], 2);
         assert_eq!(node.chain.read().height(), live_height);
         assert!(path.exists());
+        let loaded = load_txoutset(&node, &json!([path.to_string_lossy()])).unwrap();
+        assert_eq!(loaded["coins_loaded"], 1);
+        assert_eq!(loaded["tip_hash"], target_hash.to_string());
+        assert_eq!(loaded["base_height"], 1);
+        assert_eq!(node.chain.read().height(), live_height);
 
         let named_path = directory.path().join("historical-utxos-named.snapshot");
         let named = normalize_rpc_params(

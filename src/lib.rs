@@ -300,6 +300,7 @@ pub struct PeerInfo {
     pub id: usize,
     pub address: std::net::SocketAddr,
     pub local_address: Option<std::net::SocketAddr>,
+    pub reported_local_address: Option<std::net::SocketAddr>,
     pub inbound: bool,
     pub version: Option<i32>,
     pub services: u64,
@@ -1147,6 +1148,16 @@ impl Node {
         }
     }
 
+    pub(crate) fn update_peer_reported_local_address(
+        &self,
+        peer_id: usize,
+        address: Option<SocketAddr>,
+    ) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.reported_local_address = address;
+        }
+    }
+
     pub(crate) fn track_peer_block_request(&self, peer_id: usize, hash: BlockHash) {
         let Some(height) = self.chain.read().block_height_by_hash(&hash) else {
             return;
@@ -1219,6 +1230,7 @@ impl Node {
             id,
             address,
             local_address,
+            reported_local_address: None,
             inbound,
             version: None,
             services: 0,
@@ -1453,6 +1465,7 @@ impl Node {
                 id: 0,
                 address,
                 local_address: None,
+                reported_local_address: None,
                 inbound: false,
                 version: None,
                 services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
@@ -1504,6 +1517,7 @@ impl Node {
             id: 0,
             address,
             local_address: None,
+            reported_local_address: None,
             inbound: false,
             version: None,
             services,
@@ -1997,6 +2011,7 @@ fn load_known_addresses(
                 id: 0,
                 address,
                 local_address: None,
+                reported_local_address: None,
                 inbound: false,
                 version: None,
                 services: entry.services,

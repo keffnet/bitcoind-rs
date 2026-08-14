@@ -1558,6 +1558,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     if let Some(address) = peer.local_address {
                         info["addrbind"] = json!(address.to_string());
                     }
+                    if let Some(address) = peer.reported_local_address {
+                        info["addrlocal"] = json!(address.to_string());
+                    }
                     if let Some(ping_time) = peer.ping_time {
                         info["pingtime"] = json!(ping_time);
                     }
@@ -12961,6 +12964,7 @@ mod tests {
         node.update_peer_version(7, 70016, 0, "/test-peer/", 0, true);
         node.update_peer_time_offset(7, 42);
         node.update_peer_bip152_highbandwidth_from(7, true);
+        node.update_peer_reported_local_address(7, Some("198.51.100.2:18444".parse().unwrap()));
         let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(peer_info[0]["id"], json!(7));
         assert_eq!(
@@ -12971,6 +12975,7 @@ mod tests {
         assert_eq!(peer_info[0]["bip152_hb_to"], json!(false));
         assert_eq!(peer_info[0]["bip152_hb_from"], json!(true));
         assert_eq!(peer_info[0]["inflight"], json!([]));
+        assert_eq!(peer_info[0]["addrlocal"], json!("198.51.100.2:18444"));
         assert_eq!(peer_info[0]["transport_protocol_type"], json!("v1"));
         assert!(peer_info[0].get("startingheight").is_none());
         assert!(peer_info[0].get("pingtime").is_none());

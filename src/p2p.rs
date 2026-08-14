@@ -1084,6 +1084,10 @@ async fn serve_peer_loop(
                     version.start_height,
                     version.relay,
                 );
+                node.update_peer_reported_local_address(
+                    peer_id,
+                    socket_address_from_parts(version.receiver_address, version.receiver_port),
+                );
                 if peer_state.local_relay_transactions {
                     // Core initializes TxRelay's inventory boundary to one
                     // only after the VERSION handshake creates the relay
@@ -2223,18 +2227,22 @@ fn socket_address_bytes(address: std::net::SocketAddr) -> [u8; 16] {
     }
 }
 
-fn socket_address_from_legacy(address: &wire::NetworkAddress) -> Option<std::net::SocketAddr> {
-    let ip = if address.address[..10] == [0; 10] && address.address[10..12] == [0xff, 0xff] {
+fn socket_address_from_parts(address: [u8; 16], port: u16) -> Option<std::net::SocketAddr> {
+    let ip = if address[..10] == [0; 10] && address[10..12] == [0xff, 0xff] {
         std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-            address.address[12],
-            address.address[13],
-            address.address[14],
-            address.address[15],
+            address[12],
+            address[13],
+            address[14],
+            address[15],
         ))
     } else {
-        std::net::IpAddr::V6(std::net::Ipv6Addr::from(address.address))
+        std::net::IpAddr::V6(std::net::Ipv6Addr::from(address))
     };
-    (address.port != 0).then(|| std::net::SocketAddr::new(ip, address.port))
+    (port != 0).then(|| std::net::SocketAddr::new(ip, port))
+}
+
+fn socket_address_from_legacy(address: &wire::NetworkAddress) -> Option<std::net::SocketAddr> {
+    socket_address_from_parts(address.address, address.port)
 }
 
 fn socket_address_from_v2(address: &wire::NetworkAddressV2) -> Option<std::net::SocketAddr> {

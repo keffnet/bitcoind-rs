@@ -10368,7 +10368,7 @@ pub(crate) fn optional_bool(
         .ok_or_else(|| anyhow!("{name} must be a boolean"))
 }
 
-fn optional_str<'a>(
+pub(crate) fn optional_str<'a>(
     params: &'a Value,
     index: usize,
     default: &'a str,

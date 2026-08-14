@@ -416,10 +416,16 @@ fn dispatch_with_session(
         }
         "blockchain.estimatefee" => {
             let conf_target = param::<u32>(params, 0)?;
+            let mode = crate::rpc::optional_str(params, 1, "UNSET", "mode")?;
+            let conservative = match mode.to_ascii_uppercase().as_str() {
+                "UNSET" | "ECONOMICAL" => false,
+                "CONSERVATIVE" => true,
+                _ => bail!("mode must be UNSET, ECONOMICAL, or CONSERVATIVE"),
+            };
             let rate = node
                 .chain
                 .write()
-                .estimate_fee_rate_sat_per_kvb(conf_target, false)?
+                .estimate_fee_rate_sat_per_kvb(conf_target, conservative)?
                 .map_or(-1.0, |rate| rate as f64 / 100_000_000.0);
             Ok(json!(rate))
         }
@@ -1923,6 +1929,27 @@ mod tests {
             )
             .unwrap(),
             json!(-1.0)
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "blockchain.estimatefee",
+                &json!([6, "conservative"]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!(-1.0)
+        );
+        assert!(
+            dispatch_with_session(
+                &node,
+                "blockchain.estimatefee",
+                &json!([6, "invalid"]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .is_err()
         );
         assert_eq!(
             dispatch_with_session(

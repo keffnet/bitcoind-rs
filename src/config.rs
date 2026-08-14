@@ -107,6 +107,28 @@ pub enum NetworkName {
     Regtest,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ValueEnum)]
+pub enum OnlyNet {
+    Ipv4,
+    Ipv6,
+    Onion,
+    I2p,
+    Cjdns,
+}
+
+impl OnlyNet {
+    pub fn matches(self, address: SocketAddr) -> bool {
+        match self {
+            Self::Ipv4 => address.is_ipv4(),
+            Self::Ipv6 => address.is_ipv6(),
+            // Onion, I2P, and CJDNS endpoints are not representable by the
+            // SocketAddr-only address table yet. Keep the options explicit so
+            // they fail closed instead of silently bypassing onlynet.
+            Self::Onion | Self::I2p | Self::Cjdns => false,
+        }
+    }
+}
+
 impl From<NetworkName> for Network {
     fn from(value: NetworkName) -> Self {
         match value {
@@ -164,6 +186,12 @@ pub struct Args {
 
     #[arg(long, value_delimiter = ',')]
     pub connect: Vec<SocketAddr>,
+
+    #[arg(long = "onlynet", value_enum, value_delimiter = ',')]
+    pub onlynet: Vec<OnlyNet>,
+
+    #[arg(long, value_name = "IP:PORT")]
+    pub proxy: Option<SocketAddr>,
 
     #[arg(long, value_name = "HEX")]
     pub signet_challenge: Option<String>,
@@ -335,6 +363,8 @@ pub struct Config {
     pub rest: bool,
     pub seed_nodes: Vec<SocketAddr>,
     pub dnsseed: bool,
+    pub onlynet: Vec<OnlyNet>,
+    pub proxy: Option<SocketAddr>,
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
     pub peer_timeout_secs: u64,
@@ -374,6 +404,9 @@ impl Config {
         }
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
+        }
+        if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
+            bail!("--proxy must use a non-zero port");
         }
         if args.blockmaxweight > DEFAULT_BLOCK_MAX_WEIGHT {
             bail!(
@@ -476,6 +509,8 @@ impl Config {
             rest: args.rest,
             seed_nodes: args.connect,
             dnsseed: args.dnsseed,
+            onlynet: args.onlynet,
+            proxy: args.proxy,
             signet_challenge,
             max_peers: args.max_peers,
             peer_timeout_secs: args.peertimeout,
@@ -516,6 +551,15 @@ impl Config {
             },
         })
     }
+
+    pub fn allows_address(&self, address: SocketAddr) -> bool {
+        self.onlynet.is_empty()
+            || self
+                .onlynet
+                .iter()
+                .copied()
+                .any(|network| network.matches(address))
+    }
 }
 
 fn parse_fee_rate(value: Option<&str>, default: &str, name: &str) -> Result<u64> {
@@ -540,12 +584,18 @@ mod tests {
             "--listen=false",
             "--dnsseed=0",
             "--blocksonly=1",
+            "--onlynet=ipv4",
+            "--proxy=127.0.0.1:9050",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
         assert!(!config.listen);
         assert!(!config.dnsseed);
         assert!(config.blocksonly);
+        assert_eq!(config.onlynet, vec![OnlyNet::Ipv4]);
+        assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
+        assert!(config.allows_address("192.0.2.1:8333".parse().unwrap()));
+        assert!(!config.allows_address("[2001:db8::1]:8333".parse().unwrap()));
         assert_eq!(config.prune, 0);
 
         let args = Args::try_parse_from([

@@ -1910,6 +1910,9 @@ impl Node {
     }
 
     pub fn add_node(&self, address: SocketAddr) -> bool {
+        if !self.config.allows_address(address) {
+            return false;
+        }
         let inserted = self.added_nodes.write().insert(address);
         if inserted {
             if let Some(sender) = self.peer_manager_requests.read().as_ref() {
@@ -1929,6 +1932,9 @@ impl Node {
         transport_v2: Option<bool>,
         connection_type: &'static str,
     ) {
+        if !self.config.allows_address(address) {
+            return;
+        }
         if let Some(sender) = self.peer_manager_requests.read().as_ref() {
             let _ = sender.send(p2p::PeerManagerRequest::OneTry(
                 address,
@@ -2420,6 +2426,8 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            onlynet: Vec::new(),
+            proxy: None,
             blocksonly: false,
             prune: 0,
             reindex: false,

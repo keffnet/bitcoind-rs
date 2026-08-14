@@ -1210,17 +1210,23 @@ impl PeerManager {
         let seed_nodes = if !configured_seed_nodes && self.node.config.dnsseed {
             let addresses = discover_dns_seeds(self.node.config.network).await;
             for address in &addresses {
-                self.node.remember_address(
-                    *address,
-                    wire::NODE_NETWORK | wire::NODE_WITNESS,
-                    unix_time_seconds(),
-                );
+                if self.node.config.allows_address(*address) {
+                    self.node.remember_address(
+                        *address,
+                        wire::NODE_NETWORK | wire::NODE_WITNESS,
+                        unix_time_seconds(),
+                    );
+                }
             }
             Vec::new()
         } else {
             self.node.config.seed_nodes.clone()
         };
         for address in seed_nodes {
+            if !self.node.config.allows_address(address) {
+                debug!(%address, "skipping peer outside onlynet policy");
+                continue;
+            }
             self.node.ensure_node_added(address);
             spawn_outbound_loop(
                 self.node.clone(),
@@ -1289,7 +1295,10 @@ impl PeerManager {
         };
         loop {
             let (stream, address) = listener.accept().await?;
-            if !self.node.network_active() || self.node.is_banned(address.ip()) {
+            if !self.node.network_active()
+                || self.node.is_banned(address.ip())
+                || !self.node.config.allows_address(address)
+            {
                 continue;
             }
             let node = self.node.clone();
@@ -1363,6 +1372,10 @@ fn spawn_outbound_loop(
         let Ok(_permit) = slots.acquire_owned().await else {
             return;
         };
+        if !node.config.allows_address(address) {
+            debug!(%address, "skipping outbound peer outside onlynet policy");
+            return;
+        }
         loop {
             if persistent && !node.is_node_added(address) {
                 return;
@@ -1382,7 +1395,7 @@ fn spawn_outbound_loop(
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
-            match TcpStream::connect(address).await {
+            match connect_peer(address, node.config.proxy).await {
                 Ok(stream) => {
                     info!(%address, "connected to configured peer");
                     if let Err(error) = serve_peer(
@@ -1439,6 +1452,7 @@ fn select_discovery_addresses(
         .filter(|peer| {
             peer.address.port() != 0
                 && !peer.address.ip().is_unspecified()
+                && node.config.allows_address(peer.address)
                 && !connected.contains(&peer.address)
                 && !added.contains(&peer.address)
                 && !attempts.contains(&peer.address)
@@ -1457,6 +1471,78 @@ fn select_discovery_addresses(
         .take(limit)
         .map(|peer| peer.address)
         .collect()
+}
+
+async fn connect_peer(address: SocketAddr, proxy: Option<SocketAddr>) -> Result<TcpStream> {
+    let mut stream = TcpStream::connect(proxy.unwrap_or(address))
+        .await
+        .with_context(|| {
+            proxy.map_or_else(
+                || format!("connecting to {address}"),
+                |proxy| format!("connecting to {address} through proxy {proxy}"),
+            )
+        })?;
+    stream.set_nodelay(true)?;
+    if proxy.is_some() {
+        socks5_connect(&mut stream, address).await?;
+    }
+    Ok(stream)
+}
+
+async fn socks5_connect(stream: &mut TcpStream, address: SocketAddr) -> Result<()> {
+    stream.write_all(&[5, 1, 0]).await?;
+    let mut greeting = [0; 2];
+    stream.read_exact(&mut greeting).await?;
+    if greeting != [5, 0] {
+        bail!("SOCKS5 proxy does not support unauthenticated connections")
+    }
+
+    let mut request = Vec::with_capacity(22);
+    request.extend_from_slice(&[5, 1, 0]);
+    match address.ip() {
+        std::net::IpAddr::V4(ip) => {
+            request.push(1);
+            request.extend_from_slice(&ip.octets());
+        }
+        std::net::IpAddr::V6(ip) => {
+            request.push(4);
+            request.extend_from_slice(&ip.octets());
+        }
+    }
+    request.extend_from_slice(&address.port().to_be_bytes());
+    stream.write_all(&request).await?;
+
+    let mut response = [0; 4];
+    stream.read_exact(&mut response).await?;
+    if response[0] != 5 {
+        bail!("SOCKS5 proxy returned an invalid response version")
+    }
+    if response[1] != 0 {
+        bail!(
+            "SOCKS5 proxy rejected the connection with code {}",
+            response[1]
+        )
+    }
+    match response[3] {
+        1 => {
+            let mut address = [0; 4];
+            stream.read_exact(&mut address).await?;
+        }
+        3 => {
+            let mut length = [0; 1];
+            stream.read_exact(&mut length).await?;
+            let mut address = vec![0; usize::from(length[0])];
+            stream.read_exact(&mut address).await?;
+        }
+        4 => {
+            let mut address = [0; 16];
+            stream.read_exact(&mut address).await?;
+        }
+        value => bail!("SOCKS5 proxy returned an invalid address type {value}"),
+    }
+    let mut port = [0; 2];
+    stream.read_exact(&mut port).await?;
+    Ok(())
 }
 
 async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
@@ -1508,6 +1594,7 @@ async fn establish_transport(
     outbound: bool,
     network: Network,
     transport_v2: Option<bool>,
+    proxy: Option<SocketAddr>,
 ) -> Result<(
     PeerReader,
     PeerWriterKind,
@@ -1527,10 +1614,9 @@ async fn establish_transport(
             }
             Err(error) => {
                 debug!(%address, %error, "BIP324 handshake failed; retrying with v1");
-                let fallback = TcpStream::connect(address)
+                let fallback = connect_peer(address, proxy)
                     .await
                     .with_context(|| format!("reconnecting to {address} with v1 transport"))?;
-                fallback.set_nodelay(true)?;
                 return establish_v1(fallback);
             }
         }
@@ -1675,6 +1761,7 @@ async fn serve_peer(
         options.outbound,
         node.config.network,
         options.transport_v2,
+        node.config.proxy,
     )
     .await?;
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
@@ -4029,6 +4116,7 @@ mod tests {
     use bitcoin::block::{Header, Version as BlockVersion};
     use bitcoin::blockdata::constants::genesis_block;
 
+    use crate::config::OnlyNet;
     use crate::{Config, Node};
 
     #[test]
@@ -4054,6 +4142,88 @@ mod tests {
         assert!(!connection_fetches_addresses(true, "block-relay-only"));
         assert!(!connection_fetches_addresses(true, "feeler"));
         assert!(!connection_fetches_addresses(false, "inbound"));
+    }
+
+    #[tokio::test]
+    async fn socks5_proxy_negotiation_routes_ipv4_targets() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+
+            let mut request = [0; 10];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..4], &[5, 1, 0, 1]);
+            assert_eq!(&request[4..8], &[192, 0, 2, 44]);
+            assert_eq!(&request[8..], &18444u16.to_be_bytes());
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+        });
+
+        let mut stream = TcpStream::connect(proxy_address).await.unwrap();
+        socks5_connect(&mut stream, "192.0.2.44:18444".parse().unwrap())
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn onlynet_filters_addresses_and_added_nodes() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: false,
+            onlynet: vec![OnlyNet::Ipv4],
+            proxy: None,
+            blocksonly: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: false,
+            peer_block_filters: false,
+            persist_mempool: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let ipv4 = "192.0.2.10:18444".parse().unwrap();
+        let ipv6 = "[2001:db8::10]:18444".parse().unwrap();
+        assert!(node.add_peer_address(ipv4, false));
+        assert!(node.add_peer_address(ipv6, false));
+        assert!(node.add_node(ipv4));
+        assert!(!node.add_node(ipv6));
+        let attempts = Arc::new(parking_lot::Mutex::new(HashSet::new()));
+        assert_eq!(select_discovery_addresses(&node, 4, &attempts), Vec::new());
     }
 
     #[test]
@@ -4148,6 +4318,8 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: false,
+            onlynet: Vec::new(),
+            proxy: None,
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4465,6 +4637,8 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            onlynet: Vec::new(),
+            proxy: None,
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4555,6 +4729,8 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            onlynet: Vec::new(),
+            proxy: None,
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4658,6 +4834,8 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            onlynet: Vec::new(),
+            proxy: None,
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4847,6 +5025,8 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            onlynet: Vec::new(),
+            proxy: None,
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4934,6 +5114,8 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            onlynet: Vec::new(),
+            proxy: None,
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -4998,6 +5180,8 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            onlynet: Vec::new(),
+            proxy: None,
             blocksonly: false,
             prune: 0,
             reindex: false,
@@ -5123,6 +5307,8 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            onlynet: Vec::new(),
+            proxy: None,
             blocksonly: false,
             prune: 0,
             reindex: false,

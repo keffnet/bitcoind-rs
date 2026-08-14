@@ -4651,17 +4651,9 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let outputs = params
         .get(1)
         .ok_or_else(|| anyhow!("createrawtransaction outputs are missing"))?;
-    let lock_time = params
-        .get(2)
-        .filter(|value| !value.is_null())
-        .and_then(Value::as_u64)
-        .map(|value| {
-            u32::try_from(value)
-                .map_err(|_| anyhow!("locktime is out of range"))
-                .map(LockTime::from_consensus)
-        })
-        .transpose()?
-        .unwrap_or(LockTime::ZERO);
+    let lock_time = u32::try_from(optional_u64(params, 2, 0, "locktime")?)
+        .map(LockTime::from_consensus)
+        .map_err(|_| anyhow!("locktime is out of range"))?;
     let replaceable = params
         .get(3)
         .filter(|value| !value.is_null())
@@ -4706,15 +4698,13 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
             let vout = u32::try_from(vout)
                 .map_err(|_| anyhow!("transaction input vout is out of range"))?;
             let sequence = match value.get("sequence").filter(|value| !value.is_null()) {
-                Some(value) if value.is_number() => {
+                Some(value) => {
                     let sequence = value
                         .as_u64()
-                        .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
-                        .ok_or_else(|| anyhow!("transaction input sequence is out of range"))?;
+                        .ok_or_else(|| anyhow!("transaction input sequence must be an integer"))?;
                     u32::try_from(sequence)
                         .map_err(|_| anyhow!("transaction input sequence is out of range"))?
                 }
-                Some(_) => default_sequence,
                 None => default_sequence,
             };
             Ok(TxIn {
@@ -7504,16 +7494,20 @@ fn parse_signing_prevouts(value: Option<&Value>) -> Result<HashMap<OutPoint, Sig
             let redeem_script = entry
                 .get("redeemScript")
                 .filter(|value| !value.is_null())
-                .and_then(Value::as_str)
-                .map(|script| -> Result<ScriptBuf> {
+                .map(|value| -> Result<ScriptBuf> {
+                    let script = value
+                        .as_str()
+                        .ok_or_else(|| anyhow!("prevtx redeemScript must be a string"))?;
                     Ok(ScriptBuf::from_bytes(hex::decode(script)?))
                 })
                 .transpose()?;
             let witness_script = entry
                 .get("witnessScript")
                 .filter(|value| !value.is_null())
-                .and_then(Value::as_str)
-                .map(|script| -> Result<ScriptBuf> {
+                .map(|value| -> Result<ScriptBuf> {
+                    let script = value
+                        .as_str()
+                        .ok_or_else(|| anyhow!("prevtx witnessScript must be a string"))?;
                     Ok(ScriptBuf::from_bytes(hex::decode(script)?))
                 })
                 .transpose()?;
@@ -13452,6 +13446,15 @@ mod tests {
         let decoded_witness = decode_raw_transaction(&node, &json!([witness_raw, true])).unwrap();
         assert!(decoded_witness["vin"][0]["txinwitness"].is_array());
         assert!(decode_raw_transaction(&node, &json!([witness_raw, false])).is_err());
+        assert!(
+            parse_signing_prevouts(Some(&json!([{
+                "txid": Txid::from_byte_array([7; 32]).to_string(),
+                "vout": 0,
+                "scriptPubKey": "51",
+                "redeemScript": 1,
+            }])))
+            .is_err()
+        );
 
         let default_raw = create_raw_transaction(
             &node,
@@ -13477,6 +13480,7 @@ mod tests {
         assert!(
             create_raw_transaction(&node, &json!([[], {"data": "00"}, null, true, 4])).is_err()
         );
+        assert!(create_raw_transaction(&node, &json!([[], {"data": "00"}, "42"])).is_err());
         assert!(create_raw_transaction(
             &node,
             &json!([[
@@ -13484,6 +13488,15 @@ mod tests {
             ], {"data": "00"}, null, true])
         )
         .is_err());
+        assert!(
+            create_raw_transaction(
+                &node,
+                &json!([[
+                {"txid": Txid::from_byte_array([7; 32]).to_string(), "vout": 1, "sequence": "1"}
+            ], {"data": "00"}])
+            )
+            .is_err()
+        );
         assert!(
             create_raw_transaction(
                 &node,

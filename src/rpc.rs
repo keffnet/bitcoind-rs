@@ -992,6 +992,13 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
 
 fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
     if params.is_array() {
+        if let Some(names) = rpc_parameter_names(method)
+            && params
+                .as_array()
+                .is_some_and(|values| values.len() > names.len())
+        {
+            bail!("too many positional arguments for {method}")
+        }
         return Ok(params.clone());
     }
     let Some(object) = params.as_object() else {
@@ -11206,6 +11213,9 @@ mod tests {
         .unwrap();
         assert_eq!(normalized, json!([[], [], null, null, 3]));
         assert!(normalize_rpc_params("getblockhash", &json!({"height": 0, "extra": 1})).is_err());
+        assert!(normalize_rpc_params("getblockhash", &json!([0, 1])).is_err());
+        assert!(normalize_rpc_params("getblockcount", &json!([1])).is_err());
+        assert!(normalize_rpc_params("echo", &json!([1, 2, 3])).is_ok());
     }
 
     #[test]

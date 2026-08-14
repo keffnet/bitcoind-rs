@@ -1274,7 +1274,7 @@ mod tests {
     fn mine_test_block(previous: &Header, height: u32, tag: u8) -> Block {
         let mut block = Block {
             header: Header {
-                version: BlockVersion::TWO,
+                version: BlockVersion::from_consensus(4),
                 prev_blockhash: previous.block_hash(),
                 merkle_root: bitcoin::TxMerkleNode::all_zeros(),
                 time: previous.time + 1,

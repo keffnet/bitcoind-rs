@@ -69,8 +69,12 @@ pub enum ValidationError {
     BadSignetSolution,
     #[error("block weight exceeds the consensus limit")]
     OversizedBlock,
+    #[error("transaction {0} exceeds the consensus size limit")]
+    OversizedTransaction(Txid),
     #[error("block sigop cost exceeds the consensus limit")]
     TooManySigops,
+    #[error("block version {actual} is below the required version {required}")]
+    BadBlockVersion { actual: i32, required: i32 },
     #[error("coinbase transaction is missing or malformed")]
     BadCoinbase,
     #[error("non-coinbase transaction appears in the coinbase position")]
@@ -354,13 +358,14 @@ pub fn validate_block_structure_with_signet(
     if block.txdata.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }
+    validate_block_version(network, height, block.header.version.to_consensus())?;
     if !block.check_merkle_root() {
         return Err(ValidationError::BadMerkleRoot);
     }
     if !block.check_witness_commitment() {
         return Err(ValidationError::BadWitnessCommitment);
     }
-    if block.weight().to_wu() > 4_000_000 {
+    if block.weight().to_wu() > MAX_BLOCK_WEIGHT as u64 {
         return Err(ValidationError::OversizedBlock);
     }
     let first = &block.txdata[0];
@@ -397,6 +402,9 @@ pub fn validate_block_structure_with_signet(
         let txid = tx.compute_txid();
         if !txids.insert(txid) {
             return Err(ValidationError::DuplicateTransaction(txid));
+        }
+        if tx.base_size().saturating_mul(4) > MAX_BLOCK_WEIGHT {
+            return Err(ValidationError::OversizedTransaction(txid));
         }
         if position > 0 && tx.is_coinbase() {
             return Err(ValidationError::ExtraCoinbase(txid));
@@ -638,16 +646,18 @@ pub fn checked_money_add(left: u64, right: u64) -> Result<u64, ValidationError> 
 pub fn validate_transaction_finality(
     transaction: &Transaction,
     height: u32,
-    median_time_past: u32,
+    lock_time_cutoff: u32,
+    csv_active: bool,
     previous_entries: &[crate::chain::UtxoEntry],
 ) -> Result<(), ValidationError> {
     let block_height = Height::from_consensus(height).expect("block height fits consensus range");
     let block_time =
-        Time::from_consensus(median_time_past).expect("median time is a valid timestamp");
+        Time::from_consensus(lock_time_cutoff).expect("lock time cutoff is a valid timestamp");
     if !transaction.is_absolute_timelock_satisfied(block_height, block_time) {
         return Err(ValidationError::NonFinalTransaction);
     }
-    if transaction.version.0 < 2 || previous_entries.len() != transaction.input.len() {
+    if !csv_active || transaction.version.0 < 2 || previous_entries.len() != transaction.input.len()
+    {
         return Ok(());
     }
     for (input, entry) in transaction.input.iter().zip(previous_entries) {
@@ -662,7 +672,7 @@ pub fn validate_transaction_finality(
             }
         } else {
             let relative_seconds = relative.saturating_mul(512);
-            if median_time_past
+            if lock_time_cutoff
                 <= entry
                     .median_time_past
                     .saturating_add(relative_seconds.saturating_sub(1))
@@ -730,7 +740,29 @@ pub fn validate_transaction_scripts_at_time(
     Ok(())
 }
 
+pub(crate) const MAX_BLOCK_WEIGHT: usize = 4_000_000;
 pub(crate) const MAX_BLOCK_SIGOP_COST: usize = 80_000;
+
+pub fn validate_block_version(
+    network: Network,
+    height: u32,
+    actual: i32,
+) -> Result<(), ValidationError> {
+    let heights = buried_deployment_heights(network);
+    let required = if height >= heights.bip65 {
+        4
+    } else if height >= heights.bip66 {
+        3
+    } else if height >= heights.bip34 {
+        2
+    } else {
+        1
+    };
+    if actual < required {
+        return Err(ValidationError::BadBlockVersion { actual, required });
+    }
+    Ok(())
+}
 
 fn legacy_sigop_cost_for_transaction(transaction: &Transaction) -> usize {
     transaction
@@ -888,7 +920,7 @@ mod tests {
         };
         let mut block = Block {
             header: Header {
-                version: BlockVersion::TWO,
+                version: BlockVersion::from_consensus(4),
                 prev_blockhash: BlockHash::all_zeros(),
                 merkle_root: bitcoin::TxMerkleNode::all_zeros(),
                 time: 1,
@@ -901,6 +933,26 @@ mod tests {
         assert!(matches!(
             validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
             Err(ValidationError::TooManySigops)
+        ));
+    }
+
+    #[test]
+    fn buried_deployments_require_their_block_versions() {
+        assert!(validate_block_version(Network::Regtest, 0, 1).is_ok());
+        assert!(matches!(
+            validate_block_version(Network::Regtest, 1, 1),
+            Err(ValidationError::BadBlockVersion {
+                actual: 1,
+                required: 4
+            })
+        ));
+        assert!(validate_block_version(Network::Bitcoin, 227_930, 1).is_ok());
+        assert!(matches!(
+            validate_block_version(Network::Bitcoin, 227_931, 1),
+            Err(ValidationError::BadBlockVersion {
+                actual: 1,
+                required: 2
+            })
         ));
     }
 
@@ -955,11 +1007,15 @@ mod tests {
                 &transaction,
                 11,
                 500_000_001,
+                true,
                 std::slice::from_ref(&entry),
             )
             .is_err()
         );
-        assert!(validate_transaction_finality(&transaction, 12, 500_000_001, &[entry]).is_ok());
+        assert!(
+            validate_transaction_finality(&transaction, 12, 500_000_001, true, &[entry]).is_ok()
+        );
+        assert!(validate_transaction_finality(&transaction, 11, 500_000_000, false, &[]).is_ok());
     }
 
     #[test]
@@ -1000,7 +1056,7 @@ mod tests {
         };
         let mut block = Block {
             header: Header {
-                version: BlockVersion::TWO,
+                version: BlockVersion::from_consensus(4),
                 prev_blockhash: BlockHash::all_zeros(),
                 merkle_root: bitcoin::TxMerkleNode::all_zeros(),
                 time: 1,

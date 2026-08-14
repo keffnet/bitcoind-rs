@@ -88,6 +88,8 @@ pub enum MempoolError {
     DuplicateInput,
     #[error("transaction has no inputs or outputs")]
     Empty,
+    #[error("bad-txns-oversize")]
+    Oversized,
     #[error("transaction output value is invalid")]
     BadOutput,
     #[error("transaction spends more than its inputs")]
@@ -715,6 +717,9 @@ impl Mempool {
         if transaction.input.is_empty() || transaction.output.is_empty() {
             return Err(MempoolError::Empty);
         }
+        if transaction.base_size().saturating_mul(4) > validation::MAX_BLOCK_WEIGHT {
+            return Err(MempoolError::Oversized);
+        }
         let mut seen = HashSet::with_capacity(transaction.input.len());
         let mut input_total = 0u64;
         let mut previous_outputs = Vec::with_capacity(transaction.input.len());
@@ -758,6 +763,7 @@ impl Mempool {
             &transaction,
             chain.height() + 1,
             chain.median_time_past_value(),
+            chain.height() + 1 >= validation::buried_deployment_heights(chain.network).csv,
             &previous_entries,
         )
         .map_err(|error| MempoolError::Script(error.to_string()))?;

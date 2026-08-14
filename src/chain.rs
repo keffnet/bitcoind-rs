@@ -1553,6 +1553,12 @@ impl ChainState {
         let mut total_fees = 0u64;
         let sigop_flags =
             validation::script_flags_for_block(self.network, height, block.header.time);
+        let csv_active = height >= validation::buried_deployment_heights(self.network).csv;
+        let lock_time_cutoff = if csv_active {
+            block_median_time_past
+        } else {
+            block.header.time
+        };
         let mut sigop_cost = validation::transaction_sigop_cost(&block.txdata[0], &[], sigop_flags);
         if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
             return Err(ValidationError::TooManySigops.into());
@@ -1595,7 +1601,8 @@ impl ChainState {
             validation::validate_transaction_finality(
                 transaction,
                 height,
-                block_median_time_past,
+                lock_time_cutoff,
+                csv_active,
                 &previous_entries,
             )?;
             validation::validate_transaction_scripts_at_time(
@@ -2884,7 +2891,7 @@ mod tests {
         let previous = *state.header(100).expect("height 100 header");
         let mut block = Block {
             header: Header {
-                version: BlockVersion::TWO,
+                version: BlockVersion::from_consensus(4),
                 prev_blockhash: previous.block_hash(),
                 merkle_root: bitcoin::TxMerkleNode::all_zeros(),
                 time: previous.time + 1,
@@ -2945,7 +2952,7 @@ mod tests {
         );
         let mut block = Block {
             header: Header {
-                version: BlockVersion::TWO,
+                version: BlockVersion::from_consensus(4),
                 prev_blockhash: previous.block_hash(),
                 merkle_root: bitcoin::TxMerkleNode::all_zeros(),
                 time: previous.time + 1,

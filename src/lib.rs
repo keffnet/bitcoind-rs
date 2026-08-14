@@ -741,32 +741,11 @@ impl Node {
         };
         self.reduce_block_stalling_timeout();
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
-            let disconnected_transactions = disconnected_blocks
-                .iter()
-                .flat_map(|block| block.txdata.iter().skip(1).cloned())
-                .collect::<Vec<_>>();
             self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
 
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
-            for block in &activated_blocks {
-                self.orphans.lock().erase_for_block(block);
-            }
-            for block in &activated_blocks {
-                for transaction in &block.txdata {
-                    self.promote_orphans_for_parent(transaction);
-                }
-            }
-            for transaction in disconnected_transactions {
-                if self
-                    .mempool
-                    .read()
-                    .get(&transaction.compute_txid())
-                    .is_some()
-                {
-                    self.promote_orphans_for_parent(&transaction);
-                }
-            }
+            self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
         }
         Ok(tip)
     }
@@ -803,6 +782,33 @@ impl Node {
         drop(chain);
         self.announce_mempool_diff(mempool_before, mempool_after);
         self.notify_zmq_mempool_changes(mempool_changes);
+    }
+
+    fn promote_orphans_after_chain_change(
+        &self,
+        activated_blocks: &[Block],
+        disconnected_blocks: &[Block],
+    ) {
+        for block in activated_blocks {
+            self.orphans.lock().erase_for_block(block);
+        }
+        for block in activated_blocks {
+            for transaction in &block.txdata {
+                self.promote_orphans_for_parent(transaction);
+            }
+        }
+        for block in disconnected_blocks {
+            for transaction in block.txdata.iter().skip(1) {
+                if self
+                    .mempool
+                    .read()
+                    .get(&transaction.compute_txid())
+                    .is_some()
+                {
+                    self.promote_orphans_for_parent(transaction);
+                }
+            }
+        }
     }
 
     fn reduce_block_stalling_timeout(&self) {
@@ -1301,6 +1307,7 @@ impl Node {
         if changed {
             self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
+            self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
         Ok(tip)
@@ -1327,6 +1334,7 @@ impl Node {
         if changed {
             self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
+            self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
         Ok(tip)
@@ -1353,6 +1361,7 @@ impl Node {
         if changed {
             self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
+            self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
         Ok(tip)

@@ -1141,7 +1141,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "addnode" => Some(&["node", "command"]),
         "disconnectnode" => Some(&["address", "nodeid"]),
         "getaddednodeinfo" => Some(&["node"]),
-        "setban" => Some(&["command", "subnet", "bantime", "absolute"]),
+        "setban" => Some(&["subnet", "command", "bantime", "absolute"]),
         "setnetworkactive" => Some(&["state"]),
         "estimatesmartfee" => Some(&["conf_target", "estimate_mode"]),
         "estimaterawfee" => Some(&["conf_target", "threshold"]),
@@ -2781,8 +2781,8 @@ fn get_added_node_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let command = param::<String>(params, 0)?;
-    let address = param::<String>(params, 1)?;
+    let address = param::<String>(params, 0)?;
+    let command = param::<String>(params, 1)?;
     let address = parse_ip_address(&address)?;
     match command.as_str() {
         "add" => {
@@ -13089,8 +13089,8 @@ mod tests {
         assert!(add_node(&node, &json!(["127.0.0.1:18444", "add"])).is_err());
         let added = get_added_node_info(&node, &json!([])).unwrap();
         assert_eq!(added[0]["addednode"], "127.0.0.1:18444");
-        assert!(set_ban(&node, &json!(["add", "192.0.2.2", "60"])).is_err());
-        set_ban(&node, &json!(["add", "192.0.2.1", 60])).unwrap();
+        assert!(set_ban(&node, &json!(["192.0.2.2", "add", "60"])).is_err());
+        set_ban(&node, &json!(["192.0.2.1", "add", 60])).unwrap();
         let banned = list_banned(&node).unwrap();
         assert_eq!(banned.as_array().unwrap().len(), 1);
         assert_eq!(banned[0]["ban_duration"], json!(60));
@@ -13100,7 +13100,7 @@ mod tests {
                 .is_some_and(|remaining| (1..=60).contains(&remaining))
         );
         assert!(banned[0].get("ban_reason").is_none());
-        set_ban(&node, &json!(["add", "192.0.2.3", 0])).unwrap();
+        set_ban(&node, &json!(["192.0.2.3", "add", 0])).unwrap();
         let default_duration = list_banned(&node)
             .unwrap()
             .as_array()
@@ -13109,6 +13109,12 @@ mod tests {
             .find(|entry| entry["address"] == "192.0.2.3")
             .and_then(|entry| entry["ban_duration"].as_u64());
         assert_eq!(default_duration, Some(86_400));
+        let normalized = normalize_rpc_params(
+            "setban",
+            &json!({"subnet": "192.0.2.4", "command": "add", "bantime": 60}),
+        )
+        .unwrap();
+        assert_eq!(normalized, json!(["192.0.2.4", "add", 60, null]));
         clear_banned(&node).unwrap();
         assert_eq!(list_banned(&node).unwrap(), json!([]));
         add_node(&node, &json!(["127.0.0.1:18444", "remove"])).unwrap();

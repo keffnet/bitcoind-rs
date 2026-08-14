@@ -17,7 +17,7 @@ use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, seria
 use bitcoin::ecdsa::Signature as EcdsaSignature;
 use bitcoin::hashes::Hash;
 use bitcoin::key::TapTweak;
-use bitcoin::psbt::{Input as PsbtInput, Psbt};
+use bitcoin::psbt::{GetKey, Input as PsbtInput, KeyRequest, Psbt};
 use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::sign_message::{MessageSignature, signed_msg_hash};
@@ -25,7 +25,10 @@ use bitcoin::{
     Address, Amount, Block, BlockHash, Denomination, Network, OutPoint, ScriptBuf, Transaction,
     TxOut, Txid,
 };
-use miniscript::{Descriptor as MiniscriptDescriptor, DescriptorPublicKey as MiniscriptPublicKey};
+use miniscript::psbt::PsbtExt;
+use miniscript::{
+    Descriptor as MiniscriptDescriptor, DescriptorPublicKey as MiniscriptPublicKey, Miniscript, Tap,
+};
 use rand::random;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4683,6 +4686,16 @@ fn multisig_script_keys(script: &bitcoin::Script) -> Option<(usize, Vec<bitcoin:
 }
 
 fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
+    if psbt
+        .inputs
+        .get(input_index)
+        .is_some_and(|input| !input.tap_scripts.is_empty())
+        && psbt
+            .finalize_inp_mut(&Secp256k1::verification_only(), input_index)
+            .is_ok()
+    {
+        return true;
+    }
     let Some(input) = psbt.inputs.get(input_index) else {
         return false;
     };
@@ -4864,6 +4877,7 @@ struct DescriptorCandidate {
     redeem_script: Option<ScriptBuf>,
     witness_script: Option<ScriptBuf>,
     tap_internal_key: Option<bitcoin::XOnlyPublicKey>,
+    tap_merkle_root: Option<bitcoin::taproot::TapNodeHash>,
     tap_tree: Option<bitcoin::taproot::TapTree>,
     tap_scripts: Vec<(
         bitcoin::taproot::ControlBlock,
@@ -4871,6 +4885,37 @@ struct DescriptorCandidate {
         bitcoin::taproot::LeafVersion,
     )>,
     keys: Vec<DescriptorDerivedKey>,
+}
+
+fn update_taproot_psbt_origins(
+    origins: &mut std::collections::BTreeMap<
+        bitcoin::XOnlyPublicKey,
+        (Vec<bitcoin::TapLeafHash>, bitcoin::bip32::KeySource),
+    >,
+    candidate: &DescriptorCandidate,
+) {
+    for key in &candidate.keys {
+        if let (Some(public_key), Some(origin)) = (key.public_key, &key.origin) {
+            origins
+                .entry(bitcoin::XOnlyPublicKey::from(public_key))
+                .or_insert_with(|| (Vec::new(), (origin.0, origin.1.clone())));
+        }
+    }
+    for (_, script, leaf_version) in &candidate.tap_scripts {
+        let Ok(miniscript) = Miniscript::<bitcoin::XOnlyPublicKey, Tap>::decode_consensus(script)
+        else {
+            continue;
+        };
+        let leaf_hash = bitcoin::TapLeafHash::from_script(script, *leaf_version);
+        for public_key in miniscript.iter_pk() {
+            let xonly = public_key;
+            if let Some((leaf_hashes, _)) = origins.get_mut(&xonly)
+                && !leaf_hashes.contains(&leaf_hash)
+            {
+                leaf_hashes.push(leaf_hash);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4944,6 +4989,9 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
         if let Some(tap_internal_key) = candidate.tap_internal_key {
             psbt.inputs[input_index].tap_internal_key = Some(tap_internal_key);
         }
+        if let Some(tap_merkle_root) = candidate.tap_merkle_root {
+            psbt.inputs[input_index].tap_merkle_root = Some(tap_merkle_root);
+        }
         for (control_block, script, leaf_version) in &candidate.tap_scripts {
             psbt.inputs[input_index]
                 .tap_scripts
@@ -4958,15 +5006,7 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .or_insert_with(|| (origin.0, origin.1.clone()));
                 }
             }
-            if let Some(tap_internal_key) = candidate.tap_internal_key
-                && let Some((fingerprint, path)) =
-                    candidate.keys.iter().find_map(|key| key.origin.as_ref())
-            {
-                psbt.inputs[input_index]
-                    .tap_key_origins
-                    .entry(tap_internal_key)
-                    .or_insert_with(|| (Vec::new(), (*fingerprint, path.clone())));
-            }
+            update_taproot_psbt_origins(&mut psbt.inputs[input_index].tap_key_origins, candidate);
         }
         sign_descriptor_psbt_input(&mut psbt, input_index, &prevout, candidate, sighash_type)?;
         if finalize {
@@ -5003,15 +5043,7 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .or_insert_with(|| (origin.0, origin.1.clone()));
                 }
             }
-            if let Some(tap_internal_key) = candidate.tap_internal_key
-                && let Some((fingerprint, path)) =
-                    candidate.keys.iter().find_map(|key| key.origin.as_ref())
-            {
-                psbt.outputs[output_index]
-                    .tap_key_origins
-                    .entry(tap_internal_key)
-                    .or_insert_with(|| (Vec::new(), (*fingerprint, path.clone())));
-            }
+            update_taproot_psbt_origins(&mut psbt.outputs[output_index].tap_key_origins, candidate);
         }
     }
 
@@ -5109,7 +5141,6 @@ fn descriptor_candidates(
 }
 
 fn miniscript_taproot_candidates(
-    node: &Arc<Node>,
     descriptor: &str,
     range: Option<(u32, u32)>,
 ) -> Result<Option<Vec<DescriptorCandidate>>> {
@@ -5117,7 +5148,7 @@ fn miniscript_taproot_candidates(
         return Ok(None);
     }
     let secp = Secp256k1::new();
-    let Ok((parsed, _keymap)) =
+    let Ok((parsed, keymap)) =
         MiniscriptDescriptor::<MiniscriptPublicKey>::parse_descriptor(&secp, descriptor)
     else {
         return Ok(None);
@@ -5125,18 +5156,54 @@ fn miniscript_taproot_candidates(
     if !matches!(&parsed, MiniscriptDescriptor::Tr(_)) {
         return Ok(None);
     }
-    let internal_key_expression = taproot_internal_key_expression(descriptor)?;
-    let internal_key = parse_descriptor_key(internal_key_expression).ok();
-    let internal_origin = descriptor_key_origin(internal_key_expression).unwrap_or(None);
     let indices = descriptor_indices(parsed.has_wildcard(), range)?;
     let verification = Secp256k1::verification_only();
+    let signing = Secp256k1::new();
     let candidates = indices
         .into_iter()
         .map(|index| {
-            let derived = parsed
-                .at_derivation_index(index.unwrap_or(0))?
-                .derived_descriptor(&verification);
-            let (tap_internal_key, tap_tree, tap_scripts) = match &derived {
+            let definite = parsed.at_derivation_index(index.unwrap_or(0))?;
+            let derived = definite.derived_descriptor(&verification);
+            let descriptor_keys = definite.iter_pk().collect::<Vec<_>>();
+            let public_keys = derived.iter_pk().collect::<Vec<_>>();
+            if descriptor_keys.len() != public_keys.len() {
+                bail!("miniscript descriptor key derivation is inconsistent")
+            }
+            let keys = descriptor_keys
+                .into_iter()
+                .zip(public_keys)
+                .map(|(descriptor_key, public_key)| {
+                    let origin = descriptor_key
+                        .full_derivation_path()
+                        .map(|path| (descriptor_key.master_fingerprint(), path));
+                    let private_key = origin
+                        .as_ref()
+                        .and_then(|(_, path)| {
+                            keymap
+                                .get_key(
+                                    KeyRequest::Bip32((
+                                        descriptor_key.master_fingerprint(),
+                                        path.clone(),
+                                    )),
+                                    &signing,
+                                )
+                                .ok()
+                                .flatten()
+                        })
+                        .or_else(|| {
+                            keymap
+                                .get_key(KeyRequest::Pubkey(public_key), &signing)
+                                .ok()
+                                .flatten()
+                        });
+                    DescriptorDerivedKey {
+                        public_key: Some(public_key),
+                        private_key,
+                        origin,
+                    }
+                })
+                .collect();
+            let (tap_internal_key, tap_merkle_root, tap_tree, tap_scripts) = match &derived {
                 MiniscriptDescriptor::Tr(tr) => {
                     let spend_info = tr.spend_info();
                     let scripts = spend_info
@@ -5151,36 +5218,19 @@ fn miniscript_taproot_candidates(
                         .collect();
                     (
                         Some(bitcoin::XOnlyPublicKey::from(*tr.internal_key())),
+                        spend_info.merkle_root(),
                         spend_info.to_tap_tree(),
                         scripts,
                     )
                 }
-                _ => (None, None, Vec::new()),
-            };
-            let keys = match internal_key.as_ref() {
-                Some((DescriptorKey::XOnlyPublicKey(_), _, _)) => vec![DescriptorDerivedKey {
-                    public_key: None,
-                    private_key: None,
-                    origin: internal_origin.clone(),
-                }],
-                Some((key, path, _)) => {
-                    let public_key = descriptor_public_key(key, path, index, &verification)?;
-                    vec![descriptor_derived_key(
-                        node,
-                        key,
-                        path,
-                        index,
-                        public_key,
-                        internal_origin.clone(),
-                    )?]
-                }
-                None => Vec::new(),
+                _ => (None, None, None, Vec::new()),
             };
             Ok(DescriptorCandidate {
                 script_pubkey: derived.script_pubkey(),
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key,
+                tap_merkle_root,
                 tap_tree,
                 tap_scripts,
                 keys,
@@ -5188,26 +5238,6 @@ fn miniscript_taproot_candidates(
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(Some(candidates))
-}
-
-fn taproot_internal_key_expression(descriptor: &str) -> Result<&str> {
-    let inner = descriptor
-        .strip_prefix("tr(")
-        .and_then(|value| value.strip_suffix(')'))
-        .ok_or_else(|| anyhow!("invalid taproot descriptor"))?;
-    let mut parentheses = 0usize;
-    let mut braces = 0usize;
-    for (index, character) in inner.char_indices() {
-        match character {
-            '(' => parentheses = parentheses.saturating_add(1),
-            ')' => parentheses = parentheses.saturating_sub(1),
-            '{' => braces = braces.saturating_add(1),
-            '}' => braces = braces.saturating_sub(1),
-            ',' if parentheses == 0 && braces == 0 => return Ok(&inner[..index]),
-            _ => {}
-        }
-    }
-    bail!("taproot descriptor is missing a script tree")
 }
 
 fn descriptor_candidates_inner(
@@ -5230,6 +5260,7 @@ fn descriptor_candidates_inner(
             redeem_script: None,
             witness_script: None,
             tap_internal_key: None,
+            tap_merkle_root: None,
             tap_tree: None,
             tap_scripts: Vec::new(),
             keys: Vec::new(),
@@ -5247,6 +5278,7 @@ fn descriptor_candidates_inner(
             redeem_script: None,
             witness_script: None,
             tap_internal_key: None,
+            tap_merkle_root: None,
             tap_tree: None,
             tap_scripts: Vec::new(),
             keys: Vec::new(),
@@ -5269,6 +5301,7 @@ fn descriptor_candidates_inner(
                             redeem_script: Some(redeem_script),
                             witness_script: child.witness_script,
                             tap_internal_key: None,
+                            tap_merkle_root: None,
                             tap_tree: None,
                             tap_scripts: Vec::new(),
                             keys: child.keys,
@@ -5281,6 +5314,7 @@ fn descriptor_candidates_inner(
                             redeem_script: None,
                             witness_script: Some(witness_script),
                             tap_internal_key: None,
+                            tap_merkle_root: None,
                             tap_tree: None,
                             tap_scripts: Vec::new(),
                             keys: child.keys,
@@ -5334,6 +5368,7 @@ fn descriptor_candidates_inner(
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: None,
+                tap_merkle_root: None,
                 tap_tree: None,
                 tap_scripts: Vec::new(),
                 keys: vec![derived_key.clone()],
@@ -5343,6 +5378,7 @@ fn descriptor_candidates_inner(
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: None,
+                tap_merkle_root: None,
                 tap_tree: None,
                 tap_scripts: Vec::new(),
                 keys: vec![derived_key.clone()],
@@ -5354,6 +5390,7 @@ fn descriptor_candidates_inner(
                     redeem_script: None,
                     witness_script: None,
                     tap_internal_key: None,
+                    tap_merkle_root: None,
                     tap_tree: None,
                     tap_scripts: Vec::new(),
                     keys: vec![derived_key.clone()],
@@ -5366,6 +5403,7 @@ fn descriptor_candidates_inner(
                     ),
                     witness_script: None,
                     tap_internal_key: None,
+                    tap_merkle_root: None,
                     tap_tree: None,
                     tap_scripts: Vec::new(),
                     keys: vec![derived_key],
@@ -5374,7 +5412,7 @@ fn descriptor_candidates_inner(
         }
         return Ok(candidates);
     }
-    if let Some(candidates) = miniscript_taproot_candidates(node, descriptor, range)? {
+    if let Some(candidates) = miniscript_taproot_candidates(descriptor, range)? {
         return Ok(candidates);
     }
     if let Some(key_expression) = descriptor
@@ -5415,6 +5453,7 @@ fn descriptor_candidates_inner(
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: Some(xonly),
+                tap_merkle_root: None,
                 tap_tree: None,
                 tap_scripts: Vec::new(),
                 keys: vec![derived_key],
@@ -5464,6 +5503,7 @@ where
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: None,
+                tap_merkle_root: None,
                 tap_tree: None,
                 tap_scripts: Vec::new(),
                 keys: vec![descriptor_derived_key(
@@ -5554,6 +5594,7 @@ fn multisig_descriptor_candidates(
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: None,
+                tap_merkle_root: None,
                 tap_tree: None,
                 tap_scripts: Vec::new(),
                 keys: derived.into_iter().map(|(_, key)| key).collect(),
@@ -5606,34 +5647,37 @@ fn sign_descriptor_psbt_input(
     sighash_type: DescriptorSighashType,
 ) -> Result<()> {
     if let Some(tap_internal_key) = candidate.tap_internal_key {
-        let Some(private_key) = candidate.keys.iter().find_map(|key| {
+        if let Some(private_key) = candidate.keys.iter().find_map(|key| {
             let private_key = key.private_key.as_ref()?;
             let public_key = key.public_key?;
             (bitcoin::XOnlyPublicKey::from(public_key) == tap_internal_key).then_some(private_key)
-        }) else {
+        }) {
+            let prevouts = (0..psbt.inputs.len())
+                .map(|index| psbt_prevout(psbt, index))
+                .collect::<Option<Vec<_>>>();
+            let Some(prevouts) = prevouts else {
+                return Ok(());
+            };
+            let sighash = SighashCache::new(&psbt.unsigned_tx).taproot_key_spend_signature_hash(
+                input_index,
+                &Prevouts::All(&prevouts),
+                sighash_type.taproot,
+            )?;
+            let keypair =
+                bitcoin::secp256k1::Keypair::from_secret_key(&Secp256k1::new(), &private_key.inner)
+                    .tap_tweak(&Secp256k1::new(), psbt.inputs[input_index].tap_merkle_root)
+                    .to_keypair();
+            let secp = Secp256k1::new();
+            psbt.inputs[input_index].tap_key_sig = Some(bitcoin::taproot::Signature {
+                signature: secp.sign_schnorr_no_aux_rand(&Message::from(sighash), &keypair),
+                sighash_type: sighash_type.taproot,
+            });
             return Ok(());
-        };
-        let prevouts = (0..psbt.inputs.len())
-            .map(|index| psbt_prevout(psbt, index))
-            .collect::<Option<Vec<_>>>();
-        let Some(prevouts) = prevouts else {
+        }
+        if !candidate.tap_scripts.is_empty() {
+            sign_taproot_script_path(psbt, input_index, candidate, sighash_type.taproot)?;
             return Ok(());
-        };
-        let sighash = SighashCache::new(&psbt.unsigned_tx).taproot_key_spend_signature_hash(
-            input_index,
-            &Prevouts::All(&prevouts),
-            sighash_type.taproot,
-        )?;
-        let keypair =
-            bitcoin::secp256k1::Keypair::from_secret_key(&Secp256k1::new(), &private_key.inner)
-                .tap_tweak(&Secp256k1::new(), psbt.inputs[input_index].tap_merkle_root)
-                .to_keypair();
-        let secp = Secp256k1::new();
-        psbt.inputs[input_index].tap_key_sig = Some(bitcoin::taproot::Signature {
-            signature: secp.sign_schnorr_no_aux_rand(&Message::from(sighash), &keypair),
-            sighash_type: sighash_type.taproot,
-        });
-        return Ok(());
+        }
     }
 
     let sighash_type = sighash_type.ecdsa;
@@ -5694,6 +5738,64 @@ fn sign_descriptor_psbt_input(
                 sighash_type,
             },
         );
+    }
+    Ok(())
+}
+
+fn sign_taproot_script_path(
+    psbt: &mut Psbt,
+    input_index: usize,
+    candidate: &DescriptorCandidate,
+    sighash_type: TapSighashType,
+) -> Result<()> {
+    let prevouts = (0..psbt.inputs.len())
+        .map(|index| psbt_prevout(psbt, index))
+        .collect::<Option<Vec<_>>>();
+    let Some(prevouts) = prevouts else {
+        return Ok(());
+    };
+    let secp = Secp256k1::new();
+    for (_, script, leaf_version) in &candidate.tap_scripts {
+        if *leaf_version != bitcoin::taproot::LeafVersion::TapScript {
+            continue;
+        }
+        let Ok(miniscript) = Miniscript::<bitcoin::XOnlyPublicKey, Tap>::decode_consensus(script)
+        else {
+            continue;
+        };
+        let leaf_keys = miniscript.iter_pk().collect::<Vec<_>>();
+        let leaf_hash = bitcoin::TapLeafHash::from_script(script, *leaf_version);
+        for key in &candidate.keys {
+            let Some(public_key) = key.public_key else {
+                continue;
+            };
+            let Some(private_key) = key.private_key.as_ref() else {
+                continue;
+            };
+            let xonly = bitcoin::XOnlyPublicKey::from(public_key);
+            if !leaf_keys.contains(&xonly)
+                || psbt.inputs[input_index]
+                    .tap_script_sigs
+                    .contains_key(&(xonly, leaf_hash))
+            {
+                continue;
+            }
+            let sighash = SighashCache::new(&psbt.unsigned_tx)
+                .taproot_script_spend_signature_hash(
+                    input_index,
+                    &Prevouts::All(&prevouts),
+                    leaf_hash,
+                    sighash_type,
+                )?;
+            let keypair = bitcoin::secp256k1::Keypair::from_secret_key(&secp, &private_key.inner);
+            psbt.inputs[input_index].tap_script_sigs.insert(
+                (xonly, leaf_hash),
+                bitcoin::taproot::Signature {
+                    signature: secp.sign_schnorr_no_aux_rand(&Message::from(sighash), &keypair),
+                    sighash_type,
+                },
+            );
+        }
     }
     Ok(())
 }
@@ -7683,7 +7785,7 @@ fn expand_descriptor_scripts(
         }
         return Ok(scripts);
     }
-    if let Some(candidates) = miniscript_taproot_candidates(node, descriptor, range)? {
+    if let Some(candidates) = miniscript_taproot_candidates(descriptor, range)? {
         return Ok(candidates
             .into_iter()
             .map(|candidate| candidate.script_pubkey)
@@ -10441,6 +10543,58 @@ mod tests {
         );
         assert_eq!(tree_processed_psbt.inputs[0].tap_scripts.len(), 1);
         assert!(tree_processed_psbt.outputs[0].tap_tree.is_some());
+
+        let leaf_xpriv = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[8; 32]).unwrap();
+        let leaf_private = bitcoin::PrivateKey::new(leaf_xpriv.private_key, Network::Regtest);
+        let leaf_public = leaf_private.public_key(&secp);
+        let script_path_descriptor =
+            format!("tr({internal_key},pk([d34db33f/86'/0'/0']{leaf_xpriv}))");
+        let script_path_script = expand_descriptor_scripts(&node, &script_path_descriptor, None)
+            .unwrap()
+            .remove(0);
+        let mut script_path_psbt = tree_psbt;
+        script_path_psbt.unsigned_tx.output[0].script_pubkey = script_path_script.clone();
+        script_path_psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: script_path_script,
+        });
+        let script_path_processed = descriptor_process_psbt(
+            &node,
+            &json!([
+                encode_psbt(&script_path_psbt),
+                [script_path_descriptor],
+                "SIGHASH_DEFAULT",
+                true,
+                false
+            ]),
+        )
+        .unwrap();
+        assert_eq!(script_path_processed["complete"], false);
+        let script_path_psbt =
+            parse_psbt(&json!([script_path_processed["psbt"].clone()]), 0).unwrap();
+        assert_eq!(script_path_psbt.inputs[0].tap_script_sigs.len(), 1);
+        assert_eq!(
+            script_path_psbt.inputs[0]
+                .tap_script_sigs
+                .keys()
+                .next()
+                .unwrap()
+                .0,
+            bitcoin::XOnlyPublicKey::from(leaf_public)
+        );
+        let finalized_script_path =
+            finalize_psbt(&json!([encode_psbt(&script_path_psbt), true])).unwrap();
+        assert_eq!(finalized_script_path["complete"], true);
+        let finalized_script_path =
+            parse_psbt(&json!([finalized_script_path["psbt"].clone()]), 0).unwrap();
+        assert_eq!(
+            finalized_script_path.inputs[0]
+                .final_script_witness
+                .as_ref()
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]

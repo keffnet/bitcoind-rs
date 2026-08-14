@@ -962,6 +962,11 @@ impl ChainState {
                 header.time,
                 parent.header.time,
             )?;
+            validation::validate_block_version(
+                self.network,
+                parent.height.saturating_add(1),
+                header.version.to_consensus(),
+            )?;
             validation::validate_header(
                 self.network,
                 header,
@@ -2911,6 +2916,21 @@ mod tests {
         state.connect_block(parent).unwrap();
         state.connect_block(child).unwrap();
         assert_eq!(state.height(), 2);
+    }
+
+    #[test]
+    fn rejects_outdated_versions_during_header_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let mut stale = mine_block_from_header(&parent.header, 2, 11);
+        stale.header.version = BlockVersion::ONE;
+        stale.header.nonce = 0;
+        while !stale.header.target().is_met_by(stale.block_hash()) {
+            stale.header.nonce = stale.header.nonce.wrapping_add(1);
+        }
+        state.accept_headers(&[parent.header]).unwrap();
+        assert!(state.accept_headers(&[stale.header]).is_err());
     }
 
     #[test]

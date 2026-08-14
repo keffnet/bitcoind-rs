@@ -40,6 +40,8 @@ For the public signet, use `--network signet`. Custom BIP325 challenges can be s
 
 Bloom-filter peer relay is disabled by default, matching Core's default; enable it with `--peer-bloom-filters` when serving BIP37 clients.
 
+Inbound P2P listening can be disabled with `--listen=false`; DNS seed lookup can be disabled with `--dnsseed=false`. `--blocksonly` disables transaction relay while retaining block synchronization and local RPC/mempool operation.
+
 ZeroMQ topics can be enabled with the Core-style options, for example
 `--zmqpubhashtx tcp://127.0.0.1:28332 --zmqpubsequence tcp://127.0.0.1:28333`.
 `getzmqnotifications` reports the configured topic endpoints and high-water marks.

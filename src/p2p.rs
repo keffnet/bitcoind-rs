@@ -331,9 +331,17 @@ impl PeerManager {
     }
 
     pub async fn run(self) -> Result<()> {
-        let listener = TcpListener::bind(self.node.config.p2p_bind)
-            .await
-            .with_context(|| format!("binding P2P listener {}", self.node.config.p2p_bind))?;
+        let listener = if self.node.config.listen {
+            Some(
+                TcpListener::bind(self.node.config.p2p_bind)
+                    .await
+                    .with_context(|| {
+                        format!("binding P2P listener {}", self.node.config.p2p_bind)
+                    })?,
+            )
+        } else {
+            None
+        };
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
         let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let next_peer_id = Arc::new(AtomicUsize::new(1));
@@ -388,6 +396,9 @@ impl PeerManager {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
+                if relay_node.config.blocksonly {
+                    continue;
+                }
                 let Some(hash) = relay_node
                     .mempool
                     .read()
@@ -413,7 +424,7 @@ impl PeerManager {
             }
         });
         let configured_seed_nodes = !self.node.config.seed_nodes.is_empty();
-        let seed_nodes = if !configured_seed_nodes {
+        let seed_nodes = if !configured_seed_nodes && self.node.config.dnsseed {
             let addresses = discover_dns_seeds(self.node.config.network).await;
             for address in &addresses {
                 self.node.remember_address(
@@ -481,6 +492,9 @@ impl PeerManager {
             }
         });
 
+        let Some(listener) = listener else {
+            return std::future::pending::<Result<()>>().await;
+        };
         loop {
             let (stream, address) = listener.accept().await?;
             if !self.node.network_active() || self.node.is_banned(address.ip()) {
@@ -842,16 +856,15 @@ async fn serve_peer_loop(
     let relay_transactions = &peer_state.relay_transactions;
     let height = node.chain.read().height() as i32;
     let local_nonce = random();
+    let mut version =
+        VersionMessage::with_bloom(height, local_nonce, node.config.peer_bloom_filters);
+    version.relay = !node.config.blocksonly;
     send_message(
         node,
         peer_id,
         writer,
         node.config.network,
-        &Message::Version(VersionMessage::with_bloom(
-            height,
-            local_nonce,
-            node.config.peer_bloom_filters,
-        )),
+        &Message::Version(version),
     )
     .await?;
     let mut version_received = false;
@@ -1014,7 +1027,7 @@ async fn serve_peer_loop(
                 if verack_received {
                     anyhow::bail!("wtxidrelay received after verack");
                 }
-                if peer_version >= WTXID_RELAY_VERSION {
+                if peer_version >= WTXID_RELAY_VERSION && !node.config.blocksonly {
                     *peer_state.wtxid_relay.lock() = true;
                 }
             }
@@ -1143,6 +1156,9 @@ async fn serve_peer_loop(
                             }
                             InventoryType::CompactBlock => !chain.store.contains(&item.hash),
                             InventoryType::Transaction | InventoryType::WitnessTransaction => {
+                                if node.config.blocksonly {
+                                    return false;
+                                }
                                 if (wtxid_relay && item.kind == InventoryType::Transaction)
                                     || (!wtxid_relay
                                         && item.kind == InventoryType::WitnessTransaction)
@@ -1256,6 +1272,10 @@ async fn serve_peer_loop(
                             }
                         }
                         InventoryType::Transaction | InventoryType::WitnessTransaction => {
+                            if node.config.blocksonly {
+                                missing.push(item);
+                                continue;
+                            }
                             let transaction = {
                                 let mempool = node.mempool.read();
                                 if item.kind == InventoryType::WitnessTransaction {
@@ -1558,6 +1578,9 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::Transaction(transaction) => {
+                if node.config.blocksonly {
+                    continue;
+                }
                 let known_hash = if *peer_state.wtxid_relay.lock() {
                     BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash())
                 } else {
@@ -1667,7 +1690,7 @@ async fn serve_peer_loop(
                 }
             }
             Message::Mempool => {
-                if !*relay_transactions.lock() {
+                if node.config.blocksonly || !*relay_transactions.lock() {
                     send_message(
                         node,
                         peer_id,
@@ -1974,9 +1997,14 @@ async fn send_peer_extensions(
         send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
     }
     if peer_version >= WTXID_RELAY_VERSION {
-        send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
+        if !node.config.blocksonly {
+            send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
+        }
         send_message(node, peer_id, writer, network, &Message::SendAddrV2).await?;
-        if node.config.zmq.tx_reconciliation && *peer_state.relay_transactions.lock() {
+        if node.config.zmq.tx_reconciliation
+            && *peer_state.relay_transactions.lock()
+            && !node.config.blocksonly
+        {
             let salt = random::<u64>();
             send_message(
                 node,
@@ -2068,6 +2096,14 @@ async fn broadcast_inventory_excluding(
     network: Network,
     item: Inventory,
 ) {
+    if node.config.blocksonly
+        && matches!(
+            item.kind,
+            InventoryType::Transaction | InventoryType::WitnessTransaction
+        )
+    {
+        return;
+    }
     let transaction = if matches!(
         item.kind,
         InventoryType::Transaction | InventoryType::WitnessTransaction
@@ -2275,6 +2311,9 @@ mod tests {
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -2354,6 +2393,9 @@ mod tests {
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -2448,6 +2490,9 @@ mod tests {
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -2500,6 +2545,9 @@ mod tests {
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
@@ -2539,6 +2587,9 @@ mod tests {
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
@@ -2638,6 +2689,9 @@ mod tests {
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,

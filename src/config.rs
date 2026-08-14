@@ -119,6 +119,24 @@ pub struct Args {
     #[arg(long, default_value = "127.0.0.1:8333")]
     pub p2p: SocketAddr,
 
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub listen: bool,
+
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub dnsseed: bool,
+
     #[arg(long, default_value = "127.0.0.1:8332")]
     pub rpc: SocketAddr,
 
@@ -139,6 +157,15 @@ pub struct Args {
 
     #[arg(long, default_value_t = false)]
     pub peer_bloom_filters: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub blocksonly: bool,
 
     #[arg(long, default_value_t = false, hide = true)]
     pub tx_reconciliation: bool,
@@ -179,13 +206,16 @@ pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
     pub p2p_bind: SocketAddr,
+    pub listen: bool,
     pub rpc_bind: Option<SocketAddr>,
     pub electrum_bind: Option<SocketAddr>,
     pub rest: bool,
     pub seed_nodes: Vec<SocketAddr>,
+    pub dnsseed: bool,
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
     pub peer_bloom_filters: bool,
+    pub blocksonly: bool,
     pub zmq: ZmqConfig,
 }
 
@@ -205,7 +235,10 @@ impl Config {
         {
             bail!("ZMQ high water marks must be greater than zero");
         }
-        if args.p2p.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) && args.p2p.port() == 0 {
+        if args.listen
+            && args.p2p.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            && args.p2p.port() == 0
+        {
             bail!("--p2p must use a non-zero port when binding all interfaces");
         }
         let signet_challenge = match args.signet_challenge {
@@ -223,13 +256,16 @@ impl Config {
             network: args.network.into(),
             datadir: args.datadir,
             p2p_bind: args.p2p,
+            listen: args.listen,
             rpc_bind: Some(args.rpc),
             electrum_bind: Some(args.electrum),
             rest: args.rest,
             seed_nodes: args.connect,
+            dnsseed: args.dnsseed,
             signet_challenge,
             max_peers: args.max_peers,
             peer_bloom_filters: args.peer_bloom_filters,
+            blocksonly: args.blocksonly,
             zmq: ZmqConfig {
                 tx_reconciliation: args.tx_reconciliation,
                 pub_hash_tx: args.zmq_pub_hash_tx,
@@ -244,5 +280,30 @@ impl Config {
                 sequence_hwm: args.zmq_pub_sequence_hwm,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_core_style_network_policy_switches() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--p2p",
+            "0.0.0.0:0",
+            "--listen=false",
+            "--dnsseed=0",
+            "--blocksonly=1",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(!config.listen);
+        assert!(!config.dnsseed);
+        assert!(config.blocksonly);
     }
 }

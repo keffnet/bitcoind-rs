@@ -1355,18 +1355,41 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             let options = params
                 .get(1)
                 .filter(|value| !value.is_null())
-                .and_then(Value::as_object);
+                .map(|value| {
+                    value
+                        .as_object()
+                        .ok_or_else(|| anyhow!("options must be an object"))
+                })
+                .transpose()?;
             let use_current_time = options
                 .and_then(|options| options.get("use_current_time"))
-                .and_then(Value::as_bool)
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or_else(|| anyhow!("use_current_time must be a boolean"))
+                })
+                .transpose()?
                 .unwrap_or(true);
             let apply_fee_delta_priority = options
                 .and_then(|options| options.get("apply_fee_delta_priority"))
-                .and_then(Value::as_bool)
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or_else(|| anyhow!("apply_fee_delta_priority must be a boolean"))
+                })
+                .transpose()?
                 .unwrap_or(false);
             let apply_unbroadcast_set = options
                 .and_then(|options| options.get("apply_unbroadcast_set"))
-                .and_then(Value::as_bool)
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_bool()
+                        .ok_or_else(|| anyhow!("apply_unbroadcast_set must be a boolean"))
+                })
+                .transpose()?
                 .unwrap_or(false);
             node.import_mempool_with_options(
                 path,
@@ -6047,18 +6070,33 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let sighash_name = params
         .get(2)
         .filter(|value| !value.is_null())
-        .and_then(Value::as_str)
-        .unwrap_or("SIGHASH_ALL");
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("sighashtype must be a string"))
+        })
+        .transpose()?
+        .unwrap_or("DEFAULT");
     let sighash_type = parse_descriptor_sighash_type(sighash_name)?;
     let include_bip32_derivations = params
         .get(3)
         .filter(|value| !value.is_null())
-        .and_then(Value::as_bool)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("bip32derivs must be a boolean"))
+        })
+        .transpose()?
         .unwrap_or(true);
     let finalize = params
         .get(4)
         .filter(|value| !value.is_null())
-        .and_then(Value::as_bool)
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("finalize must be a boolean"))
+        })
+        .transpose()?
         .unwrap_or(true);
 
     for input_index in 0..psbt.inputs.len() {
@@ -14135,6 +14173,45 @@ mod tests {
             value: Amount::from_sat(100_000),
             script_pubkey: previous_script,
         });
+        assert!(
+            descriptor_process_psbt(
+                &node,
+                &json!([
+                    encode_psbt(&psbt),
+                    [format!("wpkh({public_key})")],
+                    1,
+                    true,
+                    true
+                ]),
+            )
+            .is_err()
+        );
+        assert!(
+            descriptor_process_psbt(
+                &node,
+                &json!([
+                    encode_psbt(&psbt),
+                    [format!("wpkh({public_key})")],
+                    "SIGHASH_ALL",
+                    1,
+                    true
+                ]),
+            )
+            .is_err()
+        );
+        assert!(
+            descriptor_process_psbt(
+                &node,
+                &json!([
+                    encode_psbt(&psbt),
+                    [format!("wpkh({public_key})")],
+                    "SIGHASH_ALL",
+                    true,
+                    1
+                ]),
+            )
+            .is_err()
+        );
         let processed = descriptor_process_psbt(
             &node,
             &json!([encode_psbt(&psbt), [descriptor], "SIGHASH_ALL", true, true]),
@@ -14492,6 +14569,29 @@ mod tests {
         node.mempool.read().save_to_file(&path).unwrap();
         node.mempool.write().remove(&txid);
         assert!(node.mempool.read().get(&txid).is_none());
+        assert!(
+            dispatch_method(
+                &node,
+                "importmempool",
+                &json!([path.to_string_lossy().to_string(), 1]),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("options must be an object")
+        );
+        assert!(
+            dispatch_method(
+                &node,
+                "importmempool",
+                &json!([
+                    path.to_string_lossy().to_string(),
+                    {"use_current_time": 1}
+                ]),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("use_current_time must be a boolean")
+        );
         assert_eq!(
             dispatch_method(
                 &node,

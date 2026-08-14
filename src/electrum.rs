@@ -647,43 +647,17 @@ fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
 fn mempool_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
     let chain = node.chain.read();
     let mempool = node.mempool.read();
-    let mut result = Vec::new();
-    for txid in mempool.transaction_order() {
-        let Some(entry) = mempool.get(&txid) else {
-            continue;
-        };
-        let transaction = &entry.transaction;
-        let affects_outputs = transaction
-            .output
-            .iter()
-            .any(|output| chain::electrum_script_hash(&output.script_pubkey) == script_hash);
-        let affects_inputs = transaction.input.iter().any(|input| {
-            chain.utxo(&input.previous_output).map_or_else(
-                || {
-                    mempool
-                        .get(&input.previous_output.txid)
-                        .and_then(|entry| {
-                            entry
-                                .transaction
-                                .output
-                                .get(input.previous_output.vout as usize)
-                        })
-                        .is_some_and(|output| {
-                            chain::electrum_script_hash(&output.script_pubkey) == script_hash
-                        })
-                },
-                |entry| chain::electrum_script_hash(&entry.output.script_pubkey) == script_hash,
-            )
-        });
-        if affects_outputs || affects_inputs {
-            result.push(json!({
+    mempool_records_for_script(&chain, &mempool, script_hash)
+        .into_iter()
+        .filter_map(|(txid, height)| {
+            let entry = mempool.get(&txid)?;
+            Some(json!({
                 "tx_hash": txid.to_string(),
-                "height": mempool_transaction_height(transaction, &mempool),
+                "height": height,
                 "fee": entry.fee_sat,
-            }));
-        }
-    }
-    result
+            }))
+        })
+        .collect()
 }
 
 fn mempool_transaction_height(transaction: &Transaction, mempool: &crate::mempool::Mempool) -> i64 {
@@ -1227,9 +1201,7 @@ fn history_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
         .into_iter()
         .map(|(txid, height)| {
             let mut result = json!({"tx_hash": txid.to_string(), "height": height});
-            if height == 0
-                && let Some(entry) = mempool.get(&txid)
-            {
+            if let Some(entry) = mempool.get(&txid) {
                 result["fee"] = json!(entry.fee_sat);
             }
             result
@@ -1266,17 +1238,40 @@ fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<(Txid,
             records.push((entry.txid, i64::from(entry.height)));
         }
     }
-    for txid in mempool.transaction_order() {
-        let Some(entry) = mempool.get(&txid) else {
-            continue;
-        };
-        if transaction_affects_script(&entry.transaction, &chain, &mempool, script_hash)
-            && seen.insert(txid)
-        {
-            records.push((txid, 0));
+    for (txid, height) in mempool_records_for_script(&chain, &mempool, script_hash) {
+        if seen.insert(txid) {
+            records.push((txid, height));
         }
     }
     records
+}
+
+fn mempool_records_for_script(
+    chain: &crate::chain::ChainState,
+    mempool: &crate::mempool::Mempool,
+    script_hash: &str,
+) -> Vec<(Txid, i64)> {
+    let mut records = mempool
+        .transaction_order()
+        .into_iter()
+        .filter_map(|txid| {
+            let entry = mempool.get(&txid)?;
+            transaction_affects_script(&entry.transaction, chain, mempool, script_hash).then_some((
+                txid,
+                mempool_transaction_height(&entry.transaction, mempool),
+            ))
+        })
+        .collect::<Vec<_>>();
+    sort_mempool_records(&mut records);
+    records
+}
+
+fn sort_mempool_records(records: &mut [(Txid, i64)]) {
+    records.sort_by(|(left_txid, left_height), (right_txid, right_height)| {
+        right_height
+            .cmp(left_height)
+            .then_with(|| left_txid.to_string().cmp(&right_txid.to_string()))
+    });
 }
 
 fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> (u64, i64) {
@@ -1475,6 +1470,21 @@ mod tests {
             history_status(&[(txid, 1)]),
             "549540a6810df8dc5008757fa694172b0f7a3e32facfd9f39eab228286543cde"
         );
+    }
+
+    #[test]
+    fn mempool_records_use_electrum_height_then_txid_order() {
+        let low_txid = Txid::from_byte_array([1; 32]);
+        let high_txid = Txid::from_byte_array([2; 32]);
+        let child_txid = Txid::from_byte_array([3; 32]);
+        let mut records = vec![(child_txid, -1), (high_txid, 0), (low_txid, 0)];
+
+        sort_mempool_records(&mut records);
+
+        assert_eq!(records[0].1, 0);
+        assert_eq!(records[1].1, 0);
+        assert_eq!(records[2], (child_txid, -1));
+        assert!(records[0].0.to_string() < records[1].0.to_string());
     }
 
     #[test]

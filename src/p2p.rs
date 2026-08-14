@@ -21,6 +21,7 @@ use bitcoin::p2p::message_bloom::{BloomFlags, FilterAdd, FilterLoad};
 use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
 use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction, Txid, Wtxid};
 use rand::random;
+use rand::seq::SliceRandom;
 use tokio::io::BufReader;
 use tokio::net::{
     TcpListener, TcpStream,
@@ -938,6 +939,7 @@ async fn serve_peer_loop(
     let mut verack_sent = false;
     let mut extensions_sent = false;
     let mut addrv2_received = false;
+    let mut getaddr_received = false;
     let mut peer_version = 0i32;
     let mut compact_block_version = 2u64;
     let mut pending_compact = None;
@@ -1764,12 +1766,14 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetAddr => {
+                if outbound || getaddr_received {
+                    continue;
+                }
+                getaddr_received = true;
                 node.enable_peer_address_relay(peer_id);
-                let peer_infos = node
-                    .known_addresses()
-                    .into_iter()
-                    .take(1_000)
-                    .collect::<Vec<_>>();
+                let mut peer_infos = node.known_addresses();
+                peer_infos.shuffle(&mut rand::rng());
+                peer_infos.truncate(MAX_ADDR_TO_SEND);
                 if addrv2_received {
                     let addresses = peer_infos
                         .into_iter()

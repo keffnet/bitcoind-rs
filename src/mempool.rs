@@ -86,6 +86,8 @@ pub enum MempoolError {
     MissingInput(OutPoint),
     #[error("transaction contains a duplicate input")]
     DuplicateInput,
+    #[error("transaction contains a null prevout")]
+    NullPrevout,
     #[error("transaction has no inputs or outputs")]
     Empty,
     #[error("bad-txns-oversize")]
@@ -713,6 +715,13 @@ impl Mempool {
         }
         if transaction.is_coinbase() {
             return Err(MempoolError::Coinbase);
+        }
+        if transaction
+            .input
+            .iter()
+            .any(|input| input.previous_output.is_null())
+        {
+            return Err(MempoolError::NullPrevout);
         }
         if transaction.input.is_empty() || transaction.output.is_empty() {
             return Err(MempoolError::Empty);

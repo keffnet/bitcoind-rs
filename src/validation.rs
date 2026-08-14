@@ -85,6 +85,8 @@ pub enum ValidationError {
     FirstTransactionNotCoinbase,
     #[error("transaction {0} is unexpectedly coinbase")]
     ExtraCoinbase(Txid),
+    #[error("transaction {0} contains a null prevout")]
+    NullPrevout(Txid),
     #[error("transaction {0} has no inputs")]
     EmptyInputs(Txid),
     #[error("transaction {0} has no outputs")]
@@ -464,6 +466,9 @@ pub fn validate_block_structure_with_signet(
         }
         if position > 0 && tx.is_coinbase() {
             return Err(ValidationError::ExtraCoinbase(txid));
+        }
+        if !tx.is_coinbase() && tx.input.iter().any(|input| input.previous_output.is_null()) {
+            return Err(ValidationError::NullPrevout(txid));
         }
         if tx.input.is_empty() {
             return Err(ValidationError::EmptyInputs(txid));
@@ -1008,6 +1013,62 @@ mod tests {
         assert!(matches!(
             validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
             Err(ValidationError::TooManySigops)
+        ));
+    }
+
+    #[test]
+    fn rejects_null_prevouts_in_non_coinbase_transactions() {
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Builder::new().push_int(1).push_int(0).into_script(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let malformed = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                },
+                TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+                    script_sig: ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::from_consensus(4),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase, malformed],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(matches!(
+            validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
+            Err(ValidationError::NullPrevout(_))
         ));
     }
 

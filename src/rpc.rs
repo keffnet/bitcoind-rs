@@ -1500,7 +1500,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     "proxy_randomize_credentials": false,
                 },
             ],
-            "localaddresses": [],
+            "localaddresses": local_addresses(node),
             "relayfee": sat_to_btc(mempool.min_relay_fee_sat_per_kvb()),
             "incrementalfee": sat_to_btc(mempool.incremental_relay_fee_sat_per_kvb()),
             "warnings": [],
@@ -1971,6 +1971,52 @@ fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
         },
         "connections": peers.len(),
     }))
+}
+
+fn local_addresses(node: &Arc<Node>) -> Value {
+    let Some(address) = node
+        .listen_address()
+        .filter(|address| is_routable_ip(address.ip()))
+    else {
+        return json!([]);
+    };
+    json!([{
+        "address": address.ip().to_string(),
+        "port": address.port(),
+        "score": 2,
+    }])
+}
+
+fn is_routable_ip(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => {
+            let octets = address.octets();
+            let shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
+            let documentation = (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
+            let benchmark = octets[0] == 198 && (18..=19).contains(&octets[1]);
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_private()
+                && !address.is_link_local()
+                && !address.is_broadcast()
+                && !shared
+                && !documentation
+                && !benchmark
+                && !address.is_multicast()
+        }
+        std::net::IpAddr::V6(address) => {
+            let segments = address.segments();
+            let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+            !address.is_unspecified()
+                && !address.is_loopback()
+                && !address.is_unique_local()
+                && !address.is_unicast_link_local()
+                && !address.is_multicast()
+                && !documentation
+        }
+    }
 }
 
 fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -12833,6 +12879,16 @@ mod tests {
         }
         dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap();
         assert!(node.network_active());
+        node.set_listen_address("8.8.8.8:18444".parse().unwrap());
+        assert_eq!(
+            dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["localaddresses"],
+            json!([{"address": "8.8.8.8", "port": 18444, "score": 2}])
+        );
+        node.set_listen_address("127.0.0.1:18444".parse().unwrap());
+        assert_eq!(
+            dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["localaddresses"],
+            json!([])
+        );
     }
 
     #[test]

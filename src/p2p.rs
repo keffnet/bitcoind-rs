@@ -364,13 +364,11 @@ impl PeerManager {
 
     pub async fn run(self) -> Result<()> {
         let listener = if self.node.config.listen {
-            Some(
-                TcpListener::bind(self.node.config.p2p_bind)
-                    .await
-                    .with_context(|| {
-                        format!("binding P2P listener {}", self.node.config.p2p_bind)
-                    })?,
-            )
+            let listener = TcpListener::bind(self.node.config.p2p_bind)
+                .await
+                .with_context(|| format!("binding P2P listener {}", self.node.config.p2p_bind))?;
+            self.node.set_listen_address(listener.local_addr()?);
+            Some(listener)
         } else {
             None
         };

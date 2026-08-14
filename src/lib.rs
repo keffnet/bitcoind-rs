@@ -528,6 +528,7 @@ pub struct Node {
     tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
     added_nodes: parking_lot::RwLock<HashSet<SocketAddr>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
+    listen_address: parking_lot::RwLock<Option<SocketAddr>>,
     pub started_at: Instant,
     shutdown: Notify,
 }
@@ -625,6 +626,7 @@ impl Node {
             tried_addresses: parking_lot::RwLock::new(tried_addresses),
             added_nodes: parking_lot::RwLock::new(added_nodes),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
+            listen_address: parking_lot::RwLock::new(None),
             started_at: Instant::now(),
             shutdown: Notify::new(),
         }))
@@ -1197,6 +1199,14 @@ impl Node {
 
     pub fn network_active(&self) -> bool {
         self.network_active.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_listen_address(&self, address: SocketAddr) {
+        *self.listen_address.write() = Some(address);
+    }
+
+    pub(crate) fn listen_address(&self) -> Option<SocketAddr> {
+        *self.listen_address.read()
     }
 
     pub fn set_network_active(&self, active: bool) {

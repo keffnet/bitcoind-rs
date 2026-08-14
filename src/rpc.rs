@@ -6649,6 +6649,9 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let block: bitcoin::Block = deserialize(&bytes)?;
     let hash = block.block_hash();
+    if node.chain.write().block(&hash)?.is_some() {
+        return Ok(json!("duplicate"));
+    }
     let result = node.connect_block(block);
     match result {
         Ok(_) => Ok(Value::Null),
@@ -9750,6 +9753,15 @@ mod tests {
 
         let descriptor_block = generate_block(&node, &json!(["raw(51)", [], false])).unwrap();
         assert!(descriptor_block["hex"].as_str().is_some());
+        let block_hex = descriptor_block["hex"].as_str().unwrap();
+        assert_eq!(
+            submit_block(&node, &json!([block_hex])).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            submit_block(&node, &json!([block_hex])).unwrap(),
+            json!("duplicate")
+        );
     }
 
     #[test]

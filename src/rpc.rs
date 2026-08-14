@@ -632,7 +632,10 @@ fn rest_spent_txouts(
                         .map(|output| {
                             json!({
                                 "value": output.value.to_btc(),
-                                "scriptPubKey": script_json(&output.script_pubkey),
+                                "scriptPubKey": script_json_with_network(
+                                    &output.script_pubkey,
+                                    Some(node.config.network),
+                                ),
                             })
                         })
                         .collect::<Vec<_>>()
@@ -774,7 +777,10 @@ fn rest_get_utxos(
                 .map(|(height, output)| json!({
                     "height": height,
                     "value": output.value.to_btc(),
-                    "scriptPubKey": script_json(&output.script_pubkey),
+                    "scriptPubKey": script_json_with_network(
+                        &output.script_pubkey,
+                        Some(node.config.network),
+                    ),
                 }))
                 .collect::<Vec<_>>(),
         }));
@@ -889,7 +895,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "reconsiderblock" => reconsider_block(node, params),
         "preciousblock" => precious_block(node, params),
         "getrawtransaction" => get_raw_transaction(node, params),
-        "decoderawtransaction" => decode_raw_transaction(params),
+        "decoderawtransaction" => decode_raw_transaction(node, params),
         "createrawtransaction" => create_raw_transaction(node, params),
         "decodescript" => decode_script(node, params),
         "combinerawtransaction" => combine_raw_transaction(params),
@@ -2301,12 +2307,19 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     Some(confirmations),
                     Some(block.header.time),
                     Some(block.header.time),
+                    chain.network,
                 );
                 if let Some(undo) = undo.as_ref() {
                     let spent_outputs = undo.get(transaction_index).ok_or_else(|| {
                         anyhow!("Block undo is missing transaction {transaction_index}")
                     })?;
-                    add_prevout_details(&mut transaction_json, tx, spent_outputs, &mut chain)?;
+                    add_prevout_details(
+                        &mut transaction_json,
+                        tx,
+                        spent_outputs,
+                        &mut chain,
+                        node.config.network,
+                    )?;
                 }
                 Ok(transaction_json)
             })
@@ -3161,6 +3174,7 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         confirmations,
         block_time,
         block_time,
+        node.config.network,
     );
     if verbosity >= 2 {
         if location.block_hash != BlockHash::all_zeros() {
@@ -3169,7 +3183,13 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .and_then(|entries| entries.get(location.transaction_index).cloned())
                 && undo.len() == transaction.input.len()
             {
-                add_prevout_details(&mut result, &transaction, &undo, &mut chain)?;
+                add_prevout_details(
+                    &mut result,
+                    &transaction,
+                    &undo,
+                    &mut chain,
+                    node.config.network,
+                )?;
                 let input_total = undo
                     .iter()
                     .map(|output| output.value.to_sat())
@@ -3210,10 +3230,17 @@ fn parse_transaction_verbosity(value: Option<&Value>) -> Result<u8> {
     }
 }
 
-fn decode_raw_transaction(params: &Value) -> Result<Value> {
+fn decode_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let transaction: Transaction = deserialize(&bytes)?;
-    Ok(rpc_transaction(&transaction, None, None, None, None))
+    Ok(rpc_transaction(
+        &transaction,
+        None,
+        None,
+        None,
+        None,
+        node.config.network,
+    ))
 }
 
 fn combine_raw_transaction(params: &Value) -> Result<Value> {
@@ -3806,7 +3833,14 @@ fn decode_psbt_output(output: &bitcoin::psbt::Output) -> Value {
 fn decode_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let psbt = parse_psbt(params, 0)?;
     Ok(json!({
-        "tx": rpc_transaction(&psbt.unsigned_tx, None, None, None, None),
+        "tx": rpc_transaction(
+            &psbt.unsigned_tx,
+            None,
+            None,
+            None,
+            None,
+            node.config.network,
+        ),
         "global_xpub": psbt.xpub.iter().map(|(xpub, source)| json!({
             "xpub": xpub.to_string(),
             "master_fingerprint": source.0.to_string(),
@@ -6210,7 +6244,10 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
             "bestblock": chain.best_hash().to_string(),
             "confirmations": chain.height().saturating_sub(entry.height) + 1,
             "value": sat_to_btc(entry.output.value.to_sat()),
-            "scriptPubKey": script_json(&entry.output.script_pubkey),
+            "scriptPubKey": script_json_with_network(
+                &entry.output.script_pubkey,
+                Some(node.config.network),
+            ),
             "coinbase": entry.coinbase,
         }));
     }
@@ -6225,7 +6262,10 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 "bestblock": chain.best_hash().to_string(),
                 "confirmations": 0,
                 "value": sat_to_btc(output.value.to_sat()),
-                "scriptPubKey": script_json(&output.script_pubkey),
+                "scriptPubKey": script_json_with_network(
+                    &output.script_pubkey,
+                    Some(node.config.network),
+                ),
                 "coinbase": false,
             }));
         }
@@ -6279,7 +6319,10 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 unspents.push(json!({
                     "txid": outpoint.txid.to_string(),
                     "vout": outpoint.vout,
-                    "scriptPubKey": script_json(&entry.output.script_pubkey),
+                    "scriptPubKey": script_json_with_network(
+                        &entry.output.script_pubkey,
+                        Some(node.config.network),
+                    ),
                     "desc": descriptor,
                     "amount": sat_to_btc(entry.output.value.to_sat()),
                     "height": entry.height,
@@ -6468,7 +6511,10 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         "height": height,
                         "txid": txid.to_string(),
                         "vout": vout,
-                        "output_spk": script_json(&output.script_pubkey),
+                        "output_spk": script_json_with_network(
+                            &output.script_pubkey,
+                            Some(node.config.network),
+                        ),
                     }));
                 }
             }
@@ -6492,7 +6538,10 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         "spend_vin": vin,
                         "prevout_txid": input.previous_output.txid.to_string(),
                         "prevout_vout": input.previous_output.vout,
-                        "prevout_spk": script_json(&output.script_pubkey),
+                        "prevout_spk": script_json_with_network(
+                            &output.script_pubkey,
+                            Some(node.config.network),
+                        ),
                     }));
                 }
             }
@@ -6513,7 +6562,10 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         "spend_txid": Value::Null,
                         "txid": txid.to_string(),
                         "vout": vout,
-                        "output_spk": script_json(&output.script_pubkey),
+                        "output_spk": script_json_with_network(
+                            &output.script_pubkey,
+                            Some(node.config.network),
+                        ),
                     }));
                 }
             }
@@ -6530,7 +6582,10 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         "spend_vin": vin,
                         "prevout_txid": input.previous_output.txid.to_string(),
                         "prevout_vout": input.previous_output.vout,
-                        "prevout_spk": script_json(&output.script_pubkey),
+                        "prevout_spk": script_json_with_network(
+                            &output.script_pubkey,
+                            Some(node.config.network),
+                        ),
                     }));
                 }
             }
@@ -7071,6 +7126,7 @@ fn rpc_transaction(
     confirmations: Option<i64>,
     time: Option<u32>,
     blocktime: Option<u32>,
+    network: Network,
 ) -> Value {
     let vin = transaction
         .input
@@ -7097,7 +7153,7 @@ fn rpc_transaction(
             json!({
                 "value": sat_to_btc(output.value.to_sat()),
                 "n": index,
-                "scriptPubKey": script_json(&output.script_pubkey),
+                "scriptPubKey": script_json_with_network(&output.script_pubkey, Some(network)),
             })
         })
         .collect::<Vec<_>>();
@@ -7133,6 +7189,7 @@ fn add_prevout_details(
     transaction: &Transaction,
     spent_outputs: &[bitcoin::TxOut],
     chain: &mut chain::ChainState,
+    network: Network,
 ) -> Result<()> {
     let vin = transaction_json
         .get_mut("vin")
@@ -7152,7 +7209,7 @@ fn add_prevout_details(
             "generated": previous_transaction.is_coinbase(),
             "height": location.height,
             "value": sat_to_btc(output.value.to_sat()),
-            "scriptPubKey": script_json(&output.script_pubkey),
+            "scriptPubKey": script_json_with_network(&output.script_pubkey, Some(network)),
         });
         let input_json = vin
             .get_mut(input_index)
@@ -7177,7 +7234,51 @@ fn add_prevout_details(
 }
 
 fn script_json(script: &bitcoin::Script) -> Value {
-    json!({"asm": script.to_asm_string(), "hex": hex::encode(script.as_bytes())})
+    script_json_with_network(script, None)
+}
+
+fn script_json_with_network(script: &bitcoin::Script, network: Option<Network>) -> Value {
+    let (script_type, address) = if script.is_p2pkh() {
+        (
+            "pubkeyhash",
+            network.and_then(|network| Address::from_script(script, network).ok()),
+        )
+    } else if script.is_p2sh() {
+        (
+            "scripthash",
+            network.and_then(|network| Address::from_script(script, network).ok()),
+        )
+    } else if script.is_p2wpkh() {
+        (
+            "witness_v0_keyhash",
+            network.and_then(|network| Address::from_script(script, network).ok()),
+        )
+    } else if script.is_p2wsh() {
+        (
+            "witness_v0_scripthash",
+            network.and_then(|network| Address::from_script(script, network).ok()),
+        )
+    } else if script.is_p2tr() {
+        (
+            "witness_v1_taproot",
+            network.and_then(|network| Address::from_script(script, network).ok()),
+        )
+    } else if script.is_op_return() {
+        ("nulldata", None)
+    } else if script.is_p2pk() {
+        ("pubkey", None)
+    } else {
+        ("nonstandard", None)
+    };
+    let mut result = json!({
+        "asm": script.to_asm_string(),
+        "hex": hex::encode(script.as_bytes()),
+        "type": script_type,
+    });
+    if let Some(address) = address {
+        result["address"] = json!(address.to_string());
+    }
+    result
 }
 
 fn param<T: serde::de::DeserializeOwned>(params: &Value, index: usize) -> Result<T> {
@@ -8477,6 +8578,15 @@ mod tests {
         assert_eq!(decoded["type"], "witness_v0_keyhash");
         assert_eq!(
             decoded["addresses"][0],
+            "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
+        );
+        let decoded_transaction = decode_raw_transaction(&node, &json!([raw])).unwrap();
+        assert_eq!(
+            decoded_transaction["vout"][0]["scriptPubKey"]["type"],
+            "witness_v0_keyhash"
+        );
+        assert_eq!(
+            decoded_transaction["vout"][0]["scriptPubKey"]["address"],
             "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
         );
 

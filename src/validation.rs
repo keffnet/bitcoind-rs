@@ -232,14 +232,42 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
 }
 
 pub fn script_flags_for_block(network: Network, height: u32, block_time: u32) -> u32 {
+    let _ = block_time;
+    script_flags_for_block_with_hash(network, height, None)
+}
+
+/// Return the consensus script flags for a block, including Core's historical
+/// block-specific exceptions.
+pub fn script_flags_for_block_with_hash(
+    network: Network,
+    height: u32,
+    block_hash: Option<BlockHash>,
+) -> u32 {
     let heights = buried_deployment_heights(network);
-    let mut flags = bitcoinconsensus::VERIFY_NONE;
-    let p2sh_active = match network {
-        Network::Regtest | Network::Signet | Network::Testnet4 => true,
-        Network::Bitcoin | Network::Testnet => block_time >= network_params(network).bip16_time,
+    // Core keeps these flags enabled for historical block replay because only
+    // the listed blocks violate the modern rules. The block hash is required
+    // to reproduce those exceptions exactly.
+    let mut flags = bitcoinconsensus::VERIFY_P2SH
+        | bitcoinconsensus::VERIFY_WITNESS
+        | bitcoinconsensus::VERIFY_TAPROOT;
+    let hash = block_hash.map(|hash| hash.to_string());
+    let exception = match (network, hash.as_deref()) {
+        (
+            Network::Bitcoin,
+            Some("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"),
+        )
+        | (
+            Network::Testnet,
+            Some("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"),
+        ) => Some(bitcoinconsensus::VERIFY_NONE),
+        (
+            Network::Bitcoin,
+            Some("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"),
+        ) => Some(bitcoinconsensus::VERIFY_P2SH | bitcoinconsensus::VERIFY_WITNESS),
+        _ => None,
     };
-    if p2sh_active {
-        flags |= bitcoinconsensus::VERIFY_P2SH;
+    if let Some(exception) = exception {
+        flags = exception;
     }
     if height >= heights.bip66 {
         flags |= bitcoinconsensus::VERIFY_DERSIG;
@@ -252,13 +280,6 @@ pub fn script_flags_for_block(network: Network, height: u32, block_time: u32) ->
     }
     if height >= heights.segwit {
         flags |= bitcoinconsensus::VERIFY_NULLDUMMY | bitcoinconsensus::VERIFY_WITNESS;
-    }
-    let taproot_active = match network {
-        Network::Bitcoin => height >= 709_632,
-        Network::Testnet | Network::Testnet4 | Network::Signet | Network::Regtest => true,
-    };
-    if taproot_active {
-        flags |= bitcoinconsensus::VERIFY_TAPROOT;
     }
     flags
 }
@@ -739,6 +760,24 @@ pub fn validate_transaction_scripts_at_time(
     transaction: &Transaction,
     previous_outputs: &[bitcoin::TxOut],
 ) -> Result<(), ValidationError> {
+    validate_transaction_scripts_at_time_with_block_hash(
+        network,
+        height,
+        block_time,
+        None,
+        transaction,
+        previous_outputs,
+    )
+}
+
+pub fn validate_transaction_scripts_at_time_with_block_hash(
+    network: Network,
+    height: u32,
+    block_time: u32,
+    block_hash: Option<BlockHash>,
+    transaction: &Transaction,
+    previous_outputs: &[bitcoin::TxOut],
+) -> Result<(), ValidationError> {
     if previous_outputs.len() != transaction.input.len() {
         return Err(ValidationError::Script {
             txid: transaction.compute_txid(),
@@ -755,7 +794,8 @@ pub fn validate_transaction_scripts_at_time(
             value: output.value.to_sat() as i64,
         })
         .collect();
-    let flags = script_flags_for_block(network, height, block_time);
+    let _ = block_time;
+    let flags = script_flags_for_block_with_hash(network, height, block_hash);
     for (input, previous_output) in previous_outputs.iter().enumerate() {
         if let Err(error) = bitcoinconsensus::verify_with_flags(
             previous_output.script_pubkey.as_bytes(),
@@ -1000,6 +1040,42 @@ mod tests {
             Err(ValidationError::Bip94TimeWarp)
         ));
         assert!(validate_bip94_timewarp(Network::Regtest, 2_016, 1, 10_000).is_ok());
+    }
+
+    #[test]
+    fn matches_core_historical_script_flag_exceptions() {
+        let mainnet_bip16 = "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+            .parse()
+            .unwrap();
+        let testnet_bip16 = "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105"
+            .parse()
+            .unwrap();
+        let mainnet_taproot = "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            script_flags_for_block_with_hash(Network::Bitcoin, 1, Some(mainnet_bip16)),
+            bitcoinconsensus::VERIFY_NONE
+        );
+        assert_eq!(
+            script_flags_for_block_with_hash(Network::Testnet, 1, Some(testnet_bip16)),
+            bitcoinconsensus::VERIFY_NONE
+        );
+        let taproot_exception =
+            script_flags_for_block_with_hash(Network::Bitcoin, 700_000, Some(mainnet_taproot));
+        assert_eq!(
+            taproot_exception & bitcoinconsensus::VERIFY_TAPROOT,
+            bitcoinconsensus::VERIFY_NONE
+        );
+        assert_ne!(
+            taproot_exception & bitcoinconsensus::VERIFY_WITNESS,
+            bitcoinconsensus::VERIFY_NONE
+        );
+        assert_ne!(
+            script_flags_for_block_with_hash(Network::Bitcoin, 1, None)
+                & bitcoinconsensus::VERIFY_TAPROOT,
+            bitcoinconsensus::VERIFY_NONE
+        );
     }
 
     #[test]

@@ -1584,8 +1584,9 @@ impl ChainState {
         let mut spent_entries = Vec::new();
         let mut created = HashMap::new();
         let mut total_fees = 0u64;
+        let block_hash = block.block_hash();
         let sigop_flags =
-            validation::script_flags_for_block(self.network, height, block.header.time);
+            validation::script_flags_for_block_with_hash(self.network, height, Some(block_hash));
         let csv_active = height >= validation::buried_deployment_heights(self.network).csv;
         let lock_time_cutoff = if csv_active {
             block_median_time_past
@@ -1638,10 +1639,11 @@ impl ChainState {
                 csv_active,
                 &previous_entries,
             )?;
-            validation::validate_transaction_scripts_at_time(
+            validation::validate_transaction_scripts_at_time_with_block_hash(
                 self.network,
                 height,
                 block.header.time,
+                Some(block_hash),
                 transaction,
                 &previous_outputs,
             )?;

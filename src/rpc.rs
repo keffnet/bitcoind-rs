@@ -2774,9 +2774,6 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = chain
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
-    let header = chain
-        .header_by_hash(&hash)
-        .ok_or_else(|| anyhow!("Block header not found"))?;
     let headers = chain
         .headers_to_hash(&hash)
         .ok_or_else(|| anyhow!("Block header chain is unavailable"))?;
@@ -2807,7 +2804,7 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "taproot".to_owned(),
         bip9_deployment_json(&headers, height, taproot),
     );
-    let flags = validation::script_flags_for_block(chain.network, height, header.time);
+    let flags = validation::script_flags_for_block_with_hash(chain.network, height, Some(hash));
     Ok(json!({
         "hash": hash.to_string(),
         "height": height,

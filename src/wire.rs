@@ -23,6 +23,7 @@ const HEADER_SIZE: usize = 24;
 pub const NODE_NETWORK: u64 = 1;
 pub const NODE_WITNESS: u64 = 1 << 3;
 pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
+pub const NODE_P2P_V2: u64 = 1 << 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InventoryType {
@@ -110,12 +111,12 @@ impl VersionMessage {
     pub fn new(start_height: i32, nonce: u64) -> Self {
         Self {
             version: Self::PROTOCOL_VERSION,
-            services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS,
+            services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS | NODE_P2P_V2,
             timestamp: chrono_like_unix_time(),
-            receiver_services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS,
+            receiver_services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS | NODE_P2P_V2,
             receiver_address: [0; 16],
             receiver_port: 0,
-            sender_services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS,
+            sender_services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS | NODE_P2P_V2,
             sender_address: [0; 16],
             sender_port: 0,
             nonce,
@@ -414,6 +415,125 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
         Message::Unknown { payload, .. } => out.extend_from_slice(payload),
     }
     Ok(out)
+}
+
+/// Encode the application-layer contents used inside a BIP324 packet.
+///
+/// Unlike v1 framing, the network magic, length, checksum, and 12-byte
+/// command header are not transported separately. Common commands use their
+/// one-byte BIP324 type id; extensions use a zero byte followed by the
+/// conventional 12-byte command name.
+pub fn encode_v2_message(message: &Message) -> Result<Vec<u8>> {
+    let command = message.command();
+    let mut result = Vec::new();
+    if let Some(message_id) = v2_message_id(command) {
+        result.push(message_id);
+    } else {
+        if command.is_empty() || command.len() > 12 || command.contains('\0') {
+            bail!("invalid Bitcoin command name");
+        }
+        result.push(0);
+        let mut command_bytes = [0u8; 12];
+        command_bytes[..command.len()].copy_from_slice(command.as_bytes());
+        result.extend_from_slice(&command_bytes);
+    }
+    result.extend_from_slice(&encode_payload(message)?);
+    Ok(result)
+}
+
+/// Decode a BIP324 application-layer message into the normal wire message
+/// representation used by the peer state machine.
+pub fn decode_v2_message(payload: &[u8]) -> Result<Message> {
+    let Some(&message_type) = payload.first() else {
+        bail!("empty BIP324 application message");
+    };
+    let (command, payload_start) = if message_type == 0 {
+        let command_bytes = payload
+            .get(1..13)
+            .ok_or_else(|| anyhow::anyhow!("short BIP324 command header"))?;
+        let command_end = command_bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(command_bytes.len());
+        let command = std::str::from_utf8(&command_bytes[..command_end])?;
+        (command.to_owned(), 13)
+    } else {
+        (
+            v2_message_command(message_type)
+                .ok_or_else(|| anyhow::anyhow!("unknown BIP324 message type {message_type}"))?
+                .to_owned(),
+            1,
+        )
+    };
+    decode_payload(&command, payload.get(payload_start..).unwrap_or_default()).map_err(Into::into)
+}
+
+fn v2_message_id(command: &str) -> Option<u8> {
+    Some(match command {
+        "addr" => 1,
+        "block" => 2,
+        "blocktxn" => 3,
+        "cmpctblock" => 4,
+        "feefilter" => 5,
+        "filteradd" => 6,
+        "filterclear" => 7,
+        "filterload" => 8,
+        "getblocks" => 9,
+        "getblocktxn" => 10,
+        "getdata" => 11,
+        "getheaders" => 12,
+        "headers" => 13,
+        "inv" => 14,
+        "mempool" => 15,
+        "merkleblock" => 16,
+        "notfound" => 17,
+        "ping" => 18,
+        "pong" => 19,
+        "sendcmpct" => 20,
+        "tx" => 21,
+        "getcfilters" => 22,
+        "cfilter" => 23,
+        "getcfheaders" => 24,
+        "cfheaders" => 25,
+        "getcfcheckpt" => 26,
+        "cfcheckpt" => 27,
+        "addrv2" => 28,
+        _ => return None,
+    })
+}
+
+fn v2_message_command(message_type: u8) -> Option<&'static str> {
+    Some(match message_type {
+        1 => "addr",
+        2 => "block",
+        3 => "blocktxn",
+        4 => "cmpctblock",
+        5 => "feefilter",
+        6 => "filteradd",
+        7 => "filterclear",
+        8 => "filterload",
+        9 => "getblocks",
+        10 => "getblocktxn",
+        11 => "getdata",
+        12 => "getheaders",
+        13 => "headers",
+        14 => "inv",
+        15 => "mempool",
+        16 => "merkleblock",
+        17 => "notfound",
+        18 => "ping",
+        19 => "pong",
+        20 => "sendcmpct",
+        21 => "tx",
+        22 => "getcfilters",
+        23 => "cfilter",
+        24 => "getcfheaders",
+        25 => "cfheaders",
+        26 => "getcfcheckpt",
+        27 => "cfcheckpt",
+        28 => "addrv2",
+        _ => return None,
+    })
 }
 
 fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
@@ -807,6 +927,23 @@ mod tests {
         };
         let frame = encode_message(Network::Regtest, &message).unwrap();
         assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn bip324_application_messages_round_trip_with_short_and_extended_ids() {
+        for message in [Message::Ping(42), Message::Verack, Message::WtxidRelay] {
+            let encoded = encode_v2_message(&message).unwrap();
+            let decoded = decode_v2_message(&encoded).unwrap();
+            assert_eq!(decoded, message);
+        }
+
+        let message = Message::Unknown {
+            command: "futurecmd".to_owned(),
+            payload: vec![1, 2, 3],
+        };
+        let encoded = encode_v2_message(&message).unwrap();
+        assert_eq!(encoded[0], 0);
+        assert_eq!(decode_v2_message(&encoded).unwrap(), message);
     }
 
     #[test]

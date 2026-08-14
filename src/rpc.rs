@@ -1054,9 +1054,12 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "version": 310100,
             "subversion": "/bitcoind-rs:0.1.0/",
             "protocolversion": 70016,
-            "localservices": "0000000000000049",
+            "localservices": "0000000000000849",
             "localservicesnames": peer_services_names(
-                wire::NODE_NETWORK | wire::NODE_WITNESS | wire::NODE_COMPACT_FILTERS,
+                wire::NODE_NETWORK
+                    | wire::NODE_WITNESS
+                    | wire::NODE_COMPACT_FILTERS
+                    | wire::NODE_P2P_V2,
             ),
             "timeoffset": 0,
             "localrelay": true,
@@ -1422,6 +1425,7 @@ fn peer_services_names(services: u64) -> Vec<&'static str> {
         (wire::NODE_NETWORK, "NETWORK"),
         (wire::NODE_WITNESS, "WITNESS"),
         (wire::NODE_COMPACT_FILTERS, "COMPACT_FILTERS"),
+        (wire::NODE_P2P_V2, "P2P_V2"),
     ]
     .into_iter()
     .filter_map(|(bit, name)| (services & bit != 0).then_some(name))

@@ -9,21 +9,56 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bip324::futures::{Protocol, ProtocolReader, ProtocolWriter};
+use bip324::io::Payload;
+use bip324::{PacketType, Role};
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
 use bitcoin::bip158::{FilterHash, FilterHeader};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
 use bitcoin::{Block, BlockHash, Network, Transaction, Txid, Wtxid};
 use rand::random;
-use tokio::net::{TcpListener, TcpStream, tcp::OwnedReadHalf};
+use tokio::io::BufReader;
+use tokio::net::{
+    TcpListener, TcpStream,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
 use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::Node;
 use crate::wire::{self, GetHeadersMessage, Inventory, InventoryType, Message, VersionMessage};
 
-type PeerWriter = Arc<Mutex<tokio::net::tcp::OwnedWriteHalf>>;
+enum PeerReader {
+    V1(OwnedReadHalf),
+    V2(ProtocolReader<BufReader<OwnedReadHalf>>),
+}
+
+enum PeerWriterKind {
+    V1(OwnedWriteHalf),
+    V2(ProtocolWriter<OwnedWriteHalf>),
+}
+
+type PeerWriter = Arc<Mutex<PeerWriterKind>>;
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, PeerWriter>>>;
+
+impl PeerReader {
+    async fn read_message(&mut self, network: Network) -> Result<(Message, usize)> {
+        match self {
+            Self::V1(reader) => wire::read_message_with_size(reader, network).await,
+            Self::V2(reader) => loop {
+                let payload = reader.read().await?;
+                if payload.packet_type() == PacketType::Decoy {
+                    continue;
+                }
+                let contents = payload.contents();
+                let bytes = contents.len().saturating_add(20);
+                let message = wire::decode_v2_message(contents)?;
+                break Ok((message, bytes));
+            },
+        }
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum PeerCommand {
@@ -249,6 +284,82 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
     addresses
 }
 
+async fn establish_transport(
+    stream: TcpStream,
+    address: SocketAddr,
+    outbound: bool,
+    network: Network,
+) -> Result<(PeerReader, PeerWriterKind, Option<SocketAddr>)> {
+    if outbound {
+        match establish_v2(stream, network, Role::Initiator).await {
+            Ok((reader, writer, local_address)) => {
+                return Ok((reader, writer, local_address));
+            }
+            Err(error) => {
+                debug!(%address, %error, "BIP324 handshake failed; retrying with v1");
+                let fallback = TcpStream::connect(address)
+                    .await
+                    .with_context(|| format!("reconnecting to {address} with v1 transport"))?;
+                fallback.set_nodelay(true)?;
+                return establish_v1(fallback);
+            }
+        }
+    }
+
+    let mut prefix = [0u8; 16];
+    let mut received = 0;
+    while received < prefix.len() {
+        let count = stream.peek(&mut prefix[received..]).await?;
+        if count == 0 {
+            anyhow::bail!("peer closed before transport negotiation");
+        }
+        received += count;
+    }
+
+    let mut v1_prefix = [0u8; 16];
+    v1_prefix[..4].copy_from_slice(&wire::network_magic(network));
+    v1_prefix[4..11].copy_from_slice(b"version");
+    if prefix == v1_prefix {
+        establish_v1(stream)
+    } else {
+        establish_v2(stream, network, Role::Responder).await
+    }
+}
+
+async fn establish_v2(
+    stream: TcpStream,
+    network: Network,
+    role: Role,
+) -> Result<(PeerReader, PeerWriterKind, Option<SocketAddr>)> {
+    let local_address = stream.local_addr().ok();
+    let (reader, writer) = stream.into_split();
+    let protocol = Protocol::new(
+        wire::network_magic(network),
+        role,
+        None,
+        None,
+        BufReader::new(reader),
+        writer,
+    )
+    .await?;
+    let (reader, writer) = protocol.into_split();
+    Ok((
+        PeerReader::V2(reader),
+        PeerWriterKind::V2(writer),
+        local_address,
+    ))
+}
+
+fn establish_v1(stream: TcpStream) -> Result<(PeerReader, PeerWriterKind, Option<SocketAddr>)> {
+    let local_address = stream.local_addr().ok();
+    let (reader, writer) = stream.into_split();
+    Ok((
+        PeerReader::V1(reader),
+        PeerWriterKind::V1(writer),
+        local_address,
+    ))
+}
+
 async fn serve_peer(
     node: Arc<Node>,
     stream: TcpStream,
@@ -259,10 +370,10 @@ async fn serve_peer(
 ) -> Result<()> {
     let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
+    let (mut reader, writer_half, local_address) =
+        establish_transport(stream, address, outbound, node.config.network).await?;
     let (commands, command_receiver) = mpsc::unbounded_channel();
-    let local_address = stream.local_addr().ok();
     node.register_peer_with_local(peer_id, address, !outbound, commands, local_address);
-    let (mut reader, writer_half) = stream.into_split();
     let writer = Arc::new(Mutex::new(writer_half));
     peers.lock().insert(peer_id, writer.clone());
     let result = serve_peer_loop(
@@ -301,7 +412,7 @@ impl Drop for PeerCountGuard<'_> {
 
 async fn serve_peer_loop(
     node: &Arc<Node>,
-    reader: &mut OwnedReadHalf,
+    reader: &mut PeerReader,
     writer: &PeerWriter,
     outbound: bool,
     peers: &PeerRegistry,
@@ -367,7 +478,7 @@ async fn serve_peer_loop(
                     }
                 }
             }
-            message = wire::read_message_with_size(reader, node.config.network) => {
+            message = reader.read_message(node.config.network) => {
                 let (message, bytes) = message?;
                 node.record_bytes_received(peer_id, bytes);
                 message
@@ -931,7 +1042,7 @@ async fn serve_peer_loop(
                         .into_iter()
                         .map(|peer| wire::NetworkAddress {
                             time: u32::try_from(peer.connected_at).unwrap_or(u32::MAX),
-                            services: wire::NODE_NETWORK | wire::NODE_WITNESS,
+                            services: wire::NODE_NETWORK | wire::NODE_WITNESS | wire::NODE_P2P_V2,
                             address: socket_address_bytes(peer.address),
                             port: peer.address.port(),
                         })
@@ -1211,7 +1322,7 @@ fn network_address_v2(address: std::net::SocketAddr, connected_at: u64) -> wire:
     };
     wire::NetworkAddressV2 {
         time: u32::try_from(connected_at).unwrap_or(u32::MAX),
-        services: wire::NODE_NETWORK | wire::NODE_WITNESS,
+        services: wire::NODE_NETWORK | wire::NODE_WITNESS | wire::NODE_P2P_V2,
         network,
         address,
         port,
@@ -1271,7 +1382,17 @@ async fn send_message(
     message: &Message,
 ) -> Result<()> {
     let mut writer = writer.lock().await;
-    let bytes = wire::write_message_with_size(&mut *writer, network, message).await?;
+    let bytes = match &mut *writer {
+        PeerWriterKind::V1(writer) => {
+            wire::write_message_with_size(writer, network, message).await?
+        }
+        PeerWriterKind::V2(writer) => {
+            let contents = wire::encode_v2_message(message)?;
+            let bytes = contents.len().saturating_add(20);
+            writer.write(&Payload::genuine(contents)).await?;
+            bytes
+        }
+    };
     node.record_bytes_sent(peer_id, bytes);
     Ok(())
 }
@@ -1395,5 +1516,65 @@ mod tests {
         assert!(addresses.iter().any(|peer| peer.address == legacy_socket));
         assert!(addresses.iter().any(|peer| peer.address == v2_socket));
         assert_eq!(addresses.iter().filter(|peer| peer.id == 0).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn bip324_transport_round_trips_encrypted_application_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address);
+        let server = listener.accept();
+        let (client, server) = tokio::join!(client, server);
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+
+        let (client_result, server_result) = tokio::join!(
+            establish_v2(client, Network::Regtest, Role::Initiator),
+            establish_v2(server, Network::Regtest, Role::Responder),
+        );
+        let (client_reader, client_writer, _) = client_result.unwrap();
+        let (server_reader, server_writer, _) = server_result.unwrap();
+        let mut client_reader = match client_reader {
+            PeerReader::V2(reader) => reader,
+            PeerReader::V1(_) => panic!("expected encrypted client reader"),
+        };
+        let mut client_writer = match client_writer {
+            PeerWriterKind::V2(writer) => writer,
+            PeerWriterKind::V1(_) => panic!("expected encrypted client writer"),
+        };
+        let mut server_reader = match server_reader {
+            PeerReader::V2(reader) => reader,
+            PeerReader::V1(_) => panic!("expected encrypted server reader"),
+        };
+        let mut server_writer = match server_writer {
+            PeerWriterKind::V2(writer) => writer,
+            PeerWriterKind::V1(_) => panic!("expected encrypted server writer"),
+        };
+
+        let client_message = Message::Ping(123);
+        client_writer
+            .write(&Payload::genuine(
+                wire::encode_v2_message(&client_message).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let payload = server_reader.read().await.unwrap();
+        assert_eq!(
+            wire::decode_v2_message(payload.contents()).unwrap(),
+            client_message
+        );
+
+        let server_message = Message::Pong(456);
+        server_writer
+            .write(&Payload::genuine(
+                wire::encode_v2_message(&server_message).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let payload = client_reader.read().await.unwrap();
+        assert_eq!(
+            wire::decode_v2_message(payload.contents()).unwrap(),
+            server_message
+        );
     }
 }

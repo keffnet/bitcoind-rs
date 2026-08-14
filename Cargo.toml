@@ -9,6 +9,7 @@ license = "MIT"
 [dependencies]
 anyhow = "1.0"
 base64 = "0.22"
+bip324 = { version = "0.11", features = ["tokio"] }
 bitcoin = { version = "0.32.7", features = ["serde"] }
 bitcoinconsensus = "0.106.0"
 bytes = "1.10"

@@ -24,6 +24,7 @@ const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const SNAPSHOT_INTERVAL: u32 = 1_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
+const MAX_ORPHAN_BLOCKS: usize = 128;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
@@ -1552,8 +1553,7 @@ impl ChainState {
         }
         let parent_hash = block.header.prev_blockhash;
         let Some(parent) = self.block_index.get(&parent_hash).copied() else {
-            self.store.insert(&block)?;
-            self.orphans.entry(parent_hash).or_default().push(block);
+            self.queue_orphan_block(parent_hash, block)?;
             bail!("block {} has an unknown parent {}", hash, parent_hash);
         };
         if self.has_invalid_ancestor(parent_hash) {
@@ -1563,14 +1563,7 @@ impl ChainState {
         // until its parent UTXO state is available so an unvalidated body
         // cannot influence chain selection.
         if !self.store.contains(&parent_hash) {
-            self.store.insert(&block)?;
-            let pending = self.orphans.entry(parent_hash).or_default();
-            if !pending
-                .iter()
-                .any(|candidate| candidate.block_hash() == hash)
-            {
-                pending.push(block);
-            }
+            self.queue_orphan_block(parent_hash, block)?;
             bail!("block {} has a parent whose full body is unavailable", hash)
         }
         if parent_hash == self.best_hash() {
@@ -1630,6 +1623,23 @@ impl ChainState {
         for child in children {
             let _ = self.connect_block(child);
         }
+    }
+
+    fn queue_orphan_block(&mut self, parent_hash: BlockHash, block: Block) -> Result<()> {
+        let hash = block.block_hash();
+        if self
+            .orphans
+            .values()
+            .any(|children| children.iter().any(|child| child.block_hash() == hash))
+        {
+            return Ok(());
+        }
+        let orphan_count = self.orphans.values().map(Vec::len).sum::<usize>();
+        if orphan_count >= MAX_ORPHAN_BLOCKS {
+            bail!("too many orphan blocks")
+        }
+        self.orphans.entry(parent_hash).or_default().push(block);
+        Ok(())
     }
 
     fn process_known_children(&mut self, parent_hash: BlockHash) {
@@ -2059,10 +2069,7 @@ impl ChainState {
             if let Some(node) = self.block_index.get(&hash).copied() {
                 self.index_all_transactions(&block, node.height);
             } else {
-                self.orphans
-                    .entry(block.header.prev_blockhash)
-                    .or_default()
-                    .push(block);
+                let _ = self.queue_orphan_block(block.header.prev_blockhash, block);
             }
         }
         Ok(())
@@ -3179,9 +3186,47 @@ mod tests {
         let child = mine_block_from_header(&parent.header, 2, 7);
         let child_hash = child.block_hash();
         assert!(state.connect_block(child).is_err());
+        assert!(!state.store.contains(&child_hash));
         state.connect_block(parent).unwrap();
         assert_eq!(state.best_hash(), child_hash);
         assert_eq!(state.height(), 2);
+    }
+
+    #[test]
+    fn bounds_transient_orphan_blocks_without_persisting_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let genesis = genesis_block(Network::Regtest);
+        let unknown_parent = BlockHash::from_byte_array([7; 32]);
+        for nonce in 0..=MAX_ORPHAN_BLOCKS {
+            let transaction = coinbase_transaction(
+                1,
+                validation::block_subsidy_for_network(Network::Regtest, 1),
+                u8::try_from(nonce).unwrap(),
+            );
+            let mut block = Block {
+                header: Header {
+                    version: BlockVersion::from_consensus(4),
+                    prev_blockhash: unknown_parent,
+                    merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                    time: genesis.header.time + 1,
+                    bits: genesis.header.bits,
+                    nonce: u32::try_from(nonce).unwrap(),
+                },
+                txdata: vec![transaction],
+            };
+            block.header.merkle_root = block.compute_merkle_root().unwrap();
+            assert!(state.connect_block(block).is_err());
+        }
+        assert_eq!(
+            state
+                .orphans
+                .values()
+                .map(|children| children.len())
+                .sum::<usize>(),
+            MAX_ORPHAN_BLOCKS
+        );
+        assert_eq!(state.store.len(), 1);
     }
 
     #[test]

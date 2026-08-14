@@ -3099,8 +3099,7 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let header = chain.header(tip.height).expect("tip header exists");
     let headers = chain.active_headers();
     let minimum_chain_work = chain.minimum_chain_work();
-    let tip_recent = u64::from(header.time).saturating_add(24 * 60 * 60) >= unix_time();
-    let initial_block_download = tip.work < minimum_chain_work || !tip_recent;
+    let initial_block_download = chain.is_initial_block_download();
     let verification_progress = if !initial_block_download {
         1.0
     } else {
@@ -8467,10 +8466,7 @@ fn ensure_get_block_template_ready(node: &Arc<Node>) -> Result<()> {
     }
     let initial_block_download = {
         let chain = node.chain.read();
-        let tip = chain.tip();
-        let header = chain.header(tip.height).expect("tip header exists");
-        let tip_recent = u64::from(header.time).saturating_add(24 * 60 * 60) >= unix_time();
-        tip.work < chain.minimum_chain_work() || !tip_recent
+        chain.is_initial_block_download()
     };
     if initial_block_download {
         bail!("Bitcoin Core is in initial sync and waiting for blocks...")

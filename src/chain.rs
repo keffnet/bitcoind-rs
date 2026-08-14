@@ -25,6 +25,7 @@ const SNAPSHOT_INTERVAL: u32 = 1_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
 const MAX_ORPHAN_BLOCKS: usize = 128;
+const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 const MAX_UNSPENDABLE_SCRIPT_SIZE: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -297,6 +298,7 @@ pub struct ChainState {
     coin_stats: Option<CoinStatsState>,
     active_chain: Vec<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
+    initial_block_download: bool,
     block_index: HashMap<BlockHash, BlockNode>,
     orphans: HashMap<BlockHash, Vec<Block>>,
     invalid_blocks: HashSet<BlockHash>,
@@ -434,6 +436,7 @@ impl ChainState {
             coin_stats: None,
             active_chain: Vec::new(),
             headers: Vec::new(),
+            initial_block_download: true,
             block_index: HashMap::new(),
             orphans: HashMap::new(),
             invalid_blocks,
@@ -537,6 +540,7 @@ impl ChainState {
                 state.persist_snapshot_checksum()?;
             }
         }
+        state.update_ibd_status();
         state.persist_metadata()?;
         Ok(state)
     }
@@ -768,16 +772,31 @@ impl ChainState {
         Work::from_unprefixed_hex(hex).expect("Core minimum chainwork is valid hex")
     }
 
-    /// Return the same chainwork/tip-age IBD predicate exposed by
-    /// `getblockchaininfo`. Transaction relay is intentionally paused while
-    /// this is true, but headers and blocks continue to synchronize.
+    /// Return Core's latched initial-block-download state. Transaction relay
+    /// is intentionally paused while this is true, but headers and blocks
+    /// continue to synchronize. Once the tip reaches the work/age boundary,
+    /// the state remains false for the lifetime of this chain instance.
     pub fn is_initial_block_download(&self) -> bool {
+        self.initial_block_download
+    }
+
+    fn update_ibd_status(&mut self) {
+        self.update_ibd_status_at(crate::time::unix_time());
+    }
+
+    fn update_ibd_status_at(&mut self, now: u64) {
+        if !self.initial_block_download {
+            return;
+        }
         let tip = self.tip();
         let header = self
             .header(tip.height)
             .expect("the active tip header is always indexed");
-        tip.work < self.minimum_chain_work()
-            || u64::from(header.time).saturating_add(24 * 60 * 60) < crate::time::unix_time()
+        if tip.work >= self.minimum_chain_work()
+            && u64::from(header.time).saturating_add(MAX_TIP_AGE_SECS) >= now
+        {
+            self.initial_block_download = false;
+        }
     }
 
     pub fn chain_tips(&self) -> Vec<KnownChainTip> {
@@ -2104,6 +2123,7 @@ impl ChainState {
             self.connect_block_internal(&block, true)?;
             self.process_orphans(hash);
             self.process_known_children(hash);
+            self.update_ibd_status();
             return Ok(self.tip());
         }
 
@@ -2147,6 +2167,7 @@ impl ChainState {
         }
         self.process_orphans(hash);
         self.process_known_children(hash);
+        self.update_ibd_status();
         Ok(self.tip())
     }
 
@@ -2763,6 +2784,7 @@ impl ChainState {
             self.coin_stats = old_coin_stats;
             return Err(error);
         }
+        self.update_ibd_status();
         Ok(())
     }
 
@@ -3621,6 +3643,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert!(state.is_initial_block_download());
+    }
+
+    #[test]
+    fn initial_block_download_latches_false_after_a_recent_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let genesis_time = u64::from(state.header(0).unwrap().time);
+        state.update_ibd_status_at(genesis_time + MAX_TIP_AGE_SECS);
+        assert!(!state.is_initial_block_download());
+
+        state.update_ibd_status_at(genesis_time + MAX_TIP_AGE_SECS + 1_000_000);
+        assert!(!state.is_initial_block_download());
     }
 
     #[test]

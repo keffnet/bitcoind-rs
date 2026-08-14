@@ -4726,7 +4726,9 @@ fn multisig_script_keys(script: &bitcoin::Script) -> Option<(usize, Vec<bitcoin:
 
 fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
     if let Some(input) = psbt.inputs.get(input_index)
-        && (input.witness_script.is_some() || !input.tap_scripts.is_empty())
+        && (input.witness_script.is_some()
+            || input.redeem_script.is_some()
+            || !input.tap_scripts.is_empty())
         && psbt
             .finalize_inp_mut(&Secp256k1::verification_only(), input_index)
             .is_ok()
@@ -5369,6 +5371,13 @@ fn miniscript_v0_candidates(
     Ok(Some(candidates))
 }
 
+fn raw_taproot_script_pubkey(xonly: bitcoin::XOnlyPublicKey) -> ScriptBuf {
+    let mut bytes = Vec::with_capacity(34);
+    bytes.extend_from_slice(&[0x51, 0x20]);
+    bytes.extend_from_slice(&xonly.serialize());
+    ScriptBuf::from_bytes(bytes)
+}
+
 fn descriptor_candidates_inner(
     node: &Arc<Node>,
     descriptor: &str,
@@ -5414,6 +5423,51 @@ fn descriptor_candidates_inner(
         }]);
     }
     if let Some(candidates) = miniscript_v0_candidates(descriptor, range)? {
+        return Ok(candidates);
+    }
+    if let Some(key_expression) = descriptor
+        .strip_prefix("rawtr(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let origin = descriptor_key_origin(key_expression)?;
+        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, range)?;
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        let mut candidates = Vec::with_capacity(indices.len());
+        for index in indices {
+            let xonly = match &key {
+                DescriptorKey::PublicKey(public_key) => bitcoin::XOnlyPublicKey::from(*public_key),
+                DescriptorKey::XOnlyPublicKey(public_key) => *public_key,
+                DescriptorKey::Xpriv(_) | DescriptorKey::Xpub(_) => {
+                    bitcoin::XOnlyPublicKey::from(descriptor_public_key(&key, &path, index, &secp)?)
+                }
+            };
+            let derived_key = match &key {
+                DescriptorKey::XOnlyPublicKey(_) => DescriptorDerivedKey {
+                    public_key: None,
+                    private_key: None,
+                    origin: origin.clone(),
+                },
+                _ => descriptor_derived_key(
+                    node,
+                    &key,
+                    &path,
+                    index,
+                    descriptor_public_key(&key, &path, index, &secp)?,
+                    origin.clone(),
+                )?,
+            };
+            candidates.push(DescriptorCandidate {
+                script_pubkey: raw_taproot_script_pubkey(xonly),
+                redeem_script: None,
+                witness_script: None,
+                tap_internal_key: None,
+                tap_merkle_root: None,
+                tap_tree: None,
+                tap_scripts: Vec::new(),
+                keys: vec![derived_key],
+            });
+        }
         return Ok(candidates);
     }
     for kind in ["sh", "wsh"] {
@@ -5599,7 +5653,7 @@ fn descriptor_candidates_inner(
         .filter(|(kind, _)| matches!(*kind, "pkh" | "wpkh"))
     else {
         bail!(
-            "unsupported descriptor; use addr(...), raw(...), pk(...), pkh(...), wpkh(...), combo(...), multi(...), sortedmulti(...), sh(...), wsh(...), or tr(...)"
+            "unsupported descriptor; use addr(...), raw(...), pk(...), pkh(...), wpkh(...), combo(...), multi(...), sortedmulti(...), sh(...), wsh(...), tr(...), or rawtr(...)"
         )
     };
     single_key_descriptor_candidates(node, key_expression, range, |public_key| {
@@ -7898,6 +7952,31 @@ fn expand_descriptor_scripts(
             .map(|candidate| candidate.script_pubkey)
             .collect());
     }
+    if let Some(key_expression) = descriptor
+        .strip_prefix("rawtr(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, range)?;
+        let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+        return indices
+            .into_iter()
+            .map(|index| {
+                let xonly = match &key {
+                    DescriptorKey::PublicKey(public_key) => {
+                        bitcoin::XOnlyPublicKey::from(*public_key)
+                    }
+                    DescriptorKey::XOnlyPublicKey(public_key) => *public_key,
+                    DescriptorKey::Xpriv(_) | DescriptorKey::Xpub(_) => {
+                        bitcoin::XOnlyPublicKey::from(descriptor_public_key(
+                            &key, &path, index, &secp,
+                        )?)
+                    }
+                };
+                Ok(raw_taproot_script_pubkey(xonly))
+            })
+            .collect();
+    }
     for kind in ["multi", "sortedmulti"] {
         if let Some(arguments) = descriptor
             .strip_prefix(&format!("{kind}("))
@@ -8015,7 +8094,7 @@ fn expand_descriptor_scripts(
         .filter(|(kind, _)| matches!(*kind, "pkh" | "wpkh"))
     else {
         bail!(
-            "unsupported descriptor; use addr(...), raw(...), pk(...), pkh(...), wpkh(...), combo(...), multi(...), sortedmulti(...), sh(...), wsh(...), or tr(...)"
+            "unsupported descriptor; use addr(...), raw(...), pk(...), pkh(...), wpkh(...), combo(...), multi(...), sortedmulti(...), sh(...), wsh(...), tr(...), or rawtr(...)"
         )
     };
     let (base_key, path, wildcard) = parse_descriptor_key(key_expression)?;
@@ -10048,6 +10127,9 @@ mod tests {
         let taproot_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let taproot = derive_addresses(&node, &json!([format!("tr({taproot_key})")])).unwrap();
         assert_eq!(taproot.as_array().unwrap().len(), 1);
+        let rawtr = derive_addresses(&node, &json!([format!("rawtr({taproot_key})")])).unwrap();
+        assert_eq!(rawtr.as_array().unwrap().len(), 1);
+        assert_ne!(rawtr[0], taproot[0]);
         let taproot_tree = derive_addresses(
             &node,
             &json!([format!("tr({taproot_key},pk({public_key}))")]),
@@ -10705,6 +10787,44 @@ mod tests {
             parse_psbt(&json!([miniscript_processed["psbt"].clone()]), 0).unwrap();
         assert_eq!(
             miniscript_processed.inputs[0]
+                .final_script_witness
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let nested_miniscript_descriptor = format!("sh({miniscript_descriptor})");
+        let nested_miniscript_script =
+            expand_descriptor_scripts(&node, &nested_miniscript_descriptor, None)
+                .unwrap()
+                .remove(0);
+        let mut nested_miniscript_psbt = miniscript_psbt.clone();
+        nested_miniscript_psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: nested_miniscript_script,
+        });
+        let nested_miniscript_processed = descriptor_process_psbt(
+            &node,
+            &json!([
+                encode_psbt(&nested_miniscript_psbt),
+                [nested_miniscript_descriptor],
+                "SIGHASH_ALL",
+                true,
+                true
+            ]),
+        )
+        .unwrap();
+        assert_eq!(nested_miniscript_processed["complete"], true);
+        let nested_miniscript_processed =
+            parse_psbt(&json!([nested_miniscript_processed["psbt"].clone()]), 0).unwrap();
+        assert!(
+            nested_miniscript_processed.inputs[0]
+                .final_script_sig
+                .is_some()
+        );
+        assert_eq!(
+            nested_miniscript_processed.inputs[0]
                 .final_script_witness
                 .as_ref()
                 .unwrap()

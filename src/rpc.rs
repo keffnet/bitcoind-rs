@@ -266,11 +266,15 @@ fn authorized(node: &Arc<Node>, headers: &str) -> bool {
         "Basic {}",
         base64::engine::general_purpose::STANDARD.encode(cookie.as_bytes())
     );
+    authorization_matches(headers, &expected)
+}
+
+fn authorization_matches(headers: &str, expected: &str) -> bool {
     headers.lines().any(|line| {
-        line.strip_prefix("Authorization:")
-            .or_else(|| line.strip_prefix("authorization:"))
-            .map(|value| value.trim() == expected)
-            .unwrap_or(false)
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.eq_ignore_ascii_case("Authorization") && value.trim() == expected
     })
 }
 
@@ -10196,6 +10200,18 @@ mod tests {
         let headers = "Connection: keep-alive, Upgrade\r\nX-Test: yes\r\n";
         assert!(header_has_token(headers, "connection", "KEEP-ALIVE"));
         assert!(!header_has_token(headers, "connection", "close"));
+    }
+
+    #[test]
+    fn http_authorization_header_name_is_case_insensitive() {
+        assert!(authorization_matches(
+            "aUtHoRiZaTiOn: Basic secret\r\n",
+            "Basic secret"
+        ));
+        assert!(!authorization_matches(
+            "X-Authorization: Basic secret\r\n",
+            "Basic secret"
+        ));
     }
 
     #[tokio::test]

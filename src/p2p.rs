@@ -36,6 +36,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
+use crate::address::NetworkEndpoint;
 use crate::chain::BasicFilterRange;
 use crate::config::PeerPermissions;
 use crate::mempool::MempoolError;
@@ -1082,7 +1083,7 @@ pub(crate) enum PeerCommand {
         payload: Vec<u8>,
     },
     RelayAddresses {
-        addresses: Vec<(SocketAddr, u64, u64)>,
+        addresses: Vec<(NetworkEndpoint, u64, u64)>,
     },
 }
 
@@ -1654,6 +1655,10 @@ async fn connect_peer(address: SocketAddr, proxy: Option<SocketAddr>) -> Result<
 }
 
 async fn socks5_connect(stream: &mut TcpStream, address: SocketAddr) -> Result<()> {
+    socks5_connect_endpoint(stream, &NetworkEndpoint::Ip(address)).await
+}
+
+async fn socks5_connect_endpoint(stream: &mut TcpStream, endpoint: &NetworkEndpoint) -> Result<()> {
     stream.write_all(&[5, 1, 0]).await?;
     let mut greeting = [0; 2];
     stream.read_exact(&mut greeting).await?;
@@ -1663,17 +1668,35 @@ async fn socks5_connect(stream: &mut TcpStream, address: SocketAddr) -> Result<(
 
     let mut request = Vec::with_capacity(22);
     request.extend_from_slice(&[5, 1, 0]);
-    match address.ip() {
-        std::net::IpAddr::V4(ip) => {
+    match endpoint {
+        NetworkEndpoint::Ip(address) if address.is_ipv4() => {
             request.push(1);
-            request.extend_from_slice(&ip.octets());
+            if let std::net::IpAddr::V4(ip) = address.ip() {
+                request.extend_from_slice(&ip.octets());
+            }
         }
-        std::net::IpAddr::V6(ip) => {
+        NetworkEndpoint::Ip(address) => {
             request.push(4);
-            request.extend_from_slice(&ip.octets());
+            if let std::net::IpAddr::V6(ip) = address.ip() {
+                request.extend_from_slice(&ip.octets());
+            }
+        }
+        NetworkEndpoint::Cjdns { address, .. } => {
+            request.push(4);
+            request.extend_from_slice(&address.octets());
+        }
+        NetworkEndpoint::OnionV2 { .. }
+        | NetworkEndpoint::OnionV3 { .. }
+        | NetworkEndpoint::I2p { .. } => {
+            let host = endpoint.host_string();
+            let host = host.as_bytes();
+            let length = u8::try_from(host.len()).context("SOCKS5 domain name is too long")?;
+            request.push(3);
+            request.push(length);
+            request.extend_from_slice(host);
         }
     }
-    request.extend_from_slice(&address.port().to_be_bytes());
+    request.extend_from_slice(&endpoint.port().to_be_bytes());
     stream.write_all(&request).await?;
 
     let mut response = [0; 4];
@@ -3417,9 +3440,15 @@ async fn serve_peer_loop(
                 for entry in addresses {
                     if let Some(address) = socket_address_from_legacy(&entry)
                         && node.allow_peer_address(peer_id)
-                        && node.remember_address(address, entry.services, u64::from(entry.time))
                     {
-                        relay_addresses.push((address, entry.services, u64::from(entry.time)));
+                        let endpoint = NetworkEndpoint::Ip(address);
+                        if node.remember_network_address(
+                            endpoint.clone(),
+                            entry.services,
+                            u64::from(entry.time),
+                        ) {
+                            relay_addresses.push((endpoint, entry.services, u64::from(entry.time)));
+                        }
                     }
                 }
                 node.relay_peer_addresses(peer_id, relay_addresses);
@@ -3434,11 +3463,18 @@ async fn serve_peer_loop(
                 node.enable_peer_address_relay(peer_id);
                 let mut relay_addresses = Vec::new();
                 for address in addresses {
-                    if let Some(socket) = socket_address_from_v2(&address)
-                        && node.allow_peer_address(peer_id)
-                        && node.remember_address(socket, address.services, u64::from(address.time))
+                    if let Some(endpoint) = NetworkEndpoint::from_addr_v2(
+                        address.network,
+                        &address.address,
+                        address.port,
+                    ) && node.allow_peer_address(peer_id)
+                        && node.remember_network_address(
+                            endpoint.clone(),
+                            address.services,
+                            u64::from(address.time),
+                        )
                     {
-                        relay_addresses.push((socket, address.services, u64::from(address.time)));
+                        relay_addresses.push((endpoint, address.services, u64::from(address.time)));
                     }
                 }
                 node.relay_peer_addresses(peer_id, relay_addresses);
@@ -3507,14 +3543,14 @@ async fn serve_peer_loop(
                 }
                 getaddr_received = true;
                 node.enable_peer_address_relay(peer_id);
-                let mut peer_infos = node.known_addresses();
-                peer_infos.shuffle(&mut rand::rng());
-                peer_infos.truncate(MAX_ADDR_TO_SEND);
+                let mut addresses = node.known_network_addresses();
+                addresses.shuffle(&mut rand::rng());
+                addresses.truncate(MAX_ADDR_TO_SEND);
                 if addrv2_received {
-                    let addresses = peer_infos
+                    let addresses = addresses
                         .into_iter()
-                        .map(|peer| {
-                            network_address_v2(peer.address, peer.connected_at, peer.services)
+                        .map(|entry| {
+                            network_address_v2(&entry.endpoint, entry.time, entry.services)
                         })
                         .collect::<Vec<_>>();
                     send_message(
@@ -3526,13 +3562,17 @@ async fn serve_peer_loop(
                     )
                     .await?;
                 } else {
-                    let addresses = peer_infos
+                    let addresses = addresses
                         .into_iter()
-                        .map(|peer| wire::NetworkAddress {
-                            time: u32::try_from(peer.connected_at).unwrap_or(u32::MAX),
-                            services: peer.services,
-                            address: socket_address_bytes(peer.address),
-                            port: peer.address.port(),
+                        .filter_map(|entry| {
+                            entry.endpoint.legacy_socket_addr().map(|address| {
+                                wire::NetworkAddress {
+                                    time: u32::try_from(entry.time).unwrap_or(u32::MAX),
+                                    services: entry.services,
+                                    address: socket_address_bytes(address),
+                                    port: address.port(),
+                                }
+                            })
                         })
                         .collect::<Vec<_>>();
                     send_message(
@@ -3878,35 +3918,18 @@ fn socket_address_from_legacy(address: &wire::NetworkAddress) -> Option<std::net
     socket_address_from_parts(address.address, address.port)
 }
 
-fn socket_address_from_v2(address: &wire::NetworkAddressV2) -> Option<std::net::SocketAddr> {
-    let ip = match address.network {
-        1 => std::net::IpAddr::V4(std::net::Ipv4Addr::from(
-            <[u8; 4]>::try_from(address.address.as_slice()).ok()?,
-        )),
-        2 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
-            <[u8; 16]>::try_from(address.address.as_slice()).ok()?,
-        )),
-        _ => return None,
-    };
-    (address.port != 0).then(|| std::net::SocketAddr::new(ip, address.port))
-}
-
 fn network_address_v2(
-    address: std::net::SocketAddr,
+    endpoint: &NetworkEndpoint,
     connected_at: u64,
     services: u64,
 ) -> wire::NetworkAddressV2 {
-    let port = address.port();
-    let (network, address) = match address.ip() {
-        std::net::IpAddr::V4(ip) => (1, ip.octets().to_vec()),
-        std::net::IpAddr::V6(ip) => (2, ip.octets().to_vec()),
-    };
+    let (network, address) = endpoint.to_addr_v2();
     wire::NetworkAddressV2 {
         time: u32::try_from(connected_at).unwrap_or(u32::MAX),
         services,
         network,
         address,
-        port,
+        port: endpoint.port(),
     }
 }
 
@@ -4046,23 +4069,30 @@ async fn send_message(
     Ok(())
 }
 
-fn relay_address_message(addresses: &[(SocketAddr, u64, u64)], addrv2_received: bool) -> Message {
+fn relay_address_message(
+    addresses: &[(NetworkEndpoint, u64, u64)],
+    addrv2_received: bool,
+) -> Message {
     if addrv2_received {
         Message::AddrV2(
             addresses
                 .iter()
-                .map(|(address, services, time)| network_address_v2(*address, *time, *services))
+                .map(|(endpoint, services, time)| network_address_v2(endpoint, *time, *services))
                 .collect(),
         )
     } else {
         Message::Addr(
             addresses
                 .iter()
-                .map(|(address, services, time)| wire::NetworkAddress {
-                    time: u32::try_from(*time).unwrap_or(u32::MAX),
-                    services: *services,
-                    address: socket_address_bytes(*address),
-                    port: address.port(),
+                .filter_map(|(endpoint, services, time)| {
+                    endpoint
+                        .legacy_socket_addr()
+                        .map(|address| wire::NetworkAddress {
+                            time: u32::try_from(*time).unwrap_or(u32::MAX),
+                            services: *services,
+                            address: socket_address_bytes(address),
+                            port: address.port(),
+                        })
                 })
                 .collect(),
         )
@@ -4785,6 +4815,45 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn socks5_proxy_negotiation_routes_onion_domains() {
+        let endpoint = NetworkEndpoint::OnionV3 {
+            address: [7; 32],
+            port: 18444,
+        };
+        let host = endpoint.host_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+
+            let mut prefix = [0; 5];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(&prefix[..4], &[5, 1, 0, 3]);
+            assert_eq!(usize::from(prefix[4]), host.len());
+            let mut received_host = vec![0; usize::from(prefix[4])];
+            stream.read_exact(&mut received_host).await.unwrap();
+            assert_eq!(received_host, host.as_bytes());
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            assert_eq!(port, 18444u16.to_be_bytes());
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+        });
+
+        let mut stream = TcpStream::connect(proxy_address).await.unwrap();
+        socks5_connect_endpoint(&mut stream, &endpoint)
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
     #[test]
     fn onlynet_filters_addresses_and_added_nodes() {
         let directory = tempfile::tempdir().unwrap();
@@ -5303,7 +5372,14 @@ mod tests {
         node.enable_peer_address_relay(3);
         node.set_peer_connection_type(4, "block-relay-only");
 
-        node.relay_peer_addresses(1, vec![("192.0.2.10:18444".parse().unwrap(), 9, 123)]);
+        node.relay_peer_addresses(
+            1,
+            vec![(
+                NetworkEndpoint::Ip("192.0.2.10:18444".parse().unwrap()),
+                9,
+                123,
+            )],
+        );
 
         assert!(origin_receiver.try_recv().is_err());
         assert!(matches!(
@@ -5320,8 +5396,24 @@ mod tests {
     #[test]
     fn address_relay_batches_legacy_and_addrv2_payloads() {
         let addresses = vec![
-            ("192.0.2.10:18444".parse().unwrap(), 1, 123),
-            ("[2001:db8::10]:18444".parse().unwrap(), 8, 456),
+            (
+                NetworkEndpoint::Ip("192.0.2.10:18444".parse().unwrap()),
+                1,
+                123,
+            ),
+            (
+                NetworkEndpoint::Ip("[2001:db8::10]:18444".parse().unwrap()),
+                8,
+                456,
+            ),
+            (
+                NetworkEndpoint::OnionV3 {
+                    address: [6; 32],
+                    port: 18446,
+                },
+                16,
+                789,
+            ),
         ];
         let Message::Addr(legacy) = relay_address_message(&addresses, false) else {
             panic!("expected legacy address message");
@@ -5333,9 +5425,11 @@ mod tests {
         let Message::AddrV2(addrv2) = relay_address_message(&addresses, true) else {
             panic!("expected ADDRv2 message");
         };
-        assert_eq!(addrv2.len(), 2);
+        assert_eq!(addrv2.len(), 3);
         assert_eq!(addrv2[0].services, 1);
         assert_eq!(addrv2[1].time, 456);
+        assert_eq!(addrv2[2].network, 4);
+        assert_eq!(addrv2[2].address, vec![6; 32]);
     }
 
     #[test]
@@ -5784,16 +5878,20 @@ mod tests {
         assert!(node.remember_address(legacy_socket, legacy.services, u64::from(legacy.time)));
         assert!(!node.remember_address(legacy_socket, legacy.services, u64::from(legacy.time)));
         let v2 = network_address_v2(
-            "[2001:db8::10]:18444".parse().unwrap(),
+            &NetworkEndpoint::Ip("[2001:db8::10]:18444".parse().unwrap()),
             456,
             wire::NODE_NETWORK | wire::NODE_WITNESS,
         );
-        let v2_socket = socket_address_from_v2(&v2).unwrap();
-        node.remember_address(v2_socket, v2.services, u64::from(v2.time));
+        let v2_endpoint = NetworkEndpoint::from_addr_v2(v2.network, &v2.address, v2.port).unwrap();
+        node.remember_network_address(v2_endpoint.clone(), v2.services, u64::from(v2.time));
 
         let addresses = node.known_addresses();
         assert!(addresses.iter().any(|peer| peer.address == legacy_socket));
-        assert!(addresses.iter().any(|peer| peer.address == v2_socket));
+        assert!(
+            addresses
+                .iter()
+                .any(|peer| peer.address == v2_endpoint.socket_addr().unwrap())
+        );
         assert_eq!(addresses.iter().filter(|peer| peer.id == 0).count(), 2);
     }
 

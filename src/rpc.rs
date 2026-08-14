@@ -40,6 +40,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tracing::debug;
 
+use crate::address::NetworkEndpoint;
 use crate::chain;
 use crate::config::OnlyNet;
 use crate::mempool::{
@@ -2746,25 +2747,22 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
     {
         bail!("network not recognized: {network}")
     }
-    let mut peers = node.known_addresses();
-    peers.sort_by_key(|peer| peer.address);
+    let mut peers = node.known_network_addresses();
+    peers.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     Ok(json!(
         peers
             .into_iter()
             .filter(|peer| match network.as_deref() {
                 None => true,
-                Some("ipv4") => peer.address.ip().is_ipv4(),
-                Some("ipv6") => peer.address.ip().is_ipv6(),
-                Some("onion" | "i2p" | "cjdns") => false,
-                Some(_) => false,
+                Some(network) => peer.endpoint.network_name() == network,
             })
             .take(count.unwrap_or(usize::MAX))
             .map(|peer| json!({
-                "address": peer.address.ip().to_string(),
-                "port": peer.address.port(),
+                "address": peer.endpoint.host_string(),
+                "port": peer.endpoint.port(),
                 "services": peer.services,
-                "time": peer.connected_at,
-                "network": if peer.address.ip().is_ipv4() { "ipv4" } else { "ipv6" },
+                "time": peer.time,
+                "network": peer.endpoint.network_name(),
             }))
             .collect::<Vec<_>>()
     ))
@@ -2780,16 +2778,12 @@ fn get_addrman_info(node: &Arc<Node>) -> Result<Value> {
     ]
     .into_iter()
     .collect::<HashMap<_, _>>();
-    for peer in node.known_addresses() {
-        let network = if peer.address.ip().is_ipv4() {
-            "ipv4"
-        } else {
-            "ipv6"
-        };
+    for peer in node.known_network_addresses() {
+        let network = peer.endpoint.network_name();
         let Some((new, tried)) = counts.get_mut(network) else {
             continue;
         };
-        if !node.is_address_tried(peer.address) {
+        if !node.is_network_address_tried(&peer.endpoint) {
             *new = new.saturating_add(1);
         } else {
             *tried = tried.saturating_add(1);
@@ -2819,7 +2813,7 @@ fn get_addrman_info(node: &Arc<Node>) -> Result<Value> {
 }
 
 fn add_peer_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let address = parse_ip_address(&param::<String>(params, 0)?)?;
+    let address = param::<String>(params, 0)?;
     let port = param::<u16>(params, 1)?;
     let tried = match params.get(2) {
         None | Some(Value::Null) => false,
@@ -2827,8 +2821,16 @@ fn add_peer_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .as_bool()
             .ok_or_else(|| anyhow!("tried must be a boolean"))?,
     };
-    let address = SocketAddr::new(address, port);
-    if node.add_peer_address(address, tried) {
+    let endpoint = if let Ok(address) = parse_ip_address(&address) {
+        NetworkEndpoint::Ip(SocketAddr::new(address, port))
+    } else if address.ends_with(".onion") {
+        NetworkEndpoint::parse(Some("onion"), &address, Some(port))?
+    } else if address.ends_with(".b32.i2p") {
+        NetworkEndpoint::parse(Some("i2p"), &address, Some(port))?
+    } else {
+        bail!("address must be an IP, onion, or I2P endpoint")
+    };
+    if node.add_network_address(endpoint, tried) {
         Ok(json!({"success": true}))
     } else {
         Ok(json!({"success": false, "error": "failed-adding-to-new"}))
@@ -2836,26 +2838,23 @@ fn add_peer_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_raw_addrman(node: &Arc<Node>) -> Result<Value> {
-    let mut peers = node.known_addresses();
-    peers.sort_by_key(|peer| peer.address);
+    let mut peers = node.known_network_addresses();
+    peers.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     let mut new_table = serde_json::Map::new();
     let mut tried_table = serde_json::Map::new();
     for (position, peer) in peers.into_iter().enumerate() {
-        let network = if peer.address.ip().is_ipv4() {
-            "ipv4"
-        } else {
-            "ipv6"
-        };
+        let network = peer.endpoint.network_name();
+        let host = peer.endpoint.host_string();
         let entry = json!({
-            "address": peer.address.ip().to_string(),
-            "port": peer.address.port(),
+            "address": host,
+            "port": peer.endpoint.port(),
             "services": peer.services,
-            "time": peer.connected_at,
+            "time": peer.time,
             "network": network,
-            "source": peer.address.ip().to_string(),
+            "source": host,
             "source_network": network,
         });
-        let table = if node.is_address_tried(peer.address) {
+        let table = if node.is_network_address_tried(&peer.endpoint) {
             &mut tried_table
         } else {
             &mut new_table

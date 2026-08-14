@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![warn(rust_2018_idioms, clippy::all)]
 
+pub mod address;
 pub mod chain;
 pub mod config;
 pub mod electrum;
@@ -34,6 +35,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
 use tracing::{info, warn};
 
+use crate::address::NetworkEndpoint;
 use crate::chain::ChainState;
 use crate::config::{Config, PeerPermissions};
 use crate::mempool::{
@@ -375,6 +377,14 @@ pub struct PeerInfo {
     ping_sent_at: Option<Instant>,
 }
 
+/// Address-manager metadata for an endpoint that may not be connected yet.
+#[derive(Clone, Debug)]
+pub struct KnownNetworkAddress {
+    pub endpoint: NetworkEndpoint,
+    pub services: u64,
+    pub time: u64,
+}
+
 #[derive(Clone, Debug)]
 struct InflightBlock {
     hash: BlockHash,
@@ -529,7 +539,18 @@ struct PersistedAddress {
     time: u64,
     #[serde(default)]
     tried: bool,
+    #[serde(default)]
+    network: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
 }
+
+type LoadedAddressState = (
+    HashMap<SocketAddr, PeerInfo>,
+    HashSet<SocketAddr>,
+    HashMap<NetworkEndpoint, KnownNetworkAddress>,
+    HashSet<NetworkEndpoint>,
+);
 
 /// Per-node state shared by the long-running descriptor scans.
 pub(crate) struct ScanState {
@@ -581,6 +602,8 @@ pub struct Node {
     orphans: parking_lot::Mutex<OrphanPool>,
     known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
     tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
+    network_addresses: parking_lot::RwLock<HashMap<NetworkEndpoint, KnownNetworkAddress>>,
+    network_tried_addresses: parking_lot::RwLock<HashSet<NetworkEndpoint>>,
     added_nodes: parking_lot::RwLock<HashSet<SocketAddr>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
     listen_address: parking_lot::RwLock<Option<SocketAddr>>,
@@ -645,7 +668,8 @@ impl Node {
         }
         let _ = mempool.take_changes();
         let banned_addresses = load_banlist(&config.datadir)?;
-        let (known_addresses, tried_addresses) = load_known_addresses(&config.datadir)?;
+        let (known_addresses, tried_addresses, network_addresses, network_tried_addresses) =
+            load_known_addresses(&config.datadir)?;
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
@@ -683,6 +707,8 @@ impl Node {
             orphans: parking_lot::Mutex::new(OrphanPool::default()),
             known_addresses: parking_lot::RwLock::new(known_addresses),
             tried_addresses: parking_lot::RwLock::new(tried_addresses),
+            network_addresses: parking_lot::RwLock::new(network_addresses),
+            network_tried_addresses: parking_lot::RwLock::new(network_tried_addresses),
             added_nodes: parking_lot::RwLock::new(added_nodes),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
             listen_address: parking_lot::RwLock::new(None),
@@ -1927,7 +1953,7 @@ impl Node {
     pub(crate) fn relay_peer_addresses(
         &self,
         origin_peer_id: usize,
-        addresses: Vec<(SocketAddr, u64, u64)>,
+        addresses: Vec<(NetworkEndpoint, u64, u64)>,
     ) {
         if addresses.is_empty() {
             return;
@@ -2023,8 +2049,91 @@ impl Node {
         self.known_addresses.read().values().cloned().collect()
     }
 
+    pub fn known_network_addresses(&self) -> Vec<KnownNetworkAddress> {
+        let mut addresses = self
+            .known_addresses
+            .read()
+            .values()
+            .map(|peer| KnownNetworkAddress {
+                endpoint: NetworkEndpoint::Ip(peer.address),
+                services: peer.services,
+                time: peer.connected_at,
+            })
+            .collect::<Vec<_>>();
+        addresses.extend(self.network_addresses.read().values().cloned());
+        addresses
+    }
+
     pub(crate) fn is_address_tried(&self, address: SocketAddr) -> bool {
         self.tried_addresses.read().contains(&address)
+    }
+
+    pub(crate) fn is_network_address_tried(&self, endpoint: &NetworkEndpoint) -> bool {
+        match endpoint {
+            NetworkEndpoint::Ip(address) => self.is_address_tried(*address),
+            NetworkEndpoint::OnionV2 { .. }
+            | NetworkEndpoint::OnionV3 { .. }
+            | NetworkEndpoint::I2p { .. }
+            | NetworkEndpoint::Cjdns { .. } => {
+                self.network_tried_addresses.read().contains(endpoint)
+            }
+        }
+    }
+
+    pub(crate) fn add_network_address(&self, endpoint: NetworkEndpoint, tried: bool) -> bool {
+        if !self.config.allows_network_endpoint(&endpoint) {
+            return false;
+        }
+        if let Some(address) = endpoint.legacy_socket_addr() {
+            return self.add_peer_address(address, tried);
+        }
+        let now = unix_time_seconds();
+        let mut known = self.network_addresses.write();
+        if known.contains_key(&endpoint) || !self.reserve_network_address(&mut known, &endpoint) {
+            return false;
+        }
+        known.insert(
+            endpoint.clone(),
+            KnownNetworkAddress {
+                endpoint: endpoint.clone(),
+                services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+                time: now,
+            },
+        );
+        drop(known);
+        if tried {
+            self.network_tried_addresses.write().insert(endpoint);
+        }
+        true
+    }
+
+    pub(crate) fn remember_network_address(
+        &self,
+        endpoint: NetworkEndpoint,
+        services: u64,
+        time: u64,
+    ) -> bool {
+        if !self.config.allows_network_endpoint(&endpoint) {
+            return false;
+        }
+        if let Some(address) = endpoint.legacy_socket_addr() {
+            return self.remember_address(address, services, time);
+        }
+        let mut known = self.network_addresses.write();
+        if !self.reserve_network_address(&mut known, &endpoint) {
+            return false;
+        }
+        let is_new = !known.contains_key(&endpoint);
+        let entry = known
+            .entry(endpoint.clone())
+            .or_insert_with(|| KnownNetworkAddress {
+                endpoint,
+                services,
+                time,
+            });
+        entry.services |= services;
+        entry.time = entry.time.max(time);
+        is_new
     }
 
     pub(crate) fn add_peer_address(&self, address: SocketAddr, tried: bool) -> bool {
@@ -2163,6 +2272,29 @@ impl Node {
             })
             .min_by_key(|(_, peer)| peer.connected_at)
             .map(|(candidate, _)| *candidate);
+        drop(tried);
+        if let Some(eviction) = eviction {
+            known.remove(&eviction);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn reserve_network_address(
+        &self,
+        known: &mut HashMap<NetworkEndpoint, KnownNetworkAddress>,
+        endpoint: &NetworkEndpoint,
+    ) -> bool {
+        if known.contains_key(endpoint) || known.len() < MAX_KNOWN_ADDRESSES {
+            return true;
+        }
+        let tried = self.network_tried_addresses.read();
+        let eviction = known
+            .iter()
+            .filter(|(candidate, _)| !tried.contains(*candidate) && *candidate != endpoint)
+            .min_by_key(|(_, entry)| entry.time)
+            .map(|(candidate, _)| candidate.clone());
         drop(tried);
         if let Some(eviction) = eviction {
             known.remove(&eviction);
@@ -2571,9 +2703,29 @@ impl Node {
                 services: peer.services,
                 time: peer.connected_at,
                 tried: self.is_address_tried(peer.address),
+                network: None,
+                port: None,
             })
             .collect::<Vec<_>>();
-        entries.sort_by(|left, right| left.address.cmp(&right.address));
+        entries.extend(
+            self.network_addresses
+                .read()
+                .values()
+                .map(|entry| PersistedAddress {
+                    address: entry.endpoint.host_string(),
+                    services: entry.services,
+                    time: entry.time,
+                    tried: self.is_network_address_tried(&entry.endpoint),
+                    network: Some(entry.endpoint.network_name().to_owned()),
+                    port: Some(entry.endpoint.port()),
+                }),
+        );
+        entries.sort_by(|left, right| {
+            left.network
+                .cmp(&right.network)
+                .then_with(|| left.address.cmp(&right.address))
+                .then_with(|| left.port.cmp(&right.port))
+        });
         std::fs::write(&temp, serde_json::to_vec_pretty(&entries)?)?;
         std::fs::rename(temp, path)?;
         Ok(())
@@ -2608,70 +2760,93 @@ fn load_banlist(data_dir: &Path) -> Result<HashMap<IpSubnet, BannedAddress>> {
         .collect()
 }
 
-fn load_known_addresses(
-    data_dir: &Path,
-) -> Result<(HashMap<SocketAddr, PeerInfo>, HashSet<SocketAddr>)> {
+fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
     let path = data_dir.join("peers.json");
     if !path.exists() {
-        return Ok((HashMap::new(), HashSet::new()));
+        return Ok((
+            HashMap::new(),
+            HashSet::new(),
+            HashMap::new(),
+            HashSet::new(),
+        ));
     }
     let bytes = std::fs::read(path)?;
     let entries: Vec<PersistedAddress> = serde_json::from_slice(&bytes)?;
     let mut known = HashMap::with_capacity(entries.len());
     let mut tried = HashSet::new();
+    let mut network_addresses = HashMap::new();
+    let mut network_tried_addresses = HashSet::new();
     for entry in entries {
-        let address = entry.address.parse::<SocketAddr>()?;
-        if entry.tried {
-            tried.insert(address);
+        let endpoint =
+            NetworkEndpoint::parse(entry.network.as_deref(), &entry.address, entry.port)?;
+        match endpoint {
+            NetworkEndpoint::Ip(address) => {
+                if entry.tried {
+                    tried.insert(address);
+                }
+                known.insert(
+                    address,
+                    PeerInfo {
+                        id: 0,
+                        address,
+                        local_address: None,
+                        reported_local_address: None,
+                        inbound: false,
+                        version: None,
+                        services: entry.services,
+                        user_agent: String::new(),
+                        start_height: 0,
+                        relay_transactions: true,
+                        permissions: PeerPermissions::empty(),
+                        min_fee_filter: 0,
+                        transport_protocol_type: "v1",
+                        session_id: String::new(),
+                        connection_type: "outbound-full",
+                        connected_at: entry.time,
+                        last_send: entry.time,
+                        last_recv: entry.time,
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        bytes_sent_per_msg: HashMap::new(),
+                        bytes_received_per_msg: HashMap::new(),
+                        last_inv_sequence: 0,
+                        inv_to_send: 0,
+                        last_transaction: 0,
+                        last_block: 0,
+                        best_known_block: None,
+                        last_common_block: None,
+                        bip152_highbandwidth_to: false,
+                        bip152_highbandwidth_from: false,
+                        inflight_blocks: Vec::new(),
+                        time_offset: 0,
+                        addr_processed: 0,
+                        addr_rate_limited: 0,
+                        addr_relay_enabled: false,
+                        ping_time: None,
+                        min_ping: None,
+                        ping_nonce: None,
+                        ping_sent_at: None,
+                        addr_token_bucket: 1.0,
+                        addr_token_timestamp: Instant::now(),
+                    },
+                );
+            }
+            endpoint => {
+                if entry.tried {
+                    network_tried_addresses.insert(endpoint.clone());
+                }
+                network_addresses.insert(
+                    endpoint.clone(),
+                    KnownNetworkAddress {
+                        endpoint,
+                        services: entry.services,
+                        time: entry.time,
+                    },
+                );
+            }
         }
-        known.insert(
-            address,
-            PeerInfo {
-                id: 0,
-                address,
-                local_address: None,
-                reported_local_address: None,
-                inbound: false,
-                version: None,
-                services: entry.services,
-                user_agent: String::new(),
-                start_height: 0,
-                relay_transactions: true,
-                permissions: PeerPermissions::empty(),
-                min_fee_filter: 0,
-                transport_protocol_type: "v1",
-                session_id: String::new(),
-                connection_type: "outbound-full",
-                connected_at: entry.time,
-                last_send: entry.time,
-                last_recv: entry.time,
-                bytes_sent: 0,
-                bytes_received: 0,
-                bytes_sent_per_msg: HashMap::new(),
-                bytes_received_per_msg: HashMap::new(),
-                last_inv_sequence: 0,
-                inv_to_send: 0,
-                last_transaction: 0,
-                last_block: 0,
-                best_known_block: None,
-                last_common_block: None,
-                bip152_highbandwidth_to: false,
-                bip152_highbandwidth_from: false,
-                inflight_blocks: Vec::new(),
-                time_offset: 0,
-                addr_processed: 0,
-                addr_rate_limited: 0,
-                addr_relay_enabled: false,
-                ping_time: None,
-                min_ping: None,
-                ping_nonce: None,
-                ping_sent_at: None,
-                addr_token_bucket: 1.0,
-                addr_token_timestamp: Instant::now(),
-            },
-        );
     }
-    Ok((known, tried))
+    Ok((known, tried, network_addresses, network_tried_addresses))
 }
 
 fn unix_time_seconds() -> u64 {
@@ -3298,6 +3473,37 @@ mod tests {
         assert_eq!(peer.id, 0);
         assert_eq!(peer.services, crate::wire::NODE_NETWORK);
         assert_eq!(peer.connected_at, 123);
+    }
+
+    #[test]
+    fn non_ip_addresses_survive_a_restart_with_network_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let onion = NetworkEndpoint::OnionV3 {
+            address: [4; 32],
+            port: 18444,
+        };
+        let i2p = NetworkEndpoint::I2p {
+            address: [5; 32],
+            port: 18445,
+        };
+        let cjdns = NetworkEndpoint::Cjdns {
+            address: "fc00::42".parse().unwrap(),
+            port: 18446,
+        };
+        assert!(node.remember_network_address(onion.clone(), 1, 100));
+        assert!(node.remember_network_address(i2p.clone(), 2, 101));
+        assert!(node.remember_network_address(cjdns.clone(), 4, 102));
+        node.network_tried_addresses.write().insert(i2p.clone());
+        node.persist_known_addresses().unwrap();
+        drop(node);
+
+        let reopened = Node::open(test_config(directory.path())).unwrap();
+        let addresses = reopened.known_network_addresses();
+        assert!(addresses.iter().any(|entry| entry.endpoint == onion));
+        assert!(addresses.iter().any(|entry| entry.endpoint == i2p));
+        assert!(addresses.iter().any(|entry| entry.endpoint == cjdns));
+        assert!(reopened.is_network_address_tried(&i2p));
     }
 
     #[test]

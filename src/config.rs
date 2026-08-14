@@ -5,6 +5,8 @@ use anyhow::{Context, Result, bail};
 use bitcoin::{Amount, Denomination, Network};
 use clap::{Parser, ValueEnum};
 
+use crate::address::NetworkEndpoint;
+
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
 pub const DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB: u64 = 5;
@@ -438,13 +440,16 @@ impl PeerPermissionConfig {
 
 impl OnlyNet {
     pub fn matches(self, address: SocketAddr) -> bool {
+        self.matches_endpoint(&NetworkEndpoint::Ip(address))
+    }
+
+    pub fn matches_endpoint(self, endpoint: &NetworkEndpoint) -> bool {
         match self {
-            Self::Ipv4 => address.is_ipv4(),
-            Self::Ipv6 => address.is_ipv6(),
-            // Onion, I2P, and CJDNS endpoints are not representable by the
-            // SocketAddr-only address table yet. Keep the options explicit so
-            // they fail closed instead of silently bypassing onlynet.
-            Self::Onion | Self::I2p | Self::Cjdns => false,
+            Self::Ipv4 => endpoint.network_name() == "ipv4",
+            Self::Ipv6 => endpoint.network_name() == "ipv6",
+            Self::Onion => endpoint.network_name() == "onion",
+            Self::I2p => endpoint.network_name() == "i2p",
+            Self::Cjdns => endpoint.network_name() == "cjdns",
         }
     }
 }
@@ -933,12 +938,16 @@ impl Config {
     }
 
     pub fn allows_address(&self, address: SocketAddr) -> bool {
+        self.allows_network_endpoint(&NetworkEndpoint::Ip(address))
+    }
+
+    pub fn allows_network_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
         self.onlynet.is_empty()
             || self
                 .onlynet
                 .iter()
                 .copied()
-                .any(|network| network.matches(address))
+                .any(|network| network.matches_endpoint(endpoint))
     }
 
     pub fn peer_permissions(&self, address: IpAddr, incoming: bool) -> PeerPermissions {

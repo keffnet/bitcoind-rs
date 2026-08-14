@@ -1098,6 +1098,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "getmempoolentry" | "getmempoolancestors" | "getmempooldescendants" => {
             Some(&["txid", "verbose"])
         }
+        "getorphantxs" => Some(&["verbosity"]),
         "getmempoolcluster" => Some(&["txid"]),
         "importmempool" => Some(&["filepath", "options"]),
         "gettxoutsetinfo" => Some(&["hash_type", "hash_or_height", "use_index"]),
@@ -10924,6 +10925,8 @@ mod tests {
 
         let normalized = normalize_rpc_params("gettxout", &json!({"txid": "00", "n": 1})).unwrap();
         assert_eq!(normalized, json!(["00", 1, null]));
+        let normalized = normalize_rpc_params("getorphantxs", &json!({"verbosity": 2})).unwrap();
+        assert_eq!(normalized, json!([2]));
         let normalized = normalize_rpc_params(
             "createpsbt",
             &json!({"inputs": [], "outputs": [], "version": 3}),

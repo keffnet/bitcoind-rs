@@ -320,6 +320,7 @@ pub struct PeerInfo {
     pub addr_processed: u64,
     pub ping_time: Option<f64>,
     pub min_ping: Option<f64>,
+    pub connection_type: &'static str,
     ping_nonce: Option<u64>,
     ping_sent_at: Option<Instant>,
 }
@@ -1035,6 +1036,7 @@ impl Node {
             relay_transactions: true,
             min_fee_filter: 0,
             transport_protocol_type: "v1",
+            connection_type: if inbound { "inbound" } else { "outbound-full" },
             connected_at,
             last_send: connected_at,
             last_recv: connected_at,
@@ -1115,6 +1117,12 @@ impl Node {
         }
     }
 
+    pub(crate) fn set_peer_connection_type(&self, id: usize, connection_type: &'static str) {
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.connection_type = connection_type;
+        }
+    }
+
     pub fn unregister_peer(&self, id: usize) {
         let address = self.peers.write().remove(&id).map(|peer| peer.address);
         self.peer_commands.write().remove(&id);
@@ -1185,6 +1193,7 @@ impl Node {
                 relay_transactions: true,
                 min_fee_filter: 0,
                 transport_protocol_type: "v1",
+                connection_type: "outbound-full",
                 connected_at: now,
                 last_send: now,
                 last_recv: now,
@@ -1227,6 +1236,7 @@ impl Node {
             relay_transactions: true,
             min_fee_filter: 0,
             transport_protocol_type: "v1",
+            connection_type: "outbound-full",
             connected_at: time,
             last_send: time,
             last_recv: time,
@@ -1288,8 +1298,21 @@ impl Node {
     }
 
     pub(crate) fn request_one_try(&self, address: SocketAddr, transport_v2: Option<bool>) {
+        self.request_one_try_with_connection_type(address, transport_v2, "outbound-full");
+    }
+
+    pub(crate) fn request_one_try_with_connection_type(
+        &self,
+        address: SocketAddr,
+        transport_v2: Option<bool>,
+        connection_type: &'static str,
+    ) {
         if let Some(sender) = self.peer_manager_requests.read().as_ref() {
-            let _ = sender.send(p2p::PeerManagerRequest::OneTry(address, transport_v2));
+            let _ = sender.send(p2p::PeerManagerRequest::OneTry(
+                address,
+                transport_v2,
+                connection_type,
+            ));
         }
     }
 
@@ -1651,6 +1674,7 @@ fn load_known_addresses(
                 relay_transactions: true,
                 min_fee_filter: 0,
                 transport_protocol_type: "v1",
+                connection_type: "outbound-full",
                 connected_at: entry.time,
                 last_send: entry.time,
                 last_recv: entry.time,

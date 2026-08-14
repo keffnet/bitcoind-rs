@@ -58,8 +58,14 @@ const TX_RECONCILIATION_VERSION: u32 = 1;
 const KNOWN_TX_FILTER_BITS: usize = 1 << 20;
 const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
+
+fn local_transaction_relay_enabled(connection_type: &str, blocksonly: bool) -> bool {
+    !blocksonly && matches!(connection_type, "outbound-full" | "inbound")
+}
+
 struct PeerState {
     writer: PeerWriter,
+    local_relay_transactions: bool,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
     fee_filter: parking_lot::Mutex<i64>,
@@ -310,7 +316,7 @@ pub(crate) enum PeerCommand {
 #[derive(Debug)]
 pub(crate) enum PeerManagerRequest {
     Add(SocketAddr),
-    OneTry(SocketAddr, Option<bool>),
+    OneTry(SocketAddr, Option<bool>, &'static str),
 }
 
 struct PendingCompactBlock {
@@ -437,7 +443,14 @@ impl PeerManager {
         };
         for address in seed_nodes {
             self.node.ensure_node_added(address);
-            spawn_outbound_loop(self.node.clone(), address, outbound.clone(), true, None);
+            spawn_outbound_loop(
+                self.node.clone(),
+                address,
+                outbound.clone(),
+                true,
+                None,
+                "outbound-full",
+            );
         }
         let discovery_node = self.node.clone();
         let discovery_outbound = outbound.clone();
@@ -465,6 +478,7 @@ impl PeerManager {
                             discovery_outbound.clone(),
                             false,
                             None,
+                            "outbound-full",
                         );
                     }
                 }
@@ -474,10 +488,10 @@ impl PeerManager {
         let dynamic_outbound = outbound.clone();
         tokio::spawn(async move {
             while let Some(request) = add_node_receiver.recv().await {
-                let (address, persistent, transport_v2) = match request {
-                    PeerManagerRequest::Add(address) => (address, true, None),
-                    PeerManagerRequest::OneTry(address, transport_v2) => {
-                        (address, false, transport_v2)
+                let (address, persistent, transport_v2, connection_type) = match request {
+                    PeerManagerRequest::Add(address) => (address, true, None, "outbound-full"),
+                    PeerManagerRequest::OneTry(address, transport_v2, connection_type) => {
+                        (address, false, transport_v2, connection_type)
                     }
                 };
                 spawn_outbound_loop(
@@ -486,6 +500,7 @@ impl PeerManager {
                     dynamic_outbound.clone(),
                     persistent,
                     transport_v2,
+                    connection_type,
                 );
             }
         });
@@ -507,8 +522,19 @@ impl PeerManager {
                     debug!(%address, "rejecting peer because peer limit is reached");
                     return;
                 };
-                if let Err(error) =
-                    serve_peer(node, stream, address, false, None, peers, peer_id).await
+                if let Err(error) = serve_peer(
+                    node,
+                    stream,
+                    address,
+                    PeerConnectionOptions {
+                        outbound: false,
+                        transport_v2: None,
+                        connection_type: "inbound",
+                    },
+                    peers,
+                    peer_id,
+                )
+                .await
                 {
                     debug!(%address, %error, "inbound peer ended");
                 }
@@ -524,6 +550,7 @@ fn spawn_outbound_loop(
     outbound: OutboundContext,
     persistent: bool,
     transport_v2: Option<bool>,
+    connection_type: &'static str,
 ) {
     {
         let mut attempts = outbound.attempts.lock();
@@ -583,8 +610,11 @@ fn spawn_outbound_loop(
                         node.clone(),
                         stream,
                         address,
-                        true,
-                        transport_v2,
+                        PeerConnectionOptions {
+                            outbound: true,
+                            transport_v2,
+                            connection_type,
+                        },
                         peers.clone(),
                         peer_id,
                     )
@@ -776,25 +806,41 @@ fn establish_v1(stream: TcpStream) -> Result<(PeerReader, PeerWriterKind, Option
     ))
 }
 
+struct PeerConnectionOptions {
+    outbound: bool,
+    transport_v2: Option<bool>,
+    connection_type: &'static str,
+}
+
 async fn serve_peer(
     node: Arc<Node>,
     stream: TcpStream,
     address: std::net::SocketAddr,
-    outbound: bool,
-    transport_v2: Option<bool>,
+    options: PeerConnectionOptions,
     peers: PeerRegistry,
     peer_id: usize,
 ) -> Result<()> {
     let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
-    let (mut reader, writer_half, local_address) =
-        establish_transport(stream, address, outbound, node.config.network, transport_v2).await?;
+    let (mut reader, writer_half, local_address) = establish_transport(
+        stream,
+        address,
+        options.outbound,
+        node.config.network,
+        options.transport_v2,
+    )
+    .await?;
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
     let (commands, command_receiver) = mpsc::unbounded_channel();
-    node.register_peer_with_local(peer_id, address, !outbound, commands, local_address);
+    node.register_peer_with_local(peer_id, address, !options.outbound, commands, local_address);
     node.set_peer_transport_protocol(peer_id, transport_v2);
+    node.set_peer_connection_type(peer_id, options.connection_type);
     let peer_state = Arc::new(PeerState {
         writer: Arc::new(Mutex::new(writer_half)),
+        local_relay_transactions: local_transaction_relay_enabled(
+            options.connection_type,
+            node.config.blocksonly,
+        ),
         bloom_filter: parking_lot::Mutex::new(None),
         known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
         fee_filter: parking_lot::Mutex::new(0),
@@ -811,7 +857,7 @@ async fn serve_peer(
         &node,
         &mut reader,
         &peer_state,
-        outbound,
+        options.outbound,
         &peers,
         peer_id,
         command_receiver,
@@ -871,7 +917,7 @@ async fn serve_peer_loop(
         version.receiver_services &= !wire::NODE_COMPACT_FILTERS;
         version.sender_services &= !wire::NODE_COMPACT_FILTERS;
     }
-    version.relay = !node.config.blocksonly;
+    version.relay = peer_state.local_relay_transactions;
     send_message(
         node,
         peer_id,
@@ -1726,7 +1772,7 @@ async fn serve_peer_loop(
                 }
             }
             Message::Mempool => {
-                if node.config.blocksonly || !*relay_transactions.lock() {
+                if !peer_state.local_relay_transactions || !*relay_transactions.lock() {
                     send_message(
                         node,
                         peer_id,
@@ -2039,13 +2085,13 @@ async fn send_peer_extensions(
         send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
     }
     if peer_version >= WTXID_RELAY_VERSION {
-        if !node.config.blocksonly {
+        if peer_state.local_relay_transactions {
             send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
         }
         send_message(node, peer_id, writer, network, &Message::SendAddrV2).await?;
         if node.config.zmq.tx_reconciliation
             && *peer_state.relay_transactions.lock()
-            && !node.config.blocksonly
+            && peer_state.local_relay_transactions
         {
             let salt = random::<u64>();
             send_message(
@@ -2230,7 +2276,7 @@ async fn broadcast_inventory_excluding(
             item.kind,
             InventoryType::Transaction | InventoryType::WitnessTransaction
         ) {
-            if !*state.relay_transactions.lock() {
+            if !state.local_relay_transactions || !*state.relay_transactions.lock() {
                 continue;
             }
             let minimum_fee = *state.fee_filter.lock();
@@ -2361,6 +2407,16 @@ mod tests {
     use bitcoin::bip158::FilterHeader;
 
     use crate::{Config, Node};
+
+    #[test]
+    fn non_full_connection_types_disable_local_transaction_relay() {
+        assert!(local_transaction_relay_enabled("outbound-full", false));
+        assert!(local_transaction_relay_enabled("inbound", false));
+        for connection_type in ["block-relay-only", "addr-fetch", "feeler"] {
+            assert!(!local_transaction_relay_enabled(connection_type, false));
+        }
+        assert!(!local_transaction_relay_enabled("outbound-full", true));
+    }
 
     #[test]
     fn builds_a_bounded_basic_filter_range() {
@@ -2906,6 +2962,7 @@ mod tests {
         let writer = Arc::new(Mutex::new(PeerWriterKind::V1(client_writer)));
         let peer_state = PeerState {
             writer: writer.clone(),
+            local_relay_transactions: true,
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
             fee_filter: parking_lot::Mutex::new(0),

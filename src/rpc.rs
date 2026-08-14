@@ -1434,61 +1434,60 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "warnings": [],
             }))
         }
-        "getpeerinfo" => {
-            Ok(json!(node
-            .peer_infos()
-            .into_iter()
-            .map(|peer| {
-                let mut info = json!({
-                    "id": peer.id,
-                    "addr": peer.address.to_string(),
-                    "network": if peer.address.ip().is_ipv4() { "ipv4" } else { "ipv6" },
-                    "services": format!("{:016x}", peer.services),
-                    "servicesnames": peer_services_names(peer.services),
-                    "relaytxes": peer.relay_transactions,
-                    "last_inv_sequence": peer.last_inv_sequence,
-                    "inv_to_send": 0,
-                    "lastsend": peer.last_send,
-                    "lastrecv": peer.last_recv,
-                    "last_transaction": peer.last_transaction,
-                    "last_block": peer.last_block,
-                    "bytessent": peer.bytes_sent,
-                    "bytesrecv": peer.bytes_received,
-                    "conntime": peer.connected_at,
-                    "timeoffset": peer.time_offset,
-                    "version": peer.version.unwrap_or_default(),
-                    "subver": peer.user_agent,
-                    "inbound": peer.inbound,
-                    "bip152_hb_to": false,
-                    "bip152_hb_from": false,
-                    "presynced_headers": -1,
-                    "synced_headers": node.chain.read().best_header_tip().height,
-                    "synced_blocks": node.chain.read().height(),
-                    "inflight": [],
-                    "addr_relay_enabled": true,
-                    "addr_processed": peer.addr_processed,
-                    "addr_rate_limited": 0,
-                    "permissions": [],
-                    "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
-                    "bytessent_per_msg": peer.bytes_sent_per_msg,
-                    "bytesrecv_per_msg": peer.bytes_received_per_msg,
-                    "connection_type": if peer.inbound { "inbound" } else { "outbound-full" },
-                    "transport_protocol_type": peer.transport_protocol_type,
-                    "session_id": "",
-                });
-                if let Some(address) = peer.local_address {
-                    info["addrbind"] = json!(address.to_string());
-                }
-                if let Some(ping_time) = peer.ping_time {
-                    info["pingtime"] = json!(ping_time);
-                }
-                if let Some(min_ping) = peer.min_ping {
-                    info["minping"] = json!(min_ping);
-                }
-                info
-            })
-            .collect::<Vec<_>>()))
-        }
+        "getpeerinfo" => Ok(json!(
+            node.peer_infos()
+                .into_iter()
+                .map(|peer| {
+                    let mut info = json!({
+                        "id": peer.id,
+                        "addr": peer.address.to_string(),
+                        "network": if peer.address.ip().is_ipv4() { "ipv4" } else { "ipv6" },
+                        "services": format!("{:016x}", peer.services),
+                        "servicesnames": peer_services_names(peer.services),
+                        "relaytxes": peer.relay_transactions,
+                        "last_inv_sequence": peer.last_inv_sequence,
+                        "inv_to_send": 0,
+                        "lastsend": peer.last_send,
+                        "lastrecv": peer.last_recv,
+                        "last_transaction": peer.last_transaction,
+                        "last_block": peer.last_block,
+                        "bytessent": peer.bytes_sent,
+                        "bytesrecv": peer.bytes_received,
+                        "conntime": peer.connected_at,
+                        "timeoffset": peer.time_offset,
+                        "version": peer.version.unwrap_or_default(),
+                        "subver": peer.user_agent,
+                        "inbound": peer.inbound,
+                        "bip152_hb_to": false,
+                        "bip152_hb_from": false,
+                        "presynced_headers": -1,
+                        "synced_headers": node.chain.read().best_header_tip().height,
+                        "synced_blocks": node.chain.read().height(),
+                        "inflight": [],
+                        "addr_relay_enabled": true,
+                        "addr_processed": peer.addr_processed,
+                        "addr_rate_limited": 0,
+                        "permissions": [],
+                        "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
+                        "bytessent_per_msg": peer.bytes_sent_per_msg,
+                        "bytesrecv_per_msg": peer.bytes_received_per_msg,
+                        "connection_type": peer.connection_type,
+                        "transport_protocol_type": peer.transport_protocol_type,
+                        "session_id": "",
+                    });
+                    if let Some(address) = peer.local_address {
+                        info["addrbind"] = json!(address.to_string());
+                    }
+                    if let Some(ping_time) = peer.ping_time {
+                        info["pingtime"] = json!(ping_time);
+                    }
+                    if let Some(min_ping) = peer.min_ping {
+                        info["minping"] = json!(min_ping);
+                    }
+                    info
+                })
+                .collect::<Vec<_>>()
+        )),
         "getnettotals" => get_net_totals(node),
         "getnodeaddresses" => get_node_addresses(node, params),
         "getaddrmaninfo" => get_addrman_info(node),
@@ -2534,18 +2533,25 @@ fn add_connection(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     let address_string = param::<String>(params, 0)?;
     let address = parse_socket_address(&address_string)?;
-    let connection_type = param::<String>(params, 1)?;
+    let requested_connection_type = param::<String>(params, 1)?;
     if !matches!(
-        connection_type.as_str(),
+        requested_connection_type.as_str(),
         "outbound-full-relay" | "block-relay-only" | "addr-fetch" | "feeler"
     ) {
         bail!("invalid connection type")
     }
     let transport_v2 = param::<bool>(params, 2)?;
-    node.request_one_try(address, Some(transport_v2));
+    let connection_type = match requested_connection_type.as_str() {
+        "outbound-full-relay" => "outbound-full",
+        "block-relay-only" => "block-relay-only",
+        "addr-fetch" => "addr-fetch",
+        "feeler" => "feeler",
+        _ => unreachable!("connection type was validated above"),
+    };
+    node.request_one_try_with_connection_type(address, Some(transport_v2), connection_type);
     Ok(json!({
         "address": address_string,
-        "connection_type": connection_type,
+        "connection_type": requested_connection_type,
     }))
 }
 
@@ -12351,6 +12357,11 @@ mod tests {
         assert_eq!(peer_info[0]["transport_protocol_type"], json!("v1"));
         assert!(peer_info[0].get("startingheight").is_none());
         assert!(peer_info[0].get("pingtime").is_none());
+        node.set_peer_connection_type(7, "block-relay-only");
+        assert_eq!(
+            dispatch_method(&node, "getpeerinfo", &json!([])).unwrap()[0]["connection_type"],
+            json!("block-relay-only")
+        );
         assert_eq!(
             dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["timeoffset"],
             json!(42)

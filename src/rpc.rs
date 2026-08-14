@@ -8244,6 +8244,9 @@ fn get_mempool_relationship(node: &Arc<Node>, params: &Value, ancestors: bool) -
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
     let mempool = node.mempool.read();
+    if mempool.get(&txid).is_none() {
+        bail!("Transaction not in mempool");
+    }
     let related = if ancestors {
         mempool.ancestors(&txid)
     } else {
@@ -11475,6 +11478,53 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn mempool_relationships_reject_missing_transactions() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: true,
+            blocksonly: false,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
+            persist_mempool: true,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let missing = Txid::from_byte_array([7; 32]).to_string();
+
+        assert!(dispatch_method(&node, "getmempoolancestors", &json!([missing])).is_err());
+        assert!(dispatch_method(&node, "getmempooldescendants", &json!([missing])).is_err());
     }
 
     #[test]

@@ -6667,15 +6667,24 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     let block: bitcoin::Block = deserialize(&bytes)?;
     let hash = block.block_hash();
-    if node.chain.write().block(&hash)?.is_some() {
-        return Ok(json!("duplicate"));
+    if let Some(status) = node.chain.read().proposal_duplicate_status(&hash) {
+        return Ok(json!(status));
     }
     let result = node.connect_block(block);
     match result {
         Ok(_) => Ok(Value::Null),
         Err(error) => {
             debug!(%hash, %error, "submitblock rejected");
-            Ok(json!(error.to_string()))
+            let message = error.to_string();
+            if message.contains("unknown parent")
+                || message.contains("parent whose full body is unavailable")
+            {
+                Ok(json!("inconclusive"))
+            } else if message.contains("invalidated branch") {
+                Ok(json!("duplicate-invalid"))
+            } else {
+                Ok(json!(message))
+            }
         }
     }
 }

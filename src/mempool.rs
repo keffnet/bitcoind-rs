@@ -1773,7 +1773,7 @@ impl Mempool {
         self.spent.clear();
         self.children.clear();
         self.wtxids.clear();
-        self.relay_sequences.clear();
+        let relay_sequences = std::mem::take(&mut self.relay_sequences);
         self.bytes = 0;
         self.vbytes = 0;
         let unbroadcast = std::mem::take(&mut self.unbroadcast);
@@ -1784,8 +1784,13 @@ impl Mempool {
                 .is_err()
             {
                 self.record_removal(transaction, true);
-            } else if unbroadcast.contains(&txid) {
-                self.unbroadcast.insert(txid);
+            } else {
+                if let Some(sequence) = relay_sequences.get(&txid) {
+                    self.relay_sequences.insert(txid, *sequence);
+                }
+                if unbroadcast.contains(&txid) {
+                    self.unbroadcast.insert(txid);
+                }
             }
         }
     }
@@ -2373,6 +2378,8 @@ mod tests {
     use super::*;
     use bitcoin::Network;
     use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version as BlockVersion};
+    use bitcoin::blockdata::script::Builder;
     use bitcoin::blockdata::script::ScriptBuf;
     use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
     use bitcoin::blockdata::witness::Witness;
@@ -2393,6 +2400,45 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         }
+    }
+
+    fn mine_regtest_block(previous: &Header, height: u32) -> bitcoin::Block {
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Builder::new()
+                    .push_int(height as i64)
+                    .push_int(0)
+                    .into_script(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(crate::validation::block_subsidy_for_network(
+                    Network::Regtest,
+                    height,
+                )),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = bitcoin::Block {
+            header: Header {
+                version: BlockVersion::from_consensus(4),
+                prev_blockhash: previous.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: previous.time + 1,
+                bits: previous.bits,
+                nonce: 0,
+            },
+            txdata: vec![transaction],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        block
     }
 
     #[test]
@@ -2504,6 +2550,46 @@ mod tests {
         )));
         assert_eq!(changes[0].sequence, 0);
         assert_eq!(changes[1].sequence, 1);
+    }
+
+    #[test]
+    fn revalidation_preserves_relay_sequences_for_retained_transactions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=101 {
+            let previous = chain.header(height - 1).expect("previous header");
+            chain
+                .connect_block(mine_regtest_block(previous, height))
+                .unwrap();
+        }
+        let (outpoint, entry) = chain
+            .all_utxos()
+            .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
+            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+            .expect("matured coinbase output");
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0; 65]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(entry.output.value.to_sat() - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let txid = transaction.compute_txid();
+        let mut pool = Mempool::new(Network::Regtest);
+        pool.accept(transaction, &chain).unwrap();
+        let sequence = pool.relay_sequences[&txid];
+
+        pool.revalidate(&chain);
+
+        assert_eq!(pool.relay_sequences[&txid], sequence);
+        assert!(pool.get_for_relay(&txid, sequence + 1).is_some());
     }
 
     #[test]

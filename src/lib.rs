@@ -1129,13 +1129,23 @@ impl Node {
             .collect();
         for (peer_id, sender) in commands {
             let nonce = random();
-            if sender.send(p2p::PeerCommand::Ping(nonce)).is_ok()
-                && let Some(peer) = self.peers.write().get_mut(&peer_id)
-            {
-                peer.ping_nonce = Some(nonce);
-                peer.ping_sent_at = Some(Instant::now());
+            if sender.send(p2p::PeerCommand::Ping(nonce)).is_ok() {
+                self.record_ping(peer_id, nonce);
             }
         }
+    }
+
+    pub(crate) fn record_ping(&self, peer_id: usize, nonce: u64) -> bool {
+        let mut peers = self.peers.write();
+        let Some(peer) = peers.get_mut(&peer_id) else {
+            return false;
+        };
+        if peer.ping_nonce.is_some() {
+            return false;
+        }
+        peer.ping_nonce = Some(nonce);
+        peer.ping_sent_at = Some(Instant::now());
+        true
     }
 
     pub fn is_banned(&self, address: IpAddr) -> bool {

@@ -860,6 +860,8 @@ async fn serve_peer_loop(
     let mut peer_version = 0i32;
     let mut compact_block_version = 2u64;
     let mut pending_compact = None;
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(120));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         if !node.network_active() {
             anyhow::bail!("networking is disabled");
@@ -908,6 +910,20 @@ async fn serve_peer_loop(
                 node.record_bytes_received(peer_id, bytes);
                 message
             },
+            _ = ping_interval.tick(), if version_received && verack_received => {
+                let nonce = random();
+                if node.record_ping(peer_id, nonce) {
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Ping(nonce),
+                    )
+                    .await?;
+                }
+                continue;
+            }
         };
         if !version_received && !matches!(&message, Message::Version(_)) {
             // Core ignores application messages until VERSION has been

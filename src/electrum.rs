@@ -662,10 +662,18 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
     let mempool = node.mempool.read();
     let mut status = serde_json::Map::new();
 
-    if let Some((transaction, location)) = chain.transaction(&outpoint.txid)? {
-        if transaction.output.get(outpoint.vout as usize).is_some() {
-            status.insert("funder_height".to_owned(), json!(location.height));
-        }
+    let active_funder = chain
+        .transaction(&outpoint.txid)?
+        .filter(|(_, location)| chain.is_active_block(&location.block_hash))
+        .and_then(|(transaction, location)| {
+            transaction
+                .output
+                .get(outpoint.vout as usize)
+                .is_some()
+                .then_some(location.height)
+        });
+    if let Some(height) = active_funder {
+        status.insert("funder_height".to_owned(), json!(height));
     } else if let Some(entry) = mempool.get(&outpoint.txid)
         && entry
             .transaction
@@ -1434,8 +1442,51 @@ fn param<T: serde::de::DeserializeOwned>(params: &Value, index: usize) -> Result
 mod tests {
     use super::*;
     use crate::{Config, Node};
+    use bitcoin::Amount;
+    use bitcoin::Block;
     use bitcoin::Network;
+    use bitcoin::absolute::LockTime;
+    use bitcoin::block::{Header, Version as BlockVersion};
+    use bitcoin::blockdata::script::Builder;
+    use bitcoin::blockdata::transaction::{TxIn, TxOut, Version};
+    use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
+
+    fn mine_test_block(previous: &Header, height: u32, tag: u8) -> Block {
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::from_consensus(4),
+                prev_blockhash: previous.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: previous.time + 1,
+                bits: previous.bits,
+                nonce: 0,
+            },
+            txdata: vec![Transaction {
+                version: Version::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: Builder::new()
+                        .push_int(i64::from(height))
+                        .push_slice([tag])
+                        .push_slice([0u8])
+                        .into_script(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(5_000_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        block
+    }
 
     #[test]
     fn empty_fee_histogram_is_a_valid_electrum_result() {
@@ -1484,6 +1535,71 @@ mod tests {
             &json!("new-status"),
             false
         ));
+    }
+
+    #[test]
+    fn outpoint_status_ignores_side_chain_funders() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Arc::new(
+            Node::open(Config {
+                network: Network::Regtest,
+                datadir: directory.path().to_owned(),
+                p2p_bind: "127.0.0.1:0".parse().unwrap(),
+                rpc_bind: None,
+                electrum_bind: Some("127.0.0.1:30001".parse().unwrap()),
+                rest: false,
+                listen: true,
+                dnsseed: true,
+                blocksonly: false,
+                prune: 0,
+                reindex: false,
+                reindex_chainstate: false,
+                load_blocks: Vec::new(),
+                txindex: false,
+                txospenderindex: false,
+                max_mempool_mb: 300,
+                mempool_expiry_hours: 336,
+                coinstatsindex: false,
+                blockfilterindex: true,
+                peer_block_filters: true,
+                persist_mempool: true,
+                seed_nodes: Vec::new(),
+                signet_challenge: None,
+                max_peers: 1,
+                peer_bloom_filters: false,
+                peer_timeout_secs: 60,
+                block_max_weight: 4_000_000,
+                block_reserved_weight: 8_000,
+                block_min_tx_fee_sat_per_kvb: 1,
+                min_relay_tx_fee_sat_per_kvb: 100,
+                incremental_relay_fee_sat_per_kvb: 100,
+                dust_relay_fee_sat_per_kvb: 3_000,
+                max_datacarrier_bytes: Some(100_000),
+                permit_bare_multisig: true,
+                zmq: crate::config::ZmqConfig::default(),
+            })
+            .unwrap(),
+        );
+        let genesis = *node.chain.read().header(0).unwrap();
+        let main_one = mine_test_block(&genesis, 1, 1);
+        let main_outpoint = OutPoint::new(main_one.txdata[0].compute_txid(), 0);
+        node.connect_block(main_one).unwrap();
+        let main_tip = *node.chain.read().header(1).unwrap();
+        node.connect_block(mine_test_block(&main_tip, 2, 2))
+            .unwrap();
+
+        let side = mine_test_block(&genesis, 1, 3);
+        let outpoint = OutPoint::new(side.txdata[0].compute_txid(), 0);
+        let side_hash = side.block_hash();
+        node.connect_block(side).unwrap();
+
+        assert_eq!(node.chain.read().height(), 2);
+        assert!(!node.chain.read().is_active_block(&side_hash));
+        assert_eq!(
+            outpoint_status(&node, &main_outpoint).unwrap(),
+            json!({"funder_height": 1})
+        );
+        assert_eq!(outpoint_status(&node, &outpoint).unwrap(), json!({}));
     }
 
     #[test]

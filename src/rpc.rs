@@ -58,6 +58,47 @@ const MAX_OPCODE: u8 = 0xb9;
 const MIN_MERKLE_TRANSACTION_WEIGHT: usize = 4 * 60;
 const MAX_MERKLE_PROOF_TRANSACTIONS: usize =
     validation::MAX_BLOCK_WEIGHT / MIN_MERKLE_TRANSACTION_WEIGHT;
+const MEMORY_STATS_ARENA_SIZE: usize = 256 * 1024;
+
+/// Wallet-free replacement for Core's locked allocator bookkeeping. The
+/// daemon does not retain private keys and forbids unsafe OS page-locking, so
+/// the managed arena is intentionally reported with `locked: 0` rather than
+/// claiming that heap pages are non-swappable.
+struct MemoryStatsArena {
+    bytes: Vec<u8>,
+}
+
+impl MemoryStatsArena {
+    fn new() -> Self {
+        let mut bytes = Vec::with_capacity(MEMORY_STATS_ARENA_SIZE);
+        // Keep one byte allocated so Core-compatible stats have a used chunk,
+        // while the remaining arena remains available to the manager.
+        bytes.push(0);
+        Self { bytes }
+    }
+
+    fn stats(&self) -> Value {
+        let total = self.bytes.capacity();
+        let used = self.bytes.len().min(total);
+        let free = total.saturating_sub(used);
+        json!({
+            "used": used,
+            "free": free,
+            "total": total,
+            "locked": 0,
+            "chunks_used": usize::from(used > 0),
+            "chunks_free": usize::from(free > 0),
+        })
+    }
+}
+
+fn rpc_locked_memory_info() -> Value {
+    static ARENA: OnceLock<parking_lot::Mutex<MemoryStatsArena>> = OnceLock::new();
+    ARENA
+        .get_or_init(|| parking_lot::Mutex::new(MemoryStatsArena::new()))
+        .lock()
+        .stats()
+}
 
 pub struct RpcServer {
     node: Arc<Node>,
@@ -1823,16 +1864,7 @@ fn get_memory_info(params: &Value) -> Result<Value> {
         .transpose()?
         .unwrap_or("stats");
     match mode {
-        "stats" => Ok(json!({
-            "locked": {
-                "used": 0,
-                "free": 0,
-                "total": 0,
-                "locked": 0,
-                "chunks_used": 0,
-                "chunks_free": 0,
-            }
-        })),
+        "stats" => Ok(json!({"locked": rpc_locked_memory_info()})),
         "mallocinfo" => bail!("mallocinfo mode not available"),
         _ => bail!("unknown mode {mode}"),
     }
@@ -11738,7 +11770,26 @@ mod tests {
         );
         assert!(dispatch_method(&node, "verifychain", &json!([5])).is_err());
         assert!(dispatch_method(&node, "verifychain", &json!([3, -1])).is_err());
-        assert!(dispatch_method(&node, "getmemoryinfo", &json!([])).unwrap()["locked"].is_object());
+        let memory = dispatch_method(&node, "getmemoryinfo", &json!([])).unwrap();
+        assert!(
+            memory["locked"]["used"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            memory["locked"]["free"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        assert!(
+            memory["locked"]["total"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        assert_eq!(
+            memory["locked"]["used"].as_u64().unwrap() + memory["locked"]["free"].as_u64().unwrap(),
+            memory["locked"]["total"].as_u64().unwrap()
+        );
         assert!(dispatch_method(&node, "getmemoryinfo", &json!(["mallocinfo"])).is_err());
         assert!(dispatch_method(&node, "getmemoryinfo", &json!([1])).is_err());
         let net_totals = dispatch_method(&node, "getnettotals", &json!([])).unwrap();

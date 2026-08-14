@@ -327,6 +327,49 @@ impl Mempool {
         }
     }
 
+    /// Admit a topologically ordered package using the package feerate for
+    /// the minimum-relay check. This models Core's one-parent/one-child
+    /// package relay policy: an individual parent may be below the relay
+    /// floor when the package as a whole pays it.
+    pub fn accept_package(
+        &mut self,
+        transactions: &[Transaction],
+        chain: &ChainState,
+    ) -> Result<Vec<Txid>, MempoolError> {
+        if transactions.is_empty() {
+            return Err(MempoolError::Empty);
+        }
+        let added_at = time::unix_time();
+        let mut candidate = self.clone();
+        let mut accepted = Vec::with_capacity(transactions.len());
+        let mut package_fee = 0u64;
+        let mut package_vsize = 0u64;
+        let allow_low_fee_parent = is_one_parent_one_child_package(transactions);
+        for transaction in transactions {
+            let txid = candidate.accept_at_with_policy(
+                transaction.clone(),
+                chain,
+                added_at,
+                !allow_low_fee_parent,
+            )?;
+            let entry = candidate.get(&txid).ok_or(MempoolError::BadOutput)?;
+            package_fee = package_fee.saturating_add(entry.fee_sat);
+            package_vsize = package_vsize.saturating_add(entry.vsize);
+            accepted.push(txid);
+        }
+        if allow_low_fee_parent {
+            let child = candidate.get(&accepted[1]).ok_or(MempoolError::BadOutput)?;
+            if child.fee_sat < child.vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
+                return Err(MempoolError::FeeRate);
+            }
+        }
+        if package_fee < package_vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
+            return Err(MempoolError::FeeRate);
+        }
+        *self = candidate;
+        Ok(accepted)
+    }
+
     fn replace(
         &mut self,
         transaction: Transaction,
@@ -412,6 +455,16 @@ impl Mempool {
         chain: &ChainState,
         added_at: u64,
     ) -> Result<Txid, MempoolError> {
+        self.accept_at_with_policy(transaction, chain, added_at, true)
+    }
+
+    fn accept_at_with_policy(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
+        enforce_fee_rate: bool,
+    ) -> Result<Txid, MempoolError> {
         let txid = transaction.compute_txid();
         if self.entries.contains_key(&txid) {
             return Err(MempoolError::AlreadyPresent);
@@ -496,7 +549,7 @@ impl Mempool {
         }
         let fee_sat = input_total - output_total;
         let vsize = transaction.vsize() as u64;
-        if fee_sat < vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
+        if enforce_fee_rate && fee_sat < vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
             return Err(MempoolError::FeeRate);
         }
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
@@ -641,6 +694,17 @@ fn signals_replaceability(transaction: &Transaction) -> bool {
         .input
         .iter()
         .any(|input| input.sequence.to_consensus_u32() < 0xffff_fffe)
+}
+
+fn is_one_parent_one_child_package(transactions: &[Transaction]) -> bool {
+    if transactions.len() != 2 {
+        return false;
+    }
+    let parent_txid = transactions[0].compute_txid();
+    transactions[1]
+        .input
+        .iter()
+        .any(|input| input.previous_output.txid == parent_txid)
 }
 
 impl From<ValidationError> for MempoolError {

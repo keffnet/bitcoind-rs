@@ -6637,6 +6637,75 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
     let chain = node.chain.read();
     let mut candidate = node.mempool.read().clone();
     let max_fee_rate = parse_max_fee_rate(params.get(1))?;
+    if transactions.len() > 1 {
+        let decoded = transactions
+            .iter()
+            .map(|raw| {
+                raw.as_str()
+                    .and_then(|raw| hex::decode(raw).ok())
+                    .and_then(|bytes| deserialize(&bytes).ok())
+            })
+            .collect::<Vec<Option<Transaction>>>();
+        if decoded.iter().any(Option::is_none) {
+            return Ok(json!(decoded
+                .into_iter()
+                .map(|transaction| {
+                    transaction.map_or_else(
+                        || json!({"txid": Value::Null, "allowed": false, "reject-reason": "decode failed"}),
+                        |transaction| json!({
+                            "txid": transaction.compute_txid().to_string(),
+                            "wtxid": transaction.compute_wtxid().to_string(),
+                            "allowed": false,
+                            "reject-reason": "package contains a transaction that failed to decode",
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>()));
+        }
+        let package = decoded.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+        if let Err(error) = candidate.accept_package(&package, &chain) {
+            return Ok(json!(
+                package
+                    .into_iter()
+                    .map(|transaction| json!({
+                        "txid": transaction.compute_txid().to_string(),
+                        "wtxid": transaction.compute_wtxid().to_string(),
+                        "allowed": false,
+                        "reject-reason": error.to_string(),
+                    }))
+                    .collect::<Vec<_>>()
+            ));
+        }
+        return Ok(json!(
+            package
+                .into_iter()
+                .map(|transaction| {
+                    let txid = transaction.compute_txid();
+                    let entry = candidate.get(&txid).expect("accepted package entry exists");
+                    let exceeds_max_fee = max_fee_rate.is_some_and(|max_fee_rate| {
+                        entry.fee_sat as f64
+                            > max_fee_rate * 100_000_000.0 * entry.vsize as f64 / 1_000.0
+                    });
+                    if exceeds_max_fee {
+                        json!({
+                            "txid": txid.to_string(),
+                            "wtxid": transaction.compute_wtxid().to_string(),
+                            "allowed": false,
+                            "reject-reason": "max-fee-exceeded",
+                        })
+                    } else {
+                        json!({
+                            "txid": txid.to_string(),
+                            "wtxid": transaction.compute_wtxid().to_string(),
+                            "allowed": true,
+                            "vsize": entry.vsize,
+                            "fees": {"base": sat_to_btc(entry.fee_sat)},
+                        })
+                    }
+                })
+                .collect::<Vec<_>>()
+        ));
+    }
     let mut result = Vec::with_capacity(transactions.len());
     for raw in transactions {
         let raw = raw
@@ -6735,40 +6804,42 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
 
     let chain = node.chain.read();
     let mut candidate = node.mempool.read().clone();
+    let package_transactions = ordered
+        .iter()
+        .map(|(_, transaction)| transaction.clone())
+        .collect::<Vec<_>>();
     let mut results = serde_json::Map::new();
-    for (txid, transaction) in &ordered {
-        match candidate.accept(transaction.clone(), &chain) {
-            Ok(_) => {
-                let entry = candidate
-                    .get(txid)
-                    .ok_or_else(|| anyhow!("accepted package transaction disappeared"))?;
-                results.insert(
-                    txid.to_string(),
-                    json!({
-                        "txid": txid.to_string(),
-                        "wtxid": transaction.compute_wtxid().to_string(),
-                        "allowed": true,
-                        "vsize": entry.vsize,
-                        "fees": {"base": sat_to_btc(entry.fee_sat)},
-                    }),
-                );
-            }
-            Err(error) => {
-                results.insert(
-                    txid.to_string(),
-                    json!({
-                        "txid": txid.to_string(),
-                        "wtxid": transaction.compute_wtxid().to_string(),
-                        "allowed": false,
-                        "reject-reason": error.to_string(),
-                    }),
-                );
-                return Ok(json!({
-                    "package_msg": error.to_string(),
-                    "tx-results": results,
-                }));
-            }
+    if let Err(error) = candidate.accept_package(&package_transactions, &chain) {
+        for (txid, transaction) in &ordered {
+            results.insert(
+                txid.to_string(),
+                json!({
+                    "txid": txid.to_string(),
+                    "wtxid": transaction.compute_wtxid().to_string(),
+                    "allowed": false,
+                    "reject-reason": error.to_string(),
+                }),
+            );
         }
+        return Ok(json!({
+            "package_msg": error.to_string(),
+            "tx-results": results,
+        }));
+    }
+    for (txid, transaction) in &ordered {
+        let entry = candidate
+            .get(txid)
+            .ok_or_else(|| anyhow!("accepted package transaction disappeared"))?;
+        results.insert(
+            txid.to_string(),
+            json!({
+                "txid": txid.to_string(),
+                "wtxid": transaction.compute_wtxid().to_string(),
+                "allowed": true,
+                "vsize": entry.vsize,
+                "fees": {"base": sat_to_btc(entry.fee_sat)},
+            }),
+        );
     }
     let accepted = ordered
         .iter()
@@ -10051,7 +10122,7 @@ mod tests {
                 witness: Witness::default(),
             }],
             output: vec![TxOut {
-                value: bitcoin::Amount::from_sat(4_999_999_000),
+                value: bitcoin::Amount::from_sat(5_000_000_000),
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };

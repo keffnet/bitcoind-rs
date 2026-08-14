@@ -341,6 +341,12 @@ impl Node {
             (tip, activated_blocks, disconnected_blocks)
         };
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
+            let mempool_before = self
+                .mempool
+                .read()
+                .transaction_order()
+                .into_iter()
+                .collect::<HashSet<_>>();
             let disconnected_transactions = disconnected_blocks
                 .iter()
                 .flat_map(|block| block.txdata.iter().skip(1).cloned())
@@ -356,10 +362,15 @@ impl Node {
                 }
             }
             mempool.revalidate(&chain);
+            let mempool_after = mempool
+                .transaction_order()
+                .into_iter()
+                .collect::<HashSet<_>>();
             let _ = self.events.send(tip.clone());
 
             drop(mempool);
             drop(chain);
+            self.announce_mempool_diff(mempool_before, mempool_after);
             for block in &activated_blocks {
                 self.orphans.lock().erase_for_block(block);
             }
@@ -467,6 +478,20 @@ impl Node {
         }
     }
 
+    fn announce_mempool_diff(&self, before: HashSet<Txid>, after: HashSet<Txid>) {
+        let mut changed = before
+            .symmetric_difference(&after)
+            .copied()
+            .collect::<Vec<_>>();
+        changed.sort_by_key(ToString::to_string);
+        for txid in &changed {
+            self.announce_mempool_transaction(*txid);
+        }
+        for txid in changed {
+            self.announce_peer_mempool_transaction(txid, Vec::new());
+        }
+    }
+
     pub(crate) fn notify_mempool_transaction(&self, transaction: Transaction) {
         self.notify_mempool_transaction_with_exclusions(transaction, Vec::new());
     }
@@ -521,7 +546,22 @@ impl Node {
             (tip, previous != chain.best_hash())
         };
         if changed {
-            self.mempool.write().revalidate(&self.chain.read());
+            let before = self
+                .mempool
+                .read()
+                .transaction_order()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let chain = self.chain.read();
+            let mut mempool = self.mempool.write();
+            mempool.revalidate(&chain);
+            let after = mempool
+                .transaction_order()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            drop(mempool);
+            drop(chain);
+            self.announce_mempool_diff(before, after);
             let _ = self.events.send(tip.clone());
         }
         Ok(tip)
@@ -535,7 +575,22 @@ impl Node {
             (tip, previous != chain.best_hash())
         };
         if changed {
-            self.mempool.write().revalidate(&self.chain.read());
+            let before = self
+                .mempool
+                .read()
+                .transaction_order()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let chain = self.chain.read();
+            let mut mempool = self.mempool.write();
+            mempool.revalidate(&chain);
+            let after = mempool
+                .transaction_order()
+                .into_iter()
+                .collect::<HashSet<_>>();
+            drop(mempool);
+            drop(chain);
+            self.announce_mempool_diff(before, after);
             let _ = self.events.send(tip.clone());
         }
         Ok(tip)

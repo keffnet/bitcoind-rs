@@ -748,7 +748,15 @@ fn rest_transaction(
         .as_str()
         .ok_or_else(|| anyhow!("raw transaction response is not hex"))?;
     match format {
-        "json" => rest_json(get_raw_transaction(node, &json!([txid, true]))?),
+        "json" => {
+            let mut transaction = get_raw_transaction(node, &json!([txid, true]))?;
+            if let Some(object) = transaction.as_object_mut() {
+                object.remove("confirmations");
+                object.remove("time");
+                object.remove("blocktime");
+            }
+            rest_json(transaction)
+        }
         "bin" => Ok(("application/octet-stream", hex::decode(raw)?)),
         "hex" => Ok(("text/plain", format!("{raw}\n").into_bytes())),
         _ => bail!("unsupported REST output format"),
@@ -818,8 +826,8 @@ fn rest_get_utxos(
         }
         _ => bail!("unsupported REST output format"),
     };
-    if outpoints.is_empty() || outpoints.len() > 15 {
-        bail!("getutxos accepts between 1 and 15 outpoints")
+    if outpoints.len() > 15 {
+        bail!("getutxos accepts at most 15 outpoints")
     }
     let chain = node.chain.read();
     let mempool = check_mempool.then(|| node.mempool.read());
@@ -894,7 +902,7 @@ fn deserialize_get_utxos_request(bytes: &[u8]) -> Result<(bool, Vec<OutPoint>)> 
     consumed = consumed.saturating_add(count_consumed);
     let count = usize::try_from(count.0).context("getutxos request has too many outpoints")?;
     if count > 15 {
-        bail!("getutxos accepts between 1 and 15 outpoints")
+        bail!("getutxos accepts at most 15 outpoints")
     }
     let mut outpoints = Vec::with_capacity(count);
     for _ in 0..count {
@@ -12048,6 +12056,9 @@ mod tests {
         let (_, spent_hex) =
             dispatch_rest(&node, &format!("/rest/spenttxouts/{genesis_hash}.hex")).unwrap();
         assert_eq!(std::str::from_utf8(&spent_hex).unwrap(), "0100\n");
+        let (_, empty_utxos) =
+            dispatch_rest_with_body(&node, "/rest/getutxos.bin", &[0, 0]).unwrap();
+        assert_eq!(empty_utxos.len(), 38);
     }
 
     #[test]

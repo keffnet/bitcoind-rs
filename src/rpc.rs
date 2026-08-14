@@ -49,6 +49,9 @@ use crate::wire;
 
 const MAX_HTTP_REQUEST: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_RAW_TX_FEE_RATE_BTC_PER_KVB: f64 = 0.1;
+const MAX_SCRIPT_SIZE: usize = 10_000;
+const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
+const MAX_OPCODE: u8 = 0xb9;
 
 pub struct RpcServer {
     node: Arc<Node>,
@@ -6313,9 +6316,23 @@ fn parse_max_burn_amount(value: Option<&Value>) -> Result<u64> {
         .to_sat())
 }
 
+fn script_has_valid_ops(script: &bitcoin::Script) -> bool {
+    script.instructions().all(|instruction| match instruction {
+        Ok(Instruction::Op(opcode)) => opcode.to_u8() <= MAX_OPCODE,
+        Ok(Instruction::PushBytes(bytes)) => bytes.len() <= MAX_SCRIPT_ELEMENT_SIZE,
+        Err(_) => false,
+    })
+}
+
+fn script_is_unspendable(script: &bitcoin::Script) -> bool {
+    script.is_op_return() || script.len() > MAX_SCRIPT_SIZE
+}
+
 fn validate_burn_amount(transaction: &Transaction, max_burn_amount: u64) -> Result<()> {
     if transaction.output.iter().any(|output| {
-        output.script_pubkey.is_op_return() && output.value.to_sat() > max_burn_amount
+        (script_is_unspendable(&output.script_pubkey)
+            || !script_has_valid_ops(&output.script_pubkey))
+            && output.value.to_sat() > max_burn_amount
     }) {
         bail!("Unspendable output exceeds maximum configured by user (maxburnamount)")
     }
@@ -9147,6 +9164,18 @@ mod tests {
         });
         assert!(validate_burn_amount(&transaction, 0).is_err());
         assert!(validate_burn_amount(&transaction, 1).is_ok());
+
+        transaction.output.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x4c]),
+        });
+        assert!(validate_burn_amount(&transaction, 0).is_err());
+
+        transaction.output.push(TxOut {
+            value: Amount::from_sat(1),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; MAX_SCRIPT_SIZE + 1]),
+        });
+        assert!(validate_burn_amount(&transaction, 0).is_err());
     }
 
     #[test]

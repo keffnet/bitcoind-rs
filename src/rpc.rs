@@ -1408,22 +1408,22 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 },
                 {
                     "name": "onion",
-                    "limited": false,
-                    "reachable": true,
+                    "limited": true,
+                    "reachable": false,
                     "proxy": "",
                     "proxy_randomize_credentials": false,
                 },
                 {
                     "name": "i2p",
-                    "limited": false,
-                    "reachable": true,
+                    "limited": true,
+                    "reachable": false,
                     "proxy": "",
                     "proxy_randomize_credentials": false,
                 },
                 {
                     "name": "cjdns",
-                    "limited": false,
-                    "reachable": true,
+                    "limited": true,
+                    "reachable": false,
                     "proxy": "",
                     "proxy_randomize_credentials": false,
                 },
@@ -12210,6 +12210,17 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["ipv4", "ipv6", "onion", "i2p", "cjdns"]
         );
+        let networks = dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap();
+        for name in ["onion", "i2p", "cjdns"] {
+            let network = networks["networks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|network| network["name"] == name)
+                .unwrap();
+            assert_eq!(network["limited"], json!(true));
+            assert_eq!(network["reachable"], json!(false));
+        }
         dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap();
         assert!(node.network_active());
     }

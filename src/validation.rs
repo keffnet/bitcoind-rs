@@ -65,6 +65,8 @@ pub enum ValidationError {
     BadMerkleRoot,
     #[error("block witness commitment is invalid")]
     BadWitnessCommitment,
+    #[error("block contains witness data before SegWit activation")]
+    UnexpectedWitness,
     #[error("block signet solution is invalid")]
     BadSignetSolution,
     #[error("block weight exceeds the consensus limit")]
@@ -362,8 +364,17 @@ pub fn validate_block_structure_with_signet(
     if !block.check_merkle_root() {
         return Err(ValidationError::BadMerkleRoot);
     }
-    if !block.check_witness_commitment() {
-        return Err(ValidationError::BadWitnessCommitment);
+    if height >= buried_deployment_heights(network).segwit {
+        if !block.check_witness_commitment() {
+            return Err(ValidationError::BadWitnessCommitment);
+        }
+    } else if block.txdata.iter().any(|transaction| {
+        transaction
+            .input
+            .iter()
+            .any(|input| !input.witness.is_empty())
+    }) {
+        return Err(ValidationError::UnexpectedWitness);
     }
     if block.weight().to_wu() > MAX_BLOCK_WEIGHT as u64 {
         return Err(ValidationError::OversizedBlock);
@@ -953,6 +964,40 @@ mod tests {
                 actual: 1,
                 required: 2
             })
+        ));
+    }
+
+    #[test]
+    fn rejects_witness_data_before_segwit_activation() {
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Builder::new().push_int(1).push_int(0).into_script(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0u8; 32]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::ONE,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        assert!(matches!(
+            validate_block_structure(&block, Network::Bitcoin, 0, Amount::MAX_MONEY.to_sat()),
+            Err(ValidationError::UnexpectedWitness)
         ));
     }
 

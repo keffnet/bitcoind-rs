@@ -32,7 +32,7 @@ use parking_lot::RwLock;
 use rand::random;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::chain::ChainState;
 use crate::config::{Config, PeerPermissions};
@@ -2436,6 +2436,17 @@ impl Node {
         let mut p2p_task = tokio::spawn(p2p.run());
         let mut rpc_task = tokio::spawn(rpc.run());
         let mut electrum_task = tokio::spawn(electrum.run());
+        let background_node = self.clone();
+        let background_validation_task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(100));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = background_node.chain.write().poll_background_validation() {
+                    warn!(%error, "background AssumeUTXO validation supervisor failed to poll");
+                }
+            }
+        });
         let expiry_node = self.clone();
         let mempool_expiry_task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(MEMPOOL_EXPIRY_INTERVAL);
@@ -2459,6 +2470,7 @@ impl Node {
         rpc_task.abort();
         electrum_task.abort();
         zmq_task.abort();
+        background_validation_task.abort();
         mempool_expiry_task.abort();
         if self.config.persist_mempool {
             self.persist_mempool()?;

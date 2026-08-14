@@ -4,6 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
+use std::thread;
 
 use anyhow::{Context, Result, bail};
 use bincode::{deserialize as deserialize_binary, serialize as serialize_binary};
@@ -15,6 +20,7 @@ use bitcoin::pow::{CompactTarget, Target, Work};
 use bitcoin::{
     Amount, Block, BlockHash, Network, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid,
 };
+use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -37,6 +43,9 @@ const CORE_UTXO_SNAPSHOT_VERSION: u16 = 2;
 const CHAIN_METADATA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-v1\0";
 const CHAIN_SNAPSHOT_MAGIC: &[u8] = b"bitcoind-rs-snapshot-v1\0";
 const ASSUMEUTXO_STATE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-v1\0";
+const ASSUMEUTXO_BASE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-base-v1\0";
+const ASSUMEUTXO_CHECKPOINT_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-checkpoint-v1\0";
+const ASSUMEUTXO_CHECKPOINT_INTERVAL: u32 = 256;
 
 /// A hardcoded UTXO commitment from Bitcoin Core v31.1's chain parameters.
 ///
@@ -416,6 +425,58 @@ struct SnapshotProvenance {
     base_hash: String,
     #[serde(default)]
     validated: bool,
+    #[serde(default)]
+    failure: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AssumeUtxoBaseSnapshot {
+    base_hash: String,
+    utxos: HashMap<OutPoint, UtxoEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AssumeUtxoCheckpoint {
+    base_hash: String,
+    height: u32,
+    block_hash: String,
+    #[serde(default)]
+    base_matches: Option<bool>,
+    utxos: HashMap<OutPoint, UtxoEntry>,
+}
+
+#[derive(Debug)]
+enum BackgroundValidationOutcome {
+    Complete {
+        target_tip: BlockHash,
+        utxos: HashMap<OutPoint, UtxoEntry>,
+        base_matches: bool,
+    },
+    Failed {
+        target_tip: BlockHash,
+        error: String,
+        utxos: Option<HashMap<OutPoint, UtxoEntry>>,
+    },
+}
+
+#[derive(Clone)]
+struct BackgroundValidation {
+    base_hash: BlockHash,
+    cancel: Arc<AtomicBool>,
+    progress: Arc<AtomicU32>,
+    outcome: Arc<Mutex<Option<BackgroundValidationOutcome>>>,
+}
+
+struct BackgroundValidationJob {
+    data_dir: PathBuf,
+    network: Network,
+    signet_challenge: Option<Vec<u8>>,
+    active_chain: Vec<BlockHash>,
+    block_index: HashMap<BlockHash, BlockNode>,
+    base_hash: BlockHash,
+    base_height: u32,
+    target_tip: BlockHash,
+    cancel: Arc<AtomicBool>,
 }
 
 fn serialize_internal<T: Serialize>(magic: &[u8], value: &T) -> Result<Vec<u8>> {
@@ -456,6 +517,8 @@ pub struct ChainState {
     initial_block_download: bool,
     snapshot_base: Option<BlockHash>,
     snapshot_validated: bool,
+    snapshot_validation_error: Option<String>,
+    background_validation: Option<BackgroundValidation>,
     block_index: HashMap<BlockHash, BlockNode>,
     orphans: HashMap<BlockHash, Vec<Block>>,
     invalid_blocks: HashSet<BlockHash>,
@@ -620,6 +683,10 @@ impl ChainState {
             snapshot_validated: persisted_snapshot_provenance
                 .as_ref()
                 .is_some_and(|provenance| provenance.validated),
+            snapshot_validation_error: persisted_snapshot_provenance
+                .as_ref()
+                .and_then(|provenance| provenance.failure.clone()),
+            background_validation: None,
             block_index: HashMap::new(),
             orphans: HashMap::new(),
             invalid_blocks,
@@ -708,6 +775,7 @@ impl ChainState {
         if !loaded_snapshot {
             state.snapshot_base = None;
             state.snapshot_validated = true;
+            state.snapshot_validation_error = None;
             state.remove_snapshot_provenance_file()?;
         }
         state.index_persisted_headers(&persisted_headers)?;
@@ -724,8 +792,15 @@ impl ChainState {
         }
         if loaded_snapshot {
             let snapshot_utxos = state.utxos.clone();
-            state.validate_snapshot_utxos(&snapshot_utxos)?;
-            if !snapshot_verified {
+            let pending_assumeutxo = state.snapshot_base.is_some()
+                && !state.snapshot_validated
+                && state.snapshot_validation_error.is_none();
+            if pending_assumeutxo {
+                state.validate_snapshot_utxo_shape(&snapshot_utxos, state.height())?;
+            } else {
+                state.validate_snapshot_utxos(&snapshot_utxos)?;
+            }
+            if !pending_assumeutxo && !snapshot_verified {
                 if state.prune_height.is_none() {
                     let expected = state
                         .replay_utxos_for_block(state.best_hash(), false)?
@@ -739,6 +814,12 @@ impl ChainState {
         }
         state.update_ibd_status();
         state.persist_metadata()?;
+        if state.snapshot_base.is_some()
+            && !state.snapshot_validated
+            && state.snapshot_validation_error.is_none()
+        {
+            state.start_background_validation()?;
+        }
         Ok(state)
     }
 
@@ -996,6 +1077,114 @@ impl ChainState {
     pub fn snapshot_provenance(&self) -> Option<(BlockHash, bool)> {
         self.snapshot_base
             .map(|base| (base, self.snapshot_validated))
+    }
+
+    pub fn snapshot_validation_error(&self) -> Option<String> {
+        self.snapshot_validation_error.clone()
+    }
+
+    /// Return the background validation chainstate's current replay point.
+    /// The active snapshot chainstate remains the serving tip while this
+    /// point advances independently.
+    pub fn background_chainstate(&self) -> Option<(u32, BlockHash, BlockHash, Option<String>)> {
+        let base_hash = self.snapshot_base?;
+        if self.snapshot_validated {
+            return None;
+        }
+        let progress_height = self
+            .background_validation
+            .as_ref()
+            .map(|validation| validation.progress.load(Ordering::Acquire))
+            .or_else(|| self.block_height_by_hash(&base_hash))
+            .unwrap_or_default()
+            .min(self.height());
+        let progress_hash = self
+            .active_chain
+            .get(progress_height as usize)
+            .copied()
+            .unwrap_or(base_hash);
+        Some((
+            progress_height,
+            progress_hash,
+            base_hash,
+            self.snapshot_validation_error.clone(),
+        ))
+    }
+
+    /// Complete a background AssumeUTXO validation job, if its worker has
+    /// published a result.  This is intentionally called from the node's
+    /// periodic supervisor and from synchronous chain-entry points so the
+    /// worker never mutates the serving chainstate behind its lock.
+    pub fn poll_background_validation(&mut self) -> Result<()> {
+        let Some(validation) = self.background_validation.as_ref() else {
+            return Ok(());
+        };
+        let outcome = validation.outcome.lock().take();
+        let Some(outcome) = outcome else {
+            return Ok(());
+        };
+        let target_tip = match &outcome {
+            BackgroundValidationOutcome::Complete { target_tip, .. }
+            | BackgroundValidationOutcome::Failed { target_tip, .. } => *target_tip,
+        };
+        let base_hash = validation.base_hash;
+        let target_is_current = target_tip == self.best_hash()
+            && self
+                .block_height_by_hash(&target_tip)
+                .is_some_and(|height| self.active_chain.get(height as usize) == Some(&target_tip));
+        self.background_validation = None;
+        if !target_is_current || self.snapshot_base != Some(base_hash) {
+            if self.snapshot_base == Some(base_hash)
+                && !self.snapshot_validated
+                && self.snapshot_validation_error.is_none()
+            {
+                self.start_background_validation()?;
+            }
+            return Ok(());
+        }
+
+        match outcome {
+            BackgroundValidationOutcome::Complete {
+                base_matches: true, ..
+            } => {
+                self.snapshot_base = None;
+                self.snapshot_validated = true;
+                self.snapshot_validation_error = None;
+                self.persist_snapshot()?;
+                self.remove_assumeutxo_artifacts()?;
+                self.persist_snapshot_provenance()?;
+            }
+            BackgroundValidationOutcome::Complete {
+                base_matches: false,
+                utxos,
+                ..
+            } => {
+                self.utxos = utxos;
+                self.rebuild_utxo_index();
+                self.snapshot_base = None;
+                self.snapshot_validated = true;
+                self.snapshot_validation_error = None;
+                self.persist_snapshot()?;
+                self.remove_assumeutxo_artifacts()?;
+                self.persist_snapshot_provenance()?;
+            }
+            BackgroundValidationOutcome::Failed { error, utxos, .. } => {
+                if let Some(utxos) = utxos {
+                    self.utxos = utxos;
+                    self.rebuild_utxo_index();
+                    self.snapshot_base = None;
+                    self.snapshot_validated = true;
+                    self.snapshot_validation_error = None;
+                    self.persist_snapshot()?;
+                    self.remove_assumeutxo_artifacts()?;
+                    self.persist_snapshot_provenance()?;
+                } else {
+                    self.snapshot_validation_error = Some(error);
+                    self.persist_snapshot_provenance()?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Return Core's latched initial-block-download state. Transaction relay
@@ -2132,11 +2321,17 @@ impl ChainState {
         let bytes = fs::read(path.as_ref())
             .with_context(|| format!("reading UTXO snapshot {}", path.as_ref().display()))?;
         if bytes.starts_with(&CORE_UTXO_SNAPSHOT_MAGIC) {
-            let (result, fully_validated) = self.load_core_utxo_set(&bytes, strict_assumeutxo)?;
+            let (result, _fully_validated) = self.load_core_utxo_set(&bytes, strict_assumeutxo)?;
             if strict_assumeutxo {
                 self.snapshot_base = Some(result.1);
-                self.snapshot_validated = fully_validated;
+                // Strict activation always creates a second, independently
+                // replayed chainstate.  Even when local block data happens to
+                // be complete, doing the replay asynchronously preserves the
+                // same trust boundary as Core and keeps RPC activation fast.
+                self.snapshot_validated = false;
+                self.snapshot_validation_error = None;
                 self.persist_snapshot_provenance()?;
+                self.start_background_validation()?;
             } else {
                 self.clear_snapshot_provenance()?;
             }
@@ -2230,16 +2425,24 @@ impl ChainState {
                 self.median_time_past_for_parent(parent)
             };
         }
-        self.validate_snapshot_utxos_at(&snapshot.utxos, snapshot.base_hash)?;
-        let fully_validated =
-            if let Some(expected) = self.replay_utxos_for_block(snapshot.base_hash, false)? {
-                if expected != snapshot.utxos {
-                    bail!("UTXO snapshot contents do not match the base chain")
-                }
-                true
-            } else {
-                false
-            };
+        if strict_assumeutxo {
+            self.validate_snapshot_utxo_shape(&snapshot.utxos, base_height)?;
+        } else {
+            self.validate_snapshot_utxos_at(&snapshot.utxos, snapshot.base_hash)?;
+        }
+        if strict_assumeutxo {
+            self.persist_assumeutxo_base_snapshot(snapshot.base_hash, &snapshot.utxos)?;
+        }
+        let fully_validated = if strict_assumeutxo {
+            false
+        } else if let Some(expected) = self.replay_utxos_for_block(snapshot.base_hash, false)? {
+            if expected != snapshot.utxos {
+                bail!("UTXO snapshot contents do not match the base chain")
+            }
+            true
+        } else {
+            false
+        };
 
         let active_height = self.height();
         if base_height < active_height {
@@ -2305,6 +2508,22 @@ impl ChainState {
         self.validate_snapshot_utxos_at(utxos, self.best_hash())
     }
 
+    fn validate_snapshot_utxo_shape(
+        &self,
+        utxos: &HashMap<OutPoint, UtxoEntry>,
+        tip_height: u32,
+    ) -> Result<()> {
+        for entry in utxos.values() {
+            if entry.height > tip_height {
+                bail!("UTXO snapshot contains an output from the future")
+            }
+            if entry.output.value > Amount::MAX_MONEY {
+                bail!("UTXO snapshot contains an output above the money range")
+            }
+        }
+        Ok(())
+    }
+
     fn validate_snapshot_utxos_at(
         &mut self,
         utxos: &HashMap<OutPoint, UtxoEntry>,
@@ -2316,6 +2535,7 @@ impl ChainState {
         if !self.is_active_block(&tip_hash) {
             bail!("UTXO snapshot target block is not on the active chain")
         }
+        self.validate_snapshot_utxo_shape(utxos, tip_height)?;
         let mut entries_by_block: HashMap<BlockHash, Vec<(&OutPoint, &UtxoEntry, TxLocation)>> =
             HashMap::new();
         for (outpoint, entry) in utxos {
@@ -2503,6 +2723,7 @@ impl ChainState {
     }
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {
+        self.poll_background_validation()?;
         let hash = block.block_hash();
         if self.has_invalid_ancestor(hash) {
             bail!("block {hash} is on an invalidated branch")
@@ -3163,6 +3384,8 @@ impl ChainState {
         let old_coin_stats = self.coin_stats.clone();
         let old_snapshot_base = self.snapshot_base;
         let old_snapshot_validated = self.snapshot_validated;
+        let old_snapshot_validation_error = self.snapshot_validation_error.clone();
+        let old_background_validation = self.background_validation.take();
         let snapshot_invalidated = self.snapshot_base.is_some_and(|base| !path.contains(&base));
         self.active_chain.clear();
         self.headers.clear();
@@ -3176,6 +3399,7 @@ impl ChainState {
             if snapshot_invalidated {
                 self.snapshot_base = None;
                 self.snapshot_validated = true;
+                self.snapshot_validation_error = None;
             }
             self.initialize_genesis(&blocks[0])?;
             for block in blocks.iter().skip(1) {
@@ -3197,10 +3421,19 @@ impl ChainState {
             self.coin_stats = old_coin_stats;
             self.snapshot_base = old_snapshot_base;
             self.snapshot_validated = old_snapshot_validated;
+            self.snapshot_validation_error = old_snapshot_validation_error;
+            self.background_validation = old_background_validation.clone();
             return Err(error);
         }
         if snapshot_invalidated {
+            if let Some(background) = old_background_validation.as_ref() {
+                background.cancel.store(true, Ordering::Release);
+            }
+            self.background_validation = None;
             self.remove_snapshot_provenance_file()?;
+            self.remove_assumeutxo_artifacts()?;
+        } else {
+            self.background_validation = old_background_validation;
         }
         self.update_ibd_status();
         Ok(())
@@ -3719,6 +3952,105 @@ impl ChainState {
         self.data_dir.join("chainstate.snapshot.sha256")
     }
 
+    fn assumeutxo_base_snapshot_path(&self) -> PathBuf {
+        self.data_dir.join("assumeutxo-base.bin")
+    }
+
+    fn assumeutxo_checkpoint_path(&self) -> PathBuf {
+        self.data_dir.join("assumeutxo-checkpoint.bin")
+    }
+
+    fn persist_assumeutxo_base_snapshot(
+        &self,
+        base_hash: BlockHash,
+        utxos: &HashMap<OutPoint, UtxoEntry>,
+    ) -> Result<()> {
+        let snapshot = AssumeUtxoBaseSnapshot {
+            base_hash: base_hash.to_string(),
+            utxos: utxos.clone(),
+        };
+        let bytes = serialize_internal(ASSUMEUTXO_BASE_MAGIC, &snapshot)?;
+        let path = self.assumeutxo_base_snapshot_path();
+        let temp = path.with_extension("bin.tmp");
+        fs::write(&temp, bytes)?;
+        fs::rename(temp, path)?;
+        Ok(())
+    }
+
+    fn remove_assumeutxo_artifacts(&self) -> Result<()> {
+        for path in [
+            self.assumeutxo_base_snapshot_path(),
+            self.assumeutxo_checkpoint_path(),
+        ] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn start_background_validation(&mut self) -> Result<()> {
+        let Some(base_hash) = self.snapshot_base else {
+            return Ok(());
+        };
+        if self.snapshot_validated || self.snapshot_validation_error.is_some() {
+            return Ok(());
+        }
+        let base_height = self
+            .block_height_by_hash(&base_hash)
+            .context("AssumeUTXO base block is not indexed")?;
+        if !self.is_active_block(&base_hash) {
+            bail!("AssumeUTXO base block is not on the active chain")
+        }
+        let target_tip = self.best_hash();
+        let active_chain = self.active_chain.clone();
+        let block_index = self.block_index.clone();
+        let data_dir = self.data_dir.clone();
+        let network = self.network;
+        let signet_challenge = self.signet_challenge.clone();
+        if let Some(previous) = self.background_validation.take() {
+            previous.cancel.store(true, Ordering::Release);
+        }
+        let progress = Arc::new(AtomicU32::new(
+            load_assumeutxo_checkpoint(&data_dir, base_hash, &active_chain)
+                .ok()
+                .flatten()
+                .map_or(0, |checkpoint| checkpoint.height),
+        ));
+        let outcome = Arc::new(Mutex::new(None));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = BackgroundValidationJob {
+            data_dir,
+            network,
+            signet_challenge,
+            active_chain,
+            block_index,
+            base_hash,
+            base_height,
+            target_tip,
+            cancel: cancel.clone(),
+        };
+        self.background_validation = Some(BackgroundValidation {
+            base_hash,
+            cancel,
+            progress: progress.clone(),
+            outcome: outcome.clone(),
+        });
+        let worker = thread::Builder::new()
+            .name("assumeutxo-validation".to_owned())
+            .spawn(move || {
+                let result = run_background_validation(job, progress);
+                *outcome.lock() = Some(result);
+            });
+        if let Err(error) = worker {
+            self.background_validation = None;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     fn snapshot_provenance_path(&self) -> PathBuf {
         self.data_dir.join("assumeutxo.bin")
     }
@@ -3730,6 +4062,7 @@ impl ChainState {
         let provenance = SnapshotProvenance {
             base_hash: base_hash.to_string(),
             validated: self.snapshot_validated,
+            failure: self.snapshot_validation_error.clone(),
         };
         let bytes = serialize_internal(ASSUMEUTXO_STATE_MAGIC, &provenance)?;
         let temp = self.data_dir.join("assumeutxo.bin.tmp");
@@ -3749,6 +4082,11 @@ impl ChainState {
     fn clear_snapshot_provenance(&mut self) -> Result<()> {
         self.snapshot_base = None;
         self.snapshot_validated = true;
+        self.snapshot_validation_error = None;
+        if let Some(background) = self.background_validation.take() {
+            background.cancel.store(true, Ordering::Release);
+        }
+        self.remove_assumeutxo_artifacts()?;
         self.remove_snapshot_provenance_file()
     }
 
@@ -3835,6 +4173,295 @@ impl ChainState {
                 .then_with(|| left_hash.to_string().cmp(&right_hash.to_string()))
         });
         nodes.into_iter().map(|(_, node)| node.header).collect()
+    }
+}
+
+impl Drop for ChainState {
+    fn drop(&mut self) {
+        if let Some(background) = self.background_validation.as_ref() {
+            background.cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn load_assumeutxo_checkpoint(
+    data_dir: &Path,
+    base_hash: BlockHash,
+    active_chain: &[BlockHash],
+) -> Result<Option<AssumeUtxoCheckpoint>> {
+    let path = data_dir.join("assumeutxo-checkpoint.bin");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading AssumeUTXO checkpoint {}", path.display()))?;
+    let checkpoint: AssumeUtxoCheckpoint =
+        deserialize_internal(&bytes, ASSUMEUTXO_CHECKPOINT_MAGIC)
+            .with_context(|| format!("decoding AssumeUTXO checkpoint {}", path.display()))?;
+    let checkpoint_base = checkpoint
+        .base_hash
+        .parse::<BlockHash>()
+        .context("decoding AssumeUTXO checkpoint base hash")?;
+    let checkpoint_block = checkpoint
+        .block_hash
+        .parse::<BlockHash>()
+        .context("decoding AssumeUTXO checkpoint block hash")?;
+    if checkpoint_base != base_hash
+        || active_chain.get(checkpoint.height as usize) != Some(&checkpoint_block)
+    {
+        return Ok(None);
+    }
+    Ok(Some(checkpoint))
+}
+
+fn load_assumeutxo_expected_snapshot(
+    data_dir: &Path,
+    base_hash: BlockHash,
+    target_tip: BlockHash,
+) -> Result<HashMap<OutPoint, UtxoEntry>> {
+    let base_path = data_dir.join("assumeutxo-base.bin");
+    if base_path.exists() {
+        let bytes = fs::read(&base_path)
+            .with_context(|| format!("reading AssumeUTXO base snapshot {}", base_path.display()))?;
+        let snapshot: AssumeUtxoBaseSnapshot = deserialize_internal(&bytes, ASSUMEUTXO_BASE_MAGIC)
+            .with_context(|| {
+                format!("decoding AssumeUTXO base snapshot {}", base_path.display())
+            })?;
+        let stored_base = snapshot
+            .base_hash
+            .parse::<BlockHash>()
+            .context("decoding AssumeUTXO base snapshot hash")?;
+        if stored_base != base_hash {
+            bail!("AssumeUTXO base snapshot does not match its provenance")
+        }
+        return Ok(snapshot.utxos);
+    }
+
+    // Compatibility for an interrupted upgrade from the original single
+    // chainstate implementation: when the base is the serving tip, the
+    // durable chainstate snapshot is itself the expected validation input.
+    if target_tip != base_hash {
+        bail!("AssumeUTXO base snapshot is missing")
+    }
+    let path = data_dir.join("chainstate.snapshot");
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading chainstate snapshot {}", path.display()))?;
+    let snapshot: ChainSnapshot = if bytes.starts_with(CHAIN_SNAPSHOT_MAGIC) {
+        deserialize_internal(&bytes, CHAIN_SNAPSHOT_MAGIC)?
+    } else {
+        serde_json::from_slice(&bytes).context("decoding chainstate snapshot")?
+    };
+    if snapshot.tip.parse::<BlockHash>().ok() != Some(base_hash) {
+        bail!("chainstate snapshot does not contain the AssumeUTXO base")
+    }
+    Ok(snapshot.utxos)
+}
+
+fn persist_assumeutxo_checkpoint(data_dir: &Path, checkpoint: &AssumeUtxoCheckpoint) -> Result<()> {
+    let bytes = serialize_internal(ASSUMEUTXO_CHECKPOINT_MAGIC, checkpoint)?;
+    let path = data_dir.join("assumeutxo-checkpoint.bin");
+    let temp = path.with_extension("bin.tmp");
+    fs::write(&temp, bytes)?;
+    fs::rename(temp, path)?;
+    Ok(())
+}
+
+fn open_background_replay_state(
+    network: Network,
+    data_dir: &Path,
+    signet_challenge: Option<Vec<u8>>,
+    active_chain: &[BlockHash],
+    block_index: &HashMap<BlockHash, BlockNode>,
+) -> Result<ChainState> {
+    let store = BlockStore::open_read_only(data_dir.join("blocks"))?;
+    let filter_store = FilterStore::open(data_dir.join("filters"))?;
+    let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
+    let headers = active_chain
+        .iter()
+        .map(|hash| {
+            block_index
+                .get(hash)
+                .map(|node| node.header)
+                .context("background validator is missing an active header")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(ChainState {
+        network,
+        data_dir: data_dir.to_owned(),
+        signet_challenge,
+        store,
+        filter_store,
+        blockfilter_index_enabled: false,
+        coinstats_store,
+        txospender_index_enabled: false,
+        coinstats_index_enabled: false,
+        coin_stats: None,
+        active_chain: active_chain.to_vec(),
+        headers,
+        initial_block_download: true,
+        snapshot_base: None,
+        snapshot_validated: true,
+        snapshot_validation_error: None,
+        background_validation: None,
+        block_index: block_index.clone(),
+        orphans: HashMap::new(),
+        invalid_blocks: HashSet::new(),
+        prune_height: None,
+        prune_mode: false,
+        prune_target_size: None,
+        utxos: HashMap::new(),
+        utxos_by_script: HashMap::new(),
+        tx_index: HashMap::new(),
+        tx_index_all: HashMap::new(),
+        history: HashMap::new(),
+        spent_by: HashMap::new(),
+        precious_blocks: HashMap::new(),
+        precious_sequence: 0,
+        basic_filter_cache: HashMap::new(),
+        block_undo_cache: HashMap::new(),
+    })
+}
+
+fn run_background_validation(
+    job: BackgroundValidationJob,
+    progress: Arc<AtomicU32>,
+) -> BackgroundValidationOutcome {
+    let BackgroundValidationJob {
+        data_dir,
+        network,
+        signet_challenge,
+        active_chain,
+        block_index,
+        base_hash,
+        base_height,
+        target_tip,
+        cancel,
+    } = job;
+    let result = (|| -> Result<(HashMap<OutPoint, UtxoEntry>, bool)> {
+        let target_height = active_chain
+            .iter()
+            .position(|hash| *hash == target_tip)
+            .context("background validator target tip is not active")?
+            as u32;
+        if active_chain.get(base_height as usize) != Some(&base_hash) {
+            bail!("background validator base block is not active")
+        }
+        let expected = load_assumeutxo_expected_snapshot(&data_dir, base_hash, target_tip)?;
+        let checkpoint = load_assumeutxo_checkpoint(&data_dir, base_hash, &active_chain)?;
+        let (mut utxos, mut start_height, mut base_matches) = if let Some(checkpoint) = checkpoint {
+            let height = checkpoint.height;
+            (checkpoint.utxos, height, checkpoint.base_matches)
+        } else {
+            (HashMap::new(), 0, None)
+        };
+        if start_height > target_height {
+            start_height = 0;
+            utxos.clear();
+            base_matches = None;
+        }
+        if start_height > base_height && base_matches.is_none() {
+            bail!("AssumeUTXO checkpoint crossed its base without a comparison")
+        }
+        progress.store(start_height, Ordering::Release);
+
+        let mut state = open_background_replay_state(
+            network,
+            &data_dir,
+            signet_challenge,
+            &active_chain,
+            &block_index,
+        )?;
+        if base_height == 0 && start_height == 0 {
+            base_matches = Some(utxos == expected);
+        }
+        for height in start_height.saturating_add(1)..=target_height {
+            if cancel.load(Ordering::Acquire) {
+                bail!("background AssumeUTXO validation was cancelled")
+            }
+            let block_hash = active_chain[height as usize];
+            let block = state
+                .store
+                .get(&block_hash)?
+                .with_context(|| format!("background validator is missing block {block_hash}"))?;
+            let node = state
+                .block_index
+                .get(&block_hash)
+                .copied()
+                .context("background validator block index entry is missing")?;
+            let parent_hash = block.header.prev_blockhash;
+            let parent = state
+                .block_index
+                .get(&parent_hash)
+                .copied()
+                .context("background validator parent index entry is missing")?;
+            validation::validate_bip94_timewarp(
+                state.network,
+                node.height,
+                block.header.time,
+                parent.header.time,
+            )?;
+            validation::validate_header(
+                state.network,
+                &block.header,
+                parent_hash,
+                state.expected_target_for_parent(parent_hash, block.header.time),
+                state.median_time_past_for_parent(parent_hash),
+            )?;
+            state.validate_block_structure(
+                &block,
+                state.network,
+                node.height,
+                Amount::MAX_MONEY.to_sat(),
+            )?;
+            let median_time_past = state.median_time_past_for_parent(parent_hash);
+            let application =
+                state.validate_block_transactions(&block, node.height, &utxos, median_time_past)?;
+            apply_block_to_utxos(
+                &mut utxos,
+                &block,
+                node.height,
+                median_time_past,
+                application.spent_entries,
+            );
+            if height == base_height {
+                base_matches = Some(utxos == expected);
+            }
+            progress.store(height, Ordering::Release);
+            if height % ASSUMEUTXO_CHECKPOINT_INTERVAL == 0
+                || height == base_height
+                || height == target_height
+            {
+                if cancel.load(Ordering::Acquire) {
+                    bail!("background AssumeUTXO validation was cancelled")
+                }
+                persist_assumeutxo_checkpoint(
+                    &data_dir,
+                    &AssumeUtxoCheckpoint {
+                        base_hash: base_hash.to_string(),
+                        height,
+                        block_hash: block_hash.to_string(),
+                        base_matches,
+                        utxos: utxos.clone(),
+                    },
+                )?;
+            }
+        }
+        let base_matches =
+            base_matches.context("background validator did not reach the snapshot base")?;
+        Ok((utxos, base_matches))
+    })();
+
+    match result {
+        Ok((utxos, base_matches)) => BackgroundValidationOutcome::Complete {
+            target_tip,
+            utxos,
+            base_matches,
+        },
+        Err(error) => BackgroundValidationOutcome::Failed {
+            target_tip,
+            error: error.to_string(),
+            utxos: None,
+        },
     }
 }
 
@@ -4486,6 +5113,71 @@ mod tests {
 
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.snapshot_provenance(), Some((base, false)));
+        assert!(reopened.background_chainstate().is_some());
+    }
+
+    #[test]
+    fn background_assumeutxo_validation_promotes_a_matching_chainstate() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            let block = mine_block(&state, height);
+            state.connect_block(block).unwrap();
+        }
+        let base = state.best_hash();
+        let expected = state.utxos.clone();
+        state.persist_snapshot().unwrap();
+        state
+            .persist_assumeutxo_base_snapshot(base, &expected)
+            .unwrap();
+        state.snapshot_base = Some(base);
+        state.snapshot_validated = false;
+        state.persist_snapshot_provenance().unwrap();
+        state.start_background_validation().unwrap();
+
+        for _ in 0..200 {
+            state.poll_background_validation().unwrap();
+            if state.snapshot_provenance().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(state.snapshot_provenance().is_none());
+        assert!(state.background_chainstate().is_none());
+        assert_eq!(state.utxos, expected);
+        assert!(!directory.path().join("assumeutxo.bin").exists());
+        assert!(!directory.path().join("assumeutxo-base.bin").exists());
+    }
+
+    #[test]
+    fn background_assumeutxo_validation_discards_a_mismatching_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            let block = mine_block(&state, height);
+            state.connect_block(block).unwrap();
+        }
+        let base = state.best_hash();
+        let expected = state.utxos.clone();
+        state.persist_snapshot().unwrap();
+        state
+            .persist_assumeutxo_base_snapshot(base, &HashMap::new())
+            .unwrap();
+        state.snapshot_base = Some(base);
+        state.snapshot_validated = false;
+        state.persist_snapshot_provenance().unwrap();
+        state.start_background_validation().unwrap();
+
+        for _ in 0..200 {
+            state.poll_background_validation().unwrap();
+            if state.snapshot_provenance().is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(state.snapshot_provenance().is_none());
+        assert_eq!(state.utxos, expected);
+        assert!(state.snapshot_validation_error().is_none());
     }
 
     #[test]

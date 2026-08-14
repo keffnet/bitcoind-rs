@@ -105,6 +105,58 @@ impl BlockStore {
         })
     }
 
+    /// Open the block and undo records for a reader that must not mutate the
+    /// append-only stores.  Background chainstate validation uses a separate
+    /// file descriptor so seeks in the validator cannot race the active
+    /// chain's reads or writes.
+    pub fn open_read_only(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref();
+        let path = directory.join("blocks.dat");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .with_context(|| format!("opening block store {}", path.display()))?;
+        let index_path = directory.join("blocks.index");
+        let mut index_file = OpenOptions::new()
+            .read(true)
+            .open(&index_path)
+            .with_context(|| format!("opening block index {}", index_path.display()))?;
+        let data_len = file.metadata()?.len();
+        let index = match load_index(&mut index_file, data_len)? {
+            Some(index) => index,
+            None => {
+                scan_index(&mut file).with_context(|| format!("scanning {}", path.display()))?
+            }
+        };
+
+        let undo_path = directory.join("undo.dat");
+        let mut undo_file = OpenOptions::new()
+            .read(true)
+            .open(&undo_path)
+            .with_context(|| format!("opening undo store {}", undo_path.display()))?;
+        let undo_index_path = directory.join("undo.index");
+        let mut undo_index_file = OpenOptions::new()
+            .read(true)
+            .open(&undo_index_path)
+            .with_context(|| format!("opening undo index {}", undo_index_path.display()))?;
+        let undo_data_len = undo_file.metadata()?.len();
+        let undo_index = match load_index(&mut undo_index_file, undo_data_len)? {
+            Some(index) => index,
+            None => scan_undo_index(&mut undo_file)
+                .with_context(|| format!("scanning {}", undo_path.display()))?,
+        };
+
+        Ok(Self {
+            path,
+            file,
+            index_file,
+            index,
+            undo_file,
+            undo_index_file,
+            undo_index,
+        })
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

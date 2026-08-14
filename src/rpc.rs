@@ -9962,32 +9962,85 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
-    let chain = node.chain.read();
+    let mut chain = node.chain.write();
+    chain.poll_background_validation()?;
     let tip = chain.tip();
     let header_tip = chain.best_header_tip();
-    let header = chain
-        .header(tip.height)
-        .ok_or_else(|| anyhow!("active tip header is unavailable"))?;
-    let (snapshot_base, validated) = chain
-        .snapshot_provenance()
-        .map_or((None, true), |(base, validated)| (Some(base), validated));
-    let mut chainstate = json!({
-        "blocks": tip.height,
-        "bestblockhash": tip.hash.to_string(),
-        "bits": format!("{:08x}", header.bits.to_consensus()),
-        "target": format!("{:064x}", header.target()),
-        "difficulty": header.difficulty_float(),
-        "verificationprogress": 1.0,
-        "coins_db_cache_bytes": 0,
-        "coins_tip_cache_bytes": chain.utxo_bogo_size(),
-        "validated": validated,
-    });
-    if let Some(snapshot_base) = snapshot_base {
-        chainstate["snapshot_blockhash"] = json!(snapshot_base.to_string());
+    let mut chainstates = Vec::with_capacity(2);
+    let make_chainstate = |height: u32,
+                           hash: BlockHash,
+                           verificationprogress: f64,
+                           coins_tip_cache_bytes: u64,
+                           validated: bool,
+                           snapshot_base: Option<BlockHash>,
+                           validation_error: Option<String>|
+     -> Result<Value> {
+        let header = chain
+            .header(height)
+            .ok_or_else(|| anyhow!("chainstate header is unavailable"))?;
+        let mut chainstate = json!({
+            "blocks": height,
+            "bestblockhash": hash.to_string(),
+            "bits": format!("{:08x}", header.bits.to_consensus()),
+            "target": format!("{:064x}", header.target()),
+            "difficulty": header.difficulty_float(),
+            "verificationprogress": verificationprogress,
+            "coins_db_cache_bytes": 0,
+            "coins_tip_cache_bytes": coins_tip_cache_bytes,
+            "validated": validated,
+        });
+        if let Some(snapshot_base) = snapshot_base {
+            chainstate["snapshot_blockhash"] = json!(snapshot_base.to_string());
+        }
+        if let Some(validation_error) = validation_error {
+            chainstate["validation_error"] = json!(validation_error);
+        }
+        Ok(chainstate)
+    };
+
+    if let Some((progress_height, progress_hash, snapshot_base, validation_error)) =
+        chain.background_chainstate()
+    {
+        let progress = if tip.height == 0 {
+            0.0
+        } else {
+            f64::from(progress_height) / f64::from(tip.height)
+        };
+        chainstates.push(make_chainstate(
+            progress_height,
+            progress_hash,
+            progress.min(1.0),
+            0,
+            false,
+            None,
+            None,
+        )?);
+        chainstates.push(make_chainstate(
+            tip.height,
+            tip.hash,
+            1.0,
+            chain.utxo_bogo_size(),
+            false,
+            Some(snapshot_base),
+            validation_error,
+        )?);
+    } else {
+        let (snapshot_base, validated) = chain
+            .snapshot_provenance()
+            .map_or((None, true), |(base, validated)| (Some(base), validated));
+        chainstates.push(make_chainstate(
+            tip.height,
+            tip.hash,
+            1.0,
+            chain.utxo_bogo_size(),
+            validated,
+            snapshot_base,
+            chain.snapshot_validation_error(),
+        )?);
     }
     Ok(json!({
         "headers": header_tip.height,
-        "chainstates": [chainstate],
+        "chainstates": chainstates,
     }))
 }
 

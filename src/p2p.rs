@@ -76,6 +76,14 @@ fn connection_fetches_addresses(outbound: bool, connection_type: &str) -> bool {
     outbound && connection_type != "block-relay-only" && connection_type != "feeler"
 }
 
+fn block_request_inventory_type(peer_services: u64) -> InventoryType {
+    if peer_services & wire::NODE_WITNESS != 0 {
+        InventoryType::WitnessBlock
+    } else {
+        InventoryType::Block
+    }
+}
+
 fn addr_fetch_timed_out(connected_at: u64, now: u64) -> bool {
     now.saturating_sub(connected_at) > ADDR_FETCH_TIMEOUT_SECS
 }
@@ -954,6 +962,7 @@ async fn serve_peer_loop(
     let mut addrv2_received = false;
     let mut getaddr_received = false;
     let mut peer_version = 0i32;
+    let mut peer_services = 0u64;
     let mut compact_block_version = 2u64;
     let mut pending_compact = None;
     let peer_timeout = Duration::from_secs(node.config.peer_timeout_secs);
@@ -1065,6 +1074,7 @@ async fn serve_peer_loop(
                     anyhow::bail!("feeler connection completed");
                 }
                 peer_version = version.version;
+                peer_services = version.services;
                 node.update_peer_version(
                     peer_id,
                     version.version,
@@ -1232,7 +1242,7 @@ async fn serve_peer_loop(
                         .into_iter()
                         .filter(|hash| !chain.store.contains(hash))
                         .map(|hash| Inventory {
-                            kind: InventoryType::Block,
+                            kind: block_request_inventory_type(peer_services),
                             hash,
                         })
                         .collect::<Vec<_>>()
@@ -2679,6 +2689,18 @@ mod tests {
         assert!(!connection_fetches_addresses(true, "block-relay-only"));
         assert!(!connection_fetches_addresses(true, "feeler"));
         assert!(!connection_fetches_addresses(false, "inbound"));
+    }
+
+    #[test]
+    fn block_downloads_request_witnesses_from_capable_peers() {
+        assert_eq!(
+            block_request_inventory_type(wire::NODE_NETWORK | wire::NODE_WITNESS),
+            InventoryType::WitnessBlock
+        );
+        assert_eq!(
+            block_request_inventory_type(wire::NODE_NETWORK),
+            InventoryType::Block
+        );
     }
 
     #[test]

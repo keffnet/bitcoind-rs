@@ -2915,13 +2915,17 @@ fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let explicit_window = params.get(0).is_some_and(|value| !value.is_null());
+    let default_window = {
+        let spacing = node.config.network.params().pow_target_spacing;
+        i64::try_from((30 * 24 * 60 * 60) / spacing).unwrap_or(i64::MAX)
+    };
     let requested_window = if explicit_window {
         params
             .get(0)
             .and_then(Value::as_i64)
             .ok_or_else(|| anyhow!("window must be an integer"))?
     } else {
-        30
+        default_window
     };
     if requested_window < 0 {
         bail!("window must not be negative");

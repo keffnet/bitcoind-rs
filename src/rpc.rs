@@ -1044,6 +1044,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "setban" => Some(&["command", "subnet", "bantime", "absolute"]),
         "setnetworkactive" => Some(&["active"]),
         "estimatesmartfee" => Some(&["conf_target", "estimate_mode"]),
+        "estimaterawfee" => Some(&["conf_target", "threshold"]),
         "logging" => Some(&["include", "exclude"]),
         "validateaddress" => Some(&["address"]),
         "deriveaddresses" => Some(&["descriptor", "range"]),
@@ -1359,6 +1360,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         })),
         "help" => Ok(json!(rpc_help(method_params_string(params)))),
         "estimatesmartfee" => estimate_smart_fee(node, params),
+        "estimaterawfee" => estimate_raw_fee(node, params),
         "getdifficulty" => Ok(json!(
             node.chain
                 .read()
@@ -1481,8 +1483,109 @@ fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let mut result = json!({"blocks": conf_target});
     if let Some(rate) = estimate {
         result["feerate"] = json!(sat_to_btc(rate));
+    } else {
+        result["errors"] = json!(["Insufficient data or no feerate found"]);
     }
     Ok(result)
+}
+
+fn raw_fee_bucket(
+    start: u64,
+    end: u64,
+    within_target: u64,
+    total_confirmed: u64,
+    in_mempool: u64,
+    left_mempool: u64,
+) -> Value {
+    json!({
+        "startrange": start,
+        "endrange": end,
+        "withintarget": within_target,
+        "totalconfirmed": total_confirmed,
+        "inmempool": in_mempool,
+        "leftmempool": left_mempool,
+    })
+}
+
+fn raw_fee_horizon(mut samples: Vec<(u64, u64)>, threshold: f64, decay: f64, scale: u32) -> Value {
+    samples.retain(|(rate, _)| *rate > 0);
+    let mut result = json!({"decay": decay, "scale": scale});
+    if samples.is_empty() {
+        result["fail"] = json!({
+            "startrange": -1,
+            "endrange": -1,
+            "withintarget": 0,
+            "totalconfirmed": 0,
+            "inmempool": 0,
+            "leftmempool": 0,
+        });
+        result["errors"] = json!(["Insufficient data or no feerate found which meets threshold"]);
+        return result;
+    }
+
+    samples.sort_unstable_by_key(|(rate, _)| *rate);
+    let index = ((samples.len().saturating_sub(1) as f64) * threshold).ceil() as usize;
+    let estimate = samples[index.min(samples.len() - 1)].0;
+    let total = samples.len() as u64;
+    let passing = samples.iter().filter(|(rate, _)| *rate >= estimate).count() as u64;
+    result["feerate"] = json!(sat_to_btc(estimate));
+    result["pass"] = raw_fee_bucket(
+        estimate,
+        samples.last().map_or(estimate, |(rate, _)| *rate),
+        passing,
+        passing,
+        0,
+        0,
+    );
+    if passing < total {
+        result["fail"] = raw_fee_bucket(0, estimate, total - passing, total - passing, 0, 0);
+    }
+    result
+}
+
+fn estimate_raw_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let conf_target = params
+        .get(0)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("conf_target must be a positive integer"))?;
+    let conf_target = u32::try_from(conf_target)
+        .map_err(|_| anyhow!("Invalid conf_target, must be between 1 and 1008"))?;
+    if !(1..=1_008).contains(&conf_target) {
+        bail!("Invalid conf_target, must be between 1 and 1008")
+    }
+    let threshold = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| anyhow!("threshold must be a number"))
+        })
+        .transpose()?
+        .unwrap_or(0.95);
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        bail!("Invalid threshold")
+    }
+
+    // Core tracks three moving-average horizons. This implementation does not
+    // retain mempool admission/eviction history, so use confirmed transaction
+    // samples from the longest available window and expose the same stable
+    // result shape for each horizon.
+    let samples = node.chain.write().recent_fee_rate_samples(1_008)?;
+    let mut result = serde_json::Map::new();
+    for (name, max_target, decay, scale) in [
+        ("short", 12_u32, 0.962_f64, 1_u32),
+        ("medium", 48_u32, 0.9952_f64, 2_u32),
+        ("long", 1_008_u32, 0.99931_f64, 24_u32),
+    ] {
+        if conf_target <= max_target {
+            result.insert(
+                name.to_owned(),
+                raw_fee_horizon(samples.clone(), threshold, decay, scale),
+            );
+        }
+    }
+    Ok(Value::Object(result))
 }
 
 const LOG_CATEGORIES: &[&str] = &[
@@ -8707,6 +8810,7 @@ fn rpc_help(method: &str) -> String {
         "setnetworkactive",
         "getrpcinfo",
         "estimatesmartfee",
+        "estimaterawfee",
         "getdifficulty",
         "getconnectioncount",
         "uptime",
@@ -8951,6 +9055,34 @@ mod tests {
         assert!(result.get("feerate").is_none());
         assert!(dispatch_method(&node, "estimatesmartfee", &json!([0])).is_err());
         assert!(dispatch_method(&node, "estimatesmartfee", &json!([6, "invalid"])).is_err());
+    }
+
+    #[test]
+    fn raw_fee_estimate_reports_core_horizon_shape() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+        })
+        .unwrap();
+        let result = dispatch_method(&node, "estimaterawfee", &json!([6])).unwrap();
+        for horizon in ["short", "medium", "long"] {
+            assert!(result[horizon]["decay"].is_number());
+            assert!(result[horizon]["scale"].is_number());
+            assert!(result[horizon]["errors"].is_array());
+            assert!(result[horizon]["feerate"].is_null());
+        }
+        assert!(dispatch_method(&node, "estimaterawfee", &json!([0])).is_err());
+        assert!(dispatch_method(&node, "estimaterawfee", &json!([6, -0.1])).is_err());
+        assert!(dispatch_method(&node, "estimaterawfee", &json!([6, "invalid"])).is_err());
     }
 
     #[test]

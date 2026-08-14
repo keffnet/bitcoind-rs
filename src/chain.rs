@@ -574,27 +574,14 @@ impl ChainState {
         Ok(Some(samples))
     }
 
-    /// Estimate a fee rate in satoshis per virtual kilobyte from recent
-    /// confirmed transactions. The returned block count is the requested
-    /// target; `None` means there is not enough confirmed fee data yet.
-    pub fn estimate_fee_rate_sat_per_kvb(
-        &mut self,
-        conf_target: u32,
-        conservative: bool,
-    ) -> Result<Option<u64>> {
-        if conf_target == 0 || conf_target > 1_008 {
-            bail!("confirmation target must be between 1 and 1008 blocks");
+    /// Return recent confirmed transaction fee-rate samples as
+    /// `(sat_per_kvb, vsize)` pairs.
+    pub fn recent_fee_rate_samples(&mut self, max_blocks: u32) -> Result<Vec<(u64, u64)>> {
+        if max_blocks == 0 {
+            return Ok(Vec::new());
         }
         let tip_height = self.height();
-        if tip_height == 0 {
-            return Ok(None);
-        }
-        let sample_blocks = if conservative {
-            conf_target.saturating_mul(2).clamp(conf_target, 1_008)
-        } else {
-            conf_target
-        };
-        let start_height = tip_height.saturating_sub(sample_blocks.saturating_sub(1));
+        let start_height = tip_height.saturating_sub(max_blocks.saturating_sub(1));
         let mut samples = Vec::new();
         for height in start_height..=tip_height {
             let Some(hash) = self.block_hash(height) else {
@@ -611,6 +598,26 @@ impl ChainState {
                 }));
             }
         }
+        Ok(samples)
+    }
+
+    /// Estimate a fee rate in satoshis per virtual kilobyte from recent
+    /// confirmed transactions. The returned block count is the requested
+    /// target; `None` means there is not enough confirmed fee data yet.
+    pub fn estimate_fee_rate_sat_per_kvb(
+        &mut self,
+        conf_target: u32,
+        conservative: bool,
+    ) -> Result<Option<u64>> {
+        if conf_target == 0 || conf_target > 1_008 {
+            bail!("confirmation target must be between 1 and 1008 blocks");
+        }
+        let sample_blocks = if conservative {
+            conf_target.saturating_mul(2).clamp(conf_target, 1_008)
+        } else {
+            conf_target
+        };
+        let mut samples = self.recent_fee_rate_samples(sample_blocks)?;
         if samples.is_empty() {
             return Ok(None);
         }

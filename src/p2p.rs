@@ -47,12 +47,17 @@ type PeerWriter = Arc<Mutex<PeerWriterKind>>;
 const MAX_BLOOM_FILTER_SIZE: usize = 36_000;
 const MAX_BLOOM_HASH_FUNCS: u32 = 50;
 const MAX_BLOOM_ELEMENT_SIZE: usize = 520;
+const SENDHEADERS_VERSION: i32 = 70_012;
+const FEEFILTER_VERSION: i32 = 70_013;
+const SHORT_IDS_BLOCKS_VERSION: i32 = 70_014;
+const WTXID_RELAY_VERSION: i32 = 70_016;
 
 struct PeerState {
     writer: PeerWriter,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     fee_filter: parking_lot::Mutex<i64>,
     relay_transactions: parking_lot::Mutex<bool>,
+    wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
     compact_block_version: parking_lot::Mutex<Option<u64>>,
     compact_block_announce: parking_lot::Mutex<bool>,
@@ -717,6 +722,7 @@ async fn serve_peer(
         bloom_filter: parking_lot::Mutex::new(None),
         fee_filter: parking_lot::Mutex::new(0),
         relay_transactions: parking_lot::Mutex::new(true),
+        wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
         compact_block_version: parking_lot::Mutex::new(None),
         compact_block_announce: parking_lot::Mutex::new(false),
@@ -787,6 +793,7 @@ async fn serve_peer_loop(
     let mut verack_sent = false;
     let mut extensions_sent = false;
     let mut addrv2_received = false;
+    let mut peer_version = 0i32;
     let mut compact_block_version = 2u64;
     let mut pending_compact = None;
     loop {
@@ -838,6 +845,12 @@ async fn serve_peer_loop(
                 message
             },
         };
+        if !version_received && !matches!(&message, Message::Version(_)) {
+            // Core ignores application messages until VERSION has been
+            // received. In particular, a VERACK received first must not
+            // complete the handshake state prematurely.
+            continue;
+        }
         match message {
             Message::Version(version) => {
                 if version_received {
@@ -847,6 +860,7 @@ async fn serve_peer_loop(
                 if version.version < 70001 {
                     anyhow::bail!("peer protocol version is too old");
                 }
+                peer_version = version.version;
                 node.update_peer_version(
                     peer_id,
                     version.version,
@@ -867,6 +881,7 @@ async fn serve_peer_loop(
                     writer,
                     node.config.network,
                     &mut extensions_sent,
+                    peer_version,
                 )
                 .await?;
                 if outbound {
@@ -884,6 +899,7 @@ async fn serve_peer_loop(
                     writer,
                     node.config.network,
                     &mut extensions_sent,
+                    peer_version,
                 )
                 .await?;
                 request_headers(node, peer_id, writer).await?;
@@ -897,7 +913,20 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::SendAddrV2 => {
-                addrv2_received = true;
+                if verack_received {
+                    anyhow::bail!("sendaddrv2 received after verack");
+                }
+                if peer_version >= WTXID_RELAY_VERSION {
+                    addrv2_received = true;
+                }
+            }
+            Message::WtxidRelay => {
+                if verack_received {
+                    anyhow::bail!("wtxidrelay received after verack");
+                }
+                if peer_version >= WTXID_RELAY_VERSION {
+                    *peer_state.wtxid_relay.lock() = true;
+                }
             }
             Message::Ping(nonce) => {
                 send_message(
@@ -975,6 +1004,7 @@ async fn serve_peer_loop(
                 }
             }
             Message::Inv(items) => {
+                let wtxid_relay = *peer_state.wtxid_relay.lock();
                 let requests = {
                     let chain = node.chain.read();
                     let mempool = node.mempool.read();
@@ -986,6 +1016,12 @@ async fn serve_peer_loop(
                             }
                             InventoryType::CompactBlock => !chain.store.contains(&item.hash),
                             InventoryType::Transaction | InventoryType::WitnessTransaction => {
+                                if (wtxid_relay && item.kind == InventoryType::Transaction)
+                                    || (!wtxid_relay
+                                        && item.kind == InventoryType::WitnessTransaction)
+                                {
+                                    return false;
+                                }
                                 if item.kind == InventoryType::WitnessTransaction {
                                     mempool
                                         .get_by_wtxid(&Wtxid::from_byte_array(
@@ -1428,7 +1464,6 @@ async fn serve_peer_loop(
             Message::CFilter(_)
             | Message::CFHeaders(_)
             | Message::CFCheckpt(_)
-            | Message::WtxidRelay
             | Message::NotFound(_)
             | Message::Unknown { .. } => {}
             Message::FeeFilter(rate) => {
@@ -1524,6 +1559,7 @@ async fn serve_peer_loop(
                 };
                 let inventory = {
                     let mut filter = bloom_filter.lock();
+                    let wtxid_relay = *peer_state.wtxid_relay.lock();
                     transactions
                         .into_iter()
                         .filter_map(|transaction| {
@@ -1532,12 +1568,7 @@ async fn serve_peer_loop(
                             {
                                 return None;
                             }
-                            Some(Inventory {
-                                kind: InventoryType::WitnessTransaction,
-                                hash: BlockHash::from_raw_hash(
-                                    transaction.compute_wtxid().to_raw_hash(),
-                                ),
-                            })
+                            Some(transaction_inventory(&transaction, wtxid_relay))
                         })
                         .collect::<Vec<_>>()
                 };
@@ -1818,25 +1849,34 @@ async fn send_peer_extensions(
     writer: &PeerWriter,
     network: Network,
     sent: &mut bool,
+    peer_version: i32,
 ) -> Result<()> {
     if *sent {
         return Ok(());
     }
-    send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
-    send_message(node, peer_id, writer, network, &Message::SendAddrV2).await?;
-    send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
-    send_message(
-        node,
-        peer_id,
-        writer,
-        network,
-        &Message::SendCmpct {
-            announce: false,
-            version: 2,
-        },
-    )
-    .await?;
-    send_message(node, peer_id, writer, network, &Message::FeeFilter(1_000)).await?;
+    if peer_version >= SENDHEADERS_VERSION {
+        send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
+    }
+    if peer_version >= WTXID_RELAY_VERSION {
+        send_message(node, peer_id, writer, network, &Message::SendAddrV2).await?;
+        send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
+    }
+    if peer_version >= SHORT_IDS_BLOCKS_VERSION {
+        send_message(
+            node,
+            peer_id,
+            writer,
+            network,
+            &Message::SendCmpct {
+                announce: false,
+                version: 2,
+            },
+        )
+        .await?;
+    }
+    if peer_version >= FEEFILTER_VERSION {
+        send_message(node, peer_id, writer, network, &Message::FeeFilter(1_000)).await?;
+    }
     *sent = true;
     Ok(())
 }
@@ -1897,6 +1937,21 @@ async fn broadcast_inventory_excluding(
     network: Network,
     item: Inventory,
 ) {
+    let transaction = if matches!(
+        item.kind,
+        InventoryType::Transaction | InventoryType::WitnessTransaction
+    ) {
+        transaction_for_inventory(node, &item)
+    } else {
+        None
+    };
+    if matches!(
+        item.kind,
+        InventoryType::Transaction | InventoryType::WitnessTransaction
+    ) && transaction.is_none()
+    {
+        return;
+    }
     let recipients: Vec<(usize, Arc<PeerState>)> = peers
         .lock()
         .iter()
@@ -1908,6 +1963,10 @@ async fn broadcast_inventory_excluding(
         .map(|(peer_id, state)| (*peer_id, state.clone()))
         .collect();
     for (peer_id, state) in recipients {
+        let item = transaction
+            .as_ref()
+            .map(|transaction| transaction_inventory(transaction, *state.wtxid_relay.lock()))
+            .unwrap_or_else(|| item.clone());
         if matches!(
             item.kind,
             InventoryType::Block | InventoryType::WitnessBlock | InventoryType::CompactBlock
@@ -2005,6 +2064,20 @@ fn transaction_fee_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<(
             .get(&Txid::from_byte_array(item.hash.to_byte_array()))
             .map(|entry| (entry.fee_sat, entry.vsize)),
         _ => None,
+    }
+}
+
+fn transaction_inventory(transaction: &Transaction, wtxid_relay: bool) -> Inventory {
+    if wtxid_relay {
+        Inventory {
+            kind: InventoryType::WitnessTransaction,
+            hash: BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
+        }
+    } else {
+        Inventory {
+            kind: InventoryType::Transaction,
+            hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
+        }
     }
 }
 

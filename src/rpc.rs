@@ -3090,7 +3090,7 @@ fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
         "difficulty": header.difficulty_float(),
         "networkhashps": network_hashps,
         "pooledtx": mempool.len(),
-        "blockmintxfee": sat_to_btc(1_000),
+        "blockmintxfee": sat_to_btc(node.config.block_min_tx_fee_sat_per_kvb),
         "chain": network_name(chain.network),
         "next": {
             "height": tip.height.saturating_add(1),
@@ -7537,12 +7537,18 @@ fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Bloc
     let mempool = node.mempool.read();
     let mut transactions = Vec::new();
     let mut transaction_weight = 0u64;
-    for txid in mempool.mining_order(4_000_000, 2_000) {
+    for txid in mempool.mining_order_with_min_fee(
+        node.config.block_max_weight,
+        node.config.block_reserved_weight,
+        node.config.block_min_tx_fee_sat_per_kvb,
+    ) {
         let Some(entry) = mempool.get(&txid) else {
             continue;
         };
         let next_weight = transaction_weight.saturating_add(entry.transaction.weight().to_wu());
-        if next_weight.saturating_add(2_000) > 4_000_000 {
+        if next_weight.saturating_add(node.config.block_reserved_weight)
+            > node.config.block_max_weight
+        {
             break;
         }
         transaction_weight = next_weight;
@@ -7633,7 +7639,7 @@ fn build_mining_block_with_transactions(
         fees,
         extra_nonce: random(),
     })?;
-    if block.weight().to_wu() > 4_000_000 {
+    if block.weight().to_wu() > node.config.block_max_weight {
         bail!("generated block exceeds the block weight limit")
     }
     Ok(block)
@@ -7781,7 +7787,11 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bits = chain.next_bits(curtime);
     let mempool = node.mempool.read();
     let mut fees = 0u64;
-    let selected = mempool.mining_order(4_000_000, 4_000);
+    let selected = mempool.mining_order_with_min_fee(
+        node.config.block_max_weight,
+        node.config.block_reserved_weight,
+        node.config.block_min_tx_fee_sat_per_kvb,
+    );
     let positions = selected
         .iter()
         .enumerate()
@@ -7882,8 +7892,8 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "mutable": ["time", "transactions", "prevblock"],
         "noncerange": "00000000ffffffff",
         "sigoplimit": 80_000,
-        "sizelimit": 4_000_000,
-        "weightlimit": 4_000_000,
+        "sizelimit": node.config.block_max_weight,
+        "weightlimit": node.config.block_max_weight,
         "longpollid": format!("{}:{}", tip.hash, mempool.sequence()),
         "height": height,
         "bits": format!("{:08x}", bits),
@@ -9911,6 +9921,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10074,6 +10087,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10152,6 +10168,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10189,6 +10208,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10231,6 +10253,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10304,6 +10329,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10356,6 +10384,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10470,6 +10501,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10530,6 +10564,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10568,6 +10605,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10576,7 +10616,7 @@ mod tests {
         assert_eq!(info["blocks"], json!(0));
         assert_eq!(info["next"]["height"], json!(1));
         assert_eq!(info["pooledtx"], json!(0));
-        assert_eq!(info["blockmintxfee"], json!(0.00001));
+        assert_eq!(info["blockmintxfee"], json!(0.00000001));
         assert!(info["warnings"].is_array());
         assert!(info["bits"].as_str().is_some());
         assert!(info["target"].as_str().is_some());
@@ -10609,6 +10649,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10659,6 +10702,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10702,6 +10748,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10739,6 +10788,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10773,6 +10825,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10882,6 +10937,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10938,6 +10996,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11016,6 +11077,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11061,6 +11125,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11132,6 +11199,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11224,12 +11294,15 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 120_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1_000,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
         let template = get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
         assert_eq!(template["height"], 1);
-        assert_eq!(template["weightlimit"], 4_000_000);
+        assert_eq!(template["weightlimit"], 120_000);
         assert_eq!(template["rules"], json!(["csv", "!segwit", "taproot"]));
         assert_eq!(
             template["longpollid"],
@@ -11318,6 +11391,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11356,6 +11432,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11399,6 +11478,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11448,6 +11530,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11504,6 +11589,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11551,6 +11639,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11598,6 +11689,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11636,6 +11730,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
             signet_challenge: None,
         })
@@ -11675,6 +11772,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11759,6 +11859,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11823,6 +11926,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11881,6 +11987,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12049,6 +12158,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12224,6 +12336,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12270,6 +12385,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12366,6 +12484,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12486,6 +12607,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12532,6 +12656,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12616,6 +12743,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12832,6 +12962,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13182,6 +13315,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13246,6 +13382,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13319,6 +13458,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13436,6 +13578,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13475,6 +13620,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();

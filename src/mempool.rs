@@ -316,6 +316,19 @@ impl Mempool {
     /// (including prioritisation deltas) per weight, while the returned list
     /// remains topologically ordered.
     pub fn mining_order(&self, max_weight: u64, reserved_weight: u64) -> Vec<Txid> {
+        self.mining_order_with_min_fee(max_weight, reserved_weight, 0)
+    }
+
+    /// Return transactions in ancestor-package feerate order, excluding
+    /// packages below the configured block-creation feerate. The fee rate is
+    /// expressed in satoshis per virtual kilobyte, matching Core's
+    /// `-blockmintxfee` option.
+    pub fn mining_order_with_min_fee(
+        &self,
+        max_weight: u64,
+        reserved_weight: u64,
+        min_fee_sat_per_kvb: u64,
+    ) -> Vec<Txid> {
         let weight_limit = max_weight.saturating_sub(reserved_weight);
         let mut selected = HashSet::new();
         let mut ordered = Vec::new();
@@ -368,6 +381,7 @@ impl Mempool {
                 &selected,
                 selected_weight,
                 weight_limit,
+                min_fee_sat_per_kvb,
             ) else {
                 break;
             };
@@ -1714,6 +1728,7 @@ fn next_mining_candidate(
     selected: &HashSet<Txid>,
     selected_weight: u64,
     weight_limit: u64,
+    min_fee_sat_per_kvb: u64,
 ) -> Option<MiningCandidate> {
     while let Some(candidate) = candidates.pop() {
         if selected.contains(&candidate.txid) {
@@ -1733,6 +1748,14 @@ fn next_mining_candidate(
             // its ancestors is selected; that selection pushes a fresh heap
             // entry through the descendant update path.
             continue;
+        }
+        if min_fee_sat_per_kvb != 0 {
+            let package_vsize = candidate.weight.saturating_add(3) / 4;
+            if candidate.fee.saturating_mul(1_000)
+                < i128::from(min_fee_sat_per_kvb) * i128::from(package_vsize)
+            {
+                continue;
+            }
         }
         return Some(candidate);
     }
@@ -2011,6 +2034,10 @@ mod tests {
         assert_eq!(
             pool.mining_order(4_000_000, 0),
             vec![parent_id, child_id, independent_id]
+        );
+        assert_eq!(
+            pool.mining_order_with_min_fee(4_000_000, 0, 1_000),
+            vec![parent_id, child_id]
         );
     }
 

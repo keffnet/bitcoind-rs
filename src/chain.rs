@@ -234,12 +234,7 @@ impl ChainState {
         data_dir: impl AsRef<Path>,
         signet_challenge: Option<&[u8]>,
     ) -> Result<Self> {
-        Self::open_with_signet_challenge_and_filter_index(
-            network,
-            data_dir,
-            signet_challenge,
-            true,
-        )
+        Self::open_with_signet_challenge_and_filter_index(network, data_dir, signet_challenge, true)
     }
 
     pub fn open_with_signet_challenge_and_filter_index(

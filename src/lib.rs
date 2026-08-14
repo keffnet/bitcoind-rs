@@ -301,11 +301,7 @@ impl Node {
         let mempool_path = config.datadir.join("mempool.json");
         let mut mempool = Mempool::with_max_bytes(config.network, max_mempool_bytes);
         if config.persist_mempool {
-            let expiry = Duration::from_secs(
-                config
-                    .mempool_expiry_hours
-                    .saturating_mul(60 * 60),
-            );
+            let expiry = Duration::from_secs(config.mempool_expiry_hours.saturating_mul(60 * 60));
             mempool.load_from_file_with_expiry(&mempool_path, &chain, expiry)?;
         }
         let _ = mempool.take_changes();
@@ -509,11 +505,8 @@ impl Node {
     fn expire_mempool(&self) {
         let changes = {
             let mut mempool = self.mempool.write();
-            let expiry = Duration::from_secs(
-                self.config
-                    .mempool_expiry_hours
-                    .saturating_mul(60 * 60),
-            );
+            let expiry =
+                Duration::from_secs(self.config.mempool_expiry_hours.saturating_mul(60 * 60));
             mempool.clear_expired(time::unix_time(), expiry);
             mempool.take_changes()
         };
@@ -1327,11 +1320,8 @@ impl Node {
                 .transaction_order()
                 .into_iter()
                 .collect::<HashSet<_>>();
-            let expiry = Duration::from_secs(
-                self.config
-                    .mempool_expiry_hours
-                    .saturating_mul(60 * 60),
-            );
+            let expiry =
+                Duration::from_secs(self.config.mempool_expiry_hours.saturating_mul(60 * 60));
             let result = mempool.load_from_file_with_expiry(path.as_ref(), &chain, expiry);
             let after = mempool
                 .transaction_order()
@@ -1502,6 +1492,9 @@ mod tests {
             max_peers: 1,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
             zmq: crate::config::ZmqConfig::default(),
         }
     }

@@ -2,13 +2,17 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use bitcoin::Network;
+use bitcoin::{Amount, Denomination, Network};
 use clap::{Parser, ValueEnum};
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
 pub const DEFAULT_MEMPOOL_EXPIRY_HOURS: u64 = 336;
 pub const DEFAULT_PEER_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_BLOCK_MAX_WEIGHT: u64 = 4_000_000;
+pub const DEFAULT_BLOCK_RESERVED_WEIGHT: u64 = 8_000;
+pub const MINIMUM_BLOCK_RESERVED_WEIGHT: u64 = 2_000;
+pub const DEFAULT_BLOCK_MIN_TX_FEE_SAT_PER_KVB: u64 = 1;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 pub const DEFAULT_PERSIST_MEMPOOL: bool = true;
 pub const DEFAULT_BLOCKFILTERINDEX: &str = "0";
@@ -164,6 +168,15 @@ pub struct Args {
     #[arg(long, default_value_t = DEFAULT_PEER_TIMEOUT_SECS)]
     pub peertimeout: u64,
 
+    #[arg(long, default_value_t = DEFAULT_BLOCK_MAX_WEIGHT)]
+    pub blockmaxweight: u64,
+
+    #[arg(long, default_value_t = DEFAULT_BLOCK_RESERVED_WEIGHT)]
+    pub blockreservedweight: u64,
+
+    #[arg(long, default_value = "0.00000001")]
+    pub blockmintxfee: String,
+
     #[arg(long, default_value_t = false)]
     pub peer_bloom_filters: bool,
 
@@ -268,6 +281,9 @@ pub struct Config {
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
     pub peer_timeout_secs: u64,
+    pub block_max_weight: u64,
+    pub block_reserved_weight: u64,
+    pub block_min_tx_fee_sat_per_kvb: u64,
     pub peer_bloom_filters: bool,
     pub blocksonly: bool,
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
@@ -294,6 +310,28 @@ impl Config {
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
         }
+        if args.blockmaxweight > DEFAULT_BLOCK_MAX_WEIGHT {
+            bail!(
+                "--blockmaxweight must not exceed the consensus maximum of {DEFAULT_BLOCK_MAX_WEIGHT}"
+            );
+        }
+        if args.blockreservedweight > DEFAULT_BLOCK_MAX_WEIGHT {
+            bail!(
+                "--blockreservedweight must not exceed the consensus maximum of {DEFAULT_BLOCK_MAX_WEIGHT}"
+            );
+        }
+        if args.blockreservedweight < MINIMUM_BLOCK_RESERVED_WEIGHT {
+            bail!("--blockreservedweight must be at least {MINIMUM_BLOCK_RESERVED_WEIGHT}");
+        }
+        let block_min_tx_fee_sat_per_kvb =
+            Amount::from_str_in(&args.blockmintxfee, Denomination::Bitcoin)
+                .with_context(|| {
+                    format!(
+                        "decoding --blockmintxfee as BTC/kvB: {}",
+                        args.blockmintxfee
+                    )
+                })?
+                .to_sat();
         if args.prune != 0 && args.prune != 1 && args.prune < MIN_AUTO_PRUNE_TARGET_MIB {
             bail!("--prune automatic target must be at least {MIN_AUTO_PRUNE_TARGET_MIB} MiB");
         }
@@ -355,6 +393,9 @@ impl Config {
             signet_challenge,
             max_peers: args.max_peers,
             peer_timeout_secs: args.peertimeout,
+            block_max_weight: args.blockmaxweight.max(args.blockreservedweight),
+            block_reserved_weight: args.blockreservedweight,
+            block_min_tx_fee_sat_per_kvb,
             peer_bloom_filters: args.peer_bloom_filters,
             blocksonly: args.blocksonly,
             prune: args.prune,
@@ -529,6 +570,43 @@ mod tests {
             "--datadir",
             directory.path().to_str().unwrap(),
             "--maxmempool=0",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--blockmaxweight",
+            "2500000",
+            "--blockreservedweight",
+            "9000",
+            "--blockmintxfee",
+            "0.00001000",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.block_max_weight, 2_500_000);
+        assert_eq!(config.block_reserved_weight, 9_000);
+        assert_eq!(config.block_min_tx_fee_sat_per_kvb, 1_000);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--blockreservedweight",
+            "1999",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--blockmintxfee",
+            "not-an-amount",
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());

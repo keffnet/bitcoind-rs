@@ -36,6 +36,123 @@ const CORE_UTXO_SNAPSHOT_MAGIC: [u8; 5] = [b'u', b't', b'x', b'o', 0xff];
 const CORE_UTXO_SNAPSHOT_VERSION: u16 = 2;
 const CHAIN_METADATA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-v1\0";
 const CHAIN_SNAPSHOT_MAGIC: &[u8] = b"bitcoind-rs-snapshot-v1\0";
+const ASSUMEUTXO_STATE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-v1\0";
+
+/// A hardcoded UTXO commitment from Bitcoin Core v31.1's chain parameters.
+///
+/// These values are deliberately kept as data rather than inferred from a
+/// local chain. They are the trust anchor used by strict `loadtxoutset`
+/// activation, just as Core uses its `AssumeutxoData` table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AssumeUtxoData {
+    pub height: u32,
+    pub hash_serialized: &'static str,
+    pub chain_tx_count: u64,
+    pub blockhash: &'static str,
+}
+
+const MAINNET_ASSUMEUTXO: &[AssumeUtxoData] = &[
+    AssumeUtxoData {
+        height: 840_000,
+        hash_serialized: "a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96",
+        chain_tx_count: 991_032_194,
+        blockhash: "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5",
+    },
+    AssumeUtxoData {
+        height: 880_000,
+        hash_serialized: "dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9",
+        chain_tx_count: 1_145_604_538,
+        blockhash: "000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880",
+    },
+    AssumeUtxoData {
+        height: 910_000,
+        hash_serialized: "4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568",
+        chain_tx_count: 1_226_586_151,
+        blockhash: "0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821",
+    },
+    AssumeUtxoData {
+        height: 935_000,
+        hash_serialized: "e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050",
+        chain_tx_count: 1_305_397_408,
+        blockhash: "0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee",
+    },
+];
+
+const TESTNET_ASSUMEUTXO: &[AssumeUtxoData] = &[
+    AssumeUtxoData {
+        height: 2_500_000,
+        hash_serialized: "f841584909f68e47897952345234e37fcd9128cd818f41ee6c3ca68db8071be7",
+        chain_tx_count: 66_484_552,
+        blockhash: "0000000000000093bcb68c03a9a168ae252572d348a2eaeba2cdf9231d73206f",
+    },
+    AssumeUtxoData {
+        height: 4_840_000,
+        hash_serialized: "ce6bb677bb2ee9789c4a1c9d73e6683c53fc20e8fdbedbdaaf468982a0c8db2a",
+        chain_tx_count: 536_078_574,
+        blockhash: "00000000000000f4971a7fb37fbdff89315b69a2e1920c467654a382f0d64786",
+    },
+];
+
+const TESTNET4_ASSUMEUTXO: &[AssumeUtxoData] = &[
+    AssumeUtxoData {
+        height: 90_000,
+        hash_serialized: "784fb5e98241de66fdd429f4392155c9e7db5c017148e66e8fdbc95746f8b9b5",
+        chain_tx_count: 11_347_043,
+        blockhash: "0000000002ebe8bcda020e0dd6ccfbdfac531d2f6a81457191b99fc2df2dbe3b",
+    },
+    AssumeUtxoData {
+        height: 120_000,
+        hash_serialized: "10b05d05ad468d0971162e1b222a4aa66caca89da2bb2a93f8f37fb29c4794b0",
+        chain_tx_count: 14_141_057,
+        blockhash: "000000000bd2317e51b3c5794981c35ba894ce27d3e772d5c39ecd9cbce01dc8",
+    },
+];
+
+const DEFAULT_SIGNET_ASSUMEUTXO: &[AssumeUtxoData] = &[
+    AssumeUtxoData {
+        height: 160_000,
+        hash_serialized: "fe0a44309b74d6b5883d246cb419c6221bcccf0b308c9b59b7d70783dbdf928a",
+        chain_tx_count: 2_289_496,
+        blockhash: "0000003ca3c99aff040f2563c2ad8f8ec88bd0fd6b8f0895cfaf1ef90353a62c",
+    },
+    AssumeUtxoData {
+        height: 290_000,
+        hash_serialized: "97267e000b4b876800167e71b9123f1529d13b14308abec2888bbd2160d14545",
+        chain_tx_count: 28_547_497,
+        blockhash: "0000000577f2741bb30cd9d39d6d71b023afbeb9764f6260786a97969d5c9ac0",
+    },
+];
+
+const REGTEST_ASSUMEUTXO: &[AssumeUtxoData] = &[
+    AssumeUtxoData {
+        height: 110,
+        hash_serialized: "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327",
+        chain_tx_count: 111,
+        blockhash: "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397",
+    },
+    AssumeUtxoData {
+        height: 200,
+        hash_serialized: "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a",
+        chain_tx_count: 201,
+        blockhash: "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9",
+    },
+    AssumeUtxoData {
+        height: 299,
+        hash_serialized: "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2",
+        chain_tx_count: 334,
+        blockhash: "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2",
+    },
+];
+
+fn assumeutxo_data_for_network(network: Network) -> &'static [AssumeUtxoData] {
+    match network {
+        Network::Bitcoin => MAINNET_ASSUMEUTXO,
+        Network::Testnet => TESTNET_ASSUMEUTXO,
+        Network::Testnet4 => TESTNET4_ASSUMEUTXO,
+        Network::Signet => DEFAULT_SIGNET_ASSUMEUTXO,
+        Network::Regtest => REGTEST_ASSUMEUTXO,
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
@@ -294,6 +411,13 @@ struct ChainSnapshot {
     prune_height: Option<u32>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct SnapshotProvenance {
+    base_hash: String,
+    #[serde(default)]
+    validated: bool,
+}
+
 fn serialize_internal<T: Serialize>(magic: &[u8], value: &T) -> Result<Vec<u8>> {
     let payload = serialize_binary(value).context("serializing internal chainstate")?;
     let mut bytes = Vec::with_capacity(magic.len() + payload.len());
@@ -307,6 +431,13 @@ fn deserialize_internal<T: DeserializeOwned>(bytes: &[u8], magic: &[u8]) -> Resu
         bail!("internal chainstate format marker is invalid")
     }
     deserialize_binary(&bytes[magic.len()..]).context("decoding internal chainstate")
+}
+
+fn load_snapshot_provenance(path: &Path) -> Result<SnapshotProvenance> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading AssumeUTXO provenance {}", path.display()))?;
+    deserialize_internal(&bytes, ASSUMEUTXO_STATE_MAGIC)
+        .with_context(|| format!("decoding AssumeUTXO provenance {}", path.display()))
 }
 
 pub struct ChainState {
@@ -323,6 +454,8 @@ pub struct ChainState {
     active_chain: Vec<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
     initial_block_download: bool,
+    snapshot_base: Option<BlockHash>,
+    snapshot_validated: bool,
     block_index: HashMap<BlockHash, BlockNode>,
     orphans: HashMap<BlockHash, Vec<Block>>,
     invalid_blocks: HashSet<BlockHash>,
@@ -392,6 +525,7 @@ impl ChainState {
 
         let metadata_path = data_dir.join("chainstate.bin");
         let legacy_metadata_path = data_dir.join("chainstate.json");
+        let snapshot_provenance_path = data_dir.join("assumeutxo.bin");
         let rebuild_chainstate = reindex || reindex_chainstate;
         if rebuild_chainstate {
             for path in [
@@ -399,6 +533,7 @@ impl ChainState {
                 legacy_metadata_path.clone(),
                 data_dir.join("chainstate.snapshot"),
                 data_dir.join("chainstate.snapshot.sha256"),
+                snapshot_provenance_path.clone(),
             ] {
                 match fs::remove_file(&path) {
                     Ok(()) => {}
@@ -449,6 +584,12 @@ impl ChainState {
             } else {
                 (vec![genesis_hash], Vec::new(), HashSet::new(), None)
             };
+        let persisted_snapshot_provenance =
+            if !rebuild_chainstate && snapshot_provenance_path.exists() {
+                Some(load_snapshot_provenance(&snapshot_provenance_path)?)
+            } else {
+                None
+            };
         if active_chain.first().copied() != Some(genesis_hash) {
             bail!("chainstate does not start at the configured network genesis block");
         }
@@ -471,6 +612,14 @@ impl ChainState {
             active_chain: Vec::new(),
             headers: Vec::new(),
             initial_block_download: true,
+            snapshot_base: persisted_snapshot_provenance
+                .as_ref()
+                .map(|provenance| provenance.base_hash.parse())
+                .transpose()
+                .context("decoding AssumeUTXO snapshot base hash")?,
+            snapshot_validated: persisted_snapshot_provenance
+                .as_ref()
+                .is_some_and(|provenance| provenance.validated),
             block_index: HashMap::new(),
             orphans: HashMap::new(),
             invalid_blocks,
@@ -531,6 +680,8 @@ impl ChainState {
                 state.spent_by.clear();
             }
         } else {
+            state.snapshot_base = None;
+            state.snapshot_validated = true;
             let mut blocks = Vec::with_capacity(active_chain.len());
             for hash in &active_chain {
                 let block = state
@@ -546,6 +697,18 @@ impl ChainState {
         }
         if !rebuild_chainstate && state.active_chain != active_chain {
             bail!("chainstate metadata does not match replayed active chain");
+        }
+        if loaded_snapshot
+            && state
+                .snapshot_base
+                .is_some_and(|base| !state.is_active_block(&base))
+        {
+            bail!("AssumeUTXO snapshot base is not on the active chain");
+        }
+        if !loaded_snapshot {
+            state.snapshot_base = None;
+            state.snapshot_validated = true;
+            state.remove_snapshot_provenance_file()?;
         }
         state.index_persisted_headers(&persisted_headers)?;
         state.rebuild_block_index()?;
@@ -804,6 +967,35 @@ impl ChainState {
             Network::Regtest => return Work::from_be_bytes([0; 32]),
         };
         Work::from_unprefixed_hex(hex).expect("Core minimum chainwork is valid hex")
+    }
+
+    /// Return the hardcoded AssumeUTXO commitments for this network.
+    ///
+    /// Custom Signet challenges intentionally have no commitments because
+    /// their chain is not the public default Signet chain.
+    pub fn assumeutxo_data(&self) -> &'static [AssumeUtxoData] {
+        if self.network == Network::Signet
+            && self.signet_challenge.as_deref()
+                != Some(validation::default_signet_challenge().as_slice())
+        {
+            return &[];
+        }
+        assumeutxo_data_for_network(self.network)
+    }
+
+    /// Return the commitment for a supported snapshot base block.
+    pub fn assumeutxo_for_block(&self, hash: BlockHash) -> Option<AssumeUtxoData> {
+        self.assumeutxo_data()
+            .iter()
+            .copied()
+            .find(|data| data.blockhash.parse::<BlockHash>().ok() == Some(hash))
+    }
+
+    /// Return the base block and validation state of the active snapshot
+    /// chainstate, if one was loaded through strict AssumeUTXO activation.
+    pub fn snapshot_provenance(&self) -> Option<(BlockHash, bool)> {
+        self.snapshot_base
+            .map(|base| (base, self.snapshot_validated))
     }
 
     /// Return Core's latched initial-block-download state. Transaction relay
@@ -1919,11 +2111,39 @@ impl ChainState {
         ))
     }
 
+    /// Load a local snapshot using the implementation's compatibility
+    /// formats. This helper intentionally accepts arbitrary active-chain
+    /// snapshots and is separate from strict Core RPC activation.
     pub fn load_utxo_set(&mut self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {
+        self.load_utxo_set_with_options(path, false)
+    }
+
+    /// Load a Core UTXO snapshot through the AssumeUTXO trust boundary.
+    /// Snapshot activation is restricted to the v31.1 hardcoded commitments.
+    pub fn load_assumeutxo_set(&mut self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {
+        self.load_utxo_set_with_options(path, true)
+    }
+
+    fn load_utxo_set_with_options(
+        &mut self,
+        path: impl AsRef<Path>,
+        strict_assumeutxo: bool,
+    ) -> Result<(u64, BlockHash, u32)> {
         let bytes = fs::read(path.as_ref())
             .with_context(|| format!("reading UTXO snapshot {}", path.as_ref().display()))?;
         if bytes.starts_with(&CORE_UTXO_SNAPSHOT_MAGIC) {
-            return self.load_core_utxo_set(&bytes);
+            let (result, fully_validated) = self.load_core_utxo_set(&bytes, strict_assumeutxo)?;
+            if strict_assumeutxo {
+                self.snapshot_base = Some(result.1);
+                self.snapshot_validated = fully_validated;
+                self.persist_snapshot_provenance()?;
+            } else {
+                self.clear_snapshot_provenance()?;
+            }
+            return Ok(result);
+        }
+        if strict_assumeutxo {
+            bail!("loadtxoutset requires a Core binary UTXO snapshot")
         }
         let snapshot: ChainSnapshot = serde_json::from_slice(&bytes)
             .with_context(|| format!("decoding UTXO snapshot {}", path.as_ref().display()))?;
@@ -1950,10 +2170,15 @@ impl ChainState {
         self.rebuild_utxo_index();
         self.block_undo_cache.clear();
         self.persist_snapshot()?;
+        self.clear_snapshot_provenance()?;
         Ok((self.utxos.len() as u64, self.best_hash(), self.height()))
     }
 
-    fn load_core_utxo_set(&mut self, bytes: &[u8]) -> Result<(u64, BlockHash, u32)> {
+    fn load_core_utxo_set(
+        &mut self,
+        bytes: &[u8],
+        strict_assumeutxo: bool,
+    ) -> Result<((u64, BlockHash, u32), bool)> {
         let mut snapshot = read_core_utxo_snapshot(bytes, self.network)?;
         let base_height = self
             .block_height_by_hash(&snapshot.base_hash)
@@ -1963,6 +2188,34 @@ impl ChainState {
                 "UTXO snapshot base {} is not on the active chain",
                 snapshot.base_hash,
             )
+        }
+        if strict_assumeutxo {
+            let commitment = self
+                .assumeutxo_for_block(snapshot.base_hash)
+                .with_context(|| {
+                    format!(
+                        "UTXO snapshot base {} is not supported by this network's AssumeUTXO commitments",
+                        snapshot.base_hash
+                    )
+                })?;
+            if base_height != commitment.height {
+                bail!(
+                    "UTXO snapshot base {} has height {}, expected committed height {}",
+                    snapshot.base_hash,
+                    base_height,
+                    commitment.height
+                );
+            }
+            let actual_hash = calculate_utxo_statistics(&snapshot.utxos, true, false)
+                .serialized_hash
+                .context("UTXO snapshot serialized hash was not calculated")?;
+            if actual_hash != commitment.hash_serialized {
+                bail!(
+                    "UTXO snapshot content hash mismatch: expected {}, got {}",
+                    commitment.hash_serialized,
+                    actual_hash
+                );
+            }
         }
         for entry in snapshot.utxos.values_mut() {
             if entry.height > base_height {
@@ -1978,11 +2231,15 @@ impl ChainState {
             };
         }
         self.validate_snapshot_utxos_at(&snapshot.utxos, snapshot.base_hash)?;
-        if let Some(expected) = self.replay_utxos_for_block(snapshot.base_hash, false)?
-            && expected != snapshot.utxos
-        {
-            bail!("UTXO snapshot contents do not match the base chain")
-        }
+        let fully_validated =
+            if let Some(expected) = self.replay_utxos_for_block(snapshot.base_hash, false)? {
+                if expected != snapshot.utxos {
+                    bail!("UTXO snapshot contents do not match the base chain")
+                }
+                true
+            } else {
+                false
+            };
 
         let active_height = self.height();
         if base_height < active_height {
@@ -2041,7 +2298,7 @@ impl ChainState {
         self.rebuild_utxo_index();
         self.block_undo_cache.clear();
         self.persist_snapshot()?;
-        Ok((coins_count, base_hash, base_height))
+        Ok(((coins_count, base_hash, base_height), fully_validated))
     }
 
     fn validate_snapshot_utxos(&mut self, utxos: &HashMap<OutPoint, UtxoEntry>) -> Result<()> {
@@ -2904,6 +3161,9 @@ impl ChainState {
         let old_basic_filter_cache = self.basic_filter_cache.clone();
         let old_block_undo_cache = self.block_undo_cache.clone();
         let old_coin_stats = self.coin_stats.clone();
+        let old_snapshot_base = self.snapshot_base;
+        let old_snapshot_validated = self.snapshot_validated;
+        let snapshot_invalidated = self.snapshot_base.is_some_and(|base| !path.contains(&base));
         self.active_chain.clear();
         self.headers.clear();
         self.utxos.clear();
@@ -2913,6 +3173,10 @@ impl ChainState {
         self.spent_by.clear();
         self.coin_stats = self.coinstats_index_enabled.then(CoinStatsState::default);
         let replay = (|| -> Result<()> {
+            if snapshot_invalidated {
+                self.snapshot_base = None;
+                self.snapshot_validated = true;
+            }
             self.initialize_genesis(&blocks[0])?;
             for block in blocks.iter().skip(1) {
                 self.connect_block_internal(block, false)?;
@@ -2931,7 +3195,12 @@ impl ChainState {
             self.basic_filter_cache = old_basic_filter_cache;
             self.block_undo_cache = old_block_undo_cache;
             self.coin_stats = old_coin_stats;
+            self.snapshot_base = old_snapshot_base;
+            self.snapshot_validated = old_snapshot_validated;
             return Err(error);
+        }
+        if snapshot_invalidated {
+            self.remove_snapshot_provenance_file()?;
         }
         self.update_ibd_status();
         Ok(())
@@ -3448,6 +3717,39 @@ impl ChainState {
 
     fn snapshot_checksum_path(&self) -> PathBuf {
         self.data_dir.join("chainstate.snapshot.sha256")
+    }
+
+    fn snapshot_provenance_path(&self) -> PathBuf {
+        self.data_dir.join("assumeutxo.bin")
+    }
+
+    fn persist_snapshot_provenance(&self) -> Result<()> {
+        let Some(base_hash) = self.snapshot_base else {
+            return self.remove_snapshot_provenance_file();
+        };
+        let provenance = SnapshotProvenance {
+            base_hash: base_hash.to_string(),
+            validated: self.snapshot_validated,
+        };
+        let bytes = serialize_internal(ASSUMEUTXO_STATE_MAGIC, &provenance)?;
+        let temp = self.data_dir.join("assumeutxo.bin.tmp");
+        fs::write(&temp, bytes)?;
+        fs::rename(temp, self.snapshot_provenance_path())?;
+        Ok(())
+    }
+
+    fn remove_snapshot_provenance_file(&self) -> Result<()> {
+        match fs::remove_file(self.snapshot_provenance_path()) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn clear_snapshot_provenance(&mut self) -> Result<()> {
+        self.snapshot_base = None;
+        self.snapshot_validated = true;
+        self.remove_snapshot_provenance_file()
     }
 
     fn current_snapshot(&self) -> ChainSnapshot {
@@ -4119,6 +4421,71 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn assumeutxo_commitments_match_core_v31_1_network_tables() {
+        let expected = [
+            (Network::Bitcoin, 4, 935_000),
+            (Network::Testnet, 2, 4_840_000),
+            (Network::Testnet4, 2, 120_000),
+            (Network::Signet, 2, 290_000),
+            (Network::Regtest, 3, 299),
+        ];
+        for (network, count, last_height) in expected {
+            let directory = tempfile::tempdir().unwrap();
+            let state = ChainState::open(network, directory.path()).unwrap();
+            let data = state.assumeutxo_data();
+            assert_eq!(data.len(), count);
+            assert_eq!(data.last().unwrap().height, last_height);
+            for commitment in data {
+                assert_eq!(commitment.hash_serialized.len(), 64);
+                assert_eq!(commitment.blockhash.len(), 64);
+                assert!(commitment.blockhash.parse::<BlockHash>().is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn custom_signet_has_no_assumeutxo_commitments() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = ChainState::open_with_signet_challenge(
+            Network::Signet,
+            directory.path(),
+            Some(&[0x51]),
+        )
+        .unwrap();
+        assert!(state.assumeutxo_data().is_empty());
+    }
+
+    #[test]
+    fn strict_assumeutxo_rejects_an_uncommitted_snapshot_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        let path = directory.path().join("uncommitted.snapshot");
+        state.dump_utxo_set(&path).unwrap();
+
+        let error = state.load_assumeutxo_set(&path).unwrap_err().to_string();
+        assert!(error.contains("not supported by this network's AssumeUTXO commitments"));
+        assert!(state.snapshot_provenance().is_none());
+        assert!(!directory.path().join("assumeutxo.bin").exists());
+    }
+
+    #[test]
+    fn snapshot_provenance_survives_restart_and_reports_unvalidated_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        let base = state.best_hash();
+        state.persist_snapshot().unwrap();
+        state.snapshot_base = Some(base);
+        state.snapshot_validated = false;
+        state.persist_snapshot_provenance().unwrap();
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.snapshot_provenance(), Some((base, false)));
     }
 
     #[test]

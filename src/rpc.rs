@@ -3883,7 +3883,7 @@ fn parse_rollback_target(chain: &chain::ChainState, value: &Value) -> Result<Blo
 
 fn load_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let path = snapshot_path(node, &param::<String>(params, 0)?);
-    let (coins_loaded, tip_hash, base_height) = node.chain.write().load_utxo_set(&path)?;
+    let (coins_loaded, tip_hash, base_height) = node.chain.write().load_assumeutxo_set(&path)?;
     Ok(json!({
         "coins_loaded": coins_loaded,
         "tip_hash": tip_hash.to_string(),
@@ -9968,19 +9968,26 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
     let header = chain
         .header(tip.height)
         .ok_or_else(|| anyhow!("active tip header is unavailable"))?;
+    let (snapshot_base, validated) = chain
+        .snapshot_provenance()
+        .map_or((None, true), |(base, validated)| (Some(base), validated));
+    let mut chainstate = json!({
+        "blocks": tip.height,
+        "bestblockhash": tip.hash.to_string(),
+        "bits": format!("{:08x}", header.bits.to_consensus()),
+        "target": format!("{:064x}", header.target()),
+        "difficulty": header.difficulty_float(),
+        "verificationprogress": 1.0,
+        "coins_db_cache_bytes": 0,
+        "coins_tip_cache_bytes": chain.utxo_bogo_size(),
+        "validated": validated,
+    });
+    if let Some(snapshot_base) = snapshot_base {
+        chainstate["snapshot_blockhash"] = json!(snapshot_base.to_string());
+    }
     Ok(json!({
         "headers": header_tip.height,
-        "chainstates": [{
-            "blocks": tip.height,
-            "bestblockhash": tip.hash.to_string(),
-            "bits": format!("{:08x}", header.bits.to_consensus()),
-            "target": format!("{:064x}", header.target()),
-            "difficulty": header.difficulty_float(),
-            "verificationprogress": 1.0,
-            "coins_db_cache_bytes": 0,
-            "coins_tip_cache_bytes": chain.utxo_bogo_size(),
-            "validated": true,
-        }],
+        "chainstates": [chainstate],
     }))
 }
 
@@ -16200,10 +16207,10 @@ mod tests {
                 .is_some_and(|hash| !hash.is_empty())
         );
         assert_eq!(dumped["path"], path.to_string_lossy().as_ref());
-        let loaded = load_txoutset(&node, &json!([path.to_string_lossy()])).unwrap();
-        assert_eq!(loaded["base_height"], 0);
-        assert_eq!(loaded["coins_loaded"], 0);
-        assert_eq!(loaded["path"], path.to_string_lossy().as_ref());
+        let error = load_txoutset(&node, &json!([path.to_string_lossy()]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported by this network's AssumeUTXO commitments"));
     }
 
     #[test]
@@ -16270,10 +16277,10 @@ mod tests {
         assert_eq!(dumped["nchaintx"], 2);
         assert_eq!(node.chain.read().height(), live_height);
         assert!(path.exists());
-        let loaded = load_txoutset(&node, &json!([path.to_string_lossy()])).unwrap();
-        assert_eq!(loaded["coins_loaded"], 1);
-        assert_eq!(loaded["tip_hash"], target_hash.to_string());
-        assert_eq!(loaded["base_height"], 1);
+        let error = load_txoutset(&node, &json!([path.to_string_lossy()]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not supported by this network's AssumeUTXO commitments"));
         assert_eq!(node.chain.read().height(), live_height);
 
         let named_path = directory.path().join("historical-utxos-named.snapshot");
@@ -16402,5 +16409,8 @@ mod tests {
             get_chain_states(&node).unwrap()["chainstates"][0]["blocks"],
             1
         );
+        let chainstate = &get_chain_states(&node).unwrap()["chainstates"][0];
+        assert_eq!(chainstate["validated"], true);
+        assert!(chainstate.get("snapshot_blockhash").is_none());
     }
 }

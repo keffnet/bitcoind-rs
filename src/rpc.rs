@@ -1242,7 +1242,33 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "echo" | "echojson" => Ok(params.clone()),
         "echoipc" => Ok(json!(param::<String>(params, 0)?)),
         "verifychain" => {
-            let depth = params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
+            let checklevel = params
+                .get(0)
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_i64()
+                        .ok_or_else(|| anyhow!("checklevel must be an integer"))
+                })
+                .transpose()?
+                .unwrap_or(3);
+            if !(0..=4).contains(&checklevel) {
+                bail!("checklevel must be between 0 and 4")
+            }
+            let checkblocks = params
+                .get(1)
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    value
+                        .as_i64()
+                        .ok_or_else(|| anyhow!("nblocks must be an integer"))
+                })
+                .transpose()?
+                .unwrap_or(6);
+            if checkblocks < 0 {
+                bail!("nblocks must not be negative")
+            }
+            let depth = u32::try_from(checkblocks).map_err(|_| anyhow!("nblocks is too large"))?;
             node.chain.write().verify_active_chain(depth)?;
             Ok(Value::Bool(true))
         }
@@ -1604,7 +1630,12 @@ fn get_memory_info(params: &Value) -> Result<Value> {
     let mode = params
         .get(0)
         .filter(|value| !value.is_null())
-        .and_then(Value::as_str)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("mode must be a string"))
+        })
+        .transpose()?
         .unwrap_or("stats");
     match mode {
         "stats" => Ok(json!({
@@ -11015,8 +11046,17 @@ mod tests {
             dispatch_method(&node, "echoipc", &json!(["hello"])).unwrap(),
             json!("hello")
         );
+        assert!(
+            dispatch_method(&node, "verifychain", &json!([]))
+                .unwrap()
+                .as_bool()
+                .unwrap()
+        );
+        assert!(dispatch_method(&node, "verifychain", &json!([5])).is_err());
+        assert!(dispatch_method(&node, "verifychain", &json!([3, -1])).is_err());
         assert!(dispatch_method(&node, "getmemoryinfo", &json!([])).unwrap()["locked"].is_object());
         assert!(dispatch_method(&node, "getmemoryinfo", &json!(["mallocinfo"])).is_err());
+        assert!(dispatch_method(&node, "getmemoryinfo", &json!([1])).is_err());
         let net_totals = dispatch_method(&node, "getnettotals", &json!([])).unwrap();
         assert!(net_totals["uploadtarget"]["bytes_left_in_cycle"].is_number());
         assert!(net_totals["uploadtarget"]["time_left_in_cycle"].is_number());

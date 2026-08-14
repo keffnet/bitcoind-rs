@@ -7080,24 +7080,33 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let coinbase_value =
         validation::block_subsidy_for_network(chain.network, height).saturating_add(fees);
     let segwit_active = height >= validation::buried_deployment_heights(chain.network).segwit;
-    let taproot_active = validation::script_flags_for_block(chain.network, height, curtime)
-        & bitcoinconsensus::VERIFY_TAPROOT
-        != 0;
     let mut rules = vec!["csv"];
     if segwit_active {
         rules.push("!segwit");
     }
-    if taproot_active {
-        rules.push("taproot");
-    }
     if chain.network == Network::Signet {
         rules.push("!signet");
     }
+    let headers = chain.headers_to_hash(&tip.hash).unwrap_or_default();
+    let [testdummy, taproot] = validation::bip9_deployments(chain.network);
+    let mut version = 0x2000_0000u32;
+    let mut vbavailable = serde_json::Map::new();
+    for (name, deployment) in [("testdummy", testdummy), ("taproot", taproot)] {
+        let (state, _) = bip9_state_at_height(&headers, deployment, tip.height);
+        match state {
+            Bip9State::Started | Bip9State::LockedIn => {
+                version |= 1u32 << deployment.bit;
+                vbavailable.insert(name.to_owned(), json!(deployment.bit));
+            }
+            Bip9State::Active => rules.push(name),
+            Bip9State::Defined | Bip9State::Failed => {}
+        }
+    }
     Ok(json!({
         "capabilities": ["proposal"],
-        "version": 0x20000000u32,
+        "version": version,
         "rules": rules,
-        "vbavailable": {},
+        "vbavailable": vbavailable,
         "vbrequired": 0,
         "previousblockhash": tip.hash.to_string(),
         "transactions": transactions,

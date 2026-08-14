@@ -134,7 +134,7 @@ pub struct Args {
     #[arg(long, value_name = "HEX")]
     pub signet_challenge: Option<String>,
 
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, visible_alias = "maxconnections", default_value_t = 32)]
     pub max_peers: usize,
 
     #[arg(long, default_value_t = false)]

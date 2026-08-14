@@ -2359,7 +2359,7 @@ fn get_block_from_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let peer_id = param::<u64>(params, 1)?;
     let peer_id = usize::try_from(peer_id).map_err(|_| anyhow!("peer id is out of range"))?;
     node.request_block_from_peer(peer_id, hash)?;
-    Ok(Value::Null)
+    Ok(json!({}))
 }
 
 fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -11249,6 +11249,20 @@ mod tests {
         };
         assert_eq!(command, "test");
         assert_eq!(payload, vec![1, 2]);
+
+        assert_eq!(
+            dispatch_method(
+                &node,
+                "getblockfrompeer",
+                &json!([BlockHash::all_zeros().to_string(), 7]),
+            )
+            .unwrap(),
+            json!({})
+        );
+        let crate::p2p::PeerCommand::RequestBlock(hash) = receiver.try_recv().unwrap() else {
+            panic!("expected block request command");
+        };
+        assert_eq!(hash, BlockHash::all_zeros());
     }
 
     #[test]

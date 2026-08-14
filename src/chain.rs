@@ -5797,6 +5797,33 @@ mod tests {
     }
 
     #[test]
+    fn invalidation_state_survives_restart_and_reconsideration() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        let second = mine_block(&state, 2);
+        let second_hash = second.block_hash();
+        state.connect_block(second).unwrap();
+        state.invalidate_block(&second_hash).unwrap();
+        assert_eq!(state.height(), 1);
+        drop(state);
+
+        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.height(), 1);
+        assert_eq!(
+            reopened
+                .chain_tips()
+                .into_iter()
+                .find(|tip| tip.hash == second_hash)
+                .map(|tip| tip.status),
+            Some("invalid")
+        );
+        reopened.reconsider_block(&second_hash).unwrap();
+        assert_eq!(reopened.height(), 2);
+        assert_eq!(reopened.best_hash(), second_hash);
+    }
+
+    #[test]
     fn failed_reorg_replay_restores_the_all_transaction_index() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();

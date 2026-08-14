@@ -6,6 +6,7 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use bincode::{deserialize as deserialize_binary, serialize as serialize_binary};
 use bitcoin::bip158::{BlockFilter, FilterHeader};
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::consensus::encode::{Decodable, VarInt, serialize};
@@ -14,6 +15,7 @@ use bitcoin::pow::{CompactTarget, Target, Work};
 use bitcoin::{
     Amount, Block, BlockHash, Network, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -32,6 +34,8 @@ const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 const MAX_UNSPENDABLE_SCRIPT_SIZE: usize = 10_000;
 const CORE_UTXO_SNAPSHOT_MAGIC: [u8; 5] = [b'u', b't', b'x', b'o', 0xff];
 const CORE_UTXO_SNAPSHOT_VERSION: u16 = 2;
+const CHAIN_METADATA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-v1\0";
+const CHAIN_SNAPSHOT_MAGIC: &[u8] = b"bitcoind-rs-snapshot-v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UtxoEntry {
@@ -290,6 +294,21 @@ struct ChainSnapshot {
     prune_height: Option<u32>,
 }
 
+fn serialize_internal<T: Serialize>(magic: &[u8], value: &T) -> Result<Vec<u8>> {
+    let payload = serialize_binary(value).context("serializing internal chainstate")?;
+    let mut bytes = Vec::with_capacity(magic.len() + payload.len());
+    bytes.extend_from_slice(magic);
+    bytes.extend_from_slice(&payload);
+    Ok(bytes)
+}
+
+fn deserialize_internal<T: DeserializeOwned>(bytes: &[u8], magic: &[u8]) -> Result<T> {
+    if !bytes.starts_with(magic) {
+        bail!("internal chainstate format marker is invalid")
+    }
+    deserialize_binary(&bytes[magic.len()..]).context("decoding internal chainstate")
+}
+
 pub struct ChainState {
     pub network: Network,
     data_dir: PathBuf,
@@ -371,11 +390,13 @@ impl ChainState {
             store.insert(&genesis)?;
         }
 
-        let metadata_path = data_dir.join("chainstate.json");
+        let metadata_path = data_dir.join("chainstate.bin");
+        let legacy_metadata_path = data_dir.join("chainstate.json");
         let rebuild_chainstate = reindex || reindex_chainstate;
         if rebuild_chainstate {
             for path in [
-                data_dir.join("chainstate.json"),
+                metadata_path.clone(),
+                legacy_metadata_path.clone(),
                 data_dir.join("chainstate.snapshot"),
                 data_dir.join("chainstate.snapshot.sha256"),
             ] {
@@ -390,11 +411,19 @@ impl ChainState {
             }
         }
         let (active_chain, persisted_headers, invalid_blocks, prune_height) =
-            if !rebuild_chainstate && metadata_path.exists() {
-                let bytes = fs::read(&metadata_path)
-                    .with_context(|| format!("reading {}", metadata_path.display()))?;
-                let metadata: ChainMetadata = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("decoding {}", metadata_path.display()))?;
+            if !rebuild_chainstate && (metadata_path.exists() || legacy_metadata_path.exists()) {
+                let metadata = if metadata_path.exists() {
+                    let bytes = fs::read(&metadata_path)
+                        .with_context(|| format!("reading {}", metadata_path.display()))?;
+                    deserialize_internal(&bytes, CHAIN_METADATA_MAGIC)
+                        .with_context(|| format!("decoding {}", metadata_path.display()))?
+                } else {
+                    let bytes = fs::read(&legacy_metadata_path)
+                        .with_context(|| format!("reading {}", legacy_metadata_path.display()))?;
+                    serde_json::from_slice(&bytes)
+                        .with_context(|| format!("decoding {}", legacy_metadata_path.display()))?
+                };
+                let metadata: ChainMetadata = metadata;
                 let active_chain = metadata
                     .active_chain
                     .into_iter()
@@ -3343,9 +3372,9 @@ impl ChainState {
                 .collect(),
             prune_height: self.prune_height,
         };
-        let bytes = serde_json::to_vec_pretty(&metadata)?;
-        let path = self.data_dir.join("chainstate.json");
-        let temp = self.data_dir.join("chainstate.json.tmp");
+        let bytes = serialize_internal(CHAIN_METADATA_MAGIC, &metadata)?;
+        let path = self.data_dir.join("chainstate.bin");
+        let temp = self.data_dir.join("chainstate.bin.tmp");
         fs::write(&temp, bytes)?;
         fs::rename(temp, path)?;
         Ok(())
@@ -3357,8 +3386,13 @@ impl ChainState {
             return Ok(None);
         }
         let bytes = fs::read(path)?;
-        let Ok(snapshot) = serde_json::from_slice::<ChainSnapshot>(&bytes) else {
-            return Ok(None);
+        let snapshot = if bytes.starts_with(CHAIN_SNAPSHOT_MAGIC) {
+            deserialize_internal(&bytes, CHAIN_SNAPSHOT_MAGIC)?
+        } else {
+            let Ok(snapshot) = serde_json::from_slice::<ChainSnapshot>(&bytes) else {
+                return Ok(None);
+            };
+            snapshot
         };
         let checksum_path = self.snapshot_checksum_path();
         let verified = match fs::read_to_string(checksum_path) {
@@ -3389,7 +3423,7 @@ impl ChainState {
 
     fn persist_snapshot(&self) -> Result<()> {
         let snapshot = self.current_snapshot();
-        let bytes = serde_json::to_vec(&snapshot)?;
+        let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
         let temp = self.data_dir.join("chainstate.snapshot.tmp");
         fs::write(&temp, &bytes)?;
@@ -4130,7 +4164,50 @@ mod tests {
         assert_eq!(rebuilt.best_hash(), tip_hash);
         assert_eq!(rebuilt.height(), 3);
         assert_eq!(rebuilt.utxo_stats(), tip_stats);
-        assert!(directory.path().join("chainstate.json").exists());
+        assert!(directory.path().join("chainstate.bin").exists());
+    }
+
+    #[test]
+    fn legacy_json_chainstate_files_migrate_to_binary_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            let block = mine_block(&state, height);
+            state.connect_block(block).unwrap();
+        }
+        let metadata = ChainMetadata {
+            active_chain: state.active_chain.iter().map(ToString::to_string).collect(),
+            headers: state.known_headers(),
+            invalid_blocks: state
+                .invalid_blocks
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            prune_height: state.prune_height,
+        };
+        let snapshot = state.current_snapshot();
+        let metadata_json = serde_json::to_vec_pretty(&metadata).unwrap();
+        let snapshot_json = serde_json::to_vec(&snapshot).unwrap();
+        let tip = state.best_hash();
+        let height = state.height();
+        drop(state);
+
+        fs::remove_file(directory.path().join("chainstate.bin")).unwrap();
+        fs::write(directory.path().join("chainstate.json"), &metadata_json).unwrap();
+        fs::write(directory.path().join("chainstate.snapshot"), &snapshot_json).unwrap();
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), tip);
+        assert_eq!(reopened.height(), height);
+        assert!(directory.path().join("chainstate.bin").exists());
+        reopened.persist_snapshot().unwrap();
+        drop(reopened);
+
+        let binary_metadata = fs::read(directory.path().join("chainstate.bin")).unwrap();
+        assert!(binary_metadata.starts_with(CHAIN_METADATA_MAGIC));
+        assert!(binary_metadata.len() < metadata_json.len());
+        let binary_snapshot = fs::read(directory.path().join("chainstate.snapshot")).unwrap();
+        assert!(binary_snapshot.starts_with(CHAIN_SNAPSHOT_MAGIC));
+        assert!(binary_snapshot.len() < snapshot_json.len());
     }
 
     #[test]
@@ -4573,10 +4650,16 @@ mod tests {
         drop(reopened);
         let snapshot_path = directory.path().join("chainstate.snapshot");
         let bytes = fs::read(&snapshot_path).unwrap();
-        let mut snapshot: ChainSnapshot = serde_json::from_slice(&bytes).unwrap();
+        assert!(bytes.starts_with(CHAIN_SNAPSHOT_MAGIC));
+        let mut snapshot: ChainSnapshot =
+            deserialize_internal(&bytes, CHAIN_SNAPSHOT_MAGIC).unwrap();
         let entry = snapshot.utxos.values_mut().next().unwrap();
         entry.output.value = Amount::from_sat(entry.output.value.to_sat().saturating_sub(1));
-        fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        fs::write(
+            &snapshot_path,
+            serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot).unwrap(),
+        )
+        .unwrap();
         assert!(ChainState::open(Network::Regtest, directory.path()).is_err());
         fs::write(directory.path().join("chainstate.snapshot"), b"corrupt").unwrap();
         let replayed = ChainState::open(Network::Regtest, directory.path()).unwrap();

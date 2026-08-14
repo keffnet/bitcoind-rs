@@ -8990,11 +8990,7 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .ok_or_else(|| anyhow!("scan descriptor object requires desc"))?
                         .to_owned()
                 };
-                let range = object
-                    .get("range")
-                    .filter(|value| !value.is_null())
-                    .map(parse_descriptor_range)
-                    .transpose()?;
+                let range = scan_descriptor_range(object, &descriptor)?;
                 for script in expand_descriptor_scripts(node, &descriptor, range)? {
                     descriptors.push((descriptor.clone(), script));
                 }
@@ -9321,14 +9317,25 @@ fn scan_object_scripts(node: &Arc<Node>, objects: &[Value]) -> Result<Vec<Script
                 .ok_or_else(|| anyhow!("scan descriptor object requires desc"))?
                 .to_owned()
         };
-        let range = object
-            .get("range")
-            .filter(|value| !value.is_null())
-            .map(parse_descriptor_range)
-            .transpose()?;
+        let range = scan_descriptor_range(object, &descriptor)?;
         scripts.extend(expand_descriptor_scripts(node, &descriptor, range)?);
     }
     Ok(scripts)
+}
+
+fn scan_descriptor_range(object: &Value, descriptor: &str) -> Result<Option<(u32, u32)>> {
+    let range = object
+        .get("range")
+        .filter(|value| !value.is_null())
+        .map(parse_descriptor_process_range)
+        .transpose()?;
+    Ok(range.or_else(|| {
+        descriptor
+            .split('#')
+            .next()
+            .is_some_and(|payload| payload.contains('*'))
+            .then_some((0, 1_000))
+    }))
 }
 
 fn output_for_outpoint(
@@ -12378,6 +12385,19 @@ mod tests {
         assert_eq!(result["unspents"][0]["confirmations"], 1);
         assert!(result["unspents"][0]["scriptPubKey"].is_string());
         assert_eq!(result["total_amount"], 50.0);
+
+        let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
+        let ranged_descriptor = format!("wpkh({xpub}/0/*)");
+        let ranged_address = derive_addresses(&node, &json!([ranged_descriptor.clone(), [0, 0]]))
+            .unwrap()[0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        generate_to_address(&node, &json!([1, ranged_address])).unwrap();
+        let ranged_result = scan_txout_set(&node, &json!(["start", [ranged_descriptor]])).unwrap();
+        assert_eq!(ranged_result["success"], true);
+        assert_eq!(ranged_result["txouts"], 1);
+        assert_eq!(ranged_result["unspents"][0]["height"], 2);
     }
 
     #[test]

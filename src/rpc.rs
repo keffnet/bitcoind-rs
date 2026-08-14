@@ -96,10 +96,13 @@ async fn handle_connection(node: Arc<Node>, mut stream: TcpStream) -> Result<()>
                 stream.shutdown().await?;
                 return Ok(());
             }
+            let body = dispatch_json_rpc(&node, &request.body).await;
             (
                 "200 OK",
                 "application/json",
-                serde_json::to_vec(&dispatch_json_rpc(&node, &request.body).await)?,
+                body.map(|value| serde_json::to_vec(&value))
+                    .transpose()?
+                    .unwrap_or_default(),
             )
         }
         None => (
@@ -820,35 +823,52 @@ fn deserialize_get_utxos_request(bytes: &[u8]) -> Result<(bool, Vec<OutPoint>)> 
     Ok((check_mempool, outpoints))
 }
 
-async fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Value {
+async fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Option<Value> {
     let request: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
-            return json!({"result": null, "error": {"code": -32700, "message": error.to_string()}, "id": null});
+            return Some(
+                json!({"result": null, "error": {"code": -32700, "message": error.to_string()}, "id": null}),
+            );
         }
     };
     if let Some(batch) = request.as_array() {
         if batch.is_empty() {
-            return json!({"result": null, "error": {"code": -32600, "message": "empty batch"}, "id": null});
+            return Some(
+                json!({"result": null, "error": {"code": -32600, "message": "empty batch"}, "id": null}),
+            );
         }
         let mut responses = Vec::with_capacity(batch.len());
         for request in batch {
-            responses.push(dispatch_request(node, request).await);
+            if let Some(response) = dispatch_request(node, request).await {
+                responses.push(response);
+            }
         }
-        return Value::Array(responses);
+        return (!responses.is_empty()).then_some(Value::Array(responses));
     }
     dispatch_request(node, &request).await
 }
 
-async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Value {
+async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Option<Value> {
+    let Some(request_object) = request.as_object() else {
+        return Some(json!({
+            "result": null,
+            "error": {"code": -32600, "message": "invalid Request object"},
+            "id": null,
+        }));
+    };
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let json_rpc_2 = request.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
-    let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = request
+    let is_notification = json_rpc_2 && !request_object.contains_key("id");
+    let method = request_object
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let params = request_object
         .get("params")
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
-    match dispatch_method_async(node, method, &params).await {
+    let response = match dispatch_method_async(node, method, &params).await {
         Ok(result) if json_rpc_2 => json!({
             "jsonrpc": "2.0",
             "result": result,
@@ -861,7 +881,8 @@ async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Value {
         }),
         Ok(result) => json!({"result": result, "error": null, "id": id}),
         Err(error) => json!({"result": null, "error": rpc_error(&error), "id": id}),
-    }
+    };
+    (!is_notification).then_some(response)
 }
 
 async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
@@ -8584,6 +8605,52 @@ mod tests {
         let normalized = normalize_rpc_params("gettxout", &json!({"txid": "00", "n": 1})).unwrap();
         assert_eq!(normalized, json!(["00", 1, null]));
         assert!(normalize_rpc_params("getblockhash", &json!({"height": 0, "extra": 1})).is_err());
+    }
+
+    #[tokio::test]
+    async fn json_rpc_two_notifications_have_no_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+        })
+        .unwrap();
+
+        assert!(
+            dispatch_json_rpc(&node, br#"{"jsonrpc":"2.0","method":"getblockcount"}"#)
+                .await
+                .is_none()
+        );
+        assert!(dispatch_json_rpc(
+            &node,
+            br#"[{"jsonrpc":"2.0","method":"getblockcount"},{"jsonrpc":"2.0","method":"getdifficulty"}]"#,
+        )
+        .await
+        .is_none());
+
+        let response = dispatch_json_rpc(
+            &node,
+            br#"[{"jsonrpc":"2.0","method":"getblockcount"},{"jsonrpc":"2.0","id":7,"method":"getblockcount"}]"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.as_array().unwrap().len(), 1);
+        assert_eq!(response[0]["id"], json!(7));
+        assert_eq!(response[0]["result"], json!(0));
+
+        let legacy = dispatch_json_rpc(&node, br#"{"method":"getblockcount"}"#)
+            .await
+            .unwrap();
+        assert_eq!(legacy["result"], json!(0));
+        assert_eq!(legacy["id"], Value::Null);
     }
 
     #[test]

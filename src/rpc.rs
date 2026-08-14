@@ -3894,9 +3894,26 @@ fn decoded_transaction_json(transaction: &Transaction, network: Network) -> Valu
     result
 }
 
+fn transaction_has_witness_serialization(bytes: &[u8]) -> bool {
+    bytes.get(4).copied() == Some(0) && bytes.get(5).is_some_and(|flag| *flag != 0)
+}
+
 fn decode_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let bytes = hex::decode(param::<String>(params, 0)?)?;
-    let transaction: Transaction = deserialize(&bytes)?;
+    let bytes = hex::decode(param::<String>(params, 0)?).context("TX decode failed")?;
+    if let Some(iswitness) = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("iswitness must be a boolean"))
+        })
+        .transpose()?
+        && iswitness != transaction_has_witness_serialization(&bytes)
+    {
+        bail!("TX decode failed")
+    }
+    let transaction: Transaction = deserialize(&bytes).context("TX decode failed")?;
     Ok(decoded_transaction_json(&transaction, node.config.network))
 }
 
@@ -4250,11 +4267,86 @@ fn expand_decimal_exponent(value: &str) -> Result<String> {
     })
 }
 
-fn decode_script(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let bytes = hex::decode(param::<String>(params, 0)?)?;
-    let script = ScriptBuf::from_bytes(bytes);
-    let address = Address::from_script(&script, node.config.network).ok();
-    let script_type = if script.is_p2pkh() {
+fn script_push_num(opcode: u8) -> Option<u8> {
+    match opcode {
+        0x00 => Some(0),
+        0x51..=0x60 => Some(opcode - 0x50),
+        _ => None,
+    }
+}
+
+fn multisig_descriptor_body(script: &bitcoin::Script) -> Option<String> {
+    if !script.is_multisig() {
+        return None;
+    }
+    let mut instructions = script.instructions();
+    let required = match instructions.next()? {
+        Ok(Instruction::Op(op)) => script_push_num(op.to_u8())?,
+        _ => return None,
+    };
+    if required == 0 {
+        return None;
+    }
+    let mut keys = Vec::new();
+    loop {
+        match instructions.next()? {
+            Ok(Instruction::PushBytes(bytes)) => {
+                let public_key = bitcoin::PublicKey::from_slice(bytes.as_bytes()).ok()?;
+                keys.push(public_key.to_string());
+            }
+            Ok(Instruction::Op(op)) => {
+                let key_count = script_push_num(op.to_u8())?;
+                let parsed_key_count = u8::try_from(keys.len()).ok()?;
+                if key_count != parsed_key_count || required > key_count {
+                    return None;
+                }
+                match instructions.next()? {
+                    Ok(Instruction::Op(check))
+                        if check == bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG => {}
+                    _ => return None,
+                }
+                if instructions.next().is_some() {
+                    return None;
+                }
+                return Some(format!("multi({required},{})", keys.join(",")));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+fn is_core_nulldata(script: &bitcoin::Script) -> bool {
+    script.as_bytes().first() == Some(&OP_RETURN.to_u8())
+        && bitcoin::Script::from_bytes(&script.as_bytes()[1..]).is_push_only()
+}
+
+fn script_has_op_success_or_checksigadd(script: &bitcoin::Script) -> bool {
+    script.instructions().any(|instruction| {
+        let Ok(Instruction::Op(op)) = instruction else {
+            return false;
+        };
+        let opcode = op.to_u8();
+        opcode == 0xba
+            || matches!(
+                opcode,
+                0x50
+                    | 0x62
+                    | 0x7e..=0x81
+                    | 0x83..=0x86
+                    | 0x89..=0x8a
+                    | 0x8d..=0x8e
+                    | 0x95..=0x99
+                    | 0xbb..=0xfe
+            )
+    })
+}
+
+fn is_p2a_script(script: &bitcoin::Script) -> bool {
+    script.as_bytes() == [0x51, 0x02, 0x4e, 0x73]
+}
+
+fn script_type_for_decode(script: &bitcoin::Script) -> &'static str {
+    if script.is_p2pkh() {
         "pubkeyhash"
     } else if script.is_p2sh() {
         "scripthash"
@@ -4264,34 +4356,117 @@ fn decode_script(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "witness_v0_scripthash"
     } else if script.is_p2tr() {
         "witness_v1_taproot"
-    } else if script.is_op_return() {
+    } else if is_p2a_script(script) {
+        "anchor"
+    } else if script
+        .witness_version()
+        .is_some_and(|version| version.to_num() != 0)
+    {
+        "witness_unknown"
+    } else if is_core_nulldata(script) {
         "nulldata"
     } else if script.is_p2pk() {
         "pubkey"
+    } else if script.is_multisig() {
+        "multisig"
     } else {
         "nonstandard"
+    }
+}
+
+fn descriptor_with_checksum(body: &str) -> String {
+    format!("{body}#{}", descriptor_checksum(body).unwrap_or_default())
+}
+
+fn inferred_script_descriptor(node: &Arc<Node>, script: &bitcoin::Script) -> String {
+    let body = if script.is_p2tr() {
+        script
+            .as_bytes()
+            .get(2..)
+            .and_then(|bytes| bitcoin::XOnlyPublicKey::from_slice(bytes).ok())
+            .map(|key| format!("rawtr({key})"))
+            .unwrap_or_else(|| format!("raw({})", hex::encode(script.as_bytes())))
+    } else if let Some(public_key) = script.p2pk_public_key() {
+        format!("pk({public_key})")
+    } else if let Some(multisig) = multisig_descriptor_body(script) {
+        multisig
+    } else if let Ok(address) = Address::from_script(script, node.config.network) {
+        format!("addr({address})")
+    } else {
+        format!("raw({})", hex::encode(script.as_bytes()))
     };
+    descriptor_with_checksum(&body)
+}
+
+fn decoded_script_json(node: &Arc<Node>, script: &bitcoin::Script, include_hex: bool) -> Value {
+    let script_type = script_type_for_decode(script);
     let mut result = json!({
         "asm": script.to_asm_string(),
-        "hex": hex::encode(script.as_bytes()),
+        "desc": inferred_script_descriptor(node, script),
         "type": script_type,
-        "reqSigs": (script.is_p2pkh() || script.is_p2pk() || script.is_p2wpkh()).then_some(1),
-        "addresses": address
-            .as_ref()
-            .map(|address| vec![address.to_string()])
-            .unwrap_or_default(),
-        "p2sh": address
-            .as_ref()
-            .and_then(|_| Address::p2sh(&script, node.config.network).ok())
-            .map(|address| address.to_string()),
     });
-    if let Some(address) = address
-        && script.is_p2tr()
+    if include_hex {
+        result["hex"] = json!(hex::encode(script.as_bytes()));
+    }
+    if script_type != "pubkey"
+        && let Ok(address) = Address::from_script(script, node.config.network)
     {
-        result["segwit"] = json!({
-            "version": address.witness_program().map(|program| program.version().to_num()),
-            "hex": address.witness_program().map(|program| hex::encode(program.program().as_bytes())),
-        });
+        result["address"] = json!(address.to_string());
+    }
+    result
+}
+
+fn segwit_wrapper_script(script: &bitcoin::Script, script_type: &str) -> Option<ScriptBuf> {
+    match script_type {
+        "pubkey" => {
+            let public_key = script.p2pk_public_key()?;
+            let compressed = bitcoin::CompressedPublicKey::try_from(public_key).ok()?;
+            Some(Address::p2wpkh(&compressed, Network::Bitcoin).script_pubkey())
+        }
+        "pubkeyhash" => {
+            let hash = script.as_bytes().get(3..23)?;
+            let mut bytes = Vec::with_capacity(22);
+            bytes.extend_from_slice(&[0x00, 0x14]);
+            bytes.extend_from_slice(hash);
+            Some(ScriptBuf::from_bytes(bytes))
+        }
+        _ => Some(script.to_p2wsh()),
+    }
+}
+
+fn decode_script(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let bytes = hex::decode(param::<String>(params, 0)?)?;
+    let script = ScriptBuf::from_bytes(bytes);
+    let script_ref = script.as_script();
+    let script_type = script_type_for_decode(script_ref);
+    let mut result = decoded_script_json(node, script_ref, false);
+    let can_wrap = matches!(
+        script_type,
+        "multisig"
+            | "nonstandard"
+            | "pubkey"
+            | "pubkeyhash"
+            | "witness_v0_keyhash"
+            | "witness_v0_scripthash"
+    ) && script_has_valid_ops(script_ref)
+        && !script_is_unspendable(script_ref)
+        && !script_has_op_success_or_checksigadd(script_ref);
+    if can_wrap {
+        result["p2sh"] = json!(Address::p2sh(script_ref, node.config.network)?.to_string());
+        let can_wrap_p2wsh = matches!(script_type, "multisig" | "nonstandard" | "pubkeyhash")
+            || (script_type == "pubkey"
+                && script_ref
+                    .p2pk_public_key()
+                    .is_some_and(|public_key| public_key.compressed));
+        if can_wrap_p2wsh
+            && let Some(segwit_script) = segwit_wrapper_script(script_ref, script_type)
+        {
+            let segwit_ref = segwit_script.as_script();
+            let mut segwit = decoded_script_json(node, segwit_ref, true);
+            segwit["p2sh-segwit"] =
+                json!(Address::p2sh(segwit_ref, node.config.network)?.to_string());
+            result["segwit"] = segwit;
+        }
     }
     Ok(result)
 }
@@ -10833,9 +11008,34 @@ mod tests {
         .unwrap();
         assert_eq!(decoded["type"], "witness_v0_keyhash");
         assert_eq!(
-            decoded["addresses"][0],
+            decoded["address"],
             "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
         );
+        assert!(decoded["p2sh"].as_str().is_some());
+        assert!(decoded.get("segwit").is_none());
+        assert!(decoded.get("hex").is_none());
+        let decoded_nulldata = decode_script(
+            &node,
+            &json!([hex::encode(transaction.output[1].script_pubkey.as_bytes())]),
+        )
+        .unwrap();
+        assert_eq!(decoded_nulldata["type"], "nulldata");
+        assert!(decoded_nulldata.get("address").is_none());
+        assert!(decoded_nulldata.get("p2sh").is_none());
+        assert!(decoded_nulldata.get("segwit").is_none());
+        let taproot_script = {
+            let mut bytes = vec![0x51, 0x20];
+            bytes.extend_from_slice(
+                &hex::decode("79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                    .unwrap(),
+            );
+            ScriptBuf::from_bytes(bytes)
+        };
+        let decoded_taproot =
+            decode_script(&node, &json!([hex::encode(taproot_script.as_bytes())])).unwrap();
+        assert_eq!(decoded_taproot["type"], "witness_v1_taproot");
+        assert!(decoded_taproot.get("p2sh").is_none());
+        assert!(decoded_taproot.get("segwit").is_none());
         let decoded_transaction = decode_raw_transaction(&node, &json!([raw])).unwrap();
         assert_eq!(
             decoded_transaction["vout"][0]["scriptPubKey"]["type"],
@@ -10845,6 +11045,18 @@ mod tests {
             decoded_transaction["vout"][0]["scriptPubKey"]["address"],
             "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
         );
+        assert!(decode_raw_transaction(&node, &json!([raw, false])).is_ok());
+        assert!(decode_raw_transaction(&node, &json!([raw, true])).is_err());
+
+        let mut witness_transaction = transaction.clone();
+        witness_transaction.input[0].witness = Witness::from_slice(&[vec![0x01]]);
+        let witness_raw = hex::encode(serialize(&witness_transaction));
+        assert!(transaction_has_witness_serialization(
+            &hex::decode(&witness_raw).unwrap()
+        ));
+        assert!(decode_raw_transaction(&node, &json!([witness_raw])).is_ok());
+        assert!(decode_raw_transaction(&node, &json!([witness_raw, true])).is_ok());
+        assert!(decode_raw_transaction(&node, &json!([witness_raw, false])).is_err());
 
         let default_raw = create_raw_transaction(
             &node,

@@ -39,6 +39,9 @@ pub enum InventoryType {
     CompactBlock,
     WitnessTransaction,
     WitnessBlock,
+    /// Legacy BIP144 witness transaction type. This is valid for GETDATA
+    /// requests, but BIP339 INV/GETDATA wtxid relay uses MSG_WTX instead.
+    LegacyWitnessTransaction,
     Unknown(u32),
 }
 
@@ -50,8 +53,9 @@ impl InventoryType {
             2 => Self::Block,
             3 => Self::FilteredBlock,
             4 => Self::CompactBlock,
-            0x4000_0001 => Self::WitnessTransaction,
+            5 => Self::WitnessTransaction,
             0x4000_0002 => Self::WitnessBlock,
+            0x4000_0001 => Self::LegacyWitnessTransaction,
             other => Self::Unknown(other),
         }
     }
@@ -63,10 +67,25 @@ impl InventoryType {
             Self::Block => 2,
             Self::FilteredBlock => 3,
             Self::CompactBlock => 4,
-            Self::WitnessTransaction => 0x4000_0001,
+            Self::WitnessTransaction => 5,
             Self::WitnessBlock => 0x4000_0002,
+            Self::LegacyWitnessTransaction => 0x4000_0001,
             Self::Unknown(value) => value,
         }
+    }
+
+    pub fn is_transaction(self) -> bool {
+        matches!(
+            self,
+            Self::Transaction | Self::WitnessTransaction | Self::LegacyWitnessTransaction
+        )
+    }
+
+    pub fn is_witness_transaction(self) -> bool {
+        matches!(
+            self,
+            Self::WitnessTransaction | Self::LegacyWitnessTransaction
+        )
     }
 }
 
@@ -1062,6 +1081,24 @@ mod tests {
         put_compact_size(102, &mut locator).unwrap();
         locator.extend_from_slice(&[0; 32 * 103]);
         assert!(decode_getheaders(&mut Reader::new(&locator)).is_err());
+    }
+
+    #[test]
+    fn uses_bip339_wtx_inventory_type_and_keeps_legacy_witness_getdata() {
+        assert_eq!(InventoryType::WitnessTransaction.as_u32(), 5);
+        assert_eq!(
+            InventoryType::from_u32(5),
+            InventoryType::WitnessTransaction
+        );
+        assert_eq!(
+            InventoryType::from_u32(0x4000_0001),
+            InventoryType::LegacyWitnessTransaction
+        );
+        assert!(InventoryType::LegacyWitnessTransaction.is_witness_transaction());
+        assert_eq!(
+            InventoryType::LegacyWitnessTransaction.as_u32(),
+            0x4000_0001
+        );
     }
 
     #[test]

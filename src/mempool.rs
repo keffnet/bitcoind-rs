@@ -12,19 +12,21 @@ use bitcoin::{Amount, Network, OutPoint, PublicKey, Script, Transaction, TxOut, 
 use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainState;
+use crate::config::{
+    DEFAULT_ACCEPT_DATACARRIER, DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
+    DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB, DEFAULT_MAX_DATACARRIER_BYTES,
+    DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB, DEFAULT_PERMIT_BARE_MULTISIG,
+};
 use crate::time;
 use crate::validation::{self, ValidationError};
 
 const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300_000_000;
-const MIN_RELAY_SAT_PER_VBYTE: u64 = 1;
 pub(crate) const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
 const MAX_TX_LEGACY_SIGOPS: usize = 2_500;
 const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
-const MAX_DATACARRIER_BYTES: usize = 100_000;
-const DUST_RELAY_SAT_PER_KVB: u64 = 3_000;
 /// BIP 431/TRUC transaction version and topology limits.
 const TRUC_VERSION: i32 = 3;
 const TRUC_ANCESTOR_LIMIT: usize = 2;
@@ -38,7 +40,30 @@ pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
 /// Core's default cluster limits for the v31.1 mempool policy.
 pub const MAX_CLUSTER_COUNT: usize = 64;
 pub const MAX_CLUSTER_VSIZE: u64 = 101_000;
-pub const MAX_DATACARRIER_SIZE: usize = MAX_DATACARRIER_BYTES;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MempoolPolicy {
+    pub min_relay_fee_sat_per_kvb: u64,
+    pub incremental_relay_fee_sat_per_kvb: u64,
+    pub dust_relay_fee_sat_per_kvb: u64,
+    pub max_datacarrier_bytes: Option<usize>,
+    pub permit_bare_multisig: bool,
+}
+
+impl Default for MempoolPolicy {
+    fn default() -> Self {
+        Self {
+            min_relay_fee_sat_per_kvb: DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB,
+            incremental_relay_fee_sat_per_kvb: DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
+            dust_relay_fee_sat_per_kvb: DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
+            max_datacarrier_bytes: DEFAULT_ACCEPT_DATACARRIER
+                .then_some(usize::try_from(DEFAULT_MAX_DATACARRIER_BYTES).expect("constant fits")),
+            permit_bare_multisig: DEFAULT_PERMIT_BARE_MULTISIG,
+        }
+    }
+}
+
+pub const MAX_DATACARRIER_SIZE: usize = DEFAULT_MAX_DATACARRIER_BYTES as usize;
 
 #[derive(Deserialize, Serialize)]
 struct DiskMempoolEntry {
@@ -72,6 +97,7 @@ pub(crate) struct MempoolChange {
 #[derive(Clone)]
 pub struct Mempool {
     pub network: Network,
+    policy: MempoolPolicy,
     max_bytes: usize,
     bytes: usize,
     sequence: u64,
@@ -166,8 +192,17 @@ impl Mempool {
     }
 
     pub fn with_max_bytes(network: Network, max_bytes: usize) -> Self {
+        Self::with_max_bytes_and_policy(network, max_bytes, MempoolPolicy::default())
+    }
+
+    pub fn with_max_bytes_and_policy(
+        network: Network,
+        max_bytes: usize,
+        policy: MempoolPolicy,
+    ) -> Self {
         Self {
             network,
+            policy,
             max_bytes: max_bytes.max(1),
             bytes: 0,
             sequence: 0,
@@ -194,6 +229,26 @@ impl Mempool {
 
     pub fn max_bytes(&self) -> usize {
         self.max_bytes
+    }
+
+    pub fn min_relay_fee_sat_per_kvb(&self) -> u64 {
+        self.policy.min_relay_fee_sat_per_kvb
+    }
+
+    pub fn incremental_relay_fee_sat_per_kvb(&self) -> u64 {
+        self.policy.incremental_relay_fee_sat_per_kvb
+    }
+
+    pub fn dust_relay_fee_sat_per_kvb(&self) -> u64 {
+        self.policy.dust_relay_fee_sat_per_kvb
+    }
+
+    pub fn max_datacarrier_bytes(&self) -> Option<usize> {
+        self.policy.max_datacarrier_bytes
+    }
+
+    pub fn permit_bare_multisig(&self) -> bool {
+        self.policy.permit_bare_multisig
     }
 
     pub fn sequence(&self) -> u64 {
@@ -661,14 +716,20 @@ impl Mempool {
                 .ok_or(MempoolError::Empty)?
                 .compute_txid();
             let child = candidate.get(&child_txid).ok_or(MempoolError::BadOutput)?;
-            if candidate.modified_fee_sat(&child_txid, child.fee_sat)
-                < i128::from(child.vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE))
-            {
+            if !fee_rate_meets(
+                candidate.modified_fee_sat(&child_txid, child.fee_sat),
+                child.vsize,
+                candidate.policy.min_relay_fee_sat_per_kvb,
+            ) {
                 return Err(MempoolError::FeeRate);
             }
         }
         if new_count > 0
-            && package_fee < i128::from(package_vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE))
+            && !fee_rate_meets(
+                package_fee,
+                package_vsize,
+                candidate.policy.min_relay_fee_sat_per_kvb,
+            )
         {
             return Err(MempoolError::FeeRate);
         }
@@ -732,12 +793,13 @@ impl Mempool {
             .get(&txid)
             .map(|entry| candidate.modified_fee_sat(&txid, entry.fee_sat))
             .ok_or(MempoolError::BadOutput)?;
-        let required_fee = conflict_fees.saturating_add(i128::from(
-            candidate
-                .get(&txid)
-                .map(|entry| entry.vsize)
-                .unwrap_or_default()
-                .saturating_mul(MIN_RELAY_SAT_PER_VBYTE),
+        let replacement_vsize = candidate
+            .get(&txid)
+            .map(|entry| entry.vsize)
+            .unwrap_or_default();
+        let required_fee = conflict_fees.saturating_add(fee_for_rate(
+            candidate.policy.incremental_relay_fee_sat_per_kvb,
+            replacement_vsize,
         ));
         if replacement_fee < required_fee {
             return Err(MempoolError::ReplacementFee);
@@ -985,16 +1047,20 @@ impl Mempool {
             .unwrap_or(i64::MAX)
             .saturating_add(self.fee_delta(&txid));
         if chain.network != Network::Regtest {
-            validate_standard_policy_with_modified_fee(
+            validate_standard_policy_with_modified_fee_and_policy(
                 &transaction,
                 &previous_outputs,
                 fee_sat,
                 modified_fee_sat,
+                &self.policy,
             )?;
         }
         if enforce_fee_rate
-            && i128::from(modified_fee_sat)
-                < i128::from(vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE))
+            && !fee_rate_meets(
+                i128::from(modified_fee_sat),
+                vsize,
+                self.policy.min_relay_fee_sat_per_kvb,
+            )
         {
             return Err(MempoolError::FeeRate);
         }
@@ -1375,6 +1441,14 @@ impl Mempool {
     }
 }
 
+fn fee_rate_meets(fee_sat: i128, vsize: u64, fee_rate_sat_per_kvb: u64) -> bool {
+    fee_sat.saturating_mul(1_000) >= i128::from(fee_rate_sat_per_kvb) * i128::from(vsize)
+}
+
+fn fee_for_rate(fee_rate_sat_per_kvb: u64, vsize: u64) -> i128 {
+    (i128::from(fee_rate_sat_per_kvb) * i128::from(vsize) + 999) / 1_000
+}
+
 #[cfg(test)]
 fn validate_standard_policy(
     transaction: &Transaction,
@@ -1389,11 +1463,28 @@ fn validate_standard_policy(
     )
 }
 
+#[cfg(test)]
 fn validate_standard_policy_with_modified_fee(
     transaction: &Transaction,
     previous_outputs: &[TxOut],
     base_fee_sat: u64,
     modified_fee_sat: i64,
+) -> Result<(), MempoolError> {
+    validate_standard_policy_with_modified_fee_and_policy(
+        transaction,
+        previous_outputs,
+        base_fee_sat,
+        modified_fee_sat,
+        &MempoolPolicy::default(),
+    )
+}
+
+fn validate_standard_policy_with_modified_fee_and_policy(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+    base_fee_sat: u64,
+    modified_fee_sat: i64,
+    policy: &MempoolPolicy,
 ) -> Result<(), MempoolError> {
     if !(1..=3).contains(&transaction.version.0) {
         return Err(MempoolError::NonStandard("version".to_owned()));
@@ -1423,13 +1514,16 @@ fn validate_standard_policy_with_modified_fee(
     for output in &transaction.output {
         if output.script_pubkey.is_op_return() {
             data_carrier_bytes = data_carrier_bytes.saturating_add(output.script_pubkey.len());
-            if data_carrier_bytes > MAX_DATACARRIER_BYTES {
+            if policy
+                .max_datacarrier_bytes
+                .is_none_or(|max| data_carrier_bytes > max)
+            {
                 return Err(MempoolError::NonStandard("datacarrier".to_owned()));
             }
-        } else if !is_standard_output_script(&output.script_pubkey) {
+        } else if !is_standard_output_script(&output.script_pubkey, policy.permit_bare_multisig) {
             return Err(MempoolError::NonStandard("scriptpubkey".to_owned()));
         }
-        if is_dust_output(output) {
+        if is_dust_output_with_fee(output, policy.dust_relay_fee_sat_per_kvb) {
             dust_outputs = dust_outputs.saturating_add(1);
         }
     }
@@ -1594,12 +1688,12 @@ fn validate_standard_witnesses(
     Ok(())
 }
 
-fn is_standard_output_script(script: &Script) -> bool {
+fn is_standard_output_script(script: &Script, permit_bare_multisig: bool) -> bool {
     script.is_p2pkh()
         || script.is_p2sh()
         || script.p2pk_public_key().is_some()
         || script.is_witness_program()
-        || is_standard_bare_multisig(script)
+        || (permit_bare_multisig && is_standard_bare_multisig(script))
 }
 
 fn last_push_data(script: &Script) -> Option<&[u8]> {
@@ -1615,7 +1709,7 @@ fn last_push_data(script: &Script) -> Option<&[u8]> {
 }
 
 fn is_standard_spend_script(script: &Script) -> bool {
-    is_standard_output_script(script)
+    is_standard_output_script(script, true)
         && !(script.is_witness_program()
             && !(script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr()))
 }
@@ -1634,7 +1728,12 @@ fn is_standard_bare_multisig(script: &Script) -> bool {
     !keys.is_empty() && keys.len() <= 3 && keys.iter().all(|key| PublicKey::from_slice(key).is_ok())
 }
 
+#[cfg(test)]
 fn is_dust_output(output: &TxOut) -> bool {
+    is_dust_output_with_fee(output, DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB)
+}
+
+fn is_dust_output_with_fee(output: &TxOut, dust_relay_fee_sat_per_kvb: u64) -> bool {
     if output.script_pubkey.is_op_return() {
         return false;
     }
@@ -1646,7 +1745,7 @@ fn is_dust_output(output: &TxOut) -> bool {
     };
     let threshold = output_size
         .saturating_add(input_size)
-        .saturating_mul(DUST_RELAY_SAT_PER_KVB)
+        .saturating_mul(dust_relay_fee_sat_per_kvb)
         .saturating_add(999)
         / 1_000;
     output.value.to_sat() < threshold
@@ -1677,7 +1776,7 @@ fn validate_ephemeral_spends(
                 });
             if let Some(parent) = parent {
                 for (vout, output) in parent.output.iter().enumerate() {
-                    if is_dust_output(output) {
+                    if is_dust_output_with_fee(output, mempool.policy.dust_relay_fee_sat_per_kvb) {
                         unspent_dust.insert(OutPoint::new(input.previous_output.txid, vout as u32));
                     }
                 }
@@ -2344,6 +2443,56 @@ mod tests {
 
         nonstandard.output[0].value = Amount::from_sat(1);
         assert!(is_dust_output(&nonstandard.output[0]));
+    }
+
+    #[test]
+    fn standard_policy_honors_data_carrier_and_bare_multisig_switches() {
+        let previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::from_bytes({
+                let mut bytes = vec![0x76, 0xa9, 0x14];
+                bytes.extend([0u8; 20]);
+                bytes.extend([0x88, 0xac]);
+                bytes
+            }),
+        };
+        let mut transaction = graph_transaction(Txid::from_byte_array([8; 32]), 8);
+        transaction.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00]);
+        transaction.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x01]);
+        let mut policy = MempoolPolicy {
+            max_datacarrier_bytes: None,
+            ..MempoolPolicy::default()
+        };
+        assert!(matches!(
+            validate_standard_policy_with_modified_fee_and_policy(
+                &transaction,
+                std::slice::from_ref(&previous),
+                1,
+                1,
+                &policy,
+            ),
+            Err(MempoolError::NonStandard(reason)) if reason == "datacarrier"
+        ));
+
+        let mut bare_multisig = vec![0x51, 0x21];
+        bare_multisig.extend(
+            hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+                .unwrap(),
+        );
+        bare_multisig.extend([0x51, 0xae]);
+        transaction.output[0].script_pubkey = ScriptBuf::from_bytes(bare_multisig);
+        policy.max_datacarrier_bytes = Some(100_000);
+        policy.permit_bare_multisig = false;
+        assert!(matches!(
+            validate_standard_policy_with_modified_fee_and_policy(
+                &transaction,
+                std::slice::from_ref(&previous),
+                1,
+                1,
+                &policy,
+            ),
+            Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
+        ));
     }
 
     #[test]

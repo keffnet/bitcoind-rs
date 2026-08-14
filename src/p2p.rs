@@ -2047,7 +2047,16 @@ async fn send_peer_extensions(
         .await?;
     }
     if peer_version >= FEEFILTER_VERSION {
-        send_message(node, peer_id, writer, network, &Message::FeeFilter(1_000)).await?;
+        let relay_fee =
+            i64::try_from(node.mempool.read().min_relay_fee_sat_per_kvb()).unwrap_or(i64::MAX);
+        send_message(
+            node,
+            peer_id,
+            writer,
+            network,
+            &Message::FeeFilter(relay_fee),
+        )
+        .await?;
     }
     *sent = true;
     Ok(())
@@ -2344,6 +2353,11 @@ mod tests {
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2439,6 +2453,11 @@ mod tests {
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2549,6 +2568,11 @@ mod tests {
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2617,6 +2641,11 @@ mod tests {
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2672,6 +2701,11 @@ mod tests {
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2787,6 +2821,11 @@ mod tests {
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
             zmq,
         })
         .unwrap();
@@ -2869,7 +2908,7 @@ mod tests {
             wire::read_message(&mut server_reader, Network::Regtest)
                 .await
                 .unwrap(),
-            Message::FeeFilter(1_000)
+            Message::FeeFilter(100)
         );
         send_message(&node, 1, &writer, Network::Regtest, &Message::Verack)
             .await

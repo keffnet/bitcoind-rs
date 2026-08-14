@@ -339,7 +339,12 @@ fn dispatch_with_session(
                 .map_or(-1.0, |rate| rate as f64 / 100_000_000.0);
             Ok(json!(rate))
         }
-        "blockchain.relayfee" => Ok(json!(0.00001000)),
+        "blockchain.relayfee" => {
+            let mempool = node.mempool.read();
+            Ok(json!(
+                mempool.min_relay_fee_sat_per_kvb() as f64 / 100_000_000.0
+            ))
+        }
         "mempool.get_fee_histogram" => {
             let mempool = node.mempool.read();
             Ok(fee_histogram(&mempool))
@@ -703,11 +708,12 @@ fn block_headers_for_protocol(
     Ok(result)
 }
 
-fn mempool_info(_node: &Arc<Node>) -> Value {
+fn mempool_info(node: &Arc<Node>) -> Value {
+    let mempool = node.mempool.read();
     json!({
-        "mempoolminfee": 0.00001000,
-        "minrelaytxfee": 0.00001000,
-        "incrementalrelayfee": 0.00001000,
+        "mempoolminfee": mempool.min_relay_fee_sat_per_kvb() as f64 / 100_000_000.0,
+        "minrelaytxfee": mempool.min_relay_fee_sat_per_kvb() as f64 / 100_000_000.0,
+        "incrementalrelayfee": mempool.incremental_relay_fee_sat_per_kvb() as f64 / 100_000_000.0,
     })
 }
 
@@ -1398,6 +1404,11 @@ mod tests {
                 block_max_weight: 4_000_000,
                 block_reserved_weight: 8_000,
                 block_min_tx_fee_sat_per_kvb: 1,
+                min_relay_tx_fee_sat_per_kvb: 100,
+                incremental_relay_fee_sat_per_kvb: 100,
+                dust_relay_fee_sat_per_kvb: 3_000,
+                max_datacarrier_bytes: Some(100_000),
+                permit_bare_multisig: true,
                 zmq: crate::config::ZmqConfig::default(),
             })
             .unwrap(),
@@ -1477,7 +1488,7 @@ mod tests {
                 &mut session,
             )
             .unwrap()["minrelaytxfee"],
-            json!(0.00001)
+            json!(0.000001)
         );
         assert_eq!(
             dispatch_with_session(
@@ -1510,7 +1521,7 @@ mod tests {
                 &mut session,
             )
             .unwrap(),
-            json!(0.00001)
+            json!(0.000001)
         );
         assert!(
             dispatch_with_session(
@@ -1555,6 +1566,11 @@ mod tests {
                 block_max_weight: 4_000_000,
                 block_reserved_weight: 8_000,
                 block_min_tx_fee_sat_per_kvb: 1,
+                min_relay_tx_fee_sat_per_kvb: 100,
+                incremental_relay_fee_sat_per_kvb: 100,
+                dust_relay_fee_sat_per_kvb: 3_000,
+                max_datacarrier_bytes: Some(100_000),
+                permit_bare_multisig: true,
                 zmq: crate::config::ZmqConfig::default(),
             })
             .unwrap(),

@@ -34,7 +34,7 @@ use tracing::info;
 
 use crate::chain::ChainState;
 use crate::config::Config;
-use crate::mempool::{Mempool, MempoolChange, MempoolChangeKind, MempoolError};
+use crate::mempool::{Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolPolicy};
 
 const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
@@ -299,7 +299,15 @@ impl Node {
         chain.configure_coinstats_index(config.coinstatsindex)?;
         chain.maybe_auto_prune()?;
         let mempool_path = config.datadir.join("mempool.json");
-        let mut mempool = Mempool::with_max_bytes(config.network, max_mempool_bytes);
+        let mempool_policy = MempoolPolicy {
+            min_relay_fee_sat_per_kvb: config.min_relay_tx_fee_sat_per_kvb,
+            incremental_relay_fee_sat_per_kvb: config.incremental_relay_fee_sat_per_kvb,
+            dust_relay_fee_sat_per_kvb: config.dust_relay_fee_sat_per_kvb,
+            max_datacarrier_bytes: config.max_datacarrier_bytes,
+            permit_bare_multisig: config.permit_bare_multisig,
+        };
+        let mut mempool =
+            Mempool::with_max_bytes_and_policy(config.network, max_mempool_bytes, mempool_policy);
         if config.persist_mempool {
             let expiry = Duration::from_secs(config.mempool_expiry_hours.saturating_mul(60 * 60));
             mempool.load_from_file_with_expiry(&mempool_path, &chain, expiry)?;
@@ -1495,6 +1503,11 @@ mod tests {
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         }
     }

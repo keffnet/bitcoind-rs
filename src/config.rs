@@ -13,6 +13,12 @@ pub const DEFAULT_BLOCK_MAX_WEIGHT: u64 = 4_000_000;
 pub const DEFAULT_BLOCK_RESERVED_WEIGHT: u64 = 8_000;
 pub const MINIMUM_BLOCK_RESERVED_WEIGHT: u64 = 2_000;
 pub const DEFAULT_BLOCK_MIN_TX_FEE_SAT_PER_KVB: u64 = 1;
+pub const DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB: u64 = 100;
+pub const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 100;
+pub const DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB: u64 = 3_000;
+pub const DEFAULT_MAX_DATACARRIER_BYTES: u64 = 100_000;
+pub const DEFAULT_ACCEPT_DATACARRIER: bool = true;
+pub const DEFAULT_PERMIT_BARE_MULTISIG: bool = true;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 pub const DEFAULT_PERSIST_MEMPOOL: bool = true;
 pub const DEFAULT_BLOCKFILTERINDEX: &str = "0";
@@ -177,6 +183,36 @@ pub struct Args {
     #[arg(long, default_value = "0.00000001")]
     pub blockmintxfee: String,
 
+    #[arg(long)]
+    pub minrelaytxfee: Option<String>,
+
+    #[arg(long)]
+    pub incrementalrelayfee: Option<String>,
+
+    #[arg(long)]
+    pub dustrelayfee: Option<String>,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_ACCEPT_DATACARRIER,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub datacarrier: bool,
+
+    #[arg(long, default_value_t = DEFAULT_MAX_DATACARRIER_BYTES)]
+    pub datacarriersize: u64,
+
+    #[arg(
+        long,
+        default_value_t = DEFAULT_PERMIT_BARE_MULTISIG,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub permitbaremultisig: bool,
+
     #[arg(long, default_value_t = false)]
     pub peer_bloom_filters: bool,
 
@@ -284,6 +320,11 @@ pub struct Config {
     pub block_max_weight: u64,
     pub block_reserved_weight: u64,
     pub block_min_tx_fee_sat_per_kvb: u64,
+    pub min_relay_tx_fee_sat_per_kvb: u64,
+    pub incremental_relay_fee_sat_per_kvb: u64,
+    pub dust_relay_fee_sat_per_kvb: u64,
+    pub max_datacarrier_bytes: Option<usize>,
+    pub permit_bare_multisig: bool,
     pub peer_bloom_filters: bool,
     pub blocksonly: bool,
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
@@ -332,6 +373,27 @@ impl Config {
                     )
                 })?
                 .to_sat();
+        let incremental_relay_fee_sat_per_kvb = parse_fee_rate(
+            args.incrementalrelayfee.as_deref(),
+            "0.00000100",
+            "--incrementalrelayfee",
+        )?;
+        let min_relay_tx_fee_sat_per_kvb = parse_fee_rate(
+            args.minrelaytxfee.as_deref(),
+            "0.00000100",
+            "--minrelaytxfee",
+        )?;
+        let min_relay_tx_fee_sat_per_kvb = if args.minrelaytxfee.is_none() {
+            min_relay_tx_fee_sat_per_kvb.max(incremental_relay_fee_sat_per_kvb)
+        } else {
+            min_relay_tx_fee_sat_per_kvb
+        };
+        let dust_relay_fee_sat_per_kvb =
+            parse_fee_rate(args.dustrelayfee.as_deref(), "0.00003000", "--dustrelayfee")?;
+        let max_datacarrier_bytes = args.datacarrier.then_some(
+            usize::try_from(args.datacarriersize)
+                .context("--datacarriersize does not fit usize")?,
+        );
         if args.prune != 0 && args.prune != 1 && args.prune < MIN_AUTO_PRUNE_TARGET_MIB {
             bail!("--prune automatic target must be at least {MIN_AUTO_PRUNE_TARGET_MIB} MiB");
         }
@@ -396,6 +458,11 @@ impl Config {
             block_max_weight: args.blockmaxweight.max(args.blockreservedweight),
             block_reserved_weight: args.blockreservedweight,
             block_min_tx_fee_sat_per_kvb,
+            min_relay_tx_fee_sat_per_kvb,
+            incremental_relay_fee_sat_per_kvb,
+            dust_relay_fee_sat_per_kvb,
+            max_datacarrier_bytes,
+            permit_bare_multisig: args.permitbaremultisig,
             peer_bloom_filters: args.peer_bloom_filters,
             blocksonly: args.blocksonly,
             prune: args.prune,
@@ -422,6 +489,12 @@ impl Config {
             },
         })
     }
+}
+
+fn parse_fee_rate(value: Option<&str>, default: &str, name: &str) -> Result<u64> {
+    Amount::from_str_in(value.unwrap_or(default), Denomination::Bitcoin)
+        .with_context(|| format!("decoding {name} as BTC/kvB"))
+        .map(Amount::to_sat)
 }
 
 #[cfg(test)]
@@ -610,6 +683,44 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--minrelaytxfee",
+            "0.00000200",
+            "--incrementalrelayfee",
+            "0.00000300",
+            "--dustrelayfee",
+            "0.00004000",
+            "--datacarrier=false",
+            "--datacarriersize",
+            "42",
+            "--permitbaremultisig=false",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.min_relay_tx_fee_sat_per_kvb, 200);
+        assert_eq!(config.incremental_relay_fee_sat_per_kvb, 300);
+        assert_eq!(config.dust_relay_fee_sat_per_kvb, 4_000);
+        assert_eq!(config.max_datacarrier_bytes, None);
+        assert!(!config.permit_bare_multisig);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--incrementalrelayfee",
+            "0.00000300",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args)
+                .unwrap()
+                .min_relay_tx_fee_sat_per_kvb,
+            300
+        );
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

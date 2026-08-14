@@ -1166,18 +1166,79 @@ impl ChainState {
         {
             bail!("UTXO snapshot does not match the active chain")
         }
+        self.validate_snapshot_utxos(&snapshot.utxos)?;
+        if self.prune_height.is_none() {
+            let expected = self
+                .replay_utxos_for_block(self.best_hash(), false)?
+                .context("cannot verify UTXO snapshot because active block data is unavailable")?;
+            if expected != snapshot.utxos {
+                bail!("UTXO snapshot contents do not match the active chain")
+            }
+        }
         self.utxos = snapshot.utxos;
         self.rebuild_utxo_index();
-        self.tx_index = snapshot.tx_index;
-        self.tx_index_all = if snapshot.tx_index_all.is_empty() {
-            self.tx_index.clone()
-        } else {
-            snapshot.tx_index_all
-        };
-        self.history = snapshot.history;
         self.block_undo_cache.clear();
         self.persist_snapshot()?;
         Ok((self.utxos.len() as u64, self.best_hash(), self.height()))
+    }
+
+    fn validate_snapshot_utxos(&mut self, utxos: &HashMap<OutPoint, UtxoEntry>) -> Result<()> {
+        for (outpoint, entry) in utxos {
+            if entry.height > self.height() {
+                bail!("UTXO snapshot contains an output from the future")
+            }
+            if entry.output.value > Amount::MAX_MONEY {
+                bail!("UTXO snapshot contains an output above the money range")
+            }
+            let location = self
+                .tx_index_all
+                .get(&outpoint.txid)
+                .or_else(|| self.tx_index.get(&outpoint.txid))
+                .with_context(|| {
+                    format!(
+                        "UTXO snapshot references unknown transaction {}",
+                        outpoint.txid
+                    )
+                })?;
+            if location.height != entry.height
+                || location.height as usize >= self.active_chain.len()
+                || self.active_chain[location.height as usize] != location.block_hash
+            {
+                bail!("UTXO snapshot references an inactive or mismatched transaction")
+            }
+            if let Some(block) = self.store.get(&location.block_hash)? {
+                let transaction =
+                    block
+                        .txdata
+                        .get(location.transaction_index)
+                        .with_context(|| {
+                            format!(
+                                "UTXO snapshot transaction index is invalid for {}",
+                                location.block_hash
+                            )
+                        })?;
+                let output = transaction
+                    .output
+                    .get(outpoint.vout as usize)
+                    .with_context(|| {
+                        format!(
+                            "UTXO snapshot output index is invalid for {}",
+                            outpoint.txid
+                        )
+                    })?;
+                if output != &entry.output
+                    || entry.coinbase != (location.transaction_index == 0)
+                    || (location.height != 0
+                        && entry.median_time_past
+                            != self.median_time_past_for_parent(
+                                self.active_chain[location.height as usize - 1],
+                            ))
+                {
+                    bail!("UTXO snapshot output metadata does not match the active chain")
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn verify_active_chain(&mut self, depth: u32) -> Result<()> {
@@ -2478,6 +2539,25 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn rejects_a_modified_unpruned_utxo_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let first = mine_block(&state, 1);
+        state.connect_block(first).unwrap();
+        let path = directory.path().join("external.snapshot");
+        state.dump_utxo_set(&path).unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        let mut snapshot: ChainSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let entry = snapshot.utxos.values_mut().next().unwrap();
+        entry.output.value = Amount::from_sat(entry.output.value.to_sat().saturating_sub(1));
+        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+        assert!(state.load_utxo_set(&path).is_err());
+        assert_eq!(state.utxo_stats().2, 5_000_000_000);
     }
 
     #[test]

@@ -6713,7 +6713,7 @@ fn generate_to_descriptor(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("nblocks must not be negative");
     }
     let descriptor = param::<String>(params, 1)?;
-    let script = scan_descriptor_script(node, &descriptor)?;
+    let script = mining_descriptor_script(node, &descriptor)?;
     let max_tries = params
         .get(2)
         .filter(|value| !value.is_null())
@@ -6747,7 +6747,7 @@ fn generate_blocks_to_script(
 
 fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let output = param::<String>(params, 0)?;
-    let output_script = scan_descriptor_script(node, &output).or_else(|_| {
+    let output_script = mining_descriptor_script(node, &output).or_else(|_| {
         output
             .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
             .require_network(node.config.network)
@@ -8072,12 +8072,14 @@ fn output_for_outpoint(
         })
 }
 
-fn scan_descriptor_script(node: &Arc<Node>, descriptor: &str) -> Result<ScriptBuf> {
+fn mining_descriptor_script(node: &Arc<Node>, descriptor: &str) -> Result<ScriptBuf> {
     let mut scripts = expand_descriptor_scripts(node, descriptor, None)?;
-    if scripts.len() != 1 {
-        bail!("descriptor expands to multiple scripts; provide an explicit range")
+    match scripts.len() {
+        0 => bail!("descriptor did not produce a script"),
+        1 => Ok(scripts.remove(0)),
+        4 => Ok(scripts.remove(2)),
+        _ => Ok(scripts.remove(1)),
     }
-    Ok(scripts.remove(0))
 }
 
 fn expand_descriptor_scripts(
@@ -9831,6 +9833,16 @@ mod tests {
             submit_block(&node, &json!([block_hex])).unwrap(),
             json!("duplicate")
         );
+        let combo_block = generate_block(
+            &node,
+            &json!([
+                "combo(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)",
+                [],
+                false
+            ]),
+        )
+        .unwrap();
+        assert!(combo_block["hex"].as_str().is_some());
     }
 
     #[test]

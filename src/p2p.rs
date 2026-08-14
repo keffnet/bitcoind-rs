@@ -215,10 +215,7 @@ impl BloomFilter {
             return true;
         }
         let txid = transaction.compute_txid();
-        if self.contains(&serialize(&txid)) {
-            return true;
-        }
-        let mut matched = false;
+        let mut matched = self.contains(&serialize(&txid));
         for (index, output) in transaction.output.iter().enumerate() {
             if !self.contains_script_data(&output.script_pubkey) {
                 continue;
@@ -235,7 +232,6 @@ impl BloomFilter {
                 let outpoint = bitcoin::OutPoint::new(txid, index as u32);
                 self.insert(&serialize(&outpoint));
             }
-            break;
         }
         if matched {
             return true;
@@ -3010,10 +3006,16 @@ mod tests {
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::from_bytes(vec![1, 0x42]),
-            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![1, 0x42]),
+                },
+                TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![1, 0x43]),
+                },
+            ],
         };
         let mut filter = BloomFilter::from_message(FilterLoad {
             filter: vec![0; 32],
@@ -3040,6 +3042,20 @@ mod tests {
             }],
         };
         assert!(filter.is_relevant_and_update(&spending));
+
+        let mut txid_filter = BloomFilter::from_message(FilterLoad {
+            filter: vec![0; 32],
+            hash_funcs: 5,
+            tweak: 0,
+            flags: BloomFlags::All,
+        })
+        .unwrap();
+        txid_filter.insert(&serialize(&transaction.compute_txid()));
+        txid_filter.insert(&[0x42]);
+        txid_filter.insert(&[0x43]);
+        assert!(txid_filter.is_relevant_and_update(&transaction));
+        assert!(txid_filter.contains(&serialize(&OutPoint::new(transaction.compute_txid(), 0,))));
+        assert!(txid_filter.contains(&serialize(&OutPoint::new(transaction.compute_txid(), 1,))));
     }
 
     #[test]

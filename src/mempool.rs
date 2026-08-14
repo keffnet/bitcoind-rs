@@ -100,6 +100,7 @@ pub struct Mempool {
     policy: MempoolPolicy,
     max_bytes: usize,
     bytes: usize,
+    rolling_min_fee_sat_per_kvb: u64,
     sequence: u64,
     entries: HashMap<Txid, MempoolEntry>,
     spent: HashMap<OutPoint, Txid>,
@@ -205,6 +206,7 @@ impl Mempool {
             policy,
             max_bytes: max_bytes.max(1),
             bytes: 0,
+            rolling_min_fee_sat_per_kvb: 0,
             sequence: 0,
             entries: HashMap::new(),
             spent: HashMap::new(),
@@ -233,6 +235,12 @@ impl Mempool {
 
     pub fn min_relay_fee_sat_per_kvb(&self) -> u64 {
         self.policy.min_relay_fee_sat_per_kvb
+    }
+
+    pub fn mempool_min_fee_sat_per_kvb(&self) -> u64 {
+        self.policy
+            .min_relay_fee_sat_per_kvb
+            .max(self.rolling_min_fee_sat_per_kvb)
     }
 
     pub fn incremental_relay_fee_sat_per_kvb(&self) -> u64 {
@@ -719,7 +727,7 @@ impl Mempool {
             if !fee_rate_meets(
                 candidate.modified_fee_sat(&child_txid, child.fee_sat),
                 child.vsize,
-                candidate.policy.min_relay_fee_sat_per_kvb,
+                candidate.mempool_min_fee_sat_per_kvb(),
             ) {
                 return Err(MempoolError::FeeRate);
             }
@@ -728,7 +736,7 @@ impl Mempool {
             && !fee_rate_meets(
                 package_fee,
                 package_vsize,
-                candidate.policy.min_relay_fee_sat_per_kvb,
+                candidate.mempool_min_fee_sat_per_kvb(),
             )
         {
             return Err(MempoolError::FeeRate);
@@ -1059,7 +1067,7 @@ impl Mempool {
             && !fee_rate_meets(
                 i128::from(modified_fee_sat),
                 vsize,
-                self.policy.min_relay_fee_sat_per_kvb,
+                self.mempool_min_fee_sat_per_kvb(),
             )
         {
             return Err(MempoolError::FeeRate);
@@ -1146,9 +1154,15 @@ impl Mempool {
             return Err(MempoolError::Full);
         }
         while self.bytes.saturating_add(additional_bytes) > self.max_bytes {
-            let Some(package) = self.lowest_eviction_package(protected) else {
+            let Some((package, package_vsize, package_fee)) =
+                self.lowest_eviction_package(protected)
+            else {
                 return Err(MempoolError::Full);
             };
+            let package_fee_rate = fee_rate_from_package(package_fee, package_vsize);
+            self.rolling_min_fee_sat_per_kvb = self.rolling_min_fee_sat_per_kvb.max(
+                package_fee_rate.saturating_add(self.policy.incremental_relay_fee_sat_per_kvb),
+            );
             for txid in package {
                 self.remove(&txid);
             }
@@ -1230,7 +1244,10 @@ impl Mempool {
         Ok(())
     }
 
-    fn lowest_eviction_package(&self, protected: &HashSet<Txid>) -> Option<HashSet<Txid>> {
+    fn lowest_eviction_package(
+        &self,
+        protected: &HashSet<Txid>,
+    ) -> Option<(HashSet<Txid>, u64, i128)> {
         let mut best: Option<(HashSet<Txid>, Txid, u64, i128)> = None;
         for txid in self.entries.keys().copied() {
             let mut package = HashSet::from([txid]);
@@ -1269,7 +1286,7 @@ impl Mempool {
                 best = Some((package, txid, package_vsize, package_fee));
             }
         }
-        best.map(|(package, _, _, _)| package)
+        best.map(|(package, _, package_vsize, package_fee)| (package, package_vsize, package_fee))
     }
 
     fn check_cluster_limits(&self, transaction: &Transaction) -> Result<(), MempoolError> {
@@ -1443,6 +1460,14 @@ impl Mempool {
 
 fn fee_rate_meets(fee_sat: i128, vsize: u64, fee_rate_sat_per_kvb: u64) -> bool {
     fee_sat.saturating_mul(1_000) >= i128::from(fee_rate_sat_per_kvb) * i128::from(vsize)
+}
+
+fn fee_rate_from_package(fee_sat: i128, vsize: u64) -> u64 {
+    if fee_sat <= 0 || vsize == 0 {
+        return 0;
+    }
+    u64::try_from((fee_sat.saturating_mul(1_000) + i128::from(vsize) - 1) / i128::from(vsize))
+        .unwrap_or(u64::MAX)
 }
 
 fn fee_for_rate(fee_rate_sat_per_kvb: u64, vsize: u64) -> i128 {
@@ -2242,6 +2267,7 @@ mod tests {
         pool.ensure_space(candidate_size, &HashSet::new()).unwrap();
         assert!(!pool.entries.contains_key(&low_id));
         assert!(pool.entries.contains_key(&high_id));
+        assert!(pool.mempool_min_fee_sat_per_kvb() > pool.min_relay_fee_sat_per_kvb());
 
         let parent = graph_transaction(Txid::from_byte_array([22; 32]), 22);
         let parent_id = parent.compute_txid();

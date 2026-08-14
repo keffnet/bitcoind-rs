@@ -1247,7 +1247,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "bytes": mempool.bytes(),
                 "usage": mempool.bytes(),
                 "maxmempool": mempool.max_bytes(),
-                "mempoolminfee": sat_to_btc(mempool.min_relay_fee_sat_per_kvb()),
+                "mempoolminfee": sat_to_btc(mempool.mempool_min_fee_sat_per_kvb()),
                 "minrelaytxfee": sat_to_btc(mempool.min_relay_fee_sat_per_kvb()),
                 "unbroadcastcount": 0,
                 "incrementalrelayfee": sat_to_btc(mempool.incremental_relay_fee_sat_per_kvb()),

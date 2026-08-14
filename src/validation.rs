@@ -59,6 +59,8 @@ pub enum ValidationError {
     TimeTooOld,
     #[error("block timestamp is too far in the future")]
     TimeTooNew,
+    #[error("block timestamp violates the BIP94 timewarp limit")]
+    Bip94TimeWarp,
     #[error("block contains no transactions")]
     EmptyBlock,
     #[error("block merkle root is invalid")]
@@ -296,6 +298,28 @@ pub fn validate_header_without_pow(
         median_time_past,
         false,
     )
+}
+
+/// Enforce the BIP94 difficulty-adjustment timestamp rule.
+///
+/// Core enables this rule by default on Testnet4. Regtest's corresponding
+/// option is not exposed by this wallet-free node configuration, so it is not
+/// enabled here.
+pub fn validate_bip94_timewarp(
+    network: Network,
+    height: u32,
+    block_time: u32,
+    previous_block_time: u32,
+) -> Result<(), ValidationError> {
+    if network != Network::Testnet4 {
+        return Ok(());
+    }
+    let params = network_params(network);
+    let difficulty_interval = (params.pow_target_timespan / params.pow_target_spacing) as u32;
+    if height % difficulty_interval == 0 && block_time < previous_block_time.saturating_sub(600) {
+        return Err(ValidationError::Bip94TimeWarp);
+    }
+    Ok(())
 }
 
 fn validate_header_internal(
@@ -965,6 +989,17 @@ mod tests {
                 required: 2
             })
         ));
+    }
+
+    #[test]
+    fn enforces_testnet4_bip94_timewarp_at_adjustment_boundaries() {
+        assert!(validate_bip94_timewarp(Network::Testnet4, 2_015, 1, 10_000).is_ok());
+        assert!(validate_bip94_timewarp(Network::Testnet4, 2_016, 9_400, 10_000).is_ok());
+        assert!(matches!(
+            validate_bip94_timewarp(Network::Testnet4, 2_016, 9_399, 10_000),
+            Err(ValidationError::Bip94TimeWarp)
+        ));
+        assert!(validate_bip94_timewarp(Network::Regtest, 2_016, 1, 10_000).is_ok());
     }
 
     #[test]

@@ -955,6 +955,12 @@ impl ChainState {
                 .get(&parent_hash)
                 .copied()
                 .with_context(|| format!("header {hash} has an unknown parent {parent_hash}"))?;
+            validation::validate_bip94_timewarp(
+                self.network,
+                parent.height.saturating_add(1),
+                header.time,
+                parent.header.time,
+            )?;
             validation::validate_header(
                 self.network,
                 header,
@@ -1280,6 +1286,16 @@ impl ChainState {
             bail!("proposed block does not build on the active tip")
         }
         let height = self.height().saturating_add(1);
+        let parent = self
+            .block_index
+            .get(&parent_hash)
+            .expect("active tip is indexed");
+        validation::validate_bip94_timewarp(
+            self.network,
+            height,
+            block.header.time,
+            parent.header.time,
+        )?;
         let expected_target = self.expected_target_for_parent(parent_hash, block.header.time);
         let median_time_past = self.median_time_past_for_parent(parent_hash);
         if check_pow {
@@ -1399,6 +1415,12 @@ impl ChainState {
         }
 
         let height = parent.height.saturating_add(1);
+        validation::validate_bip94_timewarp(
+            self.network,
+            height,
+            block.header.time,
+            parent.header.time,
+        )?;
         validation::validate_header(
             self.network,
             &block.header,
@@ -1500,6 +1522,17 @@ impl ChainState {
                 .copied()
                 .context("side-chain block index entry is missing")?;
             let parent_hash = block.header.prev_blockhash;
+            let parent = self
+                .block_index
+                .get(&parent_hash)
+                .copied()
+                .context("side-chain parent block index entry is missing")?;
+            validation::validate_bip94_timewarp(
+                self.network,
+                node.height,
+                block.header.time,
+                parent.header.time,
+            )?;
             validation::validate_header(
                 self.network,
                 &block.header,
@@ -1661,6 +1694,16 @@ impl ChainState {
     fn connect_block_internal(&mut self, block: &Block, persist: bool) -> Result<()> {
         let height = self.height().saturating_add(1);
         let previous = self.best_hash();
+        let previous_node = self
+            .block_index
+            .get(&previous)
+            .expect("active tip is indexed");
+        validation::validate_bip94_timewarp(
+            self.network,
+            height,
+            block.header.time,
+            previous_node.header.time,
+        )?;
         let expected_target = self.expected_target(block.header.time);
         validation::validate_header(
             self.network,

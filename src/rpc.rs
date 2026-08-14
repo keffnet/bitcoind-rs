@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, atomic::Ordering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -40,7 +40,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 use tracing::debug;
 
-use crate::Node;
 use crate::chain;
 use crate::mempool::{
     MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool,
@@ -49,6 +48,7 @@ use crate::mempool::{
 };
 use crate::validation;
 use crate::wire;
+use crate::{Node, ScanState};
 
 const MAX_HTTP_REQUEST: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_RAW_TX_FEE_RATE_BTC_PER_KVB: f64 = 0.1;
@@ -976,6 +976,14 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
         "waitforblock" => wait_for_block(node, &normalized_params).await,
         "waitforblockheight" => wait_for_block_height(node, &normalized_params).await,
         "getblocktemplate" => get_block_template_async(node, &normalized_params).await,
+        "scantxoutset" | "scanblocks" => {
+            let node = node.clone();
+            let method = method.to_owned();
+            let params = normalized_params.clone();
+            tokio::task::spawn_blocking(move || dispatch_method(&node, &method, &params))
+                .await
+                .context("scan RPC task failed")?
+        }
         _ => dispatch_method(node, method, &normalized_params),
     };
     node.end_rpc_command(command_id);
@@ -8997,10 +9005,33 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(Value::Null)
 }
 
+struct ScanReservation(Arc<ScanState>);
+
+impl Drop for ScanReservation {
+    fn drop(&mut self) {
+        self.0.in_progress.store(false, Ordering::Release);
+        self.0.abort.store(false, Ordering::Release);
+    }
+}
+
+fn reserve_scan(state: &Arc<ScanState>) -> Result<ScanReservation> {
+    if state
+        .in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        bail!("Scan already in progress, use action \"abort\" or \"status\"")
+    }
+    state.abort.store(false, Ordering::Release);
+    state.progress.store(0, Ordering::Release);
+    Ok(ScanReservation(state.clone()))
+}
+
 fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let action = param::<String>(params, 0)?;
     match action.as_str() {
         "start" => {
+            let _reservation = reserve_scan(&node.txout_scan)?;
             let scan_objects = params
                 .get(1)
                 .and_then(Value::as_array)
@@ -9027,8 +9058,26 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
             let chain = node.chain.read();
             let mut unspents = Vec::new();
             let mut total = 0u64;
+            let mut scanned_txouts = 0usize;
+            let total_txouts = chain.all_utxos().count();
+            let mut completed = true;
             for (outpoint, entry) in chain.all_utxos() {
-                let Some((descriptor, _)) = descriptors
+                if node.txout_scan.abort.load(Ordering::Acquire) {
+                    completed = false;
+                    break;
+                }
+                scanned_txouts = scanned_txouts.saturating_add(1);
+                let progress = if total_txouts == 0 {
+                    100
+                } else {
+                    scanned_txouts
+                        .saturating_mul(100)
+                        .checked_div(total_txouts)
+                        .unwrap_or(100)
+                        .min(100)
+                };
+                node.txout_scan.progress.store(progress, Ordering::Release);
+                let Some((_, _)) = descriptors
                     .iter()
                     .find(|(_, script)| *script == entry.output.script_pubkey)
                 else {
@@ -9039,7 +9088,7 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     "txid": outpoint.txid.to_string(),
                     "vout": outpoint.vout,
                     "scriptPubKey": hex::encode(entry.output.script_pubkey.as_bytes()),
-                    "desc": descriptor,
+                    "desc": inferred_script_descriptor(node, &entry.output.script_pubkey),
                     "amount": sat_to_btc(entry.output.value.to_sat()),
                     "coinbase": entry.coinbase,
                     "height": entry.height,
@@ -9050,6 +9099,9 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     "confirmations": chain.height().saturating_sub(entry.height) + 1,
                 }));
             }
+            if completed {
+                node.txout_scan.progress.store(100, Ordering::Release);
+            }
             unspents.sort_by(|left, right| {
                 left["txid"]
                     .as_str()
@@ -9057,16 +9109,31 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     .then_with(|| left["vout"].as_u64().cmp(&right["vout"].as_u64()))
             });
             Ok(json!({
-                "success": true,
-                "txouts": unspents.len(),
+                "success": completed,
+                "txouts": scanned_txouts,
                 "height": chain.height(),
                 "bestblock": chain.best_hash().to_string(),
                 "unspents": unspents,
                 "total_amount": sat_to_btc(total),
             }))
         }
-        "status" => Ok(Value::Null),
-        "abort" => Ok(Value::Bool(false)),
+        "status" => {
+            if !node.txout_scan.in_progress.load(Ordering::Acquire) {
+                Ok(Value::Null)
+            } else {
+                Ok(json!({
+                    "progress": node.txout_scan.progress.load(Ordering::Acquire),
+                }))
+            }
+        }
+        "abort" => {
+            if !node.txout_scan.in_progress.load(Ordering::Acquire) {
+                Ok(Value::Bool(false))
+            } else {
+                node.txout_scan.abort.store(true, Ordering::Release);
+                Ok(Value::Bool(true))
+            }
+        }
         _ => bail!("scantxoutset action must be start, status, or abort"),
     }
 }
@@ -9074,9 +9141,26 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let action = param::<String>(params, 0)?;
     match action.as_str() {
-        "status" => Ok(Value::Null),
-        "abort" => Ok(Value::Bool(false)),
+        "status" => {
+            if !node.blockfilter_scan.in_progress.load(Ordering::Acquire) {
+                Ok(Value::Null)
+            } else {
+                Ok(json!({
+                    "progress": node.blockfilter_scan.progress.load(Ordering::Acquire),
+                    "current_height": node.blockfilter_scan.current_height.load(Ordering::Acquire),
+                }))
+            }
+        }
+        "abort" => {
+            if !node.blockfilter_scan.in_progress.load(Ordering::Acquire) {
+                Ok(Value::Bool(false))
+            } else {
+                node.blockfilter_scan.abort.store(true, Ordering::Release);
+                Ok(Value::Bool(true))
+            }
+        }
         "start" => {
+            let _reservation = reserve_scan(&node.blockfilter_scan)?;
             let scan_objects = params
                 .get(1)
                 .and_then(Value::as_array)
@@ -9120,9 +9204,22 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
             if start_height > stop_height || stop_height > chain_height {
                 bail!("invalid scan height range")
             }
+            node.blockfilter_scan
+                .current_height
+                .store(start_height as usize, Ordering::Release);
             let mut chain = node.chain.write();
             let mut relevant_blocks = Vec::new();
+            let progress_denominator = stop_height.saturating_sub(start_height).max(1);
+            let mut completed = true;
+            let mut last_height = start_height;
             for height in start_height..=stop_height {
+                if node.blockfilter_scan.abort.load(Ordering::Acquire) {
+                    completed = false;
+                    break;
+                }
+                node.blockfilter_scan
+                    .current_height
+                    .store(height as usize, Ordering::Release);
                 let hash = chain
                     .block_hash(height)
                     .ok_or_else(|| anyhow!("scan height is out of range"))?;
@@ -9136,12 +9233,24 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 {
                     relevant_blocks.push(hash.to_string());
                 }
+                last_height = height;
+                let progress = height
+                    .saturating_sub(start_height)
+                    .saturating_mul(100)
+                    .checked_div(progress_denominator)
+                    .unwrap_or(100);
+                node.blockfilter_scan
+                    .progress
+                    .store(progress as usize, Ordering::Release);
+            }
+            if completed {
+                node.blockfilter_scan.progress.store(100, Ordering::Release);
             }
             Ok(json!({
                 "from_height": start_height,
-                "to_height": stop_height,
+                "to_height": last_height,
                 "relevant_blocks": relevant_blocks,
-                "completed": true,
+                "completed": completed,
             }))
         }
         _ => bail!("scanblocks action must be start, status, or abort"),
@@ -12408,6 +12517,14 @@ mod tests {
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
+        assert_eq!(
+            scan_txout_set(&node, &json!(["status"])).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            scan_txout_set(&node, &json!(["abort"])).unwrap(),
+            Value::Bool(false)
+        );
         generate_to_address(&node, &json!([1, address])).unwrap();
         let result =
             scan_txout_set(&node, &json!(["start", [format!("addr({address})")]])).unwrap();
@@ -12433,7 +12550,7 @@ mod tests {
         generate_to_address(&node, &json!([1, ranged_address])).unwrap();
         let ranged_result = scan_txout_set(&node, &json!(["start", [ranged_descriptor]])).unwrap();
         assert_eq!(ranged_result["success"], true);
-        assert_eq!(ranged_result["txouts"], 1);
+        assert_eq!(ranged_result["txouts"], 2);
         assert_eq!(ranged_result["unspents"][0]["height"], 2);
     }
 
@@ -14609,6 +14726,11 @@ mod tests {
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
+        assert_eq!(scan_blocks(&node, &json!(["status"])).unwrap(), Value::Null);
+        assert_eq!(
+            scan_blocks(&node, &json!(["abort"])).unwrap(),
+            Value::Bool(false)
+        );
         let hash = generate_to_descriptor(&node, &json!([1, format!("addr({address})")])).unwrap()
             [0]
         .as_str()

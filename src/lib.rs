@@ -348,6 +348,25 @@ struct PersistedAddress {
     tried: bool,
 }
 
+/// Per-node state shared by the long-running descriptor scans.
+pub(crate) struct ScanState {
+    pub(crate) in_progress: AtomicBool,
+    pub(crate) abort: AtomicBool,
+    pub(crate) progress: AtomicUsize,
+    pub(crate) current_height: AtomicUsize,
+}
+
+impl Default for ScanState {
+    fn default() -> Self {
+        Self {
+            in_progress: AtomicBool::new(false),
+            abort: AtomicBool::new(false),
+            progress: AtomicUsize::new(0),
+            current_height: AtomicUsize::new(0),
+        }
+    }
+}
+
 /// The wallet-free node facade shared by the network and RPC services.
 pub struct Node {
     pub config: Config,
@@ -357,6 +376,8 @@ pub struct Node {
     pub mempool_events: broadcast::Sender<MempoolEvent>,
     peer_mempool_events: broadcast::Sender<PeerMempoolEvent>,
     pub(crate) zmq_events: broadcast::Sender<zmq::Event>,
+    pub(crate) txout_scan: Arc<ScanState>,
+    pub(crate) blockfilter_scan: Arc<ScanState>,
     pub rpc_cookie: Option<String>,
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
@@ -454,6 +475,8 @@ impl Node {
             mempool_events,
             peer_mempool_events,
             zmq_events,
+            txout_scan: Arc::new(ScanState::default()),
+            blockfilter_scan: Arc::new(ScanState::default()),
             rpc_cookie,
             mempool_path,
             peer_count: AtomicUsize::new(0),

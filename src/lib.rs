@@ -750,9 +750,9 @@ impl Node {
         inserted
     }
 
-    pub(crate) fn request_one_try(&self, address: SocketAddr) {
+    pub(crate) fn request_one_try(&self, address: SocketAddr, transport_v2: Option<bool>) {
         if let Some(sender) = self.peer_manager_requests.read().as_ref() {
-            let _ = sender.send(p2p::PeerManagerRequest::OneTry(address));
+            let _ = sender.send(p2p::PeerManagerRequest::OneTry(address, transport_v2));
         }
     }
 

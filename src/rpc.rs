@@ -2109,10 +2109,8 @@ fn add_connection(node: &Arc<Node>, params: &Value) -> Result<Value> {
     ) {
         bail!("invalid connection type")
     }
-    if param::<bool>(params, 2)? {
-        bail!("v2transport is not supported")
-    }
-    node.request_one_try(address);
+    let transport_v2 = param::<bool>(params, 2)?;
+    node.request_one_try(address, Some(transport_v2));
     Ok(json!({
         "address": address_string,
         "connection_type": connection_type,
@@ -2139,7 +2137,7 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
             Ok(Value::Null)
         }
         "onetry" => {
-            node.request_one_try(address);
+            node.request_one_try(address, None);
             Ok(Value::Null)
         }
         "remove" => {
@@ -10504,7 +10502,7 @@ mod tests {
                 "addconnection",
                 &json!(["127.0.0.1:18446", "feeler", true]),
             )
-            .is_err()
+            .is_ok()
         );
         add_node(&node, &json!(["127.0.0.1:18445", "onetry"])).unwrap();
         assert_eq!(get_added_node_info(&node, &json!([])).unwrap(), json!([]));

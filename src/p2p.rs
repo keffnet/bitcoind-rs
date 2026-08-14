@@ -232,7 +232,7 @@ pub(crate) enum PeerCommand {
 #[derive(Debug)]
 pub(crate) enum PeerManagerRequest {
     Add(SocketAddr),
-    OneTry(SocketAddr),
+    OneTry(SocketAddr, Option<bool>),
 }
 
 struct PendingCompactBlock {
@@ -309,6 +309,7 @@ impl PeerManager {
                 peers.clone(),
                 next_peer_id.clone(),
                 true,
+                None,
             );
         }
         let dynamic_node = self.node.clone();
@@ -317,9 +318,11 @@ impl PeerManager {
         let dynamic_ids = next_peer_id.clone();
         tokio::spawn(async move {
             while let Some(request) = add_node_receiver.recv().await {
-                let (address, persistent) = match request {
-                    PeerManagerRequest::Add(address) => (address, true),
-                    PeerManagerRequest::OneTry(address) => (address, false),
+                let (address, persistent, transport_v2) = match request {
+                    PeerManagerRequest::Add(address) => (address, true, None),
+                    PeerManagerRequest::OneTry(address, transport_v2) => {
+                        (address, false, transport_v2)
+                    }
                 };
                 spawn_outbound_loop(
                     dynamic_node.clone(),
@@ -328,6 +331,7 @@ impl PeerManager {
                     dynamic_peers.clone(),
                     dynamic_ids.clone(),
                     persistent,
+                    transport_v2,
                 );
             }
         });
@@ -346,7 +350,9 @@ impl PeerManager {
                     debug!(%address, "rejecting peer because peer limit is reached");
                     return;
                 };
-                if let Err(error) = serve_peer(node, stream, address, false, peers, peer_id).await {
+                if let Err(error) =
+                    serve_peer(node, stream, address, false, None, peers, peer_id).await
+                {
                     debug!(%address, %error, "inbound peer ended");
                 }
                 drop(permit);
@@ -362,6 +368,7 @@ fn spawn_outbound_loop(
     peers: PeerRegistry,
     next_peer_id: Arc<AtomicUsize>,
     persistent: bool,
+    transport_v2: Option<bool>,
 ) {
     let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
@@ -379,9 +386,16 @@ fn spawn_outbound_loop(
             match TcpStream::connect(address).await {
                 Ok(stream) => {
                     info!(%address, "connected to configured peer");
-                    if let Err(error) =
-                        serve_peer(node.clone(), stream, address, true, peers.clone(), peer_id)
-                            .await
+                    if let Err(error) = serve_peer(
+                        node.clone(),
+                        stream,
+                        address,
+                        true,
+                        transport_v2,
+                        peers.clone(),
+                        peer_id,
+                    )
+                    .await
                     {
                         debug!(%address, %error, "outbound peer ended");
                     }
@@ -450,8 +464,15 @@ async fn establish_transport(
     address: SocketAddr,
     outbound: bool,
     network: Network,
+    transport_v2: Option<bool>,
 ) -> Result<(PeerReader, PeerWriterKind, Option<SocketAddr>)> {
     if outbound {
+        if transport_v2 == Some(false) {
+            return establish_v1(stream);
+        }
+        if transport_v2 == Some(true) {
+            return establish_v2(stream, network, Role::Initiator).await;
+        }
         match establish_v2(stream, network, Role::Initiator).await {
             Ok((reader, writer, local_address)) => {
                 return Ok((reader, writer, local_address));
@@ -526,13 +547,14 @@ async fn serve_peer(
     stream: TcpStream,
     address: std::net::SocketAddr,
     outbound: bool,
+    transport_v2: Option<bool>,
     peers: PeerRegistry,
     peer_id: usize,
 ) -> Result<()> {
     let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
     let (mut reader, writer_half, local_address) =
-        establish_transport(stream, address, outbound, node.config.network).await?;
+        establish_transport(stream, address, outbound, node.config.network, transport_v2).await?;
     let (commands, command_receiver) = mpsc::unbounded_channel();
     node.register_peer_with_local(peer_id, address, !outbound, commands, local_address);
     let peer_state = Arc::new(PeerState {

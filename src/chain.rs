@@ -672,15 +672,6 @@ impl ChainState {
                         work: node.chain_work,
                     };
                 }
-                if self.invalid_blocks.contains(hash) || self.has_invalid_ancestor(*hash) {
-                    return KnownChainTip {
-                        hash: *hash,
-                        height: node.height,
-                        branch_len: 0,
-                        status: "invalid",
-                        work: node.chain_work,
-                    };
-                }
                 let mut cursor = *hash;
                 let mut branch_len: u32 = 0;
                 let mut has_full_blocks = true;
@@ -694,15 +685,19 @@ impl ChainState {
                     cursor = current.header.prev_blockhash;
                     branch_len = branch_len.saturating_add(1);
                 }
+                let status =
+                    if self.invalid_blocks.contains(hash) || self.has_invalid_ancestor(*hash) {
+                        "invalid"
+                    } else if has_full_blocks {
+                        "valid-fork"
+                    } else {
+                        "headers-only"
+                    };
                 KnownChainTip {
                     hash: *hash,
                     height: node.height,
                     branch_len,
-                    status: if has_full_blocks {
-                        "valid-fork"
-                    } else {
-                        "headers-only"
-                    },
+                    status,
                     work: node.chain_work,
                 }
             })

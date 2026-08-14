@@ -11834,7 +11834,14 @@ mod tests {
             .unwrap();
         invalidate_block(&node, &json!([hash.to_string()])).unwrap();
         assert_eq!(node.chain.read().height(), 0);
-        assert_eq!(node.chain.read().chain_tips()[0].status, "invalid");
+        let invalid_tip = node
+            .chain
+            .read()
+            .chain_tips()
+            .into_iter()
+            .find(|tip| tip.status == "invalid")
+            .expect("invalid tip is reported");
+        assert_eq!(invalid_tip.branch_len, 1);
         reconsider_block(&node, &json!([hash.to_string()])).unwrap();
         assert_eq!(node.chain.read().height(), 1);
         assert_eq!(node.chain.read().best_hash(), hash);

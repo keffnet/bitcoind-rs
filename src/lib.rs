@@ -26,7 +26,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid};
+use bitcoin::hashes::Hash;
+use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid, Wtxid};
 use parking_lot::RwLock;
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -50,6 +51,8 @@ const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_EXTERNAL_BLOCK_RECORD_SIZE: usize = 4 * 1024 * 1024;
+pub(crate) const PRIVATE_BROADCAST_PEERS_PER_TRANSACTION: usize = 3;
+pub(crate) const PRIVATE_BROADCAST_RETRY_SECS: u64 = 60;
 
 fn core_block_download_timeout(
     block_interval: Duration,
@@ -301,6 +304,24 @@ pub(crate) struct PeerMempoolEvent {
     pub txid: Txid,
     pub excluded_peers: Vec<usize>,
     pub force_relay: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PrivateBroadcastPeer {
+    pub(crate) address: SocketAddr,
+    pub(crate) sent: u64,
+    pub(crate) received: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PrivateBroadcastInfo {
+    pub(crate) transaction: Transaction,
+    pub(crate) peers: Vec<PrivateBroadcastPeer>,
+}
+
+struct PrivateBroadcastEntry {
+    transaction: Transaction,
+    peers: Vec<PrivateBroadcastPeer>,
 }
 
 #[derive(Clone, Debug)]
@@ -556,6 +577,7 @@ pub struct Node {
         parking_lot::RwLock<HashMap<usize, tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>>>,
     peer_manager_requests:
         parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<p2p::PeerManagerRequest>>>,
+    private_broadcasts: parking_lot::Mutex<HashMap<Wtxid, PrivateBroadcastEntry>>,
     orphans: parking_lot::Mutex<OrphanPool>,
     known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
     tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
@@ -657,6 +679,7 @@ impl Node {
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
+            private_broadcasts: parking_lot::Mutex::new(HashMap::new()),
             orphans: parking_lot::Mutex::new(OrphanPool::default()),
             known_addresses: parking_lot::RwLock::new(known_addresses),
             tried_addresses: parking_lot::RwLock::new(tried_addresses),
@@ -764,6 +787,192 @@ impl Node {
         self.mempool.write().add_unbroadcast(txid);
         self.notify_mempool_transaction(transaction);
         Ok(txid)
+    }
+
+    fn validate_private_broadcast_transaction(&self, transaction: Transaction) -> Result<()> {
+        let chain = self.chain.read();
+        let mut mempool = self.mempool.read().clone();
+        mempool
+            .accept(transaction, &chain)
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn queue_private_broadcast(&self, transaction: Transaction) -> Result<Txid> {
+        if !self.config.private_broadcast {
+            bail!("private broadcast is disabled")
+        }
+        if self.config.proxy.is_none() {
+            bail!("--privatebroadcast requires --proxy for IPv4/IPv6 private connections")
+        }
+        let txid = transaction.compute_txid();
+        let wtxid = transaction.compute_wtxid();
+        if self.private_broadcasts.lock().contains_key(&wtxid) {
+            return Ok(txid);
+        }
+        self.validate_private_broadcast_transaction(transaction.clone())?;
+        self.private_broadcasts.lock().insert(
+            wtxid,
+            PrivateBroadcastEntry {
+                transaction,
+                peers: Vec::new(),
+            },
+        );
+        self.schedule_private_broadcasts();
+        Ok(txid)
+    }
+
+    pub(crate) fn private_broadcast_infos(&self) -> Vec<PrivateBroadcastInfo> {
+        let mut infos = self
+            .private_broadcasts
+            .lock()
+            .values()
+            .map(|entry| PrivateBroadcastInfo {
+                transaction: entry.transaction.clone(),
+                peers: entry.peers.clone(),
+            })
+            .collect::<Vec<_>>();
+        infos.sort_by_key(|info| info.transaction.compute_txid().to_string());
+        infos
+    }
+
+    pub(crate) fn abort_private_broadcast(&self, id: Txid) -> Vec<PrivateBroadcastInfo> {
+        let removed = {
+            let mut broadcasts = self.private_broadcasts.lock();
+            let id_as_wtxid = Wtxid::from_byte_array(id.to_byte_array());
+            let keys = broadcasts
+                .iter()
+                .filter_map(|(entry_wtxid, entry)| {
+                    (entry.transaction.compute_txid() == id
+                        || entry.transaction.compute_wtxid() == id_as_wtxid)
+                        .then_some(*entry_wtxid)
+                })
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|wtxid| broadcasts.remove(&wtxid))
+                .map(|entry| PrivateBroadcastInfo {
+                    transaction: entry.transaction,
+                    peers: entry.peers,
+                })
+                .collect::<Vec<_>>()
+        };
+        let addresses = removed
+            .iter()
+            .flat_map(|info| info.peers.iter().map(|peer| peer.address))
+            .collect::<HashSet<_>>();
+        for peer in self.peer_infos().into_iter().filter(|peer| {
+            peer.connection_type == "private-broadcast" && addresses.contains(&peer.address)
+        }) {
+            self.disconnect_peer(peer.id);
+        }
+        removed
+    }
+
+    pub(crate) fn private_broadcast_transaction_is_pending(
+        &self,
+        transaction: &Transaction,
+    ) -> bool {
+        self.private_broadcasts
+            .lock()
+            .contains_key(&transaction.compute_wtxid())
+    }
+
+    pub(crate) fn mark_private_broadcast_peer_ack(
+        &self,
+        transaction: &Transaction,
+        address: SocketAddr,
+    ) {
+        let wtxid = transaction.compute_wtxid();
+        if let Some(entry) = self.private_broadcasts.lock().get_mut(&wtxid)
+            && let Some(peer) = entry.peers.iter_mut().find(|peer| peer.address == address)
+        {
+            peer.received = Some(time::unix_time());
+        }
+    }
+
+    pub(crate) fn mark_private_broadcast_received(&self, transaction: &Transaction) -> bool {
+        self.private_broadcasts
+            .lock()
+            .remove(&transaction.compute_wtxid())
+            .is_some()
+    }
+
+    fn private_broadcast_targets(
+        &self,
+        entry: &PrivateBroadcastEntry,
+        now: u64,
+    ) -> Vec<SocketAddr> {
+        let mut candidates = self.config.seed_nodes.clone();
+        candidates.extend(self.known_addresses.read().keys().copied());
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.retain(|address| {
+            address.port() != 0
+                && !address.ip().is_unspecified()
+                && (address.is_ipv4() || address.is_ipv6())
+        });
+        candidates.retain(|address| {
+            self.config.allows_address(*address)
+                && !self.is_banned_for_peer(*address, false)
+                && !entry.peers.iter().any(|peer| {
+                    peer.address == *address
+                        && now.saturating_sub(peer.sent) < PRIVATE_BROADCAST_RETRY_SECS
+                })
+        });
+        candidates
+    }
+
+    pub(crate) fn schedule_private_broadcasts(&self) {
+        if !self.config.private_broadcast {
+            return;
+        }
+        let Some(sender) = self.peer_manager_requests.read().as_ref().cloned() else {
+            return;
+        };
+        let now = time::unix_time();
+        let mut requests = Vec::new();
+        {
+            let mut broadcasts = self.private_broadcasts.lock();
+            for (wtxid, entry) in broadcasts.iter_mut() {
+                let current = entry
+                    .peers
+                    .iter()
+                    .filter(|peer| {
+                        let last_activity = peer.received.unwrap_or(peer.sent);
+                        now.saturating_sub(last_activity) < PRIVATE_BROADCAST_RETRY_SECS
+                    })
+                    .count();
+                let needed = PRIVATE_BROADCAST_PEERS_PER_TRANSACTION.saturating_sub(current);
+                if needed == 0 {
+                    continue;
+                }
+                for address in self
+                    .private_broadcast_targets(entry, now)
+                    .into_iter()
+                    .take(needed)
+                {
+                    entry.peers.push(PrivateBroadcastPeer {
+                        address,
+                        sent: now,
+                        received: None,
+                    });
+                    requests.push((*wtxid, address, entry.transaction.clone()));
+                }
+            }
+        }
+        for (wtxid, address, transaction) in requests {
+            if sender
+                .send(p2p::PeerManagerRequest::PrivateBroadcast {
+                    address,
+                    transaction,
+                })
+                .is_err()
+            {
+                if let Some(entry) = self.private_broadcasts.lock().get_mut(&wtxid) {
+                    entry.peers.retain(|peer| peer.address != address);
+                }
+            }
+        }
     }
 
     /// Process a transaction received over the peer network. Missing-input
@@ -1493,20 +1702,24 @@ impl Node {
         self.block_stalling_since.write().remove(&peer_id);
     }
 
-    pub(crate) fn record_pong(&self, peer_id: usize, nonce: u64) {
-        if let Some(peer) = self.peers.write().get_mut(&peer_id)
-            && peer.ping_nonce == Some(nonce)
-        {
-            peer.ping_nonce = None;
-            if let Some(sent_at) = peer.ping_sent_at.take() {
-                let ping_time = sent_at.elapsed().as_secs_f64();
-                peer.ping_time = Some(ping_time);
-                peer.min_ping = Some(
-                    peer.min_ping
-                        .map_or(ping_time, |minimum| minimum.min(ping_time)),
-                );
-            }
+    pub(crate) fn record_pong(&self, peer_id: usize, nonce: u64) -> bool {
+        let mut peers = self.peers.write();
+        let Some(peer) = peers.get_mut(&peer_id) else {
+            return false;
+        };
+        if peer.ping_nonce != Some(nonce) {
+            return false;
         }
+        peer.ping_nonce = None;
+        if let Some(sent_at) = peer.ping_sent_at.take() {
+            let ping_time = sent_at.elapsed().as_secs_f64();
+            peer.ping_time = Some(ping_time);
+            peer.min_ping = Some(
+                peer.min_ping
+                    .map_or(ping_time, |minimum| minimum.min(ping_time)),
+            );
+        }
+        true
     }
 
     pub fn network_active(&self) -> bool {
@@ -2017,6 +2230,7 @@ impl Node {
         sender: tokio::sync::mpsc::UnboundedSender<p2p::PeerManagerRequest>,
     ) {
         *self.peer_manager_requests.write() = Some(sender);
+        self.schedule_private_broadcasts();
     }
 
     pub fn disconnect_peer(&self, id: usize) -> bool {
@@ -2495,6 +2709,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -2522,6 +2737,95 @@ mod tests {
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         }
+    }
+
+    fn private_broadcast_test_transaction(node: &Arc<Node>) -> Transaction {
+        for height in 1..=101 {
+            let previous = *node.chain.read().header(height - 1).unwrap();
+            node.connect_block(mine_test_block(&previous, height, height as u8))
+                .unwrap();
+        }
+        let funding_hash = node.chain.read().block_hash(1).unwrap();
+        let funding_block = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(funding_block.txdata[0].compute_txid(), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    #[test]
+    fn private_broadcast_queue_keeps_transactions_out_of_the_mempool() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.private_broadcast = true;
+        config.proxy = Some("127.0.0.1:9050".parse().unwrap());
+        config.seed_nodes = vec![
+            "192.0.2.1:18444".parse().unwrap(),
+            "192.0.2.2:18444".parse().unwrap(),
+            "192.0.2.3:18444".parse().unwrap(),
+        ];
+        config.max_peers = 3;
+        let node = Node::open(config).unwrap();
+        let transaction = private_broadcast_test_transaction(&node);
+        let txid = transaction.compute_txid();
+        let wtxid = transaction.compute_wtxid();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.set_peer_manager_sender(sender);
+
+        assert_eq!(
+            node.queue_private_broadcast(transaction.clone()).unwrap(),
+            txid
+        );
+        assert!(node.mempool.read().is_empty());
+        let info = node.private_broadcast_infos();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].transaction.compute_wtxid(), wtxid);
+        assert_eq!(info[0].peers.len(), 3);
+        for _ in 0..3 {
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                p2p::PeerManagerRequest::PrivateBroadcast { .. }
+            ));
+        }
+
+        let address = info[0].peers[0].address;
+        node.mark_private_broadcast_peer_ack(&transaction, address);
+        assert!(
+            node.private_broadcast_infos()[0].peers[0]
+                .received
+                .is_some()
+        );
+        assert!(node.mark_private_broadcast_received(&transaction));
+        assert!(node.private_broadcast_infos().is_empty());
+        assert!(node.mempool.read().is_empty());
+    }
+
+    #[test]
+    fn abort_private_broadcast_matches_wtxid_and_disconnects_private_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.private_broadcast = true;
+        config.proxy = Some("127.0.0.1:9050".parse().unwrap());
+        config.seed_nodes = vec!["192.0.2.1:18444".parse().unwrap()];
+        let node = Node::open(config).unwrap();
+        let transaction = private_broadcast_test_transaction(&node);
+        let wtxid = transaction.compute_wtxid();
+        node.queue_private_broadcast(transaction.clone()).unwrap();
+
+        let removed = node.abort_private_broadcast(wtxid.to_string().parse().unwrap());
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].transaction, transaction);
+        assert!(node.private_broadcast_infos().is_empty());
     }
 
     #[test]

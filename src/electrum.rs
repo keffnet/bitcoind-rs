@@ -1556,6 +1556,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -1654,6 +1655,7 @@ mod tests {
                 proxy: None,
                 peer_permissions: crate::config::PeerPermissionConfig::default(),
                 blocksonly: false,
+                private_broadcast: false,
                 prune: 0,
                 reindex: false,
                 reindex_chainstate: false,
@@ -1742,6 +1744,7 @@ mod tests {
                 proxy: None,
                 peer_permissions: crate::config::PeerPermissionConfig::default(),
                 blocksonly: false,
+                private_broadcast: false,
                 // Block pruning must not be advertised as Electrum history
                 // pruning in server.features.
                 prune: 1,
@@ -2007,6 +2010,7 @@ mod tests {
                 proxy: None,
                 peer_permissions: crate::config::PeerPermissionConfig::default(),
                 blocksonly: false,
+                private_broadcast: false,
                 prune: 0,
                 reindex: false,
                 reindex_chainstate: false,

@@ -42,7 +42,9 @@ use crate::mempool::MempoolError;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
 };
-use crate::{MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, unix_time_seconds};
+use crate::{
+    MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, PRIVATE_BROADCAST_RETRY_SECS, unix_time_seconds,
+};
 
 enum PeerReader {
     V1(OwnedReadHalf),
@@ -704,6 +706,8 @@ struct PeerState {
     writer: PeerWriter,
     connection_type: &'static str,
     permissions: PeerPermissions,
+    private_broadcast_transaction: Option<Transaction>,
+    private_broadcast_peer: parking_lot::Mutex<bool>,
     local_relay_transactions: bool,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
@@ -1086,6 +1090,10 @@ pub(crate) enum PeerCommand {
 pub(crate) enum PeerManagerRequest {
     Add(SocketAddr),
     OneTry(SocketAddr, Option<bool>, &'static str),
+    PrivateBroadcast {
+        address: SocketAddr,
+        transaction: Transaction,
+    },
 }
 
 struct PendingCompactBlock {
@@ -1294,21 +1302,42 @@ impl PeerManager {
         let dynamic_node = self.node.clone();
         let dynamic_outbound = outbound.clone();
         tokio::spawn(async move {
-            while let Some(request) = add_node_receiver.recv().await {
-                let (address, persistent, transport_v2, connection_type) = match request {
-                    PeerManagerRequest::Add(address) => (address, true, None, "outbound-full"),
-                    PeerManagerRequest::OneTry(address, transport_v2, connection_type) => {
-                        (address, false, transport_v2, connection_type)
+            let mut private_retry_interval =
+                tokio::time::interval(Duration::from_secs(PRIVATE_BROADCAST_RETRY_SECS));
+            loop {
+                tokio::select! {
+                    request = add_node_receiver.recv() => {
+                        let Some(request) = request else {
+                            break;
+                        };
+                        let (address, persistent, transport_v2, connection_type) = match request {
+                            PeerManagerRequest::Add(address) => (address, true, None, "outbound-full"),
+                            PeerManagerRequest::OneTry(address, transport_v2, connection_type) => {
+                                (address, false, transport_v2, connection_type)
+                            }
+                            PeerManagerRequest::PrivateBroadcast { address, transaction } => {
+                                spawn_private_broadcast_loop(
+                                    dynamic_node.clone(),
+                                    address,
+                                    dynamic_outbound.clone(),
+                                    transaction,
+                                );
+                                continue;
+                            }
+                        };
+                        spawn_outbound_loop(
+                            dynamic_node.clone(),
+                            address,
+                            dynamic_outbound.clone(),
+                            persistent,
+                            transport_v2,
+                            connection_type,
+                        );
                     }
-                };
-                spawn_outbound_loop(
-                    dynamic_node.clone(),
-                    address,
-                    dynamic_outbound.clone(),
-                    persistent,
-                    transport_v2,
-                    connection_type,
-                );
+                    _ = private_retry_interval.tick() => {
+                        dynamic_node.schedule_private_broadcasts();
+                    }
+                }
             }
         });
 
@@ -1378,6 +1407,7 @@ async fn run_inbound_listener(
                     transport_v2: None,
                     connection_type: "inbound",
                     permissions,
+                    private_broadcast_transaction: None,
                 },
                 peers,
                 peer_id,
@@ -1466,6 +1496,7 @@ fn spawn_outbound_loop(
                             transport_v2,
                             connection_type,
                             permissions: None,
+                            private_broadcast_transaction: None,
                         },
                         peers.clone(),
                         peer_id,
@@ -1487,6 +1518,79 @@ fn spawn_outbound_loop(
                 }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+fn spawn_private_broadcast_loop(
+    node: Arc<Node>,
+    address: SocketAddr,
+    outbound: OutboundContext,
+    transaction: Transaction,
+) {
+    {
+        let mut attempts = outbound.attempts.lock();
+        if !attempts.insert(address) {
+            return;
+        }
+    }
+    let peer_id = outbound.next_peer_id.fetch_add(1, Ordering::Relaxed);
+    let OutboundContext {
+        slots,
+        peers,
+        attempts: outbound_attempts,
+        ..
+    } = outbound;
+    tokio::spawn(async move {
+        struct AttemptGuard {
+            address: SocketAddr,
+            attempts: OutboundAttempts,
+        }
+
+        impl Drop for AttemptGuard {
+            fn drop(&mut self) {
+                self.attempts.lock().remove(&self.address);
+            }
+        }
+
+        let _attempt = AttemptGuard {
+            address,
+            attempts: outbound_attempts,
+        };
+        let Ok(_permit) = slots.acquire_owned().await else {
+            return;
+        };
+        if !node.config.allows_address(address)
+            || !node.network_active()
+            || node.is_banned_for_peer(address, false)
+        {
+            return;
+        }
+        match connect_peer(address, node.config.proxy).await {
+            Ok(stream) => {
+                info!(%address, "connected to private-broadcast peer");
+                if let Err(error) = serve_peer(
+                    node.clone(),
+                    stream,
+                    address,
+                    PeerConnectionOptions {
+                        outbound: true,
+                        transport_v2: None,
+                        connection_type: "private-broadcast",
+                        permissions: None,
+                        private_broadcast_transaction: Some(transaction),
+                    },
+                    peers,
+                    peer_id,
+                )
+                .await
+                {
+                    debug!(%address, %error, "private-broadcast peer ended");
+                }
+            }
+            Err(error) => {
+                debug!(%address, %error, "private-broadcast connection failed");
+            }
         }
     });
 }
@@ -1804,6 +1908,7 @@ struct PeerConnectionOptions {
     transport_v2: Option<bool>,
     connection_type: &'static str,
     permissions: Option<PeerPermissions>,
+    private_broadcast_transaction: Option<Transaction>,
 }
 
 async fn serve_peer(
@@ -1845,6 +1950,10 @@ async fn serve_peer(
         writer: Arc::new(Mutex::new(writer_half)),
         connection_type: options.connection_type,
         permissions,
+        private_broadcast_transaction: options.private_broadcast_transaction,
+        private_broadcast_peer: parking_lot::Mutex::new(
+            options.connection_type == "private-broadcast",
+        ),
         local_relay_transactions: local_transaction_relay_enabled(
             options.connection_type,
             node.config.blocksonly,
@@ -1914,15 +2023,33 @@ async fn serve_peer_loop(
     let relay_transactions = &peer_state.relay_transactions;
     let height = node.chain.read().height() as i32;
     let local_nonce = random();
-    let mut version = VersionMessage::with_bloom(
-        height,
-        local_nonce,
-        node.config.peer_bloom_filters
-            || peer_state
-                .permissions
-                .contains(PeerPermissions::BLOOM_FILTER),
-    );
-    if node.chain.read().is_pruned() {
+    let mut version = if peer_state.connection_type == "private-broadcast" {
+        VersionMessage {
+            version: VersionMessage::PROTOCOL_VERSION,
+            services: 0,
+            timestamp: 0,
+            receiver_services: 0,
+            receiver_address: [0; 16],
+            receiver_port: 0,
+            sender_services: 0,
+            sender_address: [0; 16],
+            sender_port: 0,
+            nonce: local_nonce,
+            user_agent: "/pynode:0.0.1/".to_owned(),
+            start_height: 0,
+            relay: false,
+        }
+    } else {
+        VersionMessage::with_bloom(
+            height,
+            local_nonce,
+            node.config.peer_bloom_filters
+                || peer_state
+                    .permissions
+                    .contains(PeerPermissions::BLOOM_FILTER),
+        )
+    };
+    if peer_state.connection_type != "private-broadcast" && node.chain.read().is_pruned() {
         version.services &= !wire::NODE_NETWORK;
         version.services |= wire::NODE_NETWORK_LIMITED;
         version.receiver_services &= !wire::NODE_NETWORK;
@@ -1930,7 +2057,9 @@ async fn serve_peer_loop(
         version.sender_services &= !wire::NODE_NETWORK;
         version.sender_services |= wire::NODE_NETWORK_LIMITED;
     }
-    if !(node.config.blockfilterindex && node.config.peer_block_filters) {
+    if peer_state.connection_type != "private-broadcast"
+        && !(node.config.blockfilterindex && node.config.peer_block_filters)
+    {
         version.services &= !wire::NODE_COMPACT_FILTERS;
         version.receiver_services &= !wire::NODE_COMPACT_FILTERS;
         version.sender_services &= !wire::NODE_COMPACT_FILTERS;
@@ -1971,6 +2100,8 @@ async fn serve_peer_loop(
     tx_inventory_interval.tick().await;
     let mut pending_block_requests = Vec::new();
     let mut headers_sync: Option<LowWorkHeadersSync> = None;
+    let private_broadcast_timeout = tokio::time::sleep(Duration::from_secs(3 * 60));
+    tokio::pin!(private_broadcast_timeout);
     loop {
         if !node.network_active() {
             anyhow::bail!("networking is disabled");
@@ -2042,7 +2173,7 @@ async fn serve_peer_loop(
                 node.record_bytes_received(peer_id, bytes, message.command());
                 message
             },
-            _ = ping_interval.tick(), if version_received && verack_received => {
+            _ = ping_interval.tick(), if version_received && verack_received && !*peer_state.private_broadcast_peer.lock() => {
                 if node.ping_timed_out(peer_id, peer_timeout) {
                     anyhow::bail!("peer ping timed out");
                 }
@@ -2066,6 +2197,20 @@ async fn serve_peer_loop(
                 continue;
             }
             _ = tx_inventory_interval.tick(), if version_received && verack_received => {
+                if *peer_state.private_broadcast_peer.lock() {
+                    if peer_state.connection_type != "private-broadcast" {
+                        flush_peer_transaction_requests(
+                            node,
+                            peer_id,
+                            peer_state,
+                            peers,
+                            writer,
+                            node.config.network,
+                        )
+                        .await?;
+                    }
+                    continue;
+                }
                 if let Some(staller) = node.take_stalled_block_peer() {
                     node.disconnect_peer(staller);
                 }
@@ -2121,6 +2266,9 @@ async fn serve_peer_loop(
                 .await?;
                 continue;
             }
+            _ = &mut private_broadcast_timeout, if peer_state.connection_type == "private-broadcast" => {
+                anyhow::bail!("private broadcast connection timed out")
+            }
         };
         if !version_received && !matches!(&message, Message::Version(_)) {
             // Core ignores application messages until VERSION has been
@@ -2142,6 +2290,14 @@ async fn serve_peer_loop(
                 }
                 if peer_state.connection_type == "feeler" {
                     anyhow::bail!("feeler connection completed");
+                }
+                let private_broadcast_version = version.services == 0
+                    && version.timestamp == 0
+                    && version.start_height == 0
+                    && !version.relay
+                    && version.user_agent == "/pynode:0.0.1/";
+                if private_broadcast_version {
+                    *peer_state.private_broadcast_peer.lock() = true;
                 }
                 peer_version = version.version;
                 peer_services = version.services;
@@ -2200,6 +2356,26 @@ async fn serve_peer_loop(
                     peer_version,
                 )
                 .await?;
+                if *peer_state.private_broadcast_peer.lock() {
+                    if let Some(transaction) = peer_state.private_broadcast_transaction.as_ref()
+                        && node.private_broadcast_transaction_is_pending(transaction)
+                    {
+                        send_message(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            &Message::Inv(vec![Inventory {
+                                kind: InventoryType::Transaction,
+                                hash: BlockHash::from_raw_hash(
+                                    transaction.compute_txid().to_raw_hash(),
+                                ),
+                            }]),
+                        )
+                        .await?;
+                    }
+                    continue;
+                }
                 if connection_requests_headers(peer_state.connection_type) {
                     request_headers(node, peer_id, writer, peer_state).await?;
                 }
@@ -2267,7 +2443,20 @@ async fn serve_peer_loop(
                 )
                 .await?;
             }
-            Message::Pong(nonce) => node.record_pong(peer_id, nonce),
+            Message::Pong(nonce) => {
+                if node.record_pong(peer_id, nonce)
+                    && peer_state.connection_type == "private-broadcast"
+                    && let Some(transaction) = peer_state.private_broadcast_transaction.as_ref()
+                    && let Some(address) = node
+                        .peer_infos()
+                        .into_iter()
+                        .find(|peer| peer.id == peer_id)
+                        .map(|peer| peer.address)
+                {
+                    node.mark_private_broadcast_peer_ack(transaction, address);
+                    anyhow::bail!("private broadcast peer acknowledged transaction");
+                }
+            }
             Message::GetHeaders(request) => {
                 if node.chain.read().is_initial_block_download()
                     && !peer_state.permissions.contains(PeerPermissions::DOWNLOAD)
@@ -2564,6 +2753,39 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetData(items) => {
+                if peer_state.connection_type == "private-broadcast" {
+                    let Some(transaction) = peer_state.private_broadcast_transaction.as_ref()
+                    else {
+                        anyhow::bail!("private broadcast peer requested without a transaction")
+                    };
+                    if items.len() != 1
+                        || items[0].kind != InventoryType::Transaction
+                        || items[0].hash
+                            != BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash())
+                    {
+                        anyhow::bail!("unexpected private broadcast transaction request")
+                    }
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Transaction(transaction.clone()),
+                    )
+                    .await?;
+                    let nonce = random();
+                    if node.record_ping(peer_id, nonce) {
+                        send_message(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            &Message::Ping(nonce),
+                        )
+                        .await?;
+                    }
+                    continue;
+                }
                 if items.len() > MAX_GETDATA_BATCH {
                     anyhow::bail!(
                         "getdata message contains {} items (maximum {})",
@@ -3052,6 +3274,13 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::Transaction(transaction) => {
+                let privately_broadcast = node.mark_private_broadcast_received(&transaction);
+                if privately_broadcast {
+                    debug!(
+                        txid = %transaction.compute_txid(),
+                        "received privately broadcast transaction back from the network"
+                    );
+                }
                 if !peer_state.local_relay_transactions {
                     anyhow::bail!("transaction sent to a non-relaying connection");
                 }
@@ -3693,6 +3922,10 @@ async fn send_peer_extensions(
     if *sent {
         return Ok(());
     }
+    if *peer_state.private_broadcast_peer.lock() {
+        *sent = true;
+        return Ok(());
+    }
     if peer_version >= SENDHEADERS_VERSION {
         send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
     }
@@ -4247,13 +4480,226 @@ fn transaction_for_getdata_tip(node: &Arc<Node>, item: &Inventory) -> Result<Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitcoin::Amount;
     use bitcoin::Network;
+    use bitcoin::absolute::LockTime;
     use bitcoin::bip158::FilterHeader;
     use bitcoin::block::{Header, Version as BlockVersion};
     use bitcoin::blockdata::constants::genesis_block;
+    use bitcoin::blockdata::script::{Builder, ScriptBuf};
+    use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
+    use bitcoin::blockdata::witness::Witness;
 
     use crate::config::OnlyNet;
     use crate::{Config, Node};
+
+    fn private_broadcast_test_config(
+        datadir: &std::path::Path,
+        private_broadcast: bool,
+        seed_nodes: Vec<SocketAddr>,
+    ) -> Config {
+        Config {
+            network: Network::Regtest,
+            datadir: datadir.to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            listen: true,
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes,
+            dnsseed: false,
+            onlynet: Vec::new(),
+            proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
+            signet_challenge: None,
+            max_peers: 4,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            peer_bloom_filters: false,
+            blocksonly: false,
+            private_broadcast,
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            coinstatsindex: false,
+            blockfilterindex: true,
+            peer_block_filters: true,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            persist_mempool: false,
+            zmq: crate::config::ZmqConfig::default(),
+        }
+    }
+
+    fn mine_private_broadcast_block(previous: &Header, height: u32, now: u32) -> Block {
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::from_consensus(4),
+                prev_blockhash: previous.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: now.saturating_sub(101).saturating_add(height),
+                bits: previous.bits,
+                nonce: 0,
+            },
+            txdata: vec![Transaction {
+                version: Version::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: Builder::new()
+                        .push_int(i64::from(height))
+                        .push_slice([height as u8])
+                        .push_slice([0u8])
+                        .into_script(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(5_000_000_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            }],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        block
+    }
+
+    fn private_broadcast_test_transaction(node: &Arc<Node>) -> Transaction {
+        let funding_hash = node.chain.read().block_hash(1).unwrap();
+        let funding_block = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(funding_block.txdata[0].compute_txid(), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn private_broadcast_handshake_delivers_transaction_and_acknowledges_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = listener.local_addr().unwrap();
+        let source_directory = tempfile::tempdir().unwrap();
+        let target_directory = tempfile::tempdir().unwrap();
+        let source = Node::open(private_broadcast_test_config(
+            source_directory.path(),
+            true,
+            vec![target_address],
+        ))
+        .unwrap();
+        let target = Node::open(private_broadcast_test_config(
+            target_directory.path(),
+            false,
+            Vec::new(),
+        ))
+        .unwrap();
+
+        let now = unix_time_seconds() as u32;
+        for height in 1..=101 {
+            let previous = *source.chain.read().header(height - 1).unwrap();
+            let block = mine_private_broadcast_block(&previous, height, now);
+            source.connect_block(block.clone()).unwrap();
+            target.connect_block(block).unwrap();
+        }
+        assert!(!source.chain.read().is_initial_block_download());
+        assert!(!target.chain.read().is_initial_block_download());
+
+        let transaction = private_broadcast_test_transaction(&source);
+        let txid = transaction.compute_txid();
+        let (manager_sender, mut manager_receiver) = tokio::sync::mpsc::unbounded_channel();
+        source.set_peer_manager_sender(manager_sender);
+        source.queue_private_broadcast(transaction.clone()).unwrap();
+        assert!(matches!(
+            manager_receiver.try_recv().unwrap(),
+            PeerManagerRequest::PrivateBroadcast { .. }
+        ));
+
+        let client = TcpStream::connect(target_address);
+        let server = listener.accept();
+        let (client, server) = tokio::join!(client, server);
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+        let target_peer_address = server.peer_addr().unwrap();
+
+        let source_peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let target_peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let source_task = tokio::spawn(serve_peer(
+            source.clone(),
+            client,
+            target_address,
+            PeerConnectionOptions {
+                outbound: true,
+                transport_v2: Some(false),
+                connection_type: "private-broadcast",
+                permissions: None,
+                private_broadcast_transaction: Some(transaction),
+            },
+            source_peers,
+            1,
+        ));
+        let target_task = tokio::spawn(serve_peer(
+            target.clone(),
+            server,
+            target_peer_address,
+            PeerConnectionOptions {
+                outbound: false,
+                transport_v2: Some(false),
+                connection_type: "inbound",
+                permissions: None,
+                private_broadcast_transaction: None,
+            },
+            target_peers,
+            1,
+        ));
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if target.mempool.read().get(&txid).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let source_result = tokio::time::timeout(Duration::from_secs(10), source_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(source_result.is_err());
+        let info = source.private_broadcast_infos();
+        assert_eq!(info.len(), 1);
+        assert!(info[0].peers.iter().any(|peer| peer.received.is_some()));
+
+        target.disconnect_all_peers();
+        let target_result = tokio::time::timeout(Duration::from_secs(10), target_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(target_result.is_err());
+    }
 
     #[test]
     fn connection_types_match_local_transaction_relay_policy() {
@@ -4272,7 +4718,7 @@ mod tests {
             false,
             PeerPermissions::empty()
         ));
-        for connection_type in ["block-relay-only", "feeler"] {
+        for connection_type in ["block-relay-only", "feeler", "private-broadcast"] {
             assert!(!local_transaction_relay_enabled(
                 connection_type,
                 false,
@@ -4355,6 +4801,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -4489,6 +4936,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -4531,6 +4979,8 @@ mod tests {
             writer: writer.clone(),
             connection_type: "outbound-full",
             permissions: PeerPermissions::empty(),
+            private_broadcast_transaction: None,
+            private_broadcast_peer: parking_lot::Mutex::new(false),
             local_relay_transactions: true,
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
@@ -4810,6 +5260,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -4903,6 +5354,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -5009,6 +5461,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -5201,6 +5654,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -5291,6 +5745,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -5358,6 +5813,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -5486,6 +5942,7 @@ mod tests {
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
+            private_broadcast: false,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
@@ -5528,6 +5985,8 @@ mod tests {
             writer: writer.clone(),
             connection_type: "outbound-full",
             permissions: PeerPermissions::empty(),
+            private_broadcast_transaction: None,
+            private_broadcast_peer: parking_lot::Mutex::new(false),
             local_relay_transactions: true,
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),

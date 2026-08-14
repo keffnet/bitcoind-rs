@@ -1415,8 +1415,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "verifymessage" => verify_message(node, params),
         "createmultisig" => create_multisig(node, params),
         "sendrawtransaction" => send_raw_transaction(node, params),
-        "getprivatebroadcastinfo" => Ok(json!({"transactions": []})),
-        "abortprivatebroadcast" => abort_private_broadcast(params),
+        "getprivatebroadcastinfo" => Ok(private_broadcast_info(node)),
+        "abortprivatebroadcast" => abort_private_broadcast(node, params),
         "signrawtransactionwithkey" => sign_raw_transaction_with_key(node, params),
         "submitblock" => submit_block(node, params),
         "getblocktemplate" => get_block_template(node, params),
@@ -7595,15 +7595,65 @@ fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let max_burn_amount = parse_max_burn_amount(params.get(2))?;
     validate_burn_amount(&transaction, max_burn_amount)?;
     enforce_max_fee_rate(node, &transaction, max_fee_rate)?;
-    let txid = node.accept_transaction(transaction)?;
+    let txid = if node.config.private_broadcast {
+        node.queue_private_broadcast(transaction)?
+    } else {
+        node.accept_transaction(transaction)?
+    };
     Ok(json!(txid.to_string()))
 }
 
-fn abort_private_broadcast(params: &Value) -> Result<Value> {
+fn private_broadcast_info(node: &Arc<Node>) -> Value {
+    let transactions = node
+        .private_broadcast_infos()
+        .into_iter()
+        .map(|info| {
+            let peers = info
+                .peers
+                .into_iter()
+                .map(|peer| {
+                    let mut value = json!({
+                        "address": peer.address.to_string(),
+                        "sent": peer.sent,
+                    });
+                    if let Some(received) = peer.received {
+                        value["received"] = json!(received);
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "txid": info.transaction.compute_txid().to_string(),
+                "wtxid": info.transaction.compute_wtxid().to_string(),
+                "hex": hex::encode(serialize(&info.transaction)),
+                "peers": peers,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({"transactions": transactions})
+}
+
+fn abort_private_broadcast(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let id = param::<String>(params, 0)?;
-    id.parse::<Txid>()
+    let id = id
+        .parse::<Txid>()
         .map_err(|error| anyhow!("invalid private broadcast transaction id: {error}"))?;
-    bail!("Transaction not in private broadcast queue. Check getprivatebroadcastinfo.")
+    let removed = node.abort_private_broadcast(id);
+    if removed.is_empty() {
+        bail!("Transaction not in private broadcast queue. Check getprivatebroadcastinfo.")
+    }
+    Ok(json!({
+        "removed_transactions": removed
+            .into_iter()
+            .map(|info| {
+                json!({
+                    "txid": info.transaction.compute_txid().to_string(),
+                    "wtxid": info.transaction.compute_wtxid().to_string(),
+                    "hex": hex::encode(serialize(&info.transaction)),
+                })
+            })
+            .collect::<Vec<_>>(),
+    }))
 }
 
 fn parse_max_fee_rate(value: Option<&Value>) -> Result<Option<f64>> {
@@ -11063,6 +11113,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -11263,6 +11314,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -11352,6 +11404,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -11460,6 +11513,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -11511,6 +11565,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -11567,6 +11622,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -11658,6 +11714,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -11738,6 +11795,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -11956,6 +12014,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12030,6 +12089,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12084,6 +12144,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12149,6 +12210,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12213,6 +12275,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12272,6 +12335,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12324,6 +12388,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12373,6 +12438,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12499,6 +12565,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12573,6 +12640,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12641,6 +12709,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12738,6 +12807,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12804,6 +12874,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -12890,6 +12961,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13041,6 +13113,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13174,6 +13247,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13224,6 +13298,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13276,6 +13351,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13333,6 +13409,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13396,6 +13473,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13466,6 +13544,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13534,6 +13613,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13616,6 +13696,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: vec![OnlyNet::Ipv4],
             proxy: Some("127.0.0.1:9050".parse().unwrap()),
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13722,6 +13803,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13774,6 +13856,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -13955,6 +14038,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -14071,6 +14155,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -14147,6 +14232,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -14329,6 +14415,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -14538,6 +14625,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -14599,6 +14687,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -14709,6 +14798,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -14948,6 +15038,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -15008,6 +15099,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -15107,6 +15199,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -15337,6 +15430,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -15740,6 +15834,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -15841,6 +15936,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -15928,6 +16024,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -16059,6 +16156,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -16121,6 +16219,7 @@ mod tests {
             listen: true,
             dnsseed: false,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -16205,6 +16304,7 @@ mod tests {
             listen: true,
             dnsseed: true,
             blocksonly: false,
+            private_broadcast: false,
             onlynet: Vec::new(),
             proxy: None,
             peer_permissions: crate::config::PeerPermissionConfig::default(),

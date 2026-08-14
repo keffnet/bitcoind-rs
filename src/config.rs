@@ -594,6 +594,17 @@ pub struct Args {
     )]
     pub blocksonly: bool,
 
+    /// Send RPC-submitted transactions over dedicated short-lived proxy
+    /// connections instead of admitting them to the local mempool first.
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub privatebroadcast: bool,
+
     #[arg(long, default_value_t = 0)]
     pub prune: u64,
 
@@ -720,6 +731,7 @@ pub struct Config {
     pub permit_bare_multisig: bool,
     pub peer_bloom_filters: bool,
     pub blocksonly: bool,
+    pub private_broadcast: bool,
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
     pub prune: u64,
     pub reindex: bool,
@@ -891,6 +903,7 @@ impl Config {
             permit_bare_multisig: args.permitbaremultisig,
             peer_bloom_filters: args.peer_bloom_filters,
             blocksonly: args.blocksonly,
+            private_broadcast: args.privatebroadcast,
             prune: args.prune,
             reindex: args.reindex,
             reindex_chainstate: args.reindex_chainstate,
@@ -980,6 +993,16 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert!(!config.listen);
         assert!(config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--privatebroadcast",
+            "--proxy=127.0.0.1:9050",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().private_broadcast);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

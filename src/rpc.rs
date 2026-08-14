@@ -1368,16 +1368,47 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "connections_in": node.peer_infos().iter().filter(|peer| peer.inbound).count(),
             "connections_out": node.peer_infos().iter().filter(|peer| !peer.inbound).count(),
             "networkactive": node.network_active(),
-            "networks": [{
-                "name": network_name(node.config.network),
-                "limited": false,
-                "reachable": true,
-                "proxy": "",
-                "proxy_randomize_credentials": false,
-            }],
+            "networks": [
+                {
+                    "name": "ipv4",
+                    "limited": false,
+                    "reachable": true,
+                    "proxy": "",
+                    "proxy_randomize_credentials": false,
+                },
+                {
+                    "name": "ipv6",
+                    "limited": false,
+                    "reachable": true,
+                    "proxy": "",
+                    "proxy_randomize_credentials": false,
+                },
+                {
+                    "name": "onion",
+                    "limited": false,
+                    "reachable": true,
+                    "proxy": "",
+                    "proxy_randomize_credentials": false,
+                },
+                {
+                    "name": "i2p",
+                    "limited": false,
+                    "reachable": true,
+                    "proxy": "",
+                    "proxy_randomize_credentials": false,
+                },
+                {
+                    "name": "cjdns",
+                    "limited": false,
+                    "reachable": true,
+                    "proxy": "",
+                    "proxy_randomize_credentials": false,
+                },
+            ],
             "localaddresses": [],
             "relayfee": sat_to_btc(mempool.min_relay_fee_sat_per_kvb()),
             "incrementalfee": sat_to_btc(mempool.incremental_relay_fee_sat_per_kvb()),
+            "warnings": [],
             }))
         }
         "getpeerinfo" => Ok(json!(
@@ -12055,6 +12086,15 @@ mod tests {
         assert_eq!(
             dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["networkactive"],
             false
+        );
+        assert_eq!(
+            dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["networks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|network| network["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["ipv4", "ipv6", "onion", "i2p", "cjdns"]
         );
         dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap();
         assert!(node.network_active());

@@ -3363,7 +3363,7 @@ mod tests {
             panic!("unexpected first ZMQ event");
         };
         assert!(
-            mempool_sequence == 0,
+            mempool_sequence == 1,
             "first sequence was {mempool_sequence}"
         );
 
@@ -3400,7 +3400,7 @@ mod tests {
         assert!(matches!(
             notifications.try_recv().unwrap(),
             zmq::Event::TransactionAdded {
-                mempool_sequence: 2,
+                mempool_sequence: 3,
                 ..
             }
         ));

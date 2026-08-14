@@ -436,7 +436,7 @@ impl Mempool {
             rolling_min_fee_sat_per_kvb: 0.0,
             rolling_fee_last_updated: time::unix_time(),
             block_since_last_rolling_fee_bump: false,
-            sequence: 0,
+            sequence: 1,
             entries: HashMap::new(),
             spent: HashMap::new(),
             children: HashMap::new(),
@@ -2547,15 +2547,15 @@ mod tests {
         pool.revalidate(&chain);
 
         assert!(pool.is_empty());
-        assert_eq!(pool.sequence(), 2);
+        assert_eq!(pool.sequence(), 3);
         let changes = pool.take_changes();
         assert_eq!(changes.len(), 2);
         assert!(changes.iter().all(|change| matches!(
             &change.kind,
             &MempoolChangeKind::Removed { notify_zmq: true }
         )));
-        assert_eq!(changes[0].sequence, 0);
-        assert_eq!(changes[1].sequence, 1);
+        assert_eq!(changes[0].sequence, 1);
+        assert_eq!(changes[1].sequence, 2);
     }
 
     #[test]
@@ -2627,7 +2627,7 @@ mod tests {
         assert!(pool.is_empty());
         let changes = pool.take_changes();
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].sequence, 0);
+        assert_eq!(changes[0].sequence, 1);
         assert!(matches!(
             changes[0].kind,
             MempoolChangeKind::Removed { notify_zmq: true }

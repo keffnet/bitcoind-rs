@@ -12667,7 +12667,7 @@ mod tests {
 
         let result = dispatch_method(&node, "getrawmempool", &json!([false, true])).unwrap();
         assert_eq!(result["txids"], json!([]));
-        assert_eq!(result["mempool_sequence"], json!(0));
+        assert_eq!(result["mempool_sequence"], json!(1));
         assert!(dispatch_method(&node, "getrawmempool", &json!([true, true])).is_err());
         let info = dispatch_method(&node, "getmempoolinfo", &json!([])).unwrap();
         assert_eq!(info["fullrbf"], json!(true));
@@ -12684,7 +12684,7 @@ mod tests {
         .unwrap();
         let result = serde_json::from_slice::<Value>(&body).unwrap();
         assert_eq!(result["txids"], json!([]));
-        assert_eq!(result["mempool_sequence"], json!(0));
+        assert_eq!(result["mempool_sequence"], json!(1));
         assert!(
             dispatch_rest(
                 &node,

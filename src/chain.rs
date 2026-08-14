@@ -233,7 +233,8 @@ impl ChainState {
         };
         let snapshot = state.load_snapshot(&active_chain)?;
         let loaded_snapshot = snapshot.is_some();
-        if let Some(snapshot) = snapshot {
+        let snapshot_verified = snapshot.as_ref().is_some_and(|(_, verified)| *verified);
+        if let Some((snapshot, _)) = snapshot {
             state.active_chain = active_chain.clone();
             state.headers = snapshot.headers;
             state.utxos = snapshot.utxos;
@@ -281,13 +282,16 @@ impl ChainState {
         if loaded_snapshot {
             let snapshot_utxos = state.utxos.clone();
             state.validate_snapshot_utxos(&snapshot_utxos)?;
-            if state.prune_height.is_none() {
-                let expected = state
-                    .replay_utxos_for_block(state.best_hash(), false)?
-                    .context("cannot verify persisted chainstate snapshot")?;
-                if expected != state.utxos {
-                    bail!("persisted chainstate snapshot does not match the active chain");
+            if !snapshot_verified {
+                if state.prune_height.is_none() {
+                    let expected = state
+                        .replay_utxos_for_block(state.best_hash(), false)?
+                        .context("cannot verify persisted chainstate snapshot")?;
+                    if expected != state.utxos {
+                        bail!("persisted chainstate snapshot does not match the active chain");
+                    }
                 }
+                state.persist_snapshot_checksum()?;
             }
         }
         state.persist_metadata()?;
@@ -2488,7 +2492,7 @@ impl ChainState {
         Ok(())
     }
 
-    fn load_snapshot(&self, active_chain: &[BlockHash]) -> Result<Option<ChainSnapshot>> {
+    fn load_snapshot(&self, active_chain: &[BlockHash]) -> Result<Option<(ChainSnapshot, bool)>> {
         let path = self.data_dir.join("chainstate.snapshot");
         if !path.exists() {
             return Ok(None);
@@ -2496,6 +2500,17 @@ impl ChainState {
         let bytes = fs::read(path)?;
         let Ok(snapshot) = serde_json::from_slice::<ChainSnapshot>(&bytes) else {
             return Ok(None);
+        };
+        let checksum_path = self.snapshot_checksum_path();
+        let verified = match fs::read_to_string(checksum_path) {
+            Ok(checksum) => {
+                if checksum.trim() != snapshot_checksum(&bytes) {
+                    bail!("chainstate snapshot checksum mismatch");
+                }
+                true
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
         };
         let Some(tip) = active_chain.last() else {
             return Ok(None);
@@ -2510,7 +2525,7 @@ impl ChainState {
         {
             return Ok(None);
         }
-        Ok(Some(snapshot))
+        Ok(Some((snapshot, verified)))
     }
 
     fn persist_snapshot(&self) -> Result<()> {
@@ -2518,9 +2533,28 @@ impl ChainState {
         let bytes = serde_json::to_vec(&snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
         let temp = self.data_dir.join("chainstate.snapshot.tmp");
-        fs::write(&temp, bytes)?;
+        fs::write(&temp, &bytes)?;
+        fs::rename(temp, path)?;
+        self.persist_snapshot_checksum_bytes(&bytes)?;
+        Ok(())
+    }
+
+    fn persist_snapshot_checksum(&self) -> Result<()> {
+        let bytes = fs::read(self.data_dir.join("chainstate.snapshot"))?;
+        self.persist_snapshot_checksum_bytes(&bytes)
+    }
+
+    fn persist_snapshot_checksum_bytes(&self, bytes: &[u8]) -> Result<()> {
+        let checksum = snapshot_checksum(bytes);
+        let path = self.snapshot_checksum_path();
+        let temp = self.data_dir.join("chainstate.snapshot.sha256.tmp");
+        fs::write(&temp, checksum)?;
         fs::rename(temp, path)?;
         Ok(())
+    }
+
+    fn snapshot_checksum_path(&self) -> PathBuf {
+        self.data_dir.join("chainstate.snapshot.sha256")
     }
 
     fn current_snapshot(&self) -> ChainSnapshot {
@@ -2668,6 +2702,10 @@ fn calculate_utxo_statistics(
         serialized_hash,
         muhash: muhash.map(|accumulator| accumulator.finalize()),
     }
+}
+
+fn snapshot_checksum(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn serialize_utxo_coin(outpoint: &OutPoint, entry: &UtxoEntry) -> Vec<u8> {

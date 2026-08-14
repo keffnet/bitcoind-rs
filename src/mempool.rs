@@ -6,7 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use bitcoin::{Amount, Network, OutPoint, Transaction, Txid, Wtxid};
+use bitcoin::blockdata::script::Instruction;
+use bitcoin::{Amount, Network, OutPoint, PublicKey, Script, Transaction, TxOut, Txid, Wtxid};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainState;
@@ -16,10 +17,19 @@ use crate::validation::{self, ValidationError};
 const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
 const MIN_RELAY_SAT_PER_VBYTE: u64 = 1;
 const MEMPOOL_EXPIRY: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
+const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
+const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
+const MAX_DATACARRIER_BYTES: usize = 100_000;
+const DUST_RELAY_SAT_PER_KVB: u64 = 3_000;
 
 /// Core's context-free package limits.
 pub const MAX_PACKAGE_COUNT: usize = 25;
 pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
+/// Core's default cluster limits for the v31.1 mempool policy.
+pub const MAX_CLUSTER_COUNT: usize = 64;
+pub const MAX_CLUSTER_VSIZE: u64 = 101_000;
+pub const MAX_DATACARRIER_SIZE: usize = MAX_DATACARRIER_BYTES;
 
 #[derive(Deserialize, Serialize)]
 struct DiskMempoolEntry {
@@ -78,8 +88,12 @@ pub enum MempoolError {
     FeeRate,
     #[error("transaction script validation failed: {0}")]
     Script(String),
+    #[error("transaction is non-standard: {0}")]
+    NonStandard(String),
     #[error("mempool size limit exceeded")]
     Full,
+    #[error("transaction cluster exceeds the mempool cluster limits")]
+    ClusterLimit,
 }
 
 impl Mempool {
@@ -449,6 +463,7 @@ impl Mempool {
         if new_count > 0 && package_fee < package_vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
             return Err(MempoolError::FeeRate);
         }
+        validate_ephemeral_spends(transactions, &candidate)?;
         *self = candidate;
         Ok(accepted)
     }
@@ -628,6 +643,12 @@ impl Mempool {
         }
         let fee_sat = input_total - output_total;
         let vsize = transaction.vsize() as u64;
+        if transaction.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
+            return Err(MempoolError::NonStandard("tx-size-small".to_owned()));
+        }
+        if chain.network != Network::Regtest {
+            validate_standard_policy(&transaction, &previous_outputs, fee_sat)?;
+        }
         if enforce_fee_rate && fee_sat < vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
             return Err(MempoolError::FeeRate);
         }
@@ -635,6 +656,7 @@ impl Mempool {
         if self.bytes.saturating_add(size) > self.max_bytes {
             return Err(MempoolError::Full);
         }
+        self.check_cluster_limits(&transaction)?;
         let entry = MempoolEntry {
             transaction,
             fee_sat,
@@ -657,6 +679,43 @@ impl Mempool {
         self.wtxids.insert(wtxid, txid);
         self.sequence = self.sequence.saturating_add(1);
         Ok(txid)
+    }
+
+    fn check_cluster_limits(&self, transaction: &Transaction) -> Result<(), MempoolError> {
+        let mut connected = HashSet::new();
+        let mut pending = transaction
+            .input
+            .iter()
+            .filter_map(|input| {
+                self.entries
+                    .contains_key(&input.previous_output.txid)
+                    .then_some(input.previous_output.txid)
+            })
+            .collect::<Vec<_>>();
+        while let Some(txid) = pending.pop() {
+            if !connected.insert(txid) {
+                continue;
+            }
+            if let Some(entry) = self.entries.get(&txid) {
+                pending.extend(entry.transaction.input.iter().filter_map(|input| {
+                    self.entries
+                        .contains_key(&input.previous_output.txid)
+                        .then_some(input.previous_output.txid)
+                }));
+            }
+            pending.extend(self.children(&txid));
+        }
+        let connected_vsize = connected
+            .iter()
+            .filter_map(|txid| self.entries.get(txid))
+            .map(|entry| entry.vsize)
+            .fold(transaction.vsize() as u64, u64::saturating_add);
+        if connected.len().saturating_add(1) > MAX_CLUSTER_COUNT
+            || connected_vsize > MAX_CLUSTER_VSIZE
+        {
+            return Err(MempoolError::ClusterLimit);
+        }
+        Ok(())
     }
 
     /// Rebuild the pool against a new active chain, dropping transactions
@@ -783,6 +842,284 @@ impl Mempool {
 
         signals_with_ancestors(self, *txid, &mut HashSet::new())
     }
+}
+
+fn validate_standard_policy(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+    fee_sat: u64,
+) -> Result<(), MempoolError> {
+    if !(1..=3).contains(&transaction.version.0) {
+        return Err(MempoolError::NonStandard("version".to_owned()));
+    }
+    if transaction.weight().to_wu() > MAX_STANDARD_TX_WEIGHT {
+        return Err(MempoolError::NonStandard("tx-size".to_owned()));
+    }
+    if transaction
+        .input
+        .iter()
+        .any(|input| input.script_sig.len() > MAX_STANDARD_SCRIPTSIG_SIZE)
+    {
+        return Err(MempoolError::NonStandard("scriptsig-size".to_owned()));
+    }
+    if transaction
+        .input
+        .iter()
+        .any(|input| !input.script_sig.is_push_only())
+    {
+        return Err(MempoolError::NonStandard(
+            "scriptsig-not-pushonly".to_owned(),
+        ));
+    }
+
+    let mut data_carrier_bytes = 0usize;
+    let mut dust_outputs = 0usize;
+    for output in &transaction.output {
+        if output.script_pubkey.is_op_return() {
+            data_carrier_bytes = data_carrier_bytes.saturating_add(output.script_pubkey.len());
+            if data_carrier_bytes > MAX_DATACARRIER_BYTES {
+                return Err(MempoolError::NonStandard("datacarrier".to_owned()));
+            }
+        } else if !is_standard_output_script(&output.script_pubkey) {
+            return Err(MempoolError::NonStandard("scriptpubkey".to_owned()));
+        }
+        if is_dust_output(output) {
+            dust_outputs = dust_outputs.saturating_add(1);
+        }
+    }
+    if dust_outputs > 1 || (fee_sat != 0 && dust_outputs != 0) {
+        return Err(MempoolError::NonStandard("dust".to_owned()));
+    }
+
+    validate_standard_inputs(transaction, previous_outputs)?;
+    validate_standard_witnesses(transaction, previous_outputs)
+}
+
+fn validate_standard_inputs(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+) -> Result<(), MempoolError> {
+    if previous_outputs.len() != transaction.input.len() {
+        return Err(MempoolError::NonStandard(
+            "bad-txns-nonstandard-inputs".to_owned(),
+        ));
+    }
+    for (input, previous) in transaction.input.iter().zip(previous_outputs) {
+        let mut spending_script = &previous.script_pubkey as &Script;
+        if previous.script_pubkey.is_p2sh() {
+            let Some(redeem_script) = last_push_data(&input.script_sig) else {
+                return Err(MempoolError::NonStandard(
+                    "bad-txns-nonstandard-inputs".to_owned(),
+                ));
+            };
+            let redeem_script = Script::from_bytes(redeem_script);
+            if redeem_script.count_sigops() > 15 {
+                return Err(MempoolError::NonStandard(
+                    "bad-txns-nonstandard-inputs".to_owned(),
+                ));
+            }
+            spending_script = redeem_script;
+        }
+        if spending_script.is_witness_program()
+            && !(spending_script.is_p2wpkh()
+                || spending_script.is_p2wsh()
+                || spending_script.is_p2tr())
+        {
+            return Err(MempoolError::NonStandard(
+                "bad-txns-nonstandard-inputs".to_owned(),
+            ));
+        }
+        if !is_standard_spend_script(&previous.script_pubkey) {
+            return Err(MempoolError::NonStandard(
+                "bad-txns-nonstandard-inputs".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_standard_witnesses(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+) -> Result<(), MempoolError> {
+    for (input, previous) in transaction.input.iter().zip(previous_outputs) {
+        if input.witness.is_empty() {
+            continue;
+        }
+        let spending_script = if previous.script_pubkey.is_p2sh() {
+            let Some(redeem_script) = last_push_data(&input.script_sig) else {
+                return Err(MempoolError::NonStandard(
+                    "bad-witness-nonstandard".to_owned(),
+                ));
+            };
+            Script::from_bytes(redeem_script)
+        } else {
+            &previous.script_pubkey
+        };
+        if !spending_script.is_witness_program() {
+            return Err(MempoolError::NonStandard(
+                "bad-witness-nonstandard".to_owned(),
+            ));
+        }
+        if spending_script.is_p2wsh() {
+            let Some(witness_script) = input.witness.last() else {
+                return Err(MempoolError::NonStandard(
+                    "bad-witness-nonstandard".to_owned(),
+                ));
+            };
+            if witness_script.len() > 3_600 {
+                return Err(MempoolError::NonStandard(
+                    "bad-witness-nonstandard".to_owned(),
+                ));
+            }
+            let stack_len = input.witness.len().saturating_sub(1);
+            if stack_len > 100
+                || input
+                    .witness
+                    .iter()
+                    .take(stack_len)
+                    .any(|item| item.len() > 80)
+            {
+                return Err(MempoolError::NonStandard(
+                    "bad-witness-nonstandard".to_owned(),
+                ));
+            }
+        } else if spending_script.is_p2tr() && !previous.script_pubkey.is_p2sh() {
+            let witness_items = input.witness.iter().collect::<Vec<_>>();
+            if witness_items
+                .last()
+                .is_some_and(|item| item.first() == Some(&0x50))
+            {
+                return Err(MempoolError::NonStandard(
+                    "bad-witness-nonstandard".to_owned(),
+                ));
+            }
+            if witness_items.len() >= 2 {
+                let control_block = witness_items[witness_items.len() - 1];
+                if control_block.is_empty() {
+                    return Err(MempoolError::NonStandard(
+                        "bad-witness-nonstandard".to_owned(),
+                    ));
+                }
+                let leaf_version = control_block[0] & 0xfe;
+                if leaf_version == 0xc0
+                    && witness_items[..witness_items.len() - 2]
+                        .iter()
+                        .any(|item| item.len() > 80)
+                {
+                    return Err(MempoolError::NonStandard(
+                        "bad-witness-nonstandard".to_owned(),
+                    ));
+                }
+            } else if witness_items.is_empty() {
+                return Err(MempoolError::NonStandard(
+                    "bad-witness-nonstandard".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_standard_output_script(script: &Script) -> bool {
+    script.is_p2pkh()
+        || script.is_p2sh()
+        || script.p2pk_public_key().is_some()
+        || script.is_witness_program()
+        || is_standard_bare_multisig(script)
+}
+
+fn last_push_data(script: &Script) -> Option<&[u8]> {
+    let mut last = None;
+    for instruction in script.instructions() {
+        match instruction {
+            Ok(Instruction::PushBytes(bytes)) => last = Some(bytes.as_bytes()),
+            Ok(Instruction::Op(_)) => {}
+            Err(_) => return None,
+        }
+    }
+    last
+}
+
+fn is_standard_spend_script(script: &Script) -> bool {
+    is_standard_output_script(script)
+        && !(script.is_witness_program()
+            && !(script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr()))
+}
+
+fn is_standard_bare_multisig(script: &Script) -> bool {
+    if !script.is_multisig() {
+        return false;
+    }
+    let keys = script
+        .instructions()
+        .filter_map(|instruction| match instruction {
+            Ok(Instruction::PushBytes(bytes)) => Some(bytes.as_bytes()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    !keys.is_empty() && keys.len() <= 3 && keys.iter().all(|key| PublicKey::from_slice(key).is_ok())
+}
+
+fn is_dust_output(output: &TxOut) -> bool {
+    if output.script_pubkey.is_op_return() {
+        return false;
+    }
+    let output_size = bitcoin::consensus::encode::serialize(output).len() as u64;
+    let input_size = if output.script_pubkey.is_witness_program() {
+        67
+    } else {
+        148
+    };
+    let threshold = output_size
+        .saturating_add(input_size)
+        .saturating_mul(DUST_RELAY_SAT_PER_KVB)
+        .saturating_add(999)
+        / 1_000;
+    output.value.to_sat() < threshold
+}
+
+fn validate_ephemeral_spends(
+    transactions: &[Transaction],
+    mempool: &Mempool,
+) -> Result<(), MempoolError> {
+    let package_transactions = transactions
+        .iter()
+        .map(|transaction| (transaction.compute_txid(), transaction))
+        .collect::<HashMap<_, _>>();
+    for transaction in transactions {
+        let mut processed_parents = HashSet::new();
+        let mut unspent_dust = HashSet::new();
+        for input in &transaction.input {
+            if !processed_parents.insert(input.previous_output.txid) {
+                continue;
+            }
+            let parent = package_transactions
+                .get(&input.previous_output.txid)
+                .copied()
+                .or_else(|| {
+                    mempool
+                        .get(&input.previous_output.txid)
+                        .map(|entry| &entry.transaction)
+                });
+            if let Some(parent) = parent {
+                for (vout, output) in parent.output.iter().enumerate() {
+                    if is_dust_output(output) {
+                        unspent_dust.insert(OutPoint::new(input.previous_output.txid, vout as u32));
+                    }
+                }
+            }
+        }
+        for input in &transaction.input {
+            unspent_dust.remove(&input.previous_output);
+        }
+        if !unspent_dust.is_empty() {
+            return Err(MempoolError::NonStandard(
+                "missing-ephemeral-spends".to_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn collect_mining_package(
@@ -1057,5 +1394,104 @@ mod tests {
         );
         pool.prioritise(txid, -25);
         assert_eq!(pool.fee_delta(&txid), 0);
+    }
+
+    #[test]
+    fn rejects_transactions_that_exceed_cluster_count_limit() {
+        let mut pool = Mempool::new(Network::Regtest);
+        let mut previous = Txid::from_byte_array([0; 32]);
+        let mut chain = Vec::with_capacity(MAX_CLUSTER_COUNT);
+        for marker in 0..MAX_CLUSTER_COUNT {
+            let transaction = graph_transaction(previous, marker as u8);
+            let txid = transaction.compute_txid();
+            pool.entries.insert(
+                txid,
+                MempoolEntry {
+                    vsize: transaction.vsize() as u64,
+                    fee_sat: 1,
+                    added_at: 1,
+                    height: 0,
+                    transaction,
+                },
+            );
+            pool.children.entry(previous).or_default().insert(txid);
+            pool.wtxids.insert(
+                pool.entries
+                    .get(&txid)
+                    .expect("inserted transaction")
+                    .transaction
+                    .compute_wtxid(),
+                txid,
+            );
+            chain.push(txid);
+            previous = txid;
+        }
+        let candidate = graph_transaction(previous, 0xff);
+        assert!(matches!(
+            pool.check_cluster_limits(&candidate),
+            Err(MempoolError::ClusterLimit)
+        ));
+        assert_eq!(chain.len(), MAX_CLUSTER_COUNT);
+    }
+
+    #[test]
+    fn standard_policy_accepts_known_scripts_and_rejects_nonstandard_outputs() {
+        let previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::from_bytes({
+                let mut bytes = vec![0x76, 0xa9, 0x14];
+                bytes.extend([0u8; 20]);
+                bytes.extend([0x88, 0xac]);
+                bytes
+            }),
+        };
+        let mut nonstandard = graph_transaction(Txid::from_byte_array([7; 32]), 7);
+        nonstandard.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00]);
+        assert!(matches!(
+            validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1),
+            Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
+        ));
+
+        nonstandard.output[0].script_pubkey = ScriptBuf::from_bytes({
+            let mut bytes = vec![0x00, 0x14];
+            bytes.extend([0u8; 20]);
+            bytes
+        });
+        nonstandard.output[0].value = Amount::from_sat(100_000);
+        assert!(validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1).is_ok());
+
+        nonstandard.output[0].value = Amount::from_sat(1);
+        assert!(is_dust_output(&nonstandard.output[0]));
+    }
+
+    #[test]
+    fn ephemeral_dust_must_be_spent_by_the_package_child() {
+        let mut parent = graph_transaction(Txid::from_byte_array([10; 32]), 10);
+        parent.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00]);
+        parent.output = vec![
+            TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes({
+                    let mut bytes = vec![0x00, 0x14];
+                    bytes.extend([0u8; 20]);
+                    bytes
+                }),
+            },
+            TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            },
+        ];
+        let mut child = graph_transaction(parent.compute_txid(), 11);
+        child.input[0].previous_output.vout = 1;
+        let pool = Mempool::new(Network::Regtest);
+        assert!(matches!(
+            validate_ephemeral_spends(&[parent.clone(), child], &pool),
+            Err(MempoolError::NonStandard(reason)) if reason == "missing-ephemeral-spends"
+        ));
+
+        let mut dust_child = graph_transaction(parent.compute_txid(), 12);
+        dust_child.input[0].previous_output.vout = 0;
+        assert!(validate_ephemeral_spends(&[parent, dust_child], &pool).is_ok());
     }
 }

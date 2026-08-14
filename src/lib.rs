@@ -1139,7 +1139,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: funding,
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
@@ -1153,7 +1153,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::new(parent.compute_txid(), 0),
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
@@ -1167,7 +1167,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::new(child.compute_txid(), 0),
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],

@@ -42,8 +42,9 @@ use tracing::debug;
 use crate::Node;
 use crate::chain;
 use crate::mempool::{
-    MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool, MempoolError,
-    package_is_child_with_parents_tree, package_is_topologically_sorted, package_weight,
+    MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_DATACARRIER_SIZE, MAX_PACKAGE_COUNT,
+    MAX_PACKAGE_WEIGHT, Mempool, MempoolError, package_is_child_with_parents_tree,
+    package_is_topologically_sorted, package_weight,
 };
 use crate::validation;
 use crate::wire;
@@ -1254,9 +1255,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "total_fee": sat_to_btc(total_fee),
                 "fullrbf": true,
                 "permitbaremultisig": true,
-                "maxdatacarriersize": 83,
-                "limitclustercount": 64,
-                "limitclustersize": 101_000,
+                "maxdatacarriersize": MAX_DATACARRIER_SIZE,
+                "limitclustercount": MAX_CLUSTER_COUNT,
+                "limitclustersize": MAX_CLUSTER_VSIZE,
                 "optimal": true,
             }))
         }
@@ -8138,6 +8139,8 @@ fn mempool_reject_reason(error: &MempoolError) -> String {
         MempoolError::Conflict(_) => "txn-mempool-conflict".to_owned(),
         MempoolError::MissingInput(_) => "missing-inputs".to_owned(),
         MempoolError::FeeRate => "mempool min fee not met".to_owned(),
+        MempoolError::NonStandard(reason) => reason.clone(),
+        MempoolError::ClusterLimit => "too-long-mempool-chain".to_owned(),
         MempoolError::Script(reason) => reason.clone(),
         _ => error.to_string(),
     }
@@ -9792,7 +9795,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::new(Txid::from_byte_array([tag; 32]), 0),
-                script_sig: ScriptBuf::from_bytes(vec![tag]),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
@@ -10636,7 +10639,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output,
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
@@ -10778,7 +10781,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::new(funding_txid, 0),
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
@@ -12442,7 +12445,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: OutPoint::new(funding.txdata[0].compute_txid(), 0),
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
@@ -12493,7 +12496,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: outpoint,
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::from_consensus(0xffff_fffd),
                 witness: Witness::default(),
             }],
@@ -12508,7 +12511,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: outpoint,
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::from_consensus(0xffff_fffd),
                 witness: Witness::default(),
             }],
@@ -12548,7 +12551,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: funding_outpoint,
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
@@ -12563,7 +12566,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: parent_outpoint,
-                script_sig: ScriptBuf::new(),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],

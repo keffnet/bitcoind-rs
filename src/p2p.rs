@@ -282,7 +282,7 @@ impl PeerManager {
         let (add_node_sender, mut add_node_receiver) = mpsc::unbounded_channel();
         self.node.set_peer_manager_sender(add_node_sender);
         let mut chain_events = self.node.subscribe_chain();
-        let mut mempool_events = self.node.subscribe_mempool();
+        let mut mempool_events = self.node.subscribe_peer_mempool();
         let block_relay_node = self.node.clone();
         let block_relay_peers = peers.clone();
         let block_relay_network = self.node.config.network;
@@ -319,21 +319,26 @@ impl PeerManager {
         let relay_network = self.node.config.network;
         tokio::spawn(async move {
             loop {
-                let txid = match mempool_events.recv().await {
-                    Ok(txid) => txid,
+                let event = match mempool_events.recv().await {
+                    Ok(event) => event,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                let hash = relay_node
+                let Some(hash) = relay_node
                     .mempool
                     .read()
-                    .get(&txid)
+                    .get(&event.txid)
                     .map(|entry| entry.transaction.compute_wtxid())
-                    .unwrap_or_else(|| Wtxid::from_raw_hash(txid.to_raw_hash()));
-                broadcast_inventory(
+                else {
+                    // Removal notifications share the public mempool event
+                    // stream, but a removed transaction must never be
+                    // announced as if it were still relayable.
+                    continue;
+                };
+                broadcast_inventory_excluding(
                     &relay_node,
                     &relay_peers,
-                    0,
+                    &event.excluded_peers,
                     relay_network,
                     Inventory {
                         kind: InventoryType::WitnessTransaction,
@@ -1377,23 +1382,11 @@ async fn serve_peer_loop(
             }
             Message::Transaction(transaction) => {
                 let txid = transaction.compute_txid();
-                let wtxid = transaction.compute_wtxid();
                 let accepted = node
                     .accept_peer_transaction_from(peer_id, transaction)
                     .is_ok();
                 if accepted {
                     debug!(%txid, "accepted peer transaction");
-                    broadcast_inventory(
-                        node,
-                        peers,
-                        peer_id,
-                        node.config.network,
-                        Inventory {
-                            kind: InventoryType::WitnessTransaction,
-                            hash: BlockHash::from_raw_hash(wtxid.to_raw_hash()),
-                        },
-                    )
-                    .await;
                 } else {
                     debug!(%txid, "rejected peer transaction");
                 }
@@ -1894,10 +1887,24 @@ async fn broadcast_inventory(
     network: Network,
     item: Inventory,
 ) {
+    broadcast_inventory_excluding(node, peers, &[excluded_peer], network, item).await;
+}
+
+async fn broadcast_inventory_excluding(
+    node: &Arc<Node>,
+    peers: &PeerRegistry,
+    excluded_peers: &[usize],
+    network: Network,
+    item: Inventory,
+) {
     let recipients: Vec<(usize, Arc<PeerState>)> = peers
         .lock()
         .iter()
-        .filter(|(peer_id, _)| **peer_id != excluded_peer)
+        .filter(|(peer_id, _)| {
+            excluded_peers
+                .iter()
+                .all(|excluded_peer| **peer_id != *excluded_peer)
+        })
         .map(|(peer_id, state)| (*peer_id, state.clone()))
         .collect();
     for (peer_id, state) in recipients {

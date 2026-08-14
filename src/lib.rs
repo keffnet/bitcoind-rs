@@ -194,6 +194,12 @@ pub type ChainEvent = chain::ChainTip;
 pub type MempoolEvent = Txid;
 
 #[derive(Clone, Debug)]
+pub(crate) struct PeerMempoolEvent {
+    pub txid: Txid,
+    pub excluded_peers: Vec<usize>,
+}
+
+#[derive(Clone, Debug)]
 pub struct OrphanTransaction {
     pub transaction: Transaction,
     pub peer_ids: Vec<usize>,
@@ -246,6 +252,7 @@ pub struct Node {
     pub mempool: Arc<RwLock<Mempool>>,
     pub events: broadcast::Sender<ChainEvent>,
     pub mempool_events: broadcast::Sender<MempoolEvent>,
+    peer_mempool_events: broadcast::Sender<PeerMempoolEvent>,
     pub rpc_cookie: Option<String>,
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
@@ -283,6 +290,7 @@ impl Node {
         let (known_addresses, tried_addresses) = load_known_addresses(&config.datadir)?;
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
+        let (peer_mempool_events, _) = broadcast::channel(256);
         let rpc_cookie = config
             .rpc_bind
             .map(|_| load_rpc_cookie(&config.datadir))
@@ -293,6 +301,7 @@ impl Node {
             mempool: Arc::new(RwLock::new(mempool)),
             events,
             mempool_events,
+            peer_mempool_events,
             rpc_cookie,
             mempool_path,
             peer_count: AtomicUsize::new(0),
@@ -393,7 +402,7 @@ impl Node {
     ) -> Result<Txid> {
         match self.try_accept_transaction(transaction.clone()) {
             Ok(txid) => {
-                self.notify_mempool_transaction(transaction);
+                self.notify_mempool_transaction_from_peer(transaction, peer_id);
                 Ok(txid)
             }
             Err(error @ MempoolError::MissingInput(_)) => {
@@ -442,6 +451,15 @@ impl Node {
         let _ = self.mempool_events.send(txid);
     }
 
+    fn announce_peer_mempool_transaction(&self, txid: Txid, mut excluded_peers: Vec<usize>) {
+        excluded_peers.sort_unstable();
+        excluded_peers.dedup();
+        let _ = self.peer_mempool_events.send(PeerMempoolEvent {
+            txid,
+            excluded_peers,
+        });
+    }
+
     fn announce_mempool_changes(&self, mut removed: Vec<Txid>) {
         removed.sort_by_key(ToString::to_string);
         for txid in removed {
@@ -450,9 +468,22 @@ impl Node {
     }
 
     pub(crate) fn notify_mempool_transaction(&self, transaction: Transaction) {
+        self.notify_mempool_transaction_with_exclusions(transaction, Vec::new());
+    }
+
+    fn notify_mempool_transaction_from_peer(&self, transaction: Transaction, peer_id: usize) {
+        self.notify_mempool_transaction_with_exclusions(transaction, vec![peer_id]);
+    }
+
+    fn notify_mempool_transaction_with_exclusions(
+        &self,
+        transaction: Transaction,
+        excluded_peers: Vec<usize>,
+    ) {
         let txid = transaction.compute_txid();
         self.orphans.lock().remove(&txid);
         self.announce_mempool_transaction(txid);
+        self.announce_peer_mempool_transaction(txid, excluded_peers);
         self.promote_orphans_for_parent(&transaction);
     }
 
@@ -468,6 +499,10 @@ impl Node {
             match self.try_accept_transaction(transaction.clone()) {
                 Ok(txid) => {
                     self.announce_mempool_transaction(txid);
+                    self.announce_peer_mempool_transaction(
+                        txid,
+                        entry.announcers.into_iter().collect(),
+                    );
                     pending.extend(self.orphans.lock().take_children(&transaction));
                 }
                 Err(MempoolError::MissingInput(_)) => {
@@ -512,6 +547,10 @@ impl Node {
 
     pub fn subscribe_mempool(&self) -> broadcast::Receiver<MempoolEvent> {
         self.mempool_events.subscribe()
+    }
+
+    pub(crate) fn subscribe_peer_mempool(&self) -> broadcast::Receiver<PeerMempoolEvent> {
+        self.peer_mempool_events.subscribe()
     }
 
     pub fn peer_count(&self) -> usize {
@@ -1033,8 +1072,11 @@ impl Node {
         if result.is_ok() {
             let mut changed = changed;
             changed.sort_by_key(ToString::to_string);
+            for txid in &changed {
+                self.announce_mempool_transaction(*txid);
+            }
             for txid in changed {
-                self.announce_mempool_transaction(txid);
+                self.announce_peer_mempool_transaction(txid, Vec::new());
             }
         }
         result

@@ -246,6 +246,9 @@ pub struct Args {
     )]
     pub reindex_chainstate: bool,
 
+    #[arg(long = "loadblock")]
+    pub loadblock: Vec<PathBuf>,
+
     #[arg(long, default_value_t = false)]
     pub txindex: bool,
 
@@ -349,6 +352,7 @@ pub struct Config {
     pub prune: u64,
     pub reindex: bool,
     pub reindex_chainstate: bool,
+    pub load_blocks: Vec<PathBuf>,
     pub txindex: bool,
     pub txospenderindex: bool,
     pub coinstatsindex: bool,
@@ -488,6 +492,7 @@ impl Config {
             prune: args.prune,
             reindex: args.reindex,
             reindex_chainstate: args.reindex_chainstate,
+            load_blocks: args.loadblock,
             txindex: args.txindex,
             txospenderindex: args.txospenderindex,
             coinstatsindex: args.coinstatsindex,
@@ -554,6 +559,20 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert!(config.reindex);
         assert!(config.reindex_chainstate);
+
+        let block_file = directory.path().join("bootstrap.blk");
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--loadblock",
+            block_file.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().load_blocks,
+            vec![block_file]
+        );
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

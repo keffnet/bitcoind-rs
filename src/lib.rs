@@ -15,6 +15,7 @@ pub mod wire;
 pub mod zmq;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::{
@@ -23,9 +24,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use bitcoin::Block;
-use bitcoin::{OutPoint, Transaction, Txid};
+use anyhow::{Context, Result, bail};
+use bitcoin::consensus::encode::deserialize;
+use bitcoin::{Block, Network, OutPoint, Transaction, Txid};
 use parking_lot::RwLock;
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,89 @@ const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_KNOWN_ADDRESSES: usize = 256_000;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_EXTERNAL_BLOCK_RECORD_SIZE: usize = 4 * 1024 * 1024;
+
+fn import_external_block_file(
+    chain: &mut ChainState,
+    path: &Path,
+    network: Network,
+) -> Result<usize> {
+    let bytes = fs::read(path).with_context(|| format!("reading block file {}", path.display()))?;
+    let magic = wire::network_magic(network);
+    let mut offset = 0usize;
+    let mut blocks = Vec::new();
+    while offset < bytes.len() {
+        let remaining = bytes.len().saturating_sub(offset);
+        if remaining < 8 {
+            bail!(
+                "block file {} ends with an incomplete record header",
+                path.display()
+            );
+        }
+        if bytes[offset..offset + 4] != magic {
+            bail!(
+                "block file {} has unexpected network magic at offset {}",
+                path.display(),
+                offset
+            );
+        }
+        let length = u32::from_le_bytes(
+            bytes[offset + 4..offset + 8]
+                .try_into()
+                .expect("record header has four length bytes"),
+        ) as usize;
+        if length == 0 || length > MAX_EXTERNAL_BLOCK_RECORD_SIZE {
+            bail!(
+                "block file {} contains an invalid block length {}",
+                path.display(),
+                length
+            );
+        }
+        let record_start = offset.saturating_add(8);
+        let record_end = record_start.saturating_add(length);
+        if record_end > bytes.len() {
+            bail!("block file {} ends with a truncated block", path.display());
+        }
+        let block: Block = deserialize(&bytes[record_start..record_end]).with_context(|| {
+            format!("decoding block at offset {} in {}", offset, path.display())
+        })?;
+        blocks.push(block);
+        offset = record_end;
+    }
+
+    let mut pending = blocks;
+    let mut imported = 0usize;
+    while !pending.is_empty() {
+        let mut remaining = Vec::new();
+        let mut progress = false;
+        for block in pending {
+            let hash = block.block_hash();
+            if chain.header_by_hash(&hash).is_some() {
+                continue;
+            }
+            if chain.header_by_hash(&block.header.prev_blockhash).is_none() {
+                remaining.push(block);
+                continue;
+            }
+            chain
+                .connect_block(block)
+                .with_context(|| format!("connecting block {hash} from {}", path.display()))?;
+            imported = imported.saturating_add(1);
+            progress = true;
+        }
+        if !remaining.is_empty() && !progress {
+            let block = &remaining[0];
+            bail!(
+                "block file {} contains block {} with an unknown parent {}",
+                path.display(),
+                block.block_hash(),
+                block.header.prev_blockhash
+            );
+        }
+        pending = remaining;
+    }
+    Ok(imported)
+}
 
 struct OrphanEntry {
     transaction: Transaction,
@@ -299,6 +383,9 @@ impl Node {
         chain.configure_pruning(config.prune)?;
         chain.configure_txospender_index(config.txospenderindex)?;
         chain.configure_coinstats_index(config.coinstatsindex)?;
+        for path in &config.load_blocks {
+            import_external_block_file(&mut chain, path, config.network)?;
+        }
         chain.maybe_auto_prune()?;
         let mempool_path = config.datadir.join("mempool.json");
         let mempool_policy = MempoolPolicy {
@@ -1491,6 +1578,7 @@ mod tests {
             prune: 0,
             reindex: false,
             reindex_chainstate: false,
+            load_blocks: Vec::new(),
             txindex: false,
             txospenderindex: false,
             max_mempool_mb: 300,
@@ -1514,6 +1602,26 @@ mod tests {
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         }
+    }
+
+    #[test]
+    fn imports_network_framed_external_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let block = mine_test_block(chain.header(0).unwrap(), 1, 1);
+        let payload = bitcoin::consensus::encode::serialize(&block);
+        let mut framed = wire::network_magic(Network::Regtest).to_vec();
+        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&payload);
+        let path = directory.path().join("external.blk");
+        fs::write(&path, framed).unwrap();
+
+        assert_eq!(
+            import_external_block_file(&mut chain, &path, Network::Regtest).unwrap(),
+            1
+        );
+        assert_eq!(chain.height(), 1);
+        assert_eq!(chain.best_hash(), block.block_hash());
     }
 
     #[test]

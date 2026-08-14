@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::muhash::MuHash3072;
-use crate::storage::BlockStore;
+use crate::storage::{BlockStore, FilterStore};
 use crate::validation::{self, ValidationError};
 
 const COINBASE_MATURITY: u32 = 100;
@@ -115,6 +115,7 @@ pub struct ChainState {
     data_dir: PathBuf,
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
+    filter_store: FilterStore,
     active_chain: Vec<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
     block_index: HashMap<BlockHash, BlockNode>,
@@ -146,6 +147,7 @@ impl ChainState {
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
         let mut store = BlockStore::open(data_dir.join("blocks"))?;
+        let filter_store = FilterStore::open(data_dir.join("filters"))?;
         let genesis = genesis_block(network);
         let genesis_hash = genesis.block_hash();
         if !store.contains(&genesis_hash) {
@@ -191,6 +193,7 @@ impl ChainState {
                     .unwrap_or_else(validation::default_signet_challenge)
             }),
             store,
+            filter_store,
             active_chain: Vec::new(),
             headers: Vec::new(),
             block_index: HashMap::new(),
@@ -676,6 +679,15 @@ impl ChainState {
         let Some(headers) = self.headers_to_hash(hash) else {
             return Ok(None);
         };
+        for header in &headers {
+            let block_hash = header.block_hash();
+            if !self.basic_filter_cache.contains_key(&block_hash)
+                && let Some((content, filter_header)) = self.filter_store.get(&block_hash)?
+            {
+                self.basic_filter_cache
+                    .insert(block_hash, (content, filter_header));
+            }
+        }
         if headers
             .iter()
             .all(|header| self.basic_filter_cache.contains_key(&header.block_hash()))
@@ -1756,6 +1768,8 @@ impl ChainState {
                 .ok_or(bitcoin::bip158::Error::UtxoMissing(*outpoint))
         })?;
         let filter_header = filter.filter_header(previous_filter_header);
+        self.filter_store
+            .insert(block.block_hash(), &filter.content, filter_header)?;
         self.basic_filter_cache
             .insert(block.block_hash(), (filter.content, filter_header));
         Ok(())

@@ -11,12 +11,14 @@ use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, TxOut};
 
 const MAX_STORED_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
+const MAX_STORED_FILTER_SIZE: usize = 4 * 1024 * 1024;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
 
@@ -208,6 +210,212 @@ impl BlockStore {
     pub fn hashes(&self) -> impl Iterator<Item = &BlockHash> {
         self.index.keys()
     }
+}
+
+/// Durable BIP158 filter content and filter-header storage.
+///
+/// Filters are immutable by block hash, so an append-only record file with a
+/// compact hash index gives restart-time lookups without replaying block
+/// bodies or the UTXO set.
+pub struct FilterStore {
+    file: File,
+    index_file: File,
+    index: HashMap<BlockHash, Record>,
+}
+
+impl FilterStore {
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref();
+        create_dir_all(directory)
+            .with_context(|| format!("creating filter directory {}", directory.display()))?;
+        let path = directory.join("basic-filters.dat");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening filter store {}", path.display()))?;
+        let index_path = directory.join("basic-filters.index");
+        let mut index_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&index_path)
+            .with_context(|| format!("opening filter index {}", index_path.display()))?;
+        let data_len = file.metadata()?.len();
+        let index = match load_filter_index(&mut index_file, data_len)? {
+            Some(index) => index,
+            None => {
+                let index = scan_filter_index(&mut file)?;
+                rewrite_index(&mut index_file, data_len, &index)?;
+                index
+            }
+        };
+        Ok(Self {
+            file,
+            index_file,
+            index,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub fn get(&mut self, hash: &BlockHash) -> Result<Option<(Vec<u8>, FilterHeader)>> {
+        let Some(record) = self.index.get(hash).copied() else {
+            return Ok(None);
+        };
+        self.file.seek(SeekFrom::Start(record.offset))?;
+        let mut length = [0u8; 4];
+        self.file.read_exact(&mut length)?;
+        let actual = u32::from_le_bytes(length);
+        if actual != record.length {
+            bail!("filter store index disagrees with record length");
+        }
+        if actual as usize > MAX_STORED_FILTER_SIZE + 64 {
+            bail!("stored filter record is too large");
+        }
+        let mut bytes = vec![0u8; record.length as usize];
+        self.file.read_exact(&mut bytes)?;
+        if bytes.len() < 64 {
+            bail!("stored filter record is truncated");
+        }
+        let stored_hash = BlockHash::from_byte_array(
+            bytes[..32]
+                .try_into()
+                .expect("filter block hash has fixed width"),
+        );
+        if stored_hash != *hash {
+            bail!("stored filter hash does not match filter index");
+        }
+        let header = FilterHeader::from_byte_array(
+            bytes[32..64]
+                .try_into()
+                .expect("filter header has fixed width"),
+        );
+        Ok(Some((bytes[64..].to_vec(), header)))
+    }
+
+    pub fn insert(&mut self, hash: BlockHash, content: &[u8], header: FilterHeader) -> Result<()> {
+        if self.index.contains_key(&hash) {
+            return Ok(());
+        }
+        if content.len() > MAX_STORED_FILTER_SIZE {
+            bail!("basic filter is too large: {} bytes", content.len());
+        }
+        let mut bytes = Vec::with_capacity(64 + content.len());
+        bytes.extend_from_slice(&hash.to_byte_array());
+        bytes.extend_from_slice(&header.to_byte_array());
+        bytes.extend_from_slice(content);
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        let length = u32::try_from(bytes.len()).context("filter length does not fit u32")?;
+        self.file.write_all(&length.to_le_bytes())?;
+        self.file.write_all(&bytes)?;
+        self.file.sync_data()?;
+        let record = Record { offset, length };
+        persist_index_entry(
+            &mut self.index_file,
+            offset + 4 + bytes.len() as u64,
+            hash,
+            record,
+        )?;
+        self.index.insert(hash, record);
+        Ok(())
+    }
+}
+
+fn load_filter_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<BlockHash, Record>>> {
+    let index_len = file.metadata()?.len();
+    if index_len < INDEX_HEADER_SIZE || (index_len - INDEX_HEADER_SIZE) % INDEX_RECORD_SIZE != 0 {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut expected_data_len = [0u8; 8];
+    file.read_exact(&mut expected_data_len)?;
+    if u64::from_le_bytes(expected_data_len) != data_len {
+        return Ok(None);
+    }
+    let count = (index_len - INDEX_HEADER_SIZE) / INDEX_RECORD_SIZE;
+    let mut index = HashMap::with_capacity(count as usize);
+    let mut max_end = 0u64;
+    for _ in 0..count {
+        let mut hash_bytes = [0u8; 32];
+        file.read_exact(&mut hash_bytes)?;
+        let mut offset_bytes = [0u8; 8];
+        file.read_exact(&mut offset_bytes)?;
+        let mut length_bytes = [0u8; 4];
+        file.read_exact(&mut length_bytes)?;
+        let record = Record {
+            offset: u64::from_le_bytes(offset_bytes),
+            length: u32::from_le_bytes(length_bytes),
+        };
+        if record.length < 64
+            || record.length as usize > MAX_STORED_FILTER_SIZE + 64
+            || record
+                .offset
+                .saturating_add(4)
+                .saturating_add(record.length as u64)
+                > data_len
+        {
+            return Ok(None);
+        }
+        let hash = BlockHash::from_byte_array(hash_bytes);
+        if index.insert(hash, record).is_some() {
+            return Ok(None);
+        }
+        max_end = max_end.max(record.offset + 4 + record.length as u64);
+    }
+    if max_end != data_len && data_len != 0 {
+        return Ok(None);
+    }
+    Ok(Some(index))
+}
+
+fn scan_filter_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut index = HashMap::new();
+    loop {
+        let offset = file.stream_position()?;
+        let mut length_bytes = [0u8; 4];
+        match file.read_exact(&mut length_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                if offset == file.metadata()?.len() {
+                    break;
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let length = u32::from_le_bytes(length_bytes);
+        if length < 64 || length as usize > MAX_STORED_FILTER_SIZE + 64 {
+            bail!(
+                "invalid filter record length {} at offset {}",
+                length,
+                offset
+            );
+        }
+        let mut bytes = vec![0u8; length as usize];
+        file.read_exact(&mut bytes).map_err(|error| {
+            anyhow::anyhow!("truncated filter record at offset {}: {}", offset, error)
+        })?;
+        let hash = BlockHash::from_byte_array(
+            bytes[..32]
+                .try_into()
+                .expect("filter block hash has fixed width"),
+        );
+        if index.insert(hash, Record { offset, length }).is_some() {
+            bail!("duplicate block hash in filter store");
+        }
+    }
+    file.seek(SeekFrom::End(0))?;
+    Ok(index)
 }
 
 fn load_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<BlockHash, Record>>> {
@@ -450,5 +658,19 @@ mod tests {
         }
         let mut reopened = BlockStore::open(directory.path()).unwrap();
         assert_eq!(reopened.get_undo(&hash).unwrap(), Some(undo));
+    }
+
+    #[test]
+    fn persists_and_reopens_basic_filter() {
+        let directory = tempfile::tempdir().unwrap();
+        let hash = BlockHash::from_byte_array([8; 32]);
+        let header = FilterHeader::from_byte_array([9; 32]);
+        {
+            let mut store = FilterStore::open(directory.path()).unwrap();
+            store.insert(hash, &[1, 2, 3], header).unwrap();
+            assert_eq!(store.get(&hash).unwrap(), Some((vec![1, 2, 3], header)));
+        }
+        let mut reopened = FilterStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&hash).unwrap(), Some((vec![1, 2, 3], header)));
     }
 }

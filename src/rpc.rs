@@ -915,6 +915,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "verifymessage" => verify_message(node, params),
         "createmultisig" => create_multisig(node, params),
         "sendrawtransaction" => send_raw_transaction(node, params),
+        "getprivatebroadcastinfo" => Ok(json!({"transactions": []})),
+        "abortprivatebroadcast" => abort_private_broadcast(params),
         "signrawtransactionwithkey" => sign_raw_transaction_with_key(node, params),
         "submitblock" => submit_block(node, params),
         "getblocktemplate" => get_block_template(node, params),
@@ -5480,6 +5482,13 @@ fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(txid.to_string()))
 }
 
+fn abort_private_broadcast(params: &Value) -> Result<Value> {
+    let id = param::<String>(params, 0)?;
+    id.parse::<Txid>()
+        .map_err(|error| anyhow!("invalid private broadcast transaction id: {error}"))?;
+    bail!("Transaction not in private broadcast queue. Check getprivatebroadcastinfo.")
+}
+
 fn parse_max_fee_rate(value: Option<&Value>) -> Result<Option<f64>> {
     let max_fee_rate = value.filter(|value| !value.is_null()).map_or(
         Ok(DEFAULT_MAX_RAW_TX_FEE_RATE_BTC_PER_KVB),
@@ -7916,6 +7925,8 @@ fn rpc_help(method: &str) -> String {
         "verifymessage",
         "createmultisig",
         "sendrawtransaction",
+        "getprivatebroadcastinfo",
+        "abortprivatebroadcast",
         "signrawtransactionwithkey",
         "submitblock",
         "getblocktemplate",
@@ -8307,6 +8318,20 @@ mod tests {
                 ["synced"]
                 .as_bool()
                 .unwrap()
+        );
+        assert_eq!(
+            dispatch_method(&node, "getprivatebroadcastinfo", &json!([])).unwrap(),
+            json!({"transactions": []})
+        );
+        assert!(
+            dispatch_method(
+                &node,
+                "abortprivatebroadcast",
+                &json!([Txid::all_zeros().to_string()]),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("not in private broadcast queue")
         );
         let logging = dispatch_method(&node, "logging", &json!([["rpc"], []])).unwrap();
         assert_eq!(logging["rpc"], json!(true));

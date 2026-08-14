@@ -1003,6 +1003,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "generatetoaddress" => Some(&["nblocks", "address", "maxtries"]),
         "generatetodescriptor" => Some(&["nblocks", "descriptor", "maxtries"]),
         "generateblock" => Some(&["output", "transactions", "submit"]),
+        "generate" => Some(&[]),
         "submitpackage" => Some(&["package", "maxfeerate", "maxburnamount"]),
         "testmempoolaccept" => Some(&["rawtxs", "maxfeerate"]),
         "setmocktime" => Some(&["timestamp"]),
@@ -1139,6 +1140,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "generatetoaddress" => generate_to_address(node, params),
         "generatetodescriptor" => generate_to_descriptor(node, params),
         "generateblock" => generate_block(node, params),
+        "generate" => bail!(
+            "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information."
+        ),
         "submitpackage" => submit_package(node, params),
         "testmempoolaccept" => test_mempool_accept(node, params),
         "setmocktime" => set_mock_time(node, params),
@@ -8764,6 +8768,7 @@ fn rpc_help(method: &str) -> String {
         "generatetoaddress",
         "generatetodescriptor",
         "generateblock",
+        "generate",
         "submitpackage",
         "testmempoolaccept",
         "verifychain",
@@ -9135,6 +9140,12 @@ mod tests {
         assert_eq!(
             dispatch_method(&node, "syncwithvalidationinterfacequeue", &json!([])).unwrap(),
             Value::Null
+        );
+        let generate_error = dispatch_method(&node, "generate", &json!([])).unwrap_err();
+        assert!(
+            generate_error
+                .to_string()
+                .contains("replaced by the -generate cli option")
         );
     }
 

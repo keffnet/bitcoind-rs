@@ -854,13 +854,16 @@ async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Value {
 }
 
 async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
-    match method {
+    let command_id = node.begin_rpc_command(method);
+    let result = match method {
         "waitfornewblock" => wait_for_new_block(node, params).await,
         "waitforblock" => wait_for_block(node, params).await,
         "waitforblockheight" => wait_for_block_height(node, params).await,
         "getblocktemplate" => get_block_template_async(node, params).await,
         _ => dispatch_method(node, method, params),
-    }
+    };
+    node.end_rpc_command(command_id);
+    result
 }
 
 fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
@@ -1127,7 +1130,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             Ok(Value::Bool(true))
         }
         "getrpcinfo" => Ok(json!({
-            "active_commands": [],
+            "active_commands": node.active_rpc_commands(),
             "logpath": node.config.datadir.join("debug.log").to_string_lossy(),
         })),
         "help" => Ok(json!(rpc_help(method_params_string(params)))),
@@ -8309,6 +8312,20 @@ mod tests {
         assert_eq!(logging["rpc"], json!(true));
         let logging = dispatch_method(&node, "logging", &json!([[], ["rpc"]])).unwrap();
         assert_eq!(logging["rpc"], json!(false));
+        let command_id = node.begin_rpc_command("testcommand");
+        let rpcinfo = dispatch_method(&node, "getrpcinfo", &json!([])).unwrap();
+        assert_eq!(
+            rpcinfo["active_commands"][0]["method"],
+            json!("testcommand")
+        );
+        assert!(rpcinfo["active_commands"][0]["duration"].is_u64());
+        node.end_rpc_command(command_id);
+        assert!(
+            dispatch_method(&node, "getrpcinfo", &json!([])).unwrap()["active_commands"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         assert!(dispatch_method(&node, "mockscheduler", &json!([0])).is_err());
         assert!(dispatch_method(&node, "setmocktime", &json!([-1])).is_err());
     }

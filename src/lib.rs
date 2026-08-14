@@ -247,6 +247,8 @@ pub struct Node {
     pub rpc_cookie: Option<String>,
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
+    rpc_command_sequence: AtomicUsize,
+    rpc_commands: parking_lot::RwLock<HashMap<usize, (String, Instant)>>,
     total_bytes_sent: AtomicU64,
     total_bytes_received: AtomicU64,
     network_active: AtomicBool,
@@ -292,6 +294,8 @@ impl Node {
             rpc_cookie,
             mempool_path,
             peer_count: AtomicUsize::new(0),
+            rpc_command_sequence: AtomicUsize::new(0),
+            rpc_commands: parking_lot::RwLock::new(HashMap::new()),
             total_bytes_sent: AtomicU64::new(0),
             total_bytes_received: AtomicU64::new(0),
             network_active: AtomicBool::new(true),
@@ -485,6 +489,32 @@ impl Node {
 
     pub fn peer_count(&self) -> usize {
         self.peer_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn begin_rpc_command(&self, method: &str) -> usize {
+        let id = self.rpc_command_sequence.fetch_add(1, Ordering::Relaxed);
+        self.rpc_commands
+            .write()
+            .insert(id, (method.to_owned(), Instant::now()));
+        id
+    }
+
+    pub(crate) fn end_rpc_command(&self, id: usize) {
+        self.rpc_commands.write().remove(&id);
+    }
+
+    pub(crate) fn active_rpc_commands(&self) -> Vec<serde_json::Value> {
+        let now = Instant::now();
+        self.rpc_commands
+            .read()
+            .values()
+            .map(|(method, started)| {
+                serde_json::json!({
+                    "method": method,
+                    "duration": now.duration_since(*started).as_micros() as u64,
+                })
+            })
+            .collect()
     }
 
     pub fn total_bytes_sent(&self) -> u64 {

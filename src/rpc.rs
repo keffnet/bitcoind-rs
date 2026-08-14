@@ -2591,16 +2591,21 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "verificationprogress": if header_tip.height == 0 { 1.0 } else { tip.height as f64 / header_tip.height as f64 },
         "initialblockdownload": tip.height < header_tip.height,
         "pruned": chain.is_pruned(),
-        "pruneheight": chain
-            .prune_height()
-            .map(|height| height.saturating_add(1))
-            .unwrap_or_default(),
         "size_on_disk": chain.store.disk_usage().unwrap_or(0),
         "softforks": softforks_json(headers, tip.height, chain.network),
         "warnings": [],
     });
-    if let Some(target_size) = chain.prune_target_size() {
-        result["prune_target_size"] = json!(target_size / (1024 * 1024));
+    if chain.is_pruned() {
+        result["pruneheight"] = json!(
+            chain
+                .prune_height()
+                .map(|height| height.saturating_add(1))
+                .unwrap_or_default()
+        );
+        result["automatic_pruning"] = json!(chain.prune_target_size().is_some());
+        if let Some(target_size) = chain.prune_target_size() {
+            result["prune_target_size"] = json!(target_size);
+        }
     }
     if let Some(challenge) = chain.signet_challenge() {
         result["signet_challenge"] = json!(hex::encode(challenge));

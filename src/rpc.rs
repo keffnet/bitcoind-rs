@@ -1958,9 +1958,44 @@ fn descriptor_payload(descriptor: &str) -> Result<(&str, String)> {
     Ok((payload, checksum))
 }
 
+fn canonicalize_descriptor_private_keys(payload: &str) -> Result<String> {
+    let mut canonical = String::with_capacity(payload.len());
+    let mut index = 0;
+    while index < payload.len() {
+        let remaining = &payload[index..];
+        if remaining.starts_with("xprv") || remaining.starts_with("tprv") {
+            let end = remaining
+                .char_indices()
+                .skip(1)
+                .find_map(|(offset, character)| {
+                    (!character.is_ascii_alphanumeric()).then_some(index + offset)
+                })
+                .unwrap_or(payload.len());
+            let private_key = remaining[..end - index]
+                .parse::<bitcoin::bip32::Xpriv>()
+                .map_err(|error| anyhow!("invalid private descriptor key: {error}"))?;
+            canonical.push_str(
+                &bitcoin::bip32::Xpub::from_priv(&Secp256k1::new(), &private_key).to_string(),
+            );
+            index = end;
+        } else {
+            let character = remaining
+                .chars()
+                .next()
+                .expect("remaining descriptor payload is non-empty");
+            canonical.push(character);
+            index += character.len_utf8();
+        }
+    }
+    Ok(canonical)
+}
+
 fn get_descriptor_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let descriptor = param::<String>(params, 0)?;
     let (payload, checksum) = descriptor_payload(&descriptor)?;
+    let canonical_payload = canonicalize_descriptor_private_keys(payload)?;
+    let canonical_checksum = descriptor_checksum(&canonical_payload)
+        .ok_or_else(|| anyhow!("descriptor contains invalid characters"))?;
     let isrange = payload.contains('*');
     let range = isrange.then_some((0, 0));
     let has_private_keys = [
@@ -1970,7 +2005,7 @@ fn get_descriptor_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     .any(|prefix| payload.contains(prefix));
     let issolvable = expand_descriptor_scripts(node, payload, range).is_ok();
     Ok(json!({
-        "descriptor": format!("{payload}#{checksum}"),
+        "descriptor": format!("{canonical_payload}#{canonical_checksum}"),
         "checksum": checksum,
         "isrange": isrange,
         "issolvable": issolvable,
@@ -11157,6 +11192,12 @@ mod tests {
         let ranged_info =
             get_descriptor_info(&node, &json!([format!("wpkh({xpub}/0/*)")])).unwrap();
         assert_eq!(ranged_info["isrange"], true);
+        let xpriv = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[6; 32]).unwrap();
+        let private_info = get_descriptor_info(&node, &json!([format!("wpkh({xpriv})")])).unwrap();
+        assert_eq!(private_info["hasprivatekeys"], true);
+        let canonical_private = private_info["descriptor"].as_str().unwrap();
+        assert!(!canonical_private.contains("tprv"));
+        assert!(canonical_private.contains("tpub"));
         let second_public_key = bitcoin::PrivateKey::new(
             bitcoin::secp256k1::SecretKey::from_slice(&[5; 32]).unwrap(),
             Network::Regtest,

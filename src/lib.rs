@@ -121,10 +121,12 @@ fn import_external_block_file(
         let mut progress = false;
         for block in pending {
             let hash = block.block_hash();
-            if chain.header_by_hash(&hash).is_some() {
+            if chain.header_by_hash(&hash).is_some() && chain.block(&hash)?.is_some() {
                 continue;
             }
-            if chain.header_by_hash(&block.header.prev_blockhash).is_none() {
+            let parent_hash = block.header.prev_blockhash;
+            if chain.header_by_hash(&parent_hash).is_none() || chain.block(&parent_hash)?.is_none()
+            {
                 remaining.push(block);
                 continue;
             }
@@ -137,7 +139,7 @@ fn import_external_block_file(
         if !remaining.is_empty() && !progress {
             let block = &remaining[0];
             bail!(
-                "block file {} contains block {} with an unknown parent {}",
+                "block file {} contains block {} with an unknown or unavailable parent {}",
                 path.display(),
                 block.block_hash(),
                 block.header.prev_blockhash
@@ -3112,6 +3114,31 @@ mod tests {
             1
         );
         assert_eq!(chain.height(), 1);
+        assert_eq!(chain.best_hash(), block.block_hash());
+    }
+
+    #[test]
+    fn imports_a_block_body_for_a_persisted_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let block = mine_test_block(chain.header(0).unwrap(), 1, 2);
+        chain
+            .accept_headers(std::slice::from_ref(&block.header))
+            .unwrap();
+        assert!(chain.block(&block.block_hash()).unwrap().is_none());
+
+        let payload = bitcoin::consensus::encode::serialize(&block);
+        let mut framed = wire::network_magic(Network::Regtest).to_vec();
+        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&payload);
+        let path = directory.path().join("header-body.blk");
+        fs::write(&path, framed).unwrap();
+
+        assert_eq!(
+            import_external_block_file(&mut chain, &path, Network::Regtest).unwrap(),
+            1
+        );
+        assert!(chain.block(&block.block_hash()).unwrap().is_some());
         assert_eq!(chain.best_hash(), block.block_hash());
     }
 

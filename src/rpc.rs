@@ -1802,7 +1802,8 @@ fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
             "target": 0,
             "target_reached": false,
             "serve_historical_blocks": true,
-            "bytes_left": 0,
+            "bytes_left_in_cycle": 0,
+            "time_left_in_cycle": 0,
         },
         "connections": peers.len(),
     }))
@@ -3914,7 +3915,8 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
             utxo_size_inc = utxo_size_inc.saturating_add(size);
             let excluded_from_utxo = height == Some(0)
                 || (is_bip30_repeat && transaction.is_coinbase())
-                || output.script_pubkey.is_op_return();
+                || output.script_pubkey.is_op_return()
+                || output.script_pubkey.len() > MAX_SCRIPT_SIZE;
             if !excluded_from_utxo {
                 utxo_count_actual = utxo_count_actual.saturating_add(1);
                 utxo_size_inc_actual = utxo_size_inc_actual.saturating_add(size);
@@ -3977,7 +3979,6 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "txs": block.txdata.len(),
         "time": block.header.time,
         "mediantime": chain.median_time_past_for_hash(&hash).unwrap_or(block.header.time),
-        "size": serialize(&block).len(),
         "total_size": total_size,
         "total_weight": total_weight,
         "total_out": total_out,
@@ -3996,7 +3997,6 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "maxfeerate": fee_rates.iter().map(|(rate, _)| *rate).max().unwrap_or(0),
         "maxtxsize": sorted_sizes.iter().copied().max().unwrap_or(0),
         "medianfee": truncated_median(&mut sorted_fees),
-        "mediantime": chain.median_time_past_for_hash(&hash).unwrap_or(block.header.time),
         "mediantxsize": truncated_median(&mut sorted_sizes),
         "minfee": sorted_fees.iter().copied().min().unwrap_or(0),
         "minfeerate": fee_rates.iter().map(|(rate, _)| *rate).min().unwrap_or(0),
@@ -10210,6 +10210,7 @@ mod tests {
         .unwrap();
         let hash = node.chain.read().best_hash();
         let stats = get_block_stats(&node, &json!([hash.to_string()])).unwrap();
+        assert!(stats.get("size").is_none());
         assert_eq!(stats["total_out"], json!(0));
         assert_eq!(stats["subsidy"], json!(5_000_000_000u64));
         assert_eq!(stats["totalfee"], json!(0));
@@ -10570,6 +10571,10 @@ mod tests {
         );
         assert!(dispatch_method(&node, "getmemoryinfo", &json!([])).unwrap()["locked"].is_object());
         assert!(dispatch_method(&node, "getmemoryinfo", &json!(["mallocinfo"])).is_err());
+        let net_totals = dispatch_method(&node, "getnettotals", &json!([])).unwrap();
+        assert!(net_totals["uploadtarget"]["bytes_left_in_cycle"].is_number());
+        assert!(net_totals["uploadtarget"]["time_left_in_cycle"].is_number());
+        assert!(net_totals["uploadtarget"].get("bytes_left").is_none());
         assert!(
             dispatch_method(&node, "getindexinfo", &json!([])).unwrap()["basic block filter index"]
                 ["synced"]
@@ -11021,6 +11026,7 @@ mod tests {
         .unwrap();
         let hash = node.chain.read().best_hash();
         assert!(get_block_stats(&node, &json!([hash.to_string(), "txs"])).is_err());
+        assert!(get_block_stats(&node, &json!([hash.to_string(), ["size"]])).is_err());
     }
 
     #[test]

@@ -132,12 +132,14 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         write_half.write_all(&encoded).await?;
                     }
                 }
-                send_status_notifications(&node, &mut subscriptions, &mut write_half).await?;
+                send_status_notifications(&node, &mut subscriptions, &mut write_half, true)
+                    .await?;
             }
             event = mempool_events.recv() => {
                 match event {
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        send_status_notifications(&node, &mut subscriptions, &mut write_half).await?;
+                        send_status_notifications(&node, &mut subscriptions, &mut write_half, false)
+                            .await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
@@ -1033,6 +1035,7 @@ async fn send_status_notifications(
     node: &Arc<Node>,
     subscriptions: &mut HashMap<String, Subscription>,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    refresh_history: bool,
 ) -> Result<()> {
     for subscription in subscriptions.values_mut() {
         let notification = match subscription {
@@ -1040,6 +1043,9 @@ async fn send_status_notifications(
                 script_hash,
                 status,
             } => {
+                if !refresh_history {
+                    continue;
+                }
                 let current = history_status_for_script(node, script_hash)
                     .map(Value::String)
                     .unwrap_or(Value::Null);
@@ -1057,6 +1063,9 @@ async fn send_status_notifications(
                 script_hash,
                 status,
             } => {
+                if !refresh_history {
+                    continue;
+                }
                 let current = history_status_for_script(node, script_hash)
                     .map(Value::String)
                     .unwrap_or(Value::Null);

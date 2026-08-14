@@ -782,11 +782,8 @@ pub fn validate_transaction_finality(
             }
         } else {
             let relative_seconds = relative.saturating_mul(512);
-            if lock_time_cutoff
-                <= entry
-                    .median_time_past
-                    .saturating_add(relative_seconds.saturating_sub(1))
-            {
+            let required_time = i64::from(entry.median_time_past) + i64::from(relative_seconds) - 1;
+            if i64::from(lock_time_cutoff) <= required_time {
                 return Err(ValidationError::NonFinalTransaction);
             }
         }
@@ -1319,6 +1316,41 @@ mod tests {
             validate_transaction_finality(&transaction, 12, 500_000_001, true, &[entry]).is_ok()
         );
         assert!(validate_transaction_finality(&transaction, 11, 500_000_000, false, &[]).is_ok());
+    }
+
+    #[test]
+    fn zero_value_relative_time_lock_is_satisfied_at_the_prevout_mtp() {
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([3u8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::from_consensus(1 << 22),
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let entry = crate::chain::UtxoEntry {
+            output: TxOut {
+                value: Amount::from_sat(2),
+                script_pubkey: ScriptBuf::new(),
+            },
+            height: 10,
+            median_time_past: 500_000_000,
+            coinbase: false,
+        };
+        assert!(validate_transaction_finality(
+            &transaction,
+            11,
+            entry.median_time_past,
+            true,
+            &[entry],
+        )
+        .is_ok());
     }
 
     #[test]

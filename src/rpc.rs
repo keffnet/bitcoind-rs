@@ -603,14 +603,19 @@ fn rest_block_filter_headers(
         let mut chain = node.chain.write();
         match chain.block_height_by_hash(&hash) {
             Some(start_height) if chain.is_active_block(&hash) => {
-                match chain.basic_filter_range(start_height, hash, count)? {
-                    Some(range) => range
-                        .filters
-                        .into_iter()
-                        .map(|(_, _, filter_header)| filter_header)
-                        .collect::<Vec<_>>(),
-                    None => Vec::new(),
-                }
+                let end_height = start_height
+                    .saturating_add(u32::try_from(count.saturating_sub(1)).unwrap_or(u32::MAX))
+                    .min(chain.height());
+                (start_height..=end_height)
+                    .map(|height| {
+                        let block_hash = chain
+                            .block_hash(height)
+                            .ok_or_else(|| anyhow!("block height out of range"))?;
+                        chain
+                            .basic_filter_header_for_block(&block_hash)?
+                            .ok_or_else(|| anyhow!("block filter headers are not available"))
+                    })
+                    .collect::<Result<Vec<_>>>()?
             }
             _ => Vec::new(),
         }

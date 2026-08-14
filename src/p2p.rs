@@ -1491,18 +1491,32 @@ async fn serve_peer_loop(
                 if request.filter_type != 0 {
                     continue;
                 }
-                let Some(range) = basic_filter_range(node, 0, request.stop_hash, usize::MAX)?
-                else {
-                    continue;
+                let (stop_hash, filter_headers) = {
+                    let mut chain = node.chain.write();
+                    let stop_hash = if request.stop_hash == BlockHash::all_zeros() {
+                        chain.best_hash()
+                    } else {
+                        request.stop_hash
+                    };
+                    let Some(stop_height) = chain.block_height_by_hash(&stop_hash) else {
+                        continue;
+                    };
+                    if !chain.is_active_block(&stop_hash) {
+                        continue;
+                    }
+                    let filter_headers = (999..=stop_height)
+                        .step_by(1_000)
+                        .map(|height| {
+                            let block_hash = chain.block_hash(height).ok_or_else(|| {
+                                anyhow::anyhow!("compact filter height is out of range")
+                            })?;
+                            chain
+                                .basic_filter_header_for_block(&block_hash)?
+                                .ok_or_else(|| anyhow::anyhow!("compact filter is missing"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    (stop_hash, filter_headers)
                 };
-                let filter_headers = range
-                    .filters
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(height, (_, _, header))| {
-                        ((height + 1) % 1_000 == 0).then_some(header)
-                    })
-                    .collect();
                 send_message(
                     node,
                     peer_id,
@@ -1510,7 +1524,7 @@ async fn serve_peer_loop(
                     node.config.network,
                     &Message::CFCheckpt(CFCheckpt {
                         filter_type: 0,
-                        stop_hash: range.stop_hash,
+                        stop_hash,
                         filter_headers,
                     }),
                 )

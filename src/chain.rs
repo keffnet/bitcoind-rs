@@ -867,6 +867,25 @@ impl ChainState {
         }))
     }
 
+    /// Return one basic filter header without reading its filter body.
+    pub fn basic_filter_header_for_block(
+        &mut self,
+        hash: &BlockHash,
+    ) -> Result<Option<FilterHeader>> {
+        if !self.block_index.contains_key(hash) {
+            return Ok(None);
+        }
+        if let Some((_, filter_header)) = self.basic_filter_cache.get(hash) {
+            return Ok(Some(*filter_header));
+        }
+        if let Some(filter_header) = self.filter_store.get_header(hash)? {
+            return Ok(Some(filter_header));
+        }
+        Ok(self
+            .basic_filter_for_block(hash)?
+            .map(|(_, filter_header)| filter_header))
+    }
+
     /// Return a bounded active-chain range of BIP158 basic filters. The
     /// durable index is consulted one block at a time; only a store missing a
     /// requested record falls back to the legacy genesis-to-tip computation.

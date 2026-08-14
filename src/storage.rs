@@ -390,6 +390,40 @@ impl FilterStore {
         Ok(Some((bytes[64..].to_vec(), header)))
     }
 
+    pub fn get_header(&mut self, hash: &BlockHash) -> Result<Option<FilterHeader>> {
+        let Some(record) = self.index.get(hash).copied() else {
+            return Ok(None);
+        };
+        if record.length < 64 {
+            bail!("stored filter record is truncated");
+        }
+        if record.length as usize > MAX_STORED_FILTER_SIZE + 64 {
+            bail!("stored filter record is too large");
+        }
+        self.file.seek(SeekFrom::Start(record.offset))?;
+        let mut length = [0u8; 4];
+        self.file.read_exact(&mut length)?;
+        let actual = u32::from_le_bytes(length);
+        if actual != record.length {
+            bail!("filter store index disagrees with record length");
+        }
+        let mut prefix = [0u8; 64];
+        self.file.read_exact(&mut prefix)?;
+        let stored_hash = BlockHash::from_byte_array(
+            prefix[..32]
+                .try_into()
+                .expect("filter block hash has fixed width"),
+        );
+        if stored_hash != *hash {
+            bail!("stored filter hash does not match filter index");
+        }
+        Ok(Some(FilterHeader::from_byte_array(
+            prefix[32..64]
+                .try_into()
+                .expect("filter header has fixed width"),
+        )))
+    }
+
     pub fn insert(&mut self, hash: BlockHash, content: &[u8], header: FilterHeader) -> Result<()> {
         if self.index.contains_key(&hash) {
             return Ok(());
@@ -763,9 +797,11 @@ mod tests {
             let mut store = FilterStore::open(directory.path()).unwrap();
             store.insert(hash, &[1, 2, 3], header).unwrap();
             assert_eq!(store.get(&hash).unwrap(), Some((vec![1, 2, 3], header)));
+            assert_eq!(store.get_header(&hash).unwrap(), Some(header));
         }
         let mut reopened = FilterStore::open(directory.path()).unwrap();
         assert_eq!(reopened.get(&hash).unwrap(), Some((vec![1, 2, 3], header)));
+        assert_eq!(reopened.get_header(&hash).unwrap(), Some(header));
     }
 
     #[test]

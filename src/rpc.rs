@@ -9910,6 +9910,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10072,6 +10073,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10149,6 +10151,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10185,6 +10188,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10226,6 +10230,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10298,6 +10303,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10349,6 +10355,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10462,6 +10469,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10521,6 +10529,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10558,6 +10567,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10598,6 +10608,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10647,6 +10658,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10689,6 +10701,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10725,6 +10738,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10758,6 +10772,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10866,6 +10881,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10921,6 +10937,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -10998,6 +11015,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11042,6 +11060,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11112,6 +11131,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11203,6 +11223,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11296,6 +11317,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11333,6 +11355,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11375,6 +11398,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11423,6 +11447,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11478,6 +11503,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11524,6 +11550,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11570,6 +11597,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11607,6 +11635,7 @@ mod tests {
             seed_nodes: Vec::new(),
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
             signet_challenge: None,
         })
@@ -11645,6 +11674,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11728,6 +11758,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11791,6 +11822,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -11848,6 +11880,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12015,6 +12048,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12189,6 +12223,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12234,6 +12269,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12329,6 +12365,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12448,6 +12485,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12493,6 +12531,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12576,6 +12615,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -12791,6 +12831,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13140,6 +13181,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13203,6 +13245,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13275,6 +13318,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13391,6 +13435,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -13429,6 +13474,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();

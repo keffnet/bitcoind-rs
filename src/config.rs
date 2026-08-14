@@ -8,6 +8,7 @@ use clap::{Parser, ValueEnum};
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
 pub const DEFAULT_MEMPOOL_EXPIRY_HOURS: u64 = 336;
+pub const DEFAULT_PEER_TIMEOUT_SECS: u64 = 60;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 pub const DEFAULT_PERSIST_MEMPOOL: bool = true;
 pub const DEFAULT_BLOCKFILTERINDEX: &str = "0";
@@ -157,8 +158,11 @@ pub struct Args {
     #[arg(long, value_name = "HEX")]
     pub signet_challenge: Option<String>,
 
-    #[arg(long, visible_alias = "maxconnections", default_value_t = 32)]
+    #[arg(long, visible_alias = "maxconnections", default_value_t = 125)]
     pub max_peers: usize,
+
+    #[arg(long, default_value_t = DEFAULT_PEER_TIMEOUT_SECS)]
+    pub peertimeout: u64,
 
     #[arg(long, default_value_t = false)]
     pub peer_bloom_filters: bool,
@@ -263,6 +267,7 @@ pub struct Config {
     pub dnsseed: bool,
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
+    pub peer_timeout_secs: u64,
     pub peer_bloom_filters: bool,
     pub blocksonly: bool,
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
@@ -285,6 +290,9 @@ impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
         if args.max_peers == 0 {
             bail!("--max-peers must be greater than zero");
+        }
+        if args.peertimeout == 0 {
+            bail!("--peertimeout must be greater than zero");
         }
         if args.prune != 0 && args.prune != 1 && args.prune < MIN_AUTO_PRUNE_TARGET_MIB {
             bail!("--prune automatic target must be at least {MIN_AUTO_PRUNE_TARGET_MIB} MiB");
@@ -346,6 +354,7 @@ impl Config {
             dnsseed: args.dnsseed,
             signet_challenge,
             max_peers: args.max_peers,
+            peer_timeout_secs: args.peertimeout,
             peer_bloom_filters: args.peer_bloom_filters,
             blocksonly: args.blocksonly,
             prune: args.prune,
@@ -397,6 +406,24 @@ mod tests {
         assert!(!config.dnsseed);
         assert!(config.blocksonly);
         assert_eq!(config.prune, 0);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--peertimeout=15",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().peer_timeout_secs, 15);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--peertimeout=0",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
     }
 
     #[test]

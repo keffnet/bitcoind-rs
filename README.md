@@ -42,6 +42,8 @@ Bloom-filter peer relay is disabled by default, matching Core's default; enable 
 
 Inbound P2P listening can be disabled with `--listen=false`; DNS seed lookup can be disabled with `--dnsseed=false`. `--blocksonly` disables transaction relay while retaining block synchronization and local RPC/mempool operation. Block pruning follows Core's `--prune=1` manual mode or `--prune=<MiB>` automatic target mode (automatic targets must be at least 550 MiB); `pruneblockchain` is only available when pruning is enabled.
 
+`--peertimeout=<seconds>` controls the inactivity ping timeout (60 seconds by default); the automatic peer connection limit defaults to Core's 125 peers.
+
 Use `--txindex` to enable confirmed transaction lookup without supplying a block hash to `getrawtransaction`; Core-style pruning and `--txindex` are mutually exclusive.
 
 Use `--txospenderindex` to enable historical spender lookup for `gettxspendingprevout`; transaction lookup indexes are unavailable in prune mode.

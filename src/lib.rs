@@ -1501,6 +1501,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         }
     }

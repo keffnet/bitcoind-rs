@@ -58,8 +58,6 @@ const TX_RECONCILIATION_VERSION: u32 = 1;
 const KNOWN_TX_FILTER_BITS: usize = 1 << 20;
 const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
-pub(crate) const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-
 struct PeerState {
     writer: PeerWriter,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
@@ -880,6 +878,7 @@ async fn serve_peer_loop(
     let mut peer_version = 0i32;
     let mut compact_block_version = 2u64;
     let mut pending_compact = None;
+    let peer_timeout = Duration::from_secs(node.config.peer_timeout_secs);
     let mut ping_interval = tokio::time::interval(Duration::from_secs(120));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -931,7 +930,7 @@ async fn serve_peer_loop(
                 message
             },
             _ = ping_interval.tick(), if version_received && verack_received => {
-                if node.ping_timed_out(peer_id, PING_TIMEOUT) {
+                if node.ping_timed_out(peer_id, peer_timeout) {
                     anyhow::bail!("peer ping timed out");
                 }
                 let nonce = random();
@@ -2341,6 +2340,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2432,6 +2432,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2538,6 +2539,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2602,6 +2604,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2653,6 +2656,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 4,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
@@ -2764,6 +2768,7 @@ mod tests {
             signet_challenge: None,
             max_peers: 1,
             peer_bloom_filters: false,
+            peer_timeout_secs: 60,
             zmq,
         })
         .unwrap();

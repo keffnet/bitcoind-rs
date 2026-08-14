@@ -741,38 +741,13 @@ impl Node {
         };
         self.reduce_block_stalling_timeout();
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
-            let mempool_before = self
-                .mempool
-                .read()
-                .transaction_order()
-                .into_iter()
-                .collect::<HashSet<_>>();
             let disconnected_transactions = disconnected_blocks
                 .iter()
                 .flat_map(|block| block.txdata.iter().skip(1).cloned())
                 .collect::<Vec<_>>();
-            let chain = self.chain.read();
-            let mut mempool = self.mempool.write();
-            for block in &activated_blocks {
-                mempool.remove_confirmed(block);
-            }
-            for block in &disconnected_blocks {
-                for transaction in block.txdata.iter().skip(1) {
-                    let _ = mempool.accept_reorg(transaction.clone(), &chain, time::unix_time());
-                }
-            }
-            mempool.revalidate(&chain);
-            let mempool_after = mempool
-                .transaction_order()
-                .into_iter()
-                .collect::<HashSet<_>>();
-            let mempool_changes = mempool.take_changes();
+            self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
 
-            drop(mempool);
-            drop(chain);
-            self.announce_mempool_diff(mempool_before, mempool_after);
-            self.notify_zmq_mempool_changes(mempool_changes);
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             for block in &activated_blocks {
                 self.orphans.lock().erase_for_block(block);
@@ -794,6 +769,40 @@ impl Node {
             }
         }
         Ok(tip)
+    }
+
+    fn reconcile_mempool_after_chain_change(
+        &self,
+        activated_blocks: &[Block],
+        disconnected_blocks: &[Block],
+    ) {
+        let mempool_before = self
+            .mempool
+            .read()
+            .transaction_order()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let chain = self.chain.read();
+        let mut mempool = self.mempool.write();
+        for block in activated_blocks {
+            mempool.remove_confirmed(block);
+        }
+        let added_at = time::unix_time();
+        for block in disconnected_blocks {
+            for transaction in block.txdata.iter().skip(1) {
+                let _ = mempool.accept_reorg(transaction.clone(), &chain, added_at);
+            }
+        }
+        mempool.revalidate(&chain);
+        let mempool_after = mempool
+            .transaction_order()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mempool_changes = mempool.take_changes();
+        drop(mempool);
+        drop(chain);
+        self.announce_mempool_diff(mempool_before, mempool_after);
+        self.notify_zmq_mempool_changes(mempool_changes);
     }
 
     fn reduce_block_stalling_timeout(&self) {
@@ -1290,32 +1299,7 @@ impl Node {
             (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
-            let before = self
-                .mempool
-                .read()
-                .transaction_order()
-                .into_iter()
-                .collect::<HashSet<_>>();
-            let chain = self.chain.read();
-            let mut mempool = self.mempool.write();
-            for block in &activated_blocks {
-                mempool.remove_confirmed(block);
-            }
-            for block in &disconnected_blocks {
-                for transaction in block.txdata.iter().skip(1) {
-                    let _ = mempool.accept_reorg(transaction.clone(), &chain, time::unix_time());
-                }
-            }
-            mempool.revalidate(&chain);
-            let after = mempool
-                .transaction_order()
-                .into_iter()
-                .collect::<HashSet<_>>();
-            let mempool_changes = mempool.take_changes();
-            drop(mempool);
-            drop(chain);
-            self.announce_mempool_diff(before, after);
-            self.notify_zmq_mempool_changes(mempool_changes);
+            self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             let _ = self.events.send(tip.clone());
         }
@@ -1341,32 +1325,33 @@ impl Node {
             (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
-            let before = self
-                .mempool
-                .read()
-                .transaction_order()
-                .into_iter()
-                .collect::<HashSet<_>>();
-            let chain = self.chain.read();
-            let mut mempool = self.mempool.write();
-            for block in &activated_blocks {
-                mempool.remove_confirmed(block);
-            }
-            for block in &disconnected_blocks {
-                for transaction in block.txdata.iter().skip(1) {
-                    let _ = mempool.accept_reorg(transaction.clone(), &chain, time::unix_time());
-                }
-            }
-            mempool.revalidate(&chain);
-            let after = mempool
-                .transaction_order()
-                .into_iter()
-                .collect::<HashSet<_>>();
-            let mempool_changes = mempool.take_changes();
-            drop(mempool);
-            drop(chain);
-            self.announce_mempool_diff(before, after);
-            self.notify_zmq_mempool_changes(mempool_changes);
+            self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
+            self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
+            let _ = self.events.send(tip.clone());
+        }
+        Ok(tip)
+    }
+
+    pub fn precious_block(&self, hash: bitcoin::BlockHash) -> Result<ChainEvent> {
+        let (tip, changed, activated_blocks, disconnected_blocks) = {
+            let mut chain = self.chain.write();
+            let previous = chain.best_hash();
+            let tip = chain.precious_block(&hash)?;
+            let changed = previous != chain.best_hash();
+            let activated_blocks = if changed {
+                chain.active_blocks_after(previous)?
+            } else {
+                Vec::new()
+            };
+            let disconnected_blocks = if changed {
+                chain.disconnected_blocks_after(previous)?
+            } else {
+                Vec::new()
+            };
+            (tip, changed, activated_blocks, disconnected_blocks)
+        };
+        if changed {
+            self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             let _ = self.events.send(tip.clone());
         }
@@ -3555,6 +3540,30 @@ mod tests {
         node.reconsider_block(block_hash).unwrap();
         assert_eq!(node.chain.read().height(), 102);
         assert!(node.mempool.read().get(&txid).is_none());
+    }
+
+    #[test]
+    fn precious_block_reorg_emits_a_chain_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let main_one = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 1);
+        node.connect_block(main_one).unwrap();
+        let main_two = mine_test_block(&node.chain.read().header(1).unwrap().to_owned(), 2, 2);
+        node.connect_block(main_two).unwrap();
+
+        let genesis = node.chain.read().header(0).unwrap().to_owned();
+        let side_one = mine_test_block(&genesis, 1, 3);
+        let side_one_header = side_one.header;
+        node.connect_block(side_one).unwrap();
+        let side_two = mine_test_block(&side_one_header, 2, 4);
+        let side_two_hash = side_two.block_hash();
+        node.connect_block(side_two).unwrap();
+        assert_ne!(node.chain.read().best_hash(), side_two_hash);
+
+        let mut events = node.subscribe_chain();
+        node.precious_block(side_two_hash).unwrap();
+        assert_eq!(node.chain.read().best_hash(), side_two_hash);
+        assert_eq!(events.try_recv().unwrap().hash, side_two_hash);
     }
 
     #[test]

@@ -3798,7 +3798,7 @@ fn reconsider_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn precious_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
-    node.chain.write().precious_block(&hash)?;
+    node.precious_block(hash)?;
     Ok(Value::Null)
 }
 

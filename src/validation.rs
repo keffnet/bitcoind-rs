@@ -260,6 +260,44 @@ pub fn validate_header(
     expected_target: Target,
     median_time_past: u32,
 ) -> Result<(), ValidationError> {
+    validate_header_internal(
+        network,
+        header,
+        expected_previous,
+        expected_target,
+        median_time_past,
+        true,
+    )
+}
+
+/// Validate a candidate header for block-template proposal mode. Proposal
+/// validation checks the expected target and header rules but intentionally
+/// skips proof-of-work; the miner has not selected a nonce yet.
+pub fn validate_header_without_pow(
+    network: Network,
+    header: &bitcoin::block::Header,
+    expected_previous: BlockHash,
+    expected_target: Target,
+    median_time_past: u32,
+) -> Result<(), ValidationError> {
+    validate_header_internal(
+        network,
+        header,
+        expected_previous,
+        expected_target,
+        median_time_past,
+        false,
+    )
+}
+
+fn validate_header_internal(
+    network: Network,
+    header: &bitcoin::block::Header,
+    expected_previous: BlockHash,
+    expected_target: Target,
+    median_time_past: u32,
+    check_pow: bool,
+) -> Result<(), ValidationError> {
     if header.prev_blockhash != expected_previous {
         return Err(ValidationError::WrongPreviousBlock);
     }
@@ -282,7 +320,7 @@ pub fn validate_header(
     if header.target() > network_params(network).max_attainable_target {
         return Err(ValidationError::TargetAboveLimit);
     }
-    if !header.target().is_met_by(header.block_hash()) {
+    if check_pow && !header.target().is_met_by(header.block_hash()) {
         return Err(ValidationError::BadProofOfWork);
     }
     Ok(())

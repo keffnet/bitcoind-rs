@@ -1095,25 +1095,42 @@ impl ChainState {
     /// storing it or changing chain state. This is the validation boundary
     /// used by RPC proposal/template clients.
     pub fn validate_candidate_block(&self, block: &Block) -> Result<()> {
+        self.validate_candidate_block_internal(block, true)
+    }
+
+    /// Validate a block-template proposal without requiring the miner's
+    /// proof-of-work nonce to be solved yet.
+    pub fn validate_candidate_block_without_pow(&self, block: &Block) -> Result<()> {
+        self.validate_candidate_block_internal(block, false)
+    }
+
+    fn validate_candidate_block_internal(&self, block: &Block, check_pow: bool) -> Result<()> {
         let parent_hash = block.header.prev_blockhash;
         if parent_hash != self.best_hash() {
             bail!("proposed block does not build on the active tip")
         }
         let height = self.height().saturating_add(1);
-        validation::validate_header(
-            self.network,
-            &block.header,
-            parent_hash,
-            self.expected_target_for_parent(parent_hash, block.header.time),
-            self.median_time_past_for_parent(parent_hash),
-        )?;
+        let expected_target = self.expected_target_for_parent(parent_hash, block.header.time);
+        let median_time_past = self.median_time_past_for_parent(parent_hash);
+        if check_pow {
+            validation::validate_header(
+                self.network,
+                &block.header,
+                parent_hash,
+                expected_target,
+                median_time_past,
+            )?;
+        } else {
+            validation::validate_header_without_pow(
+                self.network,
+                &block.header,
+                parent_hash,
+                expected_target,
+                median_time_past,
+            )?;
+        }
         self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
-        self.validate_block_transactions(
-            block,
-            height,
-            &self.utxos,
-            self.median_time_past_for_parent(parent_hash),
-        )?;
+        self.validate_block_transactions(block, height, &self.utxos, median_time_past)?;
         Ok(())
     }
 

@@ -6983,7 +6983,9 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .ok_or_else(|| anyhow!("proposal mode requires a data string"))?;
         let bytes = hex::decode(data).context("block decode failed")?;
         let block: Block = deserialize(&bytes).context("block decode failed")?;
-        node.chain.read().validate_candidate_block(&block)?;
+        node.chain
+            .read()
+            .validate_candidate_block_without_pow(&block)?;
         return Ok(Value::Null);
     }
     if mode != "template" {
@@ -9878,6 +9880,35 @@ mod tests {
                 .is_some_and(|value| value.starts_with("6a24aa21a9ed"))
         );
         assert!(get_block_template(&node, &json!([{}])).is_err());
+
+        let (parent, bits) = {
+            let chain = node.chain.read();
+            let parent = *chain.header(0).unwrap();
+            (parent, chain.next_bits(parent.time.saturating_add(1)))
+        };
+        let mut proposal = mining_block(MiningBlockTemplate {
+            network: Network::Regtest,
+            parent,
+            height: 1,
+            time: parent.time.saturating_add(1),
+            bits,
+            script_pubkey: Builder::new().push_int(1).into_script(),
+            transactions: Vec::new(),
+            fees: 0,
+            extra_nonce: 0,
+        })
+        .unwrap();
+        while proposal.header.target().is_met_by(proposal.block_hash()) {
+            proposal.header.nonce = proposal.header.nonce.saturating_add(1);
+        }
+        assert_eq!(
+            get_block_template(
+                &node,
+                &json!([{"mode": "proposal", "data": hex::encode(serialize(&proposal))}]),
+            )
+            .unwrap(),
+            Value::Null
+        );
     }
 
     #[tokio::test]

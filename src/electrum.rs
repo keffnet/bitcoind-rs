@@ -197,6 +197,8 @@ fn dispatch_with_session(
         "server.version" => negotiate_version(params, session),
         "server.ping" => server_ping(params, session.protocol_version),
         "server.banner" => Ok(json!("bitcoind-rs wallet-free Bitcoin node")),
+        "server.add_peer" => server_add_peer(node, params),
+        "server.donation_address" => Ok(json!("")),
         "server.features" => Ok(server_features_for_protocol(node, session.protocol_version)),
         "blockchain.headers.subscribe" => {
             let chain = node.chain.read();
@@ -473,6 +475,32 @@ fn server_ping(params: &Value, protocol_version: ProtocolVersion) -> Result<Valu
     Ok(json!({"data": "0".repeat(length)}))
 }
 
+fn server_add_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let features = params
+        .get(0)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("server.add_peer expects a features object"))?;
+    let hosts = features
+        .get("hosts")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("server.add_peer features must contain hosts"))?;
+    let mut accepted = false;
+    for (host, details) in hosts {
+        let Some(port) = details.get("tcp_port").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Ok(port) = u16::try_from(port) else {
+            continue;
+        };
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let Ok(address) = host.parse() else {
+            continue;
+        };
+        accepted |= node.add_peer_address(std::net::SocketAddr::new(address, port), false);
+    }
+    Ok(json!(accepted))
+}
+
 fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
     let mut entries = mempool
         .transaction_order()
@@ -613,7 +641,7 @@ fn block_headers_for_protocol(
     protocol_version: ProtocolVersion,
 ) -> Result<Value> {
     let start = param::<u32>(params, 0)?;
-    let count = param::<u32>(params, 1)?.min(2_000);
+    let count = param::<u32>(params, 1)?.min(2_016);
     let checkpoint = params.get(2).and_then(Value::as_u64).unwrap_or(0);
     let checkpoint = u32::try_from(checkpoint).map_err(|_| anyhow!("checkpoint is too large"))?;
     if checkpoint != 0 && count != 0 && start.saturating_add(count.saturating_sub(1)) > checkpoint {
@@ -633,9 +661,9 @@ fn block_headers_for_protocol(
         actual += 1;
     }
     let mut result = if protocol_version >= PROTOCOL_1_6 {
-        json!({"count": actual, "headers": headers, "max": 2_000})
+        json!({"count": actual, "headers": headers, "max": 2_016})
     } else {
-        json!({"count": actual, "hex": hex::encode(bytes), "max": 2_000})
+        json!({"count": actual, "hex": hex::encode(bytes), "max": 2_016})
     };
     if checkpoint != 0 && actual != 0 {
         let last_height = start + actual - 1;
@@ -1313,6 +1341,28 @@ mod tests {
         .unwrap();
         assert_eq!(features["protocol_max"], json!("1.7"));
         assert!(features.get("hash_function").is_none());
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "server.add_peer",
+                &json!([{"hosts": {"192.0.2.55": {"tcp_port": 50002}}}]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!(true)
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "server.donation_address",
+                &json!([]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!("")
+        );
         let headers = dispatch_with_session(
             &node,
             "blockchain.block.headers",

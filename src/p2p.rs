@@ -1393,6 +1393,11 @@ async fn serve_peer_loop(
                                         .map(|entry| entry.transaction.clone())
                                 }
                             };
+                            let transaction = if transaction.is_some() {
+                                transaction
+                            } else {
+                                transaction_for_getdata_tip(node, &item)?
+                            };
                             if let Some(transaction) = transaction {
                                 let txid = transaction.compute_txid();
                                 let transaction = if item.kind == InventoryType::Transaction {
@@ -2505,6 +2510,22 @@ fn transaction_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<Trans
     }
 }
 
+fn transaction_for_getdata_tip(node: &Arc<Node>, item: &Inventory) -> Result<Option<Transaction>> {
+    let mut chain = node.chain.write();
+    let tip_hash = chain.best_hash();
+    let Some(block) = chain.block(&tip_hash)? else {
+        return Ok(None);
+    };
+    let transaction = block.txdata.into_iter().find(|transaction| {
+        if item.kind == InventoryType::WitnessTransaction {
+            Wtxid::from_byte_array(item.hash.to_byte_array()) == transaction.compute_wtxid()
+        } else {
+            Txid::from_byte_array(item.hash.to_byte_array()) == transaction.compute_txid()
+        }
+    });
+    Ok(transaction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2813,6 +2834,27 @@ mod tests {
             .unwrap()
             .is_none()
         );
+        let coinbase = &compact.prefilled_txs[0].tx;
+        let legacy = transaction_for_getdata_tip(
+            &node,
+            &Inventory {
+                kind: InventoryType::Transaction,
+                hash: BlockHash::from_raw_hash(coinbase.compute_txid().to_raw_hash()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(legacy.compute_txid(), coinbase.compute_txid());
+        let witness = transaction_for_getdata_tip(
+            &node,
+            &Inventory {
+                kind: InventoryType::WitnessTransaction,
+                hash: BlockHash::from_raw_hash(coinbase.compute_wtxid().to_raw_hash()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(witness.compute_wtxid(), coinbase.compute_wtxid());
     }
 
     #[test]

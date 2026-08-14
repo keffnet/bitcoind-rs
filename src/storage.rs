@@ -613,7 +613,12 @@ fn scan_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
             anyhow::anyhow!("truncated block record at offset {}: {}", offset, error)
         })?;
         let block: Block = deserialize(&bytes).context("decoding block record")?;
-        index.insert(block.block_hash(), Record { offset, length });
+        if index
+            .insert(block.block_hash(), Record { offset, length })
+            .is_some()
+        {
+            bail!("duplicate block hash in block store");
+        }
     }
     file.seek(SeekFrom::End(0))?;
     Ok(index)

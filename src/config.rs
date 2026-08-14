@@ -7,6 +7,7 @@ use clap::{Parser, ValueEnum};
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
+pub const DEFAULT_MEMPOOL_EXPIRY_HOURS: u64 = 336;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 pub const DEFAULT_PERSIST_MEMPOOL: bool = true;
 pub const DEFAULT_BLOCKFILTERINDEX: &str = "0";
@@ -203,6 +204,9 @@ pub struct Args {
     #[arg(long = "maxmempool", default_value_t = DEFAULT_MAX_MEMPOOL_MB)]
     pub max_mempool: u64,
 
+    #[arg(long, default_value_t = DEFAULT_MEMPOOL_EXPIRY_HOURS)]
+    pub mempoolexpiry: u64,
+
     #[arg(
         long,
         default_value_t = DEFAULT_PERSIST_MEMPOOL,
@@ -270,6 +274,8 @@ pub struct Config {
     pub peer_block_filters: bool,
     /// Maximum mempool size in decimal megabytes, matching Core's option.
     pub max_mempool_mb: u64,
+    /// Maximum age of a mempool entry in hours.
+    pub mempool_expiry_hours: u64,
     /// Load and save the mempool automatically across node restarts.
     pub persist_mempool: bool,
     pub zmq: ZmqConfig,
@@ -288,6 +294,9 @@ impl Config {
         }
         if args.max_mempool == 0 {
             bail!("--maxmempool must be greater than zero");
+        }
+        if args.mempoolexpiry == 0 {
+            bail!("--mempoolexpiry must be greater than zero");
         }
         if [
             args.zmq_pub_hash_tx_hwm,
@@ -346,6 +355,7 @@ impl Config {
             blockfilterindex,
             peer_block_filters: args.peerblockfilters,
             max_mempool_mb: args.max_mempool,
+            mempool_expiry_hours: args.mempoolexpiry,
             persist_mempool: args.persistmempool,
             zmq: ZmqConfig {
                 tx_reconciliation: args.tx_reconciliation,
@@ -458,6 +468,25 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(Config::from_args(args).unwrap().max_mempool_mb, 12);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--mempoolexpiry",
+            "24",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().mempool_expiry_hours, 24);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--mempoolexpiry=0",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

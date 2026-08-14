@@ -48,6 +48,8 @@ Use `--txospenderindex` to enable historical spender lookup for `gettxspendingpr
 
 `--maxmempool=<MB>` sets the transaction pool's byte limit (300 MB by default); admission uses the existing package-aware eviction policy when the limit is reached.
 
+`--mempoolexpiry=<hours>` controls automatic mempool expiration (336 hours by default, matching Core).
+
 `--coinstatsindex` persists incremental UTXO statistics and enables historical `gettxoutsetinfo` queries by block hash or height.
 
 `--blockfilterindex=basic` enables the BIP157 basic compact-filter index, its RPC/REST methods, and compact-filter P2P service; it is disabled by default, matching Core.

@@ -301,7 +301,12 @@ impl Node {
         let mempool_path = config.datadir.join("mempool.json");
         let mut mempool = Mempool::with_max_bytes(config.network, max_mempool_bytes);
         if config.persist_mempool {
-            mempool.load_from_file(&mempool_path, &chain)?;
+            let expiry = Duration::from_secs(
+                config
+                    .mempool_expiry_hours
+                    .saturating_mul(60 * 60),
+            );
+            mempool.load_from_file_with_expiry(&mempool_path, &chain, expiry)?;
         }
         let _ = mempool.take_changes();
         let banned_addresses = load_banlist(&config.datadir)?;
@@ -504,7 +509,12 @@ impl Node {
     fn expire_mempool(&self) {
         let changes = {
             let mut mempool = self.mempool.write();
-            mempool.clear_expired(time::unix_time(), mempool::MEMPOOL_EXPIRY);
+            let expiry = Duration::from_secs(
+                self.config
+                    .mempool_expiry_hours
+                    .saturating_mul(60 * 60),
+            );
+            mempool.clear_expired(time::unix_time(), expiry);
             mempool.take_changes()
         };
         if changes.is_empty() {
@@ -1317,7 +1327,12 @@ impl Node {
                 .transaction_order()
                 .into_iter()
                 .collect::<HashSet<_>>();
-            let result = mempool.load_from_file(path.as_ref(), &chain);
+            let expiry = Duration::from_secs(
+                self.config
+                    .mempool_expiry_hours
+                    .saturating_mul(60 * 60),
+            );
+            let result = mempool.load_from_file_with_expiry(path.as_ref(), &chain, expiry);
             let after = mempool
                 .transaction_order()
                 .into_iter()
@@ -1477,6 +1492,7 @@ mod tests {
             txindex: false,
             txospenderindex: false,
             max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
             coinstatsindex: false,
             blockfilterindex: true,
             peer_block_filters: true,

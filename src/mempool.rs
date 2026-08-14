@@ -504,6 +504,15 @@ impl Mempool {
     }
 
     pub fn load_from_file(&mut self, path: &Path, chain: &ChainState) -> Result<()> {
+        self.load_from_file_with_expiry(path, chain, MEMPOOL_EXPIRY)
+    }
+
+    pub fn load_from_file_with_expiry(
+        &mut self,
+        path: &Path,
+        chain: &ChainState,
+        expiry: Duration,
+    ) -> Result<()> {
         if !path.exists() {
             return Ok(());
         }
@@ -514,7 +523,7 @@ impl Mempool {
             let _ = self.accept_at(entry.transaction, chain, entry.added_at);
         }
         let now = time::unix_time();
-        self.clear_expired(now, MEMPOOL_EXPIRY);
+        self.clear_expired(now, expiry);
         Ok(())
     }
 

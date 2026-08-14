@@ -3506,7 +3506,6 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     } else {
         -1
     };
-    let hash_string = hash.to_string();
     let undo = if verbosity >= 3 {
         chain.spent_outputs_by_transaction(&hash)?
     } else {
@@ -3518,14 +3517,8 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .iter()
             .enumerate()
             .map(|(transaction_index, tx)| {
-                let mut transaction_json = rpc_transaction(
-                    tx,
-                    Some(&hash_string),
-                    Some(confirmations),
-                    Some(block.header.time),
-                    Some(block.header.time),
-                    chain.network,
-                );
+                let mut transaction_json =
+                    rpc_transaction(tx, None, None, None, None, chain.network);
                 if let Some(undo) = undo.as_ref() {
                     let spent_outputs = undo.get(transaction_index).ok_or_else(|| {
                         anyhow!("Block undo is missing transaction {transaction_index}")
@@ -4461,13 +4454,14 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
             0
         }
     });
-    let block_time = (location.block_hash != BlockHash::all_zeros())
-        .then(|| {
-            chain
-                .header_by_hash(&location.block_hash)
-                .map(|header| header.time)
-        })
-        .flatten();
+    let block_time = (location.block_hash != BlockHash::all_zeros()
+        && chain.is_active_block(&location.block_hash))
+    .then(|| {
+        chain
+            .header_by_hash(&location.block_hash)
+            .map(|header| header.time)
+    })
+    .flatten();
     let mut result = rpc_transaction(
         &transaction,
         blockhash.as_deref(),
@@ -12355,6 +12349,10 @@ mod tests {
             .iter()
             .find(|transaction| transaction["txid"] == spend_txid.to_string())
             .expect("mined transaction is present");
+        assert!(transaction.get("blockhash").is_none());
+        assert!(transaction.get("confirmations").is_none());
+        assert!(transaction.get("time").is_none());
+        assert!(transaction.get("blocktime").is_none());
         assert_eq!(transaction["vin"][0]["prevout"]["generated"], true);
         assert_eq!(transaction["vin"][0]["prevout"]["height"], 1);
         assert_eq!(transaction["vin"][0]["prevout"]["value"], 50.0);

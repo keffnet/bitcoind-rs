@@ -215,6 +215,8 @@ fn dispatch(
         "blockchain.transaction.get_merkle" => transaction_merkle(node, params),
         "blockchain.transaction.id_from_pos" => transaction_id_from_pos(node, params),
         "blockchain.transaction.broadcast" => transaction_broadcast(node, params),
+        "blockchain.transaction.broadcast_package" => transaction_broadcast_package(node, params),
+        "blockchain.transaction.testmempoolaccept" => transaction_test_mempool_accept(node, params),
         "blockchain.outpoint.subscribe" => {
             let outpoint = outpoint_param(params)?;
             let _ = scriptpubkey_param(params, 2)?;
@@ -696,6 +698,50 @@ fn transaction_broadcast(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(txid.to_string()))
 }
 
+fn transaction_broadcast_package(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let raw_transactions = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("broadcast_package expects an array of transactions"))?;
+    if raw_transactions.is_empty() {
+        bail!("broadcast_package requires at least one transaction")
+    }
+    let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let result = crate::rpc::submit_package(node, &json!([raw_transactions]))?;
+    if verbose {
+        return Ok(result);
+    }
+    let success = result["package_msg"].as_str() == Some("success");
+    if success {
+        return Ok(json!({"success": true}));
+    }
+    let errors = result["tx-results"]
+        .as_object()
+        .into_iter()
+        .flat_map(|results| results.values())
+        .filter(|entry| entry["allowed"] == json!(false) || entry.get("error").is_some())
+        .map(|entry| {
+            json!({
+                "txid": entry["txid"].clone(),
+                "error": entry
+                    .get("error")
+                    .or_else(|| entry.get("reject-reason"))
+                    .cloned()
+                    .unwrap_or_else(|| result["package_msg"].clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({"success": false, "errors": errors}))
+}
+
+fn transaction_test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let raw_transactions = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("testmempoolaccept expects an array of transactions"))?;
+    crate::rpc::test_mempool_accept(node, &json!([raw_transactions]))
+}
+
 async fn send_status_notifications(
     node: &Arc<Node>,
     subscriptions: &HashMap<String, Subscription>,
@@ -1105,6 +1151,25 @@ mod tests {
             )
             .unwrap(),
             json!({"utxos": []})
+        );
+        assert_eq!(
+            dispatch(
+                &node,
+                "blockchain.transaction.testmempoolaccept",
+                &json!([[]]),
+                &mut HashMap::new(),
+            )
+            .unwrap(),
+            json!([])
+        );
+        assert!(
+            dispatch(
+                &node,
+                "blockchain.transaction.broadcast_package",
+                &json!([[]]),
+                &mut HashMap::new(),
+            )
+            .is_err()
         );
 
         let mut modern_subscriptions = HashMap::new();

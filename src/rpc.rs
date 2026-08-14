@@ -6448,7 +6448,7 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid, height: u32) -> Result<Val
     }))
 }
 
-fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
+pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let transactions = params
         .as_array()
         .and_then(|values| values.first())
@@ -6513,7 +6513,7 @@ fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(result))
 }
 
-fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> {
+pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let raw_transactions = params
         .get(0)
         .and_then(Value::as_array)

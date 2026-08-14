@@ -748,6 +748,26 @@ impl ChainState {
             .expect("genesis header is indexed")
     }
 
+    /// Return Core v31.1's default minimum chainwork threshold for this
+    /// network. Custom Signet challenges intentionally have no public-chain
+    /// work assumption.
+    pub fn minimum_chain_work(&self) -> Work {
+        if self.network == Network::Signet
+            && self.signet_challenge.as_deref()
+                != Some(validation::default_signet_challenge().as_slice())
+        {
+            return Work::from_be_bytes([0; 32]);
+        }
+        let hex = match self.network {
+            Network::Bitcoin => "0000000000000000000000000000000000000001128750f82f4c366153a3a030",
+            Network::Testnet => "0000000000000000000000000000000000000000000017dde1c649f3708d14b6",
+            Network::Testnet4 => "0000000000000000000000000000000000000000000009a0fe15d0177d086304",
+            Network::Signet => "00000000000000000000000000000000000000000000000000000b463ea0a4b8",
+            Network::Regtest => return Work::from_be_bytes([0; 32]),
+        };
+        Work::from_unprefixed_hex(hex).expect("Core minimum chainwork is valid hex")
+    }
+
     pub fn chain_tips(&self) -> Vec<KnownChainTip> {
         let mut parents = HashSet::new();
         for node in self.block_index.values() {

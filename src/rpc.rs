@@ -2707,6 +2707,24 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let header_tip = chain.best_header_tip();
     let header = chain.header(tip.height).expect("tip header exists");
     let headers = chain.active_headers();
+    let minimum_chain_work = chain.minimum_chain_work();
+    let tip_recent = u64::from(header.time).saturating_add(24 * 60 * 60) >= unix_time();
+    let initial_block_download = tip.work < minimum_chain_work || !tip_recent;
+    let verification_progress = if !initial_block_download {
+        1.0
+    } else {
+        let work_progress = if minimum_chain_work == bitcoin::pow::Work::from_be_bytes([0; 32]) {
+            0.0
+        } else {
+            (work_to_f64(tip.work) / work_to_f64(minimum_chain_work)).min(1.0)
+        };
+        let height_progress = if header_tip.height == 0 {
+            0.0
+        } else {
+            f64::from(tip.height) / f64::from(header_tip.height)
+        };
+        work_progress.min(height_progress).clamp(0.0, 1.0)
+    };
     let mut result = json!({
         "chain": network_name(chain.network),
         "blocks": tip.height,
@@ -2718,8 +2736,8 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "difficulty": header.difficulty_float(),
         "time": header.time,
         "mediantime": chain.median_time_past_value(),
-        "verificationprogress": if header_tip.height == 0 { 1.0 } else { tip.height as f64 / header_tip.height as f64 },
-        "initialblockdownload": tip.height < header_tip.height,
+        "verificationprogress": verification_progress,
+        "initialblockdownload": initial_block_download,
         "pruned": chain.is_pruned(),
         "size_on_disk": chain.store.disk_usage().unwrap_or(0),
         "softforks": softforks_json(headers, tip.height, chain.network),
@@ -11003,6 +11021,8 @@ mod tests {
         .unwrap();
 
         let info = get_blockchain_info(&node).unwrap();
+        assert_eq!(info["initialblockdownload"], json!(true));
+        assert_eq!(info["verificationprogress"], json!(0.0));
         assert_eq!(info["softforks"]["bip34"]["type"], json!("buried"));
         assert_eq!(info["softforks"]["bip34"]["height"], json!(1));
         assert_eq!(info["softforks"]["bip34"]["active"], json!(false));

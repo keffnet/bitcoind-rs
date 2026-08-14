@@ -980,6 +980,7 @@ async fn serve_peer_loop(
                 match command {
                     Some(PeerCommand::Disconnect) | None => anyhow::bail!("peer disconnected by node"),
                     Some(PeerCommand::RequestBlock(hash)) => {
+                        node.track_peer_block_request(peer_id, hash);
                         send_message(
                             node,
                             peer_id,
@@ -1248,6 +1249,9 @@ async fn serve_peer_loop(
                         .collect::<Vec<_>>()
                 };
                 if !requests.is_empty() {
+                    for request in &requests {
+                        node.track_peer_block_request(peer_id, request.hash);
+                    }
                     send_message(
                         node,
                         peer_id,
@@ -1321,6 +1325,16 @@ async fn serve_peer_loop(
                         .collect::<Vec<_>>()
                 };
                 if !requests.is_empty() {
+                    for request in &requests {
+                        if matches!(
+                            request.kind,
+                            InventoryType::Block
+                                | InventoryType::WitnessBlock
+                                | InventoryType::CompactBlock
+                        ) {
+                            node.track_peer_block_request(peer_id, request.hash);
+                        }
+                    }
                     send_message(
                         node,
                         peer_id,
@@ -1508,6 +1522,7 @@ async fn serve_peer_loop(
                 }
             }
             Message::Block(block) => {
+                node.clear_peer_block_request(peer_id, block.header.block_hash());
                 if handle_received_block(node, peers, peer_id, block).await {
                     node.record_peer_block(peer_id);
                 }
@@ -1515,6 +1530,7 @@ async fn serve_peer_loop(
             }
             Message::CompactBlock(compact) => {
                 let hash = compact.header.block_hash();
+                node.clear_peer_block_request(peer_id, hash);
                 match reconstruct_compact_block(&compact, node, compact_block_version) {
                     Ok((transactions, missing)) if missing.is_empty() => {
                         match complete_compact_block(&compact, transactions) {
@@ -1881,8 +1897,19 @@ async fn serve_peer_loop(
             Message::CFilter(_)
             | Message::CFHeaders(_)
             | Message::CFCheckpt(_)
-            | Message::NotFound(_)
             | Message::Unknown { .. } => {}
+            Message::NotFound(items) => {
+                for item in items {
+                    if matches!(
+                        item.kind,
+                        InventoryType::Block
+                            | InventoryType::WitnessBlock
+                            | InventoryType::CompactBlock
+                    ) {
+                        node.clear_peer_block_request(peer_id, item.hash);
+                    }
+                }
+            }
             Message::FeeFilter(rate) => {
                 let rate = rate.max(0);
                 *fee_filter.lock() = rate;
@@ -1893,6 +1920,7 @@ async fn serve_peer_loop(
                     compact_block_version = version;
                     *peer_state.compact_block_version.lock() = Some(version);
                     *peer_state.compact_block_announce.lock() = announce;
+                    node.update_peer_bip152_highbandwidth_from(peer_id, announce);
                 }
             }
             Message::GetAddr => {
@@ -2079,6 +2107,7 @@ async fn request_full_block(
     network: Network,
     hash: BlockHash,
 ) -> Result<()> {
+    node.track_peer_block_request(peer_id, hash);
     send_message(
         node,
         peer_id,

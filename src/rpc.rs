@@ -1538,12 +1538,12 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                         "version": peer.version.unwrap_or_default(),
                         "subver": peer.user_agent,
                         "inbound": peer.inbound,
-                        "bip152_hb_to": false,
-                        "bip152_hb_from": false,
+                        "bip152_hb_to": peer.bip152_highbandwidth_to,
+                        "bip152_hb_from": peer.bip152_highbandwidth_from,
                         "presynced_headers": -1,
                         "synced_headers": synced_headers,
                         "synced_blocks": synced_blocks,
-                        "inflight": [],
+                        "inflight": peer.inflight_heights(),
                         "addr_relay_enabled": peer.addr_relay_enabled,
                         "addr_processed": peer.addr_processed,
                         "addr_rate_limited": peer.addr_rate_limited,
@@ -12960,6 +12960,7 @@ mod tests {
         assert_eq!(unversioned_peer_info[0]["addr_relay_enabled"], json!(true));
         node.update_peer_version(7, 70016, 0, "/test-peer/", 0, true);
         node.update_peer_time_offset(7, 42);
+        node.update_peer_bip152_highbandwidth_from(7, true);
         let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(peer_info[0]["id"], json!(7));
         assert_eq!(
@@ -12967,6 +12968,9 @@ mod tests {
             json!("outbound-full-relay")
         );
         assert_eq!(peer_info[0]["presynced_headers"], json!(-1));
+        assert_eq!(peer_info[0]["bip152_hb_to"], json!(false));
+        assert_eq!(peer_info[0]["bip152_hb_from"], json!(true));
+        assert_eq!(peer_info[0]["inflight"], json!([]));
         assert_eq!(peer_info[0]["transport_protocol_type"], json!("v1"));
         assert!(peer_info[0].get("startingheight").is_none());
         assert!(peer_info[0].get("pingtime").is_none());
@@ -13007,19 +13011,24 @@ mod tests {
         assert_eq!(command, "test");
         assert_eq!(payload, vec![1, 2]);
 
+        let genesis = node.chain.read().best_hash();
         assert_eq!(
-            dispatch_method(
-                &node,
-                "getblockfrompeer",
-                &json!([BlockHash::all_zeros().to_string(), 7]),
-            )
-            .unwrap(),
+            dispatch_method(&node, "getblockfrompeer", &json!([genesis.to_string(), 7]),).unwrap(),
             json!({})
         );
         let crate::p2p::PeerCommand::RequestBlock(hash) = receiver.try_recv().unwrap() else {
             panic!("expected block request command");
         };
-        assert_eq!(hash, BlockHash::all_zeros());
+        assert_eq!(hash, genesis);
+        assert_eq!(
+            dispatch_method(&node, "getpeerinfo", &json!([])).unwrap()[0]["inflight"],
+            json!([0])
+        );
+        node.clear_peer_block_request(7, genesis);
+        assert_eq!(
+            dispatch_method(&node, "getpeerinfo", &json!([])).unwrap()[0]["inflight"],
+            json!([])
+        );
     }
 
     #[test]

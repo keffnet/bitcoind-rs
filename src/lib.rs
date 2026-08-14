@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::{Block, Network, OutPoint, Transaction, Txid};
+use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid};
 use parking_lot::RwLock;
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -318,6 +318,9 @@ pub struct PeerInfo {
     pub last_inv_sequence: u64,
     pub last_transaction: u64,
     pub last_block: u64,
+    pub(crate) bip152_highbandwidth_to: bool,
+    pub(crate) bip152_highbandwidth_from: bool,
+    inflight_blocks: Vec<(BlockHash, u32)>,
     pub time_offset: i64,
     pub addr_processed: u64,
     pub addr_rate_limited: u64,
@@ -335,6 +338,13 @@ impl PeerInfo {
     pub(crate) fn ping_wait(&self) -> Option<f64> {
         self.ping_sent_at
             .map(|sent_at| sent_at.elapsed().as_secs_f64())
+    }
+
+    pub(crate) fn inflight_heights(&self) -> Vec<u32> {
+        self.inflight_blocks
+            .iter()
+            .map(|(_, height)| *height)
+            .collect()
     }
 }
 
@@ -1018,6 +1028,33 @@ impl Node {
         }
     }
 
+    pub(crate) fn update_peer_bip152_highbandwidth_from(&self, peer_id: usize, enabled: bool) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.bip152_highbandwidth_from = enabled;
+        }
+    }
+
+    pub(crate) fn track_peer_block_request(&self, peer_id: usize, hash: BlockHash) {
+        let Some(height) = self.chain.read().block_height_by_hash(&hash) else {
+            return;
+        };
+        if let Some(peer) = self.peers.write().get_mut(&peer_id)
+            && !peer
+                .inflight_blocks
+                .iter()
+                .any(|(inflight_hash, _)| *inflight_hash == hash)
+        {
+            peer.inflight_blocks.push((hash, height));
+        }
+    }
+
+    pub(crate) fn clear_peer_block_request(&self, peer_id: usize, hash: BlockHash) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.inflight_blocks
+                .retain(|(inflight_hash, _)| *inflight_hash != hash);
+        }
+    }
+
     pub(crate) fn record_pong(&self, peer_id: usize, nonce: u64) {
         if let Some(peer) = self.peers.write().get_mut(&peer_id)
             && peer.ping_nonce == Some(nonce)
@@ -1088,6 +1125,9 @@ impl Node {
             last_inv_sequence: 0,
             last_transaction: 0,
             last_block: 0,
+            bip152_highbandwidth_to: false,
+            bip152_highbandwidth_from: false,
+            inflight_blocks: Vec::new(),
             time_offset: 0,
             addr_processed: 0,
             addr_rate_limited: 0,
@@ -1319,6 +1359,9 @@ impl Node {
                 last_inv_sequence: 0,
                 last_transaction: 0,
                 last_block: 0,
+                bip152_highbandwidth_to: false,
+                bip152_highbandwidth_from: false,
+                inflight_blocks: Vec::new(),
                 time_offset: 0,
                 addr_processed: 0,
                 addr_rate_limited: 0,
@@ -1367,6 +1410,9 @@ impl Node {
             last_inv_sequence: 0,
             last_transaction: 0,
             last_block: 0,
+            bip152_highbandwidth_to: false,
+            bip152_highbandwidth_from: false,
+            inflight_blocks: Vec::new(),
             time_offset: 0,
             addr_processed: 0,
             addr_rate_limited: 0,
@@ -1496,7 +1542,9 @@ impl Node {
             .ok_or_else(|| anyhow::anyhow!("peer {peer_id} is not connected"))?;
         sender
             .send(p2p::PeerCommand::RequestBlock(hash))
-            .map_err(|_| anyhow::anyhow!("peer {peer_id} disconnected"))
+            .map_err(|_| anyhow::anyhow!("peer {peer_id} disconnected"))?;
+        self.track_peer_block_request(peer_id, hash);
+        Ok(())
     }
 
     pub fn send_message_to_peer(
@@ -1810,6 +1858,9 @@ fn load_known_addresses(
                 last_inv_sequence: 0,
                 last_transaction: 0,
                 last_block: 0,
+                bip152_highbandwidth_to: false,
+                bip152_highbandwidth_from: false,
+                inflight_blocks: Vec::new(),
                 time_offset: 0,
                 addr_processed: 0,
                 addr_rate_limited: 0,

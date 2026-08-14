@@ -1277,8 +1277,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             }))
         }
         "getrawmempool" => {
-            let verbose = params.get(0).and_then(Value::as_bool).unwrap_or(false);
-            let include_sequence = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+            let verbose = optional_bool(params, 0, false, "verbose")?;
+            let include_sequence = optional_bool(params, 1, false, "mempool_sequence")?;
             if verbose && include_sequence {
                 bail!("Verbose results cannot contain mempool sequence values.")
             }
@@ -2727,7 +2727,7 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .filter(|value| !value.is_null())
                 .and_then(Value::as_u64)
                 .unwrap_or(86_400);
-            let absolute = params.get(3).and_then(Value::as_bool).unwrap_or(false);
+            let absolute = optional_bool(params, 3, false, "absolute")?;
             let now = unix_time();
             let ban_until = if absolute {
                 requested_duration
@@ -3110,7 +3110,7 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
-    let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(true);
+    let verbose = optional_bool(params, 1, true, "verbose")?;
     let mut chain = node.chain.write();
     let height = chain
         .block_height_by_hash(&hash)
@@ -5924,7 +5924,7 @@ fn finalize_psbt_input(psbt: &mut Psbt, input_index: usize) -> bool {
 
 fn finalize_psbt(params: &Value) -> Result<Value> {
     let mut psbt = parse_psbt(params, 0)?;
-    let extract = params.get(1).and_then(Value::as_bool).unwrap_or(true);
+    let extract = optional_bool(params, 1, true, "extract")?;
     let complete = (0..psbt.inputs.len()).all(|index| finalize_psbt_input(&mut psbt, index));
     let mut result = json!({
         "psbt": encode_psbt(&psbt),
@@ -7765,7 +7765,7 @@ fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .get(1)
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("transactions must be an array"))?;
-    let submit = params.get(2).and_then(Value::as_bool).unwrap_or(true);
+    let submit = optional_bool(params, 2, true, "submit")?;
     let mempool = node.mempool.read();
     let transactions = requested
         .iter()
@@ -8285,7 +8285,7 @@ fn get_prioritised_transactions(node: &Arc<Node>) -> Result<Value> {
 
 fn get_mempool_relationship(node: &Arc<Node>, params: &Value, ancestors: bool) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
-    let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let verbose = optional_bool(params, 1, false, "verbose")?;
     let mempool = node.mempool.read();
     if mempool.get(&txid).is_none() {
         bail!("Transaction not in mempool");
@@ -8960,7 +8960,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
 fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let vout = param::<u32>(params, 1)?;
-    let include_mempool = params.get(2).and_then(Value::as_bool).unwrap_or(true);
+    let include_mempool = optional_bool(params, 2, true, "include_mempool")?;
     let chain = node.chain.read();
     let outpoint = OutPoint::new(txid, vout);
     let mempool = include_mempool.then(|| node.mempool.read());
@@ -9301,7 +9301,7 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("getdescriptoractivity expects descriptors"))?;
     let scripts = scan_object_scripts(node, scan_objects)?;
-    let include_mempool = params.get(2).and_then(Value::as_bool).unwrap_or(true);
+    let include_mempool = optional_bool(params, 2, true, "include_mempool")?;
     let mut chain = node.chain.write();
     let mut blocks = requested_hashes
         .iter()
@@ -10168,6 +10168,20 @@ fn param<T: serde::de::DeserializeOwned>(params: &Value, index: usize) -> Result
         .and_then(|values| values.get(index))
         .ok_or_else(|| anyhow!("missing parameter {index}"))?;
     Ok(serde_json::from_value(value.clone())?)
+}
+
+pub(crate) fn optional_bool(
+    params: &Value,
+    index: usize,
+    default: bool,
+    name: &str,
+) -> Result<bool> {
+    let Some(value) = params.get(index).filter(|value| !value.is_null()) else {
+        return Ok(default);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| anyhow!("{name} must be a boolean"))
 }
 
 fn rpc_error(error: &anyhow::Error) -> Value {
@@ -11077,6 +11091,16 @@ mod tests {
         .unwrap();
         assert_eq!(normalized, json!([[], [], null, null, 3]));
         assert!(normalize_rpc_params("getblockhash", &json!({"height": 0, "extra": 1})).is_err());
+    }
+
+    #[test]
+    fn optional_rpc_booleans_preserve_defaults_and_reject_wrong_types() {
+        assert!(optional_bool(&json!([]), 0, true, "flag").unwrap());
+        assert!(optional_bool(&json!([null]), 0, true, "flag").unwrap());
+        assert!(!optional_bool(&json!([false]), 0, true, "flag").unwrap());
+        assert!(optional_bool(&json!([true]), 0, false, "flag").unwrap());
+        assert!(optional_bool(&json!([1]), 0, true, "flag").is_err());
+        assert!(optional_bool(&json!(["true"]), 0, true, "flag").is_err());
     }
 
     #[tokio::test]

@@ -873,7 +873,7 @@ fn block_chunk(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
-    let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
     if let Some((transaction, location)) = node.chain.write().transaction(&txid)? {
         if verbose {
             let chain = node.chain.read();
@@ -911,7 +911,7 @@ fn transaction_get_batch(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .get(0)
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("transaction.get_batch expects an array of txids"))?;
-    let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
     txids
         .iter()
         .map(|txid| {
@@ -1012,7 +1012,7 @@ fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn transaction_id_from_pos(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = param::<u32>(params, 0)?;
     let position = param::<u32>(params, 1)?;
-    let include_merkle = params.get(2).and_then(Value::as_bool).unwrap_or(false);
+    let include_merkle = crate::rpc::optional_bool(params, 2, false, "include_merkle")?;
     let mut chain = node.chain.write();
     let hash = chain
         .block_hash(height)
@@ -1053,7 +1053,7 @@ fn transaction_broadcast_package(node: &Arc<Node>, params: &Value) -> Result<Val
     if raw_transactions.is_empty() {
         bail!("broadcast_package requires at least one transaction")
     }
-    let verbose = params.get(1).and_then(Value::as_bool).unwrap_or(false);
+    let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
     let result = crate::rpc::submit_package(node, &json!([raw_transactions]))?;
     if verbose {
         return Ok(result);

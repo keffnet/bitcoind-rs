@@ -224,6 +224,7 @@ impl ChainState {
             block_undo_cache: HashMap::new(),
         };
         let snapshot = state.load_snapshot(&active_chain)?;
+        let loaded_snapshot = snapshot.is_some();
         if let Some(snapshot) = snapshot {
             state.active_chain = active_chain.clone();
             state.headers = snapshot.headers;
@@ -268,6 +269,18 @@ impl ChainState {
                 .best_valid_tip_hash()
                 .context("invalidated chain has no valid alternative")?;
             state.activate_chain(best_valid)?;
+        }
+        if loaded_snapshot {
+            let snapshot_utxos = state.utxos.clone();
+            state.validate_snapshot_utxos(&snapshot_utxos)?;
+            if state.prune_height.is_none() {
+                let expected = state
+                    .replay_utxos_for_block(state.best_hash(), false)?
+                    .context("cannot verify persisted chainstate snapshot")?;
+                if expected != state.utxos {
+                    bail!("persisted chainstate snapshot does not match the active chain");
+                }
+            }
         }
         state.persist_metadata()?;
         Ok(state)
@@ -2633,6 +2646,13 @@ mod tests {
         assert_eq!(reopened.utxos.len(), 2);
         assert_eq!(reopened.get_utxos(&script_hash).len(), 2);
         drop(reopened);
+        let snapshot_path = directory.path().join("chainstate.snapshot");
+        let bytes = fs::read(&snapshot_path).unwrap();
+        let mut snapshot: ChainSnapshot = serde_json::from_slice(&bytes).unwrap();
+        let entry = snapshot.utxos.values_mut().next().unwrap();
+        entry.output.value = Amount::from_sat(entry.output.value.to_sat().saturating_sub(1));
+        fs::write(&snapshot_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(ChainState::open(Network::Regtest, directory.path()).is_err());
         fs::write(directory.path().join("chainstate.snapshot"), b"corrupt").unwrap();
         let replayed = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(replayed.height(), 2);

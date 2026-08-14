@@ -16,14 +16,17 @@ use bip324::{
 };
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
 use bitcoin::bip158::FilterHash;
+use bitcoin::block::Header as BlockHeader;
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_bloom::{BloomFlags, FilterAdd, FilterLoad};
 use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
+use bitcoin::pow::{CompactTarget, Target, Work};
 use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction, Txid, Witness, Wtxid};
 use rand::random;
 use rand::seq::SliceRandom;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{
     TcpListener, TcpStream,
@@ -213,6 +216,7 @@ const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(2 * 60);
 const HEADERS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_FUTURE_BLOCK_TIME_SECS: u64 = 2 * 60 * 60;
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
 const MAX_PEER_TX_ANNOUNCEMENTS: usize = 5_000;
 const MAX_PEER_TX_REQUEST_IN_FLIGHT: usize = 100;
@@ -282,6 +286,408 @@ fn headers_request_is_due(last_request: Option<Instant>) -> bool {
 
 fn headers_download_timed_out(last_request: Option<Instant>) -> bool {
     last_request.is_some_and(|sent| sent.elapsed() > HEADERS_DOWNLOAD_TIMEOUT)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LowWorkHeadersPhase {
+    Presync,
+    Redownload,
+}
+
+#[derive(Debug)]
+struct HeadersSyncResult {
+    success: bool,
+    request_more: bool,
+    ready: Vec<BlockHeader>,
+    finished: bool,
+}
+
+#[derive(Debug, Default)]
+struct CommitmentBits {
+    words: VecDeque<u64>,
+    front_offset: u8,
+    len: usize,
+}
+
+impl CommitmentBits {
+    fn push_back(&mut self, bit: bool) {
+        let position = usize::from(self.front_offset) + self.len;
+        let word = position / 64;
+        if word == self.words.len() {
+            self.words.push_back(0);
+        }
+        if bit {
+            *self.words.get_mut(word).expect("commitment word exists") |= 1 << (position % 64);
+        }
+        self.len += 1;
+    }
+
+    fn pop_front(&mut self) -> Option<bool> {
+        if self.len == 0 {
+            return None;
+        }
+        let bit = (self.words.front().copied().unwrap_or_default() & (1 << self.front_offset)) != 0;
+        self.front_offset += 1;
+        self.len -= 1;
+        if self.front_offset == 64 {
+            self.words.pop_front();
+            self.front_offset = 0;
+        }
+        if self.len == 0 {
+            self.words.clear();
+            self.front_offset = 0;
+        }
+        Some(bit)
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    #[cfg(test)]
+    fn front(&self) -> Option<bool> {
+        (self.len != 0).then(|| {
+            (self.words.front().copied().unwrap_or_default() & (1 << self.front_offset)) != 0
+        })
+    }
+}
+
+/// Per-peer implementation of Core's low-work headers synchronization.
+///
+/// Headers in the presync phase are deliberately kept out of ChainState. A
+/// peer must first demonstrate sufficient cumulative work, then provide the
+/// same chain again while the salted commitments are checked. Only headers
+/// released from the bounded redownload buffer reach the global index.
+struct LowWorkHeadersSync {
+    network: Network,
+    minimum_work: Work,
+    commitment_period: u32,
+    redownload_buffer_size: usize,
+    commit_offset: u32,
+    salt: [u8; 32],
+    commitments: CommitmentBits,
+    max_commitments: u64,
+    phase: LowWorkHeadersPhase,
+    chain_start_hash: BlockHash,
+    chain_start_height: u32,
+    chain_start_work: Work,
+    last_header: BlockHeader,
+    current_height: u32,
+    current_work: Work,
+    redownload_headers: VecDeque<BlockHeader>,
+    redownload_last_hash: BlockHash,
+    redownload_last_bits: CompactTarget,
+    redownload_height: u32,
+    redownload_work: Work,
+    process_all_remaining_headers: bool,
+}
+
+impl LowWorkHeadersSync {
+    fn params(network: Network) -> (u32, usize) {
+        match network {
+            Network::Bitcoin => (641, 15_218),
+            Network::Testnet => (673, 14_460),
+            Network::Testnet4 => (606, 16_092),
+            Network::Signet => (620, 15_724),
+            Network::Regtest => (275, 7_017),
+        }
+    }
+
+    fn new(
+        network: Network,
+        minimum_work: Work,
+        chain_start_hash: BlockHash,
+        chain_start_height: u32,
+        chain_start_work: Work,
+        chain_start_header: BlockHeader,
+        chain_start_median_time_past: u32,
+    ) -> Self {
+        let (commitment_period, redownload_buffer_size) = Self::params(network);
+        let now = unix_time_seconds();
+        let elapsed = now
+            .saturating_sub(u64::from(chain_start_median_time_past))
+            .saturating_add(MAX_FUTURE_BLOCK_TIME_SECS);
+        let max_commitments = elapsed
+            .saturating_mul(6)
+            .checked_div(u64::from(commitment_period))
+            .unwrap_or(0);
+        let commit_offset = (random::<u64>() % u64::from(commitment_period)) as u32;
+        Self {
+            network,
+            minimum_work,
+            commitment_period,
+            redownload_buffer_size,
+            commit_offset,
+            salt: random(),
+            commitments: CommitmentBits::default(),
+            max_commitments,
+            phase: LowWorkHeadersPhase::Presync,
+            chain_start_hash,
+            chain_start_height,
+            chain_start_work,
+            last_header: chain_start_header,
+            current_height: chain_start_height,
+            current_work: chain_start_work,
+            redownload_headers: VecDeque::new(),
+            redownload_last_hash: chain_start_hash,
+            redownload_last_bits: chain_start_header.bits,
+            redownload_height: chain_start_height,
+            redownload_work: chain_start_work,
+            process_all_remaining_headers: false,
+        }
+    }
+
+    fn commitment(&self, header: &BlockHeader) -> bool {
+        let mut hasher = Sha256::new();
+        hasher.update(self.salt);
+        hasher.update(header.block_hash().to_byte_array());
+        (hasher.finalize()[0] & 1) != 0
+    }
+
+    fn process(
+        &mut self,
+        headers: &[BlockHeader],
+        full_headers_message: bool,
+    ) -> HeadersSyncResult {
+        if headers.is_empty() {
+            return HeadersSyncResult {
+                success: false,
+                request_more: false,
+                ready: Vec::new(),
+                finished: true,
+            };
+        }
+        match self.phase {
+            LowWorkHeadersPhase::Presync => self.process_presync(headers, full_headers_message),
+            LowWorkHeadersPhase::Redownload => {
+                self.process_redownload(headers, full_headers_message)
+            }
+        }
+    }
+
+    fn process_presync(
+        &mut self,
+        headers: &[BlockHeader],
+        full_headers_message: bool,
+    ) -> HeadersSyncResult {
+        let mut previous = self.last_header;
+        for header in headers {
+            let next_height = self.current_height.saturating_add(1);
+            if header.prev_blockhash != previous.block_hash()
+                || !permitted_difficulty_transition(
+                    self.network,
+                    next_height,
+                    previous.bits.to_consensus(),
+                    header.bits.to_consensus(),
+                )
+                || !valid_header_pow(self.network, header)
+            {
+                return self.failed_result();
+            }
+            if next_height % self.commitment_period == self.commit_offset {
+                self.commitments.push_back(self.commitment(header));
+                if self.commitments.len() as u64 > self.max_commitments {
+                    return self.failed_result();
+                }
+            }
+            self.current_work = add_work_saturating(self.current_work, header.work());
+            self.current_height = next_height;
+            previous = *header;
+        }
+        self.last_header = previous;
+
+        if self.current_work >= self.minimum_work {
+            self.phase = LowWorkHeadersPhase::Redownload;
+            self.redownload_headers.clear();
+            self.redownload_last_hash = self.chain_start_hash;
+            self.redownload_height = self.chain_start_height;
+            self.redownload_work = self.chain_start_work;
+            self.process_all_remaining_headers = false;
+            HeadersSyncResult {
+                success: true,
+                // The second phase starts over from the common chain start.
+                request_more: true,
+                ready: Vec::new(),
+                finished: false,
+            }
+        } else if full_headers_message {
+            HeadersSyncResult {
+                success: true,
+                request_more: true,
+                ready: Vec::new(),
+                finished: false,
+            }
+        } else {
+            // A short low-work response proves that this peer has no useful
+            // chain to continue with, so discard the presync state.
+            HeadersSyncResult {
+                success: true,
+                request_more: false,
+                ready: Vec::new(),
+                finished: true,
+            }
+        }
+    }
+
+    fn process_redownload(
+        &mut self,
+        headers: &[BlockHeader],
+        full_headers_message: bool,
+    ) -> HeadersSyncResult {
+        for header in headers {
+            let next_height = self.redownload_height.saturating_add(1);
+            if header.prev_blockhash != self.redownload_last_hash
+                || !permitted_difficulty_transition(
+                    self.network,
+                    next_height,
+                    self.redownload_last_bits.to_consensus(),
+                    header.bits.to_consensus(),
+                )
+                || !valid_header_pow(self.network, header)
+            {
+                return self.failed_result();
+            }
+
+            self.redownload_work = add_work_saturating(self.redownload_work, header.work());
+            if self.redownload_work >= self.minimum_work {
+                self.process_all_remaining_headers = true;
+            }
+
+            if !self.process_all_remaining_headers
+                && next_height % self.commitment_period == self.commit_offset
+            {
+                let Some(expected) = self.commitments.pop_front() else {
+                    return self.failed_result();
+                };
+                if self.commitment(header) != expected {
+                    return self.failed_result();
+                }
+            }
+
+            self.redownload_headers.push_back(*header);
+            self.redownload_last_hash = header.block_hash();
+            self.redownload_last_bits = header.bits;
+            self.redownload_height = next_height;
+        }
+
+        let ready = self.pop_ready_headers();
+        let finished = self.redownload_headers.is_empty() && self.process_all_remaining_headers;
+        let request_more = !finished && full_headers_message;
+        HeadersSyncResult {
+            success: true,
+            request_more,
+            ready,
+            finished: finished || !full_headers_message,
+        }
+    }
+
+    fn pop_ready_headers(&mut self) -> Vec<BlockHeader> {
+        let mut ready = Vec::new();
+        while self.redownload_headers.len() > self.redownload_buffer_size
+            || (self.process_all_remaining_headers && !self.redownload_headers.is_empty())
+        {
+            let header = self
+                .redownload_headers
+                .pop_front()
+                .expect("redownload queue is non-empty");
+            ready.push(header);
+        }
+        ready
+    }
+
+    fn failed_result(&self) -> HeadersSyncResult {
+        HeadersSyncResult {
+            success: false,
+            request_more: false,
+            ready: Vec::new(),
+            finished: true,
+        }
+    }
+
+    fn next_locator(&self, chain: &crate::chain::ChainState) -> Vec<BlockHash> {
+        let last_hash = match self.phase {
+            LowWorkHeadersPhase::Presync => self.last_header.block_hash(),
+            LowWorkHeadersPhase::Redownload => self.redownload_last_hash,
+        };
+        let mut locator = vec![last_hash];
+        for hash in chain.block_locator_hashes_from(self.chain_start_hash) {
+            if !locator.contains(&hash) {
+                locator.push(hash);
+            }
+        }
+        locator
+    }
+
+    #[cfg(test)]
+    fn phase(&self) -> LowWorkHeadersPhase {
+        self.phase
+    }
+
+    #[cfg(test)]
+    fn commitment_count(&self) -> usize {
+        self.commitments.len()
+    }
+}
+
+fn valid_header_pow(network: Network, header: &BlockHeader) -> bool {
+    let compact = header.bits.to_consensus();
+    let target = header.target();
+    let mantissa = compact & 0x007f_ffff;
+    mantissa != 0
+        && compact & 0x0080_0000 == 0
+        && target != Target::ZERO
+        && target <= network.params().max_attainable_target
+        && target.to_compact_lossy().to_consensus() == compact
+        && target.is_met_by(header.block_hash())
+}
+
+fn add_work_saturating(left: Work, right: Work) -> Work {
+    let maximum = Work::from_be_bytes([0xff; 32]);
+    if left > maximum - right {
+        maximum
+    } else {
+        left + right
+    }
+}
+
+fn permitted_difficulty_transition(
+    network: Network,
+    height: u32,
+    old_bits: u32,
+    new_bits: u32,
+) -> bool {
+    let params = network.params();
+    if params.allow_min_difficulty_blocks {
+        return true;
+    }
+    let interval = params.difficulty_adjustment_interval() as u32;
+    if height % interval != 0 {
+        return old_bits == new_bits;
+    }
+    let old_target = Target::from_compact(CompactTarget::from_consensus(old_bits));
+    let new_target = Target::from_compact(CompactTarget::from_consensus(new_bits));
+    let maximum = Target::from_compact(
+        old_target
+            .max_transition_threshold(params)
+            .to_compact_lossy(),
+    );
+    let minimum = Target::from_compact(old_target.min_transition_threshold().to_compact_lossy());
+    new_target >= minimum && new_target <= maximum
+}
+
+fn headers_sync_work_threshold(chain: &crate::chain::ChainState) -> Work {
+    let minimum = chain.minimum_chain_work();
+    let tip = chain.tip();
+    let tip_header = chain
+        .header(tip.height)
+        .expect("active tip header is always indexed");
+    let mut recent_work = Work::from_be_bytes([0; 32]);
+    for _ in 0..144 {
+        recent_work = add_work_saturating(recent_work, tip_header.work());
+    }
+    let recent_work = recent_work.min(tip.work);
+    let near_tip = tip.work - recent_work;
+    near_tip.max(minimum)
 }
 
 struct PeerState {
@@ -1398,6 +1804,7 @@ async fn serve_peer_loop(
     tx_inventory_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tx_inventory_interval.tick().await;
     let mut pending_block_requests = Vec::new();
+    let mut headers_sync: Option<LowWorkHeadersSync> = None;
     loop {
         if !node.network_active() {
             anyhow::bail!("networking is disabled");
@@ -1722,9 +2129,107 @@ async fn serve_peer_loop(
                 let request_more_headers = headers.len() == 2_000;
                 *peer_state.last_headers_request.lock() = None;
                 if headers.is_empty() {
+                    headers_sync = None;
                     continue;
                 }
-                let hashes = node.chain.write().accept_headers(&headers)?;
+
+                // Core checks proof of work before allowing a header batch to
+                // enter its low-work synchronizer. This keeps cheap invalid
+                // headers from consuming the commitment budget.
+                if headers
+                    .iter()
+                    .any(|header| !valid_header_pow(node.config.network, header))
+                {
+                    continue;
+                }
+
+                let mut headers_to_accept = headers;
+                let mut request_sync_locator = None;
+                let mut sync_finished = false;
+                if let Some(sync) = headers_sync.as_mut() {
+                    let result = sync.process(&headers_to_accept, request_more_headers);
+                    if !result.success {
+                        headers_sync = None;
+                        continue;
+                    }
+                    headers_to_accept = result.ready;
+                    if result.request_more {
+                        let locator = {
+                            let chain = node.chain.read();
+                            sync.next_locator(&chain)
+                        };
+                        request_sync_locator = Some(locator);
+                    }
+                    sync_finished = result.finished;
+                } else if request_more_headers {
+                    let low_work_state = {
+                        let chain = node.chain.read();
+                        let parent_hash = headers_to_accept[0].prev_blockhash;
+                        chain
+                            .header_by_hash(&parent_hash)
+                            .zip(chain.chain_work_by_hash(&parent_hash))
+                            .map(|(parent_header, parent_work)| {
+                                let claimed_work = headers_to_accept
+                                    .iter()
+                                    .fold(Work::from_be_bytes([0; 32]), |work, header| {
+                                        add_work_saturating(work, header.work())
+                                    });
+                                (
+                                    parent_header,
+                                    parent_work,
+                                    claimed_work,
+                                    headers_sync_work_threshold(&chain),
+                                )
+                            })
+                    };
+                    if let Some((parent_header, parent_work, claimed_work, threshold)) =
+                        low_work_state
+                    {
+                        if add_work_saturating(parent_work, claimed_work) < threshold {
+                            let parent_hash = headers_to_accept[0].prev_blockhash;
+                            let (parent_height, parent_mtp) = {
+                                let chain = node.chain.read();
+                                (
+                                    chain.block_height_by_hash(&parent_hash).unwrap_or_default(),
+                                    chain
+                                        .median_time_past_for_hash(&parent_hash)
+                                        .unwrap_or(parent_header.time),
+                                )
+                            };
+                            let mut sync = LowWorkHeadersSync::new(
+                                node.config.network,
+                                threshold,
+                                parent_hash,
+                                parent_height,
+                                parent_work,
+                                parent_header,
+                                parent_mtp,
+                            );
+                            let result = sync.process(&headers_to_accept, request_more_headers);
+                            if !result.success {
+                                continue;
+                            }
+                            headers_to_accept = result.ready;
+                            if result.request_more {
+                                let locator = {
+                                    let chain = node.chain.read();
+                                    sync.next_locator(&chain)
+                                };
+                                request_sync_locator = Some(locator);
+                            }
+                            sync_finished = result.finished;
+                            if !sync_finished {
+                                headers_sync = Some(sync);
+                            }
+                        }
+                    }
+                }
+
+                if sync_finished {
+                    headers_sync = None;
+                }
+
+                let hashes = node.chain.write().accept_headers(&headers_to_accept)?;
                 if let Some(hash) = hashes.last().copied() {
                     node.update_peer_best_known_block(peer_id, hash);
                 }
@@ -1750,7 +2255,10 @@ async fn serve_peer_loop(
                     )
                     .await?;
                 }
-                if request_more_headers {
+                if let Some(locator) = request_sync_locator {
+                    request_headers_with_locator(node, peer_id, writer, peer_state, locator, true)
+                        .await?;
+                } else if request_more_headers && headers_sync.is_none() {
                     request_headers(node, peer_id, writer, peer_state).await?;
                 }
             }
@@ -3029,14 +3537,25 @@ async fn request_headers(
     writer: &PeerWriter,
     peer_state: &PeerState,
 ) -> Result<()> {
+    let locator = node.chain.read().block_locator_hashes();
+    request_headers_with_locator(node, peer_id, writer, peer_state, locator, false).await
+}
+
+async fn request_headers_with_locator(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    peer_state: &PeerState,
+    locator: Vec<BlockHash>,
+    force: bool,
+) -> Result<()> {
     {
         let mut last_request = peer_state.last_headers_request.lock();
-        if !headers_request_is_due(*last_request) {
+        if !force && !headers_request_is_due(*last_request) {
             return Ok(());
         }
         *last_request = Some(Instant::now());
     }
-    let locator = node.chain.read().block_locator_hashes();
     send_message(
         node,
         peer_id,
@@ -3493,6 +4012,8 @@ mod tests {
     use super::*;
     use bitcoin::Network;
     use bitcoin::bip158::FilterHeader;
+    use bitcoin::block::{Header, Version as BlockVersion};
+    use bitcoin::blockdata::constants::genesis_block;
 
     use crate::{Config, Node};
 
@@ -3744,6 +4265,99 @@ mod tests {
         assert!(headers_download_timed_out(Some(
             now.checked_sub(HEADERS_DOWNLOAD_TIMEOUT).unwrap()
         )));
+    }
+
+    fn mined_regtest_headers(count: usize) -> (Header, Vec<Header>) {
+        let mut previous = genesis_block(Network::Regtest).header;
+        let mut headers = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut header = Header {
+                version: BlockVersion::from_consensus(4),
+                prev_blockhash: previous.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: previous.time.saturating_add(1),
+                bits: previous.bits,
+                nonce: 0,
+            };
+            while !header.target().is_met_by(header.block_hash()) {
+                header.nonce = header.nonce.wrapping_add(1);
+            }
+            previous = header;
+            headers.push(header);
+        }
+        (genesis_block(Network::Regtest).header, headers)
+    }
+
+    #[test]
+    fn low_work_headers_transition_to_redownload_and_release_verified_headers() {
+        let (chain_start, headers) = mined_regtest_headers(300);
+        let per_header = headers[0].work();
+        let mut minimum_work = chain_start.work();
+        for _ in 0..250 {
+            minimum_work = minimum_work + per_header;
+        }
+        let mut sync = LowWorkHeadersSync::new(
+            Network::Regtest,
+            minimum_work,
+            chain_start.block_hash(),
+            0,
+            chain_start.work(),
+            chain_start,
+            chain_start.time,
+        );
+        // Fix the randomized offset for a deterministic commitment boundary.
+        sync.commit_offset = 1;
+
+        let presync = sync.process(&headers, true);
+        assert!(presync.success);
+        assert!(presync.request_more);
+        assert!(!presync.finished);
+        assert_eq!(sync.phase(), LowWorkHeadersPhase::Redownload);
+        assert_eq!(sync.commitment_count(), 2);
+
+        let redownload = sync.process(&headers, true);
+        assert!(redownload.success);
+        assert!(redownload.finished);
+        assert!(!redownload.request_more);
+        assert_eq!(redownload.ready, headers);
+    }
+
+    #[test]
+    fn low_work_headers_abort_on_a_redownload_commitment_mismatch() {
+        let (chain_start, headers) = mined_regtest_headers(300);
+        let per_header = headers[0].work();
+        let mut minimum_work = chain_start.work();
+        for _ in 0..250 {
+            minimum_work = minimum_work + per_header;
+        }
+        let mut sync = LowWorkHeadersSync::new(
+            Network::Regtest,
+            minimum_work,
+            chain_start.block_hash(),
+            0,
+            chain_start.work(),
+            chain_start,
+            chain_start.time,
+        );
+        sync.commit_offset = 1;
+        assert!(sync.process(&headers, true).success);
+
+        let expected = sync.commitments.front().unwrap();
+        let mut changed = headers[0];
+        for tag in 1u8..=u8::MAX {
+            changed.merkle_root = bitcoin::TxMerkleNode::from_byte_array([tag; 32]);
+            changed.nonce = 0;
+            while !changed.target().is_met_by(changed.block_hash()) {
+                changed.nonce = changed.nonce.wrapping_add(1);
+            }
+            if sync.commitment(&changed) != expected {
+                break;
+            }
+        }
+        assert_ne!(sync.commitment(&changed), expected);
+        let result = sync.process(&[changed], true);
+        assert!(!result.success);
+        assert!(result.finished);
     }
 
     #[test]

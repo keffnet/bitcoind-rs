@@ -1434,20 +1434,35 @@ impl ChainState {
     /// cheap while the older entries still let a peer find a common ancestor
     /// without sending the entire active chain.
     pub fn block_locator_hashes(&self) -> Vec<BlockHash> {
+        self.block_locator_hashes_from(self.best_hash())
+    }
+
+    /// Build a locator from any indexed header. Core uses this form while
+    /// re-downloading a low-work header chain: the locator must retain the
+    /// common chain start even though the headers being synchronized are not
+    /// in the active chain yet.
+    pub fn block_locator_hashes_from(&self, start_hash: BlockHash) -> Vec<BlockHash> {
+        let Some(start) = self.block_index.get(&start_hash) else {
+            return self.block_locator_hashes();
+        };
         let mut locator = Vec::new();
-        let mut height = self.height();
+        let mut hash = start_hash;
+        let mut height = start.height;
         let mut step = 1u32;
         loop {
-            if let Some(hash) = self.block_hash(height) {
-                locator.push(hash);
-            }
+            locator.push(hash);
             if height == 0 {
                 break;
             }
             if locator.len() > 10 {
                 step = step.saturating_mul(2);
             }
-            height = height.saturating_sub(step);
+            let target_height = height.saturating_sub(step);
+            let Some(ancestor) = self.ancestor_hash(hash, target_height) else {
+                break;
+            };
+            hash = ancestor;
+            height = target_height;
         }
         locator
     }

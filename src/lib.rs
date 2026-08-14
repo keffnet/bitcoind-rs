@@ -309,6 +309,7 @@ pub struct PeerInfo {
     pub relay_transactions: bool,
     pub min_fee_filter: i64,
     pub transport_protocol_type: &'static str,
+    pub(crate) session_id: String,
     pub connected_at: u64,
     pub last_send: u64,
     pub last_recv: u64,
@@ -1300,6 +1301,7 @@ impl Node {
             relay_transactions: false,
             min_fee_filter: 0,
             transport_protocol_type: "v1",
+            session_id: String::new(),
             connection_type: if inbound { "inbound" } else { "outbound-full" },
             connected_at,
             last_send: 0,
@@ -1459,6 +1461,12 @@ impl Node {
         }
     }
 
+    pub(crate) fn set_peer_session_id(&self, id: usize, session_id: Option<String>) {
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.session_id = session_id.unwrap_or_default();
+        }
+    }
+
     pub(crate) fn set_peer_connection_type(&self, id: usize, connection_type: &'static str) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.connection_type = connection_type;
@@ -1537,6 +1545,7 @@ impl Node {
                 relay_transactions: true,
                 min_fee_filter: 0,
                 transport_protocol_type: "v1",
+                session_id: String::new(),
                 connection_type: "outbound-full",
                 connected_at: now,
                 last_send: now,
@@ -1591,6 +1600,7 @@ impl Node {
             relay_transactions: true,
             min_fee_filter: 0,
             transport_protocol_type: "v1",
+            session_id: String::new(),
             connection_type: "outbound-full",
             connected_at: time,
             last_send: time,
@@ -2087,6 +2097,7 @@ fn load_known_addresses(
                 relay_transactions: true,
                 min_fee_filter: 0,
                 transport_protocol_type: "v1",
+                session_id: String::new(),
                 connection_type: "outbound-full",
                 connected_at: entry.time,
                 last_send: entry.time,

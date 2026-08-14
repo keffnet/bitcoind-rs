@@ -1568,7 +1568,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                         "bytesrecv_per_msg": peer.bytes_received_per_msg,
                         "connection_type": rpc_connection_type(peer.connection_type),
                         "transport_protocol_type": peer.transport_protocol_type,
-                        "session_id": "",
+                        "session_id": peer.session_id,
                     });
                     if let Some(address) = peer.local_address {
                         info["addrbind"] = json!(address.to_string());
@@ -13412,6 +13412,8 @@ mod tests {
         node.update_peer_time_offset(7, 42);
         node.update_peer_bip152_highbandwidth_from(7, true);
         node.update_peer_reported_local_address(7, Some("198.51.100.2:18444".parse().unwrap()));
+        node.set_peer_transport_protocol(7, true);
+        node.set_peer_session_id(7, Some("ab".repeat(32)));
         let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(peer_info[0]["id"], json!(7));
         assert_eq!(
@@ -13423,7 +13425,8 @@ mod tests {
         assert_eq!(peer_info[0]["bip152_hb_from"], json!(true));
         assert_eq!(peer_info[0]["inflight"], json!([]));
         assert_eq!(peer_info[0]["addrlocal"], json!("198.51.100.2:18444"));
-        assert_eq!(peer_info[0]["transport_protocol_type"], json!("v1"));
+        assert_eq!(peer_info[0]["transport_protocol_type"], json!("v2"));
+        assert_eq!(peer_info[0]["session_id"], json!("ab".repeat(32)));
         assert!(peer_info[0].get("startingheight").is_none());
         assert!(peer_info[0].get("pingtime").is_none());
         assert_eq!(peer_info[0]["synced_headers"], json!(-1));

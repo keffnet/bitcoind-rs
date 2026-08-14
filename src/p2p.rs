@@ -9,9 +9,11 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use bip324::futures::{Protocol, ProtocolReader, ProtocolWriter};
 use bip324::io::Payload;
-use bip324::{PacketType, Role};
+use bip324::{
+    GarbageResult, Handshake, InboundCipher, NUM_LENGTH_BYTES, OutboundCipher, PacketType, Role,
+    VersionResult,
+};
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
 use bitcoin::bip158::FilterHash;
 use bitcoin::blockdata::script::Instruction;
@@ -22,7 +24,7 @@ use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
 use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction, Txid, Witness, Wtxid};
 use rand::random;
 use rand::seq::SliceRandom;
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{
     TcpListener, TcpStream,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -38,15 +40,160 @@ use crate::{Node, unix_time_seconds};
 
 enum PeerReader {
     V1(OwnedReadHalf),
-    V2(ProtocolReader<BufReader<OwnedReadHalf>>),
+    V2(Box<V2Reader>),
 }
 
 enum PeerWriterKind {
     V1(OwnedWriteHalf),
-    V2(ProtocolWriter<OwnedWriteHalf>),
+    V2(V2Writer),
 }
 
 type PeerWriter = Arc<Mutex<PeerWriterKind>>;
+
+const BIP324_ELLIGATOR_SWIFT_BYTES: usize = 64;
+const BIP324_GARBAGE_TERMINATOR_BYTES: usize = 16;
+const BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4_000_014;
+
+struct V2BufferedReader {
+    reader: BufReader<OwnedReadHalf>,
+    leftover: Vec<u8>,
+    leftover_offset: usize,
+}
+
+impl V2BufferedReader {
+    fn new(reader: BufReader<OwnedReadHalf>, leftover: Vec<u8>) -> Self {
+        Self {
+            reader,
+            leftover,
+            leftover_offset: 0,
+        }
+    }
+
+    async fn read_some(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let available = self.leftover.len().saturating_sub(self.leftover_offset);
+        if available != 0 {
+            let count = available.min(buffer.len());
+            buffer[..count].copy_from_slice(
+                &self.leftover[self.leftover_offset..self.leftover_offset + count],
+            );
+            self.leftover_offset += count;
+            return Ok(count);
+        }
+        self.reader.read(buffer).await
+    }
+
+    async fn read_exact(&mut self, buffer: &mut [u8]) -> std::io::Result<()> {
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let count = self.read_some(&mut buffer[offset..]).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed during BIP324 transport handshake",
+                ));
+            }
+            offset += count;
+        }
+        Ok(())
+    }
+}
+
+struct V2Reader {
+    cipher: InboundCipher,
+    reader: V2BufferedReader,
+    length_bytes: [u8; NUM_LENGTH_BYTES],
+    length_read: usize,
+    packet_bytes: Vec<u8>,
+    packet_read: usize,
+}
+
+struct V2Payload {
+    packet_type: PacketType,
+    contents: Vec<u8>,
+}
+
+impl V2Payload {
+    fn packet_type(&self) -> PacketType {
+        self.packet_type
+    }
+
+    fn contents(&self) -> &[u8] {
+        &self.contents
+    }
+}
+
+impl V2Reader {
+    fn new(cipher: InboundCipher, reader: V2BufferedReader) -> Self {
+        Self {
+            cipher,
+            reader,
+            length_bytes: [0; NUM_LENGTH_BYTES],
+            length_read: 0,
+            packet_bytes: Vec::new(),
+            packet_read: 0,
+        }
+    }
+
+    async fn read(&mut self) -> Result<V2Payload> {
+        while self.length_read < NUM_LENGTH_BYTES {
+            let count = self
+                .reader
+                .read_some(&mut self.length_bytes[self.length_read..])
+                .await?;
+            if count == 0 {
+                bail!("peer closed the BIP324 transport");
+            }
+            self.length_read += count;
+        }
+
+        let packet_len = self.cipher.decrypt_packet_len(self.length_bytes);
+        if packet_len > BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION {
+            bail!("BIP324 packet exceeds the allocation limit");
+        }
+        self.packet_bytes.resize(packet_len, 0);
+        while self.packet_read < packet_len {
+            let count = self
+                .reader
+                .read_some(&mut self.packet_bytes[self.packet_read..])
+                .await?;
+            if count == 0 {
+                bail!("peer closed the BIP324 transport");
+            }
+            self.packet_read += count;
+        }
+
+        let packet_bytes = std::mem::take(&mut self.packet_bytes);
+        self.packet_read = 0;
+        self.length_read = 0;
+        let mut plaintext = vec![0; InboundCipher::decryption_buffer_len(packet_len)];
+        let packet_type = self
+            .cipher
+            .decrypt(&packet_bytes, &mut plaintext, None)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        Ok(V2Payload {
+            packet_type,
+            contents: plaintext[1..].to_vec(),
+        })
+    }
+}
+
+struct V2Writer {
+    cipher: OutboundCipher,
+    writer: OwnedWriteHalf,
+}
+
+impl V2Writer {
+    async fn write(&mut self, payload: &Payload) -> Result<()> {
+        let packet_len = OutboundCipher::encryption_buffer_len(payload.contents().len());
+        let mut packet = vec![0; packet_len];
+        self.cipher
+            .encrypt(payload.contents(), &mut packet, payload.packet_type(), None)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        self.writer.write_all(&packet).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+}
 
 const MAX_BLOOM_FILTER_SIZE: usize = 36_000;
 const MAX_BLOOM_HASH_FUNCS: u32 = 50;
@@ -755,7 +902,12 @@ async fn establish_transport(
     outbound: bool,
     network: Network,
     transport_v2: Option<bool>,
-) -> Result<(PeerReader, PeerWriterKind, Option<SocketAddr>)> {
+) -> Result<(
+    PeerReader,
+    PeerWriterKind,
+    Option<SocketAddr>,
+    Option<String>,
+)> {
     if outbound {
         if transport_v2 == Some(false) {
             return establish_v1(stream);
@@ -764,8 +916,8 @@ async fn establish_transport(
             return establish_v2(stream, network, Role::Initiator).await;
         }
         match establish_v2(stream, network, Role::Initiator).await {
-            Ok((reader, writer, local_address)) => {
-                return Ok((reader, writer, local_address));
+            Ok((reader, writer, local_address, session_id)) => {
+                return Ok((reader, writer, local_address, session_id));
             }
             Err(error) => {
                 debug!(%address, %error, "BIP324 handshake failed; retrying with v1");
@@ -802,33 +954,96 @@ async fn establish_v2(
     stream: TcpStream,
     network: Network,
     role: Role,
-) -> Result<(PeerReader, PeerWriterKind, Option<SocketAddr>)> {
+) -> Result<(
+    PeerReader,
+    PeerWriterKind,
+    Option<SocketAddr>,
+    Option<String>,
+)> {
     let local_address = stream.local_addr().ok();
-    let (reader, writer) = stream.into_split();
-    let protocol = Protocol::new(
-        wire::network_magic(network),
-        role,
-        None,
-        None,
-        BufReader::new(reader),
-        writer,
-    )
-    .await?;
-    let (reader, writer) = protocol.into_split();
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let handshake = Handshake::new(wire::network_magic(network), role)?;
+    let mut key_buffer = vec![0; Handshake::<bip324::Initialized>::send_key_len(None)];
+    let handshake = handshake.send_key(None, &mut key_buffer)?;
+    writer.write_all(&key_buffer).await?;
+    writer.flush().await?;
+
+    let mut remote_key = [0; BIP324_ELLIGATOR_SWIFT_BYTES];
+    reader.read_exact(&mut remote_key).await?;
+    let handshake = handshake.receive_key(remote_key)?;
+
+    let mut version_buffer = vec![0; Handshake::<bip324::ReceivedKey<'_>>::send_version_len(None)];
+    let handshake = handshake.send_version(&mut version_buffer, None)?;
+    writer.write_all(&version_buffer).await?;
+    writer.flush().await?;
+
+    let mut garbage_buffer = vec![0; BIP324_GARBAGE_TERMINATOR_BYTES];
+    reader.read_exact(&mut garbage_buffer).await?;
+    let mut garbage_handshake = handshake;
+    let (mut handshake, garbage_bytes) = loop {
+        match garbage_handshake.receive_garbage(&garbage_buffer)? {
+            GarbageResult::FoundGarbage {
+                handshake,
+                consumed_bytes,
+            } => break (handshake, consumed_bytes),
+            GarbageResult::NeedMoreData(next_handshake) => {
+                let mut temp = vec![0; 256];
+                let count = reader.read(&mut temp).await?;
+                if count == 0 {
+                    bail!("peer closed during BIP324 garbage negotiation");
+                }
+                garbage_buffer.extend_from_slice(&temp[..count]);
+                garbage_handshake = next_handshake;
+            }
+        }
+    };
+
+    let mut session_reader =
+        V2BufferedReader::new(reader, garbage_buffer[garbage_bytes..].to_vec());
+    let mut length_bytes = [0; NUM_LENGTH_BYTES];
+    let cipher = loop {
+        session_reader.read_exact(&mut length_bytes).await?;
+        let packet_len = handshake.decrypt_packet_len(length_bytes)?;
+        if packet_len > BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION {
+            bail!("BIP324 packet exceeds the allocation limit");
+        }
+        let mut packet_bytes = vec![0; packet_len];
+        session_reader.read_exact(&mut packet_bytes).await?;
+        match handshake.receive_version(&mut packet_bytes)? {
+            VersionResult::Complete { cipher } => break cipher,
+            VersionResult::Decoy(next_handshake) => handshake = next_handshake,
+        }
+    };
+    let session_id = Some(hex::encode(cipher.id()));
+    let (inbound_cipher, outbound_cipher) = cipher.into_split();
     Ok((
-        PeerReader::V2(reader),
-        PeerWriterKind::V2(writer),
+        PeerReader::V2(Box::new(V2Reader::new(inbound_cipher, session_reader))),
+        PeerWriterKind::V2(V2Writer {
+            cipher: outbound_cipher,
+            writer,
+        }),
         local_address,
+        session_id,
     ))
 }
 
-fn establish_v1(stream: TcpStream) -> Result<(PeerReader, PeerWriterKind, Option<SocketAddr>)> {
+fn establish_v1(
+    stream: TcpStream,
+) -> Result<(
+    PeerReader,
+    PeerWriterKind,
+    Option<SocketAddr>,
+    Option<String>,
+)> {
     let local_address = stream.local_addr().ok();
     let (reader, writer) = stream.into_split();
     Ok((
         PeerReader::V1(reader),
         PeerWriterKind::V1(writer),
         local_address,
+        None,
     ))
 }
 
@@ -848,7 +1063,7 @@ async fn serve_peer(
 ) -> Result<()> {
     let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
-    let (mut reader, writer_half, local_address) = establish_transport(
+    let (mut reader, writer_half, local_address, session_id) = establish_transport(
         stream,
         address,
         options.outbound,
@@ -860,6 +1075,7 @@ async fn serve_peer(
     let (commands, command_receiver) = mpsc::unbounded_channel();
     node.register_peer_with_local(peer_id, address, !options.outbound, commands, local_address);
     node.set_peer_transport_protocol(peer_id, transport_v2);
+    node.set_peer_session_id(peer_id, session_id);
     node.set_peer_connection_type(peer_id, options.connection_type);
     let peer_state = Arc::new(PeerState {
         writer: Arc::new(Mutex::new(writer_half)),
@@ -3447,8 +3663,10 @@ mod tests {
             establish_v2(client, Network::Regtest, Role::Initiator),
             establish_v2(server, Network::Regtest, Role::Responder),
         );
-        let (client_reader, client_writer, _) = client_result.unwrap();
-        let (server_reader, server_writer, _) = server_result.unwrap();
+        let (client_reader, client_writer, _, client_session_id) = client_result.unwrap();
+        let (server_reader, server_writer, _, server_session_id) = server_result.unwrap();
+        assert_eq!(client_session_id, server_session_id);
+        assert_eq!(client_session_id.as_ref().map(String::len), Some(64));
         let mut client_reader = match client_reader {
             PeerReader::V2(reader) => reader,
             PeerReader::V1(_) => panic!("expected encrypted client reader"),

@@ -64,7 +64,7 @@ impl BlockStore {
             None => {
                 let index = scan_index(&mut file)
                     .with_context(|| format!("scanning {}", path.display()))?;
-                rewrite_index(&mut index_file, data_len, &index)?;
+                rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
                 index
             }
         };
@@ -89,7 +89,7 @@ impl BlockStore {
             None => {
                 let index = scan_undo_index(&mut undo_file)
                     .with_context(|| format!("scanning {}", undo_path.display()))?;
-                rewrite_index(&mut undo_index_file, undo_data_len, &index)?;
+                rewrite_index(&mut undo_index_file, undo_file.metadata()?.len(), &index)?;
                 index
             }
         };
@@ -336,7 +336,7 @@ impl FilterStore {
             Some(index) => index,
             None => {
                 let index = scan_filter_index(&mut file)?;
-                rewrite_index(&mut index_file, data_len, &index)?;
+                rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
                 index
             }
         };
@@ -502,20 +502,24 @@ fn load_filter_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<Bl
 fn scan_filter_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
     file.seek(SeekFrom::Start(0))?;
     let mut index = HashMap::new();
+    let data_len = file.metadata()?.len();
     loop {
         let offset = file.stream_position()?;
         let mut length_bytes = [0u8; 4];
         match file.read_exact(&mut length_bytes) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                if offset == file.metadata()?.len() {
-                    break;
-                }
-                return Err(error.into());
+                file.set_len(offset)?;
+                break;
             }
             Err(error) => return Err(error.into()),
         }
         let length = u32::from_le_bytes(length_bytes);
+        let end = offset.saturating_add(4).saturating_add(u64::from(length));
+        if end > data_len {
+            file.set_len(offset)?;
+            break;
+        }
         if length < 64 || length as usize > MAX_STORED_FILTER_SIZE + 64 {
             bail!(
                 "invalid filter record length {} at offset {}",
@@ -621,20 +625,24 @@ fn persist_index_entry(
 fn scan_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
     file.seek(SeekFrom::Start(0))?;
     let mut index = HashMap::new();
+    let data_len = file.metadata()?.len();
     loop {
         let offset = file.stream_position()?;
         let mut length_bytes = [0u8; 4];
         match file.read_exact(&mut length_bytes) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                if offset == file.metadata()?.len() {
-                    break;
-                }
-                return Err(error.into());
+                file.set_len(offset)?;
+                break;
             }
             Err(error) => return Err(error.into()),
         }
         let length = u32::from_le_bytes(length_bytes);
+        let end = offset.saturating_add(4).saturating_add(u64::from(length));
+        if end > data_len {
+            file.set_len(offset)?;
+            break;
+        }
         if length == 0 || length as usize > MAX_STORED_BLOCK_SIZE {
             bail!(
                 "invalid block record length {} at offset {}",
@@ -662,20 +670,24 @@ fn scan_undo_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
     file.seek(SeekFrom::Start(0))?;
     let mut index = HashMap::new();
     let mut max_end = 0u64;
+    let data_len = file.metadata()?.len();
     loop {
         let offset = file.stream_position()?;
         let mut length_bytes = [0u8; 4];
         match file.read_exact(&mut length_bytes) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                if offset == file.metadata()?.len() {
-                    break;
-                }
-                return Err(error.into());
+                file.set_len(offset)?;
+                break;
             }
             Err(error) => return Err(error.into()),
         }
         let length = u32::from_le_bytes(length_bytes);
+        let end = offset.saturating_add(4).saturating_add(u64::from(length));
+        if end > data_len {
+            file.set_len(offset)?;
+            break;
+        }
         if length == 0 || length as usize > MAX_STORED_UNDO_SIZE {
             bail!("invalid undo record length {} at offset {}", length, offset);
         }
@@ -766,6 +778,79 @@ mod tests {
         let mut reopened = BlockStore::open(directory.path()).unwrap();
         assert!(reopened.contains(&hash));
         assert_eq!(reopened.get(&hash).unwrap().unwrap(), block);
+    }
+
+    #[test]
+    fn recovers_truncated_final_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let block = genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+        {
+            let mut store = BlockStore::open(directory.path()).unwrap();
+            store.insert(&block).unwrap();
+            store.insert_undo(hash, &[Vec::new()]).unwrap();
+        }
+        let block_len = std::fs::metadata(directory.path().join("blocks.dat"))
+            .unwrap()
+            .len();
+        let undo_len = std::fs::metadata(directory.path().join("undo.dat"))
+            .unwrap()
+            .len();
+        for path in ["blocks.dat", "undo.dat"] {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(directory.path().join(path))
+                .unwrap();
+            std::io::Write::write_all(&mut file, &128u32.to_le_bytes()).unwrap();
+            std::io::Write::write_all(&mut file, &[1, 2, 3]).unwrap();
+            std::io::Write::flush(&mut file).unwrap();
+        }
+        let mut reopened = BlockStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&hash).unwrap(), Some(block));
+        assert_eq!(reopened.get_undo(&hash).unwrap(), Some(vec![Vec::new()]));
+        assert_eq!(
+            std::fs::metadata(directory.path().join("blocks.dat"))
+                .unwrap()
+                .len(),
+            block_len
+        );
+        assert_eq!(
+            std::fs::metadata(directory.path().join("undo.dat"))
+                .unwrap()
+                .len(),
+            undo_len
+        );
+
+        let filter_directory = tempfile::tempdir().unwrap();
+        let filter_hash = BlockHash::from_byte_array([8; 32]);
+        let filter_header = FilterHeader::from_byte_array([9; 32]);
+        {
+            let mut store = FilterStore::open(filter_directory.path()).unwrap();
+            store
+                .insert(filter_hash, &[1, 2, 3], filter_header)
+                .unwrap();
+        }
+        let filter_len = std::fs::metadata(filter_directory.path().join("basic-filters.dat"))
+            .unwrap()
+            .len();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(filter_directory.path().join("basic-filters.dat"))
+            .unwrap();
+        std::io::Write::write_all(&mut file, &128u32.to_le_bytes()).unwrap();
+        std::io::Write::write_all(&mut file, &[1, 2, 3]).unwrap();
+        std::io::Write::flush(&mut file).unwrap();
+        let mut reopened = FilterStore::open(filter_directory.path()).unwrap();
+        assert_eq!(
+            reopened.get(&filter_hash).unwrap(),
+            Some((vec![1, 2, 3], filter_header))
+        );
+        assert_eq!(
+            std::fs::metadata(filter_directory.path().join("basic-filters.dat"))
+                .unwrap()
+                .len(),
+            filter_len
+        );
     }
 
     #[test]

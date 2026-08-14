@@ -581,6 +581,16 @@ async fn serve_peer_loop(
                                         .map(|entry| entry.transaction.clone())
                                 }
                             };
+                            let transaction = if transaction.is_some() {
+                                transaction
+                            } else if item.kind == InventoryType::Transaction {
+                                node.chain
+                                    .write()
+                                    .transaction(&Txid::from_byte_array(item.hash.to_byte_array()))?
+                                    .map(|(transaction, _)| transaction)
+                            } else {
+                                None
+                            };
                             if let Some(transaction) = transaction {
                                 send_message(
                                     node,

@@ -3838,6 +3838,12 @@ fn get_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if txids.is_empty() {
         bail!("transaction id array must not be empty");
     }
+    let mut unique_txids = HashSet::with_capacity(txids.len());
+    for txid in &txids {
+        if !unique_txids.insert(*txid) {
+            bail!("invalid parameter, duplicated txid: {txid}");
+        }
+    }
     let requested_hash = params
         .get(1)
         .filter(|value| !value.is_null())
@@ -10898,6 +10904,16 @@ mod tests {
         assert_eq!(
             dispatch_method(&node, "verifytxoutproof", &json!([hex::encode(proof)]),).unwrap(),
             json!([txid.to_string()])
+        );
+        assert!(
+            get_txout_proof(
+                &node,
+                &json!([
+                    [txid.to_string(), txid.to_string()],
+                    genesis.block_hash().to_string()
+                ]),
+            )
+            .is_err()
         );
 
         let mut off_chain = bitcoin::Block {

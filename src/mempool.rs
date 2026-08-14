@@ -1,6 +1,7 @@
 //! In-memory transaction admission and relay pool.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -80,6 +81,41 @@ pub struct Mempool {
     wtxids: HashMap<Wtxid, Txid>,
     priorities: HashMap<Txid, i64>,
     changes: Vec<MempoolChange>,
+}
+
+#[derive(Clone, Copy)]
+struct MiningPackageMetrics {
+    fee: i128,
+    weight: u64,
+    version: u64,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct MiningCandidate {
+    txid: Txid,
+    fee: i128,
+    weight: u64,
+    version: u64,
+}
+
+impl Ord for MiningCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let left = self.fee.saturating_mul(i128::from(other.weight));
+        let right = other.fee.saturating_mul(i128::from(self.weight));
+        left.cmp(&right)
+            // BinaryHeap is a max-heap, while Core's deterministic tie break
+            // prefers the lexicographically smaller transaction id.
+            .then_with(|| other.txid.to_string().cmp(&self.txid.to_string()))
+            .then_with(|| self.version.cmp(&other.version))
+            .then_with(|| self.fee.cmp(&other.fee))
+            .then_with(|| self.weight.cmp(&other.weight))
+    }
+}
+
+impl PartialOrd for MiningCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -280,54 +316,118 @@ impl Mempool {
         let mut selected = HashSet::new();
         let mut ordered = Vec::new();
         let mut selected_weight = 0u64;
+        let mut metrics = HashMap::with_capacity(self.entries.len());
+        let mut candidates = BinaryHeap::with_capacity(self.entries.len());
+
+        for txid in self.entries.keys().copied() {
+            let mut package = HashSet::new();
+            if !collect_mining_package(
+                self,
+                txid,
+                &HashSet::new(),
+                &mut package,
+                &mut HashSet::new(),
+            ) {
+                continue;
+            }
+            let package_weight = package
+                .iter()
+                .filter_map(|candidate| self.entries.get(candidate))
+                .map(|entry| entry.transaction.weight().to_wu())
+                .fold(0u64, u64::saturating_add);
+            let package_fee = package
+                .iter()
+                .filter_map(|candidate| {
+                    self.entries.get(candidate).map(|entry| {
+                        i128::from(entry.fee_sat) + i128::from(self.fee_delta(candidate))
+                    })
+                })
+                .fold(0i128, i128::saturating_add);
+            let package_metrics = MiningPackageMetrics {
+                fee: package_fee,
+                weight: package_weight,
+                version: 0,
+            };
+            metrics.insert(txid, package_metrics);
+            candidates.push(MiningCandidate {
+                txid,
+                fee: package_fee,
+                weight: package_weight,
+                version: 0,
+            });
+        }
 
         while selected.len() < self.entries.len() {
-            let mut best: Option<(Txid, HashSet<Txid>, u64, i128)> = None;
-            for txid in self.entries.keys().copied() {
-                if selected.contains(&txid) {
-                    continue;
-                }
-                let mut package = HashSet::new();
-                if !collect_mining_package(self, txid, &selected, &mut package, &mut HashSet::new())
-                {
-                    continue;
-                }
-                let package_weight = package
-                    .iter()
-                    .filter_map(|candidate| self.entries.get(candidate))
-                    .map(|entry| entry.transaction.weight().to_wu())
-                    .fold(0u64, u64::saturating_add);
-                if selected_weight.saturating_add(package_weight) > weight_limit {
-                    continue;
-                }
-                let package_fee = package
-                    .iter()
-                    .filter_map(|candidate| {
-                        self.entries.get(candidate).map(|entry| {
-                            i128::from(entry.fee_sat) + i128::from(self.fee_delta(candidate))
-                        })
-                    })
-                    .fold(0i128, i128::saturating_add);
-                let better = match &best {
-                    None => true,
-                    Some((best_txid, _, best_weight, best_fee)) => {
-                        let left = package_fee.saturating_mul(i128::from(*best_weight));
-                        let right = best_fee.saturating_mul(i128::from(package_weight));
-                        left > right || (left == right && txid.to_string() < best_txid.to_string())
-                    }
-                };
-                if better {
-                    best = Some((txid, package, package_weight, package_fee));
-                }
-            }
-
-            let Some((txid, package, package_weight, _)) = best else {
+            let Some(candidate) = next_mining_candidate(
+                &mut candidates,
+                &metrics,
+                &selected,
+                selected_weight,
+                weight_limit,
+            ) else {
                 break;
             };
+            let txid = candidate.txid;
+            let mut package = HashSet::new();
+            if !collect_mining_package(self, txid, &selected, &mut package, &mut HashSet::new()) {
+                continue;
+            }
+            let package_weight = package
+                .iter()
+                .filter_map(|candidate| self.entries.get(candidate))
+                .map(|entry| entry.transaction.weight().to_wu())
+                .fold(0u64, u64::saturating_add);
             let mut package_order = Vec::with_capacity(package.len());
             append_mining_package(self, txid, &package, &mut selected, &mut package_order);
             selected_weight = selected_weight.saturating_add(package_weight);
             ordered.extend(package_order);
+
+            for selected_txid in package {
+                metrics.remove(&selected_txid);
+                let fee = self
+                    .entries
+                    .get(&selected_txid)
+                    .map(|entry| {
+                        i128::from(entry.fee_sat) + i128::from(self.fee_delta(&selected_txid))
+                    })
+                    .unwrap_or_default();
+                let weight = self
+                    .entries
+                    .get(&selected_txid)
+                    .map(|entry| entry.transaction.weight().to_wu())
+                    .unwrap_or_default();
+                let mut descendants = vec![selected_txid];
+                let mut index = 0;
+                while let Some(current) = descendants.get(index).copied() {
+                    index += 1;
+                    let Some(children) = self.children.get(&current) else {
+                        continue;
+                    };
+                    descendants.extend(
+                        children
+                            .iter()
+                            .copied()
+                            .filter(|child| self.entries.contains_key(child)),
+                    );
+                }
+                for descendant in descendants {
+                    if selected.contains(&descendant) {
+                        continue;
+                    }
+                    let Some(package_metrics) = metrics.get_mut(&descendant) else {
+                        continue;
+                    };
+                    package_metrics.fee = package_metrics.fee.saturating_sub(fee);
+                    package_metrics.weight = package_metrics.weight.saturating_sub(weight);
+                    package_metrics.version = package_metrics.version.saturating_add(1);
+                    candidates.push(MiningCandidate {
+                        txid: descendant,
+                        fee: package_metrics.fee,
+                        weight: package_metrics.weight,
+                        version: package_metrics.version,
+                    });
+                }
+            }
         }
 
         ordered
@@ -1593,6 +1693,37 @@ fn collect_mining_package(
     visiting.remove(&txid);
     package.insert(txid);
     true
+}
+
+fn next_mining_candidate(
+    candidates: &mut BinaryHeap<MiningCandidate>,
+    metrics: &HashMap<Txid, MiningPackageMetrics>,
+    selected: &HashSet<Txid>,
+    selected_weight: u64,
+    weight_limit: u64,
+) -> Option<MiningCandidate> {
+    while let Some(candidate) = candidates.pop() {
+        if selected.contains(&candidate.txid) {
+            continue;
+        }
+        let Some(current) = metrics.get(&candidate.txid) else {
+            continue;
+        };
+        if current.version != candidate.version
+            || current.fee != candidate.fee
+            || current.weight != candidate.weight
+        {
+            continue;
+        }
+        if selected_weight.saturating_add(candidate.weight) > weight_limit {
+            // A package that does not fit cannot become smaller unless one of
+            // its ancestors is selected; that selection pushes a fresh heap
+            // entry through the descendant update path.
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
 }
 
 fn append_mining_package(

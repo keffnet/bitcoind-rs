@@ -212,6 +212,7 @@ const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
+const MAX_PEER_TX_ANNOUNCEMENTS: usize = 5_000;
 const MAX_GETDATA_BATCH: usize = 1_000;
 const MAX_BLOCKS_TO_ANNOUNCE: usize = 8;
 const INVENTORY_BROADCAST_TARGET: usize = 70;
@@ -1596,7 +1597,7 @@ async fn serve_peer_loop(
                     }
                 }
                 let mut needs_headers = false;
-                let transaction_requests = {
+                let mut transaction_requests = {
                     let chain = node.chain.read();
                     let mempool = node.mempool.read();
                     items
@@ -1644,6 +1645,10 @@ async fn serve_peer_loop(
                         .take(50_000)
                         .collect::<Vec<_>>()
                 };
+                // Core tracks at most this many outstanding transaction
+                // announcements from one peer to bound announcement-driven
+                // memory and download work.
+                transaction_requests.truncate(MAX_PEER_TX_ANNOUNCEMENTS);
                 if !transaction_requests.is_empty() {
                     send_getdata_batches(
                         node,

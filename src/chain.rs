@@ -2989,6 +2989,9 @@ impl ChainState {
                 input_total = input_total
                     .checked_add(entry.output.value.to_sat())
                     .ok_or(ValidationError::InputTotalOverflow)?;
+                if input_total > Amount::MAX_MONEY.to_sat() {
+                    return Err(ValidationError::InputTotalOverflow.into());
+                }
                 metrics.prevout_spent_sat = metrics
                     .prevout_spent_sat
                     .saturating_add(entry.output.value.to_sat());
@@ -6015,6 +6018,58 @@ mod tests {
         assert!(state.connect_block(side).is_err());
         assert!(!state.store.contains(&side_hash));
         assert_eq!(state.height(), 2);
+    }
+
+    #[test]
+    fn rejects_transaction_input_total_above_max_money() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let first_outpoint = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let second_outpoint = OutPoint::new(Txid::from_byte_array([2; 32]), 0);
+        let half_money = Amount::MAX_MONEY.to_sat() / 2;
+        for outpoint in [first_outpoint, second_outpoint] {
+            state.utxos.insert(
+                outpoint,
+                UtxoEntry {
+                    output: TxOut {
+                        value: Amount::from_sat(half_money.saturating_add(1)),
+                        script_pubkey: Builder::new().push_int(1).into_script(),
+                    },
+                    height: 0,
+                    median_time_past: 0,
+                    coinbase: false,
+                },
+            );
+        }
+        let mut block = mine_block(&state, 1);
+        block.txdata.push(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![
+                TxIn {
+                    previous_output: first_outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::default(),
+                },
+                TxIn {
+                    previous_output: second_outpoint,
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::default(),
+                },
+            ],
+            output: vec![TxOut {
+                value: Amount::MAX_MONEY,
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        });
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        assert!(state.connect_block(block).is_err());
+        assert_eq!(state.height(), 0);
     }
 
     #[test]

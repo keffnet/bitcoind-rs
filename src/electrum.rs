@@ -702,7 +702,7 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
 
 fn block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = param::<u32>(params, 0)?;
-    let checkpoint = params.get(1).and_then(Value::as_u64).unwrap_or(0);
+    let checkpoint = crate::rpc::optional_u64(params, 1, 0, "cp_height")?;
     let checkpoint = u32::try_from(checkpoint).map_err(|_| anyhow!("checkpoint is too large"))?;
     let chain = node.chain.read();
     let header = chain
@@ -729,7 +729,7 @@ fn block_headers_for_protocol(
 ) -> Result<Value> {
     let start = param::<u32>(params, 0)?;
     let count = param::<u32>(params, 1)?.min(2_016);
-    let checkpoint = params.get(2).and_then(Value::as_u64).unwrap_or(0);
+    let checkpoint = crate::rpc::optional_u64(params, 2, 0, "cp_height")?;
     let checkpoint = u32::try_from(checkpoint).map_err(|_| anyhow!("checkpoint is too large"))?;
     if checkpoint != 0 && count != 0 && start.saturating_add(count.saturating_sub(1)) > checkpoint {
         bail!("checkpoint height is below the requested header range")

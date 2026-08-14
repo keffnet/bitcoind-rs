@@ -2776,11 +2776,7 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let address = parse_ip_address(&address)?;
     match command.as_str() {
         "add" => {
-            let requested_duration = params
-                .get(2)
-                .filter(|value| !value.is_null())
-                .and_then(Value::as_u64)
-                .unwrap_or(86_400);
+            let requested_duration = optional_u64(params, 2, 86_400, "bantime")?;
             let absolute = optional_bool(params, 3, false, "absolute")?;
             let now = unix_time();
             let ban_until = if absolute {
@@ -3763,8 +3759,14 @@ fn get_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     let requested_hash = params
         .get(1)
-        .and_then(Value::as_str)
-        .map(str::parse::<BlockHash>)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("blockhash must be a string"))?
+                .parse::<BlockHash>()
+                .map_err(|error| anyhow!("invalid blockhash: {error}"))
+        })
         .transpose()?;
     let mut chain = node.chain.write();
     let block_hash = if let Some(hash) = requested_hash {
@@ -4103,8 +4105,9 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     } else {
         let height = selector
             .as_u64()
-            .ok_or_else(|| anyhow!("block selector must be a hash or height"))?
-            as u32;
+            .ok_or_else(|| anyhow!("block selector must be a hash or height"))?;
+        let height =
+            u32::try_from(height).map_err(|_| anyhow!("block selector height is out of range"))?;
         node.chain
             .read()
             .block_hash(height)
@@ -4305,8 +4308,14 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let verbosity = parse_transaction_verbosity(params.get(1))?;
     let requested_block = params
         .get(2)
-        .and_then(Value::as_str)
-        .map(str::parse::<BlockHash>)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("blockhash must be a string"))?
+                .parse::<BlockHash>()
+                .map_err(|error| anyhow!("invalid blockhash: {error}"))
+        })
         .transpose()?;
     let mut chain = node.chain.write();
     if let Some(genesis_hash) = chain.block_hash(0)
@@ -10272,6 +10281,15 @@ fn optional_i64(params: &Value, index: usize, default: i64, name: &str) -> Resul
         .ok_or_else(|| anyhow!("{name} must be an integer"))
 }
 
+pub(crate) fn optional_u64(params: &Value, index: usize, default: u64, name: &str) -> Result<u64> {
+    let Some(value) = params.get(index).filter(|value| !value.is_null()) else {
+        return Ok(default);
+    };
+    value
+        .as_u64()
+        .ok_or_else(|| anyhow!("{name} must be a non-negative integer"))
+}
+
 fn rpc_error(error: &anyhow::Error) -> Value {
     json!({"code": -1, "message": error.to_string()})
 }
@@ -11222,6 +11240,11 @@ mod tests {
         assert_eq!(optional_i64(&json!([null]), 0, 7, "number").unwrap(), 7);
         assert_eq!(optional_i64(&json!([-2]), 0, 7, "number").unwrap(), -2);
         assert!(optional_i64(&json!(["7"]), 0, 7, "number").is_err());
+        assert_eq!(optional_u64(&json!([]), 0, 7, "number").unwrap(), 7);
+        assert_eq!(optional_u64(&json!([null]), 0, 7, "number").unwrap(), 7);
+        assert_eq!(optional_u64(&json!([2]), 0, 7, "number").unwrap(), 2);
+        assert!(optional_u64(&json!([-2]), 0, 7, "number").is_err());
+        assert!(optional_u64(&json!(["7"]), 0, 7, "number").is_err());
     }
 
     #[test]
@@ -13028,6 +13051,7 @@ mod tests {
         assert!(add_node(&node, &json!(["127.0.0.1:18444", "add"])).is_err());
         let added = get_added_node_info(&node, &json!([])).unwrap();
         assert_eq!(added[0]["addednode"], "127.0.0.1:18444");
+        assert!(set_ban(&node, &json!(["add", "192.0.2.2", "60"])).is_err());
         set_ban(&node, &json!(["add", "192.0.2.1", 60])).unwrap();
         assert_eq!(list_banned(&node).unwrap().as_array().unwrap().len(), 1);
         clear_banned(&node).unwrap();
@@ -13525,6 +13549,7 @@ mod tests {
             get_raw_transaction(&node, &json!([txid.to_string(), 1, block_hash.to_string()]))
                 .is_ok()
         );
+        assert!(get_raw_transaction(&node, &json!([txid.to_string(), 1, 1])).is_err());
     }
 
     #[test]

@@ -458,13 +458,16 @@ fn server_features_for_protocol(node: &Arc<Node>, protocol_version: ProtocolVers
         hosts.insert(host, json!({"tcp_port": address.port(), "ssl_port": null}));
     }
     let chain = node.chain.read();
+    let pruning = chain
+        .is_pruned()
+        .then(|| chain.prune_height().unwrap_or_default().saturating_add(1));
     let mut features = json!({
         "hosts": Value::Object(hosts),
         "server_version": SERVER_NAME,
         "protocol_min": "1.4",
         "protocol_max": "1.7",
         "genesis_hash": chain.block_hash(0).expect("genesis exists").to_string(),
-        "pruning": null,
+        "pruning": pruning,
     });
     if protocol_version < PROTOCOL_1_7 {
         features["hash_function"] = json!("sha256");
@@ -1584,6 +1587,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(features["protocol_max"], json!("1.7"));
+        assert_eq!(features["pruning"], Value::Null);
         assert!(features.get("hash_function").is_none());
         assert_eq!(
             dispatch_with_session(

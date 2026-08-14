@@ -1,6 +1,6 @@
 //! Bitcoin peer networking and block/transaction relay.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
@@ -14,9 +14,12 @@ use bip324::io::Payload;
 use bip324::{PacketType, Role};
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds, ShortId};
 use bitcoin::bip158::{FilterHash, FilterHeader};
+use bitcoin::blockdata::script::Instruction;
+use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::message_bloom::{BloomFlags, FilterAdd, FilterLoad};
 use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
-use bitcoin::{Block, BlockHash, Network, Transaction, Txid, Wtxid};
+use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction, Txid, Wtxid};
 use rand::random;
 use tokio::io::BufReader;
 use tokio::net::{
@@ -40,7 +43,161 @@ enum PeerWriterKind {
 }
 
 type PeerWriter = Arc<Mutex<PeerWriterKind>>;
-type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, PeerWriter>>>;
+
+const MAX_BLOOM_FILTER_SIZE: usize = 36_000;
+const MAX_BLOOM_HASH_FUNCS: u32 = 50;
+const MAX_BLOOM_ELEMENT_SIZE: usize = 520;
+
+struct PeerState {
+    writer: PeerWriter,
+    bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
+}
+
+type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, Arc<PeerState>>>>;
+
+#[derive(Clone, Debug)]
+struct BloomFilter {
+    data: Vec<u8>,
+    hash_funcs: u32,
+    tweak: u32,
+    flags: BloomFlags,
+}
+
+impl BloomFilter {
+    fn from_message(message: FilterLoad) -> Result<Self> {
+        if message.filter.len() > MAX_BLOOM_FILTER_SIZE {
+            anyhow::bail!("bloom filter exceeds the 36000-byte limit");
+        }
+        if message.hash_funcs > MAX_BLOOM_HASH_FUNCS {
+            anyhow::bail!("bloom filter has too many hash functions");
+        }
+        Ok(Self {
+            data: message.filter,
+            hash_funcs: message.hash_funcs,
+            tweak: message.tweak,
+            flags: message.flags,
+        })
+    }
+
+    fn insert(&mut self, value: &[u8]) {
+        if self.data.is_empty() {
+            return;
+        }
+        let bit_count = self.data.len().saturating_mul(8);
+        for index in 0..self.hash_funcs {
+            let seed = index.wrapping_mul(0xfba4_c795).wrapping_add(self.tweak);
+            let bit = (murmur_hash3(seed, value) as usize) % bit_count;
+            self.data[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+
+    fn contains(&self, value: &[u8]) -> bool {
+        if self.data.is_empty() {
+            return true;
+        }
+        let bit_count = self.data.len().saturating_mul(8);
+        (0..self.hash_funcs).all(|index| {
+            let seed = index.wrapping_mul(0xfba4_c795).wrapping_add(self.tweak);
+            let bit = (murmur_hash3(seed, value) as usize) % bit_count;
+            self.data[bit / 8] & (1 << (bit % 8)) != 0
+        })
+    }
+
+    fn contains_script_data(&self, script: &bitcoin::Script) -> bool {
+        for instruction in script.instructions() {
+            match instruction {
+                Ok(Instruction::PushBytes(data))
+                    if !data.is_empty() && self.contains(data.as_bytes()) =>
+                {
+                    return true;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        false
+    }
+
+    fn is_relevant_and_update(&mut self, transaction: &Transaction) -> bool {
+        if self.data.is_empty() {
+            return true;
+        }
+        let txid = transaction.compute_txid();
+        if self.contains(&serialize(&txid)) {
+            return true;
+        }
+        let mut matched = false;
+        for (index, output) in transaction.output.iter().enumerate() {
+            if !self.contains_script_data(&output.script_pubkey) {
+                continue;
+            }
+            matched = true;
+            let should_update = match self.flags {
+                BloomFlags::All => true,
+                BloomFlags::PubkeyOnly => {
+                    output.script_pubkey.is_p2pk() || output.script_pubkey.is_multisig()
+                }
+                BloomFlags::None => false,
+            };
+            if should_update {
+                let outpoint = bitcoin::OutPoint::new(txid, index as u32);
+                self.insert(&serialize(&outpoint));
+            }
+            break;
+        }
+        if matched {
+            return true;
+        }
+        for input in &transaction.input {
+            if self.contains(&serialize(&input.previous_output))
+                || self.contains_script_data(&input.script_sig)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn matched_transaction_ids(&mut self, block: &Block) -> Vec<Txid> {
+        block
+            .txdata
+            .iter()
+            .filter_map(|transaction| {
+                self.is_relevant_and_update(transaction)
+                    .then_some(transaction.compute_txid())
+            })
+            .collect()
+    }
+}
+
+fn murmur_hash3(seed: u32, data: &[u8]) -> u32 {
+    let mut hash = seed;
+    const C1: u32 = 0xcc9e_2d51;
+    const C2: u32 = 0x1b87_3593;
+    for chunk in data.chunks_exact(4) {
+        let mut value = u32::from_le_bytes(chunk.try_into().expect("four-byte chunk"));
+        value = value.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
+        hash ^= value;
+        hash = hash
+            .rotate_left(13)
+            .wrapping_mul(5)
+            .wrapping_add(0xe654_6b64);
+    }
+    let tail = data.chunks_exact(4).remainder();
+    let mut value = 0u32;
+    for (index, byte) in tail.iter().enumerate() {
+        value |= u32::from(*byte) << (index * 8);
+    }
+    if !tail.is_empty() {
+        hash ^= value.wrapping_mul(C1).rotate_left(15).wrapping_mul(C2);
+    }
+    hash ^= data.len() as u32;
+    hash ^= hash >> 16;
+    hash = hash.wrapping_mul(0x85eb_ca6b);
+    hash ^= hash >> 13;
+    hash = hash.wrapping_mul(0xc2b2_ae35);
+    hash ^ (hash >> 16)
+}
 
 impl PeerReader {
     async fn read_message(&mut self, network: Network) -> Result<(Message, usize)> {
@@ -374,12 +531,15 @@ async fn serve_peer(
         establish_transport(stream, address, outbound, node.config.network).await?;
     let (commands, command_receiver) = mpsc::unbounded_channel();
     node.register_peer_with_local(peer_id, address, !outbound, commands, local_address);
-    let writer = Arc::new(Mutex::new(writer_half));
-    peers.lock().insert(peer_id, writer.clone());
+    let peer_state = Arc::new(PeerState {
+        writer: Arc::new(Mutex::new(writer_half)),
+        bloom_filter: parking_lot::Mutex::new(None),
+    });
+    peers.lock().insert(peer_id, peer_state.clone());
     let result = serve_peer_loop(
         &node,
         &mut reader,
-        &writer,
+        &peer_state,
         outbound,
         &peers,
         peer_id,
@@ -413,19 +573,25 @@ impl Drop for PeerCountGuard<'_> {
 async fn serve_peer_loop(
     node: &Arc<Node>,
     reader: &mut PeerReader,
-    writer: &PeerWriter,
+    peer_state: &PeerState,
     outbound: bool,
     peers: &PeerRegistry,
     peer_id: usize,
     mut commands: mpsc::UnboundedReceiver<PeerCommand>,
 ) -> Result<()> {
+    let writer = &peer_state.writer;
+    let bloom_filter = &peer_state.bloom_filter;
     let height = node.chain.read().height() as i32;
     send_message(
         node,
         peer_id,
         writer,
         node.config.network,
-        &Message::Version(VersionMessage::new(height, random())),
+        &Message::Version(VersionMessage::with_bloom(
+            height,
+            random(),
+            node.config.peer_bloom_filters,
+        )),
     )
     .await?;
     let mut version_received = false;
@@ -675,6 +841,44 @@ async fn serve_peer_loop(
                                 .await?;
                             } else {
                                 missing.push(item);
+                            }
+                        }
+                        InventoryType::FilteredBlock => {
+                            let block = node.chain.write().block(&item.hash)?;
+                            let Some(block) = block else {
+                                missing.push(item);
+                                continue;
+                            };
+                            let matching = {
+                                let mut filter = bloom_filter.lock();
+                                filter
+                                    .as_mut()
+                                    .map(|filter| filter.matched_transaction_ids(&block))
+                                    .unwrap_or_default()
+                            };
+                            let matching: HashSet<Txid> = matching.into_iter().collect();
+                            let merkle = MerkleBlock::from_block_with_predicate(&block, |txid| {
+                                matching.contains(txid)
+                            });
+                            send_message(
+                                node,
+                                peer_id,
+                                writer,
+                                node.config.network,
+                                &Message::MerkleBlock(merkle),
+                            )
+                            .await?;
+                            for transaction in block.txdata.iter().filter(|transaction| {
+                                matching.contains(&transaction.compute_txid())
+                            }) {
+                                send_message(
+                                    node,
+                                    peer_id,
+                                    writer,
+                                    node.config.network,
+                                    &Message::Transaction(transaction.clone()),
+                                )
+                                .await?;
                             }
                         }
                         InventoryType::Transaction | InventoryType::WitnessTransaction => {
@@ -988,6 +1192,23 @@ async fn serve_peer_loop(
                     debug!(%txid, "rejected peer transaction");
                 }
             }
+            Message::FilterLoad(filter) => {
+                *bloom_filter.lock() = Some(BloomFilter::from_message(filter)?);
+            }
+            Message::FilterAdd(FilterAdd { data }) => {
+                if data.len() > MAX_BLOOM_ELEMENT_SIZE {
+                    anyhow::bail!("bloom filter element exceeds the 520-byte limit");
+                }
+                let mut filter = bloom_filter.lock();
+                let Some(filter) = filter.as_mut() else {
+                    anyhow::bail!("filteradd received before filterload");
+                };
+                filter.insert(&data);
+            }
+            Message::FilterClear => {
+                *bloom_filter.lock() = None;
+            }
+            Message::MerkleBlock(_) => {}
             Message::Addr(addresses) => {
                 for entry in addresses {
                     if let Some(address) = socket_address_from_legacy(&entry) {
@@ -1027,7 +1248,13 @@ async fn serve_peer_loop(
                 if addrv2_received {
                     let addresses = peer_infos
                         .into_iter()
-                        .map(|peer| network_address_v2(peer.address, peer.connected_at))
+                        .map(|peer| {
+                            network_address_v2(
+                                peer.address,
+                                peer.connected_at,
+                                node.config.peer_bloom_filters,
+                            )
+                        })
                         .collect::<Vec<_>>();
                     send_message(
                         node,
@@ -1042,7 +1269,14 @@ async fn serve_peer_loop(
                         .into_iter()
                         .map(|peer| wire::NetworkAddress {
                             time: u32::try_from(peer.connected_at).unwrap_or(u32::MAX),
-                            services: wire::NODE_NETWORK | wire::NODE_WITNESS | wire::NODE_P2P_V2,
+                            services: wire::NODE_NETWORK
+                                | wire::NODE_WITNESS
+                                | wire::NODE_P2P_V2
+                                | if node.config.peer_bloom_filters {
+                                    wire::NODE_BLOOM
+                                } else {
+                                    0
+                                },
                             address: socket_address_bytes(peer.address),
                             port: peer.address.port(),
                         })
@@ -1058,20 +1292,34 @@ async fn serve_peer_loop(
                 }
             }
             Message::Mempool => {
-                let inventory = {
+                let transactions = {
                     let mempool = node.mempool.read();
                     mempool
                         .transaction_order()
                         .into_iter()
                         .filter_map(|txid| {
-                            mempool.get(&txid).map(|entry| Inventory {
+                            mempool.get(&txid).map(|entry| entry.transaction.clone())
+                        })
+                        .take(50_000)
+                        .collect::<Vec<_>>()
+                };
+                let inventory = {
+                    let mut filter = bloom_filter.lock();
+                    transactions
+                        .into_iter()
+                        .filter_map(|transaction| {
+                            if let Some(filter) = filter.as_mut()
+                                && !filter.is_relevant_and_update(&transaction)
+                            {
+                                return None;
+                            }
+                            Some(Inventory {
                                 kind: InventoryType::WitnessTransaction,
                                 hash: BlockHash::from_raw_hash(
-                                    entry.transaction.compute_wtxid().to_raw_hash(),
+                                    transaction.compute_wtxid().to_raw_hash(),
                                 ),
                             })
                         })
-                        .take(50_000)
                         .collect::<Vec<_>>()
                 };
                 send_message(
@@ -1314,7 +1562,11 @@ fn socket_address_from_v2(address: &wire::NetworkAddressV2) -> Option<std::net::
     (address.port != 0).then(|| std::net::SocketAddr::new(ip, address.port))
 }
 
-fn network_address_v2(address: std::net::SocketAddr, connected_at: u64) -> wire::NetworkAddressV2 {
+fn network_address_v2(
+    address: std::net::SocketAddr,
+    connected_at: u64,
+    bloom_filters: bool,
+) -> wire::NetworkAddressV2 {
     let port = address.port();
     let (network, address) = match address.ip() {
         std::net::IpAddr::V4(ip) => (1, ip.octets().to_vec()),
@@ -1322,7 +1574,10 @@ fn network_address_v2(address: std::net::SocketAddr, connected_at: u64) -> wire:
     };
     wire::NetworkAddressV2 {
         time: u32::try_from(connected_at).unwrap_or(u32::MAX),
-        services: wire::NODE_NETWORK | wire::NODE_WITNESS | wire::NODE_P2P_V2,
+        services: wire::NODE_NETWORK
+            | wire::NODE_WITNESS
+            | wire::NODE_P2P_V2
+            | if bloom_filters { wire::NODE_BLOOM } else { 0 },
         network,
         address,
         port,
@@ -1404,15 +1659,36 @@ async fn broadcast_inventory(
     network: Network,
     item: Inventory,
 ) {
-    let recipients: Vec<(usize, PeerWriter)> = peers
+    let recipients: Vec<(usize, Arc<PeerState>)> = peers
         .lock()
         .iter()
         .filter(|(peer_id, _)| **peer_id != excluded_peer)
-        .map(|(peer_id, writer)| (*peer_id, writer.clone()))
+        .map(|(peer_id, state)| (*peer_id, state.clone()))
         .collect();
-    let message = Message::Inv(vec![item]);
-    for (peer_id, writer) in recipients {
-        let _ = send_message(node, peer_id, &writer, network, &message).await;
+    for (peer_id, state) in recipients {
+        if let Some(transaction) = transaction_for_inventory(node, &item) {
+            let mut filter = state.bloom_filter.lock();
+            if let Some(filter) = filter.as_mut()
+                && !filter.is_relevant_and_update(&transaction)
+            {
+                continue;
+            }
+        }
+        let message = Message::Inv(vec![item.clone()]);
+        let _ = send_message(node, peer_id, &state.writer, network, &message).await;
+    }
+}
+
+fn transaction_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<Transaction> {
+    let mempool = node.mempool.read();
+    match item.kind {
+        InventoryType::WitnessTransaction => mempool
+            .get_by_wtxid(&Wtxid::from_byte_array(item.hash.to_byte_array()))
+            .map(|entry| entry.transaction.clone()),
+        InventoryType::Transaction => mempool
+            .get(&Txid::from_byte_array(item.hash.to_byte_array()))
+            .map(|entry| entry.transaction.clone()),
+        _ => None,
     }
 }
 
@@ -1436,6 +1712,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let stop_hash = node.chain.read().best_hash();
@@ -1452,6 +1729,77 @@ mod tests {
     }
 
     #[test]
+    fn bloom_filter_matches_core_murmur_and_bit_order() {
+        let mut filter = BloomFilter::from_message(FilterLoad {
+            filter: vec![0; 3],
+            hash_funcs: 5,
+            tweak: 0,
+            flags: BloomFlags::All,
+        })
+        .unwrap();
+        for value in [
+            "99108ad8ed9bb6274d3980bab5a85c048f0950c8",
+            "b5a2c786d9ef4658287ced5914b37a1b4aa32eee",
+            "b9300670b4c5366e95b2699e8b18bc75e5f729c5",
+        ] {
+            filter.insert(&hex::decode(value).unwrap());
+        }
+        assert_eq!(filter.data, hex::decode("614e9b").unwrap());
+        assert!(
+            !filter.contains(&hex::decode("19108ad8ed9bb6274d3980bab5a85c048f0950c8").unwrap())
+        );
+    }
+
+    #[test]
+    fn bloom_filter_matches_script_elements_and_updates_spends() {
+        use bitcoin::Amount;
+        use bitcoin::absolute::LockTime;
+        use bitcoin::blockdata::script::ScriptBuf;
+        use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
+        use bitcoin::blockdata::witness::Witness;
+
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![1, 0x42]),
+            }],
+        };
+        let mut filter = BloomFilter::from_message(FilterLoad {
+            filter: vec![0; 32],
+            hash_funcs: 5,
+            tweak: 0,
+            flags: BloomFlags::All,
+        })
+        .unwrap();
+        filter.insert(&[0x42]);
+        assert!(filter.is_relevant_and_update(&transaction));
+
+        let spending = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(transaction.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        assert!(filter.is_relevant_and_update(&spending));
+    }
+
+    #[test]
     fn peer_counters_track_wire_traffic_and_pings() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
@@ -1464,6 +1812,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -1498,6 +1847,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let legacy = wire::NetworkAddress {
@@ -1508,7 +1858,7 @@ mod tests {
         };
         let legacy_socket = socket_address_from_legacy(&legacy).unwrap();
         node.remember_address(legacy_socket, legacy.services, u64::from(legacy.time));
-        let v2 = network_address_v2("[2001:db8::10]:18444".parse().unwrap(), 456);
+        let v2 = network_address_v2("[2001:db8::10]:18444".parse().unwrap(), 456, false);
         let v2_socket = socket_address_from_v2(&v2).unwrap();
         node.remember_address(v2_socket, v2.services, u64::from(v2.time));
 

@@ -1232,17 +1232,22 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     .collect::<Vec<_>>()
             ))
         }
-        "getnetworkinfo" => Ok(json!({
+        "getnetworkinfo" => {
+            let local_services = wire::NODE_NETWORK
+                | wire::NODE_WITNESS
+                | wire::NODE_COMPACT_FILTERS
+                | wire::NODE_P2P_V2
+                | if node.config.peer_bloom_filters {
+                    wire::NODE_BLOOM
+                } else {
+                    0
+                };
+            Ok(json!({
             "version": 310100,
             "subversion": "/bitcoind-rs:0.1.0/",
             "protocolversion": 70016,
-            "localservices": "0000000000000849",
-            "localservicesnames": peer_services_names(
-                wire::NODE_NETWORK
-                    | wire::NODE_WITNESS
-                    | wire::NODE_COMPACT_FILTERS
-                    | wire::NODE_P2P_V2,
-            ),
+            "localservices": format!("{local_services:016x}"),
+            "localservicesnames": peer_services_names(local_services),
             "timeoffset": 0,
             "localrelay": true,
             "connections": node.peer_count(),
@@ -1259,7 +1264,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "localaddresses": [],
             "relayfee": 0.00001000,
             "incrementalfee": 0.00001000,
-        })),
+            }))
+        }
         "getpeerinfo" => Ok(json!(
             node.peer_infos()
                 .into_iter()
@@ -1605,6 +1611,7 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn peer_services_names(services: u64) -> Vec<&'static str> {
     [
         (wire::NODE_NETWORK, "NETWORK"),
+        (wire::NODE_BLOOM, "BLOOM"),
         (wire::NODE_WITNESS, "WITNESS"),
         (wire::NODE_COMPACT_FILTERS, "COMPACT_FILTERS"),
         (wire::NODE_P2P_V2, "P2P_V2"),
@@ -8301,6 +8308,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let transaction = proof_transaction(7);
@@ -8437,6 +8445,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let hash = node.chain.read().best_hash();
@@ -8473,6 +8482,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
 
@@ -8525,6 +8535,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let mined = generate_to_address(
@@ -8557,6 +8568,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
 
@@ -8639,6 +8651,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         assert!(get_network_hash_ps(&node, &json!([0])).is_err());
@@ -8662,6 +8675,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
 
@@ -8688,6 +8702,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
 
@@ -8723,6 +8738,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
 
@@ -8751,6 +8767,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let hash = node.chain.read().best_hash();
@@ -8773,6 +8790,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let hash = node.chain.read().best_hash();
@@ -8792,6 +8810,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let (_, chaininfo) = dispatch_rest(&node, "/rest/chaininfo.json").unwrap();
@@ -8873,6 +8892,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
 
@@ -8914,6 +8934,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
 
@@ -8974,6 +8995,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
 
@@ -9004,6 +9026,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let result = generate_block(
@@ -9038,6 +9061,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let mined = generate_to_descriptor(&node, &json!([102, "raw(51)"])).unwrap();
@@ -9115,6 +9139,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let template = get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
@@ -9144,6 +9169,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let stale = format!("{}:999", node.chain.read().best_hash());
@@ -9166,6 +9192,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let outpoint = OutPoint::new(Txid::from_byte_array([0x42; 32]), 0);
@@ -9207,6 +9234,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let hash = generate_to_address(
@@ -9239,6 +9267,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
@@ -9271,6 +9300,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         dispatch_method(&node, "setnetworkactive", &json!([false])).unwrap();
@@ -9294,6 +9324,7 @@ mod tests {
             rest: false,
             seed_nodes: Vec::new(),
             max_peers: 1,
+            peer_bloom_filters: false,
             signet_challenge: None,
         })
         .unwrap();
@@ -9318,6 +9349,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
 
@@ -9373,6 +9405,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         assert_eq!(
@@ -9422,6 +9455,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         node.remember_address("192.0.2.20:18444".parse().unwrap(), 1, 10);
@@ -9463,6 +9497,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
@@ -9536,6 +9571,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let genesis_hash = node.chain.read().best_hash();
@@ -9684,6 +9720,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let secret = bitcoin::secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
@@ -9789,6 +9826,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let secret = bitcoin::secp256k1::SecretKey::from_slice(&[2; 32]).unwrap();
@@ -9820,6 +9858,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let secp = Secp256k1::new();
@@ -9857,6 +9896,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";
@@ -10046,6 +10086,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let xpriv = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[7; 32]).unwrap();
@@ -10203,6 +10244,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let hashes = generate_to_descriptor(&node, &json!([101, "raw(51)"])).unwrap();
@@ -10252,6 +10294,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let hashes = generate_to_descriptor(&node, &json!([101, "raw(51)"])).unwrap();
@@ -10306,6 +10349,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let mined = generate_to_descriptor(&node, &json!([102, "raw(51)"])).unwrap();
@@ -10388,6 +10432,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let path = directory.path().join("utxos.snapshot");
@@ -10412,6 +10457,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            peer_bloom_filters: false,
         })
         .unwrap();
         let address = "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl";

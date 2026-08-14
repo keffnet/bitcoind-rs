@@ -10,17 +10,19 @@ use anyhow::{Result, bail};
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
+use bitcoin::p2p::message_bloom::{FilterAdd, FilterLoad};
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn};
 use bitcoin::p2p::message_filter::{
     CFCheckpt, CFHeaders, CFilter, GetCFCheckpt, GetCFHeaders, GetCFilters,
 };
-use bitcoin::{Block, BlockHash, Network, Transaction};
+use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 const HEADER_SIZE: usize = 24;
 
 pub const NODE_NETWORK: u64 = 1;
+pub const NODE_BLOOM: u64 = 1 << 2;
 pub const NODE_WITNESS: u64 = 1 << 3;
 pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
 pub const NODE_P2P_V2: u64 = 1 << 11;
@@ -109,14 +111,23 @@ impl VersionMessage {
     pub const PROTOCOL_VERSION: i32 = 70016;
 
     pub fn new(start_height: i32, nonce: u64) -> Self {
+        Self::with_bloom(start_height, nonce, false)
+    }
+
+    pub fn with_bloom(start_height: i32, nonce: u64, bloom_filters: bool) -> Self {
+        let services = NODE_NETWORK
+            | NODE_WITNESS
+            | NODE_COMPACT_FILTERS
+            | NODE_P2P_V2
+            | if bloom_filters { NODE_BLOOM } else { 0 };
         Self {
             version: Self::PROTOCOL_VERSION,
-            services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS | NODE_P2P_V2,
+            services,
             timestamp: chrono_like_unix_time(),
-            receiver_services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS | NODE_P2P_V2,
+            receiver_services: services,
             receiver_address: [0; 16],
             receiver_port: 0,
-            sender_services: NODE_NETWORK | NODE_WITNESS | NODE_COMPACT_FILTERS | NODE_P2P_V2,
+            sender_services: services,
             sender_address: [0; 16],
             sender_port: 0,
             nonce,
@@ -153,7 +164,11 @@ pub enum Message {
     GetData(Vec<Inventory>),
     NotFound(Vec<Inventory>),
     Block(Block),
+    MerkleBlock(MerkleBlock),
     Transaction(Transaction),
+    FilterLoad(FilterLoad),
+    FilterAdd(FilterAdd),
+    FilterClear,
     Mempool,
     FeeFilter(i64),
     SendCmpct { announce: bool, version: u64 },
@@ -189,7 +204,11 @@ impl Message {
             Self::GetData(_) => "getdata",
             Self::NotFound(_) => "notfound",
             Self::Block(_) => "block",
+            Self::MerkleBlock(_) => "merkleblock",
             Self::Transaction(_) => "tx",
+            Self::FilterLoad(_) => "filterload",
+            Self::FilterAdd(_) => "filteradd",
+            Self::FilterClear => "filterclear",
             Self::Mempool => "mempool",
             Self::FeeFilter(_) => "feefilter",
             Self::SendCmpct { .. } => "sendcmpct",
@@ -341,6 +360,7 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
         | Message::SendAddrV2
         | Message::SendHeaders
         | Message::WtxidRelay
+        | Message::FilterClear
         | Message::Mempool => {}
         Message::Addr(entries) => {
             if entries.len() > 1_000 {
@@ -391,7 +411,10 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
             encode_inventory(items, &mut out)?;
         }
         Message::Block(block) => out.extend_from_slice(&serialize(block)),
+        Message::MerkleBlock(block) => out.extend_from_slice(&serialize(block)),
         Message::Transaction(transaction) => out.extend_from_slice(&serialize(transaction)),
+        Message::FilterLoad(filter) => out.extend_from_slice(&serialize(filter)),
+        Message::FilterAdd(filter) => out.extend_from_slice(&serialize(filter)),
         Message::FeeFilter(rate) => put_i64(*rate, &mut out),
         Message::SendCmpct { announce, version } => {
             out.push(u8::from(*announce));
@@ -557,7 +580,11 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
         "getdata" => Message::GetData(decode_inventory(&mut reader)?),
         "notfound" => Message::NotFound(decode_inventory(&mut reader)?),
         "block" => Message::Block(deserialize(payload).map_err(payload_error)?),
+        "merkleblock" => Message::MerkleBlock(deserialize(payload).map_err(payload_error)?),
         "tx" => Message::Transaction(deserialize(payload).map_err(payload_error)?),
+        "filterload" => Message::FilterLoad(deserialize(payload).map_err(payload_error)?),
+        "filteradd" => Message::FilterAdd(deserialize(payload).map_err(payload_error)?),
+        "filterclear" => Message::FilterClear,
         "feefilter" => Message::FeeFilter(reader.i64_le()?),
         "sendcmpct" => Message::SendCmpct {
             announce: reader.u8()? != 0,
@@ -593,7 +620,11 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
         && !matches!(
             message,
             Message::Block(_)
+                | Message::MerkleBlock(_)
                 | Message::Transaction(_)
+                | Message::FilterLoad(_)
+                | Message::FilterAdd(_)
+                | Message::FilterClear
                 | Message::CompactBlock(_)
                 | Message::GetBlockTxn(_)
                 | Message::BlockTxn(_)
@@ -1043,5 +1074,73 @@ mod tests {
         });
         let frame = encode_message(Network::Regtest, &message).unwrap();
         assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn bip37_messages_round_trip() {
+        use bitcoin::absolute::LockTime;
+        use bitcoin::block::{Header, Version as BlockVersion};
+        use bitcoin::blockdata::script::ScriptBuf;
+        use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
+        use bitcoin::blockdata::witness::Witness;
+        use bitcoin::p2p::message_bloom::{BloomFlags, FilterAdd, FilterLoad};
+        use bitcoin::{Amount, TxMerkleNode};
+
+        let filter_load = Message::FilterLoad(FilterLoad {
+            filter: vec![0xaa, 0x55, 0x01],
+            hash_funcs: 7,
+            tweak: 11,
+            flags: BloomFlags::All,
+        });
+        let filter_add = Message::FilterAdd(FilterAdd {
+            data: vec![1, 2, 3, 4],
+        });
+        for message in [filter_load, filter_add, Message::FilterClear] {
+            let frame = encode_message(Network::Regtest, &message).unwrap();
+            assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), message);
+        }
+
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::from_bytes(vec![1]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![transaction],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let merkle = MerkleBlock::from_block_with_predicate(&block, |_| true);
+        let message = Message::MerkleBlock(merkle);
+        let frame = encode_message(Network::Regtest, &message).unwrap();
+        let decoded = decode_message(Network::Regtest, &frame).unwrap();
+        let Message::MerkleBlock(decoded) = decoded else {
+            panic!("decoded BIP37 message was not merkleblock");
+        };
+        let Message::MerkleBlock(expected) = message else {
+            unreachable!();
+        };
+        let mut matches = Vec::new();
+        let mut indexes = Vec::new();
+        decoded.extract_matches(&mut matches, &mut indexes).unwrap();
+        assert_eq!(decoded.header, expected.header);
+        assert_eq!(matches, vec![block.txdata[0].compute_txid()]);
+        assert_eq!(indexes, vec![0]);
     }
 }

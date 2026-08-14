@@ -59,6 +59,9 @@ pub struct Args {
 
     #[arg(long, default_value_t = 32)]
     pub max_peers: usize,
+
+    #[arg(long, default_value_t = false)]
+    pub peer_bloom_filters: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +75,7 @@ pub struct Config {
     pub seed_nodes: Vec<SocketAddr>,
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
+    pub peer_bloom_filters: bool,
 }
 
 impl Config {
@@ -103,6 +107,7 @@ impl Config {
             seed_nodes: args.connect,
             signet_challenge,
             max_peers: args.max_peers,
+            peer_bloom_filters: args.peer_bloom_filters,
         })
     }
 }

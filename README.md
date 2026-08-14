@@ -15,7 +15,7 @@ The project targets the consensus and network behavior of Bitcoin Core 31.1 whil
 The implementation is an actively developed, wallet-free Core-compatible node subset. It includes:
 
 - regtest, testnet, testnet4, signet, and mainnet chain parameters, proof-of-work/header checks, UTXO validation, libbitcoinconsensus script checks, reorgs, invalidation/reconsideration, compact filters, and durable block undo data;
-- Bitcoin P2P handshake, header/block/transaction relay, compact blocks, BIP157 relay, bounded peer-transaction orphan handling, peer controls, bans, dynamic connections, traffic counters, and ping measurements;
+- Bitcoin P2P handshake, header/block/transaction relay, compact blocks, BIP157 relay, optional BIP37 Bloom-filter relay and merkle blocks (`--peer-bloom-filters`), bounded peer-transaction orphan handling, peer controls, bans, dynamic connections, traffic counters, and ping measurements;
 - mining templates and proposal validation, package-aware transaction selection, raw transaction submission, wallet-free raw signing, PSBT lifecycle including descriptor-driven updates and transient descriptor-key signing, message-signing, and multisig RPCs, opt-in RBF, package submission, wallet-free descriptors (`addr`, `raw`, `pk`, `pkh`, `wpkh`, `combo`, `multi`, `sortedmulti`, `sh`, `wsh`, and `tr`) with checksum metadata, UTXO scans, and the implemented JSON-RPC/REST methods;
 - an Electrum protocol server with header and scripthash subscriptions, history, balances, UTXOs, mempool queries, transaction retrieval, merkle proofs, broadcasts, and fee histograms.
 
@@ -34,3 +34,5 @@ The default configuration listens on `127.0.0.1:8333` for P2P, `127.0.0.1:8332` 
 JSON-RPC uses the standard cookie file at `<datadir>/.cookie`; clients should send it as HTTP Basic authentication (`curl --user "$(cat data/.cookie)" ...`).
 
 For the public signet, use `--network signet`. Custom BIP325 challenges can be supplied as script hex with `--signet-challenge <hex>`.
+
+Bloom-filter peer relay is disabled by default, matching Core's default; enable it with `--peer-bloom-filters` when serving BIP37 clients.

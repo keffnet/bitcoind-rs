@@ -1321,6 +1321,7 @@ mod tests {
                 seed_nodes: Vec::new(),
                 signet_challenge: None,
                 max_peers: 1,
+                peer_bloom_filters: false,
             })
             .unwrap(),
         );
@@ -1438,6 +1439,7 @@ mod tests {
                 seed_nodes: Vec::new(),
                 signet_challenge: None,
                 max_peers: 1,
+                peer_bloom_filters: false,
             })
             .unwrap(),
         );

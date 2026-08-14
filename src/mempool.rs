@@ -653,10 +653,9 @@ impl Mempool {
             return Err(MempoolError::FeeRate);
         }
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
-        if self.bytes.saturating_add(size) > self.max_bytes {
-            return Err(MempoolError::Full);
-        }
         self.check_cluster_limits(&transaction)?;
+        let protected = self.ancestors_for_transaction(&transaction);
+        self.ensure_space(size, &protected)?;
         let entry = MempoolEntry {
             transaction,
             fee_sat,
@@ -679,6 +678,83 @@ impl Mempool {
         self.wtxids.insert(wtxid, txid);
         self.sequence = self.sequence.saturating_add(1);
         Ok(txid)
+    }
+
+    fn ancestors_for_transaction(&self, transaction: &Transaction) -> HashSet<Txid> {
+        let mut ancestors = HashSet::new();
+        let mut pending = transaction
+            .input
+            .iter()
+            .map(|input| input.previous_output.txid)
+            .collect::<Vec<_>>();
+        while let Some(txid) = pending.pop() {
+            if !self.entries.contains_key(&txid) || !ancestors.insert(txid) {
+                continue;
+            }
+            pending.extend(self.parents(&txid));
+        }
+        ancestors
+    }
+
+    fn ensure_space(
+        &mut self,
+        additional_bytes: usize,
+        protected: &HashSet<Txid>,
+    ) -> Result<(), MempoolError> {
+        if additional_bytes > self.max_bytes {
+            return Err(MempoolError::Full);
+        }
+        while self.bytes.saturating_add(additional_bytes) > self.max_bytes {
+            let Some(package) = self.lowest_eviction_package(protected) else {
+                return Err(MempoolError::Full);
+            };
+            for txid in package {
+                self.remove(&txid);
+            }
+        }
+        Ok(())
+    }
+
+    fn lowest_eviction_package(&self, protected: &HashSet<Txid>) -> Option<HashSet<Txid>> {
+        let mut best: Option<(HashSet<Txid>, Txid, u64, i128)> = None;
+        for txid in self.entries.keys().copied() {
+            let mut package = HashSet::from([txid]);
+            package.extend(self.descendants(&txid));
+            if package
+                .iter()
+                .any(|candidate| protected.contains(candidate))
+            {
+                continue;
+            }
+            let package_vsize = package
+                .iter()
+                .filter_map(|candidate| self.entries.get(candidate))
+                .map(|entry| entry.vsize)
+                .fold(0u64, u64::saturating_add);
+            if package_vsize == 0 {
+                continue;
+            }
+            let package_fee = package
+                .iter()
+                .filter_map(|candidate| {
+                    self.entries.get(candidate).map(|entry| {
+                        i128::from(entry.fee_sat) + i128::from(self.fee_delta(candidate))
+                    })
+                })
+                .fold(0i128, i128::saturating_add);
+            let replace = match &best {
+                None => true,
+                Some((_, best_txid, best_vsize, best_fee)) => {
+                    let left = package_fee.saturating_mul(i128::from(*best_vsize));
+                    let right = best_fee.saturating_mul(i128::from(package_vsize));
+                    left < right || (left == right && txid.to_string() < best_txid.to_string())
+                }
+            };
+            if replace {
+                best = Some((package, txid, package_vsize, package_fee));
+            }
+        }
+        best.map(|(package, _, _, _)| package)
     }
 
     fn check_cluster_limits(&self, transaction: &Transaction) -> Result<(), MempoolError> {
@@ -1432,6 +1508,62 @@ mod tests {
             Err(MempoolError::ClusterLimit)
         ));
         assert_eq!(chain.len(), MAX_CLUSTER_COUNT);
+    }
+
+    #[test]
+    fn eviction_removes_the_lowest_feerate_package_but_protects_ancestors() {
+        let low = graph_transaction(Txid::from_byte_array([20; 32]), 20);
+        let low_id = low.compute_txid();
+        let high = graph_transaction(Txid::from_byte_array([21; 32]), 21);
+        let high_id = high.compute_txid();
+        let low_size = bitcoin::consensus::encode::serialize(&low).len();
+        let high_size = bitcoin::consensus::encode::serialize(&high).len();
+        let mut pool = Mempool::new(Network::Regtest);
+        pool.max_bytes = low_size.saturating_add(high_size);
+        for (transaction, fee_sat) in [(low, 1), (high, 100)] {
+            let txid = transaction.compute_txid();
+            let wtxid = transaction.compute_wtxid();
+            pool.bytes = pool
+                .bytes
+                .saturating_add(bitcoin::consensus::encode::serialize(&transaction).len());
+            pool.entries.insert(
+                txid,
+                MempoolEntry {
+                    vsize: transaction.vsize() as u64,
+                    fee_sat,
+                    added_at: 1,
+                    height: 0,
+                    transaction,
+                },
+            );
+            pool.wtxids.insert(wtxid, txid);
+        }
+        let candidate_size = low_size;
+        pool.ensure_space(candidate_size, &HashSet::new()).unwrap();
+        assert!(!pool.entries.contains_key(&low_id));
+        assert!(pool.entries.contains_key(&high_id));
+
+        let parent = graph_transaction(Txid::from_byte_array([22; 32]), 22);
+        let parent_id = parent.compute_txid();
+        let parent_size = bitcoin::consensus::encode::serialize(&parent).len();
+        let mut protected_pool = Mempool::new(Network::Regtest);
+        protected_pool.max_bytes = parent_size;
+        protected_pool.bytes = parent_size;
+        protected_pool.entries.insert(
+            parent_id,
+            MempoolEntry {
+                vsize: parent.vsize() as u64,
+                fee_sat: 1,
+                added_at: 1,
+                height: 0,
+                transaction: parent,
+            },
+        );
+        assert!(matches!(
+            protected_pool.ensure_space(1, &HashSet::from([parent_id])),
+            Err(MempoolError::Full)
+        ));
+        assert!(protected_pool.entries.contains_key(&parent_id));
     }
 
     #[test]

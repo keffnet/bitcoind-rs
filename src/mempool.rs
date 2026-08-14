@@ -22,6 +22,12 @@ const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
 const MAX_DATACARRIER_BYTES: usize = 100_000;
 const DUST_RELAY_SAT_PER_KVB: u64 = 3_000;
+/// BIP 431/TRUC transaction version and topology limits.
+const TRUC_VERSION: i32 = 3;
+const TRUC_ANCESTOR_LIMIT: usize = 2;
+const TRUC_DESCENDANT_LIMIT: usize = 2;
+const TRUC_MAX_VSIZE: u64 = 10_000;
+const TRUC_CHILD_MAX_VSIZE: u64 = 1_000;
 
 /// Core's context-free package limits.
 pub const MAX_PACKAGE_COUNT: usize = 25;
@@ -94,6 +100,8 @@ pub enum MempoolError {
     Full,
     #[error("transaction cluster exceeds the mempool cluster limits")]
     ClusterLimit,
+    #[error("TRUC-violation, {0}")]
+    Truc(String),
 }
 
 impl Mempool {
@@ -652,6 +660,8 @@ impl Mempool {
         if enforce_fee_rate && fee_sat < vsize.saturating_mul(MIN_RELAY_SAT_PER_VBYTE) {
             return Err(MempoolError::FeeRate);
         }
+        self.check_truc_policy(&transaction, vsize)?;
+        validate_ephemeral_spends(std::slice::from_ref(&transaction), self)?;
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
         self.check_cluster_limits(&transaction)?;
         let protected = self.ancestors_for_transaction(&transaction);
@@ -711,6 +721,80 @@ impl Mempool {
             for txid in package {
                 self.remove(&txid);
             }
+        }
+        Ok(())
+    }
+
+    fn check_truc_policy(&self, transaction: &Transaction, vsize: u64) -> Result<(), MempoolError> {
+        let transaction_id = transaction.compute_txid();
+        let transaction_wtxid = transaction.compute_wtxid();
+        let mut parent_ids = Vec::new();
+        let mut seen_parents = HashSet::new();
+        for input in &transaction.input {
+            let parent_id = input.previous_output.txid;
+            if self.entries.contains_key(&parent_id) && seen_parents.insert(parent_id) {
+                parent_ids.push(parent_id);
+            }
+        }
+
+        for parent_id in &parent_ids {
+            let parent = self
+                .entries
+                .get(parent_id)
+                .expect("mempool parent exists when checking TRUC policy");
+            if transaction.version.0 != TRUC_VERSION && parent.transaction.version.0 == TRUC_VERSION
+            {
+                return Err(MempoolError::Truc(format!(
+                    "non-version=3 tx {transaction_id} (wtxid={transaction_wtxid}) cannot spend from version=3 tx {parent_id} (wtxid={})",
+                    parent.transaction.compute_wtxid()
+                )));
+            }
+            if transaction.version.0 == TRUC_VERSION && parent.transaction.version.0 != TRUC_VERSION
+            {
+                return Err(MempoolError::Truc(format!(
+                    "version=3 tx {transaction_id} (wtxid={transaction_wtxid}) cannot spend from non-version=3 tx {parent_id} (wtxid={})",
+                    parent.transaction.compute_wtxid()
+                )));
+            }
+        }
+
+        if transaction.version.0 != TRUC_VERSION {
+            return Ok(());
+        }
+        if vsize > TRUC_MAX_VSIZE {
+            return Err(MempoolError::Truc(format!(
+                "version=3 tx {transaction_id} (wtxid={transaction_wtxid}) is too big: {vsize} > {TRUC_MAX_VSIZE} virtual bytes"
+            )));
+        }
+        if parent_ids.len().saturating_add(1) > TRUC_ANCESTOR_LIMIT {
+            return Err(MempoolError::Truc(format!(
+                "tx {transaction_id} (wtxid={transaction_wtxid}) would have too many ancestors"
+            )));
+        }
+
+        let Some(parent_id) = parent_ids.first() else {
+            return Ok(());
+        };
+        let parent_ancestor_count = self.ancestors(parent_id).len().saturating_add(1);
+        if parent_ancestor_count.saturating_add(1) > TRUC_ANCESTOR_LIMIT {
+            return Err(MempoolError::Truc(format!(
+                "tx {transaction_id} (wtxid={transaction_wtxid}) would have too many ancestors"
+            )));
+        }
+        if vsize > TRUC_CHILD_MAX_VSIZE {
+            return Err(MempoolError::Truc(format!(
+                "version=3 child tx {transaction_id} (wtxid={transaction_wtxid}) is too big: {vsize} > {TRUC_CHILD_MAX_VSIZE} virtual bytes"
+            )));
+        }
+        if self.descendants(parent_id).len().saturating_add(2) > TRUC_DESCENDANT_LIMIT {
+            return Err(MempoolError::Truc(format!(
+                "tx {parent_id} (wtxid={}) would exceed descendant count limit",
+                self.entries
+                    .get(parent_id)
+                    .expect("mempool parent exists when checking TRUC policy")
+                    .transaction
+                    .compute_wtxid()
+            )));
         }
         Ok(())
     }
@@ -1564,6 +1648,109 @@ mod tests {
             Err(MempoolError::Full)
         ));
         assert!(protected_pool.entries.contains_key(&parent_id));
+    }
+
+    fn insert_policy_entry(pool: &mut Mempool, transaction: Transaction) -> Txid {
+        let txid = transaction.compute_txid();
+        let wtxid = transaction.compute_wtxid();
+        for input in &transaction.input {
+            if pool.entries.contains_key(&input.previous_output.txid) {
+                pool.children
+                    .entry(input.previous_output.txid)
+                    .or_default()
+                    .insert(txid);
+            }
+        }
+        pool.entries.insert(
+            txid,
+            MempoolEntry {
+                vsize: transaction.vsize() as u64,
+                fee_sat: 1,
+                added_at: 1,
+                height: 0,
+                transaction,
+            },
+        );
+        pool.wtxids.insert(wtxid, txid);
+        txid
+    }
+
+    #[test]
+    fn enforces_truc_inheritance_size_and_topology() {
+        let mut pool = Mempool::new(Network::Regtest);
+        let mut v3_parent = graph_transaction(Txid::from_byte_array([30; 32]), 30);
+        v3_parent.version = Version::non_standard(TRUC_VERSION);
+        let v3_parent_id = insert_policy_entry(&mut pool, v3_parent);
+
+        let v2_child = graph_transaction(v3_parent_id, 31);
+        assert!(matches!(
+            pool.check_truc_policy(&v2_child, v2_child.vsize() as u64),
+            Err(MempoolError::Truc(reason)) if reason.contains("non-version=3 tx")
+        ));
+
+        let mut v2_parent = graph_transaction(Txid::from_byte_array([32; 32]), 32);
+        v2_parent.version = Version::TWO;
+        let v2_parent_id = insert_policy_entry(&mut pool, v2_parent);
+        let mut v3_child_of_v2 = graph_transaction(v2_parent_id, 33);
+        v3_child_of_v2.version = Version::non_standard(TRUC_VERSION);
+        assert!(matches!(
+            pool.check_truc_policy(&v3_child_of_v2, v3_child_of_v2.vsize() as u64),
+            Err(MempoolError::Truc(reason)) if reason.contains("cannot spend from non-version=3")
+        ));
+
+        let mut v3_child = graph_transaction(v3_parent_id, 34);
+        v3_child.version = Version::non_standard(TRUC_VERSION);
+        let v3_child_id = v3_child.compute_txid();
+        assert!(
+            pool.check_truc_policy(&v3_child, v3_child.vsize() as u64)
+                .is_ok()
+        );
+        insert_policy_entry(&mut pool, v3_child);
+
+        let mut v3_grandchild = graph_transaction(v3_child_id, 35);
+        v3_grandchild.version = Version::non_standard(TRUC_VERSION);
+        assert!(matches!(
+            pool.check_truc_policy(&v3_grandchild, v3_grandchild.vsize() as u64),
+            Err(MempoolError::Truc(reason)) if reason.contains("too many ancestors")
+        ));
+
+        let mut v3_sibling = graph_transaction(v3_parent_id, 36);
+        v3_sibling.version = Version::non_standard(TRUC_VERSION);
+        assert!(matches!(
+            pool.check_truc_policy(&v3_sibling, v3_sibling.vsize() as u64),
+            Err(MempoolError::Truc(reason)) if reason.contains("descendant count limit")
+        ));
+
+        let mut huge = graph_transaction(Txid::from_byte_array([37; 32]), 37);
+        huge.version = Version::non_standard(TRUC_VERSION);
+        huge.output = (0..1_200)
+            .map(|_| TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            })
+            .collect();
+        assert!(huge.vsize() as u64 > TRUC_MAX_VSIZE);
+        assert!(matches!(
+            pool.check_truc_policy(&huge, huge.vsize() as u64),
+            Err(MempoolError::Truc(reason)) if reason.contains("is too big")
+        ));
+
+        let mut child_size_parent = graph_transaction(Txid::from_byte_array([38; 32]), 38);
+        child_size_parent.version = Version::non_standard(TRUC_VERSION);
+        let child_size_parent_id = insert_policy_entry(&mut pool, child_size_parent);
+        let mut large_child = graph_transaction(child_size_parent_id, 39);
+        large_child.version = Version::non_standard(TRUC_VERSION);
+        large_child.output = (0..120)
+            .map(|_| TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            })
+            .collect();
+        assert!(large_child.vsize() as u64 > TRUC_CHILD_MAX_VSIZE);
+        assert!(matches!(
+            pool.check_truc_policy(&large_child, large_child.vsize() as u64),
+            Err(MempoolError::Truc(reason)) if reason.contains("child tx")
+        ));
     }
 
     #[test]

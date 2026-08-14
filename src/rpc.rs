@@ -8141,6 +8141,7 @@ fn mempool_reject_reason(error: &MempoolError) -> String {
         MempoolError::FeeRate => "mempool min fee not met".to_owned(),
         MempoolError::NonStandard(reason) => reason.clone(),
         MempoolError::ClusterLimit => "too-long-mempool-chain".to_owned(),
+        MempoolError::Truc(reason) => format!("TRUC-violation, {reason}"),
         MempoolError::Script(reason) => reason.clone(),
         _ => error.to_string(),
     }

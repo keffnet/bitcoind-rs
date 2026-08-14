@@ -882,12 +882,19 @@ fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if let Some((transaction, location)) = chain_transaction {
         if verbose {
             let chain = node.chain.read();
-            let time = chain
-                .header_by_hash(&location.block_hash)
-                .map(|header| header.time);
-            let confirmations = chain
-                .is_active_block(&location.block_hash)
-                .then(|| chain.height().saturating_sub(location.height) + 1);
+            let active = chain.is_active_block(&location.block_hash);
+            let confirmations = Some(if active {
+                chain.height().saturating_sub(location.height) + 1
+            } else {
+                0
+            });
+            let time = active
+                .then(|| {
+                    chain
+                        .header_by_hash(&location.block_hash)
+                        .map(|header| header.time)
+                })
+                .flatten();
             return Ok(electrum_transaction_json(
                 &transaction,
                 Some(&location),
@@ -2055,6 +2062,16 @@ mod tests {
         assert_eq!(verbose["confirmations"], json!(1));
         assert_eq!(verbose["time"], json!(block.header.time));
         assert_eq!(verbose["blocktime"], json!(block.header.time));
+        let side_location = chain::TxLocation {
+            block_hash: BlockHash::from_byte_array([1; 32]),
+            height: 0,
+            transaction_index: 0,
+        };
+        let side_verbose =
+            electrum_transaction_json(&block.txdata[0], Some(&side_location), Some(0), None);
+        assert_eq!(side_verbose["confirmations"], json!(0));
+        assert!(side_verbose.get("time").is_none());
+        assert!(side_verbose.get("blocktime").is_none());
         let merkle = transaction_merkle(&node, &json!([txid.to_string(), 0])).unwrap();
         assert_eq!(merkle["block_height"], 0);
         assert!(transaction_merkle(&node, &json!([txid.to_string(), 1])).is_err());

@@ -1092,6 +1092,7 @@ async fn serve_peer_loop(
                     &Message::GetAddr,
                 )
                 .await?;
+                node.grant_peer_address_tokens(peer_id, MAX_ADDR_TO_SEND);
             }
             Message::SendAddrV2 => {
                 if verack_received {
@@ -1714,13 +1715,14 @@ async fn serve_peer_loop(
                 if addresses.len() > MAX_ADDR_TO_SEND {
                     bail!("addr message contains too many addresses");
                 }
-                node.record_peer_addresses(peer_id, addresses.len());
+                node.enable_peer_address_relay(peer_id);
                 let mut relay_addresses = Vec::new();
                 for entry in addresses {
-                    if let Some(address) = socket_address_from_legacy(&entry) {
-                        if node.remember_address(address, entry.services, u64::from(entry.time)) {
-                            relay_addresses.push((address, entry.services, u64::from(entry.time)));
-                        }
+                    if let Some(address) = socket_address_from_legacy(&entry)
+                        && node.allow_peer_address(peer_id)
+                        && node.remember_address(address, entry.services, u64::from(entry.time))
+                    {
+                        relay_addresses.push((address, entry.services, u64::from(entry.time)));
                     }
                 }
                 node.relay_peer_addresses(peer_id, relay_addresses);
@@ -1729,18 +1731,14 @@ async fn serve_peer_loop(
                 if addresses.len() > MAX_ADDR_TO_SEND {
                     bail!("addrv2 message contains too many addresses");
                 }
-                node.record_peer_addresses(peer_id, addresses.len());
+                node.enable_peer_address_relay(peer_id);
                 let mut relay_addresses = Vec::new();
                 for address in addresses {
-                    if let Some(socket) = socket_address_from_v2(&address) {
-                        if node.remember_address(socket, address.services, u64::from(address.time))
-                        {
-                            relay_addresses.push((
-                                socket,
-                                address.services,
-                                u64::from(address.time),
-                            ));
-                        }
+                    if let Some(socket) = socket_address_from_v2(&address)
+                        && node.allow_peer_address(peer_id)
+                        && node.remember_address(socket, address.services, u64::from(address.time))
+                    {
+                        relay_addresses.push((socket, address.services, u64::from(address.time)));
                     }
                 }
                 node.relay_peer_addresses(peer_id, relay_addresses);
@@ -2529,7 +2527,7 @@ mod tests {
         node.update_peer_version(2, 70016, 0, "/outbound/", 0, true);
         node.update_peer_version(3, 70016, 0, "/inbound/", 0, true);
         node.update_peer_version(4, 70016, 0, "/block/", 0, true);
-        node.record_peer_addresses(3, 0);
+        node.enable_peer_address_relay(3);
         node.set_peer_connection_type(4, "block-relay-only");
 
         node.relay_peer_addresses(1, vec![("192.0.2.10:18444".parse().unwrap(), 9, 123)]);

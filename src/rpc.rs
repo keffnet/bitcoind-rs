@@ -1474,7 +1474,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                         "inflight": [],
                         "addr_relay_enabled": peer.addr_relay_enabled,
                         "addr_processed": peer.addr_processed,
-                        "addr_rate_limited": 0,
+                        "addr_rate_limited": peer.addr_rate_limited,
                         "permissions": [],
                         "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
                         "bytessent_per_msg": peer.bytes_sent_per_msg,

@@ -43,6 +43,8 @@ const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_KNOWN_ADDRESSES: usize = 256_000;
+const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
+const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_EXTERNAL_BLOCK_RECORD_SIZE: usize = 4 * 1024 * 1024;
 
@@ -318,10 +320,13 @@ pub struct PeerInfo {
     pub last_block: u64,
     pub time_offset: i64,
     pub addr_processed: u64,
+    pub addr_rate_limited: u64,
     pub addr_relay_enabled: bool,
     pub ping_time: Option<f64>,
     pub min_ping: Option<f64>,
     pub connection_type: &'static str,
+    addr_token_bucket: f64,
+    addr_token_timestamp: Instant,
     ping_nonce: Option<u64>,
     ping_sent_at: Option<Instant>,
 }
@@ -1050,11 +1055,14 @@ impl Node {
             last_block: 0,
             time_offset: 0,
             addr_processed: 0,
+            addr_rate_limited: 0,
             addr_relay_enabled: !inbound,
             ping_time: None,
             min_ping: None,
             ping_nonce: None,
             ping_sent_at: None,
+            addr_token_bucket: 1.0,
+            addr_token_timestamp: Instant::now(),
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
@@ -1106,21 +1114,43 @@ impl Node {
         }
     }
 
-    pub(crate) fn record_peer_addresses(&self, id: usize, count: usize) {
-        let count = u64::try_from(count).unwrap_or(u64::MAX);
-        if let Some(peer) = self.peers.write().get_mut(&id) {
-            peer.addr_processed = peer.addr_processed.saturating_add(count);
-            if peer.inbound {
-                peer.addr_relay_enabled = true;
-            }
-        }
-    }
-
     pub(crate) fn enable_peer_address_relay(&self, id: usize) {
         if let Some(peer) = self.peers.write().get_mut(&id)
             && peer.inbound
         {
             peer.addr_relay_enabled = true;
+        }
+    }
+
+    pub(crate) fn allow_peer_address(&self, id: usize) -> bool {
+        let mut peers = self.peers.write();
+        let Some(peer) = peers.get_mut(&id) else {
+            return false;
+        };
+        let now = Instant::now();
+        if peer.addr_token_bucket < MAX_ADDR_PROCESSING_TOKEN_BUCKET {
+            let elapsed = now
+                .saturating_duration_since(peer.addr_token_timestamp)
+                .as_secs_f64();
+            peer.addr_token_bucket = (peer.addr_token_bucket + elapsed * MAX_ADDR_RATE_PER_SECOND)
+                .min(MAX_ADDR_PROCESSING_TOKEN_BUCKET);
+        }
+        peer.addr_token_timestamp = now;
+        if peer.addr_token_bucket < 1.0 {
+            peer.addr_rate_limited = peer.addr_rate_limited.saturating_add(1);
+            return false;
+        }
+        peer.addr_token_bucket -= 1.0;
+        peer.addr_processed = peer.addr_processed.saturating_add(1);
+        if peer.inbound {
+            peer.addr_relay_enabled = true;
+        }
+        true
+    }
+
+    pub(crate) fn grant_peer_address_tokens(&self, id: usize, count: usize) {
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.addr_token_bucket += count as f64;
         }
     }
 
@@ -1247,11 +1277,14 @@ impl Node {
                 last_block: 0,
                 time_offset: 0,
                 addr_processed: 0,
+                addr_rate_limited: 0,
                 addr_relay_enabled: false,
                 ping_time: None,
                 min_ping: None,
                 ping_nonce: None,
                 ping_sent_at: None,
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: Instant::now(),
             },
         );
         drop(known);
@@ -1292,11 +1325,14 @@ impl Node {
             last_block: 0,
             time_offset: 0,
             addr_processed: 0,
+            addr_rate_limited: 0,
             addr_relay_enabled: false,
             ping_time: None,
             min_ping: None,
             ping_nonce: None,
             ping_sent_at: None,
+            addr_token_bucket: 1.0,
+            addr_token_timestamp: Instant::now(),
         });
         if entry.id == 0 {
             entry.services |= services;
@@ -1732,11 +1768,14 @@ fn load_known_addresses(
                 last_block: 0,
                 time_offset: 0,
                 addr_processed: 0,
+                addr_rate_limited: 0,
                 addr_relay_enabled: false,
                 ping_time: None,
                 min_ping: None,
                 ping_nonce: None,
                 ping_sent_at: None,
+                addr_token_bucket: 1.0,
+                addr_token_timestamp: Instant::now(),
             },
         );
     }
@@ -1884,6 +1923,24 @@ mod tests {
         node.update_peer_time_offset(4, 500);
 
         assert_eq!(node.median_outbound_time_offset(), 1);
+    }
+
+    #[test]
+    fn address_processing_uses_core_style_token_bucket() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), true, sender);
+
+        assert!(node.allow_peer_address(1));
+        assert!(!node.allow_peer_address(1));
+        node.grant_peer_address_tokens(1, 2);
+        assert!(node.allow_peer_address(1));
+        assert!(node.allow_peer_address(1));
+
+        let peer = node.peer_infos().pop().unwrap();
+        assert_eq!(peer.addr_processed, 3);
+        assert_eq!(peer.addr_rate_limited, 1);
     }
 
     #[test]

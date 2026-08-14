@@ -2566,7 +2566,10 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
         ),
     };
     if let Some(network) = &network
-        && !matches!(network.as_str(), "ipv4" | "ipv6")
+        && !matches!(
+            network.as_str(),
+            "ipv4" | "ipv6" | "onion" | "i2p" | "cjdns"
+        )
     {
         bail!("network not recognized: {network}")
     }
@@ -2575,10 +2578,13 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(
         peers
             .into_iter()
-            .filter(|peer| network.as_deref().is_none_or(|network| {
-                (network == "ipv4" && peer.address.ip().is_ipv4())
-                    || (network == "ipv6" && peer.address.ip().is_ipv6())
-            }))
+            .filter(|peer| match network.as_deref() {
+                None => true,
+                Some("ipv4") => peer.address.ip().is_ipv4(),
+                Some("ipv6") => peer.address.ip().is_ipv6(),
+                Some("onion" | "i2p" | "cjdns") => false,
+                Some(_) => false,
+            })
             .take(count.unwrap_or(usize::MAX))
             .map(|peer| json!({
                 "address": peer.address.ip().to_string(),
@@ -13389,7 +13395,11 @@ mod tests {
         let ipv6 = get_node_addresses(&node, &json!([10, "ipv6"])).unwrap();
         assert_eq!(ipv6[0]["address"], "2001:db8::20");
         assert_eq!(ipv6[0]["services"], 8);
-        assert!(get_node_addresses(&node, &json!([1, "onion"])).is_err());
+        assert_eq!(
+            get_node_addresses(&node, &json!([1, "onion"])).unwrap(),
+            json!([])
+        );
+        assert!(get_node_addresses(&node, &json!([1, "unknown"])).is_err());
 
         add_node(&node, &json!(["127.0.0.1:18444", "add"])).unwrap();
         let selected = get_added_node_info(&node, &json!(["127.0.0.1:18444"])).unwrap();

@@ -9,6 +9,7 @@ pub mod muhash;
 pub mod p2p;
 pub mod rpc;
 pub mod storage;
+pub mod time;
 pub mod validation;
 pub mod wire;
 
@@ -19,7 +20,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bitcoin::Block;
@@ -559,10 +560,7 @@ impl Node {
         commands: tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>,
         local_address: Option<SocketAddr>,
     ) {
-        let connected_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let connected_at = time::unix_time();
         let peer = PeerInfo {
             id,
             address,
@@ -808,10 +806,7 @@ impl Node {
     }
 
     pub fn is_banned(&self, address: IpAddr) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = time::unix_time();
         let mut banned = self.banned_addresses.write();
         if banned
             .get(&address)
@@ -831,10 +826,7 @@ impl Node {
     }
 
     pub fn ban_address(&self, address: IpAddr, ban_until: u64, reason: String) -> Result<()> {
-        let ban_created = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let ban_created = time::unix_time();
         self.banned_addresses.write().insert(
             address,
             BannedAddress {
@@ -997,10 +989,7 @@ fn load_known_addresses(
 }
 
 fn unix_time_seconds() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    time::unix_time()
 }
 
 fn load_rpc_cookie(data_dir: &Path) -> Result<String> {

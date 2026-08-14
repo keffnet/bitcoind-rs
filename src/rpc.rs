@@ -3,8 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -924,20 +923,16 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "generateblock" => generate_block(node, params),
         "submitpackage" => submit_package(node, params),
         "testmempoolaccept" => test_mempool_accept(node, params),
+        "setmocktime" => set_mock_time(node, params),
+        "mockscheduler" => mock_scheduler(node, params),
+        "echo" | "echojson" => Ok(params.clone()),
+        "echoipc" => Ok(json!(param::<String>(params, 0)?)),
         "verifychain" => {
             let depth = params.get(1).and_then(Value::as_u64).unwrap_or(0) as u32;
             node.chain.write().verify_active_chain(depth)?;
             Ok(Value::Bool(true))
         }
-        "getmemoryinfo" => {
-            let mempool = node.mempool.read();
-            Ok(json!({
-                "used": mempool.bytes(),
-                "free": 0,
-                "total": mempool.max_bytes(),
-                "locked": {"used": 0, "free": 0, "total": 0, "locked": 0},
-            }))
-        }
+        "getmemoryinfo" => get_memory_info(params),
         "gettxout" => get_txout(node, params),
         "gettxspendingprevout" => get_tx_spending_prevout(node, params),
         "getmempoolinfo" => {
@@ -1148,15 +1143,163 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         )),
         "getconnectioncount" => Ok(json!(node.peer_count())),
         "uptime" => Ok(json!(node.started_at.elapsed().as_secs())),
-        "getindexinfo" => Ok(json!({})),
+        "getindexinfo" => get_index_info(node, params),
         "getzmqnotifications" => Ok(json!([])),
-        "logging" => Ok(json!({})),
+        "logging" => configure_logging(params),
         "syncwithvalidationinterfacequeue" => Ok(Value::Null),
         "validateaddress" => validate_address(node, params),
         "deriveaddresses" => derive_addresses(node, params),
         "getdescriptorinfo" => get_descriptor_info(node, params),
         _ => bail!("Method not found"),
     }
+}
+
+fn set_mock_time(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    if node.config.network != Network::Regtest {
+        bail!("setmocktime is for regression testing (-regtest mode) only")
+    }
+    let timestamp = param::<i64>(params, 0)?;
+    if timestamp < 0 {
+        bail!("Mocktime must be in the range [0, 9223372036854775807]")
+    }
+    crate::time::set_mock_time(timestamp);
+    Ok(Value::Null)
+}
+
+fn mock_scheduler(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    if node.config.network != Network::Regtest {
+        bail!("mockscheduler is for regression testing (-regtest mode) only")
+    }
+    let delta = param::<i64>(params, 0)?;
+    if !(1..=3_600).contains(&delta) {
+        bail!("delta_time must be between 1 and 3600 seconds (1 hr)")
+    }
+    // Tokio's scheduler is real-time in this implementation. The RPC still
+    // validates and accepts the same testing range; validation notifications
+    // are synchronous, so no scheduler wake-up is needed here.
+    Ok(Value::Null)
+}
+
+fn get_memory_info(params: &Value) -> Result<Value> {
+    let mode = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_str)
+        .unwrap_or("stats");
+    match mode {
+        "stats" => Ok(json!({
+            "locked": {
+                "used": 0,
+                "free": 0,
+                "total": 0,
+                "locked": 0,
+                "chunks_used": 0,
+                "chunks_free": 0,
+            }
+        })),
+        "mallocinfo" => bail!("mallocinfo mode not available"),
+        _ => bail!("unknown mode {mode}"),
+    }
+}
+
+fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let requested = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("index_name must be a string"))
+        })
+        .transpose()?;
+    const BASIC_FILTER_INDEX: &str = "basic block filter index";
+    if requested.is_some_and(|name| name != BASIC_FILTER_INDEX) {
+        return Ok(json!({}));
+    }
+    let height = node.chain.read().height();
+    Ok(json!({
+        BASIC_FILTER_INDEX: {
+            "synced": true,
+            "best_block_height": height,
+        }
+    }))
+}
+
+const LOG_CATEGORIES: &[&str] = &[
+    "addrman",
+    "blockasset",
+    "blockencodings",
+    "blockfilter",
+    "coindb",
+    "estimatefee",
+    "http",
+    "leveldb",
+    "libevent",
+    "mempool",
+    "mempoolrej",
+    "net",
+    "netdag",
+    "netfulfilled",
+    "netlowlevel",
+    "not-found",
+    "proxy",
+    "prune",
+    "rand",
+    "reindex",
+    "rpc",
+    "scan",
+    "selectcoins",
+    "tor",
+    "txpackages",
+    "txreconciliation",
+    "validation",
+    "validationinterface",
+    "walletdb",
+    "zmq",
+];
+
+fn logging_state() -> &'static parking_lot::RwLock<HashSet<String>> {
+    static STATE: OnceLock<parking_lot::RwLock<HashSet<String>>> = OnceLock::new();
+    STATE.get_or_init(|| parking_lot::RwLock::new(HashSet::new()))
+}
+
+fn configure_logging(params: &Value) -> Result<Value> {
+    let mut enabled = logging_state().write();
+    for (index, should_enable) in [(0usize, true), (1usize, false)] {
+        let Some(value) = params.get(index).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let categories = value
+            .as_array()
+            .ok_or_else(|| anyhow!("logging categories must be an array"))?;
+        for category in categories {
+            let category = category
+                .as_str()
+                .ok_or_else(|| anyhow!("logging category must be a string"))?;
+            if category == "all" || category == "1" {
+                if should_enable {
+                    enabled.extend(LOG_CATEGORIES.iter().map(|category| (*category).to_owned()));
+                } else {
+                    enabled.clear();
+                }
+                continue;
+            }
+            if !LOG_CATEGORIES.contains(&category) {
+                bail!("unknown logging category {category}")
+            }
+            if should_enable {
+                enabled.insert(category.to_owned());
+            } else {
+                enabled.remove(category);
+            }
+        }
+    }
+    Ok(json!(
+        LOG_CATEGORIES
+            .iter()
+            .map(|category| ((*category).to_owned(), enabled.contains(*category)))
+            .collect::<HashMap<_, _>>()
+    ))
 }
 
 fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
@@ -1166,10 +1309,7 @@ fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
     Ok(json!({
         "totalbytesrecv": total_bytes_recv,
         "totalbytessent": total_bytes_sent,
-        "timemillis": SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
+        "timemillis": crate::time::unix_time_millis(),
         "uploadtarget": {
             "timeframe": 86_400,
             "target": 0,
@@ -1783,10 +1923,7 @@ fn parse_ip_address(value: &str) -> Result<IpAddr> {
 }
 
 fn unix_time() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
+    crate::time::unix_time()
 }
 
 fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
@@ -2297,13 +2434,7 @@ fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
     let chain = node.chain.read();
     let tip = chain.tip();
     let header = chain.header(tip.height).expect("tip header exists");
-    let now = u32::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    )
-    .unwrap_or(u32::MAX);
+    let now = u32::try_from(crate::time::unix_time()).unwrap_or(u32::MAX);
     let next_time = now.max(header.time.saturating_add(1));
     let next_bits = chain.next_bits(next_time);
     let mempool = node.mempool.read();
@@ -5875,13 +6006,7 @@ fn build_mining_block_with_transactions(
         .copied()
         .ok_or_else(|| anyhow!("active tip header is unavailable"))?;
     let height = tip.height.saturating_add(1);
-    let now = u32::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-    )
-    .unwrap_or(u32::MAX);
+    let now = u32::try_from(crate::time::unix_time()).unwrap_or(u32::MAX);
     let time = now
         .max(parent.time.saturating_add(1))
         .max(chain.median_time_past_value().saturating_add(1));
@@ -6126,10 +6251,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let tip = chain.tip();
     let parent = chain.header(tip.height).expect("tip header exists");
     let height = tip.height + 1;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as u32;
+    let now = crate::time::unix_time() as u32;
     let curtime = now.max(parent.time.saturating_add(1));
     let bits = chain.next_bits(curtime);
     let mempool = node.mempool.read();
@@ -8149,6 +8271,46 @@ mod tests {
         assert_eq!(tip["height"], json!(1));
         assert_eq!(tip["txouts"], json!(2));
         assert_eq!(tip["total_amount"], json!(50.0));
+    }
+
+    #[test]
+    fn node_control_rpcs_return_core_shapes() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+        })
+        .unwrap();
+
+        assert_eq!(
+            dispatch_method(&node, "echo", &json!([1, {"two": 2}])).unwrap(),
+            json!([1, {"two": 2}])
+        );
+        assert_eq!(
+            dispatch_method(&node, "echoipc", &json!(["hello"])).unwrap(),
+            json!("hello")
+        );
+        assert!(dispatch_method(&node, "getmemoryinfo", &json!([])).unwrap()["locked"].is_object());
+        assert!(dispatch_method(&node, "getmemoryinfo", &json!(["mallocinfo"])).is_err());
+        assert!(
+            dispatch_method(&node, "getindexinfo", &json!([])).unwrap()["basic block filter index"]
+                ["synced"]
+                .as_bool()
+                .unwrap()
+        );
+        let logging = dispatch_method(&node, "logging", &json!([["rpc"], []])).unwrap();
+        assert_eq!(logging["rpc"], json!(true));
+        let logging = dispatch_method(&node, "logging", &json!([[], ["rpc"]])).unwrap();
+        assert_eq!(logging["rpc"], json!(false));
+        assert!(dispatch_method(&node, "mockscheduler", &json!([0])).is_err());
+        assert!(dispatch_method(&node, "setmocktime", &json!([-1])).is_err());
     }
 
     #[test]

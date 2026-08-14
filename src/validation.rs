@@ -6,7 +6,6 @@
 //! witness commitments, transaction shape, money range, and block weight.
 
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use bitcoin::absolute::LockTime;
 use bitcoin::blockdata::locktime::absolute::{Height, Time};
@@ -18,6 +17,8 @@ use bitcoin::consensus::encode::{deserialize_partial, serialize};
 use bitcoin::opcodes::OP_0;
 use bitcoin::pow::Target;
 use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, Sequence, Transaction, Txid};
+
+use crate::time;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlockValidationStats {
@@ -265,13 +266,7 @@ pub fn validate_header(
     if header.time <= median_time_past {
         return Err(ValidationError::TimeTooOld);
     }
-    if header.time
-        > SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .saturating_add(2 * 60 * 60) as u32
-    {
+    if header.time > time::unix_time().saturating_add(2 * 60 * 60) as u32 {
         return Err(ValidationError::TimeTooNew);
     }
     if header.target() != expected_target

@@ -3,13 +3,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bitcoin::{Amount, Network, OutPoint, Transaction, Txid, Wtxid};
 use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainState;
+use crate::time;
 use crate::validation::{self, ValidationError};
 
 const DEFAULT_MAX_MEMPOOL_BYTES: usize = 300 * 1024 * 1024;
@@ -288,10 +289,7 @@ impl Mempool {
         for entry in entries {
             let _ = self.accept_at(entry.transaction, chain, entry.added_at);
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs();
+        let now = time::unix_time();
         self.clear_expired(now, MEMPOOL_EXPIRY);
         Ok(())
     }
@@ -322,10 +320,7 @@ impl Mempool {
         transaction: Transaction,
         chain: &ChainState,
     ) -> Result<Txid, MempoolError> {
-        let added_at = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs();
+        let added_at = time::unix_time();
         match self.accept_at(transaction.clone(), chain, added_at) {
             Err(MempoolError::Conflict(_)) => self.replace(transaction, chain, added_at),
             result => result,

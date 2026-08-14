@@ -7078,9 +7078,15 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let coinbase_value =
         validation::block_subsidy_for_network(chain.network, height).saturating_add(fees);
     let segwit_active = height >= validation::buried_deployment_heights(chain.network).segwit;
+    let taproot_active = validation::script_flags_for_block(chain.network, height, curtime)
+        & bitcoinconsensus::VERIFY_TAPROOT
+        != 0;
     let mut rules = vec!["csv"];
     if segwit_active {
         rules.push("!segwit");
+    }
+    if taproot_active {
+        rules.push("taproot");
     }
     if chain.network == Network::Signet {
         rules.push("!signet");
@@ -9861,7 +9867,7 @@ mod tests {
         let template = get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
         assert_eq!(template["height"], 1);
         assert_eq!(template["weightlimit"], 4_000_000);
-        assert_eq!(template["rules"], json!(["csv", "!segwit"]));
+        assert_eq!(template["rules"], json!(["csv", "!segwit", "taproot"]));
         assert_eq!(
             template["longpollid"],
             current_block_template_longpoll_id(&node)

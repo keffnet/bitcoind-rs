@@ -262,13 +262,10 @@ pub fn network_magic(network: Network) -> [u8; 4] {
 
 pub fn encode_message(network: Network, message: &Message) -> Result<Vec<u8>> {
     let payload = encode_payload(message)?;
-    if payload.len() > MAX_MESSAGE_SIZE {
-        return Err(WireError::Oversized(payload.len()).into());
-    }
-    let command = message.command().as_bytes();
-    if command.is_empty() || command.len() > 12 || command.contains(&0) {
-        bail!("invalid Bitcoin command name");
-    }
+    validate_payload_size(payload.len())?;
+    let command = message.command();
+    validate_command(command)?;
+    let command = command.as_bytes();
     let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
     frame.extend_from_slice(&network_magic(network));
     let mut command_bytes = [0u8; 12];
@@ -289,11 +286,7 @@ pub fn decode_message(network: Network, frame: &[u8]) -> Result<Message> {
     if magic != network_magic(network) {
         return Err(WireError::Magic(magic).into());
     }
-    let command_end = frame[4..16]
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(12);
-    let command = std::str::from_utf8(&frame[4..4 + command_end])?;
+    let command = decode_command(&frame[4..16])?;
     let length = u32::from_le_bytes(frame[16..20].try_into().expect("slice length")) as usize;
     if length > MAX_MESSAGE_SIZE {
         return Err(WireError::Oversized(length).into());
@@ -460,13 +453,11 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
 /// conventional 12-byte command name.
 pub fn encode_v2_message(message: &Message) -> Result<Vec<u8>> {
     let command = message.command();
+    validate_command(command)?;
     let mut result = Vec::new();
     if let Some(message_id) = v2_message_id(command) {
         result.push(message_id);
     } else {
-        if command.is_empty() || command.len() > 12 || command.contains('\0') {
-            bail!("invalid Bitcoin command name");
-        }
         result.push(0);
         let mut command_bytes = [0u8; 12];
         command_bytes[..command.len()].copy_from_slice(command.as_bytes());
@@ -486,12 +477,7 @@ pub fn decode_v2_message(payload: &[u8]) -> Result<Message> {
         let command_bytes = payload
             .get(1..13)
             .ok_or_else(|| anyhow::anyhow!("short BIP324 command header"))?;
-        let command_end = command_bytes
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(command_bytes.len());
-        let command = std::str::from_utf8(&command_bytes[..command_end])?;
-        (command.to_owned(), 13)
+        (decode_command(command_bytes)?.to_owned(), 13)
     } else {
         (
             v2_message_command(message_type)
@@ -501,6 +487,43 @@ pub fn decode_v2_message(payload: &[u8]) -> Result<Message> {
         )
     };
     decode_payload(&command, payload.get(payload_start..).unwrap_or_default()).map_err(Into::into)
+}
+
+fn validate_payload_size(size: usize) -> Result<()> {
+    if size > MAX_MESSAGE_SIZE {
+        return Err(WireError::Oversized(size).into());
+    }
+    Ok(())
+}
+
+fn validate_command(command: &str) -> Result<()> {
+    let bytes = command.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 12
+        || bytes
+            .iter()
+            .any(|byte| !byte.is_ascii_graphic() || *byte == b' ')
+    {
+        bail!("invalid Bitcoin command name");
+    }
+    Ok(())
+}
+
+fn decode_command(bytes: &[u8]) -> Result<&str> {
+    let command_end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    if command_end == 0
+        || bytes[command_end + usize::from(command_end < bytes.len())..]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        bail!("invalid Bitcoin command padding");
+    }
+    let command = std::str::from_utf8(&bytes[..command_end])?;
+    validate_command(command)?;
+    Ok(command)
 }
 
 fn v2_message_id(command: &str) -> Option<u8> {
@@ -956,6 +979,29 @@ mod tests {
         assert_eq!(
             decode_message(Network::Regtest, &frame).unwrap(),
             Message::Ping(42)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_command_padding() {
+        let frame = encode_message(Network::Regtest, &Message::Ping(42)).unwrap();
+        let mut nonzero_padding = frame.clone();
+        nonzero_padding[4 + 5] = b'x';
+        assert!(decode_message(Network::Regtest, &nonzero_padding).is_err());
+
+        let mut empty_command = frame;
+        empty_command[4] = 0;
+        assert!(decode_message(Network::Regtest, &empty_command).is_err());
+
+        assert!(
+            encode_message(
+                Network::Regtest,
+                &Message::Unknown {
+                    command: "bad command".to_owned(),
+                    payload: Vec::new(),
+                }
+            )
+            .is_err()
         );
     }
 

@@ -872,7 +872,8 @@ fn block_chunk(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
     let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
-    if let Some((transaction, location)) = node.chain.write().transaction(&txid)? {
+    let chain_transaction = { node.chain.write().transaction(&txid)? };
+    if let Some((transaction, location)) = chain_transaction {
         if verbose {
             let chain = node.chain.read();
             let time = chain
@@ -987,6 +988,7 @@ fn electrum_transaction_json(
     }
     if let Some(time) = time {
         result["time"] = json!(time);
+        result["blocktime"] = json!(time);
     }
     result
 }
@@ -1085,7 +1087,7 @@ fn transaction_test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<V
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("testmempoolaccept expects an array of transactions"))?;
     if raw_transactions.is_empty() {
-        return Ok(json!([]));
+        bail!("testmempoolaccept requires at least one transaction")
     }
     crate::rpc::test_mempool_accept(node, &json!([raw_transactions]))
 }
@@ -2020,6 +2022,12 @@ mod tests {
             result[0].as_str().unwrap(),
             chain::transaction_hex(&block.txdata[0])
         );
+        let verbose = transaction_get(&node, &json!([txid.to_string(), true])).unwrap();
+        assert_eq!(verbose["blockhash"], json!(hash.to_string()));
+        assert_eq!(verbose["height"], json!(0));
+        assert_eq!(verbose["confirmations"], json!(1));
+        assert_eq!(verbose["time"], json!(block.header.time));
+        assert_eq!(verbose["blocktime"], json!(block.header.time));
         let merkle = transaction_merkle(&node, &json!([txid.to_string(), 0])).unwrap();
         assert_eq!(merkle["block_height"], 0);
         assert!(transaction_merkle(&node, &json!([txid.to_string(), 1])).is_err());
@@ -2079,15 +2087,14 @@ mod tests {
             .unwrap(),
             json!({"utxos": []})
         );
-        assert_eq!(
+        assert!(
             dispatch(
                 &node,
                 "blockchain.transaction.testmempoolaccept",
                 &json!([[]]),
                 &mut HashMap::new(),
             )
-            .unwrap(),
-            json!([])
+            .is_err()
         );
         assert!(
             dispatch(

@@ -5,6 +5,7 @@ pub mod chain;
 pub mod config;
 pub mod electrum;
 pub mod mempool;
+pub mod muhash;
 pub mod p2p;
 pub mod rpc;
 pub mod storage;

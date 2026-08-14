@@ -1202,10 +1202,6 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     {
         bail!("use_index must be a boolean")
     }
-    if hash_type == "muhash" {
-        bail!("muhash is unavailable because this node has no coinstatsindex")
-    }
-
     let chain = node.chain.read();
     let (transactions, outputs, total) = chain.utxo_stats();
     let disk_size = std::fs::metadata(chain.store.path())
@@ -1220,8 +1216,15 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "disk_size": disk_size,
         "total_amount": sat_to_btc(total),
     });
-    if hash_type == "hash_serialized_3" {
-        result["hash_serialized_3"] = json!(chain.utxo_serialized_hash());
+    match hash_type {
+        "hash_serialized_3" => {
+            result["hash_serialized_3"] = json!(chain.utxo_serialized_hash());
+        }
+        "muhash" => {
+            result["muhash"] = json!(chain.utxo_muhash());
+        }
+        "none" => {}
+        _ => unreachable!("hash_type was validated above"),
     }
     Ok(result)
 }
@@ -8044,7 +8047,9 @@ mod tests {
         assert!(without_hash.get("hash_serialized_3").is_none());
         assert_eq!(without_hash["height"], json!(0));
         assert!(dispatch_method(&node, "gettxoutsetinfo", &json!(["invalid"])).is_err());
-        assert!(dispatch_method(&node, "gettxoutsetinfo", &json!(["muhash"])).is_err());
+        let muhash = dispatch_method(&node, "gettxoutsetinfo", &json!(["muhash"])).unwrap();
+        assert!(muhash["muhash"].is_string());
+        assert!(muhash.get("hash_serialized_3").is_none());
         assert!(dispatch_method(&node, "gettxoutsetinfo", &json!(["none", 0])).is_err());
         assert_eq!(
             dispatch_method(&node, "getzmqnotifications", &json!([])).unwrap(),

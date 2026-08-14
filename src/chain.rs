@@ -14,6 +14,7 @@ use bitcoin::{Amount, Block, BlockHash, Network, OutPoint, Script, Transaction, 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::muhash::MuHash3072;
 use crate::storage::BlockStore;
 use crate::validation::{self, ValidationError};
 
@@ -921,6 +922,20 @@ impl ChainState {
             engine.input(&serialize(&entry.output));
         }
         bitcoin::hashes::sha256d::Hash::from_engine(engine).to_string()
+    }
+
+    /// Return the Core-compatible MuHash commitment for the active UTXO set.
+    pub fn utxo_muhash(&self) -> String {
+        let mut accumulator = MuHash3072::default();
+        for (outpoint, entry) in &self.utxos {
+            let mut bytes = serialize(outpoint);
+            bytes.extend_from_slice(
+                &(entry.height.saturating_mul(2) | u32::from(entry.coinbase)).to_le_bytes(),
+            );
+            bytes.extend_from_slice(&serialize(&entry.output));
+            accumulator.insert(&bytes);
+        }
+        accumulator.finalize()
     }
 
     pub fn dump_utxo_set(&self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {

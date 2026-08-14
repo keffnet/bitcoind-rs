@@ -3240,7 +3240,7 @@ fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     } else {
         -1
     };
-    Ok(json!({
+    let mut result = json!({
         "hash": hash.to_string(),
         "confirmations": confirmations,
         "height": height,
@@ -3260,9 +3260,14 @@ fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .unwrap_or_else(|| chain.tip().work)
         ),
         "nTx": chain.block_transaction_count(&hash)?.unwrap_or(0),
-        "previousblockhash": (height > 0).then(|| header.prev_blockhash.to_string()),
-        "nextblockhash": chain.next_block_hash(&hash).map(|next| next.to_string()),
-    }))
+    });
+    if height > 0 {
+        result["previousblockhash"] = json!(header.prev_blockhash.to_string());
+    }
+    if let Some(next) = chain.next_block_hash(&hash) {
+        result["nextblockhash"] = json!(next.to_string());
+    }
+    Ok(result)
 }
 
 fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -3540,7 +3545,7 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .map(|txid| json!(txid.to_string()))
             .collect()
     };
-    Ok(json!({
+    let mut result = json!({
         "hash": hash.to_string(),
         "confirmations": confirmations,
         "height": height,
@@ -3566,10 +3571,15 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "size": serialize(&block).len(),
         "weight": block.weight().to_wu(),
         "tx": txs,
-        "previousblockhash": (height > 0).then(|| block.header.prev_blockhash.to_string()),
-        "nextblockhash": chain.next_block_hash(&hash).map(|next| next.to_string()),
         "coinbase_tx": coinbase_transaction_json(&block.txdata[0]),
-    }))
+    });
+    if height > 0 {
+        result["previousblockhash"] = json!(block.header.prev_blockhash.to_string());
+    }
+    if let Some(next) = chain.next_block_hash(&hash) {
+        result["nextblockhash"] = json!(next.to_string());
+    }
+    Ok(result)
 }
 
 fn get_block_filter(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -4358,12 +4368,12 @@ fn weighted_fee_percentiles(values: &mut [(u64, u64)], total_weight: u64) -> [u6
     values.sort_unstable_by_key(|(rate, _)| *rate);
     let mut result = [0; 5];
     let mut cumulative = 0u64;
-    let targets =
-        [10u64, 25, 50, 75, 90].map(|percentile| total_weight.saturating_mul(percentile) / 100);
+    let targets = [10u64, 25, 50, 75, 90]
+        .map(|percentile| (u128::from(total_weight) * u128::from(percentile)).div_ceil(100));
     let mut target_index = 0usize;
     for (rate, weight) in values.iter().copied() {
         cumulative = cumulative.saturating_add(weight);
-        while target_index < targets.len() && cumulative >= targets[target_index] {
+        while target_index < targets.len() && u128::from(cumulative) >= targets[target_index] {
             result[target_index] = rate;
             target_index += 1;
         }
@@ -10870,6 +10880,12 @@ mod tests {
                 "feerate_percentiles": [0, 0, 0, 0, 0],
             })
         );
+        let header = get_block_header(&node, &json!([hash.to_string()])).unwrap();
+        assert!(header.get("previousblockhash").is_none());
+        assert!(header.get("nextblockhash").is_none());
+        let block = get_block(&node, &json!([hash.to_string(), 1])).unwrap();
+        assert!(block.get("previousblockhash").is_none());
+        assert!(block.get("nextblockhash").is_none());
 
         let mined = generate_to_descriptor(&node, &json!([101, "raw(51)"])).unwrap();
         let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
@@ -10897,6 +10913,15 @@ mod tests {
         let stats = get_block_stats(&node, &json!([block["hash"].clone()])).unwrap();
         assert_eq!(stats["totalfee"], json!(1_000));
         assert_eq!(stats["utxo_increase_actual"], json!(1));
+    }
+
+    #[test]
+    fn block_stats_fee_percentiles_follow_core_fractional_boundaries() {
+        let mut values = [(10, 1), (20, 1), (30, 1), (40, 1), (50, 1)];
+        assert_eq!(
+            weighted_fee_percentiles(&mut values, 5),
+            [10, 20, 30, 40, 50]
+        );
     }
 
     #[test]

@@ -2783,7 +2783,7 @@ fn get_added_node_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let address = param::<String>(params, 0)?;
     let command = param::<String>(params, 1)?;
-    let address = parse_ip_address(&address)?;
+    let subnet = crate::IpSubnet::parse(&address)?;
     match command.as_str() {
         "add" => {
             let requested_duration = optional_u64(params, 2, 86_400, "bantime")?;
@@ -2802,11 +2802,11 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
             if ban_until <= now {
                 bail!("ban time must be in the future")
             }
-            node.ban_address(address, ban_until, "manually banned".to_owned())?;
+            node.ban_subnet(subnet, ban_until, "manually banned".to_owned())?;
             Ok(Value::Null)
         }
         "remove" => {
-            if node.unban_address(address)? {
+            if node.unban_subnet(subnet)? {
                 Ok(Value::Null)
             } else {
                 bail!("unban failed: address is not banned")
@@ -2822,7 +2822,7 @@ fn list_banned(node: &Arc<Node>) -> Result<Value> {
         node.banned_addresses()
             .into_iter()
             .map(|entry| json!({
-                "address": entry.address.to_string(),
+                "address": entry.subnet().display(),
                 "ban_created": entry.ban_created,
                 "banned_until": entry.ban_until,
                 "ban_duration": entry.ban_until.saturating_sub(entry.ban_created),
@@ -2834,7 +2834,7 @@ fn list_banned(node: &Arc<Node>) -> Result<Value> {
 
 fn clear_banned(node: &Arc<Node>) -> Result<Value> {
     for entry in node.banned_addresses() {
-        node.unban_address(entry.address)?;
+        node.unban_subnet(entry.subnet())?;
     }
     Ok(Value::Null)
 }
@@ -13115,9 +13115,23 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|entry| entry["address"] == "192.0.2.3")
+            .find(|entry| entry["address"] == "192.0.2.3/32")
             .and_then(|entry| entry["ban_duration"].as_u64());
         assert_eq!(default_duration, Some(86_400));
+        set_ban(&node, &json!(["192.0.2.0/24", "add", 60])).unwrap();
+        assert!(node.is_banned("192.0.2.99".parse().unwrap()));
+        assert!(set_ban(&node, &json!(["192.0.2.2", "add", 60])).is_err());
+        let subnet_entry = list_banned(&node)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["address"] == "192.0.2.0/24")
+            .cloned()
+            .unwrap();
+        assert_eq!(subnet_entry["ban_duration"], json!(60));
+        set_ban(&node, &json!(["192.0.2.0/24", "remove"])).unwrap();
+        assert!(!node.is_banned("192.0.2.99".parse().unwrap()));
         let normalized = normalize_rpc_params(
             "setban",
             &json!({"subnet": "192.0.2.4", "command": "add", "bantime": 60}),

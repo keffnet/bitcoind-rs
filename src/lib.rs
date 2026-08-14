@@ -16,7 +16,7 @@ pub mod zmq;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -348,12 +348,125 @@ impl PeerInfo {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct IpSubnet {
+    address: IpAddr,
+    prefix: u8,
+}
+
+impl IpSubnet {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        let mut parts = value.split('/');
+        let address = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid IP/Subnet"))?
+            .parse::<IpAddr>()
+            .map_err(|_| anyhow::anyhow!("invalid IP/Subnet"))?;
+        let prefix = match parts.next() {
+            Some(prefix) => prefix
+                .parse::<u8>()
+                .map_err(|_| anyhow::anyhow!("invalid IP/Subnet"))?,
+            None => address_bits(address),
+        };
+        if parts.next().is_some() {
+            bail!("invalid IP/Subnet")
+        }
+        Self::new(address, prefix)
+    }
+
+    pub(crate) fn from_address(address: IpAddr) -> Self {
+        Self {
+            address,
+            prefix: address_bits(address),
+        }
+    }
+
+    fn new(address: IpAddr, prefix: u8) -> Result<Self> {
+        let bits = address_bits(address);
+        if prefix > bits {
+            bail!("invalid IP/Subnet")
+        }
+        Ok(Self {
+            address: mask_address(address, prefix),
+            prefix,
+        })
+    }
+
+    pub(crate) fn address(self) -> IpAddr {
+        self.address
+    }
+
+    pub(crate) fn prefix(self) -> u8 {
+        self.prefix
+    }
+
+    pub(crate) fn contains(self, address: IpAddr) -> bool {
+        Self::new(address, self.prefix).is_ok_and(|candidate| candidate.address == self.address)
+    }
+
+    pub(crate) fn contains_subnet(self, subnet: Self) -> bool {
+        self.prefix <= subnet.prefix && self.contains(subnet.address)
+    }
+
+    pub(crate) fn display(self) -> String {
+        format!("{}/{}", self.address, self.prefix)
+    }
+}
+
+fn address_bits(address: IpAddr) -> u8 {
+    match address {
+        IpAddr::V4(_) => 32,
+        IpAddr::V6(_) => 128,
+    }
+}
+
+fn mask_address(address: IpAddr, prefix: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(address) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix))
+            };
+            IpAddr::V4(Ipv4Addr::from(u32::from(address) & mask))
+        }
+        IpAddr::V6(address) => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(prefix))
+            };
+            IpAddr::V6(Ipv6Addr::from(u128::from(address) & mask))
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct BannedAddress {
     pub address: IpAddr,
+    pub prefix: u8,
     pub ban_created: u64,
     pub ban_until: u64,
     pub reason: String,
+}
+
+impl BannedAddress {
+    pub(crate) fn subnet(&self) -> IpSubnet {
+        IpSubnet {
+            address: self.address,
+            prefix: self.prefix,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedBannedAddress {
+    address: IpAddr,
+    #[serde(default)]
+    prefix: Option<u8>,
+    ban_created: u64,
+    ban_until: u64,
+    reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -413,7 +526,7 @@ pub struct Node {
     known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
     tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
     added_nodes: parking_lot::RwLock<HashSet<SocketAddr>>,
-    banned_addresses: parking_lot::RwLock<HashMap<IpAddr, BannedAddress>>,
+    banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
     pub started_at: Instant,
     shutdown: Notify,
 }
@@ -1614,38 +1727,53 @@ impl Node {
     pub fn is_banned(&self, address: IpAddr) -> bool {
         let now = time::unix_time();
         let mut banned = self.banned_addresses.write();
-        if banned
-            .get(&address)
-            .is_some_and(|entry| entry.ban_until <= now)
-        {
-            banned.remove(&address);
-        }
-        banned.contains_key(&address)
+        remove_expired_bans(&mut banned, now);
+        banned.keys().any(|subnet| subnet.contains(address))
     }
 
     pub fn banned_addresses(&self) -> Vec<BannedAddress> {
-        let addresses: Vec<_> = self.banned_addresses.read().values().cloned().collect();
+        let now = time::unix_time();
+        let mut banned = self.banned_addresses.write();
+        remove_expired_bans(&mut banned, now);
+        let mut addresses = banned.values().cloned().collect::<Vec<_>>();
+        addresses.sort_by_key(|entry| entry.subnet().display());
         addresses
-            .into_iter()
-            .filter(|entry| self.is_banned(entry.address))
-            .collect()
     }
 
     pub fn ban_address(&self, address: IpAddr, ban_until: u64, reason: String) -> Result<()> {
+        self.ban_subnet(IpSubnet::from_address(address), ban_until, reason)
+    }
+
+    pub(crate) fn ban_subnet(
+        &self,
+        subnet: IpSubnet,
+        ban_until: u64,
+        reason: String,
+    ) -> Result<()> {
         let ban_created = time::unix_time();
-        self.banned_addresses.write().insert(
-            address,
+        let mut banned = self.banned_addresses.write();
+        remove_expired_bans(&mut banned, ban_created);
+        if banned
+            .keys()
+            .any(|existing| existing.contains_subnet(subnet))
+        {
+            bail!("IP/Subnet already banned")
+        }
+        banned.insert(
+            subnet,
             BannedAddress {
-                address,
+                address: subnet.address(),
+                prefix: subnet.prefix(),
                 ban_created,
                 ban_until,
                 reason,
             },
         );
+        drop(banned);
         let peers: Vec<_> = self
             .peer_infos()
             .into_iter()
-            .filter(|peer| peer.address.ip() == address)
+            .filter(|peer| subnet.contains(peer.address.ip()))
             .map(|peer| peer.id)
             .collect();
         for peer_id in peers {
@@ -1655,7 +1783,11 @@ impl Node {
     }
 
     pub fn unban_address(&self, address: IpAddr) -> Result<bool> {
-        let removed = self.banned_addresses.write().remove(&address).is_some();
+        self.unban_subnet(IpSubnet::from_address(address))
+    }
+
+    pub(crate) fn unban_subnet(&self, subnet: IpSubnet) -> Result<bool> {
+        let removed = self.banned_addresses.write().remove(&subnet).is_some();
         if removed {
             self.persist_banlist()?;
         }
@@ -1777,7 +1909,18 @@ impl Node {
     fn persist_banlist(&self) -> Result<()> {
         let path = self.config.datadir.join("banlist.json");
         let temp = self.config.datadir.join("banlist.json.tmp");
-        let entries: Vec<_> = self.banned_addresses.read().values().cloned().collect();
+        let entries = self
+            .banned_addresses
+            .read()
+            .values()
+            .map(|entry| PersistedBannedAddress {
+                address: entry.address,
+                prefix: Some(entry.prefix),
+                ban_created: entry.ban_created,
+                ban_until: entry.ban_until,
+                reason: entry.reason.clone(),
+            })
+            .collect::<Vec<_>>();
         std::fs::write(&temp, serde_json::to_vec_pretty(&entries)?)?;
         std::fs::rename(temp, path)?;
         Ok(())
@@ -1804,17 +1947,32 @@ impl Node {
     }
 }
 
-fn load_banlist(data_dir: &Path) -> Result<HashMap<IpAddr, BannedAddress>> {
+fn remove_expired_bans(banned: &mut HashMap<IpSubnet, BannedAddress>, now: u64) {
+    banned.retain(|_, entry| entry.ban_until > now);
+}
+
+fn load_banlist(data_dir: &Path) -> Result<HashMap<IpSubnet, BannedAddress>> {
     let path = data_dir.join("banlist.json");
     if !path.exists() {
         return Ok(HashMap::new());
     }
     let bytes = std::fs::read(path)?;
-    let entries: Vec<BannedAddress> = serde_json::from_slice(&bytes)?;
-    Ok(entries
+    let entries: Vec<PersistedBannedAddress> = serde_json::from_slice(&bytes)?;
+    entries
         .into_iter()
-        .map(|entry| (entry.address, entry))
-        .collect())
+        .map(|entry| {
+            let prefix = entry.prefix.unwrap_or_else(|| address_bits(entry.address));
+            let subnet = IpSubnet::new(entry.address, prefix)?;
+            let banned = BannedAddress {
+                address: subnet.address(),
+                prefix: subnet.prefix(),
+                ban_created: entry.ban_created,
+                ban_until: entry.ban_until,
+                reason: entry.reason,
+            };
+            Ok((subnet, banned))
+        })
+        .collect()
 }
 
 fn load_known_addresses(
@@ -1947,6 +2105,34 @@ mod tests {
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         }
+    }
+
+    #[test]
+    fn subnet_bans_normalize_and_load_legacy_single_addresses() {
+        let subnet = IpSubnet::parse("192.0.2.7/24").unwrap();
+        assert_eq!(subnet.display(), "192.0.2.0/24");
+        assert!(subnet.contains("192.0.2.99".parse().unwrap()));
+        assert!(!subnet.contains("192.0.3.1".parse().unwrap()));
+
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = serde_json::json!([{
+            "address": "192.0.2.7",
+            "ban_created": 1,
+            "ban_until": 2,
+            "reason": "manual"
+        }]);
+        fs::write(
+            directory.path().join("banlist.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_banlist(directory.path()).unwrap();
+        let legacy_subnet = IpSubnet::parse("192.0.2.7").unwrap();
+        assert_eq!(loaded[&legacy_subnet].prefix, 32);
+        assert_eq!(
+            loaded[&legacy_subnet].address,
+            "192.0.2.7".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]

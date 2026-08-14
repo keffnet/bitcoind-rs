@@ -3055,18 +3055,20 @@ async fn wait_for_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
     let timeout = rpc_timeout(params, 1)?;
     let mut events = node.subscribe_chain();
+    let mut current_tip = node.chain.read().tip();
+    if current_tip.hash == hash {
+        return Ok(json!({"hash": current_tip.hash.to_string(), "height": current_tip.height}));
+    }
     loop {
-        {
-            let chain = node.chain.read();
-            if chain.is_active_block(&hash) {
-                let height = chain
-                    .block_height_by_hash(&hash)
-                    .ok_or_else(|| anyhow!("block height is unavailable"))?;
-                return Ok(json!({"hash": hash.to_string(), "height": height}));
-            }
-        }
-        if receive_chain_event(&mut events, timeout).await?.is_none() {
-            return current_tip_json(node);
+        let Some(tip) = receive_chain_event(&mut events, timeout).await? else {
+            return Ok(json!({
+                "hash": current_tip.hash.to_string(),
+                "height": current_tip.height,
+            }));
+        };
+        current_tip = tip.clone();
+        if tip.hash == hash {
+            return Ok(json!({"hash": tip.hash.to_string(), "height": tip.height}));
         }
     }
 }
@@ -3076,18 +3078,26 @@ async fn wait_for_block_height(node: &Arc<Node>, params: &Value) -> Result<Value
     let height = u32::try_from(height).map_err(|_| anyhow!("height is out of range"))?;
     let timeout = rpc_timeout(params, 1)?;
     let mut events = node.subscribe_chain();
+    let mut current_tip = node.chain.read().tip();
+    if current_tip.height >= height {
+        return Ok(json!({
+            "hash": current_tip.hash.to_string(),
+            "height": current_tip.height,
+        }));
+    }
     loop {
-        {
-            let chain = node.chain.read();
-            if chain.height() >= height {
-                let hash = chain
-                    .block_hash(height)
-                    .ok_or_else(|| anyhow!("block height is unavailable"))?;
-                return Ok(json!({"hash": hash.to_string(), "height": height}));
-            }
-        }
-        if receive_chain_event(&mut events, timeout).await?.is_none() {
-            return current_tip_json(node);
+        let Some(tip) = receive_chain_event(&mut events, timeout).await? else {
+            return Ok(json!({
+                "hash": current_tip.hash.to_string(),
+                "height": current_tip.height,
+            }));
+        };
+        current_tip = tip.clone();
+        if tip.height >= height {
+            return Ok(json!({
+                "hash": tip.hash.to_string(),
+                "height": tip.height,
+            }));
         }
     }
 }
@@ -9986,6 +9996,41 @@ mod tests {
             .unwrap();
         assert_eq!(result["height"], 1);
         assert_ne!(result["hash"], old_tip.to_string());
+    }
+
+    #[tokio::test]
+    async fn waitforblock_rpcs_return_the_current_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+        })
+        .unwrap();
+        generate_to_address(
+            &node,
+            &json!([2, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"]),
+        )
+        .unwrap();
+        let tip = node.chain.read().tip();
+        let first_block = node.chain.read().block_hash(1).unwrap();
+
+        let by_hash = wait_for_block(&node, &json!([first_block.to_string(), 0]))
+            .await
+            .unwrap();
+        assert_eq!(by_hash["hash"], tip.hash.to_string());
+        assert_eq!(by_hash["height"], tip.height);
+
+        let by_height = wait_for_block_height(&node, &json!([1, 0])).await.unwrap();
+        assert_eq!(by_height["hash"], tip.hash.to_string());
+        assert_eq!(by_height["height"], tip.height);
     }
 
     #[test]

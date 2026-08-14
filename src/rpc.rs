@@ -6698,13 +6698,16 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 unspents.push(json!({
                     "txid": outpoint.txid.to_string(),
                     "vout": outpoint.vout,
-                    "scriptPubKey": script_json_with_network(
-                        &entry.output.script_pubkey,
-                        Some(node.config.network),
-                    ),
+                    "scriptPubKey": hex::encode(entry.output.script_pubkey.as_bytes()),
                     "desc": descriptor,
                     "amount": sat_to_btc(entry.output.value.to_sat()),
+                    "coinbase": entry.coinbase,
                     "height": entry.height,
+                    "blockhash": chain
+                        .block_hash(entry.height)
+                        .map(|hash| hash.to_string())
+                        .unwrap_or_default(),
+                    "confirmations": chain.height().saturating_sub(entry.height) + 1,
                 }));
             }
             unspents.sort_by(|left, right| {
@@ -8675,6 +8678,13 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["txouts"], 1);
         assert_eq!(result["unspents"][0]["height"], 1);
+        assert_eq!(result["unspents"][0]["coinbase"], true);
+        assert_eq!(
+            result["unspents"][0]["blockhash"],
+            node.chain.read().block_hash(1).unwrap().to_string()
+        );
+        assert_eq!(result["unspents"][0]["confirmations"], 1);
+        assert!(result["unspents"][0]["scriptPubKey"].is_string());
         assert_eq!(result["total_amount"], 50.0);
     }
 

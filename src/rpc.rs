@@ -1942,12 +1942,15 @@ fn parse_descriptor_range(value: &Value) -> Result<(u32, u32)> {
 
 fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let count = match params.get(0) {
-        None | Some(Value::Null) => 1,
+        None | Some(Value::Null) => Some(1usize),
         Some(value) => {
             let count = value
                 .as_i64()
                 .ok_or_else(|| anyhow!("address count must be an integer"))?;
-            usize::try_from(count).map_err(|_| anyhow!("address count out of range"))?
+            if count < 0 {
+                bail!("address count out of range")
+            }
+            (count != 0).then(|| usize::try_from(count).unwrap_or(usize::MAX))
         }
     };
     let network = match params.get(1) {
@@ -1973,7 +1976,7 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 (network == "ipv4" && peer.address.ip().is_ipv4())
                     || (network == "ipv6" && peer.address.ip().is_ipv6())
             }))
-            .take(count)
+            .take(count.unwrap_or(usize::MAX))
             .map(|peer| json!({
                 "address": peer.address.ip().to_string(),
                 "port": peer.address.port(),
@@ -10341,6 +10344,8 @@ mod tests {
 
         let default = get_node_addresses(&node, &json!([])).unwrap();
         assert_eq!(default.as_array().unwrap().len(), 1);
+        let all = get_node_addresses(&node, &json!([0])).unwrap();
+        assert_eq!(all.as_array().unwrap().len(), 2);
         let ipv6 = get_node_addresses(&node, &json!([10, "ipv6"])).unwrap();
         assert_eq!(ipv6[0]["address"], "2001:db8::20");
         assert_eq!(ipv6[0]["services"], 8);

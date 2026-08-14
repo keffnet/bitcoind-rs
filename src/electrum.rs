@@ -108,6 +108,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
     let mut session = ElectrumSession::default();
     let mut headers_subscribed = false;
+    let mut last_chain_tip = node.chain.read().best_hash();
     loop {
         line.clear();
         tokio::select! {
@@ -117,6 +118,11 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => continue,
                 };
+                let reorg = {
+                    let chain = node.chain.read();
+                    !chain.is_active_block(&last_chain_tip)
+                };
+                last_chain_tip = tip.hash;
                 if headers_subscribed {
                     let header = {
                         let chain = node.chain.read();
@@ -132,13 +138,25 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         write_half.write_all(&encoded).await?;
                     }
                 }
-                send_status_notifications(&node, &mut subscriptions, &mut write_half, true)
+                send_status_notifications(
+                    &node,
+                    &mut subscriptions,
+                    &mut write_half,
+                    true,
+                    reorg,
+                )
                     .await?;
             }
             event = mempool_events.recv() => {
                 match event {
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        send_status_notifications(&node, &mut subscriptions, &mut write_half, false)
+                        send_status_notifications(
+                            &node,
+                            &mut subscriptions,
+                            &mut write_half,
+                            false,
+                            false,
+                        )
                             .await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
@@ -1042,6 +1060,7 @@ async fn send_status_notifications(
     subscriptions: &mut HashMap<String, Subscription>,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     refresh_history: bool,
+    force_scriptpubkey_notification: bool,
 ) -> Result<()> {
     for subscription in subscriptions.values_mut() {
         let notification = match subscription {
@@ -1055,15 +1074,16 @@ async fn send_status_notifications(
                 let current = history_status_for_script(node, script_hash)
                     .map(Value::String)
                     .unwrap_or(Value::Null);
-                if *status == current {
+                if status_notification_needed(status, &current, false) {
+                    *status = current.clone();
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "blockchain.scripthash.subscribe",
+                        "params": [script_hash, current],
+                    })
+                } else {
                     continue;
                 }
-                *status = current.clone();
-                json!({
-                    "jsonrpc": "2.0",
-                    "method": "blockchain.scripthash.subscribe",
-                    "params": [script_hash, current],
-                })
             }
             Subscription::Scriptpubkey {
                 script_hash,
@@ -1075,15 +1095,16 @@ async fn send_status_notifications(
                 let current = history_status_for_script(node, script_hash)
                     .map(Value::String)
                     .unwrap_or(Value::Null);
-                if *status == current {
+                if status_notification_needed(status, &current, force_scriptpubkey_notification) {
+                    *status = current.clone();
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "blockchain.scriptpubkey.subscribe",
+                        "params": [script_hash, current],
+                    })
+                } else {
                     continue;
                 }
-                *status = current.clone();
-                json!({
-                    "jsonrpc": "2.0",
-                    "method": "blockchain.scriptpubkey.subscribe",
-                    "params": [script_hash, current],
-                })
             }
             Subscription::Outpoint { outpoint, status } => {
                 let current = outpoint_status(node, outpoint)?;
@@ -1103,6 +1124,10 @@ async fn send_status_notifications(
         writer.write_all(&encoded).await?;
     }
     Ok(())
+}
+
+fn status_notification_needed(previous: &Value, current: &Value, force: bool) -> bool {
+    force || previous != current
 }
 
 fn history_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
@@ -1351,6 +1376,18 @@ mod tests {
             history_status(&[(txid, 1)]),
             "549540a6810df8dc5008757fa694172b0f7a3e32facfd9f39eab228286543cde"
         );
+    }
+
+    #[test]
+    fn scriptpubkey_reorg_notifications_can_repeat_an_unchanged_status() {
+        let status = json!("same-status");
+        assert!(!status_notification_needed(&status, &status, false));
+        assert!(status_notification_needed(&status, &status, true));
+        assert!(status_notification_needed(
+            &status,
+            &json!("new-status"),
+            false
+        ));
     }
 
     #[test]

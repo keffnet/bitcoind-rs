@@ -483,80 +483,163 @@ impl ChainState {
     }
 
     pub fn block_fee_stats(&mut self, hash: &BlockHash) -> Result<Option<BlockFeeStats>> {
-        let Some(target) = self.block_index.get(hash).copied() else {
+        if !self.block_index.contains_key(hash) {
+            return Ok(None);
+        }
+        let Some(block) = self.store.get(hash)? else {
             return Ok(None);
         };
-        let mut path = Vec::with_capacity(target.height as usize + 1);
-        let mut cursor = *hash;
-        loop {
-            path.push(cursor);
-            if cursor == self.network_genesis_hash() {
-                break;
-            }
-            let Some(node) = self.block_index.get(&cursor) else {
-                return Ok(None);
-            };
-            cursor = node.header.prev_blockhash;
+        let Some(undo) = self.spent_outputs_by_transaction(hash)? else {
+            return Ok(None);
+        };
+        if undo.len() != block.txdata.len() {
+            bail!("block undo transaction count does not match block");
         }
-        path.reverse();
-        let mut utxos: HashMap<OutPoint, TxOut> = HashMap::new();
         let mut total_fee_sat = 0u64;
         let mut transaction_fees_sat = Vec::new();
         let mut spent_outputs = Vec::new();
-        for block_hash in path {
-            let Some(block) = self.store.get(&block_hash)? else {
-                return Ok(None);
-            };
-            let is_target = block_hash == *hash;
-            let is_genesis = block_hash == self.network_genesis_hash();
-            for transaction in &block.txdata {
-                let txid = transaction.compute_txid();
-                if !transaction.is_coinbase() {
-                    let input_outputs = transaction
-                        .input
-                        .iter()
-                        .map(|input| utxos.get(&input.previous_output).cloned())
-                        .collect::<Option<Vec<TxOut>>>();
-                    let Some(input_outputs) = input_outputs else {
-                        return Ok(None);
-                    };
-                    let input_total = input_outputs
-                        .iter()
-                        .map(|output| output.value.to_sat())
-                        .sum::<u64>();
-                    for input in &transaction.input {
-                        utxos.remove(&input.previous_output);
-                    }
-                    let output_total = transaction
-                        .output
-                        .iter()
-                        .map(|output| output.value.to_sat())
-                        .try_fold(0u64, u64::checked_add)
-                        .ok_or_else(|| anyhow::anyhow!("transaction output total overflow"))?;
-                    if input_total < output_total {
-                        return Ok(None);
-                    }
-                    if is_target {
-                        let fee = input_total - output_total;
-                        total_fee_sat = total_fee_sat
-                            .checked_add(fee)
-                            .ok_or_else(|| anyhow::anyhow!("block fee total overflow"))?;
-                        transaction_fees_sat.push(fee);
-                        spent_outputs.extend(input_outputs);
-                    }
-                }
-                if !is_genesis {
-                    for (vout, output) in transaction.output.iter().enumerate() {
-                        utxos.insert(OutPoint::new(txid, vout as u32), output.clone());
-                    }
-                }
+        for (transaction, input_outputs) in block.txdata.iter().skip(1).zip(undo.iter().skip(1)) {
+            if input_outputs.len() != transaction.input.len() {
+                bail!("block undo input count does not match transaction");
             }
+            let input_total = input_outputs
+                .iter()
+                .try_fold(0u64, |total, output| {
+                    total.checked_add(output.value.to_sat())
+                })
+                .ok_or_else(|| anyhow::anyhow!("transaction input total overflow"))?;
+            let output_total = transaction
+                .output
+                .iter()
+                .try_fold(0u64, |total, output| {
+                    total.checked_add(output.value.to_sat())
+                })
+                .ok_or_else(|| anyhow::anyhow!("transaction output total overflow"))?;
+            if input_total < output_total {
+                bail!("block transaction has a negative fee");
+            }
+            let fee = input_total - output_total;
+            total_fee_sat = total_fee_sat
+                .checked_add(fee)
+                .ok_or_else(|| anyhow::anyhow!("block fee total overflow"))?;
+            transaction_fees_sat.push(fee);
+            spent_outputs.extend(input_outputs.iter().cloned());
         }
         Ok(Some(BlockFeeStats {
             total_fee_sat,
             transaction_fees_sat,
             spent_outputs,
         }))
+    }
+
+    /// Return confirmed transaction fee samples as `(fee_sat, vsize)` pairs.
+    ///
+    /// Undo data makes this proportional to the requested block rather than
+    /// requiring a UTXO replay from genesis. Older stores without an undo
+    /// record use the existing replay fallback in
+    /// [`spent_outputs_by_transaction`].
+    pub fn block_fee_samples(&mut self, hash: &BlockHash) -> Result<Option<Vec<(u64, u64)>>> {
+        let Some(block) = self.store.get(hash)? else {
+            return Ok(None);
+        };
+        let Some(undo) = self.spent_outputs_by_transaction(hash)? else {
+            return Ok(None);
+        };
+        if undo.len() != block.txdata.len() {
+            bail!("block undo transaction count does not match block");
+        }
+        let mut samples = Vec::with_capacity(block.txdata.len().saturating_sub(1));
+        for (transaction, input_outputs) in block.txdata.iter().skip(1).zip(undo.iter().skip(1)) {
+            if input_outputs.len() != transaction.input.len() {
+                bail!("block undo input count does not match transaction");
+            }
+            let input_total = input_outputs
+                .iter()
+                .try_fold(0u64, |total, output| {
+                    total.checked_add(output.value.to_sat())
+                })
+                .ok_or_else(|| anyhow::anyhow!("transaction input total overflow"))?;
+            let output_total = transaction
+                .output
+                .iter()
+                .try_fold(0u64, |total, output| {
+                    total.checked_add(output.value.to_sat())
+                })
+                .ok_or_else(|| anyhow::anyhow!("transaction output total overflow"))?;
+            if input_total < output_total {
+                bail!("block transaction has a negative fee");
+            }
+            samples.push((input_total - output_total, transaction.vsize() as u64));
+        }
+        Ok(Some(samples))
+    }
+
+    /// Estimate a fee rate in satoshis per virtual kilobyte from recent
+    /// confirmed transactions. The returned block count is the requested
+    /// target; `None` means there is not enough confirmed fee data yet.
+    pub fn estimate_fee_rate_sat_per_kvb(
+        &mut self,
+        conf_target: u32,
+        conservative: bool,
+    ) -> Result<Option<u64>> {
+        if conf_target == 0 || conf_target > 1_008 {
+            bail!("confirmation target must be between 1 and 1008 blocks");
+        }
+        let tip_height = self.height();
+        if tip_height == 0 {
+            return Ok(None);
+        }
+        let sample_blocks = if conservative {
+            conf_target.saturating_mul(2).clamp(conf_target, 1_008)
+        } else {
+            conf_target
+        };
+        let start_height = tip_height.saturating_sub(sample_blocks.saturating_sub(1));
+        let mut samples = Vec::new();
+        for height in start_height..=tip_height {
+            let Some(hash) = self.block_hash(height) else {
+                continue;
+            };
+            if let Some(block_samples) = self.block_fee_samples(&hash)? {
+                samples.extend(block_samples.into_iter().filter_map(|(fee, vsize)| {
+                    (vsize > 0).then_some((
+                        fee.saturating_mul(1_000)
+                            .checked_div(vsize)
+                            .unwrap_or(u64::MAX),
+                        vsize,
+                    ))
+                }));
+            }
+        }
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        samples.sort_unstable_by_key(|(rate, _)| *rate);
+        let percentile = if conservative || conf_target <= 2 {
+            90
+        } else if conf_target <= 6 {
+            75
+        } else if conf_target <= 12 {
+            50
+        } else {
+            25
+        };
+        let target_weight = samples
+            .iter()
+            .map(|(_, vsize)| *vsize)
+            .sum::<u64>()
+            .saturating_mul(percentile)
+            / 100;
+        let mut cumulative_weight = 0u64;
+        let mut estimate = 0u64;
+        for (rate, vsize) in samples {
+            cumulative_weight = cumulative_weight.saturating_add(vsize);
+            estimate = rate;
+            if cumulative_weight >= target_weight {
+                break;
+            }
+        }
+        Ok(Some(estimate.max(1_000)))
     }
 
     /// Build the BIP158 basic filter and filter header for every block from
@@ -2563,6 +2646,23 @@ mod tests {
                     },
                 ],
             })
+        );
+        let samples = state.block_fee_samples(&block_hash).unwrap().unwrap();
+        assert_eq!(samples.len(), 2);
+        assert!(
+            samples
+                .iter()
+                .all(|(fee, vsize)| *fee == 1_000_000_000 && *vsize > 0)
+        );
+        assert_eq!(
+            state.estimate_fee_rate_sat_per_kvb(1, false).unwrap(),
+            Some(
+                samples[0]
+                    .0
+                    .saturating_mul(1_000)
+                    .checked_div(samples[0].1)
+                    .unwrap()
+            )
         );
     }
 

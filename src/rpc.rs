@@ -1352,9 +1352,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "logpath": node.config.datadir.join("debug.log").to_string_lossy(),
         })),
         "help" => Ok(json!(rpc_help(method_params_string(params)))),
-        "estimatesmartfee" => Ok(
-            json!({"feerate": 0.00001000, "blocks": params.get(0).and_then(Value::as_u64).unwrap_or(6)}),
-        ),
+        "estimatesmartfee" => estimate_smart_fee(node, params),
         "getdifficulty" => Ok(json!(
             node.chain
                 .read()
@@ -1444,6 +1442,41 @@ fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             "best_block_height": height,
         }
     }))
+}
+
+fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let conf_target = params
+        .get(0)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("conf_target must be a positive integer"))?;
+    let conf_target = u32::try_from(conf_target)
+        .map_err(|_| anyhow!("conf_target must be between 1 and 1008"))?;
+    let conservative = match params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| anyhow!("estimate_mode must be a string"))
+        })
+        .transpose()?
+        .unwrap_or("UNSET")
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "UNSET" | "ECONOMICAL" => false,
+        "CONSERVATIVE" => true,
+        _ => bail!("estimate_mode must be UNSET, ECONOMICAL, or CONSERVATIVE"),
+    };
+    let estimate = node
+        .chain
+        .write()
+        .estimate_fee_rate_sat_per_kvb(conf_target, conservative)?;
+    let mut result = json!({"blocks": conf_target});
+    if let Some(rate) = estimate {
+        result["feerate"] = json!(sat_to_btc(rate));
+    }
+    Ok(result)
 }
 
 const LOG_CATEGORIES: &[&str] = &[
@@ -8686,6 +8719,29 @@ mod tests {
                 "feerate_percentiles": [0, 0, 0, 0, 0],
             })
         );
+    }
+
+    #[test]
+    fn smart_fee_estimate_reports_available_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 1,
+            peer_bloom_filters: false,
+        })
+        .unwrap();
+        let result = dispatch_method(&node, "estimatesmartfee", &json!([6])).unwrap();
+        assert_eq!(result["blocks"], json!(6));
+        assert!(result.get("feerate").is_none());
+        assert!(dispatch_method(&node, "estimatesmartfee", &json!([0])).is_err());
+        assert!(dispatch_method(&node, "estimatesmartfee", &json!([6, "invalid"])).is_err());
     }
 
     #[test]

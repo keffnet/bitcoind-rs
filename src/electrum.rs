@@ -316,7 +316,16 @@ fn dispatch_with_session(
                     .is_some(),
             ))
         }
-        "blockchain.estimatefee" | "blockchain.relayfee" => Ok(json!(0.00001000)),
+        "blockchain.estimatefee" => {
+            let conf_target = param::<u32>(params, 0)?;
+            let rate = node
+                .chain
+                .write()
+                .estimate_fee_rate_sat_per_kvb(conf_target, false)?
+                .map_or(-1.0, |rate| rate as f64 / 100_000_000.0);
+            Ok(json!(rate))
+        }
+        "blockchain.relayfee" => Ok(json!(0.00001000)),
         "mempool.get_fee_histogram" => {
             let mempool = node.mempool.read();
             Ok(fee_histogram(&mempool))
@@ -1412,6 +1421,28 @@ mod tests {
             )
             .unwrap(),
             json!([])
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "blockchain.estimatefee",
+                &json!([6]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!(-1.0)
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "blockchain.relayfee",
+                &json!([]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!(0.00001)
         );
         assert!(
             dispatch_with_session(

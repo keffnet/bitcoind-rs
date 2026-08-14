@@ -33,6 +33,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 
 use crate::chain::BasicFilterRange;
+use crate::mempool::MempoolError;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
 };
@@ -274,6 +275,7 @@ struct PeerState {
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
     pending_tx_inventory: parking_lot::Mutex<Vec<Inventory>>,
+    pending_tx_requests: parking_lot::Mutex<HashSet<Txid>>,
     fee_filter: parking_lot::Mutex<i64>,
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
@@ -1134,6 +1136,7 @@ async fn serve_peer(
         bloom_filter: parking_lot::Mutex::new(None),
         known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
         pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
+        pending_tx_requests: parking_lot::Mutex::new(HashSet::new()),
         fee_filter: parking_lot::Mutex::new(0),
         relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
@@ -2144,21 +2147,51 @@ async fn serve_peer_loop(
                 if !peer_state.local_relay_transactions {
                     anyhow::bail!("transaction sent to a non-relaying connection");
                 }
+                let txid = transaction.compute_txid();
+                peer_state.pending_tx_requests.lock().remove(&txid);
                 let known_hash = if *peer_state.wtxid_relay.lock() {
                     BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash())
                 } else {
                     BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash())
                 };
                 peer_state.known_tx_inventory.lock().insert(&known_hash);
-                let txid = transaction.compute_txid();
-                let accepted = node
-                    .accept_peer_transaction_from(peer_id, transaction)
-                    .is_ok();
-                if accepted {
-                    node.record_peer_transaction(peer_id);
-                    debug!(%txid, "accepted peer transaction");
-                } else {
-                    debug!(%txid, "rejected peer transaction");
+                match node.accept_peer_transaction_from(peer_id, transaction) {
+                    Ok(_) => {
+                        node.record_peer_transaction(peer_id);
+                        debug!(%txid, "accepted peer transaction");
+                    }
+                    Err(error) => {
+                        if let Some(MempoolError::MissingInput(outpoint)) =
+                            error.downcast_ref::<MempoolError>()
+                        {
+                            let parent_txid = outpoint.txid;
+                            let in_mempool = node.mempool.read().get(&parent_txid).is_some();
+                            let in_chain = if in_mempool {
+                                true
+                            } else {
+                                node.chain.write().transaction(&parent_txid)?.is_some()
+                            };
+                            if !in_chain
+                                && peer_state.pending_tx_requests.lock().insert(parent_txid)
+                            {
+                                let request = Inventory {
+                                    // Orphan parent fetching uses MSG_TX even
+                                    // when wtxid relay is negotiated.
+                                    kind: InventoryType::Transaction,
+                                    hash: BlockHash::from_raw_hash(parent_txid.to_raw_hash()),
+                                };
+                                send_getdata_batches(
+                                    node,
+                                    peer_id,
+                                    writer,
+                                    node.config.network,
+                                    std::slice::from_ref(&request),
+                                )
+                                .await?;
+                            }
+                        }
+                        debug!(%txid, %error, "rejected peer transaction");
+                    }
                 }
             }
             Message::FilterLoad(filter) => {
@@ -2236,6 +2269,12 @@ async fn serve_peer_loop(
             | Message::Unknown { .. } => {}
             Message::NotFound(items) => {
                 for item in items {
+                    if item.kind.is_transaction() {
+                        peer_state
+                            .pending_tx_requests
+                            .lock()
+                            .remove(&Txid::from_byte_array(item.hash.to_byte_array()));
+                    }
                     if matches!(
                         item.kind,
                         InventoryType::Block
@@ -3992,6 +4031,7 @@ mod tests {
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
             pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
+            pending_tx_requests: parking_lot::Mutex::new(HashSet::new()),
             fee_filter: parking_lot::Mutex::new(0),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(false),

@@ -120,6 +120,8 @@ struct ChainSnapshot {
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
     #[serde(default)]
+    spent_by: Option<HashMap<OutPoint, SpentTransaction>>,
+    #[serde(default)]
     prune_height: Option<u32>,
 }
 
@@ -247,9 +249,15 @@ impl ChainState {
             };
             state.history = snapshot.history;
             state.prune_height = snapshot.prune_height.or(state.prune_height);
+            let persisted_spent_by = snapshot.spent_by;
             let headers = state.headers.clone();
             state.index_active_headers(&headers)?;
-            state.rebuild_spent_index()?;
+            if let Some(spent_by) = persisted_spent_by {
+                state.spent_by = spent_by;
+                state.validate_persisted_spent_index()?;
+            } else {
+                state.rebuild_spent_index()?;
+            }
         } else {
             let mut blocks = Vec::with_capacity(active_chain.len());
             for hash in &active_chain {
@@ -2318,6 +2326,33 @@ impl ChainState {
         Ok(())
     }
 
+    fn validate_persisted_spent_index(&self) -> Result<()> {
+        let active_chain: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
+        for (outpoint, (txid, _input_index, block_hash, height)) in &self.spent_by {
+            let node = self
+                .block_index
+                .get(block_hash)
+                .with_context(|| format!("spent index references unknown block {block_hash}"))?;
+            if node.height != *height || !active_chain.contains(block_hash) {
+                bail!("spent index references an inactive or mismatched block");
+            }
+            let location = self
+                .tx_index_all
+                .get(txid)
+                .with_context(|| format!("spent index references unknown transaction {txid}"))?;
+            if location.block_hash != *block_hash || location.height != *height {
+                bail!(
+                    "spent index transaction {} does not match its spending block",
+                    txid
+                );
+            }
+            if outpoint.is_null() {
+                bail!("spent index contains a null outpoint");
+            }
+        }
+        Ok(())
+    }
+
     fn index_all_transactions(&mut self, block: &Block, height: u32) {
         for (transaction_index, transaction) in block.txdata.iter().enumerate() {
             let txid = transaction.compute_txid();
@@ -2577,6 +2612,7 @@ impl ChainState {
             tx_index: self.tx_index.clone(),
             tx_index_all: self.tx_index_all.clone(),
             history: self.history.clone(),
+            spent_by: Some(self.spent_by.clone()),
             prune_height: self.prune_height,
         }
     }

@@ -25,6 +25,7 @@ use bitcoin::{
     Address, Amount, Block, BlockHash, Denomination, Network, OutPoint, ScriptBuf, Transaction,
     TxOut, Txid,
 };
+use miniscript::{Descriptor as MiniscriptDescriptor, DescriptorPublicKey as MiniscriptPublicKey};
 use rand::random;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4863,6 +4864,12 @@ struct DescriptorCandidate {
     redeem_script: Option<ScriptBuf>,
     witness_script: Option<ScriptBuf>,
     tap_internal_key: Option<bitcoin::XOnlyPublicKey>,
+    tap_tree: Option<bitcoin::taproot::TapTree>,
+    tap_scripts: Vec<(
+        bitcoin::taproot::ControlBlock,
+        ScriptBuf,
+        bitcoin::taproot::LeafVersion,
+    )>,
     keys: Vec<DescriptorDerivedKey>,
 }
 
@@ -4937,6 +4944,11 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
         if let Some(tap_internal_key) = candidate.tap_internal_key {
             psbt.inputs[input_index].tap_internal_key = Some(tap_internal_key);
         }
+        for (control_block, script, leaf_version) in &candidate.tap_scripts {
+            psbt.inputs[input_index]
+                .tap_scripts
+                .insert(control_block.clone(), (script.clone(), *leaf_version));
+        }
         if include_bip32_derivations {
             for key in &candidate.keys {
                 if let (Some(public_key), Some(origin)) = (key.public_key, &key.origin) {
@@ -4978,6 +4990,9 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }
         if let Some(tap_internal_key) = candidate.tap_internal_key {
             psbt.outputs[output_index].tap_internal_key = Some(tap_internal_key);
+        }
+        if let Some(tap_tree) = &candidate.tap_tree {
+            psbt.outputs[output_index].tap_tree = Some(tap_tree.clone());
         }
         if include_bip32_derivations {
             for key in &candidate.keys {
@@ -5093,6 +5108,108 @@ fn descriptor_candidates(
     descriptor_candidates_inner(node, descriptor, range)
 }
 
+fn miniscript_taproot_candidates(
+    node: &Arc<Node>,
+    descriptor: &str,
+    range: Option<(u32, u32)>,
+) -> Result<Option<Vec<DescriptorCandidate>>> {
+    if !descriptor.starts_with("tr(") || !descriptor.contains(',') {
+        return Ok(None);
+    }
+    let secp = Secp256k1::new();
+    let Ok((parsed, _keymap)) =
+        MiniscriptDescriptor::<MiniscriptPublicKey>::parse_descriptor(&secp, descriptor)
+    else {
+        return Ok(None);
+    };
+    if !matches!(&parsed, MiniscriptDescriptor::Tr(_)) {
+        return Ok(None);
+    }
+    let internal_key_expression = taproot_internal_key_expression(descriptor)?;
+    let internal_key = parse_descriptor_key(internal_key_expression).ok();
+    let internal_origin = descriptor_key_origin(internal_key_expression).unwrap_or(None);
+    let indices = descriptor_indices(parsed.has_wildcard(), range)?;
+    let verification = Secp256k1::verification_only();
+    let candidates = indices
+        .into_iter()
+        .map(|index| {
+            let derived = parsed
+                .at_derivation_index(index.unwrap_or(0))?
+                .derived_descriptor(&verification);
+            let (tap_internal_key, tap_tree, tap_scripts) = match &derived {
+                MiniscriptDescriptor::Tr(tr) => {
+                    let spend_info = tr.spend_info();
+                    let scripts = spend_info
+                        .leaves()
+                        .map(|leaf| {
+                            (
+                                leaf.control_block().clone(),
+                                ScriptBuf::from_bytes(leaf.script().as_bytes().to_vec()),
+                                leaf.leaf_version(),
+                            )
+                        })
+                        .collect();
+                    (
+                        Some(bitcoin::XOnlyPublicKey::from(*tr.internal_key())),
+                        spend_info.to_tap_tree(),
+                        scripts,
+                    )
+                }
+                _ => (None, None, Vec::new()),
+            };
+            let keys = match internal_key.as_ref() {
+                Some((DescriptorKey::XOnlyPublicKey(_), _, _)) => vec![DescriptorDerivedKey {
+                    public_key: None,
+                    private_key: None,
+                    origin: internal_origin.clone(),
+                }],
+                Some((key, path, _)) => {
+                    let public_key = descriptor_public_key(key, path, index, &verification)?;
+                    vec![descriptor_derived_key(
+                        node,
+                        key,
+                        path,
+                        index,
+                        public_key,
+                        internal_origin.clone(),
+                    )?]
+                }
+                None => Vec::new(),
+            };
+            Ok(DescriptorCandidate {
+                script_pubkey: derived.script_pubkey(),
+                redeem_script: None,
+                witness_script: None,
+                tap_internal_key,
+                tap_tree,
+                tap_scripts,
+                keys,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Some(candidates))
+}
+
+fn taproot_internal_key_expression(descriptor: &str) -> Result<&str> {
+    let inner = descriptor
+        .strip_prefix("tr(")
+        .and_then(|value| value.strip_suffix(')'))
+        .ok_or_else(|| anyhow!("invalid taproot descriptor"))?;
+    let mut parentheses = 0usize;
+    let mut braces = 0usize;
+    for (index, character) in inner.char_indices() {
+        match character {
+            '(' => parentheses = parentheses.saturating_add(1),
+            ')' => parentheses = parentheses.saturating_sub(1),
+            '{' => braces = braces.saturating_add(1),
+            '}' => braces = braces.saturating_sub(1),
+            ',' if parentheses == 0 && braces == 0 => return Ok(&inner[..index]),
+            _ => {}
+        }
+    }
+    bail!("taproot descriptor is missing a script tree")
+}
+
 fn descriptor_candidates_inner(
     node: &Arc<Node>,
     descriptor: &str,
@@ -5113,6 +5230,8 @@ fn descriptor_candidates_inner(
             redeem_script: None,
             witness_script: None,
             tap_internal_key: None,
+            tap_tree: None,
+            tap_scripts: Vec::new(),
             keys: Vec::new(),
         }]);
     }
@@ -5128,6 +5247,8 @@ fn descriptor_candidates_inner(
             redeem_script: None,
             witness_script: None,
             tap_internal_key: None,
+            tap_tree: None,
+            tap_scripts: Vec::new(),
             keys: Vec::new(),
         }]);
     }
@@ -5148,6 +5269,8 @@ fn descriptor_candidates_inner(
                             redeem_script: Some(redeem_script),
                             witness_script: child.witness_script,
                             tap_internal_key: None,
+                            tap_tree: None,
+                            tap_scripts: Vec::new(),
                             keys: child.keys,
                         })
                     } else {
@@ -5158,6 +5281,8 @@ fn descriptor_candidates_inner(
                             redeem_script: None,
                             witness_script: Some(witness_script),
                             tap_internal_key: None,
+                            tap_tree: None,
+                            tap_scripts: Vec::new(),
                             keys: child.keys,
                         })
                     }
@@ -5209,6 +5334,8 @@ fn descriptor_candidates_inner(
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: None,
+                tap_tree: None,
+                tap_scripts: Vec::new(),
                 keys: vec![derived_key.clone()],
             });
             candidates.push(DescriptorCandidate {
@@ -5216,6 +5343,8 @@ fn descriptor_candidates_inner(
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: None,
+                tap_tree: None,
+                tap_scripts: Vec::new(),
                 keys: vec![derived_key.clone()],
             });
             if let Ok(compressed) = bitcoin::CompressedPublicKey::try_from(public_key) {
@@ -5225,6 +5354,8 @@ fn descriptor_candidates_inner(
                     redeem_script: None,
                     witness_script: None,
                     tap_internal_key: None,
+                    tap_tree: None,
+                    tap_scripts: Vec::new(),
                     keys: vec![derived_key.clone()],
                 });
                 candidates.push(DescriptorCandidate {
@@ -5235,10 +5366,15 @@ fn descriptor_candidates_inner(
                     ),
                     witness_script: None,
                     tap_internal_key: None,
+                    tap_tree: None,
+                    tap_scripts: Vec::new(),
                     keys: vec![derived_key],
                 });
             }
         }
+        return Ok(candidates);
+    }
+    if let Some(candidates) = miniscript_taproot_candidates(node, descriptor, range)? {
         return Ok(candidates);
     }
     if let Some(key_expression) = descriptor
@@ -5279,6 +5415,8 @@ fn descriptor_candidates_inner(
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: Some(xonly),
+                tap_tree: None,
+                tap_scripts: Vec::new(),
                 keys: vec![derived_key],
             });
         }
@@ -5326,6 +5464,8 @@ where
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: None,
+                tap_tree: None,
+                tap_scripts: Vec::new(),
                 keys: vec![descriptor_derived_key(
                     node,
                     &key,
@@ -5414,6 +5554,8 @@ fn multisig_descriptor_candidates(
                 redeem_script: None,
                 witness_script: None,
                 tap_internal_key: None,
+                tap_tree: None,
+                tap_scripts: Vec::new(),
                 keys: derived.into_iter().map(|(_, key)| key).collect(),
             })
         })
@@ -7541,6 +7683,12 @@ fn expand_descriptor_scripts(
         }
         return Ok(scripts);
     }
+    if let Some(candidates) = miniscript_taproot_candidates(node, descriptor, range)? {
+        return Ok(candidates
+            .into_iter()
+            .map(|candidate| candidate.script_pubkey)
+            .collect());
+    }
     for wrapper in ["sh", "wsh"] {
         if let Some(inner) = descriptor
             .strip_prefix(&format!("{wrapper}("))
@@ -9571,6 +9719,13 @@ mod tests {
         let taproot_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         let taproot = derive_addresses(&node, &json!([format!("tr({taproot_key})")])).unwrap();
         assert_eq!(taproot.as_array().unwrap().len(), 1);
+        let taproot_tree = derive_addresses(
+            &node,
+            &json!([format!("tr({taproot_key},pk({public_key}))")]),
+        )
+        .unwrap();
+        assert_eq!(taproot_tree.as_array().unwrap().len(), 1);
+        assert_ne!(taproot_tree[0], taproot[0]);
     }
 
     #[test]
@@ -10244,6 +10399,48 @@ mod tests {
         assert!(decoded_taproot["inputs"][0]["taproot_bip32_derivs"].is_array());
         assert!(decoded_taproot["inputs"][0]["final_scriptwitness"].is_array());
         assert!(decoded_taproot["inputs"][0].get("tap_key_sig").is_none());
+
+        let taproot_tree_descriptor = format!("tr([d34db33f/86'/0'/0']{xpriv},pk({public_key}))");
+        let taproot_tree_script = expand_descriptor_scripts(&node, &taproot_tree_descriptor, None)
+            .unwrap()
+            .remove(0);
+        let tree_unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([23; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: taproot_tree_script.clone(),
+            }],
+        };
+        let mut tree_psbt = Psbt::from_unsigned_tx(tree_unsigned).unwrap();
+        tree_psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: taproot_tree_script,
+        });
+        let tree_processed = descriptor_process_psbt(
+            &node,
+            &json!([
+                encode_psbt(&tree_psbt),
+                [taproot_tree_descriptor],
+                "SIGHASH_DEFAULT",
+                true,
+                false
+            ]),
+        )
+        .unwrap();
+        let tree_processed_psbt = parse_psbt(&json!([tree_processed["psbt"].clone()]), 0).unwrap();
+        assert_eq!(
+            tree_processed_psbt.inputs[0].tap_internal_key,
+            Some(internal_key)
+        );
+        assert_eq!(tree_processed_psbt.inputs[0].tap_scripts.len(), 1);
+        assert!(tree_processed_psbt.outputs[0].tap_tree.is_some());
     }
 
     #[test]

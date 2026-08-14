@@ -1171,17 +1171,19 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::GetBlocks(request) => {
-                let hashes = node
-                    .chain
-                    .read()
-                    .headers_after_locator(&request.locator_hashes, request.stop_hash)
-                    .into_iter()
-                    .take(500)
-                    .map(|header| Inventory {
-                        kind: InventoryType::Block,
-                        hash: header.block_hash(),
-                    })
-                    .collect::<Vec<_>>();
+                let hashes = {
+                    let chain = node.chain.read();
+                    chain
+                        .headers_after_locator(&request.locator_hashes, request.stop_hash)
+                        .into_iter()
+                        .filter(|header| chain.store.contains(&header.block_hash()))
+                        .take(500)
+                        .map(|header| Inventory {
+                            kind: InventoryType::Block,
+                            hash: header.block_hash(),
+                        })
+                        .collect::<Vec<_>>()
+                };
                 send_message(
                     node,
                     peer_id,

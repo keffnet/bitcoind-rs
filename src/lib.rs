@@ -939,9 +939,6 @@ impl Node {
                 .entry(command.to_owned())
                 .or_default();
             *total = total.saturating_add(bytes);
-            if command == "inv" {
-                peer.last_inv_sequence = peer.last_inv_sequence.saturating_add(1);
-            }
         }
     }
 
@@ -958,11 +955,24 @@ impl Node {
                 .entry(command.to_owned())
                 .or_default();
             *total = total.saturating_add(bytes);
-            match command {
-                "tx" => peer.last_transaction = now,
-                "block" | "cmpctblock" | "merkleblock" => peer.last_block = now,
-                _ => {}
-            }
+        }
+    }
+
+    pub(crate) fn record_peer_inv_sequence(&self, peer_id: usize, sequence: u64) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.last_inv_sequence = sequence;
+        }
+    }
+
+    pub(crate) fn record_peer_transaction(&self, peer_id: usize) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.last_transaction = unix_time_seconds();
+        }
+    }
+
+    pub(crate) fn record_peer_block(&self, peer_id: usize) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.last_block = unix_time_seconds();
         }
     }
 

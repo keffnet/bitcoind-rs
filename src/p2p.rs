@@ -1346,7 +1346,9 @@ async fn serve_peer_loop(
                 }
             }
             Message::Block(block) => {
-                handle_received_block(node, peers, peer_id, block).await;
+                if handle_received_block(node, peers, peer_id, block).await {
+                    node.record_peer_block(peer_id);
+                }
                 request_headers(node, peer_id, writer).await?;
             }
             Message::CompactBlock(compact) => {
@@ -1355,7 +1357,9 @@ async fn serve_peer_loop(
                     Ok((transactions, missing)) if missing.is_empty() => {
                         match complete_compact_block(&compact, transactions) {
                             Ok(block) => {
-                                handle_received_block(node, peers, peer_id, block).await;
+                                if handle_received_block(node, peers, peer_id, block).await {
+                                    node.record_peer_block(peer_id);
+                                }
                                 request_headers(node, peer_id, writer).await?;
                             }
                             Err(error) => {
@@ -1484,7 +1488,9 @@ async fn serve_peer_loop(
                 }
                 match complete_compact_block(&pending.compact, pending.transactions) {
                     Ok(block) => {
-                        handle_received_block(node, peers, peer_id, block).await;
+                        if handle_received_block(node, peers, peer_id, block).await {
+                            node.record_peer_block(peer_id);
+                        }
                         request_headers(node, peer_id, writer).await?;
                     }
                     Err(error) => {
@@ -1619,6 +1625,7 @@ async fn serve_peer_loop(
                     .accept_peer_transaction_from(peer_id, transaction)
                     .is_ok();
                 if accepted {
+                    node.record_peer_transaction(peer_id);
                     debug!(%txid, "accepted peer transaction");
                 } else {
                     debug!(%txid, "rejected peer transaction");
@@ -1766,6 +1773,7 @@ async fn serve_peer_loop(
                         })
                         .collect::<Vec<_>>()
                 };
+                let mempool_sequence = node.mempool.read().sequence();
                 send_message(
                     node,
                     peer_id,
@@ -1774,6 +1782,7 @@ async fn serve_peer_loop(
                     &Message::Inv(inventory),
                 )
                 .await?;
+                node.record_peer_inv_sequence(peer_id, mempool_sequence);
             }
         }
         if version_received && verack_received && !verack_sent {
@@ -1812,7 +1821,7 @@ async fn handle_received_block(
     peers: &PeerRegistry,
     peer_id: usize,
     block: Block,
-) {
+) -> bool {
     let hash = block.block_hash();
     let (was_stored, previous_tip) = {
         let chain = node.chain.read();
@@ -1837,8 +1846,12 @@ async fn handle_received_block(
                 )
                 .await;
             }
+            true
         }
-        Err(error) => debug!(%hash, %error, "rejected peer block"),
+        Err(error) => {
+            debug!(%hash, %error, "rejected peer block");
+            false
+        }
     }
 }
 
@@ -2261,7 +2274,17 @@ async fn broadcast_inventory_excluding(
             known.insert(&item.hash);
         }
         let message = Message::Inv(vec![item.clone()]);
-        let _ = send_message(node, peer_id, &state.writer, network, &message).await;
+        let sent = send_message(node, peer_id, &state.writer, network, &message)
+            .await
+            .is_ok();
+        if sent
+            && matches!(
+                item.kind,
+                InventoryType::Transaction | InventoryType::WitnessTransaction
+            )
+        {
+            node.record_peer_inv_sequence(peer_id, node.mempool.read().sequence());
+        }
     }
 }
 
@@ -2605,6 +2628,9 @@ mod tests {
         node.register_peer(7, "127.0.0.1:18444".parse().unwrap(), false, sender);
         node.record_bytes_sent(7, 42, "ping");
         node.record_bytes_received(7, 19, "tx");
+        node.record_peer_transaction(7);
+        node.record_peer_block(7);
+        node.record_peer_inv_sequence(7, 12);
         node.update_peer_version(7, 70016, 0, "/peer/", 0, false);
         node.update_peer_fee_filter(7, 4_000);
         assert_eq!(node.total_bytes_sent(), 42);
@@ -2615,6 +2641,8 @@ mod tests {
         assert_eq!(peer.bytes_sent_per_msg.get("ping"), Some(&42));
         assert_eq!(peer.bytes_received_per_msg.get("tx"), Some(&19));
         assert!(peer.last_transaction > 0);
+        assert!(peer.last_block > 0);
+        assert_eq!(peer.last_inv_sequence, 12);
         assert!(!peer.relay_transactions);
         assert_eq!(peer.min_fee_filter, 4_000);
 

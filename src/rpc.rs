@@ -1249,7 +1249,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "maxmempool": mempool.max_bytes(),
                 "mempoolminfee": sat_to_btc(mempool.mempool_min_fee_sat_per_kvb()),
                 "minrelaytxfee": sat_to_btc(mempool.min_relay_fee_sat_per_kvb()),
-                "unbroadcastcount": 0,
+                "unbroadcastcount": mempool.unbroadcast_txids().len(),
                 "incrementalrelayfee": sat_to_btc(mempool.incremental_relay_fee_sat_per_kvb()),
                 "total_fee": sat_to_btc(total_fee),
                 "fullrbf": true,
@@ -1322,11 +1322,16 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 .and_then(|options| options.get("apply_fee_delta_priority"))
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            let apply_unbroadcast_set = options
+                .and_then(|options| options.get("apply_unbroadcast_set"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             node.import_mempool_with_options(
                 path,
                 MempoolLoadOptions {
                     use_current_time,
                     apply_fee_delta_priority,
+                    apply_unbroadcast_set,
                 },
             )?;
             Ok(json!({}))
@@ -8375,7 +8380,7 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
         "depends": parents,
         "spentby": children,
         "bip125-replaceable": mempool.is_replaceable(txid),
-        "unbroadcast": false,
+        "unbroadcast": mempool.is_unbroadcast(txid),
     }))
 }
 
@@ -8753,6 +8758,9 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         .filter(|transaction| !preexisting.contains(&transaction.compute_txid()))
         .cloned()
         .collect::<Vec<_>>();
+    for transaction in &accepted {
+        candidate.add_unbroadcast(transaction.compute_txid());
+    }
     drop(chain);
     let changes = candidate.take_changes();
     let removed = before_transactions

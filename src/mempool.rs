@@ -86,12 +86,13 @@ struct CoreMempoolEntry {
 }
 
 type CoreMempoolDeltas = Vec<(Txid, i64)>;
-type DecodedCoreMempool = (Vec<CoreMempoolEntry>, CoreMempoolDeltas);
+type DecodedCoreMempool = (Vec<CoreMempoolEntry>, CoreMempoolDeltas, Vec<Txid>);
 
 #[derive(Clone, Copy, Debug)]
 pub struct MempoolLoadOptions {
     pub use_current_time: bool,
     pub apply_fee_delta_priority: bool,
+    pub apply_unbroadcast_set: bool,
 }
 
 impl Default for MempoolLoadOptions {
@@ -99,6 +100,7 @@ impl Default for MempoolLoadOptions {
         Self {
             use_current_time: false,
             apply_fee_delta_priority: true,
+            apply_unbroadcast_set: true,
         }
     }
 }
@@ -230,8 +232,9 @@ fn decode_core_mempool_payload(bytes: &[u8]) -> Result<DecodedCoreMempool> {
     if unbroadcast_count > MAX_CORE_MEMPOOL_TRANSACTIONS {
         bail!("mempool unbroadcast count is unreasonable");
     }
+    let mut unbroadcast = Vec::with_capacity(unbroadcast_count);
     for _ in 0..unbroadcast_count {
-        let (_, consumed) = deserialize_partial::<Txid>(
+        let (txid, consumed) = deserialize_partial::<Txid>(
             bytes
                 .get(offset..)
                 .ok_or_else(|| anyhow::anyhow!("mempool file ended before an unbroadcast id"))?,
@@ -240,12 +243,13 @@ fn decode_core_mempool_payload(bytes: &[u8]) -> Result<DecodedCoreMempool> {
         offset = offset
             .checked_add(consumed)
             .context("mempool file offset overflow")?;
+        unbroadcast.push(txid);
     }
 
     if offset != bytes.len() {
         bail!("mempool file contains trailing data");
     }
-    Ok((entries, deltas))
+    Ok((entries, deltas, unbroadcast))
 }
 
 fn decode_core_mempool(bytes: &[u8]) -> Result<DecodedCoreMempool> {
@@ -324,6 +328,7 @@ pub struct Mempool {
     children: HashMap<Txid, HashSet<Txid>>,
     wtxids: HashMap<Wtxid, Txid>,
     priorities: HashMap<Txid, i64>,
+    unbroadcast: HashSet<Txid>,
     changes: Vec<MempoolChange>,
 }
 
@@ -432,6 +437,7 @@ impl Mempool {
             children: HashMap::new(),
             wtxids: HashMap::new(),
             priorities: HashMap::new(),
+            unbroadcast: HashSet::new(),
             changes: Vec::new(),
         }
     }
@@ -538,6 +544,27 @@ impl Mempool {
 
     pub fn fee_delta(&self, txid: &Txid) -> i64 {
         self.priorities.get(txid).copied().unwrap_or(0)
+    }
+
+    pub fn add_unbroadcast(&mut self, txid: Txid) {
+        if self.entries.contains_key(&txid) {
+            self.unbroadcast.insert(txid);
+        }
+    }
+
+    pub fn remove_unbroadcast(&mut self, txid: &Txid) {
+        self.unbroadcast.remove(txid);
+    }
+
+    pub fn is_unbroadcast(&self, txid: &Txid) -> bool {
+        self.unbroadcast.contains(txid)
+    }
+
+    pub fn unbroadcast_txids(&self) -> Vec<Txid> {
+        let mut txids = self.unbroadcast.iter().copied().collect::<Vec<_>>();
+        txids.sort_by_key(ToString::to_string);
+        txids.retain(|txid| self.entries.contains_key(txid));
+        txids
     }
 
     fn modified_fee_sat(&self, txid: &Txid, base_fee_sat: u64) -> i128 {
@@ -844,7 +871,7 @@ impl Mempool {
                 let _ = self.accept_at(entry.transaction, chain, added_at);
             }
         } else {
-            let (entries, deltas) = decode_core_mempool(&bytes)
+            let (entries, deltas, unbroadcast) = decode_core_mempool(&bytes)
                 .with_context(|| format!("decoding Core mempool {}", path.display()))?;
             let cutoff = now.saturating_sub(expiry.as_secs());
             for entry in entries {
@@ -866,6 +893,11 @@ impl Mempool {
             if options.apply_fee_delta_priority {
                 for (txid, fee_delta) in deltas {
                     self.prioritise(txid, fee_delta);
+                }
+            }
+            if options.apply_unbroadcast_set {
+                for txid in unbroadcast {
+                    self.add_unbroadcast(txid);
                 }
             }
         }
@@ -901,9 +933,11 @@ impl Mempool {
             payload.extend_from_slice(&serialize(txid));
             append_i64(&mut payload, *fee_delta);
         }
-        // The node does not maintain Core's unbroadcast set yet, but the
-        // empty set is part of the v2 mempool.dat wire format.
-        payload.extend_from_slice(&serialize(&VarInt(0)));
+        let unbroadcast = self.unbroadcast_txids();
+        payload.extend_from_slice(&serialize(&VarInt(unbroadcast.len() as u64)));
+        for txid in unbroadcast {
+            payload.extend_from_slice(&serialize(&txid));
+        }
 
         let key = random::<[u8; CORE_MEMPOOL_OBFUSCATION_KEY_SIZE]>();
         let mut bytes = Vec::with_capacity(17 + payload.len());
@@ -1706,12 +1740,16 @@ impl Mempool {
         self.children.clear();
         self.wtxids.clear();
         self.bytes = 0;
+        let unbroadcast = std::mem::take(&mut self.unbroadcast);
         for (added_at, transaction) in ordered {
+            let txid = transaction.compute_txid();
             if self
                 .accept_at_without_sequence(transaction.clone(), chain, added_at)
                 .is_err()
             {
                 self.record_removal(transaction, true);
+            } else if unbroadcast.contains(&txid) {
+                self.unbroadcast.insert(txid);
             }
         }
     }
@@ -1722,6 +1760,7 @@ impl Mempool {
 
     fn remove_with_notification(&mut self, txid: &Txid, notify_zmq: bool) -> Option<MempoolEntry> {
         let entry = self.entries.remove(txid)?;
+        self.unbroadcast.remove(txid);
         self.wtxids.remove(&entry.transaction.compute_wtxid());
         let size = bitcoin::consensus::encode::serialize(&entry.transaction).len();
         self.bytes = self.bytes.saturating_sub(size);
@@ -2340,14 +2379,16 @@ mod tests {
         let inserted = insert_policy_entry(&mut pool, transaction.clone());
         assert_eq!(inserted, txid);
         pool.prioritise(txid, 123);
+        pool.add_unbroadcast(txid);
 
         pool.save_to_file(&path).unwrap();
         let bytes = fs::read(path).unwrap();
-        let (entries, deltas) = decode_core_mempool(&bytes).unwrap();
+        let (entries, deltas, unbroadcast) = decode_core_mempool(&bytes).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].transaction, transaction);
         assert_eq!(entries[0].fee_delta, 123);
         assert!(deltas.is_empty());
+        assert_eq!(unbroadcast, vec![txid]);
     }
 
     #[test]
@@ -2363,9 +2404,10 @@ mod tests {
         let mut bytes = Vec::new();
         append_u64(&mut bytes, CORE_MEMPOOL_DUMP_VERSION_V1);
         bytes.extend_from_slice(&payload);
-        let (entries, deltas) = decode_core_mempool(&bytes).unwrap();
+        let (entries, deltas, unbroadcast) = decode_core_mempool(&bytes).unwrap();
         assert!(entries.is_empty());
         assert_eq!(deltas, vec![(txid, -42)]);
+        assert!(unbroadcast.is_empty());
     }
 
     #[test]

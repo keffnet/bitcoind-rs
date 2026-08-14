@@ -1317,6 +1317,7 @@ async fn serve_peer_loop(
                                 None
                             };
                             if let Some(transaction) = transaction {
+                                let txid = transaction.compute_txid();
                                 send_message(
                                     node,
                                     peer_id,
@@ -1325,6 +1326,7 @@ async fn serve_peer_loop(
                                     &Message::Transaction(transaction),
                                 )
                                 .await?;
+                                node.mempool.write().remove_unbroadcast(&txid);
                             } else {
                                 missing.push(item);
                             }

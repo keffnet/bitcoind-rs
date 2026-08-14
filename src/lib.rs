@@ -540,6 +540,7 @@ impl Node {
 
     pub fn accept_transaction(&self, transaction: Transaction) -> Result<Txid> {
         let (txid, _) = self.try_accept_transaction(transaction.clone())?;
+        self.mempool.write().add_unbroadcast(txid);
         self.notify_mempool_transaction(transaction);
         Ok(txid)
     }
@@ -1498,6 +1499,7 @@ impl Node {
             MempoolLoadOptions {
                 use_current_time: true,
                 apply_fee_delta_priority: false,
+                apply_unbroadcast_set: false,
             },
         )
     }

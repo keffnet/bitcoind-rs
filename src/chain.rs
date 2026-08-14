@@ -3377,6 +3377,7 @@ impl ChainState {
         let old_utxos = self.utxos.clone();
         let old_utxos_by_script = self.utxos_by_script.clone();
         let old_tx_index = self.tx_index.clone();
+        let old_tx_index_all = self.tx_index_all.clone();
         let old_history = self.history.clone();
         let old_spent_by = self.spent_by.clone();
         let old_basic_filter_cache = self.basic_filter_cache.clone();
@@ -3414,6 +3415,7 @@ impl ChainState {
             self.utxos = old_utxos;
             self.utxos_by_script = old_utxos_by_script;
             self.tx_index = old_tx_index;
+            self.tx_index_all = old_tx_index_all;
             self.history = old_history;
             self.spent_by = old_spent_by;
             self.basic_filter_cache = old_basic_filter_cache;
@@ -5792,6 +5794,53 @@ mod tests {
         assert_eq!(reopened.best_hash(), side_three_hash);
         assert_eq!(reopened.block_hash(1), Some(side_one_hash));
         assert!(reopened.transaction(&main_two_coinbase).unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_reorg_replay_restores_the_all_transaction_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let genesis_hash = state.best_hash();
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 51);
+        let side_one_hash = side_one.block_hash();
+        let mut invalid_side_two = mine_block_from_header(&side_one.header, 2, 52);
+        invalid_side_two.txdata[0].output[0].value = Amount::MAX_MONEY;
+        invalid_side_two.header.merkle_root = invalid_side_two.compute_merkle_root().unwrap();
+        invalid_side_two.header.nonce = 0;
+        while !invalid_side_two
+            .header
+            .target()
+            .is_met_by(invalid_side_two.block_hash())
+        {
+            invalid_side_two.header.nonce = invalid_side_two.header.nonce.wrapping_add(1);
+        }
+
+        state.store.insert(&side_one).unwrap();
+        state.store.insert(&invalid_side_two).unwrap();
+        let genesis_work = state.block_index[&genesis_hash].chain_work;
+        let side_one_work = genesis_work + side_one.header.work();
+        state.block_index.insert(
+            side_one_hash,
+            BlockNode {
+                header: side_one.header,
+                height: 1,
+                chain_work: side_one_work,
+            },
+        );
+        state.block_index.insert(
+            invalid_side_two.block_hash(),
+            BlockNode {
+                header: invalid_side_two.header,
+                height: 2,
+                chain_work: side_one_work + invalid_side_two.header.work(),
+            },
+        );
+
+        let side_one_txid = side_one.txdata[0].compute_txid();
+        assert!(state.activate_chain(invalid_side_two.block_hash()).is_err());
+        assert_eq!(state.best_hash(), genesis_hash);
+        assert!(!state.tx_index_all.contains_key(&side_one_txid));
     }
 
     #[test]

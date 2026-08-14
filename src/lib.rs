@@ -2127,6 +2127,14 @@ impl Node {
 
     pub(crate) fn is_banned_for_peer(&self, address: SocketAddr, inbound: bool) -> bool {
         let permissions = self.permissions_for_peer(address, inbound);
+        self.is_banned_for_permissions(address, permissions)
+    }
+
+    pub(crate) fn is_banned_for_permissions(
+        &self,
+        address: SocketAddr,
+        permissions: PeerPermissions,
+    ) -> bool {
         !permissions.contains(PeerPermissions::NO_BAN) && self.is_banned(address.ip())
     }
 

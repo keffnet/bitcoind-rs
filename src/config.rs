@@ -311,6 +311,43 @@ pub struct WhitelistRule {
     pub outgoing: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhiteBind {
+    pub address: SocketAddr,
+    pub permissions: PeerPermissions,
+}
+
+impl WhiteBind {
+    fn parse(value: &str, whitelist_relay: bool, whitelist_force_relay: bool) -> Result<Self> {
+        let (permission_text, address_text) = value
+            .split_once('@')
+            .map_or((None, value), |(permissions, address)| {
+                (Some(permissions), address)
+            });
+        let address = address_text
+            .parse::<SocketAddr>()
+            .with_context(|| format!("parsing --whitebind address '{address_text}'"))?;
+        if address.port() == 0 {
+            bail!("--whitebind must use a non-zero port");
+        }
+        let permissions = match permission_text {
+            Some(permissions) => {
+                let (permissions, incoming, outgoing) = PeerPermissions::parse_flags(permissions)?;
+                if outgoing || !incoming {
+                    bail!("--whitebind only supports incoming permissions");
+                }
+                permissions
+            }
+            None => PeerPermissions::implicit(),
+        }
+        .resolve(whitelist_relay, whitelist_force_relay);
+        Ok(Self {
+            address,
+            permissions,
+        })
+    }
+}
+
 impl WhitelistRule {
     fn parse(value: &str) -> Result<Self> {
         let (permission_text, subnet_text) = value
@@ -345,6 +382,7 @@ impl WhitelistRule {
 #[derive(Clone, Debug)]
 pub struct PeerPermissionConfig {
     pub whitelist: Vec<WhitelistRule>,
+    pub whitebind: Vec<WhiteBind>,
     pub whitelist_relay: bool,
     pub whitelist_force_relay: bool,
 }
@@ -353,6 +391,7 @@ impl Default for PeerPermissionConfig {
     fn default() -> Self {
         Self {
             whitelist: Vec::new(),
+            whitebind: Vec::new(),
             whitelist_relay: true,
             whitelist_force_relay: false,
         }
@@ -362,6 +401,7 @@ impl Default for PeerPermissionConfig {
 impl PeerPermissionConfig {
     fn from_args(
         whitelist: &[String],
+        whitebind: &[String],
         whitelist_relay: Option<bool>,
         whitelist_force_relay: bool,
         blocksonly: bool,
@@ -371,8 +411,13 @@ impl PeerPermissionConfig {
             .map(|value| WhitelistRule::parse(value))
             .collect::<Result<Vec<_>>>()?;
         let whitelist_relay = whitelist_relay.unwrap_or(!blocksonly);
+        let whitebind = whitebind
+            .iter()
+            .map(|value| WhiteBind::parse(value, whitelist_relay, whitelist_force_relay))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             whitelist,
+            whitebind,
             whitelist_relay: whitelist_relay || whitelist_force_relay,
             whitelist_force_relay,
         })
@@ -469,6 +514,9 @@ pub struct Args {
 
     #[arg(long = "whitelist", value_name = "PERMISSIONS@IP[/PREFIX]")]
     pub whitelist: Vec<String>,
+
+    #[arg(long = "whitebind", value_name = "PERMISSIONS@IP:PORT")]
+    pub whitebind: Vec<String>,
 
     #[arg(
         long,
@@ -703,8 +751,12 @@ impl Config {
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
             bail!("--proxy must use a non-zero port");
         }
+        if !args.listen && !args.whitebind.is_empty() {
+            bail!("--whitebind cannot be used with --listen=false");
+        }
         let peer_permissions = PeerPermissionConfig::from_args(
             &args.whitelist,
+            &args.whitebind,
             args.whitelistrelay,
             args.whitelistforcerelay,
             args.blocksonly,
@@ -981,6 +1033,64 @@ mod tests {
             config.peer_permissions("198.51.100.7".parse().unwrap(), true),
             PeerPermissions::empty()
         );
+    }
+
+    #[test]
+    fn parses_and_validates_whitebind_listeners() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--whitebind=forcerelay@127.0.0.1:18444",
+            "--whitebind=127.0.0.1:18445",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.peer_permissions.whitebind.len(), 2);
+        assert_eq!(
+            config.peer_permissions.whitebind[0].address,
+            "127.0.0.1:18444".parse().unwrap()
+        );
+        assert_eq!(
+            config.peer_permissions.whitebind[0]
+                .permissions
+                .to_strings(),
+            vec!["forcerelay", "relay"]
+        );
+        assert!(
+            config.peer_permissions.whitebind[1]
+                .permissions
+                .contains(PeerPermissions::RELAY)
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--whitebind=127.0.0.1:0",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--whitebind=out,relay@127.0.0.1:18444",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--listen=false",
+            "--whitebind=127.0.0.1:18444",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
     }
 
     #[test]

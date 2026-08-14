@@ -33,6 +33,7 @@ use tokio::net::{
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
 use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 use crate::chain::BasicFilterRange;
@@ -1112,6 +1113,18 @@ impl PeerManager {
         } else {
             None
         };
+        let whitebind_listeners = if self.node.config.listen {
+            let mut listeners = Vec::new();
+            for whitebind in &self.node.config.peer_permissions.whitebind {
+                let listener = TcpListener::bind(whitebind.address)
+                    .await
+                    .with_context(|| format!("binding whitebind listener {}", whitebind.address))?;
+                listeners.push((listener, whitebind.permissions));
+            }
+            listeners
+        } else {
+            Vec::new()
+        };
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
         let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let next_peer_id = Arc::new(AtomicUsize::new(1));
@@ -1299,45 +1312,82 @@ impl PeerManager {
             }
         });
 
-        let Some(listener) = listener else {
-            return std::future::pending::<Result<()>>().await;
-        };
-        loop {
-            let (stream, address) = listener.accept().await?;
-            if !self.node.network_active()
-                || self.node.is_banned_for_peer(address, true)
-                || !self.node.config.allows_address(address)
-            {
-                continue;
-            }
-            let node = self.node.clone();
-            let slots = slots.clone();
-            let peers = peers.clone();
-            let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
-            tokio::spawn(async move {
-                let Ok(permit) = slots.try_acquire_owned() else {
-                    debug!(%address, "rejecting peer because peer limit is reached");
-                    return;
-                };
-                if let Err(error) = serve_peer(
-                    node,
-                    stream,
-                    address,
-                    PeerConnectionOptions {
-                        outbound: false,
-                        transport_v2: None,
-                        connection_type: "inbound",
-                    },
-                    peers,
-                    peer_id,
-                )
-                .await
-                {
-                    debug!(%address, %error, "inbound peer ended");
-                }
-                drop(permit);
-            });
+        let mut inbound_listeners = JoinSet::new();
+        if let Some(listener) = listener {
+            inbound_listeners.spawn(run_inbound_listener(
+                self.node.clone(),
+                listener,
+                slots.clone(),
+                peers.clone(),
+                next_peer_id.clone(),
+                None,
+            ));
         }
+        for (listener, permissions) in whitebind_listeners {
+            inbound_listeners.spawn(run_inbound_listener(
+                self.node.clone(),
+                listener,
+                slots.clone(),
+                peers.clone(),
+                next_peer_id.clone(),
+                Some(permissions),
+            ));
+        }
+        if inbound_listeners.is_empty() {
+            return std::future::pending::<Result<()>>().await;
+        }
+        while let Some(result) = inbound_listeners.join_next().await {
+            result??;
+        }
+        Ok(())
+    }
+}
+
+async fn run_inbound_listener(
+    node: Arc<Node>,
+    listener: TcpListener,
+    slots: Arc<Semaphore>,
+    peers: PeerRegistry,
+    next_peer_id: Arc<AtomicUsize>,
+    permissions: Option<PeerPermissions>,
+) -> Result<()> {
+    loop {
+        let (stream, address) = listener.accept().await?;
+        let banned = match permissions {
+            Some(permissions) => node.is_banned_for_permissions(address, permissions),
+            None => node.is_banned_for_peer(address, true),
+        };
+        if !node.network_active() || banned || !node.config.allows_address(address) {
+            continue;
+        }
+        let node = node.clone();
+        let slots = slots.clone();
+        let peers = peers.clone();
+        let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let Ok(permit) = slots.try_acquire_owned() else {
+                debug!(%address, "rejecting peer because peer limit is reached");
+                return;
+            };
+            if let Err(error) = serve_peer(
+                node,
+                stream,
+                address,
+                PeerConnectionOptions {
+                    outbound: false,
+                    transport_v2: None,
+                    connection_type: "inbound",
+                    permissions,
+                },
+                peers,
+                peer_id,
+            )
+            .await
+            {
+                debug!(%address, %error, "inbound peer ended");
+            }
+            drop(permit);
+        });
     }
 }
 
@@ -1415,6 +1465,7 @@ fn spawn_outbound_loop(
                             outbound: true,
                             transport_v2,
                             connection_type,
+                            permissions: None,
                         },
                         peers.clone(),
                         peer_id,
@@ -1752,6 +1803,7 @@ struct PeerConnectionOptions {
     outbound: bool,
     transport_v2: Option<bool>,
     connection_type: &'static str,
+    permissions: Option<PeerPermissions>,
 }
 
 async fn serve_peer(
@@ -1775,7 +1827,9 @@ async fn serve_peer(
     .await?;
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
     let (commands, command_receiver) = mpsc::unbounded_channel();
-    let permissions = node.permissions_for_peer(address, !options.outbound);
+    let permissions = options
+        .permissions
+        .unwrap_or_else(|| node.permissions_for_peer(address, !options.outbound));
     node.register_peer_with_permissions(
         peer_id,
         address,

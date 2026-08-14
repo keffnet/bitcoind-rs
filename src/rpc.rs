@@ -55,6 +55,9 @@ const DEFAULT_MAX_RAW_TX_FEE_RATE_BTC_PER_KVB: f64 = 0.1;
 const MAX_SCRIPT_SIZE: usize = 10_000;
 const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
 const MAX_OPCODE: u8 = 0xb9;
+const MIN_MERKLE_TRANSACTION_WEIGHT: usize = 4 * 60;
+const MAX_MERKLE_PROOF_TRANSACTIONS: usize =
+    validation::MAX_BLOCK_WEIGHT / MIN_MERKLE_TRANSACTION_WEIGHT;
 
 pub struct RpcServer {
     node: Arc<Node>,
@@ -3906,7 +3909,7 @@ fn parse_merkle_proof(params: &Value) -> Result<Option<(Header, Vec<Txid>, usize
     let header: bitcoin::block::Header = deserialize(&bytes[..80])?;
     let mut reader = ProofReader::new(&bytes[80..]);
     let total = reader.u32()? as usize;
-    if total == 0 || total > 1_000_000 {
+    if total == 0 || total > MAX_MERKLE_PROOF_TRANSACTIONS {
         bail!("invalid merkle proof transaction count");
     }
     let hash_count = reader.compact_size()?;
@@ -10831,6 +10834,30 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn merkle_proof_rejects_core_excessive_transaction_counts() {
+        let mut block = bitcoin::Block {
+            header: Header {
+                version: BlockVersion::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![proof_transaction(9)],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        let txid = block.txdata[0].compute_txid();
+        let mut proof = serialize_merkle_proof(&block, &[txid]).unwrap();
+        proof[80..84].copy_from_slice(
+            &u32::try_from(MAX_MERKLE_PROOF_TRANSACTIONS + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        assert!(parse_merkle_proof(&json!([hex::encode(proof)])).is_err());
     }
 
     #[test]

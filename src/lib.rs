@@ -791,8 +791,16 @@ impl Node {
             .blocks_dir
             .clone()
             .unwrap_or_else(|| config.datadir.join("blocks"));
-        fs::create_dir_all(&blocks_dir)
-            .with_context(|| format!("creating blocks directory {}", blocks_dir.display()))?;
+        if config.blocks_dir_explicit && !blocks_dir.is_dir() {
+            bail!(
+                "specified blocks directory does not exist: {}",
+                blocks_dir.display()
+            );
+        }
+        if !config.blocks_dir_explicit {
+            fs::create_dir_all(&blocks_dir)
+                .with_context(|| format!("creating blocks directory {}", blocks_dir.display()))?;
+        }
         let blocks_dir_lock = if blocks_dir == config.datadir {
             None
         } else {
@@ -3880,6 +3888,7 @@ mod tests {
             network: bitcoin::Network::Regtest,
             datadir: datadir.to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -3916,6 +3925,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
@@ -3998,6 +4008,17 @@ mod tests {
 
         drop(node);
         assert!(Node::open(conflicting_config).is_ok());
+    }
+
+    #[test]
+    fn explicit_missing_blocks_directory_is_rejected() {
+        let data_directory = tempfile::tempdir().unwrap();
+        let missing_blocks_directory = data_directory.path().join("missing-blocks");
+        let mut config = test_config(data_directory.path());
+        config.blocks_dir = Some(missing_blocks_directory.clone());
+        config.blocks_dir_explicit = true;
+        assert!(Node::open(config).is_err());
+        assert!(!missing_blocks_directory.exists());
     }
 
     #[test]
@@ -4306,6 +4327,7 @@ mod tests {
     #[test]
     fn blocks_directory_can_be_separated_from_chainstate() {
         let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("external-blocks")).unwrap();
         let args = crate::config::Args::try_parse_from([
             "bitcoind-rs",
             "--datadir",

@@ -1306,17 +1306,33 @@ impl PeerManager {
             && has_known_network_addresses;
         let connect_nodes = if should_query_dns {
             let addresses = discover_dns_seeds(self.node.config.network).await;
+            let mut remembered = 0usize;
             for address in &addresses {
                 if self.node.config.allows_address(*address) {
-                    self.node.remember_network_address(
+                    remembered += usize::from(self.node.remember_network_address(
                         NetworkEndpoint::from_socket(*address),
                         wire::NODE_NETWORK | wire::NODE_WITNESS,
                         unix_time_seconds(),
-                    );
+                    ));
                 }
+            }
+            if remembered == 0 && self.node.config.fixed_seeds {
+                remembered = add_fixed_seed_addresses(&self.node);
+            }
+            if remembered != 0 {
+                info!(remembered, "added bootstrap peer addresses");
             }
             Vec::new()
         } else {
+            if !configured_connect_nodes
+                && !has_known_network_addresses
+                && self.node.config.fixed_seeds
+            {
+                let remembered = add_fixed_seed_addresses(&self.node);
+                if remembered != 0 {
+                    info!(remembered, "added fixed seed peer addresses");
+                }
+            }
             self.node.config.seed_nodes.clone()
         };
         let manual_nodes = self
@@ -2225,6 +2241,71 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
         }
     }
     addresses
+}
+
+fn fixed_seed_addresses(network: Network) -> Vec<SocketAddr> {
+    // These are the first IPv4 entries from Core v31.1's generated
+    // chainparamsseeds.h for each public network. They are intentionally a
+    // compact fallback; fresh DNS results and persisted addresses remain the
+    // preferred bootstrap sources.
+    let seeds: &[&str] = match network {
+        Network::Bitcoin => &[
+            "2.121.116.198:8333",
+            "3.86.179.235:8333",
+            "4.2.51.251:8333",
+            "5.2.23.226:8333",
+            "5.2.222.125:8333",
+            "5.11.92.140:8333",
+            "5.35.15.93:8333",
+            "5.36.230.237:8333",
+        ],
+        Network::Testnet => &[
+            "18.118.231.3:18333",
+            "23.227.223.209:18333",
+            "24.160.99.9:18333",
+            "35.183.51.117:18333",
+            "35.210.184.94:18333",
+            "38.102.86.40:18333",
+            "45.50.223.112:18333",
+            "45.55.132.91:18333",
+        ],
+        Network::Signet => &[
+            "34.135.189.101:38333",
+            "34.254.97.244:38333",
+            "35.196.2.204:38333",
+            "35.217.13.118:38333",
+            "37.120.177.204:38333",
+            "38.83.170.18:38333",
+            "44.192.76.239:38333",
+            "45.94.168.5:38333",
+        ],
+        Network::Testnet4 => &[
+            "2.59.134.244:48333",
+            "2.110.106.102:48333",
+            "5.182.4.106:48333",
+            "31.220.30.248:48333",
+            "34.232.194.104:48333",
+            "35.201.167.154:48333",
+            "38.102.86.40:48333",
+            "45.41.204.8:48333",
+        ],
+        Network::Regtest => &[],
+    };
+    seeds.iter().filter_map(|seed| seed.parse().ok()).collect()
+}
+
+fn add_fixed_seed_addresses(node: &Arc<Node>) -> usize {
+    fixed_seed_addresses(node.config.network)
+        .into_iter()
+        .filter(|address| node.config.allows_address(*address))
+        .filter(|address| {
+            node.remember_network_address(
+                NetworkEndpoint::from_socket(*address),
+                wire::NODE_NETWORK | wire::NODE_WITNESS,
+                unix_time_seconds(),
+            )
+        })
+        .count()
 }
 
 #[derive(Clone)]
@@ -5183,6 +5264,7 @@ mod tests {
             network: Network::Regtest,
             datadir: datadir.to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -5231,6 +5313,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             dnsseed: false,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
@@ -5834,6 +5917,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -5870,6 +5954,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: false,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: vec![OnlyNet::Ipv4],
             proxy: None,
@@ -6024,6 +6109,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -6060,6 +6146,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: false,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
@@ -6505,6 +6592,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -6541,6 +6629,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
@@ -6679,6 +6768,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -6715,6 +6805,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
@@ -6859,6 +6950,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -6895,6 +6987,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
@@ -7129,6 +7222,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -7165,6 +7259,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
@@ -7275,6 +7370,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -7311,6 +7407,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
@@ -7403,6 +7500,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -7439,6 +7537,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
@@ -7541,12 +7640,22 @@ mod tests {
     }
 
     #[test]
+    fn fixed_seed_fallback_has_public_network_entries_only() {
+        assert!(!fixed_seed_addresses(Network::Bitcoin).is_empty());
+        assert!(!fixed_seed_addresses(Network::Testnet).is_empty());
+        assert!(!fixed_seed_addresses(Network::Testnet4).is_empty());
+        assert!(!fixed_seed_addresses(Network::Signet).is_empty());
+        assert!(fixed_seed_addresses(Network::Regtest).is_empty());
+    }
+
+    #[test]
     fn typed_discovery_candidates_preserve_non_ip_endpoints() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(crate::config::Config {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -7583,6 +7692,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: false,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: Some("127.0.0.1:9050".parse().unwrap()),
@@ -7729,6 +7839,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             blocks_dir: None,
+            blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
             asmap: None,
@@ -7765,6 +7876,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            fixed_seeds: false,
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,

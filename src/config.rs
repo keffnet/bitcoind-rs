@@ -731,6 +731,15 @@ pub struct Args {
     pub dnsseed: Option<bool>,
 
     #[arg(
+        long = "fixedseeds",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub fixed_seeds: bool,
+
+    #[arg(
         long = "forcednsseed",
         default_value_t = false,
         num_args = 0..=1,
@@ -1427,6 +1436,7 @@ pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
     pub(crate) blocks_dir: Option<PathBuf>,
+    pub(crate) blocks_dir_explicit: bool,
     pub blocks_xor: bool,
     pub capture_messages: bool,
     pub(crate) asmap: Option<PathBuf>,
@@ -1473,6 +1483,7 @@ pub struct Config {
     pub add_nodes: Vec<NetworkEndpoint>,
     pub seed_nodes_for_address_fetch: Vec<NetworkEndpoint>,
     pub dnsseed: bool,
+    pub fixed_seeds: bool,
     pub force_dns_seed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
@@ -1896,6 +1907,7 @@ impl Config {
             network,
             datadir: args.datadir,
             blocks_dir: Some(blocks_dir),
+            blocks_dir_explicit: args.blocks_dir.is_some(),
             blocks_xor: args.blocks_xor,
             capture_messages: args.capture_messages,
             asmap,
@@ -1942,6 +1954,7 @@ impl Config {
             add_nodes,
             seed_nodes_for_address_fetch,
             dnsseed,
+            fixed_seeds: args.fixed_seeds,
             force_dns_seed: args.force_dns_seed,
             onlynet: args.onlynet,
             proxy: args.proxy,
@@ -2446,6 +2459,14 @@ mod tests {
             Config::from_args(args).unwrap().blocks_dir,
             Some(directory.path().join("storage/blocks"))
         );
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--blocksdir=storage/blocks",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().blocks_dir_explicit);
 
         let args = Args::try_parse_from(["bitcoind-rs", "--network=regtest"]).unwrap();
         assert!(Config::from_args(args).unwrap().blocks_xor);
@@ -2456,6 +2477,9 @@ mod tests {
         assert!(Config::from_args(args).unwrap().capture_messages);
         let args = Args::try_parse_from(["bitcoind-rs", "--capturemessages=false"]).unwrap();
         assert!(!Config::from_args(args).unwrap().capture_messages);
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--fixedseeds=false"]).unwrap();
+        assert!(!Config::from_args(args).unwrap().fixed_seeds);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

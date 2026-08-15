@@ -55,6 +55,7 @@ Repeatable `--uacomment=<comment>` values are appended to the BIP14 P2P user-age
 Compact-block reconstruction also retains a bounded FIFO of recent non-mempool transactions; tune it with `--blockreconstructionextratxn=<n>` (100 by default, `0` disables the extra cache).
 
 `--forcednsseed` forces a DNS seed lookup even when persisted peer addresses are available; regular DNS seeding is deferred briefly in that case so the saved addresses are tried first. It cannot be combined with `--dnsseed=false`.
+`--fixedseeds` (enabled by default) adds a compact Core v31.1 IPv4 fallback set when DNS seeding is disabled or produces no usable addresses; `--fixedseeds=false` disables that fallback. Manual `--connect`/`--noconnect` modes take precedence.
 
 Use `--asmap=<file>` to load Core's validated compressed IP-to-ASN map (relative paths are resolved beneath the data directory); mapped ASNs are exposed in peer/address-manager RPCs and automatic outbound selection avoids duplicate mapped ASNs. `--noasmap` or `--asmap=false` disables the map. Embedded maps are not shipped, so a bare `--asmap` reports that embedded data is unavailable.
 
@@ -62,7 +63,7 @@ Use `--asmap=<file>` to load Core's validated compressed IP-to-ASN map (relative
 
 Use `--txindex` to enable confirmed transaction lookup without supplying a block hash to `getrawtransaction`; Core-style pruning and `--txindex` are mutually exclusive.
 
-Use `--blocksdir=<path>` to place the append-only block and undo records outside the data directory; relative paths are resolved beneath `--datadir`, while chainstate and indexes remain in the data directory.
+Use `--blocksdir=<path>` to place the append-only block and undo records outside the data directory; relative paths are resolved beneath `--datadir`, while chainstate and indexes remain in the data directory. An explicitly supplied blocks directory must already exist, matching Core.
 Block and undo records use Core-style 8-byte cyclic XOR obfuscation by default; `--blocksxor=false` keeps a clear store. A fresh blocks directory receives a random key in `xor.dat`, while an existing clear directory receives a zero key. Disabling XOR after a nonzero key has been stored is rejected.
 Use `--minimumchainwork=<hex>` to override Core's assumed work floor; `0` disables the assumption.
 `--assumevalid=<hex>` selects Core's externally verified block for conservative script-check skipping during synchronization; `0` disables it. Public-network defaults match Core v31.1, while custom Signet challenges disable the default.

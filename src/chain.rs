@@ -3014,7 +3014,14 @@ impl ChainState {
                 median_time_past,
             )?;
         }
-        self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
+        validation::validate_block_structure_with_signet_options(
+            block,
+            self.network,
+            height,
+            Amount::MAX_MONEY.to_sat(),
+            self.signet_challenge.as_deref(),
+            check_pow,
+        )?;
         self.validate_block_transactions(block, height, &self.utxos, median_time_past)?;
         Ok(())
     }

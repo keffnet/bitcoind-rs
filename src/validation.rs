@@ -520,6 +520,24 @@ pub fn validate_block_structure_with_signet(
     expected_coinbase_value: u64,
     signet_challenge: Option<&[u8]>,
 ) -> Result<BlockValidationStats, ValidationError> {
+    validate_block_structure_with_signet_options(
+        block,
+        network,
+        height,
+        expected_coinbase_value,
+        signet_challenge,
+        true,
+    )
+}
+
+pub(crate) fn validate_block_structure_with_signet_options(
+    block: &Block,
+    network: Network,
+    height: u32,
+    expected_coinbase_value: u64,
+    signet_challenge: Option<&[u8]>,
+    check_signet_solution: bool,
+) -> Result<BlockValidationStats, ValidationError> {
     if block.txdata.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }
@@ -614,7 +632,7 @@ pub fn validate_block_structure_with_signet(
             allowed: expected_coinbase_value,
         });
     }
-    if let Some(challenge) = signet_challenge {
+    if check_signet_solution && let Some(challenge) = signet_challenge {
         validate_signet_block_solution(block, challenge)?;
     }
     Ok(BlockValidationStats {
@@ -1568,5 +1586,32 @@ mod tests {
             validate_signet_block_solution(&block, &[0x51]),
             Err(ValidationError::BadSignetSolution)
         ));
+    }
+
+    #[test]
+    fn proposal_structure_validation_skips_the_signet_solution_without_pow() {
+        let block = signet_block(Some(&[0xec, 0xc7, 0xda, 0xa2, 0x00]));
+        assert!(matches!(
+            validate_block_structure_with_signet_options(
+                &block,
+                Network::Signet,
+                0,
+                Amount::MAX_MONEY.to_sat(),
+                Some(&[0x51]),
+                true,
+            ),
+            Err(ValidationError::BadSignetSolution)
+        ));
+        assert!(
+            validate_block_structure_with_signet_options(
+                &block,
+                Network::Signet,
+                0,
+                Amount::MAX_MONEY.to_sat(),
+                Some(&[0x51]),
+                false,
+            )
+            .is_ok()
+        );
     }
 }

@@ -3318,23 +3318,18 @@ async fn serve_peer_loop(
                     let stop_height = chain.block_height_by_hash(&stop_hash).ok_or_else(|| {
                         anyhow::anyhow!("compact filter stop block is unavailable")
                     })?;
-                    let filter_headers = if stop_height < 999 {
-                        Vec::new()
-                    } else {
-                        (999..=stop_height)
-                            .step_by(1_000)
-                            .map(|height| {
-                                let block_hash = chain
-                                    .ancestor_hash_at_height(&stop_hash, height)
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("compact filter height is out of range")
-                                    })?;
-                                chain
-                                    .basic_filter_header_for_block(&block_hash)?
-                                    .ok_or_else(|| anyhow::anyhow!("compact filter is missing"))
-                            })
-                            .collect::<Result<Vec<_>>>()?
-                    };
+                    let filter_headers = compact_filter_checkpoint_heights(stop_height)
+                        .map(|height| {
+                            let block_hash = chain
+                                .ancestor_hash_at_height(&stop_hash, height)
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("compact filter height is out of range")
+                                })?;
+                            chain
+                                .basic_filter_header_for_block(&block_hash)?
+                                .ok_or_else(|| anyhow::anyhow!("compact filter is missing"))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
                     (stop_hash, filter_headers)
                 };
                 send_message(
@@ -4537,6 +4532,10 @@ fn requested_block_transactions(block: &Block, indexes: &[u64]) -> Option<Vec<Tr
         .collect()
 }
 
+fn compact_filter_checkpoint_heights(stop_height: u32) -> impl Iterator<Item = u32> {
+    (1_000..=stop_height).step_by(1_000)
+}
+
 fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
     height >= tip_height.saturating_sub(MAX_BLOCKTXN_DEPTH)
 }
@@ -5528,6 +5527,26 @@ mod tests {
         assert!(compact_block_is_recent(100, 100));
         assert!(!compact_block_is_recent(94, 100));
         assert!(compact_block_is_recent(0, 5));
+    }
+
+    #[test]
+    fn compact_filter_checkpoint_heights_match_core_interval() {
+        assert_eq!(
+            compact_filter_checkpoint_heights(999).collect::<Vec<_>>(),
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            compact_filter_checkpoint_heights(1_000).collect::<Vec<_>>(),
+            vec![1_000]
+        );
+        assert_eq!(
+            compact_filter_checkpoint_heights(1_999).collect::<Vec<_>>(),
+            vec![1_000]
+        );
+        assert_eq!(
+            compact_filter_checkpoint_heights(2_000).collect::<Vec<_>>(),
+            vec![1_000, 2_000]
+        );
     }
 
     #[test]

@@ -1123,14 +1123,25 @@ impl PeerManager {
     }
 
     pub async fn run(self) -> Result<()> {
-        let listener = if self.node.config.listen {
-            let listener = TcpListener::bind(self.node.config.p2p_bind)
-                .await
-                .with_context(|| format!("binding P2P listener {}", self.node.config.p2p_bind))?;
-            self.node.set_listen_address(listener.local_addr()?);
-            Some(listener)
+        let listeners = if self.node.config.listen {
+            let binds = if self.node.config.p2p_binds.is_empty() {
+                vec![self.node.config.p2p_bind]
+            } else {
+                self.node.config.p2p_binds.clone()
+            };
+            let mut listeners = Vec::with_capacity(binds.len());
+            for bind in binds {
+                let listener = TcpListener::bind(bind)
+                    .await
+                    .with_context(|| format!("binding P2P listener {bind}"))?;
+                if self.node.listen_address().is_none() {
+                    self.node.set_listen_address(listener.local_addr()?);
+                }
+                listeners.push(listener);
+            }
+            listeners
         } else {
-            None
+            Vec::new()
         };
         let whitebind_listeners = if self.node.config.listen {
             let mut listeners = Vec::new();
@@ -1384,7 +1395,7 @@ impl PeerManager {
         });
 
         let mut inbound_listeners = JoinSet::new();
-        if let Some(listener) = listener {
+        for listener in listeners {
             inbound_listeners.spawn(run_inbound_listener(
                 self.node.clone(),
                 listener,
@@ -4813,6 +4824,7 @@ mod tests {
             network: Network::Regtest,
             datadir: datadir.to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             listen: true,
             rpc_bind: None,
             electrum_bind: None,
@@ -5370,6 +5382,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
@@ -5519,6 +5532,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
@@ -5924,6 +5938,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
@@ -6057,6 +6072,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
@@ -6196,6 +6212,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
@@ -6425,6 +6442,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
@@ -6530,6 +6548,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
@@ -6617,6 +6636,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
@@ -6696,6 +6716,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
@@ -6837,6 +6858,7 @@ mod tests {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,

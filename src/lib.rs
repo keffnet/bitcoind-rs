@@ -3297,6 +3297,7 @@ mod tests {
             network: bitcoin::Network::Regtest,
             datadir: datadir.to_owned(),
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            p2p_binds: Vec::new(),
             rpc_bind: None,
             electrum_bind: None,
             rest: false,

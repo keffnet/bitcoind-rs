@@ -486,6 +486,9 @@ pub struct Args {
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
 
+    #[arg(long = "bind", value_name = "IP:PORT", value_delimiter = ',')]
+    pub bind: Vec<SocketAddr>,
+
     #[arg(
         long,
         num_args = 0..=1,
@@ -809,6 +812,7 @@ pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
     pub p2p_bind: SocketAddr,
+    pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
     pub rpc_bind: Option<SocketAddr>,
     pub electrum_bind: Option<SocketAddr>,
@@ -877,6 +881,14 @@ impl Config {
                 args.port.unwrap_or_else(|| default_p2p_port(network)),
             ))
         });
+        if args.p2p.is_some() && !args.bind.is_empty() {
+            bail!("--p2p cannot be combined with --bind");
+        }
+        let p2p_binds = if args.bind.is_empty() {
+            vec![p2p]
+        } else {
+            args.bind.clone()
+        };
         let rpc = args
             .rpc
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_rpc_port(network))));
@@ -1018,8 +1030,12 @@ impl Config {
         {
             bail!("ZMQ high water marks must be greater than zero");
         }
-        if listen && p2p.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) && p2p.port() == 0 {
-            bail!("--p2p must use a non-zero port when binding all interfaces");
+        if listen {
+            for bind in &p2p_binds {
+                if bind.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) && bind.port() == 0 {
+                    bail!("--bind/--p2p must use a non-zero port when binding all interfaces");
+                }
+            }
         }
         let signet_challenge = match args.signet_challenge {
             Some(_challenge) if args.network != NetworkName::Signet => {
@@ -1050,10 +1066,11 @@ impl Config {
         let add_nodes = parse_manual_endpoints(&args.addnode, network, "addnode")?;
         let seed_nodes_for_address_fetch =
             parse_manual_endpoints(&args.seednode, network, "seednode")?;
-        let external_port = if p2p.port() == 0 {
+        let primary_p2p_bind = p2p_binds[0];
+        let external_port = if primary_p2p_bind.port() == 0 {
             default_p2p_port(network)
         } else {
-            p2p.port()
+            primary_p2p_bind.port()
         };
         let external_addresses = parse_external_addresses(&args.externalip, external_port)?;
         std::fs::create_dir_all(&args.datadir)
@@ -1061,7 +1078,8 @@ impl Config {
         Ok(Self {
             network,
             datadir: args.datadir,
-            p2p_bind: p2p,
+            p2p_bind: primary_p2p_bind,
+            p2p_binds,
             listen,
             rpc_bind: Some(rpc),
             electrum_bind: Some(args.electrum),
@@ -1476,6 +1494,24 @@ mod tests {
             Config::from_args(args).unwrap().p2p_bind,
             "127.0.0.1:18445".parse().unwrap()
         );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--bind=127.0.0.1:18446,127.0.0.1:18447",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.p2p_binds,
+            vec![
+                "127.0.0.1:18446".parse().unwrap(),
+                "127.0.0.1:18447".parse().unwrap(),
+            ]
+        );
+        assert_eq!(config.p2p_bind, "127.0.0.1:18446".parse().unwrap());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

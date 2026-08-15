@@ -3427,9 +3427,6 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         i64::try_from((30 * 24 * 60 * 60) / spacing).unwrap_or(i64::MAX)
     };
     let requested_window = optional_i64(params, 0, default_window, "nblocks")?;
-    if requested_window < 0 {
-        bail!("window must not be negative");
-    }
     let requested_hash = params
         .get(1)
         .filter(|value| !value.is_null())
@@ -3441,23 +3438,25 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .map_err(|error| anyhow!("invalid blockhash: {error}"))
         })
         .transpose()?;
-    let mut chain = node.chain.write();
+    let chain = node.chain.write();
     let end_height = if let Some(hash) = requested_hash {
-        if !chain.is_active_block(&hash) {
-            bail!("block is not on the active chain");
-        }
-        chain
+        let height = chain
             .block_height_by_hash(&hash)
-            .ok_or_else(|| anyhow!("block not found"))?
+            .ok_or_else(|| anyhow!("Block not found"))?;
+        if !chain.is_active_block(&hash) {
+            bail!("Block is not in main chain");
+        }
+        height
     } else {
         chain.height()
     };
     let window = if explicit_window {
-        let window = u32::try_from(requested_window).unwrap_or(u32::MAX);
-        if window > 0 && window >= end_height {
-            bail!("window must be between 0 and the block height - 1");
+        if requested_window < 0
+            || (requested_window > 0 && requested_window >= i64::from(end_height))
+        {
+            bail!("Invalid block count: should be between 0 and the block's height - 1");
         }
-        window
+        u32::try_from(requested_window).context("block count is out of range")?
     } else {
         u32::try_from(requested_window)
             .unwrap_or(u32::MAX)
@@ -3470,21 +3469,15 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let start_hash = chain
         .block_hash(start_height)
         .ok_or_else(|| anyhow!("block height out of range"))?;
-    let mut txcount = 0u64;
-    let mut window_tx_count = 0u64;
-    for height in 0..=end_height {
-        let hash = chain
-            .block_hash(height)
-            .ok_or_else(|| anyhow!("block height out of range"))?;
-        let count = chain
-            .block_transaction_count(&hash)?
-            .ok_or_else(|| anyhow!("active block is missing from block store"))?
-            as u64;
-        txcount = txcount.saturating_add(count);
-        if height > start_height {
-            window_tx_count = window_tx_count.saturating_add(count);
-        }
-    }
+    let txcount = chain.chain_transaction_count(end_height);
+    let window_tx_count = if window > 0 {
+        chain
+            .chain_transaction_count(end_height)
+            .zip(chain.chain_transaction_count(start_height))
+            .map(|(end, start)| end.saturating_sub(start))
+    } else {
+        None
+    };
     let start_time = chain
         .header(start_height)
         .map(|header| header.time)
@@ -3503,16 +3496,20 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         );
     let mut result = json!({
         "time": end_time,
-        "txcount": txcount,
         "window_final_block_hash": end_hash.to_string(),
         "window_final_block_height": end_height,
         "window_block_count": window,
     });
+    if let Some(txcount) = txcount {
+        result["txcount"] = json!(txcount);
+    }
     if window > 0 {
-        result["window_tx_count"] = json!(window_tx_count);
         result["window_interval"] = json!(interval);
-        if interval > 0 {
-            result["txrate"] = json!(window_tx_count as f64 / interval as f64);
+        if let Some(window_tx_count) = window_tx_count {
+            result["window_tx_count"] = json!(window_tx_count);
+            if interval > 0 {
+                result["txrate"] = json!(window_tx_count as f64 / interval as f64);
+            }
         }
     }
     Ok(result)
@@ -10813,9 +10810,9 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "unknown filtertype"
         || lower == "block not found"
         || lower == "block not found in chain"
+        || lower == "filter not found. block was not connected to active chain."
         || lower == "transaction not found"
         || lower == "transaction not in mempool"
-        || lower == "filter not found. block was not connected to active chain."
         || lower.contains("not in private broadcast queue")
     {
         return -5;
@@ -10828,6 +10825,9 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.starts_with("missing parameter ")
         || lower.starts_with("too many positional arguments ")
         || lower.starts_with("unknown named parameter ")
+        || lower == "block is not in main chain"
+        || lower.starts_with("invalid block count:")
+        || lower.starts_with("invalid blockhash:")
         || lower.contains("specified more than once")
         || lower.contains("must be between ")
         || lower.contains("must not be negative")
@@ -12173,6 +12173,20 @@ mod tests {
         assert!(get_network_hash_ps(&node, &json!([-2])).is_err());
         assert!(get_network_hash_ps(&node, &json!(["120"])).is_err());
         assert!(get_chain_tx_stats(&node, &json!([null, 1])).is_err());
+        let stats = get_chain_tx_stats(&node, &json!([])).unwrap();
+        assert_eq!(stats["txcount"], json!(1));
+        assert_eq!(stats["window_block_count"], json!(0));
+        let unknown_hash = BlockHash::from_byte_array([0xff; 32]);
+        let block_not_found =
+            get_chain_tx_stats(&node, &json!([null, unknown_hash.to_string()])).unwrap_err();
+        assert_eq!(block_not_found.to_string(), "Block not found");
+        assert_eq!(rpc_error(&block_not_found)["code"], json!(-5));
+        let invalid_window = get_chain_tx_stats(&node, &json!([-1])).unwrap_err();
+        assert_eq!(
+            invalid_window.to_string(),
+            "Invalid block count: should be between 0 and the block's height - 1"
+        );
+        assert_eq!(rpc_error(&invalid_window)["code"], json!(-8));
         assert_eq!(
             get_network_hash_ps(&node, &json!([-1])).unwrap(),
             json!(0.0)

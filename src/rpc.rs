@@ -17693,6 +17693,12 @@ mod tests {
             .unwrap(),
             Value::Null
         );
+        let mut malformed_pow = proposal.clone();
+        malformed_pow.header.bits = bitcoin::pow::CompactTarget::from_consensus(0x1c00_00ff);
+        assert_eq!(
+            submit_block(&node, &json!([hex::encode(serialize(&malformed_pow))]),).unwrap(),
+            json!("high-hash")
+        );
 
         proposal.header.prev_blockhash = BlockHash::all_zeros();
         assert_eq!(

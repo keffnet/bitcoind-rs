@@ -626,21 +626,32 @@ fn validate_header_internal(
     if header.time > time::unix_time().saturating_add(2 * 60 * 60) as u32 {
         return Err(ValidationError::TimeTooNew);
     }
+    let compact = header.bits.to_consensus();
+    let mantissa = compact & 0x007f_ffff;
+    let compact_valid =
+        mantissa != 0 && (compact & 0x0080_0000) == 0 && header.target() != Target::ZERO;
+    if check_pow {
+        // Core's CheckBlockHeader validates the claimed target and proof of
+        // work before ContextualCheckBlockHeader compares nBits with the
+        // difficulty required by the parent.  Keep that ordering so
+        // submitblock reports "high-hash" for malformed or out-of-range
+        // compact targets rather than the contextual "bad-diffbits" result.
+        if !compact_valid
+            || header.target() > network_params(network).max_attainable_target
+            || !header.target().is_met_by(header.block_hash())
+        {
+            return Err(ValidationError::BadProofOfWork);
+        }
+    } else if !compact_valid {
+        return Err(ValidationError::BadTarget);
+    }
     if header.target() != expected_target
         || header.bits.to_consensus() != expected_target.to_compact_lossy().to_consensus()
     {
         return Err(ValidationError::BadTarget);
     }
-    let compact = header.bits.to_consensus();
-    let mantissa = compact & 0x007f_ffff;
-    if mantissa == 0 || (compact & 0x0080_0000) != 0 || header.target() == Target::ZERO {
-        return Err(ValidationError::BadTarget);
-    }
     if header.target() > network_params(network).max_attainable_target {
         return Err(ValidationError::TargetAboveLimit);
-    }
-    if check_pow && !header.target().is_met_by(header.block_hash()) {
-        return Err(ValidationError::BadProofOfWork);
     }
     Ok(())
 }

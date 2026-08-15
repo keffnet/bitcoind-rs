@@ -3026,13 +3026,21 @@ impl Node {
             }
         });
 
-        tokio::select! {
-            result = &mut p2p_task => result??,
-            result = &mut rpc_task => result??,
-            result = &mut electrum_task => result??,
-            result = &mut zmq_task => result??,
-            result = tokio::signal::ctrl_c() => result?,
-            _ = self.shutdown.notified() => (),
+        let run_result: Result<()> = tokio::select! {
+            result = &mut p2p_task => result
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result),
+            result = &mut rpc_task => result
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result),
+            result = &mut electrum_task => result
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result),
+            result = &mut zmq_task => result
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result),
+            result = tokio::signal::ctrl_c() => result.map_err(anyhow::Error::from),
+            _ = self.shutdown.notified() => Ok(()),
         };
 
         p2p_task.abort();
@@ -3046,7 +3054,7 @@ impl Node {
         }
         self.persist_known_addresses()?;
         self.remove_rpc_cookie();
-        Ok(())
+        run_result
     }
 
     fn remove_rpc_cookie(&self) {

@@ -535,6 +535,15 @@ pub struct Args {
     )]
     pub v2_transport: bool,
 
+    #[arg(
+        long = "networkactive",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub network_active: bool,
+
     #[arg(long = "onlynet", value_enum, value_delimiter = ',')]
     pub onlynet: Vec<OnlyNet>,
 
@@ -784,6 +793,7 @@ pub struct Config {
     pub seed_nodes: Vec<NetworkEndpoint>,
     pub connect_disabled: bool,
     pub v2_transport: bool,
+    pub network_active: bool,
     pub add_nodes: Vec<NetworkEndpoint>,
     pub seed_nodes_for_address_fetch: Vec<NetworkEndpoint>,
     pub dnsseed: bool,
@@ -1018,6 +1028,7 @@ impl Config {
             seed_nodes,
             connect_disabled,
             v2_transport: args.v2_transport,
+            network_active: args.network_active,
             add_nodes,
             seed_nodes_for_address_fetch,
             dnsseed,
@@ -1258,9 +1269,12 @@ mod tests {
             "--datadir",
             directory.path().to_str().unwrap(),
             "--v2transport=false",
+            "--networkactive=false",
         ])
         .unwrap();
-        assert!(!Config::from_args(args).unwrap().v2_transport);
+        let config = Config::from_args(args).unwrap();
+        assert!(!config.v2_transport);
+        assert!(!config.network_active);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -665,6 +665,7 @@ pub struct Node {
 
 impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
+        let network_active = config.network_active;
         let added_nodes = config
             .seed_nodes
             .iter()
@@ -795,7 +796,7 @@ impl Node {
             total_bytes_sent: AtomicU64::new(0),
             total_bytes_received: AtomicU64::new(0),
             outbound_usage: parking_lot::Mutex::new(OutboundUsage::default()),
-            network_active: AtomicBool::new(true),
+            network_active: AtomicBool::new(network_active),
             block_stalling_timeout_secs: AtomicU64::new(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
             block_stalling_since: parking_lot::RwLock::new(HashMap::new()),
             peers: parking_lot::RwLock::new(HashMap::new()),
@@ -3325,6 +3326,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             v2_transport: true,
+            network_active: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,

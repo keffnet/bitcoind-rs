@@ -625,6 +625,10 @@ pub struct Args {
     )]
     pub debug_log_file: String,
 
+    /// Location of the process identifier file.
+    #[arg(long = "pid", value_name = "FILE", default_value = "bitcoind.pid")]
+    pub pid_file: PathBuf,
+
     /// Disable writing the debug log file while retaining console logging.
     #[arg(
         long = "nodebuglogfile",
@@ -1537,6 +1541,7 @@ pub struct Config {
     pub blocks_xor: bool,
     pub capture_messages: bool,
     pub debug_log_path: PathBuf,
+    pub pid_path: PathBuf,
     pub debug_log_file_enabled: bool,
     pub print_to_console: bool,
     pub shrink_debug_file: bool,
@@ -1665,6 +1670,14 @@ impl Config {
             debug_log_path
         } else {
             args.datadir.join(debug_log_path)
+        };
+        if args.pid_file.as_os_str().is_empty() {
+            bail!("--pid must not be empty");
+        }
+        let pid_path = if args.pid_file.is_absolute() {
+            args.pid_file.clone()
+        } else {
+            args.datadir.join(&args.pid_file)
         };
         let settings_path = if args.no_settings {
             None
@@ -2058,6 +2071,7 @@ impl Config {
             blocks_xor: args.blocks_xor,
             capture_messages: args.capture_messages,
             debug_log_path,
+            pid_path,
             debug_log_file_enabled: !args.no_debug_log_file,
             print_to_console: args.print_to_console,
             shrink_debug_file: args.shrink_debug_file,
@@ -2656,6 +2670,20 @@ mod tests {
         assert!(!config.debug_log_file_enabled);
         assert!(!config.print_to_console);
         assert!(!config.shrink_debug_file);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--pid=run/node.pid",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().pid_path,
+            directory.path().join("run/node.pid")
+        );
+
+        assert!(Args::try_parse_from(["bitcoind-rs", "--pid="]).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

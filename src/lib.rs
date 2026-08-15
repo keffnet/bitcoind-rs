@@ -3959,6 +3959,7 @@ mod tests {
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
+            pid_path: std::path::PathBuf::from("bitcoind.pid"),
             debug_log_file_enabled: false,
             print_to_console: false,
             shrink_debug_file: false,

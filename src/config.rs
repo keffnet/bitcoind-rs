@@ -795,6 +795,15 @@ impl Config {
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
             bail!("--proxy must use a non-zero port");
         }
+        if args.proxy.is_none()
+            && let Some(network) = args.onlynet.iter().find_map(|network| match network {
+                OnlyNet::Onion => Some("onion"),
+                OnlyNet::I2p => Some("i2p"),
+                OnlyNet::Ipv4 | OnlyNet::Ipv6 | OnlyNet::Cjdns => None,
+            })
+        {
+            bail!("--onlynet={network} requires --proxy for outbound connections");
+        }
         let listen = args.listen.unwrap_or(
             !args.whitebind.is_empty()
                 || (args.proxy.is_none() && args.connect.is_empty() && args.max_peers > 0),
@@ -1057,6 +1066,21 @@ mod tests {
         assert!(!config.allows_address("[2001:db8::1]:8333".parse().unwrap()));
         assert_eq!(config.prune, 0);
         assert_eq!(config.max_upload_target, 0);
+
+        for network in ["onion", "i2p"] {
+            let args = Args::try_parse_from([
+                "bitcoind-rs",
+                "--datadir",
+                directory.path().to_str().unwrap(),
+                &format!("--onlynet={network}"),
+            ])
+            .unwrap();
+            let error = Config::from_args(args).unwrap_err().to_string();
+            assert_eq!(
+                error,
+                format!("--onlynet={network} requires --proxy for outbound connections")
+            );
+        }
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

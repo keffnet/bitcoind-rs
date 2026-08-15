@@ -3721,19 +3721,25 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_block_filter(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    if !node.config.blockfilterindex {
-        bail!("blockfilterindex is not enabled")
-    }
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
     let filter_type = optional_str(params, 1, "basic", "filtertype")?;
     if filter_type != "basic" {
-        bail!("only the basic block filter is available")
+        bail!("Unknown filtertype")
     }
-    let (content, header) = node
-        .chain
-        .write()
-        .basic_filter_for_block(&hash)?
-        .ok_or_else(|| anyhow!("Block filter not found"))?;
+    if !node.config.blockfilterindex {
+        bail!("Index is not enabled for filtertype {filter_type}")
+    }
+    let mut chain = node.chain.write();
+    if chain.block_height_by_hash(&hash).is_none() {
+        bail!("Block not found")
+    }
+    let block_was_connected = chain.is_active_block(&hash) || chain.store.contains(&hash);
+    let Some((content, header)) = chain.basic_filter_for_block(&hash)? else {
+        if !block_was_connected {
+            bail!("Filter not found. Block was not connected to active chain.")
+        }
+        bail!("Filter not found. This error is unexpected and indicates index corruption.")
+    };
     Ok(json!({
         "filter": hex::encode(content),
         "header": header.to_string(),
@@ -10804,13 +10810,18 @@ fn rpc_error_code(message: &str) -> i32 {
     {
         return -22;
     }
-    if lower == "block not found"
+    if lower == "unknown filtertype"
+        || lower == "block not found"
         || lower == "block not found in chain"
         || lower == "transaction not found"
         || lower == "transaction not in mempool"
+        || lower == "filter not found. block was not connected to active chain."
         || lower.contains("not in private broadcast queue")
     {
         return -5;
+    }
+    if lower == "filter not found. this error is unexpected and indicates index corruption." {
+        return -32603;
     }
     if lower == "mallocinfo mode not available"
         || lower.starts_with("unknown mode ")
@@ -11052,6 +11063,21 @@ mod tests {
         assert_eq!(rpc_error_code("mode must be a string"), -3);
         assert_eq!(rpc_error_code("TX decode failed"), -22);
         assert_eq!(rpc_error_code("Block not found"), -5);
+        assert_eq!(rpc_error_code("Unknown filtertype"), -5);
+        assert_eq!(
+            rpc_error_code("Index is not enabled for filtertype basic"),
+            -1
+        );
+        assert_eq!(
+            rpc_error_code("Filter not found. Block was not connected to active chain."),
+            -5
+        );
+        assert_eq!(
+            rpc_error_code(
+                "Filter not found. This error is unexpected and indicates index corruption."
+            ),
+            -32603
+        );
     }
 
     #[test]
@@ -12385,8 +12411,16 @@ mod tests {
         let filter = get_block_filter(&node, &json!([hash.to_string()])).unwrap();
         assert!(filter["filter"].as_str().is_some());
         assert_eq!(filter["header"].as_str().unwrap().len(), 64);
-        assert!(get_block_filter(&node, &json!([hash.to_string(), "extended"])).is_err());
+        let unknown_filter_type =
+            get_block_filter(&node, &json!([hash.to_string(), "extended"])).unwrap_err();
+        assert_eq!(unknown_filter_type.to_string(), "Unknown filtertype");
+        assert_eq!(rpc_error(&unknown_filter_type)["code"], json!(-5));
         assert!(get_block_filter(&node, &json!([hash.to_string(), 1])).is_err());
+        let unknown_hash = BlockHash::from_byte_array([0xff; 32]);
+        let block_not_found =
+            get_block_filter(&node, &json!([unknown_hash.to_string()])).unwrap_err();
+        assert_eq!(block_not_found.to_string(), "Block not found");
+        assert_eq!(rpc_error(&block_not_found)["code"], json!(-5));
     }
 
     #[test]

@@ -1475,7 +1475,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "decoderawtransaction" => decode_raw_transaction(node, params),
         "createrawtransaction" => create_raw_transaction(node, params),
         "decodescript" => decode_script(node, params),
-        "combinerawtransaction" => combine_raw_transaction(params),
+        "combinerawtransaction" => combine_raw_transaction(node, params),
         "createpsbt" => create_psbt(node, params),
         "decodepsbt" => decode_psbt(node, params),
         "converttopsbt" => convert_to_psbt(params),
@@ -4930,7 +4930,31 @@ fn decode_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(decoded_transaction_json(&transaction, node.config.network))
 }
 
-fn combine_raw_transaction(params: &Value) -> Result<Value> {
+fn combine_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let transactions = decode_raw_transaction_variants(params)?;
+    let combined = combine_transaction_variants(&transactions)?;
+    let chain = node.chain.read();
+    let mempool = node.mempool.read();
+    for input in &combined.input {
+        let available = !mempool.is_spent(&input.previous_output)
+            && (chain.utxo(&input.previous_output).is_some()
+                || mempool
+                    .get(&input.previous_output.txid)
+                    .and_then(|entry| {
+                        entry
+                            .transaction
+                            .output
+                            .get(input.previous_output.vout as usize)
+                    })
+                    .is_some());
+        if !available {
+            bail!("Input not found or already spent")
+        }
+    }
+    Ok(json!(hex::encode(serialize(&combined))))
+}
+
+fn decode_raw_transaction_variants(params: &Value) -> Result<Vec<Transaction>> {
     let raw_transactions = params
         .get(0)
         .and_then(Value::as_array)
@@ -4938,7 +4962,7 @@ fn combine_raw_transaction(params: &Value) -> Result<Value> {
     if raw_transactions.is_empty() {
         bail!("Missing transactions")
     }
-    let transactions = raw_transactions
+    raw_transactions
         .iter()
         .enumerate()
         .map(|(index, raw)| {
@@ -4950,7 +4974,10 @@ fn combine_raw_transaction(params: &Value) -> Result<Value> {
             deserialize::<Transaction>(&bytes)
                 .with_context(|| format!("TX decode failed for transaction {index}"))
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect()
+}
+
+fn combine_transaction_variants(transactions: &[Transaction]) -> Result<Transaction> {
     let first = transactions
         .first()
         .cloned()
@@ -4970,7 +4997,7 @@ fn combine_raw_transaction(params: &Value) -> Result<Value> {
             combined_input.witness = choose_witness(&combined_input.witness, &input.witness);
         }
     }
-    Ok(json!(hex::encode(serialize(&combined))))
+    Ok(combined)
 }
 
 fn raw_transactions_match(left: &Transaction, right: &Transaction) -> bool {
@@ -11219,6 +11246,9 @@ fn rpc_error_code(message: &str) -> i32 {
     {
         return -22;
     }
+    if lower == "input not found or already spent" {
+        return -25;
+    }
     if lower == "unknown filtertype"
         || lower == "block not found"
         || lower == "block hash not found"
@@ -11492,6 +11522,7 @@ mod tests {
         assert_eq!(rpc_error_code("mode must be a string"), -3);
         assert_eq!(rpc_error_code("TX decode failed"), -22);
         assert_eq!(rpc_error_code("TX decode failed: invalid hex"), -22);
+        assert_eq!(rpc_error_code("Input not found or already spent"), -25);
         assert_eq!(rpc_error_code("Block not found"), -5);
         assert_eq!(rpc_error_code("Transaction not yet in block"), -5);
         assert_eq!(
@@ -15610,25 +15641,82 @@ mod tests {
         let mut second = first.clone();
         second.input[0].script_sig = ScriptBuf::new();
         second.input[1].script_sig = ScriptBuf::from_bytes(vec![0x52]);
-        let combined = combine_raw_transaction(&json!([[
-            hex::encode(serialize(&first)),
-            hex::encode(serialize(&second)),
-        ]]))
-        .unwrap();
-        let combined: Transaction =
-            deserialize(&hex::decode(combined.as_str().unwrap()).unwrap()).unwrap();
+        let combined = combine_transaction_variants(&[first.clone(), second.clone()]).unwrap();
         assert_eq!(combined.input[0].script_sig, first.input[0].script_sig);
         assert_eq!(combined.input[1].script_sig, second.input[1].script_sig);
         assert_eq!(combined.output, vec![output]);
 
         first.output[0].value = bitcoin::Amount::from_sat(999);
-        assert!(
-            combine_raw_transaction(&json!([[
-                hex::encode(serialize(&first)),
-                hex::encode(serialize(&second)),
-            ]]))
-            .is_err()
-        );
+        assert!(combine_transaction_variants(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn combine_raw_transaction_rejects_missing_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(Config {
+            network: Network::Regtest,
+            datadir: directory.path().to_owned(),
+            p2p_bind: "127.0.0.1:0".parse().unwrap(),
+            rpc_bind: None,
+            electrum_bind: None,
+            rest: false,
+            listen: true,
+            dnsseed: false,
+            blocksonly: false,
+            private_broadcast: false,
+            accept_nonstd_txn: true,
+            onlynet: Vec::new(),
+            proxy: None,
+            peer_permissions: crate::config::PeerPermissionConfig::default(),
+            prune: 0,
+            reindex: false,
+            reindex_chainstate: false,
+            load_blocks: Vec::new(),
+            txindex: false,
+            txospenderindex: false,
+            max_mempool_mb: 300,
+            mempool_expiry_hours: 336,
+            coinstatsindex: false,
+            blockfilterindex: false,
+            peer_block_filters: false,
+            persist_mempool: false,
+            persist_mempool_v1: false,
+            seed_nodes: Vec::new(),
+            signet_challenge: None,
+            max_peers: 0,
+            max_upload_target: 0,
+            peer_bloom_filters: false,
+            peer_timeout_secs: 60,
+            block_max_weight: 4_000_000,
+            block_reserved_weight: 8_000,
+            block_min_tx_fee_sat_per_kvb: 1,
+            min_relay_tx_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 100,
+            dust_relay_fee_sat_per_kvb: 3_000,
+            max_datacarrier_bytes: Some(100_000),
+            permit_bare_multisig: true,
+            zmq: crate::config::ZmqConfig::default(),
+        })
+        .unwrap();
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([0xaa; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let error =
+            combine_raw_transaction(&node, &json!([[hex::encode(serialize(&transaction))]]))
+                .unwrap_err();
+        assert_eq!(error.to_string(), "Input not found or already spent");
+        assert_eq!(rpc_error(&error)["code"], json!(-25));
     }
 
     #[test]

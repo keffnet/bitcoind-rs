@@ -4354,9 +4354,37 @@ fn get_block_filter(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn submit_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let bytes = hex::decode(param::<String>(params, 0)?)?;
-    let header: bitcoin::block::Header = deserialize(&bytes)?;
-    node.chain.write().accept_headers(&[header])?;
+    let hex_data = param::<String>(params, 0)?;
+    let bytes = hex::decode(hex_data).map_err(|_| anyhow!("Block header decode failed"))?;
+    let header: bitcoin::block::Header =
+        deserialize(&bytes).map_err(|_| anyhow!("Block header decode failed"))?;
+    let hash = header.block_hash();
+    {
+        let chain = node.chain.read();
+        if chain.header_by_hash(&header.prev_blockhash).is_none() {
+            bail!(
+                "Must submit previous header ({}) first",
+                header.prev_blockhash
+            );
+        }
+        if chain.proposal_duplicate_status(&hash) == Some("duplicate-invalid") {
+            bail!("duplicate-invalid");
+        }
+        if chain.proposal_duplicate_status(&header.prev_blockhash) == Some("duplicate-invalid") {
+            bail!("bad-prevblk");
+        }
+    }
+    if let Err(error) = node.chain.write().accept_headers(&[header]) {
+        if let Some(reason) = bip22_validation_result(&error) {
+            bail!(
+                "{}",
+                reason
+                    .as_str()
+                    .expect("BIP22 validation result is a string")
+            );
+        }
+        return Err(error);
+    }
     Ok(Value::Null)
 }
 
@@ -12696,7 +12724,8 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "transaction outputs already in utxo set" {
         return -27;
     }
-    if lower.contains("tx decode failed")
+    if lower == "block header decode failed"
+        || lower.contains("tx decode failed")
         || lower.contains("transaction decode failed")
         || lower.contains("block decode failed")
     {
@@ -12753,6 +12782,24 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "redeemscript/witnessscript does not match scriptpubkey"
     {
         return -8;
+    }
+    if lower.starts_with("must submit previous header")
+        || matches!(
+            lower.as_str(),
+            "duplicate-invalid"
+                | "bad-prevblk"
+                | "prev-blk-not-found"
+                | "bad-diffbits"
+                | "high-hash"
+                | "time-too-old"
+                | "time-too-new"
+                | "time-timewarp-attack"
+                | "too-little-chainwork"
+                | "inconclusive-not-best-prevblk"
+        )
+        || lower.starts_with("bad-version(")
+    {
+        return -25;
     }
     if lower.contains(" must be a ")
         || lower.contains(" must be an ")
@@ -17699,6 +17746,24 @@ mod tests {
             submit_block(&node, &json!([hex::encode(serialize(&malformed_pow))]),).unwrap(),
             json!("high-hash")
         );
+        let mut missing_parent_header = proposal.header;
+        missing_parent_header.prev_blockhash = BlockHash::all_zeros();
+        let missing_parent_error = submit_header(
+            &node,
+            &json!([hex::encode(serialize(&missing_parent_header))]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            missing_parent_error.to_string(),
+            format!(
+                "Must submit previous header ({}) first",
+                missing_parent_header.prev_blockhash
+            )
+        );
+        assert_eq!(rpc_error(&missing_parent_error)["code"], json!(-25));
+        let decode_error = submit_header(&node, &json!(["00"])).unwrap_err();
+        assert_eq!(decode_error.to_string(), "Block header decode failed");
+        assert_eq!(rpc_error(&decode_error)["code"], json!(-22));
 
         proposal.header.prev_blockhash = BlockHash::all_zeros();
         assert_eq!(

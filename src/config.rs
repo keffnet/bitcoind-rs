@@ -615,6 +615,44 @@ pub struct Args {
     )]
     pub capture_messages: bool,
 
+    /// Location of the Core-compatible debug log file.
+    #[arg(
+        long = "debuglogfile",
+        value_name = "FILE",
+        default_value = "debug.log"
+    )]
+    pub debug_log_file: String,
+
+    /// Disable writing the debug log file while retaining console logging.
+    #[arg(
+        long = "nodebuglogfile",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub no_debug_log_file: bool,
+
+    /// Write tracing output to the process console.
+    #[arg(
+        long = "printtoconsole",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub print_to_console: bool,
+
+    /// Truncate the debug log at startup before writing new messages.
+    #[arg(
+        long = "shrinkdebugfile",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub shrink_debug_file: bool,
+
     /// Optional Core ASMap file used for ASN-aware peer grouping.
     #[arg(
         long = "asmap",
@@ -1043,6 +1081,17 @@ pub struct Args {
     #[arg(long, default_value_t = 0)]
     pub prune: u64,
 
+    /// Use Core's smaller-file/lower-height pruning test mode.
+    #[arg(
+        long = "fastprune",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub fast_prune: bool,
+
     #[arg(
         long,
         default_value_t = false,
@@ -1439,6 +1488,10 @@ pub struct Config {
     pub(crate) blocks_dir_explicit: bool,
     pub blocks_xor: bool,
     pub capture_messages: bool,
+    pub debug_log_path: PathBuf,
+    pub debug_log_file_enabled: bool,
+    pub print_to_console: bool,
+    pub shrink_debug_file: bool,
     pub(crate) asmap: Option<PathBuf>,
     pub(crate) minimum_chain_work: Option<Work>,
     pub(crate) assume_valid: Option<BlockHash>,
@@ -1518,6 +1571,8 @@ pub struct Config {
     pub accept_nonstd_txn: bool,
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
     pub prune: u64,
+    /// Core's debug-only fast-pruning mode.
+    pub fast_prune: bool,
     pub reindex: bool,
     pub reindex_chainstate: bool,
     pub load_blocks: Vec<PathBuf>,
@@ -1551,6 +1606,15 @@ impl Config {
                 }
             },
         );
+        if args.debug_log_file.is_empty() {
+            bail!("--debuglogfile must not be empty");
+        }
+        let debug_log_path = PathBuf::from(&args.debug_log_file);
+        let debug_log_path = if debug_log_path.is_absolute() {
+            debug_log_path
+        } else {
+            args.datadir.join(debug_log_path)
+        };
         let minimum_chain_work = args
             .minimum_chain_work
             .as_deref()
@@ -1794,7 +1858,11 @@ impl Config {
             usize::try_from(args.datacarriersize)
                 .context("--datacarriersize does not fit usize")?,
         );
-        if args.prune != 0 && args.prune != 1 && args.prune < MIN_AUTO_PRUNE_TARGET_MIB {
+        if !args.fast_prune
+            && args.prune != 0
+            && args.prune != 1
+            && args.prune < MIN_AUTO_PRUNE_TARGET_MIB
+        {
             bail!("--prune automatic target must be at least {MIN_AUTO_PRUNE_TARGET_MIB} MiB");
         }
         if (args.txindex || args.txospenderindex) && args.prune != 0 {
@@ -1910,6 +1978,10 @@ impl Config {
             blocks_dir_explicit: args.blocks_dir.is_some(),
             blocks_xor: args.blocks_xor,
             capture_messages: args.capture_messages,
+            debug_log_path,
+            debug_log_file_enabled: !args.no_debug_log_file,
+            print_to_console: args.print_to_console,
+            shrink_debug_file: args.shrink_debug_file,
             asmap,
             minimum_chain_work,
             assume_valid,
@@ -1986,6 +2058,7 @@ impl Config {
             private_broadcast: args.privatebroadcast,
             accept_nonstd_txn: args.accept_nonstd_txn,
             prune: args.prune,
+            fast_prune: args.fast_prune,
             reindex: args.reindex,
             reindex_chainstate: args.reindex_chainstate,
             load_blocks: args.loadblock,
@@ -2485,6 +2558,25 @@ mod tests {
             "bitcoind-rs",
             "--datadir",
             directory.path().to_str().unwrap(),
+            "--debuglogfile=logs/node.log",
+            "--nodebuglogfile",
+            "--printtoconsole=false",
+            "--shrinkdebugfile=false",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.debug_log_path,
+            directory.path().join("logs/node.log")
+        );
+        assert!(!config.debug_log_file_enabled);
+        assert!(!config.print_to_console);
+        assert!(!config.shrink_debug_file);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
             "--asmap",
             "asn.map",
         ])
@@ -2546,6 +2638,18 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--fastprune",
+            "--prune=2",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.fast_prune);
+        assert_eq!(config.prune, 2);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

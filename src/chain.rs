@@ -646,6 +646,7 @@ pub struct ChainState {
     prune_height: Option<u32>,
     prune_mode: bool,
     prune_target_size: Option<u64>,
+    prune_after_height: u32,
     utxos: HashMap<OutPoint, UtxoEntry>,
     utxos_by_script: HashMap<String, HashSet<OutPoint>>,
     tx_index: HashMap<Txid, TxLocation>,
@@ -988,6 +989,9 @@ impl ChainState {
             prune_height,
             prune_mode: false,
             prune_target_size: None,
+            // Keep the direct ChainState API's historical test behavior until
+            // the owning Node applies the network-specific Core parameter.
+            prune_after_height: MIN_BLOCKS_TO_KEEP,
             utxos: HashMap::new(),
             utxos_by_script: HashMap::new(),
             tx_index: HashMap::new(),
@@ -1263,6 +1267,17 @@ impl ChainState {
         self.prune_target_size
     }
 
+    /// Apply Core's network-specific minimum chain height for pruning. The
+    /// debug-only fast-prune mode changes regtest's threshold from 1000 to
+    /// 100, as in Core v31.1.
+    pub fn configure_prune_after_height(&mut self, network: Network, fast_prune: bool) {
+        self.prune_after_height = match network {
+            Network::Bitcoin => 100_000,
+            Network::Regtest if fast_prune => 100,
+            Network::Regtest | Network::Testnet | Network::Testnet4 | Network::Signet => 1_000,
+        };
+    }
+
     pub fn blockfilter_index_enabled(&self) -> bool {
         self.blockfilter_index_enabled
     }
@@ -1360,6 +1375,9 @@ impl ChainState {
         let Some(target_size) = self.prune_target_size else {
             return Ok(false);
         };
+        if self.height() <= self.prune_after_height {
+            return Ok(false);
+        }
         if self.store.disk_usage()? <= target_size {
             return Ok(false);
         }
@@ -1381,7 +1399,7 @@ impl ChainState {
     /// removed block bodies.
     pub fn prune(&mut self, requested: u64) -> Result<u32> {
         let tip_height = self.height();
-        if tip_height < MIN_BLOCKS_TO_KEEP {
+        if tip_height < self.prune_after_height {
             bail!("Blockchain is too short for pruning.");
         }
         let requested_height = if requested > 1_000_000_000 {
@@ -5830,6 +5848,7 @@ fn open_background_replay_state(
         prune_height: None,
         prune_mode: false,
         prune_target_size: None,
+        prune_after_height: MIN_BLOCKS_TO_KEEP,
         utxos: HashMap::new(),
         utxos_by_script: HashMap::new(),
         tx_index: HashMap::new(),
@@ -7348,6 +7367,10 @@ mod tests {
     fn configured_pruning_reports_mode_and_target() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_prune_after_height(Network::Regtest, false);
+        assert_eq!(state.prune_after_height, 1_000);
+        state.configure_prune_after_height(Network::Regtest, true);
+        assert_eq!(state.prune_after_height, 100);
         state.configure_pruning(1).unwrap();
         assert!(state.is_pruned());
         assert_eq!(state.prune_target_size(), None);

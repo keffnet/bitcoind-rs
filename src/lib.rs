@@ -893,6 +893,7 @@ impl Node {
             )?;
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
+        chain.configure_prune_after_height(config.network, config.fast_prune);
         chain.configure_pruning(config.prune)?;
         // Electrum 1.7 outpoint status needs confirmed spender lookups even
         // when the standalone Core-style txospenderindex RPC option is off.
@@ -3891,6 +3892,10 @@ mod tests {
             blocks_dir_explicit: false,
             blocks_xor: false,
             capture_messages: false,
+            debug_log_path: std::path::PathBuf::from("debug.log"),
+            debug_log_file_enabled: false,
+            print_to_console: false,
+            shrink_debug_file: false,
             asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
@@ -3942,6 +3947,7 @@ mod tests {
             accept_nonstd_txn: true,
             cjdns_reachable: true,
             prune: 0,
+            fast_prune: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),

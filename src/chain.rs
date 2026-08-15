@@ -1132,6 +1132,91 @@ impl ChainState {
         self.active_chain.len().saturating_sub(1) as u32
     }
 
+    /// Verify the block-index parent links, chain-work accumulation, active
+    /// chain vectors, and persisted transaction-count accounting.
+    pub fn check_consistency(&self) -> Result<()> {
+        if self.active_chain.is_empty() {
+            bail!("chain active chain is empty");
+        }
+        if self.active_chain.first().copied() != Some(self.network_genesis_hash()) {
+            bail!("chain active chain does not begin at genesis");
+        }
+        if self.headers.len() != self.active_chain.len()
+            || self.active_tx_counts.len() != self.active_chain.len()
+            || self.active_tx_totals.len() != self.active_chain.len()
+        {
+            bail!("chain active vectors have inconsistent lengths");
+        }
+
+        let mut cumulative_transactions = 0u64;
+        for (height, hash) in self.active_chain.iter().enumerate() {
+            let node = self
+                .block_index
+                .get(hash)
+                .with_context(|| format!("active chain is missing block index entry {hash}"))?;
+            let height_u32 = u32::try_from(height).context("active chain height exceeds u32")?;
+            if node.height != height_u32 {
+                bail!(
+                    "active chain height mismatch for {hash}: index {}, vector {height}",
+                    node.height
+                );
+            }
+            if node.header.block_hash() != *hash
+                || self.headers[height].block_hash() != *hash
+                || self.headers[height] != node.header
+            {
+                bail!("active chain header mismatch for {hash}");
+            }
+            if height > 0 {
+                let parent_hash = self.active_chain[height - 1];
+                if node.header.prev_blockhash != parent_hash {
+                    bail!("active chain parent mismatch for {hash}");
+                }
+                let parent = self
+                    .block_index
+                    .get(&parent_hash)
+                    .context("active chain parent is missing from block index")?;
+                if node.chain_work != parent.chain_work + node.header.work() {
+                    bail!("active chain work mismatch for {hash}");
+                }
+            }
+            cumulative_transactions =
+                cumulative_transactions.saturating_add(u64::from(self.active_tx_counts[height]));
+            if self.active_tx_totals[height] != cumulative_transactions {
+                bail!("active chain transaction total mismatch at height {height}");
+            }
+        }
+
+        for (hash, node) in &self.block_index {
+            if node.header.block_hash() != *hash {
+                bail!("block index key does not match its header hash: {hash}");
+            }
+            if node.height == 0 {
+                if *hash != self.network_genesis_hash() {
+                    bail!("non-genesis block index entry has height zero: {hash}");
+                }
+                continue;
+            }
+            let parent = self
+                .block_index
+                .get(&node.header.prev_blockhash)
+                .with_context(|| format!("block index parent is missing for {hash}"))?;
+            if node.height != parent.height.saturating_add(1)
+                || node.chain_work != parent.chain_work + node.header.work()
+            {
+                bail!("block index linkage or work mismatch for {hash}");
+            }
+        }
+        if self
+            .invalid_blocks
+            .iter()
+            .any(|hash| !self.block_index.contains_key(hash))
+        {
+            bail!("invalid-block set contains an unknown block");
+        }
+        Ok(())
+    }
+
     pub fn prune_height(&self) -> Option<u32> {
         self.prune_height
     }
@@ -6455,6 +6540,13 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn checks_fresh_chain_consistency() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.check_consistency().unwrap();
     }
 
     #[test]

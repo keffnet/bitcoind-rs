@@ -612,6 +612,17 @@ pub struct Args {
     #[arg(long = "checklevel", value_name = "N")]
     pub check_level: Option<u8>,
 
+    #[arg(
+        long = "checkblockindex",
+        value_name = "N",
+        num_args = 0..=1,
+        default_missing_value = "1"
+    )]
+    pub check_block_index: Option<usize>,
+
+    #[arg(long = "checkmempool", value_name = "N")]
+    pub check_mempool: Option<usize>,
+
     /// Number of script verification threads. Zero autodetects, and negative
     /// values leave that many cores available to the rest of the node.
     #[arg(long = "par", default_value_t = DEFAULT_SCRIPT_CHECK_THREADS)]
@@ -1363,6 +1374,8 @@ pub struct Config {
     pub(crate) assume_valid: Option<BlockHash>,
     pub(crate) check_blocks: Option<u32>,
     pub(crate) check_level: Option<u8>,
+    pub check_block_index: usize,
+    pub check_mempool: usize,
     pub script_check_threads: i32,
     pub block_reconstruction_extra_txn: usize,
     pub user_agent_comments: Vec<String>,
@@ -1478,6 +1491,13 @@ impl Config {
         if args.check_level.is_some_and(|level| level > 4) {
             bail!("--checklevel must be between 0 and 4");
         }
+        let default_consistency_checks = network == Network::Regtest;
+        let check_block_index = args
+            .check_block_index
+            .unwrap_or(default_consistency_checks as usize);
+        let check_mempool = args
+            .check_mempool
+            .unwrap_or(default_consistency_checks as usize);
         let p2p = args.p2p.unwrap_or_else(|| {
             SocketAddr::from((
                 [127, 0, 0, 1],
@@ -1797,6 +1817,8 @@ impl Config {
             assume_valid,
             check_blocks: args.check_blocks,
             check_level: args.check_level,
+            check_block_index,
+            check_mempool,
             script_check_threads: args.script_check_threads,
             block_reconstruction_extra_txn: args.block_reconstruction_extra_txn,
             user_agent_comments,
@@ -3450,6 +3472,59 @@ mod tests {
         assert!(!config.listen_onion);
         assert_eq!(config.tor_control, "127.0.0.1:19051".parse().unwrap());
         assert_eq!(config.tor_password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn consistency_check_defaults_follow_core_networks_and_allow_intervals() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconf",
+            "--regtest",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.check_block_index, 1);
+        assert_eq!(config.check_mempool, 1);
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconf",
+            "--network=bitcoin",
+            "--checkblockindex=9",
+            "--checkmempool=7",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.check_block_index, 9);
+        assert_eq!(config.check_mempool, 7);
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconf",
+            "--network=bitcoin",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.check_block_index, 0);
+        assert_eq!(config.check_mempool, 0);
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconf",
+            "--network=bitcoin",
+            "--checkblockindex",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().check_block_index, 1);
     }
 
     #[test]

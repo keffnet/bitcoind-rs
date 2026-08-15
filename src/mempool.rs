@@ -605,6 +605,104 @@ impl Mempool {
         self.sequence
     }
 
+    /// Verify the bidirectional indexes and accounting maintained by the
+    /// mempool. This is intentionally explicit and deterministic so the
+    /// Core-style debug consistency options can catch a mutation bug without
+    /// depending on allocator internals.
+    pub fn check_consistency(&self) -> Result<()> {
+        let mut expected_spent = HashMap::new();
+        let mut expected_children: HashMap<Txid, HashSet<Txid>> = HashMap::new();
+        let mut expected_wtxids = HashMap::new();
+        let mut expected_bytes = 0usize;
+        let mut expected_vbytes = 0u64;
+        let mut expected_memory_usage = 0usize;
+
+        for (txid, entry) in &self.entries {
+            let computed_txid = entry.transaction.compute_txid();
+            if computed_txid != *txid {
+                bail!("mempool txid index mismatch: key {txid}, transaction {computed_txid}");
+            }
+            let wtxid = entry.transaction.compute_wtxid();
+            if expected_wtxids.insert(wtxid, *txid).is_some() {
+                bail!("mempool contains duplicate wtxid {wtxid}");
+            }
+            for input in &entry.transaction.input {
+                if expected_spent
+                    .insert(input.previous_output, *txid)
+                    .is_some()
+                {
+                    bail!(
+                        "mempool input {} is claimed by more than one transaction",
+                        input.previous_output
+                    );
+                }
+                if self.entries.contains_key(&input.previous_output.txid) {
+                    expected_children
+                        .entry(input.previous_output.txid)
+                        .or_default()
+                        .insert(*txid);
+                }
+            }
+            expected_bytes = expected_bytes
+                .saturating_add(bitcoin::consensus::encode::serialize(&entry.transaction).len());
+            expected_vbytes = expected_vbytes.saturating_add(entry.vsize);
+            expected_memory_usage = expected_memory_usage
+                .saturating_add(mempool_entry_memory_usage(&entry.transaction));
+        }
+
+        if self.spent != expected_spent {
+            bail!("mempool spent-input index is inconsistent");
+        }
+        if self.children != expected_children {
+            bail!("mempool parent/child index is inconsistent");
+        }
+        if self.wtxids != expected_wtxids {
+            bail!("mempool wtxid index is inconsistent");
+        }
+        if self.adjusted_weights.len() != self.entries.len()
+            || self
+                .adjusted_weights
+                .keys()
+                .any(|txid| !self.entries.contains_key(txid))
+        {
+            bail!("mempool adjusted-weight index is inconsistent");
+        }
+        if self.relay_sequences.len() != self.entries.len()
+            || self
+                .relay_sequences
+                .keys()
+                .any(|txid| !self.entries.contains_key(txid))
+        {
+            bail!("mempool relay-sequence index is inconsistent");
+        }
+        if self.bytes != expected_bytes {
+            bail!(
+                "mempool byte accounting is inconsistent: stored {}, expected {expected_bytes}",
+                self.bytes
+            );
+        }
+        if self.vbytes != expected_vbytes {
+            bail!(
+                "mempool vbyte accounting is inconsistent: stored {}, expected {expected_vbytes}",
+                self.vbytes
+            );
+        }
+        if self.memory_usage != expected_memory_usage {
+            bail!(
+                "mempool memory accounting is inconsistent: stored {}, expected {expected_memory_usage}",
+                self.memory_usage
+            );
+        }
+        if self
+            .unbroadcast
+            .iter()
+            .any(|txid| !self.entries.contains_key(txid))
+        {
+            bail!("mempool unbroadcast set contains an unknown transaction");
+        }
+        Ok(())
+    }
+
     pub(crate) fn take_changes(&mut self) -> Vec<MempoolChange> {
         std::mem::take(&mut self.changes)
     }
@@ -3068,6 +3166,49 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         }
+    }
+
+    #[test]
+    fn consistency_check_validates_empty_pool_and_accounting() {
+        let mut pool = Mempool::new(Network::Regtest);
+        pool.check_consistency().unwrap();
+
+        pool.bytes = 1;
+        assert!(pool.check_consistency().is_err());
+    }
+
+    #[test]
+    fn consistency_check_accepts_an_admitted_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=101 {
+            let previous = *chain.header(height - 1).expect("previous header");
+            chain
+                .connect_block(mine_regtest_block(&previous, height))
+                .unwrap();
+        }
+        let (outpoint, utxo) = chain
+            .all_utxos()
+            .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
+            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+            .expect("matured coinbase output");
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0; 65]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(utxo.output.value.to_sat() - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut pool = Mempool::new(Network::Regtest);
+        pool.accept(transaction, &chain).unwrap();
+        pool.check_consistency().unwrap();
     }
 
     fn mine_regtest_block(previous: &Header, height: u32) -> bitcoin::Block {

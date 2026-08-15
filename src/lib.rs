@@ -727,6 +727,8 @@ pub struct Node {
     pub(crate) tor_controller: Option<Arc<tor::TorController>>,
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
+    mempool_check_operations: AtomicUsize,
+    block_index_check_operations: AtomicUsize,
     zmq_mempool_sequence: AtomicU64,
     rpc_command_sequence: AtomicUsize,
     rpc_commands: parking_lot::RwLock<HashMap<usize, (String, Instant)>>,
@@ -875,6 +877,16 @@ impl Node {
             }
         }
         let _ = mempool.take_changes();
+        if config.check_mempool != 0 {
+            mempool
+                .check_consistency()
+                .context("startup mempool consistency check failed")?;
+        }
+        if config.check_block_index != 0 {
+            chain
+                .check_consistency()
+                .context("startup block-index consistency check failed")?;
+        }
         let banlist_path = config.datadir.join("banlist.json");
         let banned_addresses = match load_banlist(&config.datadir) {
             Ok(entries) => entries,
@@ -929,6 +941,8 @@ impl Node {
             tor_controller,
             mempool_path,
             peer_count: AtomicUsize::new(0),
+            mempool_check_operations: AtomicUsize::new(0),
+            block_index_check_operations: AtomicUsize::new(0),
             zmq_mempool_sequence: AtomicU64::new(zmq_mempool_sequence),
             rpc_command_sequence: AtomicUsize::new(0),
             rpc_commands: parking_lot::RwLock::new(HashMap::new()),
@@ -995,7 +1009,42 @@ impl Node {
             let hash = tip.hash.to_string();
             run_notify_command(self.config.block_notify.as_deref(), Some(&hash));
         }
+        self.maybe_check_block_index();
         Ok(tip)
+    }
+
+    pub(crate) fn maybe_check_mempool(&self) {
+        let interval = self.config.check_mempool;
+        if interval == 0 {
+            return;
+        }
+        let operation = self
+            .mempool_check_operations
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if operation % interval != 0 {
+            return;
+        }
+        if let Err(error) = self.mempool.read().check_consistency() {
+            panic!("mempool consistency check failed: {error:#}");
+        }
+    }
+
+    fn maybe_check_block_index(&self) {
+        let interval = self.config.check_block_index;
+        if interval == 0 {
+            return;
+        }
+        let operation = self
+            .block_index_check_operations
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if operation % interval != 0 {
+            return;
+        }
+        if let Err(error) = self.chain.read().check_consistency() {
+            panic!("block-index consistency check failed: {error:#}");
+        }
     }
 
     fn reconcile_mempool_after_chain_change(
@@ -1357,6 +1406,7 @@ impl Node {
         }
         self.announce_mempool_changes(removed_ids);
         self.notify_zmq_mempool_changes(changes.clone());
+        self.maybe_check_mempool();
         result.map(|txid| (txid, changes))
     }
 
@@ -1410,6 +1460,7 @@ impl Node {
             .collect();
         self.announce_mempool_changes(removed);
         self.notify_zmq_mempool_changes(changes);
+        self.maybe_check_mempool();
     }
 
     #[cfg(test)]
@@ -1595,6 +1646,7 @@ impl Node {
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
+        self.maybe_check_block_index();
         Ok(tip)
     }
 
@@ -1622,6 +1674,7 @@ impl Node {
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
+        self.maybe_check_block_index();
         Ok(tip)
     }
 
@@ -1649,6 +1702,7 @@ impl Node {
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
+        self.maybe_check_block_index();
         Ok(tip)
     }
 
@@ -3280,6 +3334,7 @@ impl Node {
             (result, changed, changes)
         };
         if result.is_ok() {
+            self.maybe_check_mempool();
             self.notify_zmq_mempool_changes(changes);
             let mut changed = changed;
             changed.sort_by_key(ToString::to_string);
@@ -3579,6 +3634,8 @@ mod tests {
             assume_valid: None,
             check_blocks: None,
             check_level: None,
+            check_block_index: 0,
+            check_mempool: 0,
             max_tip_age_secs: 24 * 60 * 60,
             stop_at_height: 0,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),

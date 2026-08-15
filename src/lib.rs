@@ -743,9 +743,28 @@ impl Node {
             }
         }
         let _ = mempool.take_changes();
-        let banned_addresses = load_banlist(&config.datadir)?;
+        let banlist_path = config.datadir.join("banlist.json");
+        let banned_addresses = match load_banlist(&config.datadir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                quarantine_persistent_file(&banlist_path, &error);
+                HashMap::new()
+            }
+        };
+        let peers_path = config.datadir.join("peers.json");
         let (known_addresses, tried_addresses, network_addresses, network_tried_addresses) =
-            load_known_addresses(&config.datadir)?;
+            match load_known_addresses(&config.datadir) {
+                Ok(state) => state,
+                Err(error) => {
+                    quarantine_persistent_file(&peers_path, &error);
+                    (
+                        HashMap::new(),
+                        HashSet::new(),
+                        HashMap::new(),
+                        HashSet::new(),
+                    )
+                }
+            };
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
@@ -3096,6 +3115,33 @@ fn remove_expired_bans(banned: &mut HashMap<IpSubnet, BannedAddress>, now: u64) 
     banned.retain(|_, entry| entry.ban_until > now);
 }
 
+fn quarantine_persistent_file(path: &Path, error: &anyhow::Error) {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        warn!(path = %path.display(), %error, "discarding invalid persistent state");
+        return;
+    };
+    let mut backup = path.with_file_name(format!("{file_name}.corrupt"));
+    let mut suffix = 1u32;
+    while backup.exists() {
+        backup = path.with_file_name(format!("{file_name}.corrupt.{suffix}"));
+        suffix = suffix.saturating_add(1);
+    }
+    match std::fs::rename(path, &backup) {
+        Ok(()) => warn!(
+            path = %path.display(),
+            backup = %backup.display(),
+            %error,
+            "quarantined invalid persistent state"
+        ),
+        Err(rename_error) => warn!(
+            path = %path.display(),
+            %error,
+            %rename_error,
+            "failed to quarantine invalid persistent state; continuing with empty state"
+        ),
+    }
+}
+
 fn load_banlist(data_dir: &Path) -> Result<HashMap<IpSubnet, BannedAddress>> {
     let path = data_dir.join("banlist.json");
     if !path.exists() {
@@ -4061,5 +4107,21 @@ mod tests {
 
         assert!(node.mempool.read().is_empty());
         assert_eq!(std::fs::read(&mempool_path).unwrap(), b"not-json");
+    }
+
+    #[test]
+    fn corrupt_peer_and_ban_state_is_quarantined_on_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("peers.json"), b"not-json").unwrap();
+        fs::write(directory.path().join("banlist.json"), b"not-json").unwrap();
+
+        let node = Node::open(test_config(directory.path())).unwrap();
+
+        assert!(node.known_addresses().is_empty());
+        assert!(node.banned_addresses().is_empty());
+        assert!(!directory.path().join("peers.json").exists());
+        assert!(!directory.path().join("banlist.json").exists());
+        assert!(directory.path().join("peers.json.corrupt").exists());
+        assert!(directory.path().join("banlist.json.corrupt").exists());
     }
 }

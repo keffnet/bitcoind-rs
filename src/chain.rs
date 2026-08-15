@@ -2844,9 +2844,121 @@ impl ChainState {
     }
 
     pub fn verify_active_chain(&mut self, depth: u32) -> Result<()> {
-        let _requested_depth = depth;
-        self.replay_utxos_for_block(self.best_hash(), false)?
-            .context("active chain UTXO replay did not reach the tip")?;
+        self.verify_active_chain_with_level(3, depth)
+    }
+
+    /// Verify recent active-chain records with Core's `verifychain` levels.
+    ///
+    /// Level 0 reads and decodes block records, level 1 performs context-free
+    /// block validation, level 2 validates undo shape, level 3 disconnects
+    /// the requested suffix against the live UTXO set, and level 4 reconnects
+    /// it while checking that the UTXO set is unchanged.  The verification
+    /// state is entirely temporary, so this RPC never changes the serving
+    /// chainstate.
+    pub fn verify_active_chain_with_level(&mut self, check_level: u8, depth: u32) -> Result<()> {
+        let check_level = check_level.min(4);
+        let tip_height = self.height();
+        if tip_height == 0 {
+            return Ok(());
+        }
+        let block_count = if depth == 0 || depth > tip_height {
+            tip_height
+        } else {
+            depth
+        };
+        let first_height = tip_height.saturating_sub(block_count).saturating_add(1);
+        let mut blocks = Vec::with_capacity(block_count as usize);
+        for height in first_height..=tip_height {
+            let hash = *self
+                .active_chain
+                .get(height as usize)
+                .with_context(|| format!("active chain is missing height {height}"))?;
+            let node = self
+                .block_index
+                .get(&hash)
+                .with_context(|| format!("active block {hash} is not indexed"))?;
+            let block = self
+                .store
+                .get(&hash)?
+                .with_context(|| format!("active block {hash} is missing from block store"))?;
+            if block.header != node.header {
+                bail!("stored block header does not match active index at height {height}")
+            }
+            if check_level >= 1 {
+                self.validate_block_structure(
+                    &block,
+                    self.network,
+                    height,
+                    Amount::MAX_MONEY.to_sat(),
+                )?;
+            }
+            let undo = if check_level >= 2 {
+                let undo = self
+                    .store
+                    .get_undo(&hash)?
+                    .with_context(|| format!("undo for active block {hash} is missing"))?;
+                self.validate_block_undo(&block, &undo)?;
+                Some(undo)
+            } else {
+                None
+            };
+            blocks.push((height, block, undo));
+        }
+
+        if check_level < 3 {
+            return Ok(());
+        }
+
+        let original_utxos = self.utxos.clone();
+        let mut working_utxos = original_utxos.clone();
+        for (height, block, undo) in blocks.iter().rev() {
+            self.disconnect_block_for_verification(
+                &mut working_utxos,
+                block,
+                *height,
+                undo.as_ref().expect("level 3 verification loads undo"),
+            )?;
+        }
+
+        if check_level < 4 {
+            return Ok(());
+        }
+
+        // The two historical BIP30 repeats overwrite an older coinbase and
+        // require special disconnect metadata that is intentionally not
+        // represented in this node's compact undo format.  Reconstruct the
+        // prefix independently in that rare full-depth case, then perform
+        // the same reconnect check as ordinary blocks.
+        if blocks
+            .iter()
+            .any(|(height, block, _)| is_bip30_repeat(self.network, *height, block.block_hash()))
+        {
+            let base_height = first_height.saturating_sub(1);
+            let base_hash = self
+                .active_chain
+                .get(base_height as usize)
+                .copied()
+                .context("verification prefix is missing")?;
+            working_utxos = self
+                .replay_utxos_for_block(base_hash, false)?
+                .context("verification prefix UTXO replay did not reach its base")?;
+        }
+
+        for (height, block, _) in &blocks {
+            let median_time_past = self.median_time_past_for_parent(block.header.prev_blockhash);
+            let application =
+                self.validate_block_transactions(block, *height, &working_utxos, median_time_past)?;
+            apply_block_to_utxos(
+                &mut working_utxos,
+                block,
+                *height,
+                median_time_past,
+                application.spent_entries,
+            );
+        }
+        if working_utxos != original_utxos {
+            bail!("active chain UTXO set changed during verification")
+        }
         Ok(())
     }
 
@@ -3141,13 +3253,7 @@ impl ChainState {
         height: u32,
         undo: &[Vec<TxOut>],
     ) -> Result<()> {
-        if undo.len() != block.txdata.len() {
-            bail!(
-                "block undo contains {} transaction entries for a block with {} transactions",
-                undo.len(),
-                block.txdata.len()
-            );
-        }
+        self.validate_block_undo(block, undo)?;
 
         // Disconnect transactions in reverse order. Removing each
         // transaction immediately before restoring its inputs is important
@@ -3174,6 +3280,80 @@ impl ChainState {
             }
             for (input, output) in transaction.input.iter().zip(spent_outputs).rev() {
                 let outpoint = input.previous_output;
+                let entry = self
+                    .restored_utxo_entry(&outpoint, output, block, height)
+                    .with_context(|| format!("cannot reconstruct undo metadata for {outpoint}"))?;
+                utxos.insert(outpoint, entry);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_block_undo(&self, block: &Block, undo: &[Vec<TxOut>]) -> Result<()> {
+        if undo.len() != block.txdata.len() {
+            bail!(
+                "block undo contains {} transaction entries for a block with {} transactions",
+                undo.len(),
+                block.txdata.len()
+            );
+        }
+        if !undo.first().is_some_and(Vec::is_empty) {
+            bail!("coinbase transaction has unexpected undo outputs")
+        }
+        for (transaction, spent_outputs) in block.txdata.iter().skip(1).zip(undo.iter().skip(1)) {
+            if spent_outputs.len() != transaction.input.len() {
+                bail!(
+                    "block undo contains {} spent outputs for transaction with {} inputs",
+                    spent_outputs.len(),
+                    transaction.input.len()
+                );
+            }
+            if spent_outputs
+                .iter()
+                .any(|output| output.value > Amount::MAX_MONEY)
+            {
+                bail!("block undo contains an output above the money range")
+            }
+        }
+        Ok(())
+    }
+
+    fn disconnect_block_for_verification(
+        &self,
+        utxos: &mut HashMap<OutPoint, UtxoEntry>,
+        block: &Block,
+        height: u32,
+        undo: &[Vec<TxOut>],
+    ) -> Result<()> {
+        self.validate_block_undo(block, undo)?;
+        if is_bip30_repeat(self.network, height, block.block_hash()) {
+            self.disconnect_block_from_utxos(utxos, block, height, undo)?;
+            return Ok(());
+        }
+
+        for (transaction_index, transaction) in block.txdata.iter().enumerate().rev() {
+            let txid = transaction.compute_txid();
+            for (output_index, output) in transaction.output.iter().enumerate() {
+                if is_unspendable_script(&output.script_pubkey) {
+                    continue;
+                }
+                let outpoint = OutPoint::new(txid, output_index as u32);
+                if utxos.remove(&outpoint).is_none() {
+                    bail!(
+                        "block disconnect is missing created output {}:{}",
+                        txid,
+                        output_index
+                    )
+                }
+            }
+            if transaction_index == 0 {
+                continue;
+            }
+            for (input, output) in transaction.input.iter().zip(undo[transaction_index].iter()) {
+                let outpoint = input.previous_output;
+                if utxos.contains_key(&outpoint) {
+                    bail!("block disconnect restores an already unspent output {outpoint}")
+                }
                 let entry = self
                     .restored_utxo_entry(&outpoint, output, block, height)
                     .with_context(|| format!("cannot reconstruct undo metadata for {outpoint}"))?;
@@ -6615,6 +6795,22 @@ mod tests {
         let script_hash = electrum_script_hash(&Builder::new().push_int(1).into_script());
         assert_eq!(state.get_utxos(&script_hash).len(), 2);
         state.verify_active_chain(0).unwrap();
+        for check_level in 0..=4 {
+            state
+                .verify_active_chain_with_level(check_level, 1)
+                .unwrap();
+        }
+        state.verify_active_chain_with_level(4, 0).unwrap();
+        let original_utxos = state.utxos.clone();
+        let corrupted_outpoint = *state.utxos.keys().next().unwrap();
+        state
+            .utxos
+            .get_mut(&corrupted_outpoint)
+            .unwrap()
+            .output
+            .value = Amount::from_sat(1);
+        assert!(state.verify_active_chain_with_level(4, 0).is_err());
+        state.utxos = original_utxos;
         state.persist_snapshot().unwrap();
         drop(state);
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();

@@ -717,6 +717,7 @@ impl Default for ScanState {
 pub struct Node {
     pub config: Config,
     _data_dir_lock: File,
+    _blocks_dir_lock: Option<File>,
     pub chain: Arc<RwLock<ChainState>>,
     pub mempool: Arc<RwLock<Mempool>>,
     pub events: broadcast::Sender<ChainEvent>,
@@ -783,6 +784,33 @@ impl Node {
                 config.datadir.display()
             )
         })?;
+        let blocks_dir = config
+            .blocks_dir
+            .clone()
+            .unwrap_or_else(|| config.datadir.join("blocks"));
+        fs::create_dir_all(&blocks_dir)
+            .with_context(|| format!("creating blocks directory {}", blocks_dir.display()))?;
+        let blocks_dir_lock = if blocks_dir == config.datadir {
+            None
+        } else {
+            let lock_path = blocks_dir.join(".lock");
+            let lock = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| {
+                    format!("opening blocks directory lock {}", lock_path.display())
+                })?;
+            lock.try_lock_exclusive().with_context(|| {
+                format!(
+                    "blocks directory is already in use: {}",
+                    blocks_dir.display()
+                )
+            })?;
+            Some(lock)
+        };
         if let Some(mock_time) = config.mock_time {
             time::set_mock_time(mock_time);
         }
@@ -826,10 +854,6 @@ impl Node {
             .context("--maxmempool is too large")?;
         let max_mempool_bytes =
             usize::try_from(max_mempool_bytes).context("--maxmempool does not fit usize")?;
-        let blocks_dir = config
-            .blocks_dir
-            .clone()
-            .unwrap_or_else(|| config.datadir.join("blocks"));
         let mut chain =
             ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor(
                 config.network,
@@ -954,6 +978,7 @@ impl Node {
         let node = Arc::new(Self {
             config,
             _data_dir_lock: data_dir_lock,
+            _blocks_dir_lock: blocks_dir_lock,
             chain: Arc::new(RwLock::new(chain)),
             mempool: Arc::new(RwLock::new(mempool)),
             events,
@@ -3910,6 +3935,23 @@ mod tests {
         assert!(Node::open(test_config(directory.path())).is_err());
         drop(node);
         assert!(Node::open(test_config(directory.path())).is_ok());
+    }
+
+    #[test]
+    fn blocks_directory_lock_rejects_different_data_directories() {
+        let data_directory = tempfile::tempdir().unwrap();
+        let other_data_directory = tempfile::tempdir().unwrap();
+        let blocks_directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(data_directory.path());
+        config.blocks_dir = Some(blocks_directory.path().to_owned());
+        let node = Node::open(config).unwrap();
+
+        let mut conflicting_config = test_config(other_data_directory.path());
+        conflicting_config.blocks_dir = Some(blocks_directory.path().to_owned());
+        assert!(Node::open(conflicting_config.clone()).is_err());
+
+        drop(node);
+        assert!(Node::open(conflicting_config).is_ok());
     }
 
     #[test]

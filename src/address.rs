@@ -153,6 +153,20 @@ impl NetworkEndpoint {
         }
     }
 
+    /// Whether Core's normal proxy selection applies to this endpoint.
+    ///
+    /// Core maps non-routable IPv4/IPv6 addresses to `NET_UNROUTABLE`, which
+    /// bypasses the configured network proxy. Named privacy networks and
+    /// CJDNS remain proxyable when a proxy is configured.
+    pub fn uses_proxy_by_default(&self) -> bool {
+        match self {
+            Self::Ip(address) => is_core_routable_ip(address.ip()),
+            Self::OnionV2 { .. } | Self::OnionV3 { .. } | Self::I2p { .. } | Self::Cjdns { .. } => {
+                true
+            }
+        }
+    }
+
     /// Parse an address-manager entry. Legacy entries use the full socket
     /// address in `address` and leave `port` absent; BIP155 entries use the
     /// network-specific host string plus a separate port.
@@ -209,6 +223,38 @@ fn mapped_ipv4(address: &Ipv6Addr) -> Ipv4Addr {
         (segments[7] >> 8) as u8,
         segments[7] as u8,
     )
+}
+
+fn is_core_routable_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [first, second, third, _] = address.octets();
+            !(first == 0
+                || first == 127
+                || first == 10
+                || (first == 172 && (16..=31).contains(&second))
+                || (first == 192 && second == 168)
+                || (first == 169 && second == 254)
+                || (first == 100 && (64..=127).contains(&second))
+                || (first == 198 && (second == 18 || second == 19))
+                || (first == 192 && second == 0 && third == 2)
+                || (first == 198 && second == 51 && third == 100)
+                || (first == 203 && second == 0 && third == 113)
+                || address.is_broadcast()
+                || address.is_multicast())
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            !(address.is_unspecified()
+                || address.is_loopback()
+                || address.is_unicast_link_local()
+                || address.is_unique_local()
+                || address.is_multicast()
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x2001 && (0x0010..=0x001f).contains(&segments[1]))
+                || (segments[0] == 0x2001 && (0x0020..=0x002f).contains(&segments[1])))
+        }
+    }
 }
 
 impl fmt::Display for NetworkEndpoint {
@@ -412,5 +458,29 @@ mod tests {
             NetworkEndpoint::from_socket("[::ffff:192.0.2.1]:8333".parse().unwrap()),
             NetworkEndpoint::Ip("192.0.2.1:8333".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn matches_core_proxy_network_selection() {
+        for address in [
+            "8.8.8.8:8333",
+            "[2001:4860:4860::8888]:8333",
+            "[fc00::1]:8333",
+        ] {
+            let endpoint = NetworkEndpoint::from_socket(address.parse().unwrap());
+            assert!(endpoint.uses_proxy_by_default(), "{endpoint}");
+        }
+        for address in [
+            "127.0.0.1:8333",
+            "192.168.1.1:8333",
+            "192.0.2.1:8333",
+            "[::1]:8333",
+            "[fe80::1]:8333",
+            "[2001:db8::1]:8333",
+            "[2001:10::1]:8333",
+        ] {
+            let endpoint = NetworkEndpoint::from_socket(address.parse().unwrap());
+            assert!(!endpoint.uses_proxy_by_default(), "{endpoint}");
+        }
     }
 }

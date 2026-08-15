@@ -1607,7 +1607,7 @@ fn spawn_private_broadcast_loop(
         {
             return;
         }
-        match connect_peer_endpoint(&endpoint, node.config.proxy).await {
+        match connect_peer_endpoint_for_private_broadcast(&endpoint, node.config.proxy).await {
             Ok(stream) => {
                 info!(%address, "connected to private-broadcast peer");
                 if let Err(error) = serve_peer(
@@ -1697,6 +1697,22 @@ async fn connect_peer_endpoint(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
 ) -> Result<TcpStream> {
+    connect_peer_endpoint_with_proxy(endpoint, proxy, false).await
+}
+
+async fn connect_peer_endpoint_for_private_broadcast(
+    endpoint: &NetworkEndpoint,
+    proxy: Option<SocketAddr>,
+) -> Result<TcpStream> {
+    connect_peer_endpoint_with_proxy(endpoint, proxy, true).await
+}
+
+async fn connect_peer_endpoint_with_proxy(
+    endpoint: &NetworkEndpoint,
+    proxy: Option<SocketAddr>,
+    force_proxy: bool,
+) -> Result<TcpStream> {
+    let proxy = proxy.filter(|_| force_proxy || endpoint.uses_proxy_by_default());
     let target = proxy
         .or_else(|| endpoint.socket_addr())
         .ok_or_else(|| anyhow::anyhow!("endpoint {endpoint} requires a SOCKS5 proxy"))?;
@@ -1823,6 +1839,7 @@ async fn establish_transport(
     network: Network,
     transport_v2: Option<bool>,
     proxy: Option<SocketAddr>,
+    force_proxy: bool,
 ) -> Result<(
     PeerReader,
     PeerWriterKind,
@@ -1842,7 +1859,7 @@ async fn establish_transport(
             }
             Err(error) => {
                 debug!(%endpoint, %error, "BIP324 handshake failed; retrying with v1");
-                let fallback = connect_peer_endpoint(endpoint, proxy)
+                let fallback = connect_peer_endpoint_with_proxy(endpoint, proxy, force_proxy)
                     .await
                     .with_context(|| format!("reconnecting to {endpoint} with v1 transport"))?;
                 return establish_v1(fallback);
@@ -1992,6 +2009,7 @@ async fn serve_peer(
         node.config.network,
         options.transport_v2,
         node.config.proxy,
+        options.connection_type == "private-broadcast",
     )
     .await?;
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
@@ -5045,6 +5063,31 @@ mod tests {
             .await
             .unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_is_bypassed_for_unroutable_socket_targets() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target_listener.local_addr().unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy_listener.local_addr().unwrap();
+        let target = tokio::spawn(async move {
+            let (_stream, _) = target_listener.accept().await.unwrap();
+        });
+        let proxy = tokio::spawn(async move {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), proxy_listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+
+        let endpoint = NetworkEndpoint::Ip(target_address);
+        let _stream = connect_peer_endpoint(&endpoint, Some(proxy_address))
+            .await
+            .unwrap();
+        target.await.unwrap();
+        proxy.await.unwrap();
     }
 
     #[tokio::test]

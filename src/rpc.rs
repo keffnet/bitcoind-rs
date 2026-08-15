@@ -2000,6 +2000,13 @@ fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .chain
         .write()
         .estimate_fee_rate_sat_per_kvb(conf_target, conservative)?;
+    let estimate = estimate.map(|rate| {
+        let mut mempool = node.mempool.write();
+        let floor = mempool
+            .mempool_min_fee_sat_per_kvb()
+            .max(mempool.min_relay_fee_sat_per_kvb());
+        rate.max(floor)
+    });
     let mut result = json!({"blocks": conf_target});
     if let Some(rate) = estimate {
         result["feerate"] = json!(sat_to_btc(rate));

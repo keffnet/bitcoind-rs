@@ -3104,7 +3104,7 @@ fn disconnect_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .transpose()?;
     let disconnected = match (address, peer_id) {
         (Some(address), None) if !address.is_empty() => {
-            node.disconnect_peer_at(parse_socket_address(address)?)
+            node.disconnect_peer_endpoint(&parse_node_endpoint(node, address)?)
         }
         (Some(""), Some(peer_id)) => node.disconnect_peer(peer_id),
         (None, Some(peer_id)) => node.disconnect_peer(peer_id),
@@ -15770,6 +15770,25 @@ mod tests {
         add_node(&node, &json!(["example.invalid:18444", "add"])).unwrap();
         let hostname = get_added_node_info(&node, &json!(["example.invalid:18444"])).unwrap();
         assert_eq!(hostname[0]["addednode"], "example.invalid:18444");
+
+        let (host_sender, mut host_receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer_with_endpoint(
+            12,
+            NetworkEndpoint::dns("example.invalid".to_owned(), 18444).unwrap(),
+            false,
+            host_sender,
+            crate::PeerRegistrationOptions {
+                local_address: None,
+                permissions: crate::config::PeerPermissions::empty(),
+                connection_type: "outbound-full",
+            },
+        );
+        disconnect_node(&node, &json!(["example.invalid:18444"])).unwrap();
+        assert!(matches!(
+            host_receiver.try_recv().unwrap(),
+            crate::p2p::PeerCommand::Disconnect
+        ));
+        node.unregister_peer(12);
         add_node(&node, &json!(["example.invalid:18444", "remove"])).unwrap();
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();

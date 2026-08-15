@@ -2706,9 +2706,13 @@ impl Node {
     }
 
     pub fn disconnect_peer_at(&self, address: SocketAddr) -> bool {
+        self.disconnect_peer_endpoint(&NetworkEndpoint::from_socket(address))
+    }
+
+    pub(crate) fn disconnect_peer_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
         self.peer_infos()
             .into_iter()
-            .filter(|peer| peer.address == address)
+            .filter(|peer| &peer.endpoint == endpoint)
             .any(|peer| self.disconnect_peer(peer.id))
     }
 

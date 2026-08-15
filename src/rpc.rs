@@ -1973,6 +1973,9 @@ fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    if node.config.blocksonly {
+        bail!("Fee estimation disabled")
+    }
     let conf_target = params
         .get(0)
         .and_then(Value::as_u64)
@@ -2071,6 +2074,9 @@ fn raw_fee_horizon(mut samples: Vec<(u64, u64)>, threshold: f64, decay: f64, sca
 }
 
 fn estimate_raw_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    if node.config.blocksonly {
+        bail!("Fee estimation disabled")
+    }
     let conf_target = params
         .get(0)
         .and_then(Value::as_u64)

@@ -815,6 +815,14 @@ impl Config {
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
             bail!("--proxy must use a non-zero port");
         }
+        if args.privatebroadcast && args.proxy.is_none() {
+            bail!("--privatebroadcast requires --proxy for private connections");
+        }
+        if args.privatebroadcast && !args.connect.is_empty() {
+            bail!(
+                "Private broadcast of own transactions requested (--privatebroadcast), but --connect is also configured"
+            );
+        }
         if args.proxy.is_none()
             && let Some(network) = args.onlynet.iter().find_map(|network| match network {
                 OnlyNet::Onion => Some("onion"),
@@ -1199,6 +1207,26 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).unwrap().private_broadcast);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--privatebroadcast",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--privatebroadcast",
+            "--proxy=127.0.0.1:9050",
+            "--connect=192.0.2.1:8333",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -10,6 +10,7 @@ use crate::address::NetworkEndpoint;
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
 pub const DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB: u64 = 5;
+pub const DEFAULT_MAX_UPLOAD_TARGET: &str = "0M";
 pub const DEFAULT_MEMPOOL_EXPIRY_HOURS: u64 = 336;
 pub const DEFAULT_PEER_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_BLOCK_MAX_WEIGHT: u64 = 4_000_000;
@@ -545,6 +546,11 @@ pub struct Args {
     #[arg(long, visible_alias = "maxconnections", default_value_t = 125)]
     pub max_peers: usize,
 
+    /// Maximum outbound bytes per 24-hour cycle. Lowercase units are decimal
+    /// and uppercase units are powers of 1024, matching Core.
+    #[arg(long = "maxuploadtarget", default_value = DEFAULT_MAX_UPLOAD_TARGET)]
+    pub max_upload_target: String,
+
     #[arg(long, default_value_t = DEFAULT_PEER_TIMEOUT_SECS)]
     pub peertimeout: u64,
 
@@ -737,6 +743,7 @@ pub struct Config {
     pub peer_permissions: PeerPermissionConfig,
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
+    pub max_upload_target: u64,
     pub peer_timeout_secs: u64,
     pub block_max_weight: u64,
     pub block_reserved_weight: u64,
@@ -866,6 +873,13 @@ impl Config {
         if args.mempoolexpiry == 0 {
             bail!("--mempoolexpiry must be greater than zero");
         }
+        let max_upload_target =
+            parse_byte_units(&args.max_upload_target, 1 << 20).with_context(|| {
+                format!(
+                    "unable to parse --maxuploadtarget: '{}'",
+                    args.max_upload_target
+                )
+            })?;
         if [
             args.zmq_pub_hash_tx_hwm,
             args.zmq_pub_hash_block_hwm,
@@ -917,6 +931,7 @@ impl Config {
             peer_permissions,
             signet_challenge,
             max_peers: args.max_peers,
+            max_upload_target,
             peer_timeout_secs: args.peertimeout,
             block_max_weight: args.blockmaxweight.max(args.blockreservedweight),
             block_reserved_weight: args.blockreservedweight,
@@ -983,6 +998,29 @@ fn parse_fee_rate(value: Option<&str>, default: &str, name: &str) -> Result<u64>
         .map(Amount::to_sat)
 }
 
+fn parse_byte_units(value: &str, default_multiplier: u64) -> Option<u64> {
+    if value.is_empty() {
+        return None;
+    }
+
+    let (digits, multiplier) = match value.as_bytes().last().copied() {
+        Some(b'k') => (&value[..value.len() - 1], 1_000),
+        Some(b'K') => (&value[..value.len() - 1], 1 << 10),
+        Some(b'm') => (&value[..value.len() - 1], 1_000_000),
+        Some(b'M') => (&value[..value.len() - 1], 1 << 20),
+        Some(b'g') => (&value[..value.len() - 1], 1_000_000_000),
+        Some(b'G') => (&value[..value.len() - 1], 1 << 30),
+        Some(b't') => (&value[..value.len() - 1], 1_000_000_000_000),
+        Some(b'T') => (&value[..value.len() - 1], 1 << 40),
+        Some(_) => (value, default_multiplier),
+        None => return None,
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()?.checked_mul(multiplier)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,6 +1051,16 @@ mod tests {
         assert!(config.allows_address("192.0.2.1:8333".parse().unwrap()));
         assert!(!config.allows_address("[2001:db8::1]:8333".parse().unwrap()));
         assert_eq!(config.prune, 0);
+        assert_eq!(config.max_upload_target, 0);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--maxuploadtarget=2M",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().max_upload_target, 2 << 20);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",
@@ -1139,6 +1187,25 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+    }
+
+    #[test]
+    fn parses_core_byte_units_for_upload_target() {
+        assert_eq!(parse_byte_units("1k", 1 << 20), Some(1_000));
+        assert_eq!(parse_byte_units("1K", 1 << 20), Some(1 << 10));
+        assert_eq!(parse_byte_units("2m", 1 << 20), Some(2_000_000));
+        assert_eq!(parse_byte_units("2M", 1 << 20), Some(2 << 20));
+        assert_eq!(parse_byte_units("3g", 1 << 20), Some(3_000_000_000));
+        assert_eq!(parse_byte_units("3G", 1 << 20), Some(3 << 30));
+        assert_eq!(parse_byte_units("4t", 1 << 20), Some(4_000_000_000_000));
+        assert_eq!(parse_byte_units("4T", 1 << 20), Some(4 << 40));
+        assert_eq!(parse_byte_units("5", 1 << 20), Some(5 << 20));
+        assert_eq!(parse_byte_units("020M", 1 << 20), Some(20 << 20));
+        assert_eq!(parse_byte_units("", 1 << 20), None);
+        assert_eq!(parse_byte_units("0.5T", 1 << 20), None);
+        assert_eq!(parse_byte_units("+1M", 1 << 20), None);
+        assert_eq!(parse_byte_units("1x", 1 << 20), None);
+        assert_eq!(parse_byte_units("18446744073709551615g", 1 << 20), None);
     }
 
     #[test]

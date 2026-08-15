@@ -53,6 +53,9 @@ const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_EXTERNAL_BLOCK_RECORD_SIZE: usize = 4 * 1024 * 1024;
+const MAX_UPLOAD_TIMEFRAME_SECS: u64 = 24 * 60 * 60;
+const MAX_UPLOAD_BLOCK_RESERVE_BYTES: u64 = 4_000_000;
+const HISTORICAL_BLOCK_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 pub(crate) const PRIVATE_BROADCAST_PEERS_PER_TRANSACTION: usize = 3;
 pub(crate) const PRIVATE_BROADCAST_RETRY_SECS: u64 = 60;
 
@@ -148,6 +151,43 @@ fn import_external_block_file(
         pending = remaining;
     }
     Ok(imported)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct OutboundUsage {
+    cycle_start: u64,
+    bytes: u64,
+}
+
+fn outbound_time_left_in_cycle(target: u64, usage: OutboundUsage, now: u64) -> u64 {
+    if target == 0 {
+        return 0;
+    }
+    if usage.cycle_start == 0 {
+        return MAX_UPLOAD_TIMEFRAME_SECS;
+    }
+    usage
+        .cycle_start
+        .saturating_add(MAX_UPLOAD_TIMEFRAME_SECS)
+        .saturating_sub(now)
+}
+
+fn outbound_target_reached(
+    target: u64,
+    usage: OutboundUsage,
+    now: u64,
+    historical_block_serving_limit: bool,
+) -> bool {
+    if target == 0 {
+        return false;
+    }
+    if historical_block_serving_limit {
+        let time_left = outbound_time_left_in_cycle(target, usage, now);
+        let buffer = (time_left / (10 * 60)).saturating_mul(MAX_UPLOAD_BLOCK_RESERVE_BYTES);
+        buffer >= target || usage.bytes >= target.saturating_sub(buffer)
+    } else {
+        usage.bytes >= target
+    }
 }
 
 struct OrphanEntry {
@@ -593,6 +633,7 @@ pub struct Node {
     rpc_commands: parking_lot::RwLock<HashMap<usize, (String, Instant)>>,
     total_bytes_sent: AtomicU64,
     total_bytes_received: AtomicU64,
+    outbound_usage: parking_lot::Mutex<OutboundUsage>,
     network_active: AtomicBool,
     block_stalling_timeout_secs: AtomicU64,
     block_stalling_since: parking_lot::RwLock<HashMap<usize, Instant>>,
@@ -711,6 +752,7 @@ impl Node {
             rpc_commands: parking_lot::RwLock::new(HashMap::new()),
             total_bytes_sent: AtomicU64::new(0),
             total_bytes_received: AtomicU64::new(0),
+            outbound_usage: parking_lot::Mutex::new(OutboundUsage::default()),
             network_active: AtomicBool::new(true),
             block_stalling_timeout_secs: AtomicU64::new(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
             block_stalling_since: parking_lot::RwLock::new(HashMap::new()),
@@ -1433,12 +1475,75 @@ impl Node {
         self.total_bytes_received.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn max_upload_target(&self) -> u64 {
+        self.config.max_upload_target
+    }
+
+    pub(crate) fn max_upload_timeframe(&self) -> u64 {
+        MAX_UPLOAD_TIMEFRAME_SECS
+    }
+
+    pub(crate) fn outbound_target_reached(&self, historical_block_serving_limit: bool) -> bool {
+        outbound_target_reached(
+            self.config.max_upload_target,
+            *self.outbound_usage.lock(),
+            unix_time_seconds(),
+            historical_block_serving_limit,
+        )
+    }
+
+    pub(crate) fn outbound_target_bytes_left(&self) -> u64 {
+        let usage = *self.outbound_usage.lock();
+        self.config.max_upload_target.saturating_sub(usage.bytes)
+    }
+
+    pub(crate) fn outbound_time_left_in_cycle(&self) -> u64 {
+        outbound_time_left_in_cycle(
+            self.config.max_upload_target,
+            *self.outbound_usage.lock(),
+            unix_time_seconds(),
+        )
+    }
+
+    pub(crate) fn historical_block_serving_limit_reached(
+        &self,
+        hash: &BlockHash,
+        filtered: bool,
+        permissions: PeerPermissions,
+    ) -> bool {
+        if permissions.contains(PeerPermissions::DOWNLOAD) || !self.outbound_target_reached(true) {
+            return false;
+        }
+        if filtered {
+            return true;
+        }
+        let chain = self.chain.read();
+        let Some(header) = chain.header_by_hash(hash) else {
+            return false;
+        };
+        let best_header = chain.best_header_tip();
+        let Some(best_header) = chain.header_by_hash(&best_header.hash) else {
+            return false;
+        };
+        u64::from(best_header.time).saturating_sub(u64::from(header.time))
+            > HISTORICAL_BLOCK_AGE_SECS
+    }
+
     pub(crate) fn record_bytes_sent(&self, peer_id: usize, bytes: usize, command: &str) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.total_bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        let now = unix_time_seconds();
+        {
+            let mut usage = self.outbound_usage.lock();
+            if usage.cycle_start.saturating_add(MAX_UPLOAD_TIMEFRAME_SECS) < now {
+                usage.cycle_start = now;
+                usage.bytes = 0;
+            }
+            usage.bytes = usage.bytes.saturating_add(bytes);
+        }
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
             peer.bytes_sent = peer.bytes_sent.saturating_add(bytes);
-            peer.last_send = unix_time_seconds();
+            peer.last_send = now;
             let total = peer
                 .bytes_sent_per_msg
                 .entry(command.to_owned())
@@ -2971,6 +3076,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -2983,6 +3089,38 @@ mod tests {
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         }
+    }
+
+    #[test]
+    fn max_upload_target_matches_core_reserve_rules() {
+        let target = 10_000_000;
+        let usage = OutboundUsage {
+            cycle_start: 1_000,
+            bytes: 6_000_000,
+        };
+        assert!(!outbound_target_reached(target, usage, 1_000, false));
+        assert_eq!(outbound_time_left_in_cycle(target, usage, 1_000), 86_400);
+        assert!(outbound_target_reached(target, usage, 1_000 + 85_800, true));
+        assert_eq!(
+            outbound_time_left_in_cycle(target, usage, 1_000 + 85_800),
+            600
+        );
+        assert!(!outbound_target_reached(
+            target,
+            usage,
+            1_000 + 85_800,
+            false
+        ));
+        assert!(!outbound_target_reached(
+            0,
+            OutboundUsage::default(),
+            1_000,
+            false
+        ));
+        assert_eq!(
+            outbound_time_left_in_cycle(0, OutboundUsage::default(), 1_000),
+            0
+        );
     }
 
     #[test]

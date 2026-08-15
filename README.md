@@ -50,6 +50,8 @@ Use `--txospenderindex` to enable historical spender lookup for `gettxspendingpr
 
 `--maxmempool=<MB>` sets the transaction pool's dynamic-memory limit (300 MB by default, or 5 MB in `--blocksonly` mode unless explicitly set); admission uses the existing package-aware eviction policy when the limit is reached.
 
+`--maxuploadtarget=<size>` limits P2P upload bytes to the size of a rolling 24-hour cycle (`0M` by default, meaning unlimited). Lowercase suffixes use decimal units and uppercase suffixes use powers of 1024, matching Core; once the target is reached, historical blocks older than seven days and filtered blocks are withheld from peers without the `download` permission.
+
 `--mempoolexpiry=<hours>` controls automatic mempool expiration (336 hours by default, matching Core).
 
 Mining policy follows Core's block-creation options: `--blockmaxweight` defaults to 4,000,000, `--blockreservedweight` defaults to 8,000, and `--blockmintxfee` defaults to 1 sat/kvB. These settings affect `getblocktemplate`, `generate*`, and `getmininginfo`.

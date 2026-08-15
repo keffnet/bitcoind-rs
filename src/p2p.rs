@@ -2887,6 +2887,13 @@ async fn serve_peer_loop(
                             {
                                 continue;
                             }
+                            if node.historical_block_serving_limit_reached(
+                                &item.hash,
+                                false,
+                                peer_state.permissions,
+                            ) {
+                                anyhow::bail!("historical block serving limit reached");
+                            }
                             let block = node.chain.write().block(&item.hash)?;
                             if let Some(block) = block {
                                 let block = if item.kind == InventoryType::Block {
@@ -2954,6 +2961,13 @@ async fn serve_peer_loop(
                                 .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
                             {
                                 continue;
+                            }
+                            if node.historical_block_serving_limit_reached(
+                                &item.hash,
+                                true,
+                                peer_state.permissions,
+                            ) {
+                                anyhow::bail!("historical block serving limit reached");
                             }
                             let block = node.chain.write().block(&item.hash)?;
                             let Some(block) = block else { continue };
@@ -4687,6 +4701,7 @@ mod tests {
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             signet_challenge: None,
             max_peers: 4,
+            max_upload_target: 0,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -5116,6 +5131,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -5253,6 +5269,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -5646,6 +5663,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -5767,6 +5785,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -5894,6 +5913,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -6111,6 +6131,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -6204,6 +6225,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -6278,6 +6300,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -6345,6 +6368,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
@@ -6474,6 +6498,7 @@ mod tests {
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,

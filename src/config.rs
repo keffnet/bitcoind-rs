@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use bitcoin::pow::Work;
-use bitcoin::{Amount, Denomination, Network};
+use bitcoin::{Amount, BlockHash, Denomination, Network};
 use clap::{Parser, ValueEnum};
 
 use crate::IpSubnet;
@@ -539,6 +539,9 @@ pub struct Args {
     #[arg(long = "minimumchainwork", value_name = "HEX")]
     pub minimum_chain_work: Option<String>,
 
+    #[arg(long = "assumevalid", value_name = "HEX")]
+    pub assume_valid: Option<String>,
+
     #[arg(long = "checkblocks", value_name = "N")]
     pub check_blocks: Option<u32>,
 
@@ -952,6 +955,7 @@ pub struct Config {
     pub datadir: PathBuf,
     pub(crate) blocks_dir: Option<PathBuf>,
     pub(crate) minimum_chain_work: Option<Work>,
+    pub(crate) assume_valid: Option<BlockHash>,
     pub(crate) check_blocks: Option<u32>,
     pub(crate) check_level: Option<u8>,
     pub p2p_bind: SocketAddr,
@@ -1293,6 +1297,15 @@ impl Config {
             ),
             None => None,
         };
+        let assume_valid = match args.assume_valid.as_deref() {
+            None => default_assume_valid(network, signet_challenge.as_deref()),
+            Some(value) if value.is_empty() || value == "0" => None,
+            Some(value) => Some(
+                value
+                    .parse::<BlockHash>()
+                    .with_context(|| format!("decoding --assumevalid as a block hash: {value}"))?,
+            ),
+        };
         let blockfilterindex = match args.blockfilterindex.as_str() {
             "0" | "false" => false,
             "1" | "true" | "basic" => true,
@@ -1327,6 +1340,7 @@ impl Config {
             datadir: args.datadir,
             blocks_dir: Some(blocks_dir),
             minimum_chain_work,
+            assume_valid,
             check_blocks: args.check_blocks,
             check_level: args.check_level,
             p2p_bind: primary_p2p_bind,
@@ -1447,6 +1461,22 @@ fn default_rpc_port(network: Network) -> u16 {
         Network::Signet => 38332,
         Network::Regtest => 18443,
     }
+}
+
+fn default_assume_valid(network: Network, signet_challenge: Option<&[u8]>) -> Option<BlockHash> {
+    let hash = match network {
+        Network::Bitcoin => "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac",
+        Network::Testnet => "000000007a61e4230b28ac5cb6b5e5a0130de37ac1faf2f8987d2fa6505b67f4",
+        Network::Testnet4 => "0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a",
+        Network::Signet if signet_challenge.is_none() => {
+            "00000008414aab61092ef93f1aacc54cf9e9f16af29ddad493b908a01ff5c329"
+        }
+        Network::Signet | Network::Regtest => return None,
+    };
+    Some(
+        hash.parse()
+            .expect("Core default assumevalid hash is valid"),
+    )
 }
 
 fn parse_manual_endpoints(
@@ -1620,6 +1650,14 @@ mod tests {
         assert!(!config.cjdns_reachable);
         assert_eq!(config.prune, 0);
         assert_eq!(config.max_upload_target, 0);
+        assert_eq!(
+            config.assume_valid,
+            Some(
+                "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"
+                    .parse()
+                    .unwrap(),
+            )
+        );
 
         let args = Args::try_parse_from([
             "bitcoind-rs",
@@ -1644,6 +1682,40 @@ mod tests {
             Config::from_args(args).unwrap().minimum_chain_work,
             Some(Work::from_be_bytes([0; 32]))
         );
+
+        let assumed_valid = "0000000000000000000000000000000000000000000000000000000000000001";
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--assumevalid=0000000000000000000000000000000000000000000000000000000000000001",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().assume_valid,
+            Some(assumed_valid.parse().unwrap())
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--assumevalid=0",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().assume_valid, None);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--assumevalid=not-a-hash",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

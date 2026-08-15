@@ -730,17 +730,19 @@ impl Node {
             .blocks_dir
             .clone()
             .unwrap_or_else(|| config.datadir.join("blocks"));
-        let mut chain = ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work(
-            config.network,
-            &config.datadir,
-            blocks_dir,
-            config.signet_challenge.as_deref(),
-            config.blockfilterindex,
-            config.reindex,
-            config.reindex_chainstate,
-            config.txindex,
-            config.minimum_chain_work,
-        )?;
+        let mut chain =
+            ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid(
+                config.network,
+                &config.datadir,
+                blocks_dir,
+                config.signet_challenge.as_deref(),
+                config.blockfilterindex,
+                config.reindex,
+                config.reindex_chainstate,
+                config.txindex,
+                config.minimum_chain_work,
+                config.assume_valid,
+            )?;
         chain.configure_pruning(config.prune)?;
         // Electrum 1.7 outpoint status needs confirmed spender lookups even
         // when the standalone Core-style txospenderindex RPC option is off.
@@ -3399,6 +3401,7 @@ mod tests {
             datadir: datadir.to_owned(),
             blocks_dir: None,
             minimum_chain_work: None,
+            assume_valid: None,
             check_blocks: None,
             check_level: None,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),

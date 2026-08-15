@@ -593,6 +593,7 @@ pub struct ChainState {
     data_dir: PathBuf,
     blocks_dir: PathBuf,
     minimum_chain_work_override: Option<Work>,
+    assume_valid_block: Option<BlockHash>,
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     filter_store: FilterStore,
@@ -747,6 +748,35 @@ impl ChainState {
         tx_index_all_enabled: bool,
         minimum_chain_work_override: Option<Work>,
     ) -> Result<Self> {
+        Self::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid(
+            network,
+            data_dir,
+            blocks_dir,
+            signet_challenge,
+            blockfilter_index_enabled,
+            reindex,
+            reindex_chainstate,
+            tx_index_all_enabled,
+            minimum_chain_work_override,
+            None,
+        )
+    }
+
+    /// Open chainstate with Core-style minimum-chainwork and assume-valid
+    /// overrides.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        blocks_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
+        reindex: bool,
+        reindex_chainstate: bool,
+        tx_index_all_enabled: bool,
+        minimum_chain_work_override: Option<Work>,
+        assume_valid_block: Option<BlockHash>,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_owned();
         let blocks_dir = blocks_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
@@ -859,6 +889,7 @@ impl ChainState {
             data_dir,
             blocks_dir,
             minimum_chain_work_override,
+            assume_valid_block,
             signet_challenge: (network == Network::Signet).then(|| {
                 signet_challenge
                     .map(ToOwned::to_owned)
@@ -1290,6 +1321,35 @@ impl ChainState {
             Network::Regtest => return Work::from_be_bytes([0; 32]),
         };
         Work::from_unprefixed_hex(hex).expect("Core minimum chainwork is valid hex")
+    }
+
+    fn should_skip_script_checks(&self, block: &Block, height: u32) -> bool {
+        const TWO_WEEKS_SECS: u32 = 14 * 24 * 60 * 60;
+        let block_hash = block.block_hash();
+        let Some(assume_valid_block) = self.assume_valid_block else {
+            return false;
+        };
+        let Some(assumed_node) = self.block_index.get(&assume_valid_block) else {
+            return false;
+        };
+        if height > assumed_node.height {
+            return false;
+        }
+        let best_header = self.best_header_tip();
+        if best_header.work < self.minimum_chain_work()
+            || self.ancestor_hash(best_header.hash, height) != Some(block_hash)
+            || self.ancestor_hash(assume_valid_block, height) != Some(block_hash)
+        {
+            return false;
+        }
+        let Some(best_header_record) = self.block_index.get(&best_header.hash) else {
+            return false;
+        };
+        best_header_record
+            .header
+            .time
+            .saturating_sub(block.header.time)
+            > TWO_WEEKS_SECS
     }
 
     /// Return the hardcoded AssumeUTXO commitments for this network.
@@ -2880,8 +2940,13 @@ impl ChainState {
                     Amount::MAX_MONEY.to_sat(),
                 )?;
                 let median_time_past = self.median_time_past_for_parent(parent_hash);
-                let application =
-                    self.validate_block_transactions(&block, height, &utxos, median_time_past)?;
+                let application = self.validate_block_transactions_with_options(
+                    &block,
+                    height,
+                    &utxos,
+                    median_time_past,
+                    false,
+                )?;
                 apply_block_to_utxos(
                     &mut utxos,
                     &block,
@@ -3109,8 +3174,13 @@ impl ChainState {
 
         for (height, block, _) in &blocks {
             let median_time_past = self.median_time_past_for_parent(block.header.prev_blockhash);
-            let application =
-                self.validate_block_transactions(block, *height, &working_utxos, median_time_past)?;
+            let application = self.validate_block_transactions_with_options(
+                block,
+                *height,
+                &working_utxos,
+                median_time_past,
+                false,
+            )?;
             apply_block_to_utxos(
                 &mut working_utxos,
                 block,
@@ -3660,6 +3730,23 @@ impl ChainState {
         utxos: &HashMap<OutPoint, UtxoEntry>,
         block_median_time_past: u32,
     ) -> Result<BlockApplication> {
+        self.validate_block_transactions_with_options(
+            block,
+            height,
+            utxos,
+            block_median_time_past,
+            self.should_skip_script_checks(block, height),
+        )
+    }
+
+    fn validate_block_transactions_with_options(
+        &self,
+        block: &Block,
+        height: u32,
+        utxos: &HashMap<OutPoint, UtxoEntry>,
+        block_median_time_past: u32,
+        skip_script_checks: bool,
+    ) -> Result<BlockApplication> {
         if self.enforce_bip30(height, block.block_hash(), block.header.prev_blockhash) {
             for transaction in &block.txdata {
                 let txid = transaction.compute_txid();
@@ -3749,14 +3836,16 @@ impl ChainState {
                 csv_active,
                 &previous_entries,
             )?;
-            validation::validate_transaction_scripts_at_time_with_block_hash(
-                self.network,
-                height,
-                block.header.time,
-                Some(block_hash),
-                transaction,
-                &previous_outputs,
-            )?;
+            if !skip_script_checks {
+                validation::validate_transaction_scripts_at_time_with_block_hash(
+                    self.network,
+                    height,
+                    block.header.time,
+                    Some(block_hash),
+                    transaction,
+                    &previous_outputs,
+                )?;
+            }
             let output_total = transaction
                 .output
                 .iter()
@@ -5483,6 +5572,7 @@ fn open_background_replay_state(
         data_dir: data_dir.to_owned(),
         blocks_dir: blocks_dir.to_owned(),
         minimum_chain_work_override: None,
+        assume_valid_block: None,
         signet_challenge,
         store,
         filter_store,
@@ -5615,8 +5705,13 @@ fn run_background_validation(
                 Amount::MAX_MONEY.to_sat(),
             )?;
             let median_time_past = state.median_time_past_for_parent(parent_hash);
-            let application =
-                state.validate_block_transactions(&block, node.height, &utxos, median_time_past)?;
+            let application = state.validate_block_transactions_with_options(
+                &block,
+                node.height,
+                &utxos,
+                median_time_past,
+                false,
+            )?;
             apply_block_to_utxos(
                 &mut utxos,
                 &block,
@@ -6431,6 +6526,27 @@ mod tests {
 
         state.update_ibd_status_at(genesis_time + MAX_TIP_AGE_SECS + 1_000_000);
         assert!(!state.is_initial_block_download());
+    }
+
+    #[test]
+    fn assume_valid_skips_only_mature_ancestors_of_best_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let first = mine_block(&state, 1);
+        let first_hash = first.block_hash();
+        state.connect_block(first.clone()).unwrap();
+        state.assume_valid_block = Some(first_hash);
+
+        let mut second = mine_block(&state, 2);
+        second.header.time = first.header.time + 14 * 24 * 60 * 60 + 1;
+        second.header.nonce = 0;
+        while !second.header.target().is_met_by(second.block_hash()) {
+            second.header.nonce = second.header.nonce.wrapping_add(1);
+        }
+        state.connect_block(second.clone()).unwrap();
+
+        assert!(state.should_skip_script_checks(&first, 1));
+        assert!(!state.should_skip_script_checks(&second, 2));
     }
 
     #[test]

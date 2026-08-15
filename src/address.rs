@@ -14,6 +14,7 @@ use sha3::{Digest, Sha3_256};
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NetworkEndpoint {
     Ip(SocketAddr),
+    Dns { host: String, port: u16 },
     OnionV2 { address: [u8; 10], port: u16 },
     OnionV3 { address: [u8; 32], port: u16 },
     I2p { address: [u8; 32], port: u16 },
@@ -76,23 +77,25 @@ impl NetworkEndpoint {
     }
 
     /// Return the BIP155 network ID and raw address bytes.
-    pub fn to_addr_v2(&self) -> (u8, Vec<u8>) {
+    pub fn to_addr_v2(&self) -> Option<(u8, Vec<u8>)> {
         match self {
             Self::Ip(address) => match address.ip() {
-                IpAddr::V4(ip) => (1, ip.octets().to_vec()),
-                IpAddr::V6(ip) => (2, ip.octets().to_vec()),
+                IpAddr::V4(ip) => Some((1, ip.octets().to_vec())),
+                IpAddr::V6(ip) => Some((2, ip.octets().to_vec())),
             },
-            Self::OnionV2 { address, .. } => (3, address.to_vec()),
-            Self::OnionV3 { address, .. } => (4, address.to_vec()),
-            Self::I2p { address, .. } => (5, address.to_vec()),
-            Self::Cjdns { address, .. } => (6, address.octets().to_vec()),
+            Self::Dns { .. } => None,
+            Self::OnionV2 { address, .. } => Some((3, address.to_vec())),
+            Self::OnionV3 { address, .. } => Some((4, address.to_vec())),
+            Self::I2p { address, .. } => Some((5, address.to_vec())),
+            Self::Cjdns { address, .. } => Some((6, address.octets().to_vec())),
         }
     }
 
     pub fn port(&self) -> u16 {
         match self {
             Self::Ip(address) => address.port(),
-            Self::OnionV2 { port, .. }
+            Self::Dns { port, .. }
+            | Self::OnionV2 { port, .. }
             | Self::OnionV3 { port, .. }
             | Self::I2p { port, .. }
             | Self::Cjdns { port, .. } => *port,
@@ -104,6 +107,7 @@ impl NetworkEndpoint {
         match self {
             Self::Ip(address) if address.is_ipv4() => "ipv4",
             Self::Ip(_) => "ipv6",
+            Self::Dns { .. } => "not_publicly_routable",
             Self::OnionV2 { .. } | Self::OnionV3 { .. } => "onion",
             Self::I2p { .. } => "i2p",
             Self::Cjdns { .. } => "cjdns",
@@ -117,6 +121,7 @@ impl NetworkEndpoint {
     pub fn socket_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Ip(address) => Some(*address),
+            Self::Dns { .. } => None,
             Self::Cjdns { address, port } => Some(SocketAddr::new((*address).into(), *port)),
             Self::OnionV2 { .. } | Self::OnionV3 { .. } | Self::I2p { .. } => None,
         }
@@ -134,9 +139,11 @@ impl NetworkEndpoint {
     pub fn legacy_socket_addr(&self) -> Option<SocketAddr> {
         match self {
             Self::Ip(address) => Some(*address),
-            Self::OnionV2 { .. } | Self::OnionV3 { .. } | Self::I2p { .. } | Self::Cjdns { .. } => {
-                None
-            }
+            Self::Dns { .. }
+            | Self::OnionV2 { .. }
+            | Self::OnionV3 { .. }
+            | Self::I2p { .. }
+            | Self::Cjdns { .. } => None,
         }
     }
 
@@ -144,6 +151,7 @@ impl NetworkEndpoint {
     pub fn host_string(&self) -> String {
         match self {
             Self::Ip(address) => address.ip().to_string(),
+            Self::Dns { host, .. } => host.clone(),
             Self::OnionV2 { address, .. } => format!("{}.onion", base32_encode(address)),
             Self::OnionV3 { address, .. } => {
                 format!("{}.onion", tor_v3_address(address))
@@ -161,10 +169,38 @@ impl NetworkEndpoint {
     pub fn uses_proxy_by_default(&self) -> bool {
         match self {
             Self::Ip(address) => is_core_routable_ip(address.ip()),
-            Self::OnionV2 { .. } | Self::OnionV3 { .. } | Self::I2p { .. } | Self::Cjdns { .. } => {
-                true
-            }
+            Self::Dns { .. }
+            | Self::OnionV2 { .. }
+            | Self::OnionV3 { .. }
+            | Self::I2p { .. }
+            | Self::Cjdns { .. } => true,
         }
+    }
+
+    pub fn requires_proxy(&self) -> bool {
+        match self {
+            Self::Dns { host, .. } => host.ends_with(".onion") || host.ends_with(".b32.i2p"),
+            Self::OnionV2 { .. } | Self::OnionV3 { .. } | Self::I2p { .. } => true,
+            Self::Ip(_) | Self::Cjdns { .. } => false,
+        }
+    }
+
+    /// Construct a hostname endpoint used by manual connections. Hostnames
+    /// are intentionally not address-manager entries because ADDRv2 has no
+    /// representation for unresolved names.
+    pub fn dns(host: String, port: u16) -> Result<Self> {
+        if host.is_empty()
+            || host.len() > 255
+            || host.chars().any(|character| {
+                character.is_whitespace() || matches!(character, ':' | '[' | ']' | '/')
+            })
+        {
+            bail!("invalid hostname")
+        }
+        if port == 0 {
+            bail!("network endpoint port must be non-zero")
+        }
+        Ok(Self::Dns { host, port })
     }
 
     /// Parse an address-manager entry. Legacy entries use the full socket
@@ -272,7 +308,7 @@ impl fmt::Display for NetworkEndpoint {
                 }
                 unreachable!("CJDNS endpoint has a socket address")
             }
-            Self::OnionV2 { .. } | Self::OnionV3 { .. } | Self::I2p { .. } => {
+            Self::Dns { .. } | Self::OnionV2 { .. } | Self::OnionV3 { .. } | Self::I2p { .. } => {
                 write!(formatter, "{}:{}", self.host_string(), self.port())
             }
         }
@@ -407,7 +443,7 @@ mod tests {
             },
         ];
         for endpoint in endpoints {
-            let (network, address) = endpoint.to_addr_v2();
+            let (network, address) = endpoint.to_addr_v2().unwrap();
             let decoded = NetworkEndpoint::from_addr_v2(network, &address, endpoint.port())
                 .expect("valid BIP155 endpoint");
             assert_eq!(decoded, endpoint);
@@ -450,6 +486,15 @@ mod tests {
             NetworkEndpoint::from_socket("[fd00::1]:8333".parse().unwrap()),
             NetworkEndpoint::Ip("[fd00::1]:8333".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn hostname_endpoints_are_not_bip155_addresses() {
+        let endpoint = NetworkEndpoint::dns("example.invalid".to_owned(), 8333).unwrap();
+        assert_eq!(endpoint.to_string(), "example.invalid:8333");
+        assert_eq!(endpoint.host_string(), "example.invalid");
+        assert_eq!(endpoint.socket_addr(), None);
+        assert_eq!(endpoint.to_addr_v2(), None);
     }
 
     #[test]

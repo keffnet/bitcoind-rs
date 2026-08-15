@@ -1099,8 +1099,8 @@ pub(crate) enum PeerCommand {
 
 #[derive(Debug)]
 pub(crate) enum PeerManagerRequest {
-    Add(SocketAddr, Option<bool>),
-    OneTry(SocketAddr, Option<bool>, &'static str),
+    Add(NetworkEndpoint, Option<bool>),
+    OneTry(NetworkEndpoint, Option<bool>, &'static str),
     PrivateBroadcast {
         address: SocketAddr,
         transaction: Transaction,
@@ -1336,9 +1336,9 @@ impl PeerManager {
                             break;
                         };
                         let (endpoint, persistent, transport_v2, connection_type, manual) = match request {
-                            PeerManagerRequest::Add(address, transport_v2) => (NetworkEndpoint::from_socket(address), true, transport_v2, "outbound-full", true),
-                            PeerManagerRequest::OneTry(address, transport_v2, connection_type) => {
-                                (NetworkEndpoint::from_socket(address), false, transport_v2, connection_type, true)
+                            PeerManagerRequest::Add(endpoint, transport_v2) => (endpoint, true, transport_v2, "outbound-full", true),
+                            PeerManagerRequest::OneTry(endpoint, transport_v2, connection_type) => {
+                                (endpoint, false, transport_v2, connection_type, true)
                             }
                             PeerManagerRequest::PrivateBroadcast { address, transaction } => {
                                 spawn_private_broadcast_loop(
@@ -1499,11 +1499,7 @@ fn spawn_outbound_loop(
             return;
         }
         loop {
-            if persistent
-                && endpoint
-                    .legacy_socket_addr()
-                    .is_some_and(|address| !node.is_node_added(address))
-            {
+            if persistent && !node.is_node_added_endpoint(&endpoint) {
                 return;
             }
             if !node.network_active()
@@ -1663,7 +1659,7 @@ fn select_discovery_endpoints(
         .into_iter()
         .map(|peer| peer.endpoint)
         .collect();
-    let added: HashSet<_> = node.added_nodes().into_iter().collect();
+    let added: HashSet<_> = node.added_network_endpoints().into_iter().collect();
     let attempts = outbound_attempts.lock();
     let mut candidates = node
         .known_network_addresses()
@@ -1674,10 +1670,9 @@ fn select_discovery_endpoints(
                 && node.config.allows_network_endpoint(&entry.endpoint)
                 && !connected.contains(&entry.endpoint)
                 && !entry.endpoint.legacy_socket_addr().is_some_and(|address| {
-                    address.ip().is_unspecified()
-                        || added.contains(&address)
-                        || node.is_banned_for_peer(address, false)
+                    address.ip().is_unspecified() || node.is_banned_for_peer(address, false)
                 })
+                && !added.contains(&entry.endpoint)
                 && !attempts.contains(&entry.endpoint)
         })
         .collect::<Vec<_>>();
@@ -1730,15 +1725,23 @@ async fn connect_peer_endpoint_with_options(
     proxy_randomize: bool,
 ) -> Result<TcpStream> {
     let proxy = proxy.filter(|_| force_proxy || endpoint.uses_proxy_by_default());
-    let target = proxy
-        .or_else(|| endpoint.socket_addr())
-        .ok_or_else(|| anyhow::anyhow!("endpoint {endpoint} requires a SOCKS5 proxy"))?;
-    let mut stream = TcpStream::connect(target).await.with_context(|| {
-        proxy.map_or_else(
-            || format!("connecting to {endpoint}"),
-            |proxy| format!("connecting to {endpoint} through proxy {proxy}"),
-        )
-    })?;
+    if proxy.is_none() && endpoint.requires_proxy() {
+        bail!("endpoint {endpoint} requires a SOCKS5 proxy");
+    }
+    let mut stream = if let Some(proxy) = proxy {
+        TcpStream::connect(proxy)
+            .await
+            .with_context(|| format!("connecting to {endpoint} through proxy {proxy}"))?
+    } else if let Some(target) = endpoint.socket_addr() {
+        TcpStream::connect(target)
+            .await
+            .with_context(|| format!("connecting to {endpoint}"))?
+    } else {
+        let host = endpoint.host_string();
+        TcpStream::connect((host.as_str(), endpoint.port()))
+            .await
+            .with_context(|| format!("resolving and connecting to {host}:{}", endpoint.port()))?
+    };
     stream.set_nodelay(true)?;
     if proxy.is_some() {
         socks5_connect_endpoint_with_options(&mut stream, endpoint, proxy_randomize).await?;
@@ -3714,7 +3717,7 @@ async fn serve_peer_loop(
                 if addrv2_received {
                     let addresses = addresses
                         .into_iter()
-                        .map(|entry| {
+                        .filter_map(|entry| {
                             network_address_v2(&entry.endpoint, entry.time, entry.services)
                         })
                         .collect::<Vec<_>>();
@@ -4119,15 +4122,15 @@ fn network_address_v2(
     endpoint: &NetworkEndpoint,
     connected_at: u64,
     services: u64,
-) -> wire::NetworkAddressV2 {
-    let (network, address) = endpoint.to_addr_v2();
-    wire::NetworkAddressV2 {
+) -> Option<wire::NetworkAddressV2> {
+    let (network, address) = endpoint.to_addr_v2()?;
+    Some(wire::NetworkAddressV2 {
         time: u32::try_from(connected_at).unwrap_or(u32::MAX),
         services,
         network,
         address,
         port: endpoint.port(),
-    }
+    })
 }
 
 async fn send_peer_extensions(
@@ -4274,7 +4277,9 @@ fn relay_address_message(
         Message::AddrV2(
             addresses
                 .iter()
-                .map(|(endpoint, services, time)| network_address_v2(endpoint, *time, *services))
+                .filter_map(|(endpoint, services, time)| {
+                    network_address_v2(endpoint, *time, *services)
+                })
                 .collect(),
         )
     } else {
@@ -5244,6 +5249,41 @@ mod tests {
             let mut received_host = vec![0; usize::from(prefix[4])];
             stream.read_exact(&mut received_host).await.unwrap();
             assert_eq!(received_host, host.as_bytes());
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            assert_eq!(port, 18444u16.to_be_bytes());
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+        });
+
+        let _stream = connect_peer_endpoint(&endpoint, Some(proxy_address))
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_proxy_negotiation_routes_dns_hostnames() {
+        let endpoint = NetworkEndpoint::dns("peer.example".to_owned(), 18444).unwrap();
+        let host = endpoint.host_string();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+
+            let mut prefix = [0; 5];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(&prefix[..4], &[5, 1, 0, 3]);
+            assert_eq!(usize::from(prefix[4]), host.len());
+            let mut host = vec![0; usize::from(prefix[4])];
+            stream.read_exact(&mut host).await.unwrap();
+            assert_eq!(host, b"peer.example");
             let mut port = [0; 2];
             stream.read_exact(&mut port).await.unwrap();
             assert_eq!(port, 18444u16.to_be_bytes());
@@ -6435,7 +6475,8 @@ mod tests {
             &NetworkEndpoint::Ip("[2001:db8::10]:18444".parse().unwrap()),
             456,
             wire::NODE_NETWORK | wire::NODE_WITNESS,
-        );
+        )
+        .unwrap();
         let v2_endpoint = NetworkEndpoint::from_addr_v2(v2.network, &v2.address, v2.port).unwrap();
         node.remember_network_address(v2_endpoint.clone(), v2.services, u64::from(v2.time));
 

@@ -654,8 +654,8 @@ pub struct Node {
     tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
     network_addresses: parking_lot::RwLock<HashMap<NetworkEndpoint, KnownNetworkAddress>>,
     network_tried_addresses: parking_lot::RwLock<HashSet<NetworkEndpoint>>,
-    added_nodes: parking_lot::RwLock<HashMap<SocketAddr, Option<bool>>>,
-    added_node_names: parking_lot::RwLock<HashMap<SocketAddr, String>>,
+    added_nodes: parking_lot::RwLock<HashMap<NetworkEndpoint, Option<bool>>>,
+    added_node_names: parking_lot::RwLock<HashMap<NetworkEndpoint, String>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
     listen_address: parking_lot::RwLock<Option<SocketAddr>>,
     last_mining_block: parking_lot::RwLock<Option<(u64, usize)>>,
@@ -669,13 +669,16 @@ impl Node {
             .seed_nodes
             .iter()
             .copied()
-            .map(|address| (address, None))
+            .map(|address| (NetworkEndpoint::from_socket(address), None))
             .collect();
         let added_node_names = config
             .seed_nodes
             .iter()
             .copied()
-            .map(|address| (address, address.to_string()))
+            .map(|address| {
+                let endpoint = NetworkEndpoint::from_socket(address);
+                (endpoint, address.to_string())
+            })
             .collect();
         let max_mempool_bytes = config
             .max_mempool_mb
@@ -2050,7 +2053,9 @@ impl Node {
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
-        if connection_type != "private-broadcast" {
+        if connection_type != "private-broadcast"
+            && !matches!(endpoint, NetworkEndpoint::Dns { .. })
+        {
             if let Some(address) = endpoint.legacy_socket_addr() {
                 let mut known = self.known_addresses.write();
                 if self.reserve_known_address(&mut known, address) {
@@ -2304,6 +2309,7 @@ impl Node {
     pub(crate) fn is_network_address_tried(&self, endpoint: &NetworkEndpoint) -> bool {
         match endpoint {
             NetworkEndpoint::Ip(address) => self.is_address_tried(*address),
+            NetworkEndpoint::Dns { .. } => false,
             NetworkEndpoint::OnionV2 { .. }
             | NetworkEndpoint::OnionV3 { .. }
             | NetworkEndpoint::I2p { .. } => self.network_tried_addresses.read().contains(endpoint),
@@ -2317,6 +2323,9 @@ impl Node {
     }
 
     pub(crate) fn add_network_address(&self, endpoint: NetworkEndpoint, tried: bool) -> bool {
+        if matches!(endpoint, NetworkEndpoint::Dns { .. }) {
+            return false;
+        }
         if !self.config.allows_network_endpoint(&endpoint) {
             return false;
         }
@@ -2556,19 +2565,23 @@ impl Node {
         address: SocketAddr,
         transport_v2: Option<bool>,
     ) -> bool {
-        self.add_node_with_transport_name(address, address.to_string(), transport_v2)
+        self.add_node_endpoint_with_transport(
+            NetworkEndpoint::from_socket(address),
+            address.to_string(),
+            transport_v2,
+        )
     }
 
-    pub(crate) fn add_node_with_transport_name(
+    pub(crate) fn add_node_endpoint_with_transport(
         &self,
-        address: SocketAddr,
+        endpoint: NetworkEndpoint,
         display_name: String,
         transport_v2: Option<bool>,
     ) -> bool {
-        if !self.config.allows_address(address) {
+        if !self.config.allows_network_endpoint(&endpoint) {
             return false;
         }
-        let inserted = match self.added_nodes.write().entry(address) {
+        let inserted = match self.added_nodes.write().entry(endpoint.clone()) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(entry) => {
                 entry.insert(transport_v2);
@@ -2576,16 +2589,14 @@ impl Node {
             }
         };
         if inserted {
-            self.added_node_names.write().insert(address, display_name);
+            self.added_node_names
+                .write()
+                .insert(endpoint.clone(), display_name);
             if let Some(sender) = self.peer_manager_requests.read().as_ref() {
-                let _ = sender.send(p2p::PeerManagerRequest::Add(address, transport_v2));
+                let _ = sender.send(p2p::PeerManagerRequest::Add(endpoint, transport_v2));
             }
         }
         inserted
-    }
-
-    pub(crate) fn request_one_try(&self, address: SocketAddr, transport_v2: Option<bool>) {
-        self.request_one_try_with_connection_type(address, transport_v2, "outbound-full");
     }
 
     pub(crate) fn request_one_try_with_connection_type(
@@ -2594,12 +2605,25 @@ impl Node {
         transport_v2: Option<bool>,
         connection_type: &'static str,
     ) {
-        if !self.config.allows_address(address) {
+        self.request_one_try_endpoint_with_connection_type(
+            NetworkEndpoint::from_socket(address),
+            transport_v2,
+            connection_type,
+        );
+    }
+
+    pub(crate) fn request_one_try_endpoint_with_connection_type(
+        &self,
+        endpoint: NetworkEndpoint,
+        transport_v2: Option<bool>,
+        connection_type: &'static str,
+    ) {
+        if !self.config.allows_network_endpoint(&endpoint) {
             return;
         }
         if let Some(sender) = self.peer_manager_requests.read().as_ref() {
             let _ = sender.send(p2p::PeerManagerRequest::OneTry(
-                address,
+                endpoint,
                 transport_v2,
                 connection_type,
             ));
@@ -2607,35 +2631,63 @@ impl Node {
     }
 
     pub fn remove_node(&self, address: &SocketAddr) -> bool {
-        let removed = self.added_nodes.write().remove(address);
+        self.remove_node_endpoint(&NetworkEndpoint::from_socket(*address))
+    }
+
+    pub(crate) fn remove_node_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
+        let removed = self.added_nodes.write().remove(endpoint);
         if removed.is_some() {
-            self.added_node_names.write().remove(address);
+            self.added_node_names.write().remove(endpoint);
         }
-        self.disconnect_peer_at(*address);
+        if let Some(address) = endpoint.socket_addr() {
+            self.disconnect_peer_at(address);
+        } else {
+            let peer_ids = self
+                .peer_infos()
+                .into_iter()
+                .filter(|peer| &peer.endpoint == endpoint)
+                .map(|peer| peer.id)
+                .collect::<Vec<_>>();
+            for peer_id in peer_ids {
+                self.disconnect_peer(peer_id);
+            }
+        }
         removed.is_some()
     }
 
     pub fn added_nodes(&self) -> Vec<SocketAddr> {
-        self.added_nodes.read().keys().copied().collect()
+        self.added_nodes
+            .read()
+            .keys()
+            .filter_map(NetworkEndpoint::socket_addr)
+            .collect()
     }
 
-    pub(crate) fn is_node_added(&self, address: SocketAddr) -> bool {
-        self.added_nodes.read().contains_key(&address)
+    pub(crate) fn added_network_endpoints(&self) -> Vec<NetworkEndpoint> {
+        self.added_nodes.read().keys().cloned().collect()
+    }
+
+    pub(crate) fn is_node_added_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
+        self.added_nodes.read().contains_key(endpoint)
     }
 
     pub(crate) fn ensure_node_added(&self, address: SocketAddr) {
+        self.ensure_node_endpoint_added(NetworkEndpoint::from_socket(address));
+    }
+
+    pub(crate) fn ensure_node_endpoint_added(&self, endpoint: NetworkEndpoint) {
         if let std::collections::hash_map::Entry::Vacant(entry) =
-            self.added_nodes.write().entry(address)
+            self.added_nodes.write().entry(endpoint.clone())
         {
             entry.insert(None);
             self.added_node_names
                 .write()
-                .insert(address, address.to_string());
+                .insert(endpoint.clone(), endpoint.to_string());
         }
     }
 
-    pub(crate) fn added_node_name(&self, address: SocketAddr) -> Option<String> {
-        self.added_node_names.read().get(&address).cloned()
+    pub(crate) fn added_node_name(&self, endpoint: &NetworkEndpoint) -> Option<String> {
+        self.added_node_names.read().get(endpoint).cloned()
     }
 
     pub(crate) fn set_peer_manager_sender(
@@ -3281,11 +3333,21 @@ mod tests {
         let address = "192.0.2.10:18444".parse().unwrap();
 
         assert!(node.add_node_with_transport(address, Some(false)));
-        assert_eq!(node.added_nodes.read().get(&address), Some(&Some(false)));
+        assert_eq!(
+            node.added_nodes
+                .read()
+                .get(&NetworkEndpoint::from_socket(address)),
+            Some(&Some(false))
+        );
         assert!(!node.add_node_with_transport(address, Some(true)));
-        assert_eq!(node.added_nodes.read().get(&address), Some(&Some(false)));
+        assert_eq!(
+            node.added_nodes
+                .read()
+                .get(&NetworkEndpoint::from_socket(address)),
+            Some(&Some(false))
+        );
         assert!(node.remove_node(&address));
-        assert!(!node.is_node_added(address));
+        assert!(!node.is_node_added_endpoint(&NetworkEndpoint::from_socket(address)));
     }
 
     #[test]

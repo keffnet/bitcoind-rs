@@ -3046,7 +3046,7 @@ fn get_block_from_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let display_name = param::<String>(params, 0)?;
-    let address = parse_node_address(node, &display_name)?;
+    let endpoint = parse_node_endpoint(node, &display_name)?;
     let command = param::<String>(params, 1)?;
     let transport_v2 = params
         .get(2)
@@ -3059,17 +3059,21 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .transpose()?;
     match command.as_str() {
         "add" => {
-            if !node.add_node_with_transport_name(address, display_name, transport_v2) {
+            if !node.add_node_endpoint_with_transport(endpoint, display_name, transport_v2) {
                 bail!("node has already been added")
             }
             Ok(Value::Null)
         }
         "onetry" => {
-            node.request_one_try(address, transport_v2);
+            node.request_one_try_endpoint_with_connection_type(
+                endpoint,
+                transport_v2,
+                "outbound-full",
+            );
             Ok(Value::Null)
         }
         "remove" => {
-            if node.remove_node(&address) {
+            if node.remove_node_endpoint(&endpoint) {
                 Ok(Value::Null)
             } else {
                 bail!("Node has not been added")
@@ -3115,7 +3119,7 @@ fn disconnect_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn get_added_node_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let requested = match params.get(0) {
         None | Some(Value::Null) => None,
-        Some(value) => Some(parse_node_address(
+        Some(value) => Some(parse_node_endpoint(
             node,
             value
                 .as_str()
@@ -3124,20 +3128,23 @@ fn get_added_node_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     };
     let peers = node.peer_infos();
     let mut result = Vec::new();
-    let mut added_nodes = node.added_nodes();
+    let mut added_nodes = node.added_network_endpoints();
     added_nodes.sort_unstable();
-    for address in added_nodes {
-        if requested.is_some_and(|requested| requested != address) {
+    for endpoint in added_nodes {
+        if requested
+            .as_ref()
+            .is_some_and(|requested| requested != &endpoint)
+        {
             continue;
         }
-        let matching = peers.iter().find(|peer| peer.address == address);
+        let matching = peers.iter().find(|peer| peer.endpoint == endpoint);
         result.push(json!({
             "addednode": node
-                .added_node_name(address)
-                .unwrap_or_else(|| address.to_string()),
+                .added_node_name(&endpoint)
+                .unwrap_or_else(|| endpoint.to_string()),
             "connected": matching.is_some(),
             "addresses": matching.into_iter().map(|peer| json!({
-                "address": peer.address.to_string(),
+                "address": peer.endpoint.to_string(),
                 "connected": if peer.inbound { "inbound" } else { "outbound" },
             })).collect::<Vec<_>>(),
         }));
@@ -3213,21 +3220,44 @@ fn parse_socket_address(value: &str) -> Result<SocketAddr> {
         .map_err(|error| anyhow!("invalid network address {value}: {error}"))
 }
 
-fn parse_node_address(node: &Arc<Node>, value: &str) -> Result<SocketAddr> {
+fn parse_node_endpoint(node: &Arc<Node>, value: &str) -> Result<NetworkEndpoint> {
     if let Ok(address) = value.parse::<SocketAddr>() {
-        return Ok(address);
+        return Ok(NetworkEndpoint::from_socket(address));
     }
-    let address = value
-        .parse::<IpAddr>()
-        .map_err(|error| anyhow!("invalid network address {value}: {error}"))?;
+    if let Ok(address) = value.parse::<IpAddr>() {
+        return Ok(NetworkEndpoint::from_socket(SocketAddr::new(
+            address,
+            default_p2p_port(node.config.network),
+        )));
+    }
     let port = match node.config.network {
+        Network::Bitcoin
+        | Network::Testnet
+        | Network::Testnet4
+        | Network::Signet
+        | Network::Regtest => default_p2p_port(node.config.network),
+    };
+    let (host, port) = match value.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|error| anyhow!("invalid network address {value}: {error}"))?;
+            (host.trim_start_matches('[').trim_end_matches(']'), port)
+        }
+        None => (value, port),
+        Some(_) => bail!("invalid network address {value}"),
+    };
+    NetworkEndpoint::dns(host.to_owned(), port)
+}
+
+fn default_p2p_port(network: Network) -> u16 {
+    match network {
         Network::Bitcoin => 8333,
         Network::Testnet => 18333,
         Network::Testnet4 => 48333,
         Network::Signet => 38333,
         Network::Regtest => 18444,
-    };
-    Ok(SocketAddr::new(address, port))
+    }
 }
 
 fn parse_ip_address(value: &str) -> Result<IpAddr> {
@@ -15729,9 +15759,18 @@ mod tests {
         add_node(&node, &json!(["127.0.0.2", "add"])).unwrap();
         let bare = get_added_node_info(&node, &json!(["127.0.0.2"])).unwrap();
         assert_eq!(bare[0]["addednode"], "127.0.0.2");
-        assert!(node.is_node_added("127.0.0.2:18444".parse().unwrap()));
+        assert!(node.is_node_added_endpoint(&NetworkEndpoint::from_socket(
+            "127.0.0.2:18444".parse().unwrap(),
+        )));
         add_node(&node, &json!(["127.0.0.2", "remove"])).unwrap();
-        assert!(!node.is_node_added("127.0.0.2:18444".parse().unwrap()));
+        assert!(!node.is_node_added_endpoint(&NetworkEndpoint::from_socket(
+            "127.0.0.2:18444".parse().unwrap(),
+        )));
+
+        add_node(&node, &json!(["example.invalid:18444", "add"])).unwrap();
+        let hostname = get_added_node_info(&node, &json!(["example.invalid:18444"])).unwrap();
+        assert_eq!(hostname[0]["addednode"], "example.invalid:18444");
+        add_node(&node, &json!(["example.invalid:18444", "remove"])).unwrap();
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         node.register_peer(11, "127.0.0.1:18444".parse().unwrap(), false, sender);

@@ -2884,8 +2884,6 @@ async fn serve_peer_loop(
                                     &Message::Block(block),
                                 )
                                 .await?;
-                            } else {
-                                missing.push(item);
                             }
                         }
                         InventoryType::CompactBlock => {
@@ -2897,12 +2895,10 @@ async fn serve_peer_loop(
                                     continue;
                                 }
                                 let Some(height) = chain.block_height_by_hash(&item.hash) else {
-                                    missing.push(item);
                                     continue;
                                 };
                                 let recent = compact_block_is_recent(height, chain.height());
                                 let Some(block) = chain.block(&item.hash)? else {
-                                    missing.push(item);
                                     continue;
                                 };
                                 (block, recent)
@@ -2942,10 +2938,7 @@ async fn serve_peer_loop(
                                 continue;
                             }
                             let block = node.chain.write().block(&item.hash)?;
-                            let Some(block) = block else {
-                                missing.push(item);
-                                continue;
-                            };
+                            let Some(block) = block else { continue };
                             let matching = {
                                 let mut filter = bloom_filter.lock();
                                 let Some(filter) = filter.as_mut() else {
@@ -3035,7 +3028,7 @@ async fn serve_peer_loop(
                                 missing.push(item);
                             }
                         }
-                        _ => missing.push(item),
+                        _ => {}
                     }
                 }
                 if !missing.is_empty() {

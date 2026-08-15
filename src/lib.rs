@@ -3358,6 +3358,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,

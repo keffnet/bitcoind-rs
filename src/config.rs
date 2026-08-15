@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -575,6 +576,17 @@ pub struct Args {
     #[arg(long = "rpcauth", value_name = "USER:SALT$HASH")]
     pub rpc_auth: Vec<String>,
 
+    #[arg(long = "rpcwhitelist", value_name = "USER:METHOD[,METHOD]")]
+    pub rpc_whitelist: Vec<String>,
+
+    #[arg(
+        long = "rpcwhitelistdefault",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub rpc_whitelist_default: Option<bool>,
+
     #[arg(long, default_value = "127.0.0.1:30001")]
     pub electrum: SocketAddr,
 
@@ -890,6 +902,8 @@ pub struct Config {
     pub rpc_binds: Vec<SocketAddr>,
     pub(crate) rpc_allow_ips: Vec<IpSubnet>,
     pub(crate) rpc_auth: Vec<RpcAuth>,
+    pub(crate) rpc_whitelist: HashMap<String, HashSet<String>>,
+    pub(crate) rpc_whitelist_default: bool,
     pub electrum_bind: Option<SocketAddr>,
     pub rest: bool,
     pub seed_nodes: Vec<NetworkEndpoint>,
@@ -1005,6 +1019,10 @@ impl Config {
             args.rpc_user.as_deref(),
             args.rpc_password.as_deref(),
         )?;
+        let rpc_whitelist_default = args
+            .rpc_whitelist_default
+            .unwrap_or(!args.rpc_whitelist.is_empty());
+        let rpc_whitelist = parse_rpc_whitelist(&args.rpc_whitelist);
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
         }
@@ -1205,6 +1223,8 @@ impl Config {
             rpc_binds,
             rpc_allow_ips,
             rpc_auth,
+            rpc_whitelist,
+            rpc_whitelist_default,
             electrum_bind: Some(args.electrum),
             rest: args.rest,
             seed_nodes,
@@ -1372,6 +1392,24 @@ fn parse_rpc_auth(
         });
     }
     Ok(credentials)
+}
+
+fn parse_rpc_whitelist(values: &[String]) -> HashMap<String, HashSet<String>> {
+    let mut whitelist: HashMap<String, HashSet<String>> = HashMap::new();
+    for value in values {
+        let (username, methods) = value.split_once(':').unwrap_or((value, ""));
+        let methods = methods
+            .split([',', ' '])
+            .filter(|method| !method.is_empty())
+            .map(str::to_owned)
+            .collect::<HashSet<_>>();
+        if let Some(existing) = whitelist.get_mut(username) {
+            existing.retain(|method| methods.contains(method));
+        } else {
+            whitelist.insert(username.to_owned(), methods);
+        }
+    }
+    whitelist
 }
 
 fn parse_fee_rate(value: Option<&str>, default: &str, name: &str) -> Result<u64> {
@@ -1749,6 +1787,22 @@ mod tests {
                 if username == "rpc-user" && password == "rpc-password"
         ));
         assert!(matches!(config.rpc_auth[1], RpcAuth::Hmac { .. }));
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpcwhitelist=alice:getblock,getblockchaininfo",
+            "--rpcwhitelist=alice:getblock,getrawtransaction",
+            "--rpcwhitelistdefault=false",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.rpc_whitelist["alice"],
+            ["getblock".to_owned()].into_iter().collect()
+        );
+        assert!(!config.rpc_whitelist_default);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -195,9 +195,15 @@ async fn handle_connection(node: Arc<Node>, stream: TcpStream, peer: SocketAddr)
                     .await?;
                 return Ok(());
             }
-            if !authorized(&node, &request.headers) {
+            let Some(username) = authorized_user(&node, &request.headers) else {
                 connection
                     .write_response("401 Unauthorized", "text/plain", &[], false)
+                    .await?;
+                return Ok(());
+            };
+            if !rpc_request_allowed(&node, &username, &request.body) {
+                connection
+                    .write_response("403 Forbidden", "text/plain", &[], false)
                     .await?;
                 return Ok(());
             }
@@ -353,44 +359,72 @@ fn header_has_token(headers: &str, wanted_name: &str, wanted_value: &str) -> boo
     })
 }
 
+#[cfg(test)]
 fn authorized(node: &Arc<Node>, headers: &str) -> bool {
+    authorized_user(node, headers).is_some()
+}
+
+fn authorized_user(node: &Arc<Node>, headers: &str) -> Option<String> {
     let Some(value) = header_value(headers, "Authorization") else {
-        return node.rpc_cookie.is_none() && node.config.rpc_auth.is_empty();
+        return (node.rpc_cookie.is_none() && node.config.rpc_auth.is_empty()).then(String::new);
     };
-    let Some(encoded) = value.trim().strip_prefix("Basic ") else {
-        return false;
-    };
+    let encoded = value.trim().strip_prefix("Basic ")?;
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
-        return false;
+        return None;
     };
     if let Some(cookie) = node.rpc_cookie.as_deref()
         && constant_time_eq(&decoded, cookie.as_bytes())
     {
-        return true;
+        return Some("__cookie__".to_owned());
     }
     let Ok(decoded) = String::from_utf8(decoded) else {
-        return false;
+        return None;
     };
-    let Some((username, password)) = decoded.split_once(':') else {
+    let (username, password) = decoded.split_once(':')?;
+    node.config
+        .rpc_auth
+        .iter()
+        .any(|auth| match auth {
+            RpcAuth::Plain {
+                username: expected_username,
+                password: expected_password,
+            } => {
+                constant_time_eq(username.as_bytes(), expected_username.as_bytes())
+                    && constant_time_eq(password.as_bytes(), expected_password.as_bytes())
+            }
+            RpcAuth::Hmac {
+                username: expected_username,
+                salt,
+                hash,
+            } => {
+                constant_time_eq(username.as_bytes(), expected_username.as_bytes())
+                    && constant_time_eq(&hmac_sha256(salt, password.as_bytes()), hash)
+            }
+        })
+        .then(|| username.to_owned())
+}
+
+fn rpc_request_allowed(node: &Arc<Node>, username: &str, body: &[u8]) -> bool {
+    let user_whitelist = node.config.rpc_whitelist.get(username);
+    if user_whitelist.is_none() && node.config.rpc_whitelist_default {
         return false;
+    }
+    let Some(user_whitelist) = user_whitelist else {
+        return true;
     };
-    node.config.rpc_auth.iter().any(|auth| match auth {
-        RpcAuth::Plain {
-            username: expected_username,
-            password: expected_password,
-        } => {
-            constant_time_eq(username.as_bytes(), expected_username.as_bytes())
-                && constant_time_eq(password.as_bytes(), expected_password.as_bytes())
-        }
-        RpcAuth::Hmac {
-            username: expected_username,
-            salt,
-            hash,
-        } => {
-            constant_time_eq(username.as_bytes(), expected_username.as_bytes())
-                && constant_time_eq(&hmac_sha256(salt, password.as_bytes()), hash)
-        }
-    })
+    let Ok(request) = serde_json::from_slice::<Value>(body) else {
+        return true;
+    };
+    let method_allowed = |request: &Value| {
+        request
+            .get("method")
+            .and_then(Value::as_str)
+            .is_none_or(|method| user_whitelist.contains(method))
+    };
+    match request {
+        Value::Array(requests) => requests.iter().all(method_allowed),
+        request => method_allowed(&request),
+    }
 }
 
 fn rpc_client_allowed(node: &Arc<Node>, address: IpAddr) -> bool {
@@ -12121,6 +12155,39 @@ mod tests {
     }
 
     #[test]
+    fn rpc_method_whitelists_cover_single_and_batch_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpcuser=alice",
+            "--rpcpassword=rpc-password",
+            "--rpcwhitelist=alice:getblock,getblockchaininfo",
+        ])
+        .unwrap();
+        let node = Node::open(Config::from_args(args).unwrap()).unwrap();
+        let headers = basic_auth_header("alice", "rpc-password");
+        let username = authorized_user(&node, &headers).unwrap();
+        assert_eq!(username, "alice");
+        assert!(rpc_request_allowed(
+            &node,
+            &username,
+            br#"{"jsonrpc":"1.0","method":"getblock","params":[],"id":1}"#
+        ));
+        assert!(!rpc_request_allowed(
+            &node,
+            &username,
+            br#"{"jsonrpc":"1.0","method":"getrawmempool","params":[],"id":1}"#
+        ));
+        assert!(!rpc_request_allowed(
+            &node,
+            &username,
+            br#"[{"method":"getblock","id":1},{"method":"getrawmempool","id":2}]"#
+        ));
+    }
+
+    #[test]
     fn http_statuses_match_core_json_rpc_error_classes() {
         assert_eq!(
             json_rpc_error_status(&json!({"error": {"code": -32600}})),
@@ -12265,6 +12332,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12504,6 +12573,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12616,6 +12687,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12753,6 +12826,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12827,6 +12902,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12904,6 +12981,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13016,6 +13095,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13160,6 +13241,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13473,6 +13556,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13579,6 +13664,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13668,6 +13755,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13750,6 +13839,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13835,6 +13926,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13907,6 +14000,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13988,6 +14083,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14058,6 +14155,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: true,
             listen: true,
@@ -14205,6 +14304,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: true,
             listen: true,
@@ -14300,6 +14401,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14389,6 +14492,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14516,6 +14621,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14607,6 +14714,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14729,6 +14838,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14933,6 +15044,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15120,6 +15233,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15191,6 +15306,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15264,6 +15381,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15342,6 +15461,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15426,6 +15547,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: true,
             listen: true,
@@ -15517,6 +15640,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15606,6 +15731,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15743,6 +15870,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15911,6 +16040,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15984,6 +16115,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16226,6 +16359,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16363,6 +16498,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16496,6 +16633,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16699,6 +16838,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17011,6 +17152,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17093,6 +17236,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17300,6 +17445,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17386,6 +17533,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17804,6 +17953,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17885,6 +18036,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18005,6 +18158,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18256,6 +18411,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18680,6 +18837,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18825,6 +18984,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18997,6 +19158,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -19275,6 +19438,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -19359,6 +19524,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -19464,6 +19631,8 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_whitelist: std::collections::HashMap::new(),
+            rpc_whitelist_default: false,
             electrum_bind: None,
             rest: false,
             listen: true,

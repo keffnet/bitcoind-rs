@@ -505,6 +505,7 @@ struct BackgroundValidation {
 
 struct BackgroundValidationJob {
     data_dir: PathBuf,
+    blocks_dir: PathBuf,
     network: Network,
     signet_challenge: Option<Vec<u8>>,
     active_chain: Vec<BlockHash>,
@@ -590,6 +591,7 @@ fn load_snapshot_provenance(path: &Path) -> Result<SnapshotProvenance> {
 pub struct ChainState {
     pub network: Network,
     data_dir: PathBuf,
+    blocks_dir: PathBuf,
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     filter_store: FilterStore,
@@ -719,9 +721,10 @@ impl ChainState {
         tx_index_all_enabled: bool,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_owned();
+        let blocks_dir = blocks_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
-        let mut store = BlockStore::open(blocks_dir)?;
+        let mut store = BlockStore::open(&blocks_dir)?;
         let filter_store = FilterStore::open(data_dir.join("filters"))?;
         let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
         let genesis = genesis_block(network);
@@ -827,6 +830,7 @@ impl ChainState {
         let mut state = Self {
             network,
             data_dir,
+            blocks_dir,
             signet_challenge: (network == Network::Signet).then(|| {
                 signet_challenge
                     .map(ToOwned::to_owned)
@@ -5122,6 +5126,7 @@ impl ChainState {
         let active_chain = self.active_chain.clone();
         let block_index = self.block_index.clone();
         let data_dir = self.data_dir.clone();
+        let blocks_dir = self.blocks_dir.clone();
         let network = self.network;
         let signet_challenge = self.signet_challenge.clone();
         if let Some(previous) = self.background_validation.take() {
@@ -5137,6 +5142,7 @@ impl ChainState {
         let cancel = Arc::new(AtomicBool::new(false));
         let job = BackgroundValidationJob {
             data_dir,
+            blocks_dir,
             network,
             signet_challenge,
             active_chain,
@@ -5423,11 +5429,12 @@ fn persist_assumeutxo_checkpoint(data_dir: &Path, checkpoint: &AssumeUtxoCheckpo
 fn open_background_replay_state(
     network: Network,
     data_dir: &Path,
+    blocks_dir: &Path,
     signet_challenge: Option<Vec<u8>>,
     active_chain: &[BlockHash],
     block_index: &HashMap<BlockHash, BlockNode>,
 ) -> Result<ChainState> {
-    let store = BlockStore::open_read_only(data_dir.join("blocks"))?;
+    let store = BlockStore::open_read_only(blocks_dir)?;
     let filter_store = FilterStore::open(data_dir.join("filters"))?;
     let chainstate_store = ChainstateStore::open(data_dir.join("chainstate"))?;
     let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
@@ -5443,6 +5450,7 @@ fn open_background_replay_state(
     Ok(ChainState {
         network,
         data_dir: data_dir.to_owned(),
+        blocks_dir: blocks_dir.to_owned(),
         signet_challenge,
         store,
         filter_store,
@@ -5487,6 +5495,7 @@ fn run_background_validation(
 ) -> BackgroundValidationOutcome {
     let BackgroundValidationJob {
         data_dir,
+        blocks_dir,
         network,
         signet_challenge,
         active_chain,
@@ -5526,6 +5535,7 @@ fn run_background_validation(
         let mut state = open_background_replay_state(
             network,
             &data_dir,
+            &blocks_dir,
             signet_challenge,
             &active_chain,
             &block_index,

@@ -9981,8 +9981,13 @@ fn mining_block_version_with_params(
         .flatten();
     let mut version = custom_version.unwrap_or(0x2000_0000);
     if custom_version.is_none() {
+        // VersionBitsCache::ComputeBlockVersion(pindexPrev) returns the
+        // version for the block after the current tip.  The state changes
+        // only at period boundaries, so use the height being mined rather
+        // than the height of its parent.
+        let next_height = tip_height.saturating_add(1);
         for deployment in deployment_parameters.bip9 {
-            let (state, _) = bip9_state_at_height(headers, deployment, tip_height);
+            let (state, _) = bip9_state_at_height(headers, deployment, next_height);
             if matches!(state, Bip9State::Started | Bip9State::LockedIn) {
                 version |= 1i32 << deployment.bit;
             }
@@ -10163,7 +10168,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .filter_map(|txid| mempool.get(txid).map(|entry| entry.transaction.clone()))
         .collect::<Vec<_>>();
     let headers = chain.active_headers();
-    let version = mining_block_version_with_params(
+    let mut version = mining_block_version_with_params(
         &deployment_parameters,
         headers,
         tip.height,
@@ -10195,22 +10200,46 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     });
     let coinbase_value =
         validation::block_subsidy_for_network(chain.network, height).saturating_add(fees);
-    let mut rules = vec!["csv"];
+    let mut rules = vec!["csv".to_owned()];
     if segwit_active {
-        rules.push("!segwit");
+        rules.push("!segwit".to_owned());
     }
     if chain.network == Network::Signet {
-        rules.push("!signet");
+        rules.push("!signet".to_owned());
     }
     let [testdummy, taproot] = deployment_parameters.bip9;
     let mut vbavailable = serde_json::Map::new();
     for (name, deployment) in [("testdummy", testdummy), ("taproot", taproot)] {
-        let (state, _) = bip9_state_at_height(headers, deployment, tip.height);
+        // VersionBitsCache::GBTStatus(*pindexPrev, ...) reports the state
+        // governing the block after pindexPrev.  `bip9_state_at_height`
+        // takes that next block height explicitly.
+        let next_height = tip.height.saturating_add(1);
+        let (state, _) = bip9_state_at_height(headers, deployment, next_height);
+        // Core v31.1 marks both currently registered versionbits deployments
+        // as optional in GBT. Keep the rule construction explicit so the
+        // mandatory-rule behavior remains visible if a deployment changes.
+        let gbt_optional_rule = true;
+        let gbt_rule = if gbt_optional_rule {
+            name.to_owned()
+        } else {
+            format!("!{name}")
+        };
         match state {
             Bip9State::Started | Bip9State::LockedIn => {
-                vbavailable.insert(name.to_owned(), json!(deployment.bit));
+                if matches!(state, Bip9State::LockedIn) {
+                    version |= 1i32 << deployment.bit;
+                }
+                vbavailable.insert(gbt_rule, json!(deployment.bit));
+                if !gbt_optional_rule && !requested_rules.contains(&name) {
+                    version &= !(1i32 << deployment.bit);
+                }
             }
-            Bip9State::Active => rules.push(name),
+            Bip9State::Active => {
+                rules.push(gbt_rule);
+                if !gbt_optional_rule && !requested_rules.contains(&name) {
+                    bail!("Support for '{name}' rule requires explicit client support");
+                }
+            }
             Bip9State::Defined | Bip9State::Failed => {}
         }
     }
@@ -17316,6 +17345,47 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(unexpected_option_key.to_string(), "Unexpected key unknown");
+    }
+
+    #[test]
+    fn mining_version_uses_the_state_for_the_next_block() {
+        let deployment = validation::bip9_deployments(Network::Regtest)[0];
+        let period = usize::try_from(deployment.period).unwrap();
+        let signalled_version = 0x2000_0000 | (1u32 << deployment.bit);
+        let headers = (0..period * 3)
+            .map(|height| Header {
+                version: BlockVersion::from_consensus(signalled_version as i32),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: u32::try_from(height + 1).unwrap(),
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            })
+            .collect::<Vec<_>>();
+
+        let started = mining_block_version(
+            Network::Regtest,
+            &headers,
+            u32::try_from(period - 1).unwrap(),
+            None,
+        );
+        assert_eq!(started, signalled_version as i32);
+
+        let locked_in = mining_block_version(
+            Network::Regtest,
+            &headers,
+            u32::try_from(period * 2 - 1).unwrap(),
+            None,
+        );
+        assert_eq!(locked_in, signalled_version as i32);
+
+        let active = mining_block_version(
+            Network::Regtest,
+            &headers,
+            u32::try_from(period * 3 - 1).unwrap(),
+            None,
+        );
+        assert_eq!(active, 0x2000_0000);
     }
 
     #[test]

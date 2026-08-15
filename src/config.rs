@@ -576,6 +576,12 @@ pub struct Args {
     #[arg(long = "rpcauth", value_name = "USER:SALT$HASH")]
     pub rpc_auth: Vec<String>,
 
+    #[arg(long = "rpccookiefile", value_name = "PATH")]
+    pub rpc_cookie_file: Option<PathBuf>,
+
+    #[arg(long = "norpccookiefile", default_value_t = false)]
+    pub no_rpc_cookie_file: bool,
+
     #[arg(long = "rpcwhitelist", value_name = "USER:METHOD[,METHOD]")]
     pub rpc_whitelist: Vec<String>,
 
@@ -902,6 +908,7 @@ pub struct Config {
     pub rpc_binds: Vec<SocketAddr>,
     pub(crate) rpc_allow_ips: Vec<IpSubnet>,
     pub(crate) rpc_auth: Vec<RpcAuth>,
+    pub(crate) rpc_cookie_path: Option<PathBuf>,
     pub(crate) rpc_whitelist: HashMap<String, HashSet<String>>,
     pub(crate) rpc_whitelist_default: bool,
     pub electrum_bind: Option<SocketAddr>,
@@ -1024,6 +1031,22 @@ impl Config {
             args.rpc_user.as_deref(),
             args.rpc_password.as_deref(),
         )?;
+        if args.no_rpc_cookie_file && args.rpc_cookie_file.is_some() {
+            bail!("--norpccookiefile cannot be combined with --rpccookiefile");
+        }
+        let rpc_cookie_path = if args.no_rpc_cookie_file {
+            None
+        } else {
+            let path = args
+                .rpc_cookie_file
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(".cookie"));
+            Some(if path.is_absolute() {
+                path
+            } else {
+                args.datadir.join(path)
+            })
+        };
         let rpc_whitelist_default = args
             .rpc_whitelist_default
             .unwrap_or(!args.rpc_whitelist.is_empty());
@@ -1228,6 +1251,7 @@ impl Config {
             rpc_binds,
             rpc_allow_ips,
             rpc_auth,
+            rpc_cookie_path,
             rpc_whitelist,
             rpc_whitelist_default,
             electrum_bind: Some(args.electrum),
@@ -1826,6 +1850,28 @@ mod tests {
             ["getblock".to_owned()].into_iter().collect()
         );
         assert!(!config.rpc_whitelist_default);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpccookiefile=auth/rpc.cookie",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.rpc_cookie_path,
+            Some(directory.path().join("auth/rpc.cookie"))
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--norpccookiefile",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().rpc_cookie_path.is_none());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

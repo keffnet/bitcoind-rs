@@ -811,14 +811,15 @@ impl Node {
         let (zmq_events, _) = broadcast::channel(4_096);
         let zmq_mempool_sequence = mempool.sequence();
         let rpc_cookie = config
-            .rpc_bind
+            .rpc_cookie_path
+            .clone()
             .filter(|_| {
                 !config
                     .rpc_auth
                     .iter()
                     .any(|auth| auth.uses_plaintext_password())
             })
-            .map(|_| load_rpc_cookie(&config.datadir))
+            .map(|path| load_rpc_cookie(&path))
             .transpose()?;
         Ok(Arc::new(Self {
             config,
@@ -3319,10 +3320,14 @@ fn unix_time_seconds() -> u64 {
     time::unix_time()
 }
 
-fn load_rpc_cookie(data_dir: &Path) -> Result<String> {
-    let path = data_dir.join(".cookie");
+fn load_rpc_cookie(path: &Path) -> Result<String> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     let cookie = format!("__cookie__:{}", hex::encode(random::<[u8; 32]>()));
-    let temp = data_dir.join(".cookie.tmp");
+    let temp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
     std::fs::write(&temp, &cookie)?;
     #[cfg(unix)]
     {
@@ -3355,6 +3360,7 @@ mod tests {
             rpc_binds: Vec::new(),
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
+            rpc_cookie_path: None,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -3602,8 +3608,9 @@ mod tests {
     #[test]
     fn rpc_cookie_rotates_on_each_startup() {
         let directory = tempfile::tempdir().unwrap();
-        let first = load_rpc_cookie(directory.path()).unwrap();
-        let second = load_rpc_cookie(directory.path()).unwrap();
+        let cookie_path = directory.path().join(".cookie");
+        let first = load_rpc_cookie(&cookie_path).unwrap();
+        let second = load_rpc_cookie(&cookie_path).unwrap();
         assert_ne!(first, second);
         assert_eq!(
             fs::read_to_string(directory.path().join(".cookie"))

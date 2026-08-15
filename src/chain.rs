@@ -548,7 +548,7 @@ impl Default for ScriptValidationCache {
 impl ScriptValidationCache {
     fn with_max_entries(max_entries: usize) -> Self {
         Self {
-            max_entries,
+            max_entries: max_entries.max(2),
             ..Self::default()
         }
     }
@@ -1713,15 +1713,11 @@ impl ChainState {
             .unwrap_or(u64::MAX)
             .saturating_mul(1024 * 1024);
         let mut cache = self.script_cache.lock();
-        cache.max_entries = usize::try_from(bytes / 64).unwrap_or(usize::MAX);
+        cache.max_entries = usize::try_from(bytes / 64).unwrap_or(usize::MAX).max(2);
         while cache.order.len() > cache.max_entries {
             if let Some(key) = cache.order.pop_front() {
                 cache.entries.remove(&key);
             }
-        }
-        if cache.max_entries == 0 {
-            cache.entries.clear();
-            cache.order.clear();
         }
     }
 
@@ -4236,7 +4232,7 @@ impl ChainState {
         for job in pending {
             let key =
                 self.script_cache_key(block_hash, height, job.transaction, &job.previous_outputs);
-            if cache.max_entries == 0 || cache.entries.contains(&key) {
+            if cache.entries.contains(&key) {
                 continue;
             }
             if cache.order.len() >= cache.max_entries
@@ -6816,7 +6812,7 @@ mod tests {
     #[test]
     fn successful_script_checks_are_cached_by_block_context() {
         let directory = tempfile::tempdir().unwrap();
-        let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
         let block = mine_block(&state, 1);
         let transaction = Transaction {
             version: Version::ONE,
@@ -6845,6 +6841,8 @@ mod tests {
         assert_eq!(state.script_cache.lock().entries.len(), 1);
         state.validate_script_checks(&block, 1, &jobs).unwrap();
         assert_eq!(state.script_cache.lock().entries.len(), 1);
+        state.configure_script_cache_size_mib(0);
+        assert_eq!(state.script_cache.lock().max_entries, 2);
     }
 
     #[test]

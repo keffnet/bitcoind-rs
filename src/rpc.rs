@@ -4950,24 +4950,23 @@ fn decode_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn combine_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let transactions = decode_raw_transaction_variants(params)?;
-    let combined = combine_transaction_variants(&transactions)?;
+    let mut combined = combine_transaction_variants(&transactions)?;
     let chain = node.chain.read();
     let mempool = node.mempool.read();
-    for input in &combined.input {
-        let available = !mempool.is_spent(&input.previous_output)
-            && (chain.utxo(&input.previous_output).is_some()
+    for input_index in 0..combined.input.len() {
+        let previous_output = combined.input[input_index].previous_output;
+        let available = !mempool.is_spent(&previous_output)
+            && (chain.utxo(&previous_output).is_some()
                 || mempool
-                    .get(&input.previous_output.txid)
-                    .and_then(|entry| {
-                        entry
-                            .transaction
-                            .output
-                            .get(input.previous_output.vout as usize)
-                    })
+                    .get(&previous_output.txid)
+                    .and_then(|entry| entry.transaction.output.get(previous_output.vout as usize))
                     .is_some());
         if !available {
             bail!("Input not found or already spent")
         }
+        let previous_output = output_for_outpoint(&chain, &mempool, previous_output)
+            .expect("available combiner input has an output");
+        combine_multisig_input(&mut combined, input_index, &transactions, &previous_output)?;
     }
     Ok(json!(hex::encode(serialize(&combined))))
 }
@@ -5026,6 +5025,209 @@ fn raw_transactions_match(left: &Transaction, right: &Transaction) -> bool {
         && left.input.iter().zip(&right.input).all(|(left, right)| {
             left.previous_output == right.previous_output && left.sequence == right.sequence
         })
+}
+
+#[derive(Clone)]
+struct MultisigCombinationContext {
+    script: ScriptBuf,
+    segwit: bool,
+    redeem_script: Option<ScriptBuf>,
+}
+
+fn combine_multisig_input(
+    transaction: &mut Transaction,
+    input_index: usize,
+    variants: &[Transaction],
+    previous_output: &TxOut,
+) -> Result<()> {
+    let Some(context) = variants
+        .iter()
+        .filter_map(|variant| variant.input.get(input_index))
+        .find_map(|input| multisig_combination_context(previous_output, input))
+    else {
+        return Ok(());
+    };
+    let Some((required, public_keys)) = multisig_script_keys(context.script.as_script()) else {
+        return Ok(());
+    };
+
+    let mut candidates = Vec::<Vec<u8>>::new();
+    for input in variants
+        .iter()
+        .filter_map(|variant| variant.input.get(input_index))
+    {
+        for signature in multisig_signature_items(input, &context) {
+            if !signature.is_empty() && !candidates.contains(&signature) {
+                candidates.push(signature);
+            }
+        }
+    }
+
+    let secp = Secp256k1::verification_only();
+    let mut ordered = Vec::new();
+    for public_key in public_keys {
+        if let Some(signature) = candidates.iter().find(|signature| {
+            verify_multisig_signature(
+                transaction,
+                input_index,
+                previous_output,
+                &context,
+                public_key,
+                signature,
+                &secp,
+            )
+        }) {
+            ordered.push(signature.clone());
+        }
+        if ordered.len() == required {
+            break;
+        }
+    }
+    if ordered.is_empty() {
+        return Ok(());
+    }
+
+    if context.segwit {
+        let mut stack = Vec::with_capacity(ordered.len().saturating_add(2));
+        stack.push(Vec::new());
+        stack.extend(ordered);
+        stack.push(context.script.to_bytes());
+        transaction.input[input_index].witness = Witness::from_slice(&stack);
+        transaction.input[input_index].script_sig = context
+            .redeem_script
+            .as_ref()
+            .map(|script| push_script_items(&[script.to_bytes()]))
+            .transpose()?
+            .unwrap_or_default();
+    } else {
+        let mut stack = Vec::with_capacity(ordered.len().saturating_add(2));
+        stack.push(Vec::new());
+        stack.extend(ordered);
+        if let Some(redeem_script) = &context.redeem_script {
+            stack.push(redeem_script.to_bytes());
+        }
+        transaction.input[input_index].script_sig = push_script_items(&stack)?;
+    }
+    Ok(())
+}
+
+fn multisig_combination_context(
+    previous_output: &TxOut,
+    input: &TxIn,
+) -> Option<MultisigCombinationContext> {
+    if previous_output.script_pubkey.is_p2sh() {
+        let redeem_script = last_pushed_script(&input.script_sig)?;
+        if ScriptBuf::new_p2sh(&redeem_script.script_hash()) != previous_output.script_pubkey {
+            return None;
+        }
+        if redeem_script.is_p2wsh() {
+            let witness = input.witness.to_vec();
+            let witness_script = ScriptBuf::from_bytes(witness.last()?.clone());
+            if ScriptBuf::new_p2wsh(&witness_script.wscript_hash()) != redeem_script {
+                return None;
+            }
+            return Some(MultisigCombinationContext {
+                script: witness_script,
+                segwit: true,
+                redeem_script: Some(redeem_script),
+            });
+        }
+        return Some(MultisigCombinationContext {
+            script: redeem_script.clone(),
+            segwit: false,
+            redeem_script: Some(redeem_script),
+        });
+    }
+    if previous_output.script_pubkey.is_p2wsh() {
+        let witness = input.witness.to_vec();
+        let witness_script = ScriptBuf::from_bytes(witness.last()?.clone());
+        if ScriptBuf::new_p2wsh(&witness_script.wscript_hash()) != previous_output.script_pubkey {
+            return None;
+        }
+        return Some(MultisigCombinationContext {
+            script: witness_script,
+            segwit: true,
+            redeem_script: None,
+        });
+    }
+    Some(MultisigCombinationContext {
+        script: previous_output.script_pubkey.clone(),
+        segwit: false,
+        redeem_script: None,
+    })
+}
+
+fn last_pushed_script(script: &bitcoin::Script) -> Option<ScriptBuf> {
+    script
+        .instructions()
+        .filter_map(|instruction| match instruction {
+            Ok(Instruction::PushBytes(bytes)) => Some(bytes.as_bytes().to_vec()),
+            _ => None,
+        })
+        .last()
+        .map(ScriptBuf::from_bytes)
+}
+
+fn multisig_signature_items(input: &TxIn, context: &MultisigCombinationContext) -> Vec<Vec<u8>> {
+    if context.segwit {
+        let witness = input.witness.to_vec();
+        if witness.len() < 2 {
+            return Vec::new();
+        }
+        return witness[1..witness.len() - 1].to_vec();
+    }
+    let mut items = input
+        .script_sig
+        .instructions()
+        .filter_map(|instruction| {
+            instruction
+                .ok()?
+                .push_bytes()
+                .map(|bytes| bytes.as_bytes().to_vec())
+        })
+        .collect::<Vec<_>>();
+    if context.redeem_script.is_some() {
+        items.pop();
+    }
+    items
+}
+
+fn verify_multisig_signature(
+    transaction: &Transaction,
+    input_index: usize,
+    previous_output: &TxOut,
+    context: &MultisigCombinationContext,
+    public_key: bitcoin::PublicKey,
+    signature_bytes: &[u8],
+    secp: &Secp256k1<bitcoin::secp256k1::VerifyOnly>,
+) -> bool {
+    let Ok(signature) = EcdsaSignature::from_slice(signature_bytes) else {
+        return false;
+    };
+    let message = if context.segwit {
+        let sighash = SighashCache::new(transaction).p2wsh_signature_hash(
+            input_index,
+            &context.script,
+            previous_output.value,
+            signature.sighash_type,
+        );
+        let Ok(sighash) = sighash else {
+            return false;
+        };
+        Message::from(sighash)
+    } else {
+        let sighash = SighashCache::new(transaction).legacy_signature_hash(
+            input_index,
+            &context.script,
+            signature.sighash_type.to_u32(),
+        );
+        let Ok(sighash) = sighash else {
+            return false;
+        };
+        Message::from(sighash)
+    };
+    secp.verify_ecdsa(&message, &signature.signature, &public_key.inner)
+        .is_ok()
 }
 
 fn choose_script_sig(left: &ScriptBuf, right: &ScriptBuf) -> ScriptBuf {
@@ -5116,11 +5318,14 @@ fn merge_multisig_witnesses(left: &Witness, right: &Witness) -> Option<Witness> 
     {
         return None;
     }
-    let mut stack = left[1..left.len() - 1]
-        .iter()
-        .chain(&right[1..right.len() - 1])
-        .map(|item| item.to_vec())
-        .collect::<Vec<_>>();
+    let mut stack = vec![Vec::new()];
+    stack.extend(
+        left[1..left.len() - 1]
+            .iter()
+            .chain(&right[1..right.len() - 1])
+            .map(|item| item.to_vec())
+            .collect::<Vec<_>>(),
+    );
     stack.dedup();
     stack.push(left.last()?.to_vec());
     Some(Witness::from_slice(&stack))
@@ -8195,8 +8400,8 @@ fn sign_transaction_input(
                 break;
             }
         }
-        if signatures.len() < required {
-            bail!("not enough private keys match the multisig script")
+        if signatures.is_empty() {
+            bail!("no private key matches the multisig script")
         }
         let mut items = vec![Vec::new()];
         items.extend(signatures);
@@ -15672,6 +15877,94 @@ mod tests {
 
         first.output[0].value = bitcoin::Amount::from_sat(999);
         assert!(combine_transaction_variants(&[first, second]).is_err());
+    }
+
+    #[test]
+    fn combine_raw_transaction_orders_verified_multisig_signatures() {
+        let secp = Secp256k1::new();
+        let private_keys = [1u8, 2, 3].map(|seed| {
+            bitcoin::PrivateKey::new(
+                bitcoin::secp256k1::SecretKey::from_slice(&[seed; 32]).unwrap(),
+                Network::Regtest,
+            )
+        });
+        let public_keys = private_keys.map(|key| key.public_key(&secp));
+        let witness_script = Builder::new()
+            .push_int(2)
+            .push_key(&public_keys[0])
+            .push_key(&public_keys[1])
+            .push_key(&public_keys[2])
+            .push_int(3)
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
+            .into_script();
+        let previous_output = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: Address::p2wsh(&witness_script, Network::Regtest).script_pubkey(),
+        };
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let signing_prevout = SigningPrevout {
+            output: previous_output.clone(),
+            amount_provided: true,
+            redeem_script: None,
+            witness_script: Some(witness_script.clone()),
+        };
+        let sighash_type = DescriptorSighashType {
+            ecdsa: EcdsaSighashType::All,
+            taproot: TapSighashType::Default,
+        };
+        let previous_outputs = [previous_output.clone()];
+        let mut first = unsigned.clone();
+        sign_transaction_input(
+            &mut first,
+            0,
+            &signing_prevout,
+            &[private_keys[0]],
+            &secp,
+            sighash_type,
+            Some(&previous_outputs),
+        )
+        .unwrap();
+        let mut second = unsigned;
+        sign_transaction_input(
+            &mut second,
+            0,
+            &signing_prevout,
+            &[private_keys[2]],
+            &secp,
+            sighash_type,
+            Some(&previous_outputs),
+        )
+        .unwrap();
+
+        let mut combined = combine_transaction_variants(&[second.clone(), first.clone()]).unwrap();
+        let unordered = combined.input[0].witness.to_vec();
+        assert_eq!(unordered[1], second.input[0].witness.to_vec()[1]);
+        assert_eq!(unordered[2], first.input[0].witness.to_vec()[1]);
+        combine_multisig_input(
+            &mut combined,
+            0,
+            &[second.clone(), first.clone()],
+            &previous_output,
+        )
+        .unwrap();
+        let ordered = combined.input[0].witness.to_vec();
+        assert_eq!(ordered[1], first.input[0].witness.to_vec()[1]);
+        assert_eq!(ordered[2], second.input[0].witness.to_vec()[1]);
+        validation::validate_transaction_scripts(Network::Regtest, 1, &combined, &previous_outputs)
+            .unwrap();
     }
 
     #[test]

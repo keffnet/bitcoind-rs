@@ -881,6 +881,11 @@ pub struct Args {
     #[arg(long = "noconf", default_value_t = false)]
     pub no_config: bool,
 
+    /// Skip `includeconf=` directives from the selected configuration file.
+    /// Core permits this negated option on the command line only.
+    #[arg(long = "noincludeconf", default_value_t = false, hide = true)]
+    pub no_include_conf: bool,
+
     #[arg(
         long = "allowignoredconf",
         default_value_t = false,
@@ -1658,6 +1663,7 @@ impl Args {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./data"));
         let no_config = raw_bool_option(&raw, "noconf");
+        let no_include_conf = raw_bool_option(&raw, "noincludeconf");
         let explicit_config = raw_option_value(&raw, "conf");
         let config_path = explicit_config
             .as_deref()
@@ -1673,7 +1679,13 @@ impl Args {
         let mut entries = Vec::new();
         if !no_config {
             if config_path.exists() {
-                read_config_file(&config_path, &datadir, &mut entries, &mut Vec::new())?;
+                read_config_file(
+                    &config_path,
+                    &datadir,
+                    &mut entries,
+                    &mut Vec::new(),
+                    !no_include_conf,
+                )?;
             } else if explicit_config
                 .as_deref()
                 .is_some_and(|value| !value.is_empty())
@@ -1859,6 +1871,7 @@ fn read_config_file(
     datadir: &Path,
     entries: &mut Vec<ConfigFileEntry>,
     stack: &mut Vec<PathBuf>,
+    allow_includes: bool,
 ) -> Result<()> {
     let path = fs::canonicalize(path)
         .with_context(|| format!("resolving configuration file {}", path.display()))?;
@@ -1914,20 +1927,23 @@ fn read_config_file(
                 line_number + 1
             );
         }
-        if key == "includeconf" {
+        if key == "includeconf" && allow_includes {
             let include_path = PathBuf::from(&value);
             let include_path = if include_path.is_absolute() {
                 include_path
             } else {
                 datadir.join(include_path)
             };
-            read_config_file(&include_path, datadir, entries, stack)?;
-        } else {
+            read_config_file(&include_path, datadir, entries, stack, allow_includes)?;
+        } else if key != "includeconf" {
             entries.push(ConfigFileEntry {
                 section: section.clone(),
                 key,
                 value,
             });
+        } else {
+            // `-noincludeconf` deliberately suppresses this directive and
+            // its file, matching Core's command-line startup override.
         }
     }
     stack.pop();
@@ -3315,6 +3331,17 @@ mod tests {
         assert_eq!(args.max_peers, 5);
         assert_eq!(args.wallets, vec!["compat"]);
         assert!(!args.server);
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noincludeconf",
+        ])
+        .unwrap();
+        assert_eq!(args.network, NetworkName::Regtest);
+        assert_eq!(args.max_peers, 5);
+        assert!(args.rpc_allow_ips.is_empty());
 
         let args = Args::parse_from_with_config([
             "bitcoind-rs",

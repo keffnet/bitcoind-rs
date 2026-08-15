@@ -3321,9 +3321,6 @@ fn unix_time_seconds() -> u64 {
 
 fn load_rpc_cookie(data_dir: &Path) -> Result<String> {
     let path = data_dir.join(".cookie");
-    if path.exists() {
-        return Ok(std::fs::read_to_string(path)?.trim().to_owned());
-    }
     let cookie = format!("__cookie__:{}", hex::encode(random::<[u8; 32]>()));
     let temp = data_dir.join(".cookie.tmp");
     std::fs::write(&temp, &cookie)?;
@@ -3599,6 +3596,20 @@ mod tests {
         assert_eq!(
             loaded[&legacy_subnet].address,
             "192.0.2.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn rpc_cookie_rotates_on_each_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = load_rpc_cookie(directory.path()).unwrap();
+        let second = load_rpc_cookie(directory.path()).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            fs::read_to_string(directory.path().join(".cookie"))
+                .unwrap()
+                .trim(),
+            second
         );
     }
 

@@ -2321,7 +2321,7 @@ fn validate_standard_policy_with_modified_fee_and_policy(
     let mut data_carrier_bytes = 0usize;
     let mut dust_outputs = 0usize;
     for output in &transaction.output {
-        if output.script_pubkey.is_op_return() {
+        if is_core_nulldata(&output.script_pubkey) {
             data_carrier_bytes = data_carrier_bytes.saturating_add(output.script_pubkey.len());
             if policy
                 .max_datacarrier_bytes
@@ -2329,8 +2329,10 @@ fn validate_standard_policy_with_modified_fee_and_policy(
             {
                 return Err(MempoolError::NonStandard("datacarrier".to_owned()));
             }
-        } else if !is_standard_output_script(&output.script_pubkey, policy.permit_bare_multisig) {
+        } else if !is_standard_output_script(&output.script_pubkey, true) {
             return Err(MempoolError::NonStandard("scriptpubkey".to_owned()));
+        } else if !policy.permit_bare_multisig && is_standard_bare_multisig(&output.script_pubkey) {
+            return Err(MempoolError::NonStandard("bare-multisig".to_owned()));
         }
         if is_dust_output_with_fee(output, policy.dust_relay_fee_sat_per_kvb) {
             dust_outputs = dust_outputs.saturating_add(1);
@@ -2661,6 +2663,11 @@ fn is_p2a_script(script: &Script) -> bool {
     script.as_bytes() == [0x51, 0x02, 0x4e, 0x73]
 }
 
+fn is_core_nulldata(script: &Script) -> bool {
+    script.as_bytes().first() == Some(&0x6a)
+        && Script::from_bytes(&script.as_bytes()[1..]).is_push_only()
+}
+
 fn last_push_data(script: &Script) -> Option<&[u8]> {
     let mut last = None;
     for instruction in script.instructions() {
@@ -2684,6 +2691,12 @@ fn is_standard_spend_script(script: &Script) -> bool {
 
 fn is_standard_bare_multisig(script: &Script) -> bool {
     if !script.is_multisig() {
+        return false;
+    }
+    let Some(Ok(Instruction::Op(required))) = script.instructions().next() else {
+        return false;
+    };
+    if required.to_u8() == 0x00 {
         return false;
     }
     let keys = script
@@ -3821,14 +3834,52 @@ mod tests {
         ));
 
         let mut bare_multisig = vec![0x51, 0x21];
+        transaction.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x6a, 0xab]);
+        assert!(matches!(
+            validate_standard_policy_with_modified_fee_and_policy(
+                &transaction,
+                std::slice::from_ref(&previous),
+                1,
+                1,
+                &policy,
+            ),
+            Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
+        ));
+
         bare_multisig.extend(
             hex::decode("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
                 .unwrap(),
         );
         bare_multisig.extend([0x51, 0xae]);
-        transaction.output[0].script_pubkey = ScriptBuf::from_bytes(bare_multisig);
+        transaction.output[0].script_pubkey = ScriptBuf::from_bytes(bare_multisig.clone());
         policy.max_datacarrier_bytes = Some(100_000);
         policy.permit_bare_multisig = false;
+        assert!(matches!(
+            validate_standard_policy_with_modified_fee_and_policy(
+                &transaction,
+                std::slice::from_ref(&previous),
+                1,
+                1,
+                &policy,
+            ),
+            Err(MempoolError::NonStandard(reason)) if reason == "bare-multisig"
+        ));
+
+        policy.permit_bare_multisig = true;
+        transaction.output[0].value = Amount::from_sat(100_000);
+        assert!(
+            validate_standard_policy_with_modified_fee_and_policy(
+                &transaction,
+                std::slice::from_ref(&previous),
+                1,
+                1,
+                &policy,
+            )
+            .is_ok()
+        );
+        let mut zero_of_one = bare_multisig.clone();
+        zero_of_one[0] = 0x00;
+        transaction.output[0].script_pubkey = ScriptBuf::from_bytes(zero_of_one);
         assert!(matches!(
             validate_standard_policy_with_modified_fee_and_policy(
                 &transaction,

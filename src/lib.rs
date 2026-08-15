@@ -420,6 +420,12 @@ pub struct PeerInfo {
     ping_sent_at: Option<Instant>,
 }
 
+pub(crate) struct PeerRegistrationOptions {
+    pub(crate) local_address: Option<SocketAddr>,
+    pub(crate) permissions: PeerPermissions,
+    pub(crate) connection_type: &'static str,
+}
+
 /// Address-manager metadata for an endpoint that may not be connected yet.
 #[derive(Clone, Debug)]
 pub struct KnownNetworkAddress {
@@ -1967,8 +1973,11 @@ impl Node {
             NetworkEndpoint::from_socket(address),
             inbound,
             commands,
-            None,
-            PeerPermissions::empty(),
+            PeerRegistrationOptions {
+                local_address: None,
+                permissions: PeerPermissions::empty(),
+                connection_type: if inbound { "inbound" } else { "outbound-full" },
+            },
         );
     }
 
@@ -1978,9 +1987,13 @@ impl Node {
         endpoint: NetworkEndpoint,
         inbound: bool,
         commands: tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>,
-        local_address: Option<SocketAddr>,
-        permissions: PeerPermissions,
+        options: PeerRegistrationOptions,
     ) {
+        let PeerRegistrationOptions {
+            local_address,
+            permissions,
+            connection_type,
+        } = options;
         let address = endpoint.peer_socket_addr();
         let connected_at = time::unix_time();
         let peer = PeerInfo {
@@ -1999,7 +2012,7 @@ impl Node {
             min_fee_filter: 0,
             transport_protocol_type: "v1",
             session_id: String::new(),
-            connection_type: if inbound { "inbound" } else { "outbound-full" },
+            connection_type,
             connected_at,
             last_send: 0,
             last_recv: 0,
@@ -2029,24 +2042,27 @@ impl Node {
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
-        if let Some(address) = endpoint.legacy_socket_addr() {
-            let mut known = self.known_addresses.write();
-            if self.reserve_known_address(&mut known, address) {
-                known.insert(address, peer);
-                self.tried_addresses.write().insert(address);
-            }
-        } else {
-            let mut known = self.network_addresses.write();
-            if self.reserve_network_address(&mut known, &endpoint) {
-                let entry = known
-                    .entry(endpoint.clone())
-                    .or_insert_with(|| KnownNetworkAddress {
-                        endpoint: endpoint.clone(),
-                        services: 0,
-                        time: connected_at,
-                    });
-                entry.time = entry.time.max(connected_at);
-                self.network_tried_addresses.write().insert(endpoint);
+        if connection_type != "private-broadcast" {
+            if let Some(address) = endpoint.legacy_socket_addr() {
+                let mut known = self.known_addresses.write();
+                if self.reserve_known_address(&mut known, address) {
+                    known.insert(address, peer);
+                    self.tried_addresses.write().insert(address);
+                }
+            } else {
+                let mut known = self.network_addresses.write();
+                if self.reserve_network_address(&mut known, &endpoint) {
+                    let entry =
+                        known
+                            .entry(endpoint.clone())
+                            .or_insert_with(|| KnownNetworkAddress {
+                                endpoint: endpoint.clone(),
+                                services: 0,
+                                time: connected_at,
+                            });
+                    entry.time = entry.time.max(connected_at);
+                    self.network_tried_addresses.write().insert(endpoint);
+                }
             }
         }
     }
@@ -2066,16 +2082,18 @@ impl Node {
             peer.user_agent = user_agent.to_owned();
             peer.start_height = start_height;
             peer.relay_transactions = relay_transactions;
-            if let Some(address) = peer.endpoint.legacy_socket_addr() {
-                if let Some(known) = self.known_addresses.write().get_mut(&address) {
-                    known.version = Some(version);
-                    known.services = services;
-                    known.user_agent = user_agent.to_owned();
-                    known.start_height = start_height;
-                    known.relay_transactions = relay_transactions;
+            if peer.connection_type != "private-broadcast" {
+                if let Some(address) = peer.endpoint.legacy_socket_addr() {
+                    if let Some(known) = self.known_addresses.write().get_mut(&address) {
+                        known.version = Some(version);
+                        known.services = services;
+                        known.user_agent = user_agent.to_owned();
+                        known.start_height = start_height;
+                        known.relay_transactions = relay_transactions;
+                    }
+                } else if let Some(known) = self.network_addresses.write().get_mut(&peer.endpoint) {
+                    known.services |= services;
                 }
-            } else if let Some(known) = self.network_addresses.write().get_mut(&peer.endpoint) {
-                known.services |= services;
             }
         }
     }
@@ -2083,7 +2101,8 @@ impl Node {
     pub(crate) fn update_peer_relay_transactions(&self, id: usize, relay_transactions: bool) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.relay_transactions = relay_transactions;
-            if let Some(address) = peer.endpoint.legacy_socket_addr()
+            if peer.connection_type != "private-broadcast"
+                && let Some(address) = peer.endpoint.legacy_socket_addr()
                 && let Some(known) = self.known_addresses.write().get_mut(&address)
             {
                 known.relay_transactions = relay_transactions;
@@ -2095,7 +2114,8 @@ impl Node {
         let min_fee_filter = min_fee_filter.max(0);
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.min_fee_filter = min_fee_filter;
-            if let Some(address) = peer.endpoint.legacy_socket_addr()
+            if peer.connection_type != "private-broadcast"
+                && let Some(address) = peer.endpoint.legacy_socket_addr()
                 && let Some(known) = self.known_addresses.write().get_mut(&address)
             {
                 known.min_fee_filter = min_fee_filter;
@@ -3870,6 +3890,36 @@ mod tests {
         assert_eq!(peer.id, 0);
         assert_eq!(peer.services, crate::wire::NODE_NETWORK);
         assert_eq!(peer.connected_at, 123);
+    }
+
+    #[test]
+    fn private_broadcast_peers_do_not_mutate_addrman() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let address = "192.0.2.42:18444".parse().unwrap();
+        node.remember_address(address, 0, 123);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer_with_endpoint(
+            7,
+            NetworkEndpoint::from_socket(address),
+            false,
+            sender,
+            PeerRegistrationOptions {
+                local_address: None,
+                permissions: PeerPermissions::empty(),
+                connection_type: "private-broadcast",
+            },
+        );
+        node.update_peer_version(7, 70016, crate::wire::NODE_NETWORK, "/peer/", 1, true);
+
+        let known = node
+            .known_addresses()
+            .into_iter()
+            .find(|peer| peer.address == address)
+            .expect("known endpoint remains present");
+        assert_eq!(known.services, 0);
+        assert!(!node.is_address_tried(address));
+        node.unregister_peer(7);
     }
 
     #[test]

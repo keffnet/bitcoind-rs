@@ -44,7 +44,8 @@ use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
 };
 use crate::{
-    MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, PRIVATE_BROADCAST_RETRY_SECS, unix_time_seconds,
+    MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, PRIVATE_BROADCAST_RETRY_SECS, PeerRegistrationOptions,
+    unix_time_seconds,
 };
 
 enum PeerReader {
@@ -2099,8 +2100,11 @@ async fn serve_peer(
         endpoint,
         !options.outbound,
         commands,
-        local_address,
-        permissions,
+        PeerRegistrationOptions {
+            local_address,
+            permissions,
+            connection_type: options.connection_type,
+        },
     );
     node.set_peer_transport_protocol(peer_id, transport_v2);
     node.set_peer_session_id(peer_id, session_id);

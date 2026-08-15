@@ -15365,8 +15365,11 @@ mod tests {
             crate::address::NetworkEndpoint::Ip("127.0.0.1:18444".parse().unwrap()),
             false,
             sender,
-            None,
-            crate::config::PeerPermissions::FORCE_RELAY,
+            crate::PeerRegistrationOptions {
+                local_address: None,
+                permissions: crate::config::PeerPermissions::FORCE_RELAY,
+                connection_type: "outbound-full",
+            },
         );
         let genesis = node.chain.read().best_hash();
         let header_only = generate_block(&node, &json!(["raw(51)", [], false])).unwrap();

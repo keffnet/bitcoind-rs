@@ -13,7 +13,8 @@ use tokio::sync::Mutex;
 use crate::address::NetworkEndpoint;
 
 /// SAM v3.1 does not carry a Bitcoin service port. Core represents those
-/// endpoints with the SAM port, and rejects arbitrary ports when connecting.
+/// endpoints with port zero; older local address entries in this node use the
+/// SAM control port, so both forms are accepted when connecting.
 pub(crate) const I2P_SAM_PORT: u16 = 7656;
 const MAX_SAM_MESSAGE_BYTES: usize = 65_536;
 const SAM_REPLY_TIMEOUT: Duration = Duration::from_secs(3 * 60);
@@ -88,8 +89,8 @@ impl I2pSam {
         let NetworkEndpoint::I2p { port, .. } = endpoint else {
             bail!("I2P SAM can only connect to I2P endpoints")
         };
-        if *port != I2P_SAM_PORT {
-            bail!("I2P SAM v3.1 only supports port {I2P_SAM_PORT}, not {port}")
+        if *port != 0 && *port != I2P_SAM_PORT {
+            bail!("I2P SAM v3.1 only supports port 0 or {I2P_SAM_PORT}, not {port}")
         }
 
         if self.persistent {
@@ -482,7 +483,8 @@ mod tests {
         );
         let endpoint = NetworkEndpoint::I2p {
             address: [1; 32],
-            port: I2P_SAM_PORT,
+            // Core's generated fixed seeds use the SAM 3.1 port-zero form.
+            port: 0,
         };
         let mut stream = sam.connect(&endpoint).await?;
         let mut data = [0; 9];

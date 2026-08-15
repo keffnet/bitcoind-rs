@@ -210,6 +210,7 @@ const MAX_BLOOM_ELEMENT_SIZE: usize = 520;
 const MAX_ADDR_TO_SEND: usize = 1_000;
 const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 const MAX_BLOCKTXN_DEPTH: u32 = 10;
+const STALE_RELAY_AGE_LIMIT_SECS: u64 = 30 * 24 * 60 * 60;
 const SENDHEADERS_VERSION: i32 = 70_012;
 const FEEFILTER_VERSION: i32 = 70_013;
 const SHORT_IDS_BLOCKS_VERSION: i32 = 70_014;
@@ -2861,6 +2862,13 @@ async fn serve_peer_loop(
                 for item in items {
                     match item.kind {
                         InventoryType::Block | InventoryType::WitnessBlock => {
+                            if !node
+                                .chain
+                                .read()
+                                .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
+                            {
+                                continue;
+                            }
                             let block = node.chain.write().block(&item.hash)?;
                             if let Some(block) = block {
                                 let block = if item.kind == InventoryType::Block {
@@ -2883,6 +2891,11 @@ async fn serve_peer_loop(
                         InventoryType::CompactBlock => {
                             let (block, recent) = {
                                 let mut chain = node.chain.write();
+                                if !chain
+                                    .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
+                                {
+                                    continue;
+                                }
                                 let Some(height) = chain.block_height_by_hash(&item.hash) else {
                                     missing.push(item);
                                     continue;
@@ -2921,6 +2934,13 @@ async fn serve_peer_loop(
                             .await?;
                         }
                         InventoryType::FilteredBlock => {
+                            if !node
+                                .chain
+                                .read()
+                                .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
+                            {
+                                continue;
+                            }
                             let block = node.chain.write().block(&item.hash)?;
                             let Some(block) = block else {
                                 missing.push(item);
@@ -3119,6 +3139,10 @@ async fn serve_peer_loop(
                 }
                 let (block, recent) = {
                     let mut chain = node.chain.write();
+                    if !chain.block_request_allowed(&request.block_hash, STALE_RELAY_AGE_LIMIT_SECS)
+                    {
+                        continue;
+                    }
                     let Some(height) = chain.block_height_by_hash(&request.block_hash) else {
                         continue;
                     };
@@ -3710,6 +3734,9 @@ fn validate_basic_filter_request(
         anyhow::bail!("peer requested unsupported block filter type")
     }
     let chain = node.chain.read();
+    if !chain.block_request_allowed(&stop_hash, STALE_RELAY_AGE_LIMIT_SECS) {
+        anyhow::bail!("peer requested invalid block hash")
+    }
     let Some(stop_height) = chain.block_height_by_hash(&stop_hash) else {
         anyhow::bail!("peer requested invalid block hash")
     };

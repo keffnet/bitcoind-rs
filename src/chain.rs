@@ -21,6 +21,7 @@ use bitcoin::{
     Amount, Block, BlockHash, Network, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid,
     Witness,
 };
+use num_bigint::BigUint;
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -1616,6 +1617,47 @@ impl ChainState {
 
     pub fn block_height_by_hash(&self, hash: &BlockHash) -> Option<u32> {
         self.block_index.get(hash).map(|node| node.height)
+    }
+
+    /// Match Core's `BlockRequestAllowed` policy for non-active blocks.
+    ///
+    /// Active-chain blocks are always eligible to be served (subject to the
+    /// caller discovering that pruning removed their body). A side-chain
+    /// block must have a stored body and remain within the stale-relay age in
+    /// both header time and equivalent proof-of-work time.
+    pub fn block_request_allowed(&self, hash: &BlockHash, max_age_secs: u64) -> bool {
+        let Some(node) = self.block_index.get(hash) else {
+            return false;
+        };
+        if self
+            .active_chain
+            .get(node.height as usize)
+            .is_some_and(|active_hash| active_hash == hash)
+        {
+            return true;
+        }
+        if !self.store.contains(hash) {
+            return false;
+        }
+
+        let best_header = self.best_header_tip();
+        let Some(best_node) = self.block_index.get(&best_header.hash) else {
+            return false;
+        };
+        let time_delta = i64::from(best_node.header.time) - i64::from(node.header.time);
+        if time_delta >= i64::try_from(max_age_secs).unwrap_or(i64::MAX) {
+            return false;
+        }
+
+        let work_delta = best_node.chain_work - node.chain_work;
+        let tip_proof = BigUint::from_bytes_be(&best_node.header.work().to_be_bytes());
+        if tip_proof == BigUint::from(0u8) {
+            return false;
+        }
+        let equivalent_time = BigUint::from_bytes_be(&work_delta.to_be_bytes())
+            * BigUint::from(self.network.params().pow_target_spacing)
+            / tip_proof;
+        equivalent_time < BigUint::from(max_age_secs)
     }
 
     pub fn ancestor_hash_at_height(&self, hash: &BlockHash, height: u32) -> Option<BlockHash> {
@@ -6436,6 +6478,9 @@ mod tests {
         state.connect_block(side_two).unwrap();
 
         assert_eq!(state.best_hash(), main_two_hash);
+        assert!(state.block_request_allowed(&main_two_hash, 30 * 24 * 60 * 60));
+        assert!(state.block_request_allowed(&side_two_hash, 30 * 24 * 60 * 60));
+        assert!(!state.block_request_allowed(&BlockHash::all_zeros(), 30 * 24 * 60 * 60));
         let range = state
             .basic_filter_range(1, side_two_hash, 2)
             .unwrap()

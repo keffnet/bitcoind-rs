@@ -4437,6 +4437,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,

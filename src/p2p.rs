@@ -1326,7 +1326,11 @@ impl PeerManager {
         let fixed_seed_fallback_started_at = unix_time_seconds();
         let mut fixed_seeds_added = false;
         let connect_nodes = if should_query_dns {
-            let addresses = discover_dns_seeds(self.node.config.network).await;
+            let addresses = discover_dns_seeds(
+                self.node.config.network,
+                &self.node.config.signet_seed_nodes,
+            )
+            .await;
             let mut remembered = 0usize;
             for address in &addresses {
                 if self.node.config.allows_address(*address) {
@@ -1426,7 +1430,12 @@ impl PeerManager {
                         )
                     {
                         queried_delayed_dns_seed = true;
-                        for address in discover_dns_seeds(discovery_node.config.network).await {
+                        for address in discover_dns_seeds(
+                            discovery_node.config.network,
+                            &discovery_node.config.signet_seed_nodes,
+                        )
+                        .await
+                        {
                             if discovery_node.config.allows_address(address) {
                                 discovery_node.remember_network_address(
                                     NetworkEndpoint::from_socket(address),
@@ -2272,7 +2281,34 @@ async fn socks5_connect_endpoint_with_options(
     Ok(())
 }
 
-async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
+async fn discover_dns_seeds(
+    network: Network,
+    signet_seed_nodes: &[String],
+) -> Vec<std::net::SocketAddr> {
+    let hosts = dns_seed_hosts(network, signet_seed_nodes);
+    let port = match network {
+        Network::Bitcoin => 8333,
+        Network::Testnet => 18333,
+        Network::Testnet4 => 48333,
+        Network::Signet => 38333,
+        Network::Regtest => return Vec::new(),
+    };
+    let mut addresses = Vec::new();
+    for host in hosts {
+        if let Ok(resolved) = tokio::net::lookup_host((host.as_str(), port)).await {
+            addresses.extend(resolved.take(16));
+        }
+        if addresses.len() >= 64 {
+            break;
+        }
+    }
+    addresses
+}
+
+fn dns_seed_hosts(network: Network, signet_seed_nodes: &[String]) -> Vec<String> {
+    if network == Network::Signet && !signet_seed_nodes.is_empty() {
+        return signet_seed_nodes.to_vec();
+    }
     let hosts: &[&str] = match network {
         Network::Bitcoin => &[
             "seed.bitcoin.sipa.be",
@@ -2296,23 +2332,7 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
         ],
         Network::Testnet4 | Network::Regtest => &[],
     };
-    let port = match network {
-        Network::Bitcoin => 8333,
-        Network::Testnet => 18333,
-        Network::Testnet4 => 48333,
-        Network::Signet => 38333,
-        Network::Regtest => return Vec::new(),
-    };
-    let mut addresses = Vec::new();
-    for host in hosts {
-        if let Ok(resolved) = tokio::net::lookup_host((*host, port)).await {
-            addresses.extend(resolved.take(16));
-        }
-        if addresses.len() >= 64 {
-            break;
-        }
-    }
-    addresses
+    hosts.iter().map(|host| (*host).to_owned()).collect()
 }
 
 fn fixed_seed_data(network: Network) -> &'static [u8] {
@@ -5446,6 +5466,7 @@ mod tests {
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 4,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -6140,6 +6161,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -6352,6 +6374,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -6855,6 +6878,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 4,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -7051,6 +7075,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -7253,6 +7278,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -7545,6 +7571,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -7713,6 +7740,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -7863,6 +7891,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 4,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -7927,6 +7956,32 @@ mod tests {
             DNS_SEED_FALLBACK_DELAY,
             DNS_SEED_OUTBOUND_THRESHOLD - 1
         ));
+    }
+
+    #[test]
+    fn signet_seednode_overrides_only_signet_dns_seeds() {
+        let custom = vec!["first.example".to_owned(), "second.example".to_owned()];
+        assert_eq!(dns_seed_hosts(Network::Signet, &custom), custom);
+        assert_eq!(
+            dns_seed_hosts(Network::Signet, &[]),
+            vec![
+                "seed.signet.bitcoin.sprovoost.nl",
+                "xarb1.signet.seed.bluematt.me",
+            ]
+        );
+        assert_eq!(
+            dns_seed_hosts(Network::Bitcoin, &custom),
+            vec![
+                "seed.bitcoin.sipa.be",
+                "dnsseed.bluematt.me",
+                "seed.bitcoinstats.com",
+                "seed.bitcoin.jonasschnelli.ch",
+                "seed.btc.petertodd.org",
+                "seed.bitcoin.sprovoost.nl",
+                "dnsseed.emzy.de",
+                "seed.bitcoin.wiz.biz",
+            ]
+        );
     }
 
     #[test]
@@ -8105,6 +8160,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 4,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -8309,6 +8365,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
+            signet_seed_nodes: Vec::new(),
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,

@@ -1166,6 +1166,12 @@ pub struct Args {
     #[arg(long, value_name = "HEX")]
     pub signet_challenge: Option<String>,
 
+    /// Override the DNS seed hostnames used by Signet, matching Core's
+    /// `-signetseednode` option. The fixed Signet seed records remain
+    /// available as a fallback when this list is configured.
+    #[arg(long = "signetseednode", value_name = "HOST", value_delimiter = ',')]
+    pub signet_seed_nodes: Vec<String>,
+
     #[arg(long, visible_alias = "maxconnections", default_value_t = 125)]
     pub max_peers: usize,
 
@@ -1850,6 +1856,7 @@ pub struct Config {
     pub cjdns_reachable: bool,
     pub peer_permissions: PeerPermissionConfig,
     pub signet_challenge: Option<Vec<u8>>,
+    pub signet_seed_nodes: Vec<String>,
     pub max_peers: usize,
     pub max_receive_buffer: u32,
     pub max_send_buffer: u32,
@@ -2349,6 +2356,7 @@ impl Config {
             ),
             None => None,
         };
+        let signet_seed_nodes = args.signet_seed_nodes.clone();
         let assume_valid = match args.assume_valid.as_deref() {
             None => default_assume_valid(network, signet_challenge.as_deref()),
             Some(value) if value.is_empty() || value == "0" => None,
@@ -2493,6 +2501,7 @@ impl Config {
             cjdns_reachable: args.cjdns_reachable,
             peer_permissions,
             signet_challenge,
+            signet_seed_nodes,
             max_peers: args.max_peers,
             max_receive_buffer,
             max_send_buffer,
@@ -3003,6 +3012,25 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+    }
+
+    #[test]
+    fn parses_core_signet_seednode_overrides() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=signet",
+            "--signetseednode=first.example,second.example",
+            "--signetseednode=third.example",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.signet_seed_nodes,
+            ["first.example", "second.example", "third.example"]
+        );
     }
 
     #[test]

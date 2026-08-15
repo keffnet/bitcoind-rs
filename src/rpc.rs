@@ -9275,6 +9275,45 @@ fn exceeds_max_fee(fee_sat: u64, vsize: u64, max_fee_rate: Option<f64>) -> bool 
     })
 }
 
+fn first_max_fee_failure_index(
+    transactions: &[Transaction],
+    mempool: &Mempool,
+    preexisting: &HashSet<Txid>,
+    max_fee_rate: Option<f64>,
+) -> Option<usize> {
+    max_fee_rate.and_then(|_| {
+        transactions
+            .iter()
+            .enumerate()
+            .find_map(|(index, transaction)| {
+                let txid = transaction.compute_txid();
+                (!preexisting.contains(&txid))
+                    .then(|| mempool.get(&txid))
+                    .flatten()
+                    .filter(|entry| exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate))
+                    .map(|_| index)
+            })
+    })
+}
+
+fn discard_unaccepted_package_transactions(
+    candidate: &mut Mempool,
+    transactions: &[Transaction],
+    preexisting: &HashSet<Txid>,
+    accepted: &[Transaction],
+) {
+    let accepted_ids = accepted
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<HashSet<_>>();
+    for transaction in transactions.iter().rev() {
+        let txid = transaction.compute_txid();
+        if !preexisting.contains(&txid) && !accepted_ids.contains(&txid) {
+            candidate.remove(&txid);
+        }
+    }
+}
+
 pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let raw_transactions = params
         .as_array()
@@ -9432,70 +9471,83 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 .map(|_| transaction.compute_txid())
         })
         .collect::<HashSet<_>>();
-    let (candidate, package_result, package_rbf) =
+    let (mut candidate, package_result, package_rbf) =
         original_mempool.accept_package_with_state(&transactions, &chain);
     drop(original_mempool);
+    let max_fee_failure =
+        first_max_fee_failure_index(&transactions, &candidate, &preexisting, max_fee_rate);
     let mut results = serde_json::Map::new();
     if let Err(error) = package_result {
         // submitpackage exposes the detailed validation error in each
         // per-transaction result. testmempoolaccept uses the shorter
         // reject-reason classification instead.
         let reason = error.to_string();
-        let accepted = if !package_rbf {
-            transactions
+        let first_missing = transactions
+            .iter()
+            .position(|transaction| candidate.get(&transaction.compute_txid()).is_none());
+        let failure_index = if package_rbf {
+            None
+        } else {
+            match (max_fee_failure, first_missing) {
+                (Some(max_fee_index), Some(missing_index)) if max_fee_index < missing_index => {
+                    Some(max_fee_index)
+                }
+                (_, Some(missing_index)) => Some(missing_index),
+                (Some(max_fee_index), None) => Some(max_fee_index),
+                (None, None) => None,
+            }
+        };
+        if let Some(failure_index) = failure_index {
+            let accepted = transactions
                 .iter()
+                .take(failure_index)
                 .filter(|transaction| {
                     !preexisting.contains(&transaction.compute_txid())
                         && candidate.get(&transaction.compute_txid()).is_some()
                 })
                 .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let partial = !package_rbf
-            && transactions
-                .iter()
-                .any(|transaction| candidate.get(&transaction.compute_txid()).is_some())
-            && transactions
-                .iter()
-                .any(|transaction| candidate.get(&transaction.compute_txid()).is_none());
-        let mut reported_failure = false;
-        for transaction in &transactions {
-            let txid = transaction.compute_txid();
-            if partial && candidate.get(&txid).is_some() {
+                .collect::<Vec<_>>();
+            for (index, transaction) in transactions.iter().enumerate() {
+                let txid = transaction.compute_txid();
+                if index < failure_index {
+                    results.insert(
+                        transaction.compute_wtxid().to_string(),
+                        accepted_transaction_json(
+                            transaction,
+                            &transactions,
+                            &candidate,
+                            false,
+                            false,
+                            !preexisting.contains(&txid),
+                        )?,
+                    );
+                    continue;
+                }
+                let transaction_error = if index == failure_index {
+                    max_fee_failure
+                        .filter(|max_fee_index| *max_fee_index == failure_index)
+                        .map_or_else(|| reason.clone(), |_| "max feerate exceeded".to_owned())
+                } else {
+                    "package-not-validated".to_owned()
+                };
                 results.insert(
                     transaction.compute_wtxid().to_string(),
-                    accepted_transaction_json(
-                        transaction,
-                        &transactions,
-                        &candidate,
-                        false,
-                        false,
-                        !preexisting.contains(&txid),
-                    )?,
+                    json!({
+                        "txid": txid.to_string(),
+                        "error": transaction_error,
+                    }),
                 );
-                continue;
             }
-            let transaction_error = if partial && reported_failure {
-                "package-not-validated".to_owned()
-            } else {
-                reported_failure = true;
-                reason.clone()
-            };
-            results.insert(
-                transaction.compute_wtxid().to_string(),
-                json!({
-                    "txid": txid.to_string(),
-                    "error": transaction_error,
-                }),
-            );
-        }
-        if partial {
             drop(chain);
             let replaced_transactions = if accepted.is_empty() {
                 Vec::new()
             } else {
+                discard_unaccepted_package_transactions(
+                    &mut candidate,
+                    &transactions,
+                    &preexisting,
+                    &accepted,
+                );
                 commit_submitted_package(node, candidate, before_transactions, accepted)
             };
             return Ok(json!({
@@ -9504,11 +9556,79 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 "replaced-transactions": replaced_transactions,
             }));
         }
+        for transaction in &transactions {
+            results.insert(
+                transaction.compute_wtxid().to_string(),
+                json!({
+                    "txid": transaction.compute_txid().to_string(),
+                    "error": reason,
+                }),
+            );
+        }
         return Ok(json!({
             "package_msg": submit_package_failure_message(&error, package_rbf),
             "tx-results": results,
             "replaced-transactions": [],
         }));
+    }
+
+    if !package_rbf {
+        if let Some(failure_index) = max_fee_failure {
+            let accepted = transactions
+                .iter()
+                .take(failure_index)
+                .filter(|transaction| !preexisting.contains(&transaction.compute_txid()))
+                .cloned()
+                .collect::<Vec<_>>();
+            for (index, transaction) in transactions.iter().enumerate() {
+                if index < failure_index {
+                    results.insert(
+                        transaction.compute_wtxid().to_string(),
+                        accepted_transaction_json(
+                            transaction,
+                            &transactions,
+                            &candidate,
+                            false,
+                            false,
+                            !preexisting.contains(&transaction.compute_txid()),
+                        )?,
+                    );
+                } else if index == failure_index {
+                    results.insert(
+                        transaction.compute_wtxid().to_string(),
+                        json!({
+                            "txid": transaction.compute_txid().to_string(),
+                            "error": "max feerate exceeded",
+                        }),
+                    );
+                } else {
+                    results.insert(
+                        transaction.compute_wtxid().to_string(),
+                        json!({
+                            "txid": transaction.compute_txid().to_string(),
+                            "error": "package-not-validated",
+                        }),
+                    );
+                }
+            }
+            drop(chain);
+            let replaced_transactions = if accepted.is_empty() {
+                Vec::new()
+            } else {
+                discard_unaccepted_package_transactions(
+                    &mut candidate,
+                    &transactions,
+                    &preexisting,
+                    &accepted,
+                );
+                commit_submitted_package(node, candidate, before_transactions, accepted)
+            };
+            return Ok(json!({
+                "package_msg": "transaction failed",
+                "tx-results": results,
+                "replaced-transactions": replaced_transactions,
+            }));
+        }
     }
 
     let mut max_fee_exceeded = false;
@@ -16538,6 +16658,33 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
+        let max_fee_result = submit_package(
+            &node,
+            &json!([
+                [
+                    hex::encode(serialize(&partial_parent)),
+                    hex::encode(serialize(&partial_child)),
+                ],
+                0.000001
+            ]),
+        )
+        .unwrap();
+        assert_eq!(max_fee_result["package_msg"], "transaction failed");
+        assert!(
+            max_fee_result["tx-results"][partial_parent.compute_wtxid().to_string()]["error"]
+                == "max feerate exceeded"
+        );
+        assert_eq!(
+            max_fee_result["tx-results"][partial_child.compute_wtxid().to_string()]["error"],
+            "package-not-validated"
+        );
+        assert!(
+            node.mempool
+                .read()
+                .get(&partial_parent.compute_txid())
+                .is_none()
+        );
+
         let partial_result = submit_package(
             &node,
             &json!([[

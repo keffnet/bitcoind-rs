@@ -535,7 +535,10 @@ impl FeeEstimator {
         if vsize == 0 || height != self.best_height || self.tracked.contains_key(&txid) {
             return;
         }
-        let fee_rate = (fee_sat as f64 * 1_000.0) / vsize as f64;
+        let fee_rate = (u128::from(fee_sat)
+            .saturating_mul(1_000)
+            .checked_div(u128::from(vsize))
+            .unwrap_or(0)) as f64;
         if !fee_rate.is_finite() || fee_rate <= 0.0 || transaction.is_coinbase() {
             return;
         }

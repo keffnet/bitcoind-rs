@@ -506,6 +506,15 @@ pub struct Args {
     )]
     pub dnsseed: Option<bool>,
 
+    #[arg(
+        long = "forcednsseed",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub force_dns_seed: bool,
+
     #[arg(long)]
     pub rpc: Option<SocketAddr>,
 
@@ -833,6 +842,7 @@ pub struct Config {
     pub add_nodes: Vec<NetworkEndpoint>,
     pub seed_nodes_for_address_fetch: Vec<NetworkEndpoint>,
     pub dnsseed: bool,
+    pub force_dns_seed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
     pub proxy_randomize: bool,
@@ -953,6 +963,9 @@ impl Config {
         let dnsseed = args
             .dnsseed
             .unwrap_or(!connect_configured && args.max_peers > 0 && clearnet_reachable);
+        if args.force_dns_seed && !dnsseed {
+            bail!("Cannot set --forcednsseed=true when setting --dnsseed=false");
+        }
         let discover = args
             .discover
             .unwrap_or(listen && args.externalip.is_empty() && args.proxy.is_none());
@@ -1105,6 +1118,7 @@ impl Config {
             add_nodes,
             seed_nodes_for_address_fetch,
             dnsseed,
+            force_dns_seed: args.force_dns_seed,
             onlynet: args.onlynet,
             proxy: args.proxy,
             proxy_randomize: args.proxy_randomize,
@@ -1350,6 +1364,27 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert!(!config.listen);
         assert!(config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--forcednsseed",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.force_dns_seed);
+        assert!(config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--dnsseed=false",
+            "--forcednsseed",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

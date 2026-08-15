@@ -3303,6 +3303,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
             proxy_randomize: false,

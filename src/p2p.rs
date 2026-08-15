@@ -38,9 +38,9 @@ use tracing::{debug, info, warn};
 
 use crate::address::{NetworkEndpoint, is_core_routable_ip};
 use crate::chain::BasicFilterRange;
-use crate::config::PeerPermissions;
 #[cfg(test)]
 use crate::config::DEFAULT_CONNECT_TIMEOUT_MS;
+use crate::config::PeerPermissions;
 use crate::mempool::MempoolError;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
@@ -1287,7 +1287,10 @@ impl PeerManager {
                 );
             }
         }
-        let connect_nodes = if !configured_connect_nodes && self.node.config.dnsseed {
+        let should_query_dns = !configured_connect_nodes
+            && self.node.config.dnsseed
+            && (self.node.config.force_dns_seed || self.node.known_network_addresses().is_empty());
+        let connect_nodes = if should_query_dns {
             let addresses = discover_dns_seeds(self.node.config.network).await;
             for address in &addresses {
                 if self.node.config.allows_address(*address) {
@@ -4943,6 +4946,7 @@ mod tests {
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             dnsseed: false,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
             proxy_randomize: false,
@@ -5490,6 +5494,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: false,
+            force_dns_seed: false,
             onlynet: vec![OnlyNet::Ipv4],
             proxy: None,
             proxy_randomize: false,
@@ -5641,6 +5646,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: false,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
             proxy_randomize: false,
@@ -6050,6 +6056,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
             proxy_randomize: false,
@@ -6185,6 +6192,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
             proxy_randomize: false,
@@ -6326,6 +6334,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
             proxy_randomize: false,
@@ -6557,6 +6566,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
             proxy_randomize: false,
@@ -6664,6 +6674,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
             proxy_randomize: false,
@@ -6753,6 +6764,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
             proxy_randomize: false,
@@ -6834,6 +6846,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: false,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: Some("127.0.0.1:9050".parse().unwrap()),
             proxy_randomize: false,
@@ -6977,6 +6990,7 @@ mod tests {
             rest: false,
             listen: true,
             dnsseed: true,
+            force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
             proxy_randomize: false,

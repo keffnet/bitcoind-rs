@@ -1486,7 +1486,7 @@ fn spawn_outbound_loop(
         let Ok(_permit) = permit else {
             return;
         };
-        if !node.config.allows_network_endpoint(&endpoint) {
+        if !manual && !node.config.allows_network_endpoint(&endpoint) {
             debug!(endpoint = %endpoint, "skipping outbound peer outside onlynet policy");
             return;
         }
@@ -5295,7 +5295,7 @@ mod tests {
     }
 
     #[test]
-    fn onlynet_filters_addresses_and_added_nodes() {
+    fn onlynet_filters_discovered_addresses_but_not_manual_nodes() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
             network: Network::Regtest,
@@ -5350,7 +5350,7 @@ mod tests {
         assert!(node.add_peer_address(ipv4, false));
         assert!(node.add_peer_address(ipv6, false));
         assert!(node.add_node(ipv4));
-        assert!(!node.add_node(ipv6));
+        assert!(node.add_node(ipv6));
         let attempts = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         assert_eq!(select_discovery_addresses(&node, 4, &attempts), Vec::new());
     }

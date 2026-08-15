@@ -2583,9 +2583,6 @@ impl Node {
         display_name: String,
         transport_v2: Option<bool>,
     ) -> bool {
-        if !self.config.allows_network_endpoint(&endpoint) {
-            return false;
-        }
         let inserted = match self.added_nodes.write().entry(endpoint.clone()) {
             std::collections::hash_map::Entry::Occupied(_) => false,
             std::collections::hash_map::Entry::Vacant(entry) => {
@@ -2623,9 +2620,6 @@ impl Node {
         transport_v2: Option<bool>,
         connection_type: &'static str,
     ) {
-        if !self.config.allows_network_endpoint(&endpoint) {
-            return;
-        }
         if let Some(sender) = self.peer_manager_requests.read().as_ref() {
             let _ = sender.send(p2p::PeerManagerRequest::OneTry(
                 endpoint,

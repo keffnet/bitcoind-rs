@@ -51,7 +51,7 @@ RPC request handling uses Core-compatible defaults of 16 worker slots, 64 queued
 
 Consensus script checks use a bounded successful-validation cache; its approximate size defaults to Core's 32 MiB and can be changed with the hidden compatibility option `--maxsigcachesize=<MiB>`.
 
-The append-only block backend also honors Core's hidden `--dbcache=<MiB>` setting. Because this implementation keeps the active UTXO state in memory, the setting is mapped to a bounded decoded historical-block cache; the default is 450 MiB and values below Core's 4 MiB minimum are clamped.
+The append-only backend also honors Core's hidden `--dbcache=<MiB>` and `--dbbatchsize=<bytes>` settings. Because this implementation keeps the active UTXO state in memory, `dbcache` maps to a bounded decoded historical-block cache; the default is 450 MiB and values below Core's 4 MiB minimum are clamped. `dbbatchsize` controls how much chainstate data is accumulated between durable data-file syncs, with a flush when the store is dropped.
 
 Fee estimation tracks mempool admission, confirmation, eviction, and expiry over Core's short, medium, and long horizons. It periodically persists the policy statistics to `<datadir>/fee_estimates.dat`; `estimatesmartfee`, hidden `estimaterawfee`, and `savefeeestimates` use that state. The hidden compatibility option `--acceptstalefeeestimates` permits loading snapshots older than Core's 60-hour freshness window.
 

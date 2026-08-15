@@ -793,6 +793,8 @@ pub struct ChainstateStore {
     file: File,
     index_file: File,
     index: HashMap<BlockHash, Record>,
+    write_batch_limit: usize,
+    pending_write_bytes: usize,
 }
 
 impl ChainstateStore {
@@ -833,7 +835,25 @@ impl ChainstateStore {
             file,
             index_file,
             index,
+            write_batch_limit: 32 * 1024 * 1024,
+            pending_write_bytes: 0,
         })
+    }
+
+    /// Set the maximum amount of chainstate data written between data-file
+    /// syncs. This is the append-only backend's equivalent of Core's hidden
+    /// `-dbbatchsize` debug option.
+    pub fn configure_write_batch_size_bytes(&mut self, bytes: i64) {
+        self.write_batch_limit = usize::try_from(bytes.max(1)).unwrap_or(usize::MAX);
+    }
+
+    fn flush_pending_writes(&mut self) -> Result<()> {
+        if self.pending_write_bytes == 0 {
+            return Ok(());
+        }
+        self.file.sync_data()?;
+        self.pending_write_bytes = 0;
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -889,7 +909,9 @@ impl ChainstateStore {
         self.file.write_all(&length.to_le_bytes())?;
         self.file.write_all(&hash.to_byte_array())?;
         self.file.write_all(payload)?;
-        self.file.sync_data()?;
+        self.pending_write_bytes = self
+            .pending_write_bytes
+            .saturating_add(4usize.saturating_add(usize::try_from(length).unwrap_or(usize::MAX)));
         let record = Record { offset, length };
         persist_index_entry(
             &mut self.index_file,
@@ -898,16 +920,26 @@ impl ChainstateStore {
             record,
         )?;
         self.index.insert(hash, record);
+        if self.pending_write_bytes >= self.write_batch_limit {
+            self.flush_pending_writes()?;
+        }
         Ok(())
     }
 
     /// Discard all records covered by a durable full snapshot.
     pub fn clear(&mut self) -> Result<()> {
+        self.flush_pending_writes()?;
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::End(0))?;
         self.file.sync_data()?;
         self.index.clear();
         rewrite_index(&mut self.index_file, 0, &self.index)
+    }
+}
+
+impl Drop for ChainstateStore {
+    fn drop(&mut self) {
+        let _ = self.flush_pending_writes();
     }
 }
 
@@ -1741,6 +1773,21 @@ mod tests {
         reopened.clear().unwrap();
         assert!(!reopened.contains(&hash));
         assert_eq!(reopened.get(&hash).unwrap(), None);
+    }
+
+    #[test]
+    fn chainstate_write_batch_flushes_at_the_configured_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let hash = BlockHash::from_byte_array([7; 32]);
+        let mut store = ChainstateStore::open(directory.path()).unwrap();
+        store.configure_write_batch_size_bytes(1024 * 1024);
+        store.insert(hash, &[1, 2, 3]).unwrap();
+        assert!(store.pending_write_bytes > 0);
+        store.flush_pending_writes().unwrap();
+        assert_eq!(store.pending_write_bytes, 0);
+        drop(store);
+        let mut reopened = ChainstateStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&hash).unwrap(), Some(vec![1, 2, 3]));
     }
 
     #[test]

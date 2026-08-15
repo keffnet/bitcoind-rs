@@ -45,6 +45,7 @@ pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_SCRIPT_CHECK_THREADS: i32 = 0;
 pub const DEFAULT_MAX_SIG_CACHE_MIB: i64 = 32;
 pub const DEFAULT_DB_CACHE_MIB: i64 = 450;
+pub const DEFAULT_DB_BATCH_SIZE_BYTES: i64 = 32 * 1024 * 1024;
 pub const MAX_SCRIPT_CHECK_THREADS: usize = 15;
 pub const MAX_SUBVERSION_LENGTH: usize = 256;
 pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
@@ -829,6 +830,16 @@ pub struct Args {
     /// backend maps Core's `-dbcache` to this bounded historical-block cache.
     #[arg(long = "dbcache", value_name = "MiB", default_value_t = DEFAULT_DB_CACHE_MIB, hide = true)]
     pub db_cache_mib: i64,
+
+    /// Maximum chainstate write batch in bytes, matching Core's hidden
+    /// `-dbbatchsize` debug option.
+    #[arg(
+        long = "dbbatchsize",
+        value_name = "BYTES",
+        default_value_t = DEFAULT_DB_BATCH_SIZE_BYTES,
+        hide = true
+    )]
+    pub db_batch_size_bytes: i64,
 
     /// Allow loading fee-estimator snapshots older than Core's 60-hour limit.
     #[arg(
@@ -1850,6 +1861,7 @@ pub struct Config {
     pub script_check_threads: i32,
     pub max_sig_cache_mib: i64,
     pub db_cache_mib: i64,
+    pub db_batch_size_bytes: i64,
     pub accept_stale_fee_estimates: bool,
     pub block_reconstruction_extra_txn: usize,
     pub user_agent_comments: Vec<String>,
@@ -2499,6 +2511,7 @@ impl Config {
             script_check_threads: args.script_check_threads,
             max_sig_cache_mib: args.max_sig_cache_mib,
             db_cache_mib: args.db_cache_mib,
+            db_batch_size_bytes: args.db_batch_size_bytes,
             accept_stale_fee_estimates: args.accept_stale_fee_estimates,
             block_reconstruction_extra_txn: args.block_reconstruction_extra_txn,
             user_agent_comments,
@@ -3217,6 +3230,7 @@ mod tests {
             "--blockreconstructionextratxn=7",
             "--maxsigcachesize=1",
             "--dbcache=4",
+            "--dbbatchsize=4096",
             "--bantime=123",
             "--deprecatedrpc=startingheight,warnings",
             "--uacomment=lab",
@@ -3239,6 +3253,7 @@ mod tests {
         assert_eq!(config.block_reconstruction_extra_txn, 7);
         assert_eq!(config.max_sig_cache_mib, 1);
         assert_eq!(config.db_cache_mib, 4);
+        assert_eq!(config.db_batch_size_bytes, 4096);
         assert_eq!(config.user_agent_comments, vec!["lab".to_owned()]);
         assert_eq!(config.startup_notify.as_deref(), Some("echo start"));
         assert_eq!(config.block_notify.as_deref(), Some("echo %s"));

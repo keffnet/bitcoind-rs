@@ -1847,6 +1847,13 @@ impl ChainState {
         self.store.configure_cache_size_mib(mib);
     }
 
+    /// Configure chainstate write batching from Core's debug-only
+    /// `-dbbatchsize` option.
+    pub fn configure_storage_batch_size_bytes(&mut self, bytes: i64) {
+        self.chainstate_store
+            .configure_write_batch_size_bytes(bytes);
+    }
+
     fn update_ibd_status(&mut self) {
         self.update_ibd_status_at(crate::time::unix_time());
     }

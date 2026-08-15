@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::muhash::MuHash3072;
-use crate::storage::{BlockStore, CoinStatsRecord, CoinStatsStore, FilterStore};
+use crate::storage::{BlockStore, ChainstateStore, CoinStatsRecord, CoinStatsStore, FilterStore};
 use crate::validation::{self, ValidationError};
 
 const COINBASE_MATURITY: u32 = 100;
@@ -43,6 +43,7 @@ const CORE_UTXO_SNAPSHOT_MAGIC: [u8; 5] = [b'u', b't', b'x', b'o', 0xff];
 const CORE_UTXO_SNAPSHOT_VERSION: u16 = 2;
 const CHAIN_METADATA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-v1\0";
 const CHAIN_SNAPSHOT_MAGIC: &[u8] = b"bitcoind-rs-snapshot-v1\0";
+const CHAINSTATE_DELTA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-delta-v1\0";
 const CHAIN_TX_COUNTS_MAGIC: &[u8] = b"bitcoind-rs-tx-counts-v1\0";
 const ASSUMEUTXO_STATE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-v1\0";
 const ASSUMEUTXO_BASE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-base-v1\0";
@@ -224,7 +225,7 @@ pub struct UtxoSetStats {
     pub total_unspendable_unclaimed_rewards_sat: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct CoinStatsBlockMetrics {
     prevout_spent_sat: u64,
     new_outputs_ex_coinbase_sat: u64,
@@ -422,6 +423,26 @@ struct ChainSnapshot {
     prune_height: Option<u32>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct ChainstateDelta {
+    block_hash: BlockHash,
+    parent_hash: BlockHash,
+    height: u32,
+    spent: Vec<(OutPoint, UtxoEntry)>,
+    created: Vec<(OutPoint, UtxoEntry)>,
+    transactions: Vec<(Txid, TxLocation)>,
+    history: Vec<(String, HistoryEntry)>,
+    #[serde(default)]
+    spent_by: Vec<(OutPoint, SpentTransaction)>,
+    metrics: CoinStatsBlockMetrics,
+}
+
+#[derive(Serialize, Deserialize)]
+struct StoredChainstateDelta {
+    delta: ChainstateDelta,
+    checksum: [u8; 32],
+}
+
 /// Compact active-chain metadata used by chain statistics after pruning.
 /// Bitcoin Core keeps transaction counts in each `CBlockIndex`, so
 /// `getchaintxstats` does not need the historical block bodies.  Keep this
@@ -507,6 +528,24 @@ fn deserialize_internal<T: DeserializeOwned>(bytes: &[u8], magic: &[u8]) -> Resu
     deserialize_binary(&bytes[magic.len()..]).context("decoding internal chainstate")
 }
 
+fn serialize_chainstate_delta(delta: &ChainstateDelta) -> Result<Vec<u8>> {
+    let body = serialize_binary(delta).context("serializing chainstate delta body")?;
+    let stored = StoredChainstateDelta {
+        delta: delta.clone(),
+        checksum: Sha256::digest(&body).into(),
+    };
+    serialize_internal(CHAINSTATE_DELTA_MAGIC, &stored)
+}
+
+fn deserialize_chainstate_delta(bytes: &[u8]) -> Result<ChainstateDelta> {
+    let stored: StoredChainstateDelta = deserialize_internal(bytes, CHAINSTATE_DELTA_MAGIC)?;
+    let body = serialize_binary(&stored.delta).context("serializing stored chainstate delta")?;
+    if Sha256::digest(&body).as_slice() != stored.checksum {
+        bail!("chainstate delta checksum mismatch")
+    }
+    Ok(stored.delta)
+}
+
 fn load_active_tx_counts(data_dir: &Path, active_chain: &[BlockHash]) -> Result<Option<Vec<u32>>> {
     let path = data_dir.join("chainstate.txcounters");
     if !path.exists() {
@@ -552,6 +591,7 @@ pub struct ChainState {
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     filter_store: FilterStore,
+    chainstate_store: ChainstateStore,
     blockfilter_index_enabled: bool,
     coinstats_store: CoinStatsStore,
     txospender_index_enabled: bool,
@@ -637,6 +677,19 @@ impl ChainState {
         let legacy_metadata_path = data_dir.join("chainstate.json");
         let snapshot_provenance_path = data_dir.join("assumeutxo.bin");
         let rebuild_chainstate = reindex || reindex_chainstate;
+        let chainstate_path = data_dir.join("chainstate");
+        if rebuild_chainstate {
+            match fs::remove_dir_all(&chainstate_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("removing reindex state {}", chainstate_path.display())
+                    });
+                }
+            }
+        }
+        let chainstate_store = ChainstateStore::open(&chainstate_path)?;
         if rebuild_chainstate {
             for path in [
                 metadata_path.clone(),
@@ -724,6 +777,7 @@ impl ChainState {
             }),
             store,
             filter_store,
+            chainstate_store,
             blockfilter_index_enabled,
             coinstats_store,
             txospender_index_enabled: false,
@@ -808,12 +862,21 @@ impl ChainState {
             } else {
                 state.spent_by.clear();
             }
-            for hash in active_chain.iter().skip(snapshot_chain_len) {
-                let block = state
-                    .store
-                    .get(hash)?
-                    .with_context(|| format!("active block {hash} is missing from block store"))?;
-                state.connect_block_internal(&block, false)?;
+            state.index_persisted_headers(&persisted_headers)?;
+            let deltas = state.load_chainstate_deltas(&active_chain, snapshot_chain_len);
+            if let Some(deltas) =
+                deltas.filter(|deltas| state.validate_chainstate_deltas(deltas).is_ok())
+            {
+                for delta in deltas {
+                    state.apply_chainstate_delta(delta)?;
+                }
+            } else {
+                for hash in active_chain.iter().skip(snapshot_chain_len) {
+                    let block = state.store.get(hash)?.with_context(|| {
+                        format!("active block {hash} is missing from block store")
+                    })?;
+                    state.connect_block_internal(&block, false)?;
+                }
             }
         } else {
             state.snapshot_base = None;
@@ -3444,14 +3507,23 @@ impl ChainState {
         )?;
 
         let hash = block.block_hash();
+        let spent_entries: HashMap<OutPoint, UtxoEntry> =
+            application.spent_entries.iter().cloned().collect();
         if persist {
             self.store.insert(block)?;
+            let delta = self.chainstate_delta_for_block(
+                block,
+                height,
+                block_median_time_past,
+                &spent_entries,
+                application.metrics,
+            );
+            let bytes = serialize_chainstate_delta(&delta)?;
+            self.chainstate_store.insert(hash, &bytes)?;
         }
         for (outpoint, _) in &application.spent_entries {
             self.remove_utxo(outpoint);
         }
-        let spent_entries: HashMap<OutPoint, UtxoEntry> =
-            application.spent_entries.into_iter().collect();
         let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
         for (transaction_index, transaction) in block.txdata.iter().enumerate() {
             let txid = transaction.compute_txid();
@@ -3534,6 +3606,79 @@ impl ChainState {
             }
         }
         Ok(())
+    }
+
+    fn chainstate_delta_for_block(
+        &self,
+        block: &Block,
+        height: u32,
+        median_time_past: u32,
+        spent_entries: &HashMap<OutPoint, UtxoEntry>,
+        metrics: CoinStatsBlockMetrics,
+    ) -> ChainstateDelta {
+        let block_hash = block.block_hash();
+        let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
+        let mut created = Vec::new();
+        let mut transactions = Vec::with_capacity(block.txdata.len());
+        let mut history = Vec::new();
+        let mut spent_by = Vec::new();
+        for (transaction_index, transaction) in block.txdata.iter().enumerate() {
+            let txid = transaction.compute_txid();
+            transactions.push((
+                txid,
+                TxLocation {
+                    block_hash,
+                    height,
+                    transaction_index,
+                },
+            ));
+            let mut affected_scripts = HashSet::new();
+            for (input_index, input) in transaction.input.iter().enumerate() {
+                if let Some(entry) = spent_entries.get(&input.previous_output) {
+                    affected_scripts.insert(electrum_script_hash(&entry.output.script_pubkey));
+                }
+                if self.txospender_index_enabled && !input.previous_output.is_null() {
+                    spent_by.push((
+                        input.previous_output,
+                        (txid, input_index, block_hash, height),
+                    ));
+                }
+            }
+            for (output_index, output) in transaction.output.iter().enumerate() {
+                let outpoint = OutPoint::new(txid, output_index as u32);
+                if !spent_outpoints.contains(&outpoint)
+                    && !is_unspendable_script(&output.script_pubkey)
+                {
+                    created.push((
+                        outpoint,
+                        UtxoEntry {
+                            output: output.clone(),
+                            height,
+                            median_time_past,
+                            coinbase: transaction_index == 0,
+                        },
+                    ));
+                }
+                affected_scripts.insert(electrum_script_hash(&output.script_pubkey));
+            }
+            for script_hash in affected_scripts {
+                history.push((script_hash, HistoryEntry { txid, height }));
+            }
+        }
+        ChainstateDelta {
+            block_hash,
+            parent_hash: block.header.prev_blockhash,
+            height,
+            spent: spent_entries
+                .iter()
+                .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+                .collect(),
+            created,
+            transactions,
+            history,
+            spent_by,
+            metrics,
+        }
     }
 
     fn initialize_genesis(&mut self, genesis: &Block) -> Result<()> {
@@ -4354,7 +4499,172 @@ impl ChainState {
         Ok(Some((snapshot, verified)))
     }
 
-    fn persist_snapshot(&self) -> Result<()> {
+    /// Load the durable mutation suffix after a full chainstate snapshot.
+    /// The log is deliberately advisory: any missing, malformed, or
+    /// mismatched record returns `None`, and startup falls back to ordinary
+    /// consensus replay from the snapshot.
+    fn load_chainstate_deltas(
+        &mut self,
+        active_chain: &[BlockHash],
+        start_height: usize,
+    ) -> Option<Vec<ChainstateDelta>> {
+        if start_height >= active_chain.len() {
+            return Some(Vec::new());
+        }
+        let mut parent_hash = *active_chain.get(start_height.checked_sub(1)?)?;
+        let mut deltas = Vec::with_capacity(active_chain.len() - start_height);
+        for (height, block_hash) in active_chain.iter().enumerate().skip(start_height) {
+            let bytes = self.chainstate_store.get(block_hash).ok().flatten()?;
+            let delta = deserialize_chainstate_delta(&bytes).ok()?;
+            if delta.block_hash != *block_hash
+                || delta.parent_hash != parent_hash
+                || delta.height != u32::try_from(height).ok()?
+                || delta.transactions.is_empty()
+                || delta.transactions.iter().any(|(_, location)| {
+                    location.block_hash != *block_hash
+                        || location.height != u32::try_from(height).unwrap_or(u32::MAX)
+                })
+            {
+                return None;
+            }
+            parent_hash = *block_hash;
+            deltas.push(delta);
+        }
+        Some(deltas)
+    }
+
+    fn validate_chainstate_deltas(&self, deltas: &[ChainstateDelta]) -> Result<()> {
+        let mut parent_hash = self.best_hash();
+        let mut height = u32::try_from(self.active_chain.len())
+            .context("active chain height does not fit u32")?;
+        let mut touched = HashMap::<OutPoint, Option<UtxoEntry>>::new();
+        for delta in deltas {
+            if delta.height != height
+                || delta.parent_hash != parent_hash
+                || delta.transactions.is_empty()
+            {
+                bail!("chainstate delta does not extend the active chain")
+            }
+            let node = self.block_index.get(&delta.block_hash).with_context(|| {
+                format!("chainstate delta block {} is not indexed", delta.block_hash)
+            })?;
+            if node.height != delta.height || node.header.prev_blockhash != delta.parent_hash {
+                bail!("chainstate delta block index is inconsistent")
+            }
+            for (outpoint, entry) in &delta.spent {
+                if entry.output.value > Amount::MAX_MONEY {
+                    bail!("chainstate delta contains an output above the money range")
+                }
+                let current = match touched.get(outpoint) {
+                    Some(current) => current.as_ref(),
+                    None => self.utxos.get(outpoint),
+                }
+                .context("chainstate delta spends a missing output")?;
+                if current != entry {
+                    bail!("chainstate delta spent output metadata does not match")
+                }
+                touched.insert(*outpoint, None);
+            }
+            for (outpoint, entry) in &delta.created {
+                if entry.height != delta.height || entry.output.value > Amount::MAX_MONEY {
+                    bail!("chainstate delta contains invalid created output metadata")
+                }
+                touched.insert(*outpoint, Some(entry.clone()));
+            }
+            for (_, entry) in &delta.history {
+                if entry.height != delta.height {
+                    bail!("chainstate delta contains invalid history metadata")
+                }
+            }
+            for (_, location) in &delta.transactions {
+                if location.block_hash != delta.block_hash || location.height != delta.height {
+                    bail!("chainstate delta contains invalid transaction metadata")
+                }
+            }
+            for (_, (_, _, block_hash, spender_height)) in &delta.spent_by {
+                if *block_hash != delta.block_hash || *spender_height != delta.height {
+                    bail!("chainstate delta contains invalid spender metadata")
+                }
+            }
+            parent_hash = delta.block_hash;
+            height = height.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn apply_chainstate_delta(&mut self, delta: ChainstateDelta) -> Result<()> {
+        let height = u32::try_from(self.active_chain.len())
+            .context("active chain height does not fit u32")?;
+        if delta.height != height || delta.parent_hash != self.best_hash() {
+            bail!("chainstate delta does not extend the active chain")
+        }
+        let node = self
+            .block_index
+            .get(&delta.block_hash)
+            .copied()
+            .with_context(|| {
+                format!("chainstate delta block {} is not indexed", delta.block_hash)
+            })?;
+        if node.height != delta.height || node.header.prev_blockhash != delta.parent_hash {
+            bail!("chainstate delta block index is inconsistent")
+        }
+        for (outpoint, entry) in &delta.spent {
+            if entry.output.value > Amount::MAX_MONEY {
+                bail!("chainstate delta contains an output above the money range")
+            }
+            let removed = self.remove_utxo(outpoint).with_context(|| {
+                format!(
+                    "chainstate delta tries to spend missing output {}",
+                    outpoint
+                )
+            })?;
+            if removed != *entry {
+                bail!("chainstate delta spent output metadata does not match")
+            }
+        }
+        for (outpoint, entry) in &delta.created {
+            if entry.height != delta.height || entry.output.value > Amount::MAX_MONEY {
+                bail!("chainstate delta contains invalid created output metadata")
+            }
+            self.insert_utxo(*outpoint, entry.clone());
+        }
+        for (script_hash, entry) in &delta.history {
+            if entry.height != delta.height {
+                bail!("chainstate delta contains invalid history metadata")
+            }
+            self.add_history(script_hash, entry.clone());
+        }
+        for (txid, location) in &delta.transactions {
+            if location.block_hash != delta.block_hash || location.height != delta.height {
+                bail!("chainstate delta contains invalid transaction metadata")
+            }
+            self.tx_index.insert(*txid, location.clone());
+            self.tx_index_all.insert(*txid, location.clone());
+        }
+        if self.txospender_index_enabled {
+            for (outpoint, spender) in delta.spent_by {
+                self.spent_by.insert(outpoint, spender);
+            }
+        }
+        self.active_chain.push(delta.block_hash);
+        self.headers.push(node.header);
+        let count = u32::try_from(delta.transactions.len())
+            .context("chainstate delta transaction count does not fit u32")?;
+        self.active_tx_counts.push(count);
+        let total = self
+            .active_tx_totals
+            .last()
+            .copied()
+            .unwrap_or_default()
+            .saturating_add(u64::from(count));
+        self.active_tx_totals.push(total);
+        if let Some(stats) = self.coin_stats.as_mut() {
+            stats.apply_block_metrics(delta.metrics);
+        }
+        Ok(())
+    }
+
+    fn persist_snapshot(&mut self) -> Result<()> {
         let snapshot = self.current_snapshot();
         let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
@@ -4362,7 +4672,8 @@ impl ChainState {
         fs::write(&temp, &bytes)?;
         fs::rename(temp, path)?;
         self.persist_snapshot_checksum_bytes(&bytes)?;
-        self.persist_tx_counts()
+        self.persist_tx_counts()?;
+        self.chainstate_store.clear()
     }
 
     fn persist_snapshot_checksum(&self) -> Result<()> {
@@ -4737,6 +5048,7 @@ fn open_background_replay_state(
 ) -> Result<ChainState> {
     let store = BlockStore::open_read_only(data_dir.join("blocks"))?;
     let filter_store = FilterStore::open(data_dir.join("filters"))?;
+    let chainstate_store = ChainstateStore::open(data_dir.join("chainstate"))?;
     let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
     let headers = active_chain
         .iter()
@@ -4753,6 +5065,7 @@ fn open_background_replay_state(
         signet_challenge,
         store,
         filter_store,
+        chainstate_store,
         blockfilter_index_enabled: false,
         coinstats_store,
         txospender_index_enabled: false,
@@ -5751,7 +6064,7 @@ mod tests {
         fs::remove_file(directory.path().join("chainstate.bin")).unwrap();
         fs::write(directory.path().join("chainstate.json"), &metadata_json).unwrap();
         fs::write(directory.path().join("chainstate.snapshot"), &snapshot_json).unwrap();
-        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.best_hash(), tip);
         assert_eq!(reopened.height(), height);
         assert!(directory.path().join("chainstate.bin").exists());
@@ -6265,6 +6578,44 @@ mod tests {
         fs::write(directory.path().join("chainstate.snapshot"), b"corrupt").unwrap();
         let replayed = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(replayed.height(), 2);
+    }
+
+    #[test]
+    fn reopens_from_a_durable_chainstate_delta_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        state.persist_snapshot().unwrap();
+        let second = mine_block(&state, 2);
+        let second_hash = second.block_hash();
+        state.connect_block(second).unwrap();
+        let expected_stats = state.utxo_stats();
+        let expected_script_hash = electrum_script_hash(&Builder::new().push_int(1).into_script());
+        let expected_history = state.get_history(&expected_script_hash);
+        assert!(
+            fs::metadata(directory.path().join("chainstate/deltas.dat"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), second_hash);
+        assert_eq!(reopened.utxo_stats(), expected_stats);
+        assert_eq!(
+            reopened.get_history(&expected_script_hash),
+            expected_history
+        );
+        drop(reopened);
+
+        let delta_path = directory.path().join("chainstate/deltas.dat");
+        let mut delta_bytes = fs::read(&delta_path).unwrap();
+        *delta_bytes.last_mut().unwrap() ^= 1;
+        fs::write(&delta_path, delta_bytes).unwrap();
+        let replayed = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(replayed.best_hash(), second_hash);
+        assert_eq!(replayed.utxo_stats(), expected_stats);
     }
 
     fn mine_block(state: &ChainState, height: u32) -> Block {
@@ -6868,6 +7219,7 @@ mod tests {
             }],
         };
         let second_txid = second.compute_txid();
+        state.persist_snapshot().unwrap();
         let expected_before_spend = state.utxos.clone();
         let previous = *state.header(100).expect("height 100 header");
         let mut block = Block {

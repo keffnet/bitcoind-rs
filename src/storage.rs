@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 const MAX_STORED_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_FILTER_SIZE: usize = 4 * 1024 * 1024;
+const MAX_STORED_CHAINSTATE_DELTA_SIZE: usize = 64 * 1024 * 1024;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
 
@@ -596,6 +597,136 @@ pub struct CoinStatsStore {
     index: HashMap<BlockHash, Record>,
 }
 
+/// Durable active-chain mutation records.
+///
+/// The chainstate layer owns the serialized payload; this store only provides
+/// the crash-recoverable append-only record and hash index.  A delta is
+/// immutable once written because its key is the block hash.  Snapshots can
+/// therefore discard old records without changing the recovery semantics for
+/// the active suffix.
+pub struct ChainstateStore {
+    path: PathBuf,
+    file: File,
+    index_file: File,
+    index: HashMap<BlockHash, Record>,
+}
+
+impl ChainstateStore {
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref();
+        create_dir_all(directory)
+            .with_context(|| format!("creating chainstate directory {}", directory.display()))?;
+        let path = directory.join("deltas.dat");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening chainstate delta store {}", path.display()))?;
+        let index_path = directory.join("deltas.index");
+        let mut index_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&index_path)
+            .with_context(|| format!("opening chainstate delta index {}", index_path.display()))?;
+        let data_len = file.metadata()?.len();
+        let index = match load_index_with_limit(
+            &mut index_file,
+            data_len,
+            MAX_STORED_CHAINSTATE_DELTA_SIZE + 32,
+        )? {
+            Some(index) => index,
+            None => {
+                let index = scan_chainstate_index(&mut file)?;
+                rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
+                index
+            }
+        };
+        Ok(Self {
+            path,
+            file,
+            index_file,
+            index,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn contains(&self, hash: &BlockHash) -> bool {
+        self.index.contains_key(hash)
+    }
+
+    pub fn get(&mut self, hash: &BlockHash) -> Result<Option<Vec<u8>>> {
+        let Some(record) = self.index.get(hash).copied() else {
+            return Ok(None);
+        };
+        if record.length < 32 {
+            bail!("stored chainstate delta is truncated");
+        }
+        if record.length as usize > MAX_STORED_CHAINSTATE_DELTA_SIZE + 32 {
+            bail!("stored chainstate delta is too large");
+        }
+        self.file.seek(SeekFrom::Start(record.offset))?;
+        let mut length = [0u8; 4];
+        self.file.read_exact(&mut length)?;
+        let actual = u32::from_le_bytes(length);
+        if actual != record.length {
+            bail!("chainstate delta index disagrees with record length");
+        }
+        let mut bytes = vec![0u8; record.length as usize];
+        self.file.read_exact(&mut bytes)?;
+        let stored_hash = BlockHash::from_byte_array(
+            bytes[..32]
+                .try_into()
+                .expect("chainstate delta hash has fixed width"),
+        );
+        if stored_hash != *hash {
+            bail!("stored chainstate delta hash does not match its index");
+        }
+        Ok(Some(bytes[32..].to_vec()))
+    }
+
+    pub fn insert(&mut self, hash: BlockHash, payload: &[u8]) -> Result<()> {
+        if self.index.contains_key(&hash) {
+            return Ok(());
+        }
+        if payload.len() > MAX_STORED_CHAINSTATE_DELTA_SIZE {
+            bail!("chainstate delta is too large: {} bytes", payload.len());
+        }
+        let length = 32usize
+            .checked_add(payload.len())
+            .context("chainstate delta length overflow")?;
+        let length = u32::try_from(length).context("chainstate delta length does not fit u32")?;
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(&length.to_le_bytes())?;
+        self.file.write_all(&hash.to_byte_array())?;
+        self.file.write_all(payload)?;
+        self.file.sync_data()?;
+        let record = Record { offset, length };
+        persist_index_entry(
+            &mut self.index_file,
+            offset + 4 + u64::from(length),
+            hash,
+            record,
+        )?;
+        self.index.insert(hash, record);
+        Ok(())
+    }
+
+    /// Discard all records covered by a durable full snapshot.
+    pub fn clear(&mut self) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.sync_data()?;
+        self.index.clear();
+        rewrite_index(&mut self.index_file, 0, &self.index)
+    }
+}
+
 impl CoinStatsStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
@@ -826,6 +957,14 @@ fn scan_filter_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
 }
 
 fn load_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<BlockHash, Record>>> {
+    load_index_with_limit(file, data_len, MAX_STORED_BLOCK_SIZE)
+}
+
+fn load_index_with_limit(
+    file: &mut File,
+    data_len: u64,
+    max_record_size: usize,
+) -> Result<Option<HashMap<BlockHash, Record>>> {
     let index_len = file.metadata()?.len();
     if index_len < INDEX_HEADER_SIZE || (index_len - INDEX_HEADER_SIZE) % INDEX_RECORD_SIZE != 0 {
         return Ok(None);
@@ -850,7 +989,7 @@ fn load_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<BlockHash
             length: u32::from_le_bytes(length_bytes),
         };
         if record.length == 0
-            || record.length as usize > MAX_STORED_BLOCK_SIZE
+            || record.length as usize > max_record_size
             || record
                 .offset
                 .saturating_add(4)
@@ -868,6 +1007,51 @@ fn load_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<BlockHash
         return Ok(None);
     }
     Ok(Some(index))
+}
+
+fn scan_chainstate_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut index = HashMap::new();
+    let data_len = file.metadata()?.len();
+    loop {
+        let offset = file.stream_position()?;
+        let mut length_bytes = [0u8; 4];
+        match file.read_exact(&mut length_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                file.set_len(offset)?;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let length = u32::from_le_bytes(length_bytes);
+        let end = offset.saturating_add(4).saturating_add(u64::from(length));
+        if end > data_len {
+            file.set_len(offset)?;
+            break;
+        }
+        if length < 32 || length as usize > MAX_STORED_CHAINSTATE_DELTA_SIZE + 32 {
+            bail!(
+                "invalid chainstate delta length {} at offset {}",
+                length,
+                offset
+            );
+        }
+        let mut bytes = vec![0u8; length as usize];
+        file.read_exact(&mut bytes).map_err(|error| {
+            anyhow::anyhow!("truncated chainstate delta at offset {}: {}", offset, error)
+        })?;
+        let hash = BlockHash::from_byte_array(
+            bytes[..32]
+                .try_into()
+                .expect("chainstate delta hash has fixed width"),
+        );
+        if index.insert(hash, Record { offset, length }).is_some() {
+            bail!("duplicate block hash in chainstate delta store");
+        }
+    }
+    file.seek(SeekFrom::End(0))?;
+    Ok(index)
 }
 
 fn rewrite_index(file: &mut File, data_len: u64, index: &HashMap<BlockHash, Record>) -> Result<()> {
@@ -1278,6 +1462,34 @@ mod tests {
         }
         let mut reopened = CoinStatsStore::open(directory.path()).unwrap();
         assert_eq!(reopened.get(&record.block_hash).unwrap(), Some(record));
+    }
+
+    #[test]
+    fn persists_and_recovers_chainstate_deltas() {
+        let directory = tempfile::tempdir().unwrap();
+        let hash = BlockHash::from_byte_array([6; 32]);
+        let payload = vec![1, 2, 3, 4, 5];
+        {
+            let mut store = ChainstateStore::open(directory.path()).unwrap();
+            store.insert(hash, &payload).unwrap();
+            assert_eq!(store.get(&hash).unwrap(), Some(payload.clone()));
+        }
+        let data_path = directory.path().join("deltas.dat");
+        let original_len = std::fs::metadata(&data_path).unwrap().len();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&data_path)
+            .unwrap();
+        std::io::Write::write_all(&mut file, &128u32.to_le_bytes()).unwrap();
+        std::io::Write::write_all(&mut file, &[1, 2, 3]).unwrap();
+        std::io::Write::flush(&mut file).unwrap();
+
+        let mut reopened = ChainstateStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&hash).unwrap(), Some(payload));
+        assert_eq!(std::fs::metadata(data_path).unwrap().len(), original_len);
+        reopened.clear().unwrap();
+        assert!(!reopened.contains(&hash));
+        assert_eq!(reopened.get(&hash).unwrap(), None);
     }
 
     #[test]

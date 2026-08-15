@@ -1,8 +1,9 @@
 use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(unix))]
 use anyhow::bail;
@@ -12,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::{
     format::Writer,
     time::FormatTime,
-    writer::{BoxMakeWriter, MakeWriterExt},
+    writer::{BoxMakeWriter, MakeWriter, MakeWriterExt},
 };
 
 use bitcoind_rs::{
@@ -48,30 +49,26 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     let node = Node::open(config)?;
     let _pid_file = PidFile::create(node.config.pid_path.clone())?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let writer = if let Some(path) = node
+    let (writer, log_file) = if let Some(path) = node
         .config
         .debug_log_file_enabled
         .then_some(&node.config.debug_log_path)
     {
-        let mut options = OpenOptions::new();
-        options.create(true).write(true);
-        if node.config.shrink_debug_file {
-            options.truncate(true);
-        } else {
-            options.append(true);
-        }
-        let file = options
-            .open(path)
+        let log_file = ReloadableLogFile::open(path, node.config.shrink_debug_file)
             .with_context(|| format!("Could not open debug log file {}", path.display()))?;
+        let log_file_for_signal = log_file.clone();
         if node.config.print_to_console {
-            BoxMakeWriter::new(std::io::stdout.and(file))
+            (
+                BoxMakeWriter::new(std::io::stdout.and(log_file)),
+                Some(log_file_for_signal),
+            )
         } else {
-            BoxMakeWriter::new(file)
+            (BoxMakeWriter::new(log_file), Some(log_file_for_signal))
         }
     } else if node.config.print_to_console {
-        BoxMakeWriter::new(std::io::stdout)
+        (BoxMakeWriter::new(std::io::stdout), None)
     } else {
-        BoxMakeWriter::new(std::io::sink)
+        (BoxMakeWriter::new(std::io::sink), None)
     };
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -92,7 +89,111 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
         builder.init();
     }
     readiness.notify(true);
-    node.run().await
+    #[cfg(unix)]
+    let log_reopen_task = log_file.map(|log_file| tokio::spawn(reopen_log_on_sighup(log_file)));
+    let result = node.run().await;
+    #[cfg(unix)]
+    if let Some(task) = log_reopen_task {
+        task.abort();
+    }
+    result
+}
+
+#[derive(Clone)]
+struct ReloadableLogFile {
+    path: PathBuf,
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl ReloadableLogFile {
+    fn open(path: &std::path::Path, shrink: bool) -> io::Result<Self> {
+        let mut options = OpenOptions::new();
+        options.create(true).write(true);
+        if shrink {
+            options.truncate(true);
+        } else {
+            options.append(true);
+        }
+        let file = options.open(path)?;
+        Ok(Self {
+            path: path.to_owned(),
+            file: Arc::new(Mutex::new(file)),
+        })
+    }
+
+    fn reopen(&self) -> io::Result<()> {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        let mut current = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("debug log lock poisoned"))?;
+        *current = file;
+        Ok(())
+    }
+}
+
+struct ReloadableLogWriter {
+    file: Arc<Mutex<std::fs::File>>,
+    buffer: Vec<u8>,
+}
+
+impl Write for ReloadableLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| io::Error::other("debug log lock poisoned"))?;
+        file.write_all(&self.buffer)?;
+        file.flush()?;
+        self.buffer.clear();
+        Ok(())
+    }
+}
+
+impl Drop for ReloadableLogWriter {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+impl<'a> MakeWriter<'a> for ReloadableLogFile {
+    type Writer = ReloadableLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        ReloadableLogWriter {
+            file: self.file.clone(),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn reopen_log_on_sighup(log_file: ReloadableLogFile) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sighup = match signal(SignalKind::hangup()) {
+        Ok(signal) => signal,
+        Err(error) => {
+            tracing::warn!(%error, "unable to install SIGHUP handler for debug log reopening");
+            return;
+        }
+    };
+    while sighup.recv().await.is_some() {
+        if let Err(error) = log_file.reopen() {
+            tracing::warn!(%error, path = %log_file.path.display(), "unable to reopen debug log file");
+        }
+    }
 }
 
 struct DaemonReadyGuard {
@@ -326,5 +427,27 @@ mod tests {
     fn pid_file_rejects_empty_paths() {
         let error = PidFile::create(std::path::Path::new("").to_owned()).unwrap_err();
         assert!(error.to_string().contains("must not be empty"));
+    }
+
+    #[test]
+    fn debug_log_reopens_after_rotation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("debug.log");
+        let rotated = directory.path().join("debug.log.1");
+        let log_file = ReloadableLogFile::open(&path, true).unwrap();
+
+        let mut writer = log_file.make_writer();
+        writer.write_all(b"before rotation\n").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        fs::rename(&path, &rotated).unwrap();
+        log_file.reopen().unwrap();
+        let mut writer = log_file.make_writer();
+        writer.write_all(b"after rotation\n").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(fs::read_to_string(rotated).unwrap(), "before rotation\n");
+        assert_eq!(fs::read_to_string(path).unwrap(), "after rotation\n");
     }
 }

@@ -47,6 +47,9 @@ pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
 pub const DEFAULT_I2P_ACCEPT_INCOMING: bool = true;
 pub const DEFAULT_MAX_RECEIVE_BUFFER_KB: u64 = 5;
 pub const DEFAULT_MAX_SEND_BUFFER_KB: u64 = 1;
+pub const DEFAULT_CLUSTER_COUNT: usize = 64;
+pub const MAX_CLUSTER_COUNT_LIMIT: usize = 64;
+pub const DEFAULT_CLUSTER_SIZE_KVB: u64 = 101;
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -1229,6 +1232,18 @@ pub struct Args {
     #[arg(long = "maxmempool")]
     pub max_mempool: Option<u64>,
 
+    #[arg(
+        long = "limitclustercount",
+        default_value_t = DEFAULT_CLUSTER_COUNT
+    )]
+    pub limit_cluster_count: usize,
+
+    #[arg(
+        long = "limitclustersize",
+        default_value_t = DEFAULT_CLUSTER_SIZE_KVB
+    )]
+    pub limit_cluster_size_kvb: u64,
+
     #[arg(long, default_value_t = DEFAULT_MEMPOOL_EXPIRY_HOURS)]
     pub mempoolexpiry: u64,
 
@@ -1712,6 +1727,10 @@ pub struct Config {
     pub peer_block_filters: bool,
     /// Maximum mempool size in decimal megabytes, matching Core's option.
     pub max_mempool_mb: u64,
+    /// Maximum number of transactions in a connected mempool cluster.
+    pub cluster_count: usize,
+    /// Maximum virtual size of a connected mempool cluster.
+    pub cluster_size_vbytes: u64,
     /// Maximum age of a mempool entry in hours.
     pub mempool_expiry_hours: u64,
     /// Load and save the mempool automatically across node restarts.
@@ -2043,6 +2062,13 @@ impl Config {
         if args.mempoolexpiry == 0 {
             bail!("--mempoolexpiry must be greater than zero");
         }
+        if args.limit_cluster_count > MAX_CLUSTER_COUNT_LIMIT {
+            bail!("--limitclustercount must be less than or equal to {MAX_CLUSTER_COUNT_LIMIT}");
+        }
+        let cluster_size_vbytes = args
+            .limit_cluster_size_kvb
+            .checked_mul(1_000)
+            .context("--limitclustersize is too large")?;
         let max_upload_target =
             parse_byte_units(&args.max_upload_target, 1 << 20).with_context(|| {
                 format!(
@@ -2244,6 +2270,8 @@ impl Config {
             blockfilterindex,
             peer_block_filters: args.peerblockfilters,
             max_mempool_mb: max_mempool,
+            cluster_count: args.limit_cluster_count,
+            cluster_size_vbytes,
             mempool_expiry_hours: args.mempoolexpiry,
             persist_mempool: args.persistmempool,
             persist_mempool_v1: args.persistmempoolv1,
@@ -3761,6 +3789,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(Config::from_args(args).unwrap().max_mempool_mb, 12);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--limitclustercount=17",
+            "--limitclustersize=12",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.cluster_count, 17);
+        assert_eq!(config.cluster_size_vbytes, 12_000);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--limitclustercount=65",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

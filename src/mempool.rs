@@ -18,9 +18,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainState;
 use crate::config::{
-    DEFAULT_ACCEPT_DATACARRIER, DEFAULT_BYTES_PER_SIGOP, DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
+    DEFAULT_ACCEPT_DATACARRIER, DEFAULT_BYTES_PER_SIGOP, DEFAULT_CLUSTER_COUNT,
+    DEFAULT_CLUSTER_SIZE_KVB, DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
     DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB, DEFAULT_MAX_DATACARRIER_BYTES,
-    DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB, DEFAULT_PERMIT_BARE_MULTISIG,
+    DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB, DEFAULT_PERMIT_BARE_MULTISIG, MAX_CLUSTER_COUNT_LIMIT,
 };
 use crate::time;
 use crate::validation::{self, ValidationError};
@@ -49,8 +50,8 @@ const TRUC_CHILD_MAX_VSIZE: u64 = 1_000;
 pub const MAX_PACKAGE_COUNT: usize = 25;
 pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
 /// Core's default cluster limits for the v31.1 mempool policy.
-pub const MAX_CLUSTER_COUNT: usize = 64;
-pub const MAX_CLUSTER_VSIZE: u64 = 101_000;
+pub const MAX_CLUSTER_COUNT: usize = MAX_CLUSTER_COUNT_LIMIT;
+pub const MAX_CLUSTER_VSIZE: u64 = DEFAULT_CLUSTER_SIZE_KVB * 1_000;
 const MAX_REPLACEMENT_CANDIDATES: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +63,8 @@ pub struct MempoolPolicy {
     pub max_datacarrier_bytes: Option<usize>,
     pub permit_bare_multisig: bool,
     pub require_standard: bool,
+    pub cluster_count_limit: usize,
+    pub cluster_vsize_limit: u64,
 }
 
 impl Default for MempoolPolicy {
@@ -75,6 +78,8 @@ impl Default for MempoolPolicy {
                 .then_some(usize::try_from(DEFAULT_MAX_DATACARRIER_BYTES).expect("constant fits")),
             permit_bare_multisig: DEFAULT_PERMIT_BARE_MULTISIG,
             require_standard: true,
+            cluster_count_limit: DEFAULT_CLUSTER_COUNT,
+            cluster_vsize_limit: MAX_CLUSTER_VSIZE,
         }
     }
 }
@@ -600,6 +605,14 @@ impl Mempool {
 
     pub fn max_datacarrier_bytes(&self) -> Option<usize> {
         self.policy.max_datacarrier_bytes
+    }
+
+    pub fn cluster_count_limit(&self) -> usize {
+        self.policy.cluster_count_limit
+    }
+
+    pub fn cluster_vsize_limit(&self) -> u64 {
+        self.policy.cluster_vsize_limit
     }
 
     pub fn permit_bare_multisig(&self) -> bool {
@@ -2185,8 +2198,8 @@ impl Mempool {
             .map(|entry| entry.vsize)
             .fold(0u64, u64::saturating_add)
             .saturating_add(transaction_vsize);
-        if connected.len().saturating_add(1) > MAX_CLUSTER_COUNT
-            || connected_vsize > MAX_CLUSTER_VSIZE
+        if connected.len().saturating_add(1) > self.policy.cluster_count_limit
+            || connected_vsize > self.policy.cluster_vsize_limit
         {
             return Err(MempoolError::ClusterLimit);
         }
@@ -3852,6 +3865,25 @@ mod tests {
             Err(MempoolError::ClusterLimit)
         ));
         assert_eq!(chain.len(), MAX_CLUSTER_COUNT);
+    }
+
+    #[test]
+    fn configured_cluster_limits_are_enforced() {
+        let policy = MempoolPolicy {
+            cluster_count_limit: 1,
+            cluster_vsize_limit: MAX_CLUSTER_VSIZE,
+            ..MempoolPolicy::default()
+        };
+        let mut pool = Mempool::with_max_bytes_and_policy(Network::Regtest, 300_000_000, policy);
+        let parent = graph_transaction(Txid::from_byte_array([31; 32]), 31);
+        let parent_id = insert_policy_entry(&mut pool, parent);
+        let child = graph_transaction(parent_id, 32);
+        assert!(matches!(
+            pool.check_cluster_limits(&child),
+            Err(MempoolError::ClusterLimit)
+        ));
+        assert_eq!(pool.cluster_count_limit(), 1);
+        assert_eq!(pool.cluster_vsize_limit(), MAX_CLUSTER_VSIZE);
     }
 
     #[test]

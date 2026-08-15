@@ -85,6 +85,7 @@ Script verification uses bounded parallel workers; `--par=<n>` follows Core's co
 Use `--txospenderindex` to enable historical spender lookup for `gettxspendingprevout`; transaction lookup indexes are unavailable in prune mode.
 
 `--maxmempool=<MB>` sets the transaction pool's dynamic-memory limit (300 MB by default, or 5 MB in `--blocksonly` mode unless explicitly set); admission uses the existing package-aware eviction policy when the limit is reached.
+`--limitclustercount=<n>` and `--limitclustersize=<kB>` configure Core v31.1's connected mempool-cluster limits (64 transactions and 101 kB by default). The active values are reported by `getmempoolinfo`.
 
 `--maxuploadtarget=<size>` limits P2P upload bytes to the size of a rolling 24-hour cycle (`0M` by default, meaning unlimited). Lowercase suffixes use decimal units and uppercase suffixes use powers of 1024, matching Core; once the target is reached, historical blocks older than seven days and filtered blocks are withheld from peers without the `download` permission.
 

@@ -926,6 +926,8 @@ impl Node {
             max_datacarrier_bytes: config.max_datacarrier_bytes,
             permit_bare_multisig: config.permit_bare_multisig,
             require_standard: !config.accept_nonstd_txn,
+            cluster_count_limit: config.cluster_count,
+            cluster_vsize_limit: config.cluster_size_vbytes,
         };
         let mut mempool =
             Mempool::with_max_bytes_and_policy(config.network, max_mempool_bytes, mempool_policy);
@@ -4024,6 +4026,8 @@ mod tests {
             txindex: false,
             txospenderindex: false,
             max_mempool_mb: 300,
+            cluster_count: 64,
+            cluster_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             blockfilterindex: true,

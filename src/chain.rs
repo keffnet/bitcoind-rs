@@ -1454,6 +1454,15 @@ impl ChainState {
     }
 
     pub fn headers_to_hash(&self, hash: &BlockHash) -> Option<Vec<bitcoin::block::Header>> {
+        let node = self.block_index.get(hash)?;
+        if self
+            .active_chain
+            .get(node.height as usize)
+            .is_some_and(|active_hash| active_hash == hash)
+            && let Some(headers) = self.headers.get(..=node.height as usize)
+        {
+            return Some(headers.to_vec());
+        }
         let mut headers = Vec::new();
         let mut cursor = *hash;
         loop {
@@ -4131,7 +4140,17 @@ impl ChainState {
 
     fn ancestor_hash(&self, mut hash: BlockHash, height: u32) -> Option<BlockHash> {
         let mut current_height = self.block_index.get(&hash)?.height;
+        if current_height < height {
+            return None;
+        }
         while current_height > height {
+            if self
+                .active_chain
+                .get(current_height as usize)
+                .is_some_and(|active_hash| active_hash == &hash)
+            {
+                return self.active_chain.get(height as usize).copied();
+            }
             hash = self.block_index.get(&hash)?.header.prev_blockhash;
             current_height -= 1;
         }

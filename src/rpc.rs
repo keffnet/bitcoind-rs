@@ -7760,6 +7760,16 @@ fn enforce_max_fee_rate(
     let Some(max_fee_rate) = max_fee_rate else {
         return Ok(());
     };
+    if node
+        .mempool
+        .read()
+        .get(&transaction.compute_txid())
+        .is_some()
+    {
+        // BroadcastTransaction reannounces an existing mempool transaction
+        // before applying the caller's maxfeerate sanity check.
+        return Ok(());
+    }
     let chain = node.chain.read();
     let mut candidate = node.mempool.read().clone();
     let txid = candidate.accept(transaction.clone(), &chain)?;
@@ -13281,7 +13291,16 @@ mod tests {
                 script_pubkey: script,
             }],
         };
-        let txid = node.accept_transaction(transaction).unwrap();
+        let txid = node.accept_transaction(transaction.clone()).unwrap();
+        assert_eq!(
+            dispatch_method(
+                &node,
+                "sendrawtransaction",
+                &json!([hex::encode(serialize(&transaction)), 0])
+            )
+            .unwrap(),
+            json!(txid.to_string())
+        );
 
         let entry = dispatch_method(&node, "getmempoolentry", &json!([txid.to_string()])).unwrap();
         assert_eq!(entry["height"], json!(node.chain.read().height()));

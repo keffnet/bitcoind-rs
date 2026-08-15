@@ -881,6 +881,20 @@ impl Node {
     }
 
     pub fn accept_transaction(&self, transaction: Transaction) -> Result<Txid> {
+        let txid = transaction.compute_txid();
+        if let Some(existing) = self
+            .mempool
+            .read()
+            .get(&txid)
+            .map(|entry| entry.transaction.clone())
+        {
+            // Core treats an already-mempool transaction as a successful
+            // rebroadcast. Use the mempool's witness-bearing transaction so
+            // a same-txid/different-witness submission cannot relay data that
+            // was not admitted.
+            self.notify_mempool_transaction(existing);
+            return Ok(txid);
+        }
         let (txid, _) = self.try_accept_transaction(transaction.clone())?;
         self.mempool.write().add_unbroadcast(txid);
         self.notify_mempool_transaction(transaction);

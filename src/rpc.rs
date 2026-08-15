@@ -34,7 +34,6 @@ use miniscript::{
     Descriptor as MiniscriptDescriptor, DescriptorPublicKey as MiniscriptPublicKey, Legacy,
     Miniscript, Segwitv0, Tap,
 };
-use rand::random;
 use rand::seq::SliceRandom;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -9647,7 +9646,7 @@ fn build_mining_block_with_transactions(
             script_pubkey,
             transactions,
             fees,
-            extra_nonce: random(),
+            include_dummy_extranonce: true,
             version: Some(version),
         },
         &deployment_parameters,
@@ -9678,7 +9677,7 @@ struct MiningBlockTemplate {
     script_pubkey: ScriptBuf,
     transactions: Vec<Transaction>,
     fees: u64,
-    extra_nonce: u32,
+    include_dummy_extranonce: bool,
     version: Option<i32>,
 }
 
@@ -9703,6 +9702,60 @@ pub(crate) struct IpcBlockCreateOptions {
 
 pub(crate) const IPC_MINIMUM_BLOCK_RESERVED_WEIGHT: u64 = 2_000;
 
+fn mining_transaction_sigop_cost(
+    transaction: &Transaction,
+    chain: &chain::ChainState,
+    mempool: &Mempool,
+) -> u64 {
+    transaction.total_sigop_cost(|outpoint| {
+        chain
+            .utxo(outpoint)
+            .map(|entry| entry.output.clone())
+            .or_else(|| {
+                mempool
+                    .get(&outpoint.txid)
+                    .and_then(|entry| entry.transaction.output.get(outpoint.vout as usize))
+                    .cloned()
+            })
+    }) as u64
+}
+
+/// Apply the block assembler's sigop budget to the topology-aware mempool
+/// order. The mempool order already handles package feerate and weight; this
+/// pass mirrors Core's `nBlockSigOpsCost + chunk_sig_ops >= MAX` guard while
+/// preserving dependency order when a parent package no longer fits.
+fn filter_mining_transaction_ids(
+    selected: impl IntoIterator<Item = Txid>,
+    chain: &chain::ChainState,
+    mempool: &Mempool,
+    coinbase_output_max_additional_sigops: u64,
+) -> Vec<Txid> {
+    let coinbase_sigops =
+        coinbase_output_max_additional_sigops.min(validation::MAX_BLOCK_SIGOP_COST as u64);
+    let mut block_sigops = coinbase_sigops;
+    let mut included = HashSet::new();
+    let mut filtered = Vec::new();
+    for txid in selected {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        if entry.transaction.input.iter().any(|input| {
+            mempool.get(&input.previous_output.txid).is_some()
+                && !included.contains(&input.previous_output.txid)
+        }) {
+            continue;
+        }
+        let sigops = mining_transaction_sigop_cost(&entry.transaction, chain, mempool);
+        if block_sigops.saturating_add(sigops) >= validation::MAX_BLOCK_SIGOP_COST as u64 {
+            continue;
+        }
+        block_sigops = block_sigops.saturating_add(sigops);
+        included.insert(txid);
+        filtered.push(txid);
+    }
+    filtered
+}
+
 /// Assemble the wallet-free equivalent of Core's `BlockAssembler` template.
 /// The dummy coinbase is intentionally retained in `block`; clients replace
 /// it through BlockTemplate.submitSolution after constructing their payout
@@ -9718,14 +9771,6 @@ pub(crate) fn create_ipc_block_template(
             IPC_MINIMUM_BLOCK_RESERVED_WEIGHT
         );
     }
-
-    // The current wallet-free assembler has no node-provided coinbase
-    // outputs, so this option only constrains a future extension.  Still read
-    // and validate the value here so malformed IPC requests fail at the same
-    // boundary as Core rather than being silently ignored.
-    let _coinbase_output_max_additional_sigops = options
-        .coinbase_output_max_additional_sigops
-        .min(u64::from(u32::MAX));
 
     let chain = node.chain.read();
     let tip = chain.tip();
@@ -9754,10 +9799,16 @@ pub(crate) fn create_ipc_block_template(
 
     let mempool = node.mempool.read();
     let selected = if options.use_mempool {
-        mempool.mining_order_with_min_fee(
+        let selected = mempool.mining_order_with_min_fee(
             node.config.block_max_weight,
             options.block_reserved_weight,
             node.config.block_min_tx_fee_sat_per_kvb,
+        );
+        filter_mining_transaction_ids(
+            selected,
+            &chain,
+            &mempool,
+            options.coinbase_output_max_additional_sigops,
         )
     } else {
         Vec::new()
@@ -9771,17 +9822,7 @@ pub(crate) fn create_ipc_block_template(
             continue;
         };
         let transaction = entry.transaction.clone();
-        let sigops = transaction.total_sigop_cost(|outpoint| {
-            chain
-                .utxo(outpoint)
-                .map(|entry| entry.output.clone())
-                .or_else(|| {
-                    mempool
-                        .get(&outpoint.txid)
-                        .and_then(|entry| entry.transaction.output.get(outpoint.vout as usize))
-                        .cloned()
-                })
-        });
+        let sigops = mining_transaction_sigop_cost(&transaction, &chain, &mempool);
         total_fees_sat = total_fees_sat.saturating_add(entry.fee_sat);
         tx_fees.push(i64::try_from(entry.fee_sat).unwrap_or(i64::MAX));
         tx_sigops.push(i64::try_from(sigops).unwrap_or(i64::MAX));
@@ -9801,7 +9842,7 @@ pub(crate) fn create_ipc_block_template(
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             transactions,
             fees: total_fees_sat,
-            extra_nonce: 0,
+            include_dummy_extranonce: false,
             version: Some(version),
         },
         &deployment_parameters,
@@ -9853,7 +9894,7 @@ fn mining_block_with_deployment_parameters(
         script_pubkey,
         transactions,
         fees,
-        extra_nonce,
+        include_dummy_extranonce,
         version,
     } = template;
     let segwit_active = height >= deployment_parameters.buried.segwit;
@@ -9862,10 +9903,13 @@ fn mining_block_with_deployment_parameters(
         lock_time: LockTime::from_consensus(height.saturating_sub(1)),
         input: vec![TxIn {
             previous_output: OutPoint::null(),
-            script_sig: Builder::new()
-                .push_int(i64::from(height))
-                .push_slice(extra_nonce.to_le_bytes())
-                .into_script(),
+            script_sig: {
+                let mut builder = Builder::new().push_int(i64::from(height));
+                if include_dummy_extranonce {
+                    builder = builder.push_int(0);
+                }
+                builder.into_script()
+            },
             sequence: bitcoin::Sequence::MAX,
             witness: Witness::default(),
         }],
@@ -10062,10 +10106,15 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bits = chain.next_bits(curtime);
     let mempool = node.mempool.read();
     let mut fees = 0u64;
-    let selected = mempool.mining_order_with_min_fee(
-        node.config.block_max_weight,
-        node.config.block_reserved_weight,
-        node.config.block_min_tx_fee_sat_per_kvb,
+    let selected = filter_mining_transaction_ids(
+        mempool.mining_order_with_min_fee(
+            node.config.block_max_weight,
+            node.config.block_reserved_weight,
+            node.config.block_min_tx_fee_sat_per_kvb,
+        ),
+        &chain,
+        &mempool,
+        400,
     );
     let positions = selected
         .iter()
@@ -10130,7 +10179,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
             script_pubkey: ScriptBuf::new(),
             transactions: selected_transactions,
             fees,
-            extra_nonce: 0,
+            include_dummy_extranonce: true,
             version: Some(version),
         },
         &deployment_parameters,
@@ -17437,7 +17486,7 @@ mod tests {
             script_pubkey: ScriptBuf::new(),
             transactions: Vec::new(),
             fees: 0,
-            extra_nonce: 0,
+            include_dummy_extranonce: true,
             version: None,
         })
         .unwrap();
@@ -17459,7 +17508,7 @@ mod tests {
             script_pubkey: Builder::new().push_int(1).into_script(),
             transactions: Vec::new(),
             fees: 0,
-            extra_nonce: 0,
+            include_dummy_extranonce: true,
             version: None,
         })
         .unwrap();

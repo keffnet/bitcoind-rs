@@ -289,12 +289,7 @@ fn block_template_coinbase(template: &crate::rpc::IpcBlockTemplate) -> Option<Co
     Some(CoinbaseFields {
         version: coinbase.version.0 as u32,
         sequence: input.sequence.to_consensus_u32(),
-        script_sig_prefix: bitcoin::script::Builder::new()
-            .push_int(i64::from(
-                coinbase.lock_time.to_consensus_u32().saturating_add(1),
-            ))
-            .into_script()
-            .into_bytes(),
+        script_sig_prefix: input.script_sig.as_bytes().to_vec(),
         witness,
         reward,
         required_outputs,
@@ -1072,6 +1067,10 @@ mod tests {
                 let block: bitcoin::Block =
                     deserialize(block_response.get().unwrap().get_result().unwrap()).unwrap();
                 assert_eq!(block.txdata.len(), 1);
+                assert_eq!(
+                    block.txdata[0].input[0].script_sig.as_bytes(),
+                    Builder::new().push_int(1).into_script().as_bytes()
+                );
                 let coinbase_response = template
                     .get_coinbase_tx_request()
                     .send()

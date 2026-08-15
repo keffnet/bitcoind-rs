@@ -1017,6 +1017,15 @@ pub struct Args {
     #[arg(long = "loadblock")]
     pub loadblock: Vec<PathBuf>,
 
+    #[arg(
+        long = "stopafterblockimport",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub stop_after_block_import: bool,
+
     #[arg(long, default_value_t = false)]
     pub txindex: bool,
 
@@ -1460,6 +1469,7 @@ pub struct Config {
     pub reindex: bool,
     pub reindex_chainstate: bool,
     pub load_blocks: Vec<PathBuf>,
+    pub stop_after_block_import: bool,
     pub txindex: bool,
     pub txospenderindex: bool,
     pub coinstatsindex: bool,
@@ -1904,6 +1914,7 @@ impl Config {
             reindex: args.reindex,
             reindex_chainstate: args.reindex_chainstate,
             load_blocks: args.loadblock,
+            stop_after_block_import: args.stop_after_block_import,
             txindex: args.txindex,
             txospenderindex: args.txospenderindex,
             coinstatsindex: args.coinstatsindex,
@@ -3055,12 +3066,12 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--loadblock",
             block_file.to_str().unwrap(),
+            "--stopafterblockimport",
         ])
         .unwrap();
-        assert_eq!(
-            Config::from_args(args).unwrap().load_blocks,
-            vec![block_file]
-        );
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.load_blocks, vec![block_file]);
+        assert!(config.stop_after_block_import);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

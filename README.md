@@ -89,6 +89,7 @@ Relay policy follows Core's fee and standardness switches: `--minrelaytxfee` and
 `--reindex` and `--reindex-chainstate` rebuild this implementation's chain metadata and UTXO state from the durable block store on startup. The rebuild ignores the existing binary or legacy JSON chainstate/snapshot files and preserves the stored block records.
 
 `--loadblock=<path>` imports one or more Core-style network-magic/length-framed block files at startup; each block still passes normal header, consensus, and chain-selection validation.
+`--stopafterblockimport` requests clean shutdown after startup block-file import, matching Core's debug/test option.
 
 ZeroMQ topics can be enabled with the Core-style options, for example
 `--zmqpubhashtx tcp://127.0.0.1:28332 --zmqpubsequence tcp://127.0.0.1:28333`.

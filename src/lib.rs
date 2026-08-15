@@ -984,6 +984,9 @@ impl Node {
             node.check_addrman_consistency()
                 .context("startup address-manager consistency check failed")?;
         }
+        if node.config.stop_after_block_import {
+            node.request_shutdown();
+        }
         Ok(node)
     }
 
@@ -3781,6 +3784,7 @@ mod tests {
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
+            stop_after_block_import: false,
             txindex: false,
             txospenderindex: false,
             max_mempool_mb: 300,
@@ -4067,6 +4071,19 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), node.run())
             .await
             .expect("pre-run shutdown should wake the node")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_after_block_import_requests_shutdown_before_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.stop_after_block_import = true;
+        let node = Node::open(config).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), node.run())
+            .await
+            .expect("stop-after-block-import should wake the node")
             .unwrap();
     }
 

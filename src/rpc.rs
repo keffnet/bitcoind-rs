@@ -5618,37 +5618,33 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if let Some(block_hash) = requested_block {
         result["in_active_chain"] = json!(chain.is_active_block(&block_hash));
     }
-    if verbosity >= 2 {
-        if location.block_hash != BlockHash::all_zeros() {
-            if let Some(undo) = chain
-                .spent_outputs_by_transaction(&location.block_hash)?
-                .and_then(|entries| entries.get(location.transaction_index).cloned())
-                && undo.len() == transaction.input.len()
-            {
-                add_prevout_details(
-                    &mut result,
-                    &transaction,
-                    &undo,
-                    &mut chain,
-                    node.config.network,
-                )?;
-                let input_total = undo
-                    .iter()
-                    .map(|output| output.value.to_sat())
-                    .try_fold(0u64, u64::checked_add)
-                    .ok_or_else(|| anyhow!("transaction input total overflowed"))?;
-                let output_total = transaction
-                    .output
-                    .iter()
-                    .map(|output| output.value.to_sat())
-                    .try_fold(0u64, u64::checked_add)
-                    .ok_or_else(|| anyhow!("transaction output total overflowed"))?;
-                if input_total >= output_total {
-                    result["fee"] = json!(sat_to_btc(input_total - output_total));
-                }
-            }
-        } else if let Some(entry) = node.mempool.read().get(&txid) {
-            result["fee"] = json!(sat_to_btc(entry.fee_sat));
+    if verbosity >= 2
+        && location.block_hash != BlockHash::all_zeros()
+        && let Some(undo) = chain
+            .spent_outputs_by_transaction(&location.block_hash)?
+            .and_then(|entries| entries.get(location.transaction_index).cloned())
+        && undo.len() == transaction.input.len()
+    {
+        add_prevout_details(
+            &mut result,
+            &transaction,
+            &undo,
+            &mut chain,
+            node.config.network,
+        )?;
+        let input_total = undo
+            .iter()
+            .map(|output| output.value.to_sat())
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| anyhow!("transaction input total overflowed"))?;
+        let output_total = transaction
+            .output
+            .iter()
+            .map(|output| output.value.to_sat())
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| anyhow!("transaction output total overflowed"))?;
+        if input_total >= output_total {
+            result["fee"] = json!(sat_to_btc(input_total - output_total));
         }
     }
     Ok(result)
@@ -17323,6 +17319,9 @@ mod tests {
             }],
         };
         let spend_txid = node.accept_transaction(spend).unwrap();
+        let mempool_verbose =
+            get_raw_transaction(&node, &json!([spend_txid.to_string(), 2])).unwrap();
+        assert!(mempool_verbose.get("fee").is_none());
         let block_hash: BlockHash = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap()
             [0]
         .as_str()

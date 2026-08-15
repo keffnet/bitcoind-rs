@@ -15,6 +15,7 @@ use crate::address::NetworkEndpoint;
 use crate::i2p::I2P_SAM_PORT;
 use crate::mempool::{RbfPolicy, TrucPolicy};
 use crate::tor::DEFAULT_TOR_CONTROL_PORT;
+use crate::validation::DeploymentParameters;
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
@@ -1290,6 +1291,25 @@ pub struct Args {
     )]
     pub fast_prune: bool,
 
+    /// Set a regtest buried deployment activation height as `name@height`.
+    #[arg(
+        long = "testactivationheight",
+        value_name = "NAME@HEIGHT",
+        value_delimiter = ',',
+        hide = true
+    )]
+    pub test_activation_height: Vec<String>,
+
+    /// Override regtest version-bits parameters as
+    /// `deployment:start:end[:min_activation_height]`.
+    #[arg(
+        long = "vbparams",
+        value_name = "DEPLOYMENT:START:END[:MIN_ACTIVATION_HEIGHT]",
+        value_delimiter = ',',
+        hide = true
+    )]
+    pub vb_params: Vec<String>,
+
     #[arg(
         long,
         default_value_t = false,
@@ -1857,6 +1877,7 @@ pub struct Config {
     pub peer_permissions: PeerPermissionConfig,
     pub signet_challenge: Option<Vec<u8>>,
     pub signet_seed_nodes: Vec<String>,
+    pub deployment_parameters: Option<DeploymentParameters>,
     pub max_peers: usize,
     pub max_receive_buffer: u32,
     pub max_send_buffer: u32,
@@ -2357,6 +2378,8 @@ impl Config {
             None => None,
         };
         let signet_seed_nodes = args.signet_seed_nodes.clone();
+        let deployment_parameters =
+            parse_deployment_parameters(network, &args.test_activation_height, &args.vb_params)?;
         let assume_valid = match args.assume_valid.as_deref() {
             None => default_assume_valid(network, signet_challenge.as_deref()),
             Some(value) if value.is_empty() || value == "0" => None,
@@ -2502,6 +2525,7 @@ impl Config {
             peer_permissions,
             signet_challenge,
             signet_seed_nodes,
+            deployment_parameters: Some(deployment_parameters),
             max_peers: args.max_peers,
             max_receive_buffer,
             max_send_buffer,
@@ -2650,6 +2674,71 @@ fn default_assume_valid(network: Network, signet_challenge: Option<&[u8]>) -> Op
         hash.parse()
             .expect("Core default assumevalid hash is valid"),
     )
+}
+
+fn parse_deployment_parameters(
+    network: Network,
+    activation_heights: &[String],
+    version_bits: &[String],
+) -> Result<DeploymentParameters> {
+    let mut parameters = DeploymentParameters::for_network(network);
+    if network != Network::Regtest {
+        return Ok(parameters);
+    }
+
+    for value in activation_heights {
+        let (name, height) = value
+            .split_once('@')
+            .with_context(|| format!("invalid --testactivationheight value '{value}'"))?;
+        let height = height
+            .parse::<i64>()
+            .with_context(|| format!("invalid activation height in '{value}'"))?;
+        if !(0..i64::from(i32::MAX)).contains(&height) {
+            bail!("invalid activation height in '{value}'");
+        }
+        let height = height as u32;
+        match name {
+            "bip34" => parameters.buried.bip34 = height,
+            "bip65" | "cltv" => parameters.buried.bip65 = height,
+            "bip66" | "dersig" => parameters.buried.bip66 = height,
+            "csv" => parameters.buried.csv = height,
+            "segwit" => parameters.buried.segwit = height,
+            _ => bail!("invalid buried deployment '{name}' in '{value}'"),
+        }
+    }
+
+    for value in version_bits {
+        let fields = value.split(':').collect::<Vec<_>>();
+        if !(3..=4).contains(&fields.len()) {
+            bail!(
+                "version bits parameters malformed in '{value}', expected deployment:start:end[:min_activation_height]"
+            );
+        }
+        let deployment = match fields[0] {
+            "testdummy" => 0,
+            "taproot" => 1,
+            name => bail!("invalid version bits deployment '{name}'"),
+        };
+        let start_time = fields[1]
+            .parse::<i64>()
+            .with_context(|| format!("invalid version bits start time in '{value}'"))?;
+        let timeout = fields[2]
+            .parse::<i64>()
+            .with_context(|| format!("invalid version bits timeout in '{value}'"))?;
+        let min_activation_height = fields.get(3).map_or(Ok(0i64), |height| {
+            height.parse::<i64>().with_context(|| {
+                format!("invalid version bits minimum activation height in '{value}'")
+            })
+        })?;
+        if !(0..=i64::from(u32::MAX)).contains(&min_activation_height) {
+            bail!("invalid version bits minimum activation height in '{value}'");
+        }
+        parameters.bip9[deployment].start_time = start_time;
+        parameters.bip9[deployment].timeout = timeout;
+        parameters.bip9[deployment].min_activation_height = min_activation_height as u32;
+    }
+
+    Ok(parameters)
 }
 
 fn parse_manual_endpoints(
@@ -3031,6 +3120,39 @@ mod tests {
             config.signet_seed_nodes,
             ["first.example", "second.example", "third.example"]
         );
+    }
+
+    #[test]
+    fn parses_regtest_consensus_deployment_overrides() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--regtest",
+            "--testactivationheight=bip34@12,segwit@18",
+            "--vbparams=testdummy:123:456:789",
+        ])
+        .unwrap();
+        let parameters = Config::from_args(args)
+            .unwrap()
+            .deployment_parameters
+            .unwrap();
+        assert_eq!(parameters.buried.bip34, 12);
+        assert_eq!(parameters.buried.segwit, 18);
+        assert_eq!(parameters.bip9[0].start_time, 123);
+        assert_eq!(parameters.bip9[0].timeout, 456);
+        assert_eq!(parameters.bip9[0].min_activation_height, 789);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--regtest",
+            "--testactivationheight=unknown@1",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
     }
 
     #[test]

@@ -964,8 +964,11 @@ impl Node {
             .context("--maxmempool is too large")?;
         let max_mempool_bytes =
             usize::try_from(max_mempool_bytes).context("--maxmempool does not fit usize")?;
+        let deployment_parameters = config
+            .deployment_parameters
+            .unwrap_or_else(|| validation::DeploymentParameters::for_network(config.network));
         let mut chain =
-            ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor(
+            ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters(
                 config.network,
                 &config.datadir,
                 blocks_dir,
@@ -977,6 +980,7 @@ impl Node {
                 config.minimum_chain_work,
                 config.assume_valid,
                 config.blocks_xor,
+                deployment_parameters,
             )?;
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
@@ -2982,17 +2986,20 @@ impl Node {
                 return;
             }
             let headers = chain.active_headers();
-            let period =
-                usize::try_from(validation::bip9_deployments(self.config.network)[0].period)
-                    .unwrap_or(1)
-                    .max(1);
+            let deployment_parameters = chain.deployment_parameters();
+            let period = usize::try_from(deployment_parameters.bip9[0].period)
+                .unwrap_or(1)
+                .max(1);
             let first_scan = !self
                 .versionbits_warning_scanned
                 .swap(true, Ordering::AcqRel);
             if first_scan {
-                validation::unknown_versionbits_active(headers, self.config.network)
+                validation::unknown_versionbits_active_with_params(headers, &deployment_parameters)
             } else if headers.len() % period == 0 {
-                validation::unknown_versionbits_active_at_boundary(headers, self.config.network)
+                validation::unknown_versionbits_active_at_boundary_with_params(
+                    headers,
+                    &deployment_parameters,
+                )
             } else {
                 None
             }
@@ -4438,6 +4445,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,

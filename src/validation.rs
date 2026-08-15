@@ -56,6 +56,31 @@ impl Bip9Deployment {
     }
 }
 
+/// Consensus deployment parameters for one chain instance.
+///
+/// Bitcoin Core creates these from the selected chain and then applies
+/// regtest-only command-line overrides before validation starts. Keeping the
+/// values together lets multiple nodes in one process use different regtest
+/// activation schedules without relying on global state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeploymentParameters {
+    pub network: Network,
+    pub buried: BuriedDeploymentHeights,
+    pub bip9: [Bip9Deployment; 2],
+    pub bip94: bool,
+}
+
+impl DeploymentParameters {
+    pub fn for_network(network: Network) -> Self {
+        Self {
+            network,
+            buried: buried_deployment_heights(network),
+            bip9: bip9_deployments(network),
+            bip94: network == Network::Testnet4,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("block does not extend the active tip")]
@@ -313,6 +338,13 @@ pub fn unknown_versionbits_active(
     headers: &[bitcoin::block::Header],
     network: Network,
 ) -> Option<u8> {
+    unknown_versionbits_active_with_params(headers, &DeploymentParameters::for_network(network))
+}
+
+pub fn unknown_versionbits_active_with_params(
+    headers: &[bitcoin::block::Header],
+    params: &DeploymentParameters,
+) -> Option<u8> {
     const VERSIONBITS_TOP_MASK: u32 = 0xe000_0000;
     const VERSIONBITS_TOP_BITS: u32 = 0x2000_0000;
     const VERSIONBITS_NUM_BITS: u8 = 29;
@@ -321,14 +353,14 @@ pub fn unknown_versionbits_active(
         return None;
     }
 
-    let [testdummy, taproot] = bip9_deployments(network);
+    let [testdummy, taproot] = params.bip9;
     let known_bits = (1u32 << testdummy.bit) | (1u32 << taproot.bit);
     let period = usize::try_from(testdummy.period).ok()?;
     let threshold = usize::try_from(testdummy.threshold).ok()?;
     if period == 0 || threshold > period {
         return None;
     }
-    let min_warning_height = match network {
+    let min_warning_height = match params.network {
         Network::Bitcoin => 483_840,
         Network::Testnet => 836_640,
         Network::Testnet4 | Network::Signet | Network::Regtest => 0,
@@ -385,11 +417,21 @@ pub fn unknown_versionbits_active_at_boundary(
     headers: &[bitcoin::block::Header],
     network: Network,
 ) -> Option<u8> {
+    unknown_versionbits_active_at_boundary_with_params(
+        headers,
+        &DeploymentParameters::for_network(network),
+    )
+}
+
+pub fn unknown_versionbits_active_at_boundary_with_params(
+    headers: &[bitcoin::block::Header],
+    params: &DeploymentParameters,
+) -> Option<u8> {
     const VERSIONBITS_TOP_MASK: u32 = 0xe000_0000;
     const VERSIONBITS_TOP_BITS: u32 = 0x2000_0000;
     const VERSIONBITS_NUM_BITS: u8 = 29;
 
-    let [testdummy, taproot] = bip9_deployments(network);
+    let [testdummy, taproot] = params.bip9;
     let known_bits = (1u32 << testdummy.bit) | (1u32 << taproot.bit);
     let period = usize::try_from(testdummy.period).ok()?;
     let threshold = usize::try_from(testdummy.threshold).ok()?;
@@ -399,7 +441,7 @@ pub fn unknown_versionbits_active_at_boundary(
     if headers.len() % period != 0 {
         return None;
     }
-    let min_warning_height = match network {
+    let min_warning_height = match params.network {
         Network::Bitcoin => 483_840,
         Network::Testnet => 836_640,
         Network::Testnet4 | Network::Signet | Network::Regtest => 0,
@@ -441,7 +483,19 @@ pub fn script_flags_for_block_with_hash(
     height: u32,
     block_hash: Option<BlockHash>,
 ) -> u32 {
-    let heights = buried_deployment_heights(network);
+    script_flags_for_block_with_params(
+        &DeploymentParameters::for_network(network),
+        height,
+        block_hash,
+    )
+}
+
+pub fn script_flags_for_block_with_params(
+    params: &DeploymentParameters,
+    height: u32,
+    block_hash: Option<BlockHash>,
+) -> u32 {
+    let heights = params.buried;
     // Core keeps these flags enabled for historical block replay because only
     // the listed blocks violate the modern rules. The block hash is required
     // to reproduce those exceptions exactly.
@@ -449,7 +503,7 @@ pub fn script_flags_for_block_with_hash(
         | bitcoinconsensus::VERIFY_WITNESS
         | bitcoinconsensus::VERIFY_TAPROOT;
     let hash = block_hash.map(|hash| hash.to_string());
-    let exception = match (network, hash.as_deref()) {
+    let exception = match (params.network, hash.as_deref()) {
         (
             Network::Bitcoin,
             Some("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"),
@@ -530,11 +584,26 @@ pub fn validate_bip94_timewarp(
     block_time: u32,
     previous_block_time: u32,
 ) -> Result<(), ValidationError> {
-    if network != Network::Testnet4 {
+    validate_bip94_timewarp_with_params(
+        &DeploymentParameters::for_network(network),
+        height,
+        block_time,
+        previous_block_time,
+    )
+}
+
+pub fn validate_bip94_timewarp_with_params(
+    params: &DeploymentParameters,
+    height: u32,
+    block_time: u32,
+    previous_block_time: u32,
+) -> Result<(), ValidationError> {
+    if !params.bip94 {
         return Ok(());
     }
-    let params = network_params(network);
-    let difficulty_interval = (params.pow_target_timespan / params.pow_target_spacing) as u32;
+    let network_params = network_params(params.network);
+    let difficulty_interval =
+        (network_params.pow_target_timespan / network_params.pow_target_spacing) as u32;
     if height % difficulty_interval == 0 && block_time < previous_block_time.saturating_sub(600) {
         return Err(ValidationError::Bip94TimeWarp);
     }
@@ -657,9 +726,9 @@ pub fn validate_block_structure_with_signet(
     expected_coinbase_value: u64,
     signet_challenge: Option<&[u8]>,
 ) -> Result<BlockValidationStats, ValidationError> {
-    validate_block_structure_with_signet_options(
+    validate_block_structure_with_signet_options_with_params(
         block,
-        network,
+        &DeploymentParameters::for_network(network),
         height,
         expected_coinbase_value,
         signet_challenge,
@@ -667,6 +736,7 @@ pub fn validate_block_structure_with_signet(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn validate_block_structure_with_signet_options(
     block: &Block,
     network: Network,
@@ -675,14 +745,32 @@ pub(crate) fn validate_block_structure_with_signet_options(
     signet_challenge: Option<&[u8]>,
     check_signet_solution: bool,
 ) -> Result<BlockValidationStats, ValidationError> {
+    validate_block_structure_with_signet_options_with_params(
+        block,
+        &DeploymentParameters::for_network(network),
+        height,
+        expected_coinbase_value,
+        signet_challenge,
+        check_signet_solution,
+    )
+}
+
+pub(crate) fn validate_block_structure_with_signet_options_with_params(
+    block: &Block,
+    params: &DeploymentParameters,
+    height: u32,
+    expected_coinbase_value: u64,
+    signet_challenge: Option<&[u8]>,
+    check_signet_solution: bool,
+) -> Result<BlockValidationStats, ValidationError> {
     if block.txdata.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }
-    validate_block_version(network, height, block.header.version.to_consensus())?;
+    validate_block_version_with_params(params, height, block.header.version.to_consensus())?;
     if !block.check_merkle_root() {
         return Err(ValidationError::BadMerkleRoot);
     }
-    validate_witness_commitment(block, height >= buried_deployment_heights(network).segwit)?;
+    validate_witness_commitment(block, height >= params.buried.segwit)?;
     if block.weight().to_wu() > MAX_BLOCK_WEIGHT as u64 {
         return Err(ValidationError::OversizedBlock);
     }
@@ -753,7 +841,7 @@ pub(crate) fn validate_block_structure_with_signet_options(
             return Err(ValidationError::TooManySigops);
         }
     }
-    if height >= buried_deployment_heights(network).bip34 {
+    if height >= params.buried.bip34 {
         let encoded_height = bitcoin::script::Builder::new()
             .push_int(height as i64)
             .into_script();
@@ -1055,6 +1143,24 @@ pub fn validate_transaction_scripts_at_time_with_block_hash(
     transaction: &Transaction,
     previous_outputs: &[bitcoin::TxOut],
 ) -> Result<(), ValidationError> {
+    validate_transaction_scripts_at_time_with_block_hash_with_params(
+        &DeploymentParameters::for_network(network),
+        height,
+        block_time,
+        block_hash,
+        transaction,
+        previous_outputs,
+    )
+}
+
+pub fn validate_transaction_scripts_at_time_with_block_hash_with_params(
+    params: &DeploymentParameters,
+    height: u32,
+    block_time: u32,
+    block_hash: Option<BlockHash>,
+    transaction: &Transaction,
+    previous_outputs: &[bitcoin::TxOut],
+) -> Result<(), ValidationError> {
     if previous_outputs.len() != transaction.input.len() {
         return Err(ValidationError::Script {
             txid: transaction.compute_txid(),
@@ -1072,7 +1178,7 @@ pub fn validate_transaction_scripts_at_time_with_block_hash(
         })
         .collect();
     let _ = block_time;
-    let flags = script_flags_for_block_with_hash(network, height, block_hash);
+    let flags = script_flags_for_block_with_params(params, height, block_hash);
     for (input, previous_output) in previous_outputs.iter().enumerate() {
         if let Err(error) = bitcoinconsensus::verify_with_flags(
             previous_output.script_pubkey.as_bytes(),
@@ -1101,7 +1207,15 @@ pub fn validate_block_version(
     height: u32,
     actual: i32,
 ) -> Result<(), ValidationError> {
-    let heights = buried_deployment_heights(network);
+    validate_block_version_with_params(&DeploymentParameters::for_network(network), height, actual)
+}
+
+pub fn validate_block_version_with_params(
+    params: &DeploymentParameters,
+    height: u32,
+    actual: i32,
+) -> Result<(), ValidationError> {
+    let heights = params.buried;
     let required = if height >= heights.bip65 {
         4
     } else if height >= heights.bip66 {

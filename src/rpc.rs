@@ -3901,7 +3901,8 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let headers = chain
         .headers_to_hash(&hash)
         .ok_or_else(|| anyhow!("Block header chain is unavailable"))?;
-    let heights = validation::buried_deployment_heights(chain.network);
+    let deployment_parameters = chain.deployment_parameters();
+    let heights = deployment_parameters.buried;
     let mut deployments = serde_json::Map::new();
     for (name, activation_height) in [
         ("bip34", heights.bip34),
@@ -3919,7 +3920,7 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             }),
         );
     }
-    let [testdummy, taproot] = validation::bip9_deployments(chain.network);
+    let [testdummy, taproot] = deployment_parameters.bip9;
     // Core does not register NEVER_ACTIVE deployments in getdeploymentinfo.
     // Regtest intentionally keeps testdummy enabled for versionbits tests.
     if testdummy.is_enabled() {
@@ -3932,7 +3933,8 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "taproot".to_owned(),
         bip9_deployment_json(&headers, height, taproot),
     );
-    let flags = validation::script_flags_for_block_with_hash(chain.network, height, Some(hash));
+    let flags =
+        validation::script_flags_for_block_with_params(&deployment_parameters, height, Some(hash));
     Ok(json!({
         "hash": hash.to_string(),
         "height": height,
@@ -9544,8 +9546,9 @@ fn build_mining_block_with_transactions(
         .max(chain.median_time_past_value().saturating_add(1));
     let bits = chain.next_bits(time);
     let network = chain.network;
-    let version = mining_block_version(
-        network,
+    let deployment_parameters = chain.deployment_parameters();
+    let version = mining_block_version_with_params(
+        &deployment_parameters,
         chain.active_headers(),
         tip.height,
         node.config.block_version,
@@ -9602,18 +9605,21 @@ fn build_mining_block_with_transactions(
         }
     }
     drop(mempool);
-    let block = mining_block(MiningBlockTemplate {
-        network,
-        parent,
-        height,
-        time,
-        bits,
-        script_pubkey,
-        transactions,
-        fees,
-        extra_nonce: random(),
-        version: Some(version),
-    })?;
+    let block = mining_block_with_deployment_parameters(
+        MiningBlockTemplate {
+            network,
+            parent,
+            height,
+            time,
+            bits,
+            script_pubkey,
+            transactions,
+            fees,
+            extra_nonce: random(),
+            version: Some(version),
+        },
+        &deployment_parameters,
+    )?;
     if block.weight().to_wu() > node.config.block_max_weight {
         bail!("generated block exceeds the block weight limit")
     }
@@ -9634,7 +9640,16 @@ struct MiningBlockTemplate {
     version: Option<i32>,
 }
 
+#[cfg(test)]
 fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
+    let deployment_parameters = validation::DeploymentParameters::for_network(template.network);
+    mining_block_with_deployment_parameters(template, &deployment_parameters)
+}
+
+fn mining_block_with_deployment_parameters(
+    template: MiningBlockTemplate,
+    deployment_parameters: &validation::DeploymentParameters,
+) -> Result<Block> {
     let MiningBlockTemplate {
         network,
         parent,
@@ -9647,7 +9662,7 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
         extra_nonce,
         version,
     } = template;
-    let segwit_active = height >= validation::buried_deployment_heights(network).segwit;
+    let segwit_active = height >= deployment_parameters.buried.segwit;
     let mut coinbase = Transaction {
         version: Version::ONE,
         lock_time: LockTime::from_consensus(height.saturating_sub(1)),
@@ -9699,8 +9714,23 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
     Ok(block)
 }
 
+#[cfg(test)]
 fn mining_block_version(
     network: Network,
+    headers: &[Header],
+    tip_height: u32,
+    custom_version: Option<i32>,
+) -> i32 {
+    mining_block_version_with_params(
+        &validation::DeploymentParameters::for_network(network),
+        headers,
+        tip_height,
+        custom_version,
+    )
+}
+
+fn mining_block_version_with_params(
+    deployment_parameters: &validation::DeploymentParameters,
     headers: &[Header],
     tip_height: u32,
     custom_version: Option<i32>,
@@ -9708,12 +9738,12 @@ fn mining_block_version(
     // Core only applies -blockversion on regtest, where it is a deliberate
     // fork-testing hook. Other networks retain the versionbits-computed
     // default even if the option was supplied.
-    let custom_version = (network == Network::Regtest)
+    let custom_version = (deployment_parameters.network == Network::Regtest)
         .then_some(custom_version)
         .flatten();
     let mut version = custom_version.unwrap_or(0x2000_0000);
     if custom_version.is_none() {
-        for deployment in validation::bip9_deployments(network) {
+        for deployment in deployment_parameters.bip9 {
             let (state, _) = bip9_state_at_height(headers, deployment, tip_height);
             if matches!(state, Bip9State::Started | Bip9State::LockedIn) {
                 version |= 1i32 << deployment.bit;
@@ -9825,7 +9855,8 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let tip = chain.tip();
     let parent = chain.header(tip.height).expect("tip header exists");
     let height = tip.height + 1;
-    let segwit_active = height >= validation::buried_deployment_heights(chain.network).segwit;
+    let deployment_parameters = chain.deployment_parameters();
+    let segwit_active = height >= deployment_parameters.buried.segwit;
     let now = crate::time::unix_time() as u32;
     let mintime = minimum_block_time(
         chain.network,
@@ -9886,24 +9917,27 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .filter_map(|txid| mempool.get(txid).map(|entry| entry.transaction.clone()))
         .collect::<Vec<_>>();
     let headers = chain.active_headers();
-    let version = mining_block_version(
-        chain.network,
+    let version = mining_block_version_with_params(
+        &deployment_parameters,
         headers,
         tip.height,
         node.config.block_version,
     );
-    let template_block = mining_block(MiningBlockTemplate {
-        network: chain.network,
-        parent: *parent,
-        height,
-        time: curtime,
-        bits,
-        script_pubkey: ScriptBuf::new(),
-        transactions: selected_transactions,
-        fees,
-        extra_nonce: 0,
-        version: Some(version),
-    })?;
+    let template_block = mining_block_with_deployment_parameters(
+        MiningBlockTemplate {
+            network: chain.network,
+            parent: *parent,
+            height,
+            time: curtime,
+            bits,
+            script_pubkey: ScriptBuf::new(),
+            transactions: selected_transactions,
+            fees,
+            extra_nonce: 0,
+            version: Some(version),
+        },
+        &deployment_parameters,
+    )?;
     node.record_mining_block(&template_block);
     let default_witness_commitment = segwit_active.then(|| {
         template_block
@@ -9922,7 +9956,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if chain.network == Network::Signet {
         rules.push("!signet");
     }
-    let [testdummy, taproot] = validation::bip9_deployments(chain.network);
+    let [testdummy, taproot] = deployment_parameters.bip9;
     let mut vbavailable = serde_json::Map::new();
     for (name, deployment) in [("testdummy", testdummy), ("taproot", taproot)] {
         let (state, _) = bip9_state_at_height(headers, deployment, tip.height);
@@ -12985,6 +13019,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -13282,6 +13317,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -13452,6 +13488,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -13647,6 +13684,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -13784,6 +13822,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -13919,6 +13958,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -14089,6 +14129,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -14291,6 +14332,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -14735,6 +14777,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -14899,6 +14942,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -15046,6 +15090,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -15186,6 +15231,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -15329,6 +15375,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -15459,6 +15506,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -15598,6 +15646,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -15726,6 +15775,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -15931,6 +15981,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -16084,6 +16135,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -16231,6 +16283,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -16416,6 +16469,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -16565,6 +16619,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -16745,6 +16800,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -17007,6 +17063,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -17252,6 +17309,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -17381,6 +17439,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -17512,6 +17571,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -17648,6 +17708,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -17790,6 +17851,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -17939,6 +18001,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -18086,6 +18149,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -18281,6 +18345,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -18536,6 +18601,7 @@ mod tests {
             zmq: crate::config::ZmqConfig::default(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
         })
         .unwrap();
         let result = get_addrman_info(&node).unwrap();
@@ -18647,6 +18713,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -18947,6 +19014,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -19142,6 +19210,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -19333,6 +19402,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -19594,6 +19664,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -19964,6 +20035,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -20104,6 +20176,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -20369,6 +20442,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 0,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -20513,6 +20587,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -20989,6 +21064,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -21128,6 +21204,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -21306,6 +21383,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -21615,6 +21693,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -22097,6 +22176,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -22300,6 +22380,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -22530,6 +22611,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -22866,6 +22948,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -23008,6 +23091,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,
@@ -23171,6 +23255,7 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             signet_seed_nodes: Vec::new(),
+            deployment_parameters: None,
             max_peers: 1,
             max_receive_buffer: 5_000,
             max_send_buffer: 1_000,

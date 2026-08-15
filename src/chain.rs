@@ -525,6 +525,7 @@ struct BackgroundValidationJob {
     blocks_xor: bool,
     network: Network,
     signet_challenge: Option<Vec<u8>>,
+    deployment_parameters: validation::DeploymentParameters,
     active_chain: Vec<BlockHash>,
     block_index: HashMap<BlockHash, BlockNode>,
     base_hash: BlockHash,
@@ -664,6 +665,7 @@ pub struct ChainState {
     script_check_workers: usize,
     script_checks_enabled: bool,
     signet_challenge: Option<Vec<u8>>,
+    deployment_parameters: validation::DeploymentParameters,
     pub store: BlockStore,
     filter_store: FilterStore,
     chainstate_store: ChainstateStore,
@@ -880,6 +882,41 @@ impl ChainState {
         assume_valid_block: Option<BlockHash>,
         blocks_xor: bool,
     ) -> Result<Self> {
+        Self::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters(
+            network,
+            data_dir,
+            blocks_dir,
+            signet_challenge,
+            blockfilter_index_enabled,
+            reindex,
+            reindex_chainstate,
+            tx_index_all_enabled,
+            minimum_chain_work_override,
+            assume_valid_block,
+            blocks_xor,
+            validation::DeploymentParameters::for_network(network),
+        )
+    }
+
+    /// Open chainstate with explicit consensus deployment parameters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        blocks_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
+        reindex: bool,
+        reindex_chainstate: bool,
+        tx_index_all_enabled: bool,
+        minimum_chain_work_override: Option<Work>,
+        assume_valid_block: Option<BlockHash>,
+        blocks_xor: bool,
+        deployment_parameters: validation::DeploymentParameters,
+    ) -> Result<Self> {
+        if deployment_parameters.network != network {
+            bail!("consensus deployment parameters use a different network");
+        }
         let data_dir = data_dir.as_ref().to_owned();
         let blocks_dir = blocks_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
@@ -1009,6 +1046,7 @@ impl ChainState {
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(validation::default_signet_challenge)
             }),
+            deployment_parameters,
             store,
             filter_store,
             chainstate_store,
@@ -1923,7 +1961,7 @@ impl ChainState {
             return;
         };
         let height = parent.height.saturating_add(1);
-        if height < validation::buried_deployment_heights(self.network).segwit {
+        if height < self.deployment_parameters.buried.segwit {
             return;
         }
         let Some(coinbase) = block.txdata.first_mut() else {
@@ -2709,14 +2747,14 @@ impl ChainState {
                 .get(&parent_hash)
                 .copied()
                 .with_context(|| format!("header {hash} has an unknown parent {parent_hash}"))?;
-            validation::validate_bip94_timewarp(
-                self.network,
+            validation::validate_bip94_timewarp_with_params(
+                &self.deployment_parameters,
                 parent.height.saturating_add(1),
                 header.time,
                 parent.header.time,
             )?;
-            validation::validate_block_version(
-                self.network,
+            validation::validate_block_version_with_params(
+                &self.deployment_parameters,
                 parent.height.saturating_add(1),
                 header.version.to_consensus(),
             )?;
@@ -2936,6 +2974,10 @@ impl ChainState {
 
     pub fn signet_challenge(&self) -> Option<&[u8]> {
         self.signet_challenge.as_deref()
+    }
+
+    pub fn deployment_parameters(&self) -> validation::DeploymentParameters {
+        self.deployment_parameters
     }
 
     pub fn utxo_serialized_hash(&self) -> String {
@@ -3230,8 +3272,8 @@ impl ChainState {
                     .get(&parent_hash)
                     .copied()
                     .context("UTXO snapshot forward replay parent is not indexed")?;
-                validation::validate_bip94_timewarp(
-                    self.network,
+                validation::validate_bip94_timewarp_with_params(
+                    &self.deployment_parameters,
                     height,
                     block.header.time,
                     parent.header.time,
@@ -3528,8 +3570,8 @@ impl ChainState {
             .block_index
             .get(&parent_hash)
             .expect("active tip is indexed");
-        validation::validate_bip94_timewarp(
-            self.network,
+        validation::validate_bip94_timewarp_with_params(
+            &self.deployment_parameters,
             height,
             block.header.time,
             parent.header.time,
@@ -3553,9 +3595,9 @@ impl ChainState {
                 median_time_past,
             )?;
         }
-        validation::validate_block_structure_with_signet_options(
+        validation::validate_block_structure_with_signet_options_with_params(
             block,
-            self.network,
+            &self.deployment_parameters,
             height,
             Amount::MAX_MONEY.to_sat(),
             self.signet_challenge.as_deref(),
@@ -3654,8 +3696,8 @@ impl ChainState {
         }
 
         let height = parent.height.saturating_add(1);
-        validation::validate_bip94_timewarp(
-            self.network,
+        validation::validate_bip94_timewarp_with_params(
+            &self.deployment_parameters,
             height,
             block.header.time,
             parent.header.time,
@@ -4000,8 +4042,8 @@ impl ChainState {
                 .get(&parent_hash)
                 .copied()
                 .context("side-chain parent block index entry is missing")?;
-            validation::validate_bip94_timewarp(
-                self.network,
+            validation::validate_bip94_timewarp_with_params(
+                &self.deployment_parameters,
                 node.height,
                 block.header.time,
                 parent.header.time,
@@ -4080,9 +4122,12 @@ impl ChainState {
         };
         let mut script_jobs = Vec::new();
         let block_hash = block.block_hash();
-        let sigop_flags =
-            validation::script_flags_for_block_with_hash(self.network, height, Some(block_hash));
-        let csv_active = height >= validation::buried_deployment_heights(self.network).csv;
+        let sigop_flags = validation::script_flags_for_block_with_params(
+            &self.deployment_parameters,
+            height,
+            Some(block_hash),
+        );
+        let csv_active = height >= self.deployment_parameters.buried.csv;
         let lock_time_cutoff = if csv_active {
             block_median_time_past
         } else {
@@ -4263,12 +4308,12 @@ impl ChainState {
             return Ok(());
         }
         let thread_count = self.script_check_thread_count().min(pending.len());
-        let network = self.network;
+        let deployment_parameters = self.deployment_parameters;
         let block_time = block.header.time;
         if thread_count <= 1 {
             for job in &pending {
-                validation::validate_transaction_scripts_at_time_with_block_hash(
-                    network,
+                validation::validate_transaction_scripts_at_time_with_block_hash_with_params(
+                    &deployment_parameters,
                     height,
                     block_time,
                     Some(block_hash),
@@ -4285,8 +4330,8 @@ impl ChainState {
                         scope.spawn(move || {
                             for job in chunk {
                                 if let Err(error) =
-                                    validation::validate_transaction_scripts_at_time_with_block_hash(
-                                        network,
+                                    validation::validate_transaction_scripts_at_time_with_block_hash_with_params(
+                                        &deployment_parameters,
                                         height,
                                         block_time,
                                         Some(block_hash),
@@ -4348,8 +4393,8 @@ impl ChainState {
         if self.script_cache.lock().entries.contains(&key) {
             return Ok(());
         }
-        validation::validate_transaction_scripts_at_time_with_block_hash(
-            self.network,
+        validation::validate_transaction_scripts_at_time_with_block_hash_with_params(
+            &self.deployment_parameters,
             height,
             u32::MAX,
             None,
@@ -4390,8 +4435,12 @@ impl ChainState {
             Network::Regtest => b"regtest".as_slice(),
         });
         hasher.update(
-            validation::script_flags_for_block_with_hash(self.network, height, block_hash)
-                .to_le_bytes(),
+            validation::script_flags_for_block_with_params(
+                &self.deployment_parameters,
+                height,
+                block_hash,
+            )
+            .to_le_bytes(),
         );
         hasher.update(transaction.compute_wtxid().to_byte_array());
         for output in previous_outputs {
@@ -4410,12 +4459,9 @@ impl ChainState {
         let Some(expected_bip34_hash) = bip34_activation_hash(self.network) else {
             return true;
         };
-        self.ancestor_hash(
-            parent_hash,
-            validation::buried_deployment_heights(self.network).bip34,
-        )
-        .map(|hash| hash.to_string() != expected_bip34_hash)
-        .unwrap_or(true)
+        self.ancestor_hash(parent_hash, self.deployment_parameters.buried.bip34)
+            .map(|hash| hash.to_string() != expected_bip34_hash)
+            .unwrap_or(true)
     }
 
     fn connect_block_internal(&mut self, block: &Block, persist: bool) -> Result<()> {
@@ -4434,8 +4480,8 @@ impl ChainState {
             .block_index
             .get(&previous)
             .expect("active tip is indexed");
-        validation::validate_bip94_timewarp(
-            self.network,
+        validation::validate_bip94_timewarp_with_params(
+            &self.deployment_parameters,
             height,
             block.header.time,
             previous_node.header.time,
@@ -5271,16 +5317,17 @@ impl ChainState {
     fn validate_block_structure(
         &self,
         block: &Block,
-        network: Network,
+        _network: Network,
         height: u32,
         expected_coinbase_value: u64,
     ) -> Result<validation::BlockValidationStats, ValidationError> {
-        validation::validate_block_structure_with_signet(
+        validation::validate_block_structure_with_signet_options_with_params(
             block,
-            network,
+            &self.deployment_parameters,
             height,
             expected_coinbase_value,
             self.signet_challenge.as_deref(),
+            true,
         )
     }
 
@@ -5730,6 +5777,7 @@ impl ChainState {
         let blocks_xor = self.blocks_xor;
         let network = self.network;
         let signet_challenge = self.signet_challenge.clone();
+        let deployment_parameters = self.deployment_parameters;
         let script_check_workers = self.script_check_workers;
         let script_cache_max_entries = self.script_cache.lock().max_entries;
         if let Some(previous) = self.background_validation.take() {
@@ -5749,6 +5797,7 @@ impl ChainState {
             blocks_xor,
             network,
             signet_challenge,
+            deployment_parameters,
             active_chain,
             block_index,
             base_hash,
@@ -6039,6 +6088,7 @@ fn open_background_replay_state(
     blocks_dir: &Path,
     blocks_xor: bool,
     signet_challenge: Option<Vec<u8>>,
+    deployment_parameters: validation::DeploymentParameters,
     active_chain: &[BlockHash],
     block_index: &HashMap<BlockHash, BlockNode>,
     script_check_workers: usize,
@@ -6068,6 +6118,7 @@ fn open_background_replay_state(
         script_check_workers,
         script_checks_enabled: script_check_workers > 0,
         signet_challenge,
+        deployment_parameters,
         store,
         filter_store,
         chainstate_store,
@@ -6120,6 +6171,7 @@ fn run_background_validation(
         blocks_xor,
         network,
         signet_challenge,
+        deployment_parameters,
         active_chain,
         block_index,
         base_hash,
@@ -6162,6 +6214,7 @@ fn run_background_validation(
             &blocks_dir,
             blocks_xor,
             signet_challenge,
+            deployment_parameters,
             &active_chain,
             &block_index,
             script_check_workers,
@@ -6190,8 +6243,8 @@ fn run_background_validation(
                 .get(&parent_hash)
                 .copied()
                 .context("background validator parent index entry is missing")?;
-            validation::validate_bip94_timewarp(
-                state.network,
+            validation::validate_bip94_timewarp_with_params(
+                &state.deployment_parameters,
                 node.height,
                 block.header.time,
                 parent.header.time,

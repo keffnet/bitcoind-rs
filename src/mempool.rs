@@ -428,6 +428,8 @@ pub enum MempoolError {
     Coinbase,
     #[error("transaction already exists in the mempool")]
     AlreadyPresent,
+    #[error("Transaction outputs already in utxo set")]
+    AlreadyInChain,
     #[error("transaction input is already spent by mempool transaction {0}")]
     Conflict(Txid),
     #[error("bip125-replacement-disallowed")]
@@ -1646,6 +1648,14 @@ impl Mempool {
         let txid = transaction.compute_txid();
         if self.entries.contains_key(&txid) {
             return Err(MempoolError::AlreadyPresent);
+        }
+        if transaction.output.iter().enumerate().any(|(vout, _)| {
+            u32::try_from(vout)
+                .ok()
+                .and_then(|vout| chain.utxo(&OutPoint::new(txid, vout)))
+                .is_some()
+        }) {
+            return Err(MempoolError::AlreadyInChain);
         }
         if transaction.is_coinbase() {
             return Err(MempoolError::Coinbase);
@@ -3378,6 +3388,51 @@ mod tests {
             permissive_policy,
         );
         assert!(permissive.accept(transaction, &chain).is_ok());
+    }
+
+    #[test]
+    fn rejects_transactions_whose_outputs_are_already_in_the_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut previous = *chain.header(0).unwrap();
+        let mut funding = None;
+        for height in 1..=101 {
+            let block = mine_regtest_block(&previous, height);
+            if height == 1 {
+                funding = Some(OutPoint::new(block.txdata[0].compute_txid(), 0));
+            }
+            previous = block.header;
+            chain.connect_block(block).unwrap();
+        }
+        let funding = funding.expect("funding output exists");
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mut block = mine_regtest_block(&previous, 102);
+        block.txdata.push(transaction.clone());
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+        block.header.nonce = 0;
+        while !block.header.target().is_met_by(block.block_hash()) {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+        }
+        chain.connect_block(block).unwrap();
+
+        let mut pool = Mempool::new(Network::Regtest);
+        assert!(matches!(
+            pool.accept(transaction, &chain),
+            Err(MempoolError::AlreadyInChain)
+        ));
     }
 
     #[test]

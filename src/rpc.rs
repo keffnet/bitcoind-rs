@@ -9197,6 +9197,7 @@ fn package_policy_error(transactions: &[Transaction]) -> Option<&'static str> {
 fn mempool_reject_reason(error: &MempoolError) -> String {
     match error {
         MempoolError::AlreadyPresent => "txn-already-in-mempool".to_owned(),
+        MempoolError::AlreadyInChain => "txn-already-known".to_owned(),
         MempoolError::Conflict(_) => "txn-mempool-conflict".to_owned(),
         MempoolError::TooManyReplacementCandidates { .. } => {
             "too many potential replacements".to_owned()
@@ -11133,6 +11134,9 @@ fn rpc_error_code(message: &str) -> i32 {
     }
     if lower == "can only import the mempool after the block download and sync is done." {
         return -28;
+    }
+    if lower == "transaction outputs already in utxo set" {
+        return -27;
     }
     if lower.contains("tx decode failed")
         || lower.contains("transaction decode failed")

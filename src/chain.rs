@@ -42,6 +42,7 @@ const CORE_UTXO_SNAPSHOT_MAGIC: [u8; 5] = [b'u', b't', b'x', b'o', 0xff];
 const CORE_UTXO_SNAPSHOT_VERSION: u16 = 2;
 const CHAIN_METADATA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-v1\0";
 const CHAIN_SNAPSHOT_MAGIC: &[u8] = b"bitcoind-rs-snapshot-v1\0";
+const CHAIN_TX_COUNTS_MAGIC: &[u8] = b"bitcoind-rs-tx-counts-v1\0";
 const ASSUMEUTXO_STATE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-v1\0";
 const ASSUMEUTXO_BASE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-base-v1\0";
 const ASSUMEUTXO_CHECKPOINT_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-checkpoint-v1\0";
@@ -420,6 +421,17 @@ struct ChainSnapshot {
     prune_height: Option<u32>,
 }
 
+/// Compact active-chain metadata used by chain statistics after pruning.
+/// Bitcoin Core keeps transaction counts in each `CBlockIndex`, so
+/// `getchaintxstats` does not need the historical block bodies.  Keep this
+/// in a separate sidecar instead of changing the existing metadata format so
+/// older binary chainstate files remain readable.
+#[derive(Serialize, Deserialize)]
+struct ActiveTxCounts {
+    active_tip: String,
+    counts: Vec<u32>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct SnapshotProvenance {
     base_hash: String,
@@ -494,6 +506,27 @@ fn deserialize_internal<T: DeserializeOwned>(bytes: &[u8], magic: &[u8]) -> Resu
     deserialize_binary(&bytes[magic.len()..]).context("decoding internal chainstate")
 }
 
+fn load_active_tx_counts(data_dir: &Path, active_chain: &[BlockHash]) -> Result<Option<Vec<u32>>> {
+    let path = data_dir.join("chainstate.txcounters");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .with_context(|| format!("reading transaction-count index {}", path.display()))?;
+    let index: ActiveTxCounts = deserialize_internal(&bytes, CHAIN_TX_COUNTS_MAGIC)
+        .with_context(|| format!("decoding transaction-count index {}", path.display()))?;
+    let Some(active_tip) = active_chain.last() else {
+        return Ok(None);
+    };
+    let stored_tip = active_tip
+        .to_string()
+        .eq_ignore_ascii_case(&index.active_tip);
+    if !stored_tip || index.counts.len() != active_chain.len() {
+        return Ok(None);
+    }
+    Ok(Some(index.counts))
+}
+
 fn load_snapshot_provenance(path: &Path) -> Result<SnapshotProvenance> {
     let bytes = fs::read(path)
         .with_context(|| format!("reading AssumeUTXO provenance {}", path.display()))?;
@@ -514,6 +547,7 @@ pub struct ChainState {
     coin_stats: Option<CoinStatsState>,
     active_chain: Vec<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
+    active_tx_counts: Vec<u32>,
     initial_block_download: bool,
     snapshot_base: Option<BlockHash>,
     snapshot_validated: bool,
@@ -596,6 +630,7 @@ impl ChainState {
                 legacy_metadata_path.clone(),
                 data_dir.join("chainstate.snapshot"),
                 data_dir.join("chainstate.snapshot.sha256"),
+                data_dir.join("chainstate.txcounters"),
                 snapshot_provenance_path.clone(),
             ] {
                 match fs::remove_file(&path) {
@@ -647,6 +682,11 @@ impl ChainState {
             } else {
                 (vec![genesis_hash], Vec::new(), HashSet::new(), None)
             };
+        let persisted_tx_counts = if rebuild_chainstate {
+            None
+        } else {
+            load_active_tx_counts(&data_dir, &active_chain)?
+        };
         let persisted_snapshot_provenance =
             if !rebuild_chainstate && snapshot_provenance_path.exists() {
                 Some(load_snapshot_provenance(&snapshot_provenance_path)?)
@@ -674,6 +714,7 @@ impl ChainState {
             coin_stats: None,
             active_chain: Vec::new(),
             headers: Vec::new(),
+            active_tx_counts: persisted_tx_counts.unwrap_or_default(),
             initial_block_download: true,
             snapshot_base: persisted_snapshot_provenance
                 .as_ref()
@@ -749,6 +790,8 @@ impl ChainState {
         } else {
             state.snapshot_base = None;
             state.snapshot_validated = true;
+            state.snapshot_validation_error = None;
+            state.active_tx_counts.clear();
             let mut blocks = Vec::with_capacity(active_chain.len());
             for hash in &active_chain {
                 let block = state
@@ -761,6 +804,13 @@ impl ChainState {
             for block in blocks.iter().skip(1) {
                 state.connect_block_internal(block, false)?;
             }
+        }
+        if state.active_tx_counts.len() != state.active_chain.len() {
+            state.active_tx_counts = state.tx_counts_from_index().unwrap_or_default();
+        }
+        if state.active_tx_counts.len() != state.active_chain.len() && state.prune_height.is_none()
+        {
+            state.rebuild_active_tx_counts()?;
         }
         if !rebuild_chainstate && state.active_chain != active_chain {
             bail!("chainstate metadata does not match replayed active chain");
@@ -1420,6 +1470,12 @@ impl ChainState {
     }
 
     pub fn block_transaction_count(&mut self, hash: &BlockHash) -> Result<Option<usize>> {
+        if let Some(node) = self.block_index.get(hash)
+            && self.active_chain.get(node.height as usize) == Some(hash)
+            && let Some(count) = self.active_tx_counts.get(node.height as usize)
+        {
+            return Ok(Some(*count as usize));
+        }
         Ok(self.store.get(hash)?.map(|block| block.txdata.len()))
     }
 
@@ -3210,6 +3266,8 @@ impl ChainState {
         }
         self.active_chain.push(hash);
         self.headers.push(block.header);
+        self.active_tx_counts
+            .push(u32::try_from(block.txdata.len()).context("transaction count does not fit u32")?);
         let parent_work = self
             .block_index
             .get(&block.header.prev_blockhash)
@@ -3242,6 +3300,9 @@ impl ChainState {
         }
         self.active_chain.push(genesis.block_hash());
         self.headers.push(genesis.header);
+        self.active_tx_counts.push(
+            u32::try_from(genesis.txdata.len()).context("transaction count does not fit u32")?,
+        );
         self.block_index.insert(
             genesis.block_hash(),
             BlockNode {
@@ -3377,6 +3438,7 @@ impl ChainState {
 
         let old_active_chain = self.active_chain.clone();
         let old_headers = self.headers.clone();
+        let old_active_tx_counts = self.active_tx_counts.clone();
         let old_utxos = self.utxos.clone();
         let old_utxos_by_script = self.utxos_by_script.clone();
         let old_tx_index = self.tx_index.clone();
@@ -3393,6 +3455,7 @@ impl ChainState {
         let snapshot_invalidated = self.snapshot_base.is_some_and(|base| !path.contains(&base));
         self.active_chain.clear();
         self.headers.clear();
+        self.active_tx_counts.clear();
         self.utxos.clear();
         self.utxos_by_script.clear();
         self.tx_index.clear();
@@ -3415,6 +3478,7 @@ impl ChainState {
         if let Err(error) = replay {
             self.active_chain = old_active_chain;
             self.headers = old_headers;
+            self.active_tx_counts = old_active_tx_counts;
             self.utxos = old_utxos;
             self.utxos_by_script = old_utxos_by_script;
             self.tx_index = old_tx_index;
@@ -3901,6 +3965,25 @@ impl ChainState {
         let temp = self.data_dir.join("chainstate.bin.tmp");
         fs::write(&temp, bytes)?;
         fs::rename(temp, path)?;
+        self.persist_tx_counts()
+    }
+
+    fn persist_tx_counts(&self) -> Result<()> {
+        if self.active_tx_counts.len() != self.active_chain.len() {
+            // A pre-sidecar pruned snapshot may not contain enough data to
+            // reconstruct old block counts. Keep that legacy node startable;
+            // newly connected/reindexed nodes always have a complete vector.
+            return Ok(());
+        }
+        let index = ActiveTxCounts {
+            active_tip: self.best_hash().to_string(),
+            counts: self.active_tx_counts.clone(),
+        };
+        let bytes = serialize_internal(CHAIN_TX_COUNTS_MAGIC, &index)?;
+        let path = self.data_dir.join("chainstate.txcounters");
+        let temp = self.data_dir.join("chainstate.txcounters.tmp");
+        fs::write(&temp, bytes)?;
+        fs::rename(temp, path)?;
         Ok(())
     }
 
@@ -3953,7 +4036,7 @@ impl ChainState {
         fs::write(&temp, &bytes)?;
         fs::rename(temp, path)?;
         self.persist_snapshot_checksum_bytes(&bytes)?;
-        Ok(())
+        self.persist_tx_counts()
     }
 
     fn persist_snapshot_checksum(&self) -> Result<()> {
@@ -4187,6 +4270,36 @@ impl ChainState {
         Ok(())
     }
 
+    fn tx_counts_from_index(&self) -> Option<Vec<u32>> {
+        let mut counts = vec![0u32; self.active_chain.len()];
+        for location in self.tx_index_all.values() {
+            let height = usize::try_from(location.height).ok()?;
+            if self.active_chain.get(height) != Some(&location.block_hash) {
+                continue;
+            }
+            let count = u32::try_from(location.transaction_index)
+                .ok()?
+                .checked_add(1)?;
+            counts[height] = counts[height].max(count);
+        }
+        counts.iter().all(|count| *count > 0).then_some(counts)
+    }
+
+    fn rebuild_active_tx_counts(&mut self) -> Result<()> {
+        let mut counts = Vec::with_capacity(self.active_chain.len());
+        for hash in &self.active_chain {
+            let block = self
+                .store
+                .get(hash)?
+                .with_context(|| format!("active block {hash} is missing from block store"))?;
+            counts.push(
+                u32::try_from(block.txdata.len()).context("transaction count does not fit u32")?,
+            );
+        }
+        self.active_tx_counts = counts;
+        Ok(())
+    }
+
     fn known_headers(&self) -> Vec<bitcoin::block::Header> {
         let mut nodes: Vec<(&BlockHash, &BlockNode)> = self.block_index.iter().collect();
         nodes.sort_by(|(left_hash, left), (right_hash, right)| {
@@ -4320,6 +4433,7 @@ fn open_background_replay_state(
         coin_stats: None,
         active_chain: active_chain.to_vec(),
         headers,
+        active_tx_counts: Vec::new(),
         initial_block_download: true,
         snapshot_base: None,
         snapshot_validated: true,
@@ -5557,11 +5671,16 @@ mod tests {
         assert_eq!(state.prune_height(), Some(12));
         let path = directory.path().to_owned();
         drop(state);
-        let reopened = ChainState::open(Network::Regtest, &path).unwrap();
+        let mut reopened = ChainState::open(Network::Regtest, &path).unwrap();
         assert_eq!(reopened.best_hash(), tip_hash);
         assert_eq!(reopened.height(), 300);
         assert_eq!(reopened.prune_height(), Some(12));
         assert!(!reopened.store.contains(&old_block_hash));
+        assert_eq!(
+            reopened.block_transaction_count(&old_block_hash).unwrap(),
+            Some(1)
+        );
+        assert!(path.join("chainstate.txcounters").exists());
     }
 
     #[test]

@@ -11287,6 +11287,15 @@ fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("gettxspendingprevout expects an array"))?
         .iter()
         .map(|value| {
+            let value = value
+                .as_object()
+                .ok_or_else(|| anyhow!("outpoint must be an object"))?;
+            if let Some(key) = value
+                .keys()
+                .find(|key| !matches!(key.as_str(), "txid" | "vout"))
+            {
+                bail!("Unexpected key {key}")
+            }
             let txid: Txid = value
                 .get("txid")
                 .and_then(Value::as_str)
@@ -11318,7 +11327,11 @@ fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .keys()
         .any(|key| key != "mempool_only" && key != "return_spending_tx")
     {
-        bail!("unknown gettxspendingprevout option")
+        let key = options
+            .keys()
+            .find(|key| *key != "mempool_only" && *key != "return_spending_tx")
+            .expect("unknown option exists");
+        bail!("Unexpected key {key}")
     }
     let mempool_only = options
         .get("mempool_only")
@@ -14258,6 +14271,25 @@ mod tests {
             negative_vout.to_string(),
             "Invalid parameter, vout cannot be negative"
         );
+        let unexpected_outpoint_key = get_tx_spending_prevout(
+            &node,
+            &json!([[{
+                "txid": funding_txid.to_string(),
+                "vout": 0,
+                "unknown": true
+            }]]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            unexpected_outpoint_key.to_string(),
+            "Unexpected key unknown"
+        );
+        let unexpected_option_key = get_tx_spending_prevout(
+            &node,
+            &json!([[{"txid": funding_txid.to_string(), "vout": 0}], {"unknown": true}]),
+        )
+        .unwrap_err();
+        assert_eq!(unexpected_option_key.to_string(), "Unexpected key unknown");
     }
 
     #[test]

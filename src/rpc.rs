@@ -60,6 +60,7 @@ const MAX_OPCODE: u8 = 0xb9;
 const MIN_MERKLE_TRANSACTION_WEIGHT: usize = 4 * 60;
 const MAX_MERKLE_PROOF_TRANSACTIONS: usize =
     validation::MAX_BLOCK_WEIGHT / MIN_MERKLE_TRANSACTION_WEIGHT;
+const SCAN_BLOCKFILTER_BATCH_SIZE: usize = 10_000;
 const MEMORY_STATS_ARENA_SIZE: usize = 256 * 1024;
 
 /// Wallet-free replacement for Core's locked allocator bookkeeping. The
@@ -9745,36 +9746,53 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
             let progress_denominator = stop_height.saturating_sub(start_height).max(1);
             let mut completed = true;
             let mut last_height = start_height;
-            for height in start_height..=stop_height {
+            let stop_hash = chain
+                .block_hash(stop_height)
+                .ok_or_else(|| anyhow!("scan height is out of range"))?;
+            let mut height = start_height;
+            while height <= stop_height {
                 if node.blockfilter_scan.abort.load(Ordering::Acquire) {
                     completed = false;
                     break;
                 }
-                node.blockfilter_scan
-                    .current_height
-                    .store(height as usize, Ordering::Release);
-                let hash = chain
-                    .block_hash(height)
-                    .ok_or_else(|| anyhow!("scan height is out of range"))?;
-                let (content, _) = chain
-                    .basic_filter_for_block(&hash)?
+                let range = chain
+                    .basic_filter_range(height, stop_hash, SCAN_BLOCKFILTER_BATCH_SIZE)?
                     .ok_or_else(|| anyhow!("block filter is missing"))?;
-                let filter = BlockFilter::new(&content);
-                if filter.match_any(&hash, scripts.iter().map(|script| script.as_bytes()))?
-                    && (!filter_false_positives
-                        || block_matches_scripts(&mut chain, &hash, &scripts)?)
-                {
-                    relevant_blocks.push(hash.to_string());
+                if range.filters.is_empty() {
+                    bail!("block filter is missing")
                 }
-                last_height = height;
-                let progress = height
-                    .saturating_sub(start_height)
-                    .saturating_mul(100)
-                    .checked_div(progress_denominator)
-                    .unwrap_or(100);
-                node.blockfilter_scan
-                    .progress
-                    .store(progress as usize, Ordering::Release);
+                for (offset, (hash, content, _)) in range.filters.into_iter().enumerate() {
+                    if node.blockfilter_scan.abort.load(Ordering::Acquire) {
+                        completed = false;
+                        break;
+                    }
+                    let height = height.saturating_add(u32::try_from(offset).unwrap_or(u32::MAX));
+                    node.blockfilter_scan
+                        .current_height
+                        .store(height as usize, Ordering::Release);
+                    let filter = BlockFilter::new(&content);
+                    if filter.match_any(&hash, scripts.iter().map(|script| script.as_bytes()))?
+                        && (!filter_false_positives
+                            || block_matches_scripts(&mut chain, &hash, &scripts)?)
+                    {
+                        relevant_blocks.push(hash.to_string());
+                    }
+                    last_height = height;
+                    let progress = height
+                        .saturating_sub(start_height)
+                        .saturating_mul(100)
+                        .checked_div(progress_denominator)
+                        .unwrap_or(100);
+                    node.blockfilter_scan
+                        .progress
+                        .store(progress as usize, Ordering::Release);
+                }
+                if !completed || last_height >= stop_height {
+                    break;
+                }
+                height = last_height
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("scan height is out of range"))?;
             }
             if completed {
                 node.blockfilter_scan.progress.store(100, Ordering::Release);

@@ -8328,7 +8328,7 @@ fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Bloc
         let Some(entry) = mempool.get(&txid) else {
             continue;
         };
-        let next_weight = transaction_weight.saturating_add(mempool.adjusted_weight(&txid));
+        let next_weight = transaction_weight.saturating_add(entry.transaction.weight().to_wu());
         if next_weight.saturating_add(node.config.block_reserved_weight)
             > node.config.block_max_weight
         {

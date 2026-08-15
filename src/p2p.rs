@@ -235,6 +235,8 @@ const OVERLOADED_PEER_TX_DELAY: Duration = Duration::from_secs(2);
 const GETDATA_TX_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_GETDATA_BATCH: usize = 1_000;
 const MAX_BLOCKS_TO_ANNOUNCE: usize = 8;
+const DNS_SEED_OUTBOUND_THRESHOLD: usize = 2;
+const DNS_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(11);
 /// Core keeps manually added connections in a separate, bounded pool rather
 /// than consuming automatic `-maxconnections` slots.
 const MAX_ADDNODE_CONNECTIONS: usize = 8;
@@ -1290,9 +1292,14 @@ impl PeerManager {
                 );
             }
         }
+        let has_known_network_addresses = !self.node.known_network_addresses().is_empty();
         let should_query_dns = !configured_connect_nodes
             && self.node.config.dnsseed
-            && (self.node.config.force_dns_seed || self.node.known_network_addresses().is_empty());
+            && (self.node.config.force_dns_seed || !has_known_network_addresses);
+        let delayed_dns_seed_fallback = !configured_connect_nodes
+            && self.node.config.dnsseed
+            && !self.node.config.force_dns_seed
+            && has_known_network_addresses;
         let connect_nodes = if should_query_dns {
             let addresses = discover_dns_seeds(self.node.config.network).await;
             for address in &addresses {
@@ -1334,10 +1341,35 @@ impl PeerManager {
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(30));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let discovery_started = Instant::now();
+                let mut queried_delayed_dns_seed = false;
                 loop {
                     ticker.tick().await;
                     if !discovery_node.network_active() {
                         continue;
+                    }
+                    let outbound_peer_count = discovery_node
+                        .peer_infos()
+                        .into_iter()
+                        .filter(|peer| !peer.inbound)
+                        .count();
+                    if !queried_delayed_dns_seed
+                        && should_query_dns_seed_fallback(
+                            delayed_dns_seed_fallback,
+                            discovery_started.elapsed(),
+                            outbound_peer_count,
+                        )
+                    {
+                        queried_delayed_dns_seed = true;
+                        for address in discover_dns_seeds(discovery_node.config.network).await {
+                            if discovery_node.config.allows_address(address) {
+                                discovery_node.remember_network_address(
+                                    NetworkEndpoint::from_socket(address),
+                                    wire::NODE_NETWORK | wire::NODE_WITNESS,
+                                    unix_time_seconds(),
+                                );
+                            }
+                        }
                     }
                     let available = discovery_outbound.slots.available_permits().min(8);
                     if available == 0 {
@@ -1730,6 +1762,16 @@ fn select_discovery_endpoints(
         .take(limit)
         .map(|entry| entry.endpoint)
         .collect()
+}
+
+fn should_query_dns_seed_fallback(
+    enabled: bool,
+    elapsed: Duration,
+    outbound_peer_count: usize,
+) -> bool {
+    enabled
+        && elapsed >= DNS_SEED_FALLBACK_DELAY
+        && outbound_peer_count < DNS_SEED_OUTBOUND_THRESHOLD
 }
 
 #[cfg(test)]
@@ -6861,6 +6903,30 @@ mod tests {
             select_discovery_addresses(&node, 4, &attempts),
             vec![eligible]
         );
+    }
+
+    #[test]
+    fn delayed_dns_seed_fallback_waits_for_known_peers() {
+        assert!(!should_query_dns_seed_fallback(
+            false,
+            DNS_SEED_FALLBACK_DELAY,
+            0
+        ));
+        assert!(!should_query_dns_seed_fallback(
+            true,
+            DNS_SEED_FALLBACK_DELAY - Duration::from_secs(1),
+            0
+        ));
+        assert!(!should_query_dns_seed_fallback(
+            true,
+            DNS_SEED_FALLBACK_DELAY,
+            DNS_SEED_OUTBOUND_THRESHOLD
+        ));
+        assert!(should_query_dns_seed_fallback(
+            true,
+            DNS_SEED_FALLBACK_DELAY,
+            DNS_SEED_OUTBOUND_THRESHOLD - 1
+        ));
     }
 
     #[test]

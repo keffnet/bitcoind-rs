@@ -44,7 +44,7 @@ Inbound P2P listening can be disabled with `--listen=false`; DNS seed lookup can
 
 `--timeout=<milliseconds>` bounds each initial outbound TCP connection attempt (5,000 ms by default). `--peertimeout=<seconds>` controls the inactivity ping timeout (60 seconds by default); the automatic peer connection limit defaults to Core's 125 peers.
 
-`--forcednsseed` forces a DNS seed lookup even when persisted peer addresses are available; it cannot be combined with `--dnsseed=false`.
+`--forcednsseed` forces a DNS seed lookup even when persisted peer addresses are available; regular DNS seeding is deferred briefly in that case so the saved addresses are tried first. It cannot be combined with `--dnsseed=false`.
 
 `--seednode=<host[:port]>` opens a one-shot address-fetch connection during startup; `--connect` takes precedence, matching Core's manual-connection modes.
 

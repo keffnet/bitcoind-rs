@@ -1138,8 +1138,11 @@ impl PeerManager {
                 let listener = TcpListener::bind(bind)
                     .await
                     .with_context(|| format!("binding P2P listener {bind}"))?;
+                let local_address = listener.local_addr()?;
                 if self.node.listen_address().is_none() {
-                    self.node.set_listen_address(listener.local_addr()?);
+                    self.node.set_listen_address(local_address);
+                } else {
+                    self.node.add_listen_address(local_address);
                 }
                 listeners.push(listener);
             }

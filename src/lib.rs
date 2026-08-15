@@ -658,6 +658,7 @@ pub struct Node {
     added_node_names: parking_lot::RwLock<HashMap<NetworkEndpoint, String>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
     listen_address: parking_lot::RwLock<Option<SocketAddr>>,
+    listen_addresses: parking_lot::RwLock<Vec<SocketAddr>>,
     last_mining_block: parking_lot::RwLock<Option<(u64, usize)>>,
     pub started_at: Instant,
     shutdown: Notify,
@@ -812,6 +813,7 @@ impl Node {
             added_node_names: parking_lot::RwLock::new(added_node_names),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
             listen_address: parking_lot::RwLock::new(None),
+            listen_addresses: parking_lot::RwLock::new(Vec::new()),
             last_mining_block: parking_lot::RwLock::new(None),
             started_at: Instant::now(),
             shutdown: Notify::new(),
@@ -1966,6 +1968,18 @@ impl Node {
 
     pub(crate) fn set_listen_address(&self, address: SocketAddr) {
         *self.listen_address.write() = Some(address);
+        *self.listen_addresses.write() = vec![address];
+    }
+
+    pub(crate) fn add_listen_address(&self, address: SocketAddr) {
+        let mut addresses = self.listen_addresses.write();
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+
+    pub(crate) fn listen_addresses(&self) -> Vec<SocketAddr> {
+        self.listen_addresses.read().clone()
     }
 
     pub(crate) fn listen_address(&self) -> Option<SocketAddr> {

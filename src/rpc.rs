@@ -2239,14 +2239,16 @@ fn local_addresses(node: &Arc<Node>) -> Value {
             addresses.push((*address, 4));
         }
     }
-    if node.config.discover
-        && node.config.proxy.is_none()
-        && let Some(address) = node
-            .listen_address()
+    if node.config.discover && node.config.proxy.is_none() {
+        for address in node
+            .listen_addresses()
+            .into_iter()
             .filter(|address| is_routable_ip(address.ip()) && node.config.allows_address(*address))
-        && !addresses.iter().any(|(known, _)| known == &address)
-    {
-        addresses.push((address, 2));
+        {
+            if !addresses.iter().any(|(known, _)| known == &address) {
+                addresses.push((address, 2));
+            }
+        }
     }
     json!(
         addresses
@@ -15547,6 +15549,17 @@ mod tests {
             .config
             .external_addresses
             .clear();
+        Arc::get_mut(&mut node).unwrap().config.proxy = None;
+        node.set_listen_address("8.8.8.8:18444".parse().unwrap());
+        node.add_listen_address("9.9.9.9:18445".parse().unwrap());
+        assert_eq!(
+            dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["localaddresses"],
+            json!([
+                {"address": "8.8.8.8", "port": 18444, "score": 2},
+                {"address": "9.9.9.9", "port": 18445, "score": 2}
+            ])
+        );
+        Arc::get_mut(&mut node).unwrap().config.proxy = Some("127.0.0.1:9050".parse().unwrap());
         dispatch_method(&node, "setnetworkactive", &json!([false])).unwrap();
         assert_eq!(
             dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["networkactive"],

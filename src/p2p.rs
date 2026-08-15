@@ -1673,6 +1673,7 @@ fn spawn_outbound_loop(
             match connect_peer_endpoint_with_options_and_dns_with_i2p(
                 &endpoint,
                 node.config.proxy,
+                node.config.onion_proxy,
                 false,
                 node.config.proxy_randomize,
                 node.config.dns_lookup,
@@ -1931,6 +1932,7 @@ async fn connect_peer_endpoint_with_options_and_dns_with_timeout(
     connect_peer_endpoint_with_options_and_dns_with_i2p(
         endpoint,
         proxy,
+        None,
         force_proxy,
         proxy_randomize,
         allow_dns_lookup,
@@ -1940,9 +1942,11 @@ async fn connect_peer_endpoint_with_options_and_dns_with_timeout(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_peer_endpoint_with_options_and_dns_with_i2p(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
+    onion_proxy: Option<SocketAddr>,
     force_proxy: bool,
     proxy_randomize: bool,
     allow_dns_lookup: bool,
@@ -1954,6 +1958,11 @@ async fn connect_peer_endpoint_with_options_and_dns_with_i2p(
     {
         return i2p_sam.connect(endpoint).await;
     }
+    let proxy = if endpoint.is_onion() {
+        onion_proxy.or(proxy)
+    } else {
+        proxy
+    };
     let proxy = proxy.filter(|_| force_proxy || endpoint.uses_proxy_by_default());
     if proxy.is_none() && endpoint.requires_proxy() {
         bail!("endpoint {endpoint} requires a SOCKS5 proxy");
@@ -2154,6 +2163,7 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
 #[derive(Clone)]
 struct ProxyRoutingOptions {
     proxy: Option<SocketAddr>,
+    onion_proxy: Option<SocketAddr>,
     force_proxy: bool,
     randomize_credentials: bool,
     allow_dns_lookup: bool,
@@ -2190,6 +2200,7 @@ async fn establish_transport(
                 let fallback = connect_peer_endpoint_with_options_and_dns_with_i2p(
                     endpoint,
                     proxy_options.proxy,
+                    proxy_options.onion_proxy,
                     proxy_options.force_proxy,
                     proxy_options.randomize_credentials,
                     proxy_options.allow_dns_lookup,
@@ -2346,6 +2357,7 @@ async fn serve_peer(
         options.transport_v2,
         ProxyRoutingOptions {
             proxy: node.config.proxy,
+            onion_proxy: node.config.onion_proxy,
             force_proxy: options.connection_type == "private-broadcast",
             randomize_credentials: node.config.proxy_randomize,
             allow_dns_lookup: node.config.dns_lookup,
@@ -5147,6 +5159,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -5635,6 +5648,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn separate_onion_proxy_overrides_generic_proxy() {
+        let endpoint = NetworkEndpoint::OnionV3 {
+            address: [8; 32],
+            port: 18444,
+        };
+        let generic_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let generic_address = generic_listener.local_addr().unwrap();
+        let onion_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let onion_address = onion_listener.local_addr().unwrap();
+        let host = endpoint.host_string();
+        let port = endpoint.port();
+        let onion_server = tokio::spawn(async move {
+            let (mut stream, _) = onion_listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+            let mut prefix = [0; 5];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(&prefix[..4], &[5, 1, 0, 3]);
+            let mut received_host = vec![0; usize::from(prefix[4])];
+            stream.read_exact(&mut received_host).await.unwrap();
+            assert_eq!(received_host, host.as_bytes());
+            let mut received_port = [0; 2];
+            stream.read_exact(&mut received_port).await.unwrap();
+            assert_eq!(received_port, port.to_be_bytes());
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+        });
+
+        let _stream = connect_peer_endpoint_with_options_and_dns_with_i2p(
+            &endpoint,
+            Some(generic_address),
+            Some(onion_address),
+            false,
+            false,
+            true,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), generic_listener.accept())
+                .await
+                .is_err()
+        );
+        onion_server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn socks5_proxy_negotiation_routes_dns_hostnames() {
         let endpoint = NetworkEndpoint::dns("peer.example".to_owned(), 18444).unwrap();
         let host = endpoint.host_string();
@@ -5720,6 +5786,7 @@ mod tests {
             onlynet: vec![OnlyNet::Ipv4],
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -5897,6 +5964,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -6365,6 +6433,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -6526,6 +6595,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -6693,6 +6763,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -6950,6 +7021,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -7083,6 +7155,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -7198,6 +7271,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -7329,6 +7403,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: Some("127.0.0.1:9050".parse().unwrap()),
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -7498,6 +7573,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),

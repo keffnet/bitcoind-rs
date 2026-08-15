@@ -818,6 +818,10 @@ pub struct Args {
     )]
     pub i2p_accept_incoming: bool,
 
+    /// SOCKS5 proxy used specifically for Tor onion endpoints.
+    #[arg(long = "onion", value_name = "IP:PORT")]
+    pub onion_proxy: Option<SocketAddr>,
+
     #[arg(
         long = "proxyrandomize",
         default_value_t = true,
@@ -1382,6 +1386,7 @@ pub struct Config {
     pub proxy: Option<SocketAddr>,
     pub i2p_sam: Option<SocketAddr>,
     pub i2p_accept_incoming: bool,
+    pub onion_proxy: Option<SocketAddr>,
     pub proxy_randomize: bool,
     pub cjdns_reachable: bool,
     pub peer_permissions: PeerPermissionConfig,
@@ -1546,6 +1551,9 @@ impl Config {
         if args.i2p_sam.is_some_and(|address| address.port() == 0) {
             bail!("--i2psam must use a non-zero port");
         }
+        if args.onion_proxy.is_some_and(|address| address.port() == 0) {
+            bail!("--onion must use a non-zero port");
+        }
         let connect_configured = args.no_connect || !args.connect.is_empty();
         if args.privatebroadcast && args.proxy.is_none() {
             bail!("--privatebroadcast requires --proxy for private connections");
@@ -1558,8 +1566,11 @@ impl Config {
         if args.no_connect && !args.connect.is_empty() {
             bail!("--noconnect cannot be combined with --connect");
         }
-        if args.proxy.is_none() && args.onlynet.contains(&OnlyNet::Onion) {
-            bail!("--onlynet=onion requires --proxy for outbound connections");
+        if args.proxy.is_none()
+            && args.onion_proxy.is_none()
+            && args.onlynet.contains(&OnlyNet::Onion)
+        {
+            bail!("--onlynet=onion requires --proxy or --onion for outbound connections");
         }
         if args.i2p_sam.is_none() && args.onlynet.contains(&OnlyNet::I2p) {
             bail!("--onlynet=i2p requires --i2psam for outbound connections");
@@ -1798,6 +1809,7 @@ impl Config {
             proxy: args.proxy,
             i2p_sam: args.i2p_sam,
             i2p_accept_incoming,
+            onion_proxy: args.onion_proxy,
             proxy_randomize: args.proxy_randomize,
             cjdns_reachable: args.cjdns_reachable,
             peer_permissions,
@@ -2369,7 +2381,7 @@ mod tests {
         let expected_errors = [
             (
                 "onion",
-                "--onlynet=onion requires --proxy for outbound connections",
+                "--onlynet=onion requires --proxy or --onion for outbound connections",
             ),
             (
                 "i2p",
@@ -2387,6 +2399,17 @@ mod tests {
             let error = Config::from_args(args).unwrap_err().to_string();
             assert_eq!(error, expected_error);
         }
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--onion=127.0.0.1:9050",
+            "--onlynet=onion",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.onion_proxy, Some("127.0.0.1:9050".parse().unwrap()));
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

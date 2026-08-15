@@ -186,6 +186,14 @@ impl NetworkEndpoint {
         }
     }
 
+    pub fn is_onion(&self) -> bool {
+        match self {
+            Self::OnionV2 { .. } | Self::OnionV3 { .. } => true,
+            Self::Dns { host, .. } => host.to_ascii_lowercase().ends_with(".onion"),
+            Self::Ip(_) | Self::I2p { .. } | Self::Cjdns { .. } => false,
+        }
+    }
+
     /// Construct a hostname endpoint used by manual connections. Hostnames
     /// are intentionally not address-manager entries because ADDRv2 has no
     /// representation for unresolved names.

@@ -762,11 +762,35 @@ pub(crate) fn validate_block_structure_with_signet_options_with_params(
     signet_challenge: Option<&[u8]>,
     check_signet_solution: bool,
 ) -> Result<BlockValidationStats, ValidationError> {
+    validate_block_structure_with_signet_options_with_params_and_merkle(
+        block,
+        params,
+        height,
+        expected_coinbase_value,
+        signet_challenge,
+        check_signet_solution,
+        true,
+    )
+}
+
+/// Validate the context-free portion of a block with the same switches used
+/// by Core's mining interface.  A miner may deliberately omit the merkle-root
+/// check while checking a block assembled by external software; all other
+/// structure and witness rules still run.
+pub(crate) fn validate_block_structure_with_signet_options_with_params_and_merkle(
+    block: &Block,
+    params: &DeploymentParameters,
+    height: u32,
+    expected_coinbase_value: u64,
+    signet_challenge: Option<&[u8]>,
+    check_signet_solution: bool,
+    check_merkle_root: bool,
+) -> Result<BlockValidationStats, ValidationError> {
     if block.txdata.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }
     validate_block_version_with_params(params, height, block.header.version.to_consensus())?;
-    if !block.check_merkle_root() {
+    if check_merkle_root && !block.check_merkle_root() {
         return Err(ValidationError::BadMerkleRoot);
     }
     validate_witness_commitment(block, height >= params.buried.segwit)?;

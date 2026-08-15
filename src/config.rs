@@ -1218,6 +1218,12 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub rest: bool,
 
+    /// Bind the Core multiprocess Cap'n Proto interface to one or more Unix
+    /// socket addresses.  `unix` uses `<datadir>/node.sock` and `unix:<path>`
+    /// accepts an explicit path.
+    #[arg(long = "ipcbind", value_name = "ADDRESS")]
+    pub ipc_bind: Vec<String>,
+
     #[arg(long, value_delimiter = ',')]
     pub connect: Vec<String>,
 
@@ -2236,6 +2242,7 @@ pub struct Config {
     pub rpc_work_queue: usize,
     pub electrum_bind: Option<SocketAddr>,
     pub rest: bool,
+    pub ipc_bind: Vec<String>,
     pub seed_nodes: Vec<NetworkEndpoint>,
     pub connect_disabled: bool,
     pub v2_transport: bool,
@@ -2898,6 +2905,7 @@ impl Config {
             rpc_work_queue,
             electrum_bind: Some(args.electrum),
             rest: args.rest,
+            ipc_bind: args.ipc_bind,
             seed_nodes,
             connect_disabled,
             v2_transport: args.v2_transport,

@@ -14,9 +14,12 @@ bip324 = { version = "0.11", features = ["tokio"] }
 bitcoin = { version = "0.32.7", features = ["serde"] }
 bitcoinconsensus = "0.106.0"
 bytes = "1.10"
+capnp = "0.27"
+capnp-rpc = "0.27"
 chacha20 = "0.9"
 clap = { version = "4.5", features = ["derive", "env"] }
 fs2 = "0.4"
+futures = "0.3"
 hex = "0.4"
 libc = "0.2"
 num-bigint = "0.4"
@@ -32,12 +35,17 @@ socket2 = "0.6"
 thiserror = "2.0"
 time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
 tokio = { version = "1.44", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zeromq = "0.6"
 
 [dev-dependencies]
 tempfile = "3.19"
+
+[build-dependencies]
+capnpc = "0.27"
+capnpc-embedded = "0.2"
 
 [[bin]]
 name = "bitcoind-rs"

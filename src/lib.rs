@@ -8,6 +8,7 @@ pub mod config;
 pub mod electrum;
 pub mod fee_estimator;
 pub mod i2p;
+mod ipc;
 pub mod mempool;
 pub mod muhash;
 pub mod p2p;
@@ -19,6 +20,35 @@ pub mod tor;
 pub mod validation;
 pub mod wire;
 pub mod zmq;
+
+// The generated modules use crate-root paths for cross-schema references.
+// Keep these private: the wire protocol is a Core compatibility surface, not
+// a Rust API exposed by the node library.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub(crate) mod proxy_capnp {
+    include!(concat!(env!("OUT_DIR"), "/mp/proxy_capnp.rs"));
+}
+#[doc(hidden)]
+#[allow(dead_code)]
+pub(crate) mod common_capnp {
+    include!(concat!(env!("OUT_DIR"), "/ipc/common_capnp.rs"));
+}
+#[doc(hidden)]
+#[allow(dead_code)]
+pub(crate) mod echo_capnp {
+    include!(concat!(env!("OUT_DIR"), "/ipc/echo_capnp.rs"));
+}
+#[doc(hidden)]
+#[allow(dead_code)]
+pub(crate) mod init_capnp {
+    include!(concat!(env!("OUT_DIR"), "/ipc/init_capnp.rs"));
+}
+#[doc(hidden)]
+#[allow(dead_code)]
+pub(crate) mod mining_capnp {
+    include!(concat!(env!("OUT_DIR"), "/ipc/mining_capnp.rs"));
+}
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -3828,10 +3858,18 @@ impl Node {
         self: Arc<Self>,
         startup_sender: Option<oneshot::Sender<()>>,
     ) -> Result<()> {
-        let startup = startup_sender.map(|sender| StartupLatch::new(sender, 4));
+        let startup_services = 4 + usize::from(!self.config.ipc_bind.is_empty());
+        let startup = startup_sender.map(|sender| StartupLatch::new(sender, startup_services));
+        let ipc = ipc::IpcServer::bind(self.clone()).await?;
+        if ipc.is_some()
+            && let Some(startup) = startup.as_ref()
+        {
+            startup.service_ready();
+        }
         let p2p = p2p::PeerManager::new(self.clone());
         let rpc = rpc::RpcServer::new(self.clone());
         let electrum = electrum::ElectrumServer::new(self.clone());
+        let mut ipc_task = ipc.map(|server| tokio::task::spawn_local(server.run()));
         let mut zmq_task = tokio::spawn(zmq::run_with_startup(
             self.config.zmq.clone(),
             self.subscribe_zmq(),
@@ -3843,6 +3881,7 @@ impl Node {
             p2p = %self.config.p2p_bind,
             rpc = ?self.config.rpc_bind,
             electrum = ?self.config.electrum_bind,
+            ipc = ?self.config.ipc_bind,
             "starting wallet-free Bitcoin node"
         );
 
@@ -3908,10 +3947,22 @@ impl Node {
             result = &mut zmq_task => result
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result),
+            result = async {
+                match ipc_task.as_mut() {
+                    Some(task) => Some(task.await),
+                    None => std::future::pending().await,
+                }
+            } => result
+                .expect("IPC task branch only completes when IPC is configured")
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result),
             result = wait_for_shutdown_signal() => result,
             _ = self.wait_for_shutdown() => Ok(()),
         };
 
+        if let Some(task) = ipc_task {
+            task.abort();
+        }
         p2p_task.abort();
         rpc_task.abort();
         electrum_task.abort();
@@ -4356,6 +4407,7 @@ mod tests {
             datadir: datadir.to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),

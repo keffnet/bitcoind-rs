@@ -9682,6 +9682,158 @@ struct MiningBlockTemplate {
     version: Option<i32>,
 }
 
+/// The data exposed by Core's Cap'n Proto BlockTemplate interface.  Keeping
+/// this separate from the JSON-RPC representation avoids making the IPC
+/// server parse its own JSON output and preserves the transaction-level fee
+/// and sigop vectors that IPC clients expect.
+#[derive(Clone, Debug)]
+pub(crate) struct IpcBlockTemplate {
+    pub block: Block,
+    pub tx_fees: Vec<i64>,
+    pub tx_sigops: Vec<i64>,
+    pub total_fees_sat: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct IpcBlockCreateOptions {
+    pub use_mempool: bool,
+    pub block_reserved_weight: u64,
+    pub coinbase_output_max_additional_sigops: u64,
+}
+
+pub(crate) const IPC_MINIMUM_BLOCK_RESERVED_WEIGHT: u64 = 2_000;
+
+/// Assemble the wallet-free equivalent of Core's `BlockAssembler` template.
+/// The dummy coinbase is intentionally retained in `block`; clients replace
+/// it through BlockTemplate.submitSolution after constructing their payout
+/// transaction.
+pub(crate) fn create_ipc_block_template(
+    node: &Arc<Node>,
+    options: IpcBlockCreateOptions,
+) -> Result<IpcBlockTemplate> {
+    if options.block_reserved_weight < IPC_MINIMUM_BLOCK_RESERVED_WEIGHT {
+        bail!(
+            "block_reserved_weight ({}) must be at least {} weight units",
+            options.block_reserved_weight,
+            IPC_MINIMUM_BLOCK_RESERVED_WEIGHT
+        );
+    }
+
+    // The current wallet-free assembler has no node-provided coinbase
+    // outputs, so this option only constrains a future extension.  Still read
+    // and validate the value here so malformed IPC requests fail at the same
+    // boundary as Core rather than being silently ignored.
+    let _coinbase_output_max_additional_sigops = options
+        .coinbase_output_max_additional_sigops
+        .min(u64::from(u32::MAX));
+
+    let chain = node.chain.read();
+    let tip = chain.tip();
+    let parent = chain
+        .header(tip.height)
+        .copied()
+        .ok_or_else(|| anyhow!("active tip header is unavailable"))?;
+    let height = tip.height.saturating_add(1);
+    let deployment_parameters = chain.deployment_parameters();
+    let segwit_active = height >= deployment_parameters.buried.segwit;
+    let now = crate::time::unix_time() as u32;
+    let mintime = minimum_block_time(
+        chain.network,
+        &parent,
+        height,
+        chain.median_time_past_value(),
+    );
+    let time = now.max(mintime);
+    let bits = chain.next_bits(time);
+    let version = mining_block_version_with_params(
+        &deployment_parameters,
+        chain.active_headers(),
+        tip.height,
+        node.config.block_version,
+    );
+
+    let mempool = node.mempool.read();
+    let selected = if options.use_mempool {
+        mempool.mining_order_with_min_fee(
+            node.config.block_max_weight,
+            options.block_reserved_weight,
+            node.config.block_min_tx_fee_sat_per_kvb,
+        )
+    } else {
+        Vec::new()
+    };
+    let mut transactions = Vec::with_capacity(selected.len());
+    let mut tx_fees = Vec::with_capacity(selected.len());
+    let mut tx_sigops = Vec::with_capacity(selected.len());
+    let mut total_fees_sat = 0u64;
+    for txid in selected {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        let transaction = entry.transaction.clone();
+        let sigops = transaction.total_sigop_cost(|outpoint| {
+            chain
+                .utxo(outpoint)
+                .map(|entry| entry.output.clone())
+                .or_else(|| {
+                    mempool
+                        .get(&outpoint.txid)
+                        .and_then(|entry| entry.transaction.output.get(outpoint.vout as usize))
+                        .cloned()
+                })
+        });
+        total_fees_sat = total_fees_sat.saturating_add(entry.fee_sat);
+        tx_fees.push(i64::try_from(entry.fee_sat).unwrap_or(i64::MAX));
+        tx_sigops.push(i64::try_from(sigops).unwrap_or(i64::MAX));
+        transactions.push(transaction);
+    }
+    drop(mempool);
+
+    let mut block = mining_block_with_deployment_parameters(
+        MiningBlockTemplate {
+            network: chain.network,
+            parent,
+            height,
+            time,
+            bits,
+            // Core's IPC template contains an anyone-can-spend dummy output;
+            // the client replaces the entire coinbase before submission.
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            transactions,
+            fees: total_fees_sat,
+            extra_nonce: 0,
+            version: Some(version),
+        },
+        &deployment_parameters,
+    )?;
+    if let Some(coinbase) = block.txdata.first_mut()
+        && let Some(input) = coinbase.input.first_mut()
+    {
+        // Core's mining interface uses MAX_SEQUENCE_NONFINAL for its
+        // replaceable coinbase input while keeping the height-only prefix
+        // available to the caller.
+        input.sequence = bitcoin::Sequence::from_consensus(0xffff_fffe);
+        block.header.merkle_root = block
+            .compute_merkle_root()
+            .ok_or_else(|| anyhow!("cannot calculate transaction merkle root"))?;
+    }
+    if block.weight().to_wu() > node.config.block_max_weight {
+        bail!("generated block exceeds the block weight limit");
+    }
+
+    // The value is consumed by the IPC CoinbaseTx inspector.  Keep the
+    // `segwit_active` calculation above explicit: it documents why the block
+    // builder included the witness commitment and protects this method if
+    // the assembler is later split into pre-/post-SegWit paths.
+    let _ = segwit_active;
+    Ok(IpcBlockTemplate {
+        block,
+        tx_fees,
+        tx_sigops,
+        total_fees_sat,
+    })
+}
+
 #[cfg(test)]
 fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
     let deployment_parameters = validation::DeploymentParameters::for_network(template.network);
@@ -12971,6 +13123,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -13273,6 +13426,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -13448,6 +13602,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -13648,6 +13803,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -13790,6 +13946,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -13930,6 +14087,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -14105,6 +14263,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -14312,6 +14471,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -14761,6 +14921,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -14930,6 +15091,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -15082,6 +15244,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -15227,6 +15390,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -15375,6 +15539,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -15510,6 +15675,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -15654,6 +15820,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -15787,6 +15954,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -15997,6 +16165,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -16155,6 +16324,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -16307,6 +16477,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -16497,6 +16668,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -16651,6 +16823,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -16836,6 +17009,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -17103,6 +17277,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -17353,6 +17528,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -17487,6 +17663,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -17623,6 +17800,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -17764,6 +17942,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -17911,6 +18090,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -18065,6 +18245,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -18217,6 +18398,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -18417,6 +18599,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -18657,6 +18840,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -18793,6 +18977,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -19098,6 +19283,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -19298,6 +19484,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -19494,6 +19681,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -19760,6 +19948,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -20135,6 +20324,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -20280,6 +20470,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -20550,6 +20741,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -20699,6 +20891,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -21180,6 +21373,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -21324,6 +21518,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -21507,6 +21702,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -21821,6 +22017,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -22308,6 +22505,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -22516,6 +22714,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -22751,6 +22950,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -23092,6 +23292,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -23239,6 +23440,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),
@@ -23407,6 +23609,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_dir_explicit: false,
+            ipc_bind: Vec::new(),
             blocks_xor: false,
             capture_messages: false,
             debug_log_path: std::path::PathBuf::from("debug.log"),

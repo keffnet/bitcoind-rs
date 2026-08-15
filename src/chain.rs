@@ -3573,7 +3573,27 @@ impl ChainState {
         self.validate_candidate_block_internal(block, false)
     }
 
+    /// Validate a mining-interface candidate with independently selectable
+    /// proof-of-work and merkle-root checks.
+    pub fn validate_candidate_block_with_options(
+        &self,
+        block: &Block,
+        check_pow: bool,
+        check_merkle_root: bool,
+    ) -> Result<()> {
+        self.validate_candidate_block_internal_with_options(block, check_pow, check_merkle_root)
+    }
+
     fn validate_candidate_block_internal(&self, block: &Block, check_pow: bool) -> Result<()> {
+        self.validate_candidate_block_internal_with_options(block, check_pow, true)
+    }
+
+    fn validate_candidate_block_internal_with_options(
+        &self,
+        block: &Block,
+        check_pow: bool,
+        check_merkle_root: bool,
+    ) -> Result<()> {
         let parent_hash = block.header.prev_blockhash;
         if parent_hash != self.best_hash() {
             return Err(ValidationError::WrongPreviousBlock.into());
@@ -3608,13 +3628,14 @@ impl ChainState {
                 median_time_past,
             )?;
         }
-        validation::validate_block_structure_with_signet_options_with_params(
+        validation::validate_block_structure_with_signet_options_with_params_and_merkle(
             block,
             &self.deployment_parameters,
             height,
             Amount::MAX_MONEY.to_sat(),
             self.signet_challenge.as_deref(),
             check_pow,
+            check_merkle_root,
         )?;
         self.validate_block_transactions(block, height, &self.utxos, median_time_past)?;
         Ok(())

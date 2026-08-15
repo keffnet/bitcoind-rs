@@ -42,7 +42,7 @@ fn main() -> Result<()> {
             return Err(error.into());
         }
     };
-    runtime.block_on(run_node(config, readiness))
+    runtime.block_on(tokio::task::LocalSet::new().run_until(run_node(config, readiness)))
 }
 
 async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()> {

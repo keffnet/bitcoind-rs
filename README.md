@@ -28,6 +28,8 @@ The node never creates, imports, or stores Bitcoin wallet private keys. A privat
 
 ## Running
 
+Automatic Tor onion listening is enabled whenever P2P listening is active. Disable it with --listenonion=false; --torcontrol selects the control service (127.0.0.1:9051 by default) and --torpassword enables password authentication. The controller supports NULL, SAFECOOKIE, and COOKIE authentication, publishes an Ed25519 v3 service with ADD_ONION, keeps the control connection alive, caches its identity in onion_v3_private_key, discovers Tor's SOCKS listener for onion outbound connections, and retries when Tor is unavailable. The generated Tor identity is a network-service key, not a Bitcoin wallet key.
+
 ```text
 cargo run -- --network regtest --datadir ./data
 ```

@@ -12,6 +12,7 @@ pub mod p2p;
 pub mod rpc;
 pub mod storage;
 pub mod time;
+pub mod tor;
 pub mod validation;
 pub mod wire;
 pub mod zmq;
@@ -723,6 +724,7 @@ pub struct Node {
     pub(crate) blockfilter_scan: Arc<ScanState>,
     pub rpc_cookie: Option<String>,
     pub(crate) i2p_sam: Option<Arc<i2p::I2pSam>>,
+    pub(crate) tor_controller: Option<Arc<tor::TorController>>,
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
     zmq_mempool_sequence: AtomicU64,
@@ -766,6 +768,14 @@ impl Node {
                 config.datadir.clone(),
                 Duration::from_millis(config.connect_timeout_ms),
                 config.i2p_accept_incoming,
+            ))
+        });
+        let tor_controller = config.listen_onion.then(|| {
+            Arc::new(tor::TorController::new(
+                config.tor_control,
+                config.tor_password.clone(),
+                config.datadir.clone(),
+                Duration::from_millis(config.connect_timeout_ms),
             ))
         });
         let added_nodes = config
@@ -916,6 +926,7 @@ impl Node {
             blockfilter_scan: Arc::new(ScanState::default()),
             rpc_cookie,
             i2p_sam,
+            tor_controller,
             mempool_path,
             peer_count: AtomicUsize::new(0),
             zmq_mempool_sequence: AtomicU64::new(zmq_mempool_sequence),
@@ -2144,12 +2155,24 @@ impl Node {
         }
     }
 
+    pub(crate) fn remove_listen_network_address(&self, endpoint: &NetworkEndpoint) {
+        self.listen_network_addresses
+            .write()
+            .retain(|address| address != endpoint);
+    }
+
     pub(crate) fn listen_network_addresses(&self) -> Vec<NetworkEndpoint> {
         self.listen_network_addresses.read().clone()
     }
 
     pub(crate) fn listen_address(&self) -> Option<SocketAddr> {
         *self.listen_address.read()
+    }
+
+    pub(crate) fn onion_proxy(&self) -> Option<SocketAddr> {
+        self.config
+            .onion_proxy
+            .or_else(|| self.tor_controller.as_ref()?.socks_proxy())
     }
 
     pub(crate) fn record_mining_block(&self, block: &Block) {
@@ -3586,6 +3609,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),

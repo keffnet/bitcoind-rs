@@ -13,6 +13,7 @@ use clap::{Parser, ValueEnum};
 use crate::IpSubnet;
 use crate::address::NetworkEndpoint;
 use crate::i2p::I2P_SAM_PORT;
+use crate::tor::DEFAULT_TOR_CONTROL_PORT;
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
@@ -658,6 +659,14 @@ pub struct Args {
     pub listen: Option<bool>,
 
     #[arg(
+        long = "listenonion",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub listen_onion: Option<bool>,
+
+    #[arg(
         long,
         num_args = 0..=1,
         default_missing_value = "true",
@@ -821,6 +830,13 @@ pub struct Args {
     /// SOCKS5 proxy used specifically for Tor onion endpoints.
     #[arg(long = "onion", value_name = "IP:PORT")]
     pub onion_proxy: Option<SocketAddr>,
+
+    /// Tor control service used for automatic onion listening.
+    #[arg(long = "torcontrol", default_value = "127.0.0.1:9051")]
+    pub tor_control: String,
+
+    #[arg(long = "torpassword")]
+    pub tor_password: Option<String>,
 
     #[arg(
         long = "proxyrandomize",
@@ -1358,6 +1374,7 @@ pub struct Config {
     pub p2p_bind: SocketAddr,
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
+    pub listen_onion: bool,
     pub rpc_bind: Option<SocketAddr>,
     pub rpc_binds: Vec<SocketAddr>,
     pub(crate) rpc_allow_ips: Vec<IpSubnet>,
@@ -1387,6 +1404,8 @@ pub struct Config {
     pub i2p_sam: Option<SocketAddr>,
     pub i2p_accept_incoming: bool,
     pub onion_proxy: Option<SocketAddr>,
+    pub tor_control: SocketAddr,
+    pub tor_password: Option<String>,
     pub proxy_randomize: bool,
     pub cjdns_reachable: bool,
     pub peer_permissions: PeerPermissionConfig,
@@ -1554,6 +1573,7 @@ impl Config {
         if args.onion_proxy.is_some_and(|address| address.port() == 0) {
             bail!("--onion must use a non-zero port");
         }
+        let tor_control = parse_tor_control(&args.tor_control)?;
         let connect_configured = args.no_connect || !args.connect.is_empty();
         if args.privatebroadcast && args.proxy.is_none() {
             bail!("--privatebroadcast requires --proxy for private connections");
@@ -1566,11 +1586,26 @@ impl Config {
         if args.no_connect && !args.connect.is_empty() {
             bail!("--noconnect cannot be combined with --connect");
         }
+        let listen = args.listen.unwrap_or(
+            !args.bind.is_empty()
+                || !args.whitebind.is_empty()
+                || (args.proxy.is_none() && !connect_configured && args.max_peers > 0),
+        );
+        if !listen && (!args.bind.is_empty() || !args.whitebind.is_empty()) {
+            bail!("--bind/--whitebind cannot be used with --listen=false");
+        }
+        if !listen && args.listen_onion == Some(true) {
+            bail!("--listen=false cannot be combined with --listenonion=true");
+        }
+        let listen_onion = args.listen_onion.unwrap_or(true) && listen;
         if args.proxy.is_none()
             && args.onion_proxy.is_none()
             && args.onlynet.contains(&OnlyNet::Onion)
+            && !listen_onion
         {
-            bail!("--onlynet=onion requires --proxy or --onion for outbound connections");
+            bail!(
+                "--onlynet=onion requires --proxy, --onion, or --listenonion for outbound connections"
+            );
         }
         if args.i2p_sam.is_none() && args.onlynet.contains(&OnlyNet::I2p) {
             bail!("--onlynet=i2p requires --i2psam for outbound connections");
@@ -1579,14 +1614,6 @@ impl Config {
             bail!(
                 "Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is not provided"
             );
-        }
-        let listen = args.listen.unwrap_or(
-            !args.bind.is_empty()
-                || !args.whitebind.is_empty()
-                || (args.proxy.is_none() && !connect_configured && args.max_peers > 0),
-        );
-        if !listen && (!args.bind.is_empty() || !args.whitebind.is_empty()) {
-            bail!("--bind/--whitebind cannot be used with --listen=false");
         }
         let i2p_accept_incoming = args.i2p_accept_incoming && listen;
         let clearnet_reachable = args.onlynet.is_empty()
@@ -1781,6 +1808,7 @@ impl Config {
             p2p_bind: primary_p2p_bind,
             p2p_binds,
             listen,
+            listen_onion,
             rpc_bind: rpc_binds.first().copied(),
             rpc_binds,
             rpc_allow_ips,
@@ -1810,6 +1838,8 @@ impl Config {
             i2p_sam: args.i2p_sam,
             i2p_accept_incoming,
             onion_proxy: args.onion_proxy,
+            tor_control,
+            tor_password: args.tor_password,
             proxy_randomize: args.proxy_randomize,
             cjdns_reachable: args.cjdns_reachable,
             peer_permissions,
@@ -1899,6 +1929,19 @@ fn default_rpc_port(network: Network) -> u16 {
         Network::Signet => 38332,
         Network::Regtest => 18443,
     }
+}
+
+fn parse_tor_control(value: &str) -> Result<SocketAddr> {
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        if address.port() == 0 {
+            bail!("--torcontrol must use a non-zero port");
+        }
+        return Ok(address);
+    }
+    if let Ok(address) = value.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(address, DEFAULT_TOR_CONTROL_PORT));
+    }
+    bail!("invalid --torcontrol address '{value}'")
 }
 
 fn network_from_args(args: &Args) -> Result<Network> {
@@ -2378,16 +2421,10 @@ mod tests {
         let args = Args::try_parse_from(["bitcoind-rs", "--uacomment=unsafe!"]).unwrap();
         assert!(Config::from_args(args).is_err());
 
-        let expected_errors = [
-            (
-                "onion",
-                "--onlynet=onion requires --proxy or --onion for outbound connections",
-            ),
-            (
-                "i2p",
-                "--onlynet=i2p requires --i2psam for outbound connections",
-            ),
-        ];
+        let expected_errors = [(
+            "i2p",
+            "--onlynet=i2p requires --i2psam for outbound connections",
+        )];
         for (network, expected_error) in expected_errors {
             let args = Args::try_parse_from([
                 "bitcoind-rs",
@@ -3393,5 +3430,61 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+    }
+
+    #[test]
+    fn parses_automatic_tor_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconf",
+            "--torcontrol",
+            "127.0.0.1:19051",
+            "--torpassword=secret",
+            "--listenonion=false",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(!config.listen_onion);
+        assert_eq!(config.tor_control, "127.0.0.1:19051".parse().unwrap());
+        assert_eq!(config.tor_password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn onion_onlynet_can_use_automatic_tor_and_respects_listen_interaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconf",
+            "--onlynet=onion",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.listen_onion);
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconf",
+            "--onlynet=onion",
+            "--listenonion=false",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconf",
+            "--listen=false",
+        ])
+        .unwrap();
+        assert!(!Config::from_args(args).unwrap().listen_onion);
     }
 }

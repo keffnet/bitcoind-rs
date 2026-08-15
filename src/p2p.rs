@@ -40,7 +40,7 @@ use crate::address::{NetworkEndpoint, is_core_routable_ip};
 use crate::chain::BasicFilterRange;
 #[cfg(test)]
 use crate::config::DEFAULT_CONNECT_TIMEOUT_MS;
-use crate::config::PeerPermissions;
+use crate::config::{PeerPermissions, default_p2p_port};
 use crate::mempool::MempoolError;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
@@ -1152,6 +1152,10 @@ impl PeerManager {
         } else {
             Vec::new()
         };
+        let tor_target = listeners
+            .first()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(tor_service_target);
         let whitebind_listeners = if self.node.config.listen {
             let mut listeners = Vec::new();
             for whitebind in &self.node.config.peer_permissions.whitebind {
@@ -1468,6 +1472,15 @@ impl PeerManager {
                 ));
             }
         }
+        if let (Some(tor_controller), Some(target)) = (self.node.tor_controller.clone(), tor_target)
+        {
+            inbound_listeners.spawn(run_tor_service(
+                self.node.clone(),
+                tor_controller,
+                target,
+                default_p2p_port(self.node.config.network),
+            ));
+        }
         if inbound_listeners.is_empty() {
             return std::future::pending::<Result<()>>().await;
         }
@@ -1540,6 +1553,46 @@ async fn run_i2p_listener(
                 i2p_sam.reset().await;
                 advertised = false;
                 tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+fn tor_service_target(address: SocketAddr) -> SocketAddr {
+    match address {
+        SocketAddr::V4(address) if address.ip().is_unspecified() => {
+            SocketAddr::from(([127, 0, 0, 1], address.port()))
+        }
+        SocketAddr::V6(address) if address.ip().is_unspecified() => {
+            SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], address.port()))
+        }
+        address => address,
+    }
+}
+
+async fn run_tor_service(
+    node: Arc<Node>,
+    tor_controller: Arc<crate::tor::TorController>,
+    target: SocketAddr,
+    virtual_port: u16,
+) -> Result<()> {
+    let mut retry_delay = Duration::from_secs(1);
+    loop {
+        match tor_controller.publish(target, virtual_port).await {
+            Ok((endpoint, mut control)) => {
+                node.add_listen_network_address(endpoint.clone());
+                retry_delay = Duration::from_secs(1);
+                if let Err(error) = tor_controller.wait_for_disconnect(&mut control).await {
+                    debug!(%error, "Tor onion service control connection ended");
+                }
+                node.remove_listen_network_address(&endpoint);
+                tor_controller.clear();
+            }
+            Err(error) => {
+                tor_controller.clear();
+                debug!(%error, "Tor onion service setup failed; retrying");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = (retry_delay * 3 / 2).min(Duration::from_secs(600));
             }
         }
     }
@@ -1673,7 +1726,7 @@ fn spawn_outbound_loop(
             match connect_peer_endpoint_with_options_and_dns_with_i2p(
                 &endpoint,
                 node.config.proxy,
-                node.config.onion_proxy,
+                node.onion_proxy(),
                 false,
                 node.config.proxy_randomize,
                 node.config.dns_lookup,
@@ -2357,7 +2410,7 @@ async fn serve_peer(
         options.transport_v2,
         ProxyRoutingOptions {
             proxy: node.config.proxy,
-            onion_proxy: node.config.onion_proxy,
+            onion_proxy: node.onion_proxy(),
             force_proxy: options.connection_type == "private-broadcast",
             randomize_credentials: node.config.proxy_randomize,
             allow_dns_lookup: node.config.dns_lookup,
@@ -5160,6 +5213,9 @@ mod tests {
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -5787,6 +5843,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -5965,6 +6024,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -6434,6 +6496,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -6596,6 +6661,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -6764,6 +6832,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -7022,6 +7093,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -7156,6 +7230,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -7272,6 +7349,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -7404,6 +7484,9 @@ mod tests {
             proxy: Some("127.0.0.1:9050".parse().unwrap()),
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
@@ -7574,6 +7657,9 @@ mod tests {
             proxy: None,
             i2p_sam: None,
             onion_proxy: None,
+            listen_onion: false,
+            tor_control: "127.0.0.1:9051".parse().unwrap(),
+            tor_password: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),

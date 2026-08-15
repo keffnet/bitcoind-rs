@@ -3639,13 +3639,18 @@ async fn serve_peer_loop(
                 }
             }
             Message::Mempool => {
-                if !node.config.peer_bloom_filters
-                    && !peer_state.permissions.contains(PeerPermissions::MEMPOOL)
-                    && !peer_state
-                        .permissions
-                        .contains(PeerPermissions::BLOOM_FILTER)
+                if !peer_can_request_mempool(node.config.peer_bloom_filters, peer_state.permissions)
                 {
-                    anyhow::bail!("mempool request received while bloom filters are disabled");
+                    if !peer_state.permissions.contains(PeerPermissions::NO_BAN) {
+                        anyhow::bail!("mempool request received while bloom filters are disabled");
+                    }
+                    // Core ignores this request for a noban peer instead of
+                    // disconnecting it. There is no mempool response to send.
+                    debug!(
+                        peer_id,
+                        "ignoring unauthorized mempool request from noban peer"
+                    );
+                    continue;
                 }
                 let transactions = {
                     let mempool = node.mempool.read();
@@ -4538,6 +4543,12 @@ fn requested_block_transactions(block: &Block, indexes: &[u64]) -> Option<Vec<Tr
 
 fn compact_filter_checkpoint_heights(stop_height: u32) -> impl Iterator<Item = u32> {
     (1_000..=stop_height).step_by(1_000)
+}
+
+fn peer_can_request_mempool(peer_bloom_filters: bool, permissions: PeerPermissions) -> bool {
+    peer_bloom_filters
+        || permissions.contains(PeerPermissions::MEMPOOL)
+        || permissions.contains(PeerPermissions::BLOOM_FILTER)
 }
 
 fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
@@ -5566,6 +5577,17 @@ mod tests {
             compact_filter_checkpoint_heights(2_000).collect::<Vec<_>>(),
             vec![1_000, 2_000]
         );
+    }
+
+    #[test]
+    fn mempool_requests_require_core_advertised_permissions() {
+        assert!(!peer_can_request_mempool(false, PeerPermissions::empty()));
+        assert!(peer_can_request_mempool(true, PeerPermissions::empty()));
+        assert!(peer_can_request_mempool(false, PeerPermissions::MEMPOOL));
+        assert!(peer_can_request_mempool(
+            false,
+            PeerPermissions::BLOOM_FILTER
+        ));
     }
 
     #[test]

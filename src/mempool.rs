@@ -2520,7 +2520,8 @@ fn validate_standard_inputs(
         if spending_script.is_witness_program()
             && !(spending_script.is_p2wpkh()
                 || spending_script.is_p2wsh()
-                || spending_script.is_p2tr())
+                || spending_script.is_p2tr()
+                || is_p2a_script(spending_script))
         {
             return Err(MempoolError::NonStandard(
                 "bad-txns-nonstandard-inputs".to_owned(),
@@ -2558,7 +2559,11 @@ fn validate_standard_witnesses(
                 "bad-witness-nonstandard".to_owned(),
             ));
         }
-        if spending_script.is_p2wpkh() {
+        if is_p2a_script(spending_script) && !previous.script_pubkey.is_p2sh() {
+            return Err(MempoolError::NonStandard(
+                "bad-witness-nonstandard".to_owned(),
+            ));
+        } else if spending_script.is_p2wpkh() {
             let Some(pubkey) = input.witness.iter().nth(1) else {
                 return Err(MempoolError::NonStandard(
                     "bad-witness-nonstandard".to_owned(),
@@ -2648,7 +2653,12 @@ fn is_standard_output_script(script: &Script, permit_bare_multisig: bool) -> boo
         || script.is_p2wpkh()
         || script.is_p2wsh()
         || script.is_p2tr()
+        || is_p2a_script(script)
         || (permit_bare_multisig && is_standard_bare_multisig(script))
+}
+
+fn is_p2a_script(script: &Script) -> bool {
+    script.as_bytes() == [0x51, 0x02, 0x4e, 0x73]
 }
 
 fn last_push_data(script: &Script) -> Option<&[u8]> {
@@ -2666,7 +2676,10 @@ fn last_push_data(script: &Script) -> Option<&[u8]> {
 fn is_standard_spend_script(script: &Script) -> bool {
     is_standard_output_script(script, true)
         && !(script.is_witness_program()
-            && !(script.is_p2wpkh() || script.is_p2wsh() || script.is_p2tr()))
+            && !(script.is_p2wpkh()
+                || script.is_p2wsh()
+                || script.is_p2tr()
+                || is_p2a_script(script)))
 }
 
 fn is_standard_bare_multisig(script: &Script) -> bool {
@@ -3667,6 +3680,10 @@ mod tests {
             Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
         ));
 
+        nonstandard.output[0].script_pubkey = ScriptBuf::new_p2a();
+        nonstandard.output[0].value = Amount::from_sat(100_000);
+        assert!(validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 0).is_ok());
+
         nonstandard.output[0].script_pubkey = ScriptBuf::from_bytes({
             let mut bytes = vec![0x00, 0x14];
             bytes.extend([0u8; 20]);
@@ -3753,6 +3770,25 @@ mod tests {
             ),
             Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
         ));
+
+        let anchor_previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2a(),
+        };
+        let mut anchor_spend = graph_transaction(Txid::from_byte_array([11; 32]), 11);
+        anchor_spend.input[0].script_sig = ScriptBuf::new();
+        anchor_spend.input[0].witness = Witness::from_slice(&[vec![1u8]]);
+        anchor_spend.output[0].value = Amount::from_sat(100_000);
+        anchor_spend.output[0].script_pubkey = previous.script_pubkey.clone();
+        assert!(matches!(
+            validate_standard_policy(&anchor_spend, std::slice::from_ref(&anchor_previous), 0),
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
+        ));
+        anchor_spend.input[0].witness = Witness::default();
+        assert!(
+            validate_standard_policy(&anchor_spend, std::slice::from_ref(&anchor_previous), 0)
+                .is_ok()
+        );
     }
 
     #[test]

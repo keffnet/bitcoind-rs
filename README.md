@@ -64,6 +64,7 @@ Use `--minimumchainwork=<hex>` to override Core's assumed work floor; `0` disabl
 `--maxtipage=<seconds>` controls the maximum tip age used to leave initial block download (24 hours by default).
 For explicit startup integrity checks, `--checkblocks=<n>` selects the recent block depth (`0` means all available blocks) and `--checklevel=<0..4>` selects verification thoroughness; either option enables the check.
 Debug consistency checks follow Core: `--checkmempool` and `--checkblockindex` default to `1` on regtest and `0` on public networks; set either option to an operation interval, or `0` to disable it.
+`--checkaddrman=<n>` checks the persisted known/tried peer endpoint indexes every `n` address-manager mutations; it defaults to `0`, matching Core.
 Script verification uses bounded parallel workers; `--par=<n>` follows Core's convention (`0` autodetects, positive values select the total script-check thread budget, and negative values leave that many cores free).
 `--stopatheight=<n>` requests a clean shutdown after the active chain reaches height `n`; `0` disables the limit, and an already-persisted tip at or above the target exits during startup.
 

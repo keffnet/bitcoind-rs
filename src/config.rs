@@ -623,6 +623,9 @@ pub struct Args {
     #[arg(long = "checkmempool", value_name = "N")]
     pub check_mempool: Option<usize>,
 
+    #[arg(long = "checkaddrman", value_name = "N")]
+    pub check_addrman: Option<usize>,
+
     /// Number of script verification threads. Zero autodetects, and negative
     /// values leave that many cores available to the rest of the node.
     #[arg(long = "par", default_value_t = DEFAULT_SCRIPT_CHECK_THREADS)]
@@ -1376,6 +1379,7 @@ pub struct Config {
     pub(crate) check_level: Option<u8>,
     pub check_block_index: usize,
     pub check_mempool: usize,
+    pub check_addrman: usize,
     pub script_check_threads: i32,
     pub block_reconstruction_extra_txn: usize,
     pub user_agent_comments: Vec<String>,
@@ -1498,6 +1502,7 @@ impl Config {
         let check_mempool = args
             .check_mempool
             .unwrap_or(default_consistency_checks as usize);
+        let check_addrman = args.check_addrman.unwrap_or_default();
         let p2p = args.p2p.unwrap_or_else(|| {
             SocketAddr::from((
                 [127, 0, 0, 1],
@@ -1819,6 +1824,7 @@ impl Config {
             check_level: args.check_level,
             check_block_index,
             check_mempool,
+            check_addrman,
             script_check_threads: args.script_check_threads,
             block_reconstruction_extra_txn: args.block_reconstruction_extra_txn,
             user_agent_comments,
@@ -3488,6 +3494,7 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert_eq!(config.check_block_index, 1);
         assert_eq!(config.check_mempool, 1);
+        assert_eq!(config.check_addrman, 0);
 
         let args = Args::parse_from_with_config([
             "bitcoind-rs",
@@ -3497,11 +3504,13 @@ mod tests {
             "--network=bitcoin",
             "--checkblockindex=9",
             "--checkmempool=7",
+            "--checkaddrman=11",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
         assert_eq!(config.check_block_index, 9);
         assert_eq!(config.check_mempool, 7);
+        assert_eq!(config.check_addrman, 11);
 
         let args = Args::parse_from_with_config([
             "bitcoind-rs",
@@ -3514,6 +3523,7 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert_eq!(config.check_block_index, 0);
         assert_eq!(config.check_mempool, 0);
+        assert_eq!(config.check_addrman, 0);
 
         let args = Args::parse_from_with_config([
             "bitcoind-rs",

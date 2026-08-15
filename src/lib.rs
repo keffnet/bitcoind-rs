@@ -729,6 +729,7 @@ pub struct Node {
     pub peer_count: AtomicUsize,
     mempool_check_operations: AtomicUsize,
     block_index_check_operations: AtomicUsize,
+    addrman_check_operations: AtomicUsize,
     zmq_mempool_sequence: AtomicU64,
     rpc_command_sequence: AtomicUsize,
     rpc_commands: parking_lot::RwLock<HashMap<usize, (String, Instant)>>,
@@ -926,7 +927,7 @@ impl Node {
             .map(|path| load_rpc_cookie(&path, config.rpc_cookie_permissions))
             .transpose()?;
         let compact_extra_limit = config.block_reconstruction_extra_txn;
-        Ok(Arc::new(Self {
+        let node = Arc::new(Self {
             config,
             chain: Arc::new(RwLock::new(chain)),
             mempool: Arc::new(RwLock::new(mempool)),
@@ -943,6 +944,7 @@ impl Node {
             peer_count: AtomicUsize::new(0),
             mempool_check_operations: AtomicUsize::new(0),
             block_index_check_operations: AtomicUsize::new(0),
+            addrman_check_operations: AtomicUsize::new(0),
             zmq_mempool_sequence: AtomicU64::new(zmq_mempool_sequence),
             rpc_command_sequence: AtomicUsize::new(0),
             rpc_commands: parking_lot::RwLock::new(HashMap::new()),
@@ -973,7 +975,12 @@ impl Node {
             last_mining_block: parking_lot::RwLock::new(None),
             started_at: Instant::now(),
             shutdown: Notify::new(),
-        }))
+        });
+        if node.config.check_addrman != 0 {
+            node.check_addrman_consistency()
+                .context("startup address-manager consistency check failed")?;
+        }
+        Ok(node)
     }
 
     pub fn connect_block(&self, block: Block) -> Result<ChainEvent> {
@@ -1045,6 +1052,86 @@ impl Node {
         if let Err(error) = self.chain.read().check_consistency() {
             panic!("block-index consistency check failed: {error:#}");
         }
+    }
+
+    fn maybe_check_addrman(&self) {
+        let interval = self.config.check_addrman;
+        if interval == 0 {
+            return;
+        }
+        let operation = self
+            .addrman_check_operations
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if operation % interval != 0 {
+            return;
+        }
+        if let Err(error) = self.check_addrman_consistency() {
+            panic!("address-manager consistency check failed: {error:#}");
+        }
+    }
+
+    /// Verify the relationships between the persisted known/tried endpoint
+    /// tables and connected peer records. This is the local equivalent of
+    /// Core's AddrMan consistency check for the simplified indexed store.
+    pub(crate) fn check_addrman_consistency(&self) -> Result<()> {
+        let known_addresses = self
+            .known_addresses
+            .read()
+            .iter()
+            .map(|(address, peer)| (*address, peer.id, peer.endpoint.clone()))
+            .collect::<Vec<_>>();
+        let tried_addresses = self.tried_addresses.read().clone();
+        let network_addresses = self
+            .network_addresses
+            .read()
+            .iter()
+            .map(|(endpoint, entry)| (endpoint.clone(), entry.endpoint.clone()))
+            .collect::<Vec<_>>();
+        let network_tried_addresses = self.network_tried_addresses.read().clone();
+        let peer_ids = self
+            .peers
+            .read()
+            .iter()
+            .map(|(id, peer)| (*id, peer.endpoint.clone()))
+            .collect::<HashMap<_, _>>();
+
+        if known_addresses.len() > MAX_KNOWN_ADDRESSES
+            || network_addresses.len() > MAX_KNOWN_ADDRESSES
+        {
+            bail!("address-manager table exceeds its configured capacity");
+        }
+        for (address, peer_id, endpoint) in &known_addresses {
+            if *endpoint != NetworkEndpoint::Ip(*address) {
+                bail!("known IPv4/IPv6 address has a mismatched endpoint key: {address}");
+            }
+            if *peer_id != 0 && peer_ids.get(peer_id) != Some(endpoint) {
+                bail!("known address {address} points to a missing or different peer");
+            }
+        }
+        for address in &tried_addresses {
+            if !known_addresses.iter().any(|(known, _, _)| known == address) {
+                bail!("tried address {address} is absent from the known-address table");
+            }
+        }
+        for (endpoint, stored_endpoint) in &network_addresses {
+            if endpoint != stored_endpoint || matches!(endpoint, NetworkEndpoint::Dns { .. }) {
+                bail!("network address has an invalid endpoint key: {endpoint}");
+            }
+            if endpoint.legacy_socket_addr().is_some() {
+                bail!("legacy socket endpoint was stored in the network address table: {endpoint}");
+            }
+        }
+        for endpoint in &network_tried_addresses {
+            let present = endpoint
+                .legacy_socket_addr()
+                .is_some_and(|address| tried_addresses.contains(&address))
+                || network_addresses.iter().any(|(known, _)| known == endpoint);
+            if !present {
+                bail!("tried network address {endpoint} is absent from the known tables");
+            }
+        }
+        Ok(())
     }
 
     fn reconcile_mempool_after_chain_change(
@@ -2362,6 +2449,7 @@ impl Node {
                 }
             }
         }
+        self.maybe_check_addrman();
     }
 
     pub fn update_peer_version(
@@ -2542,6 +2630,7 @@ impl Node {
             }
         }
         self.orphans.lock().erase_for_peer(id);
+        self.maybe_check_addrman();
     }
 
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
@@ -2633,6 +2722,7 @@ impl Node {
         if tried {
             self.network_tried_addresses.write().insert(endpoint);
         }
+        self.maybe_check_addrman();
         true
     }
 
@@ -2662,6 +2752,8 @@ impl Node {
             });
         entry.services |= services;
         entry.time = entry.time.max(time);
+        drop(known);
+        self.maybe_check_addrman();
         is_new
     }
 
@@ -2729,6 +2821,7 @@ impl Node {
                 self.network_tried_addresses.write().insert(endpoint);
             }
         }
+        self.maybe_check_addrman();
         true
     }
 
@@ -2789,6 +2882,8 @@ impl Node {
             entry.last_send = entry.last_send.max(time);
             entry.last_recv = entry.last_recv.max(time);
         }
+        drop(known);
+        self.maybe_check_addrman();
         is_new
     }
 
@@ -3636,6 +3731,7 @@ mod tests {
             check_level: None,
             check_block_index: 0,
             check_mempool: 0,
+            check_addrman: 0,
             max_tip_age_secs: 24 * 60 * 60,
             stop_at_height: 0,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
@@ -4585,6 +4681,29 @@ mod tests {
         assert_eq!(known.services, 0);
         assert!(!node.is_address_tried(address));
         node.unregister_peer(7);
+    }
+
+    #[test]
+    fn addrman_consistency_checks_ip_and_network_tables() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.check_addrman = 1;
+        let node = Node::open(config).unwrap();
+        let address = "192.0.2.42:18444".parse().unwrap();
+        let onion = NetworkEndpoint::OnionV3 {
+            address: [6; 32],
+            port: 18444,
+        };
+
+        node.remember_address(address, crate::wire::NODE_NETWORK, 123);
+        node.remember_network_address(onion.clone(), crate::wire::NODE_NETWORK, 124);
+        node.network_tried_addresses.write().insert(onion.clone());
+        node.check_addrman_consistency().unwrap();
+
+        node.tried_addresses
+            .write()
+            .insert("198.51.100.1:18444".parse().unwrap());
+        assert!(node.check_addrman_consistency().is_err());
     }
 
     #[test]

@@ -11460,9 +11460,14 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 node.txout_scan.progress.store(100, Ordering::Release);
             }
             unspents.sort_by(|left, right| {
-                left["txid"]
+                let left_txid = left["txid"]
                     .as_str()
-                    .cmp(&right["txid"].as_str())
+                    .and_then(|txid| txid.parse::<Txid>().ok());
+                let right_txid = right["txid"]
+                    .as_str()
+                    .and_then(|txid| txid.parse::<Txid>().ok());
+                left_txid
+                    .cmp(&right_txid)
                     .then_with(|| left["vout"].as_u64().cmp(&right["vout"].as_u64()))
             });
             Ok(json!({
@@ -11759,7 +11764,7 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
     if include_mempool {
         let mempool = node.mempool.read();
-        for txid in mempool.transaction_order() {
+        for txid in mempool.main_order() {
             let Some(entry) = mempool.get(&txid) else {
                 continue;
             };

@@ -5,7 +5,7 @@
 //! decoding the append-only file on normal restarts; truncated, stale, or
 //! corrupt index files fall back to a complete record scan.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -92,6 +92,10 @@ pub struct BlockStore {
     undo_index_file: File,
     undo_index: HashMap<BlockHash, Record>,
     xor_key: XorKey,
+    block_cache: HashMap<BlockHash, (Block, usize)>,
+    block_cache_order: VecDeque<BlockHash>,
+    block_cache_bytes: usize,
+    block_cache_limit: usize,
 }
 
 impl BlockStore {
@@ -167,6 +171,10 @@ impl BlockStore {
             undo_index_file,
             undo_index,
             xor_key,
+            block_cache: HashMap::new(),
+            block_cache_order: VecDeque::new(),
+            block_cache_bytes: 0,
+            block_cache_limit: 0,
         })
     }
 
@@ -228,7 +236,68 @@ impl BlockStore {
             undo_index_file,
             undo_index,
             xor_key,
+            block_cache: HashMap::new(),
+            block_cache_order: VecDeque::new(),
+            block_cache_bytes: 0,
+            block_cache_limit: 0,
         })
+    }
+
+    /// Configure the in-memory block-record cache used by the custom storage
+    /// backend. Core's `-dbcache` is split across several LevelDB caches; this
+    /// implementation keeps the UTXO state in memory already, so its useful
+    /// equivalent is a bounded cache for decoded historical blocks.
+    pub fn configure_cache_size_mib(&mut self, mib: i64) {
+        const MIN_CACHE_MIB: u64 = 4;
+        const MIB: u64 = 1024 * 1024;
+        let mib = u64::try_from(mib.max(0)).unwrap_or(u64::MAX);
+        let bytes = mib.max(MIN_CACHE_MIB).saturating_mul(MIB);
+        let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
+        self.block_cache_limit = bytes.saturating_mul(3) / 4;
+        self.trim_block_cache();
+    }
+
+    fn touch_block_cache(&mut self, hash: BlockHash) {
+        if let Some(position) = self
+            .block_cache_order
+            .iter()
+            .position(|cached| *cached == hash)
+        {
+            self.block_cache_order.remove(position);
+        }
+        self.block_cache_order.push_back(hash);
+    }
+
+    fn trim_block_cache(&mut self) {
+        while self.block_cache_bytes > self.block_cache_limit {
+            let Some(hash) = self.block_cache_order.pop_front() else {
+                self.block_cache_bytes = 0;
+                break;
+            };
+            if let Some((_, bytes)) = self.block_cache.remove(&hash) {
+                self.block_cache_bytes = self.block_cache_bytes.saturating_sub(bytes);
+            }
+        }
+    }
+
+    fn cache_block(&mut self, hash: BlockHash, block: Block, bytes: usize) {
+        if self.block_cache_limit == 0 || bytes > self.block_cache_limit {
+            return;
+        }
+        if let Some((_, old_bytes)) = self.block_cache.remove(&hash) {
+            self.block_cache_bytes = self.block_cache_bytes.saturating_sub(old_bytes);
+            self.block_cache_order.retain(|cached| *cached != hash);
+        }
+        self.block_cache_bytes = self.block_cache_bytes.saturating_add(bytes);
+        self.block_cache.insert(hash, (block, bytes));
+        self.block_cache_order.push_back(hash);
+        self.trim_block_cache();
+    }
+
+    fn clear_block_cache(&mut self) {
+        self.block_cache.clear();
+        self.block_cache_order.clear();
+        self.block_cache_bytes = 0;
     }
 
     pub fn path(&self) -> &Path {
@@ -304,10 +373,15 @@ impl BlockStore {
             Record { offset, length },
         )?;
         self.index.insert(hash, Record { offset, length });
+        self.cache_block(hash, block.clone(), bytes.len());
         Ok(hash)
     }
 
     pub fn get(&mut self, hash: &BlockHash) -> Result<Option<Block>> {
+        if let Some(block) = self.block_cache.get(hash).map(|(block, _)| block.clone()) {
+            self.touch_block_cache(*hash);
+            return Ok(Some(block));
+        }
         let Some(record) = self.index.get(hash).copied() else {
             return Ok(None);
         };
@@ -326,6 +400,7 @@ impl BlockStore {
         if block.block_hash() != *hash {
             bail!("stored block hash does not match block index");
         }
+        self.cache_block(*hash, block.clone(), record.length as usize);
         Ok(Some(block))
     }
 
@@ -431,6 +506,7 @@ impl BlockStore {
         self.undo_file = undo_file;
         self.undo_index = undo_index;
         rewrite_index(&mut self.undo_index_file, undo_data_len, &self.undo_index)?;
+        self.clear_block_cache();
         Ok(())
     }
 }
@@ -1373,6 +1449,22 @@ mod tests {
         let mut reopened = BlockStore::open(directory.path()).unwrap();
         assert!(reopened.contains(&hash));
         assert_eq!(reopened.get(&hash).unwrap().unwrap(), block);
+    }
+
+    #[test]
+    fn decoded_block_cache_is_bounded_and_cleared_after_pruning() {
+        let directory = tempfile::tempdir().unwrap();
+        let block = genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+        let mut store = BlockStore::open(directory.path()).unwrap();
+        store.configure_cache_size_mib(4);
+        store.insert(&block).unwrap();
+        assert_eq!(store.block_cache.len(), 1);
+        assert_eq!(store.get(&hash).unwrap(), Some(block));
+        store
+            .prune(&HashSet::from([hash]), &HashSet::new())
+            .unwrap();
+        assert!(store.block_cache.is_empty());
     }
 
     #[test]

@@ -1841,6 +1841,12 @@ impl ChainState {
         }
     }
 
+    /// Configure the custom append-only store's decoded block cache from the
+    /// Core-compatible `-dbcache` setting.
+    pub fn configure_storage_cache_size_mib(&mut self, mib: i64) {
+        self.store.configure_cache_size_mib(mib);
+    }
+
     fn update_ibd_status(&mut self) {
         self.update_ibd_status_at(crate::time::unix_time());
     }

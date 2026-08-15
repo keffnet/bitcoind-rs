@@ -42,7 +42,10 @@ impl NetworkEndpoint {
 
     /// Decode a BIP155 network/address pair.
     pub fn from_addr_v2(network: u8, address: &[u8], port: u16) -> Option<Self> {
-        if port == 0 {
+        // I2P's SAM 3.1 transport does not use destination ports and Core
+        // serializes those fixed seeds with port zero. Other BIP155 network
+        // types still require a real TCP port.
+        if port == 0 && network != 5 {
             return None;
         }
         match network {
@@ -517,6 +520,14 @@ mod tests {
         assert!(NetworkEndpoint::from_addr_v2(6, &[0xfd; 16], 8333).is_none());
         assert!(NetworkEndpoint::parse(Some("i2p"), "abcd", Some(8333)).is_err());
         assert!(NetworkEndpoint::parse(Some("cjdns"), "fd00::1", Some(8333)).is_err());
+    }
+
+    #[test]
+    fn accepts_i2p_bip155_port_zero() {
+        assert!(matches!(
+            NetworkEndpoint::from_addr_v2(5, &[7; 32], 0),
+            Some(NetworkEndpoint::I2p { port: 0, .. })
+        ));
     }
 
     #[test]

@@ -2244,64 +2244,57 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
     addresses
 }
 
-fn fixed_seed_addresses(network: Network) -> Vec<SocketAddr> {
-    // These are the first IPv4 entries from Core v31.1's generated
-    // chainparamsseeds.h for each public network. They are intentionally a
-    // compact fallback; fresh DNS results and persisted addresses remain the
-    // preferred bootstrap sources.
-    let seeds: &[&str] = match network {
-        Network::Bitcoin => &[
-            "2.121.116.198:8333",
-            "3.86.179.235:8333",
-            "4.2.51.251:8333",
-            "5.2.23.226:8333",
-            "5.2.222.125:8333",
-            "5.11.92.140:8333",
-            "5.35.15.93:8333",
-            "5.36.230.237:8333",
-        ],
-        Network::Testnet => &[
-            "18.118.231.3:18333",
-            "23.227.223.209:18333",
-            "24.160.99.9:18333",
-            "35.183.51.117:18333",
-            "35.210.184.94:18333",
-            "38.102.86.40:18333",
-            "45.50.223.112:18333",
-            "45.55.132.91:18333",
-        ],
-        Network::Signet => &[
-            "34.135.189.101:38333",
-            "34.254.97.244:38333",
-            "35.196.2.204:38333",
-            "35.217.13.118:38333",
-            "37.120.177.204:38333",
-            "38.83.170.18:38333",
-            "44.192.76.239:38333",
-            "45.94.168.5:38333",
-        ],
-        Network::Testnet4 => &[
-            "2.59.134.244:48333",
-            "2.110.106.102:48333",
-            "5.182.4.106:48333",
-            "31.220.30.248:48333",
-            "34.232.194.104:48333",
-            "35.201.167.154:48333",
-            "38.102.86.40:48333",
-            "45.41.204.8:48333",
-        ],
+fn fixed_seed_data(network: Network) -> &'static [u8] {
+    match network {
+        Network::Bitcoin => include_bytes!("fixed_seeds/main.bin"),
+        Network::Testnet => include_bytes!("fixed_seeds/test.bin"),
+        Network::Testnet4 => include_bytes!("fixed_seeds/testnet4.bin"),
+        Network::Signet => include_bytes!("fixed_seeds/signet.bin"),
         Network::Regtest => &[],
-    };
-    seeds.iter().filter_map(|seed| seed.parse().ok()).collect()
+    }
+}
+
+fn fixed_seed_endpoints(network: Network) -> Vec<NetworkEndpoint> {
+    // These assets are the generated chainparamsseeds.h records from Core
+    // v31.1. Each record is a BIP155 network id, a length-prefixed address,
+    // and a big-endian port. Keeping the records typed is important for
+    // onlynet filtering and proxy-backed Tor/I2P/CJDNS connections.
+    let bytes = fixed_seed_data(network);
+    let mut endpoints = Vec::new();
+    let mut cursor = 0;
+    while cursor + 2 <= bytes.len() {
+        let network_id = bytes[cursor];
+        let address_len = usize::from(bytes[cursor + 1]);
+        cursor += 2;
+        if cursor + address_len + 2 > bytes.len() {
+            break;
+        }
+        let address = &bytes[cursor..cursor + address_len];
+        cursor += address_len;
+        let port = u16::from_be_bytes([bytes[cursor], bytes[cursor + 1]]);
+        cursor += 2;
+        if let Some(endpoint) = NetworkEndpoint::from_addr_v2(network_id, address, port) {
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints
+}
+
+#[cfg(test)]
+fn fixed_seed_addresses(network: Network) -> Vec<SocketAddr> {
+    fixed_seed_endpoints(network)
+        .into_iter()
+        .filter_map(|endpoint| endpoint.socket_addr())
+        .collect()
 }
 
 fn add_fixed_seed_addresses(node: &Arc<Node>) -> usize {
-    fixed_seed_addresses(node.config.network)
+    fixed_seed_endpoints(node.config.network)
         .into_iter()
-        .filter(|address| node.config.allows_address(*address))
-        .filter(|address| {
+        .filter(|endpoint| node.config.allows_network_endpoint(endpoint))
+        .filter(|endpoint| {
             node.remember_network_address(
-                NetworkEndpoint::from_socket(*address),
+                endpoint.clone(),
                 wire::NODE_NETWORK | wire::NODE_WITNESS,
                 unix_time_seconds(),
             )
@@ -7734,7 +7727,28 @@ mod tests {
     }
 
     #[test]
-    fn fixed_seed_fallback_has_public_network_entries_only() {
+    fn fixed_seed_fallback_preserves_core_bip155_networks() {
+        let main = fixed_seed_endpoints(Network::Bitcoin);
+        assert!(main.iter().any(|endpoint| {
+            matches!(endpoint, NetworkEndpoint::Ip(address) if address.is_ipv4())
+        }));
+        assert!(
+            main.iter().any(
+                |endpoint| matches!(endpoint, NetworkEndpoint::Ip(address) if address.is_ipv6())
+            )
+        );
+        assert!(
+            main.iter()
+                .any(|endpoint| matches!(endpoint, NetworkEndpoint::OnionV3 { .. }))
+        );
+        assert!(
+            main.iter()
+                .any(|endpoint| matches!(endpoint, NetworkEndpoint::I2p { port: 0, .. }))
+        );
+        assert!(
+            main.iter()
+                .any(|endpoint| matches!(endpoint, NetworkEndpoint::Cjdns { .. }))
+        );
         assert!(!fixed_seed_addresses(Network::Bitcoin).is_empty());
         assert!(!fixed_seed_addresses(Network::Testnet).is_empty());
         assert!(!fixed_seed_addresses(Network::Testnet4).is_empty());

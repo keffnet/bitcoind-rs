@@ -62,7 +62,7 @@ Repeatable `--uacomment=<comment>` values are appended to the BIP14 P2P user-age
 Compact-block reconstruction also retains a bounded FIFO of recent non-mempool transactions; tune it with `--blockreconstructionextratxn=<n>` (100 by default, `0` disables the extra cache).
 
 `--forcednsseed` forces a DNS seed lookup even when persisted peer addresses are available; regular DNS seeding is deferred briefly in that case so the saved addresses are tried first. It cannot be combined with `--dnsseed=false`.
-`--fixedseeds` (enabled by default) adds a compact Core v31.1 IPv4 fallback set when DNS seeding is disabled or produces no usable addresses; `--fixedseeds=false` disables that fallback. Manual `--connect`/`--noconnect` modes take precedence.
+`--fixedseeds` (enabled by default) loads Core v31.1's generated BIP155 fixed-seed records when DNS seeding is disabled or produces no usable addresses. The typed IPv4, IPv6, Tor v3, I2P, and CJDNS records are filtered by the configured reachability and `--onlynet` rules; `--fixedseeds=false` disables that fallback. Manual `--connect`/`--noconnect` modes take precedence.
 
 Use `--asmap=<file>` to load Core's validated compressed IP-to-ASN map (relative paths are resolved beneath the data directory); mapped ASNs are exposed in peer/address-manager RPCs and automatic outbound selection avoids duplicate mapped ASNs. `--noasmap` or `--asmap=false` disables the map. Embedded maps are not shipped, so a bare `--asmap` reports that embedded data is unavailable.
 

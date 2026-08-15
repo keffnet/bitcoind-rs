@@ -18,7 +18,7 @@ pub mod wire;
 pub mod zmq;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::process::Command;
@@ -32,6 +32,7 @@ use anyhow::{Context, Result, bail};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid, Wtxid};
+use fs2::FileExt;
 use parking_lot::RwLock;
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -714,6 +715,7 @@ impl Default for ScanState {
 /// The wallet-free node facade shared by the network and RPC services.
 pub struct Node {
     pub config: Config,
+    _data_dir_lock: File,
     pub chain: Arc<RwLock<ChainState>>,
     pub mempool: Arc<RwLock<Mempool>>,
     pub events: broadcast::Sender<ChainEvent>,
@@ -764,6 +766,22 @@ pub struct Node {
 
 impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
+        fs::create_dir_all(&config.datadir)
+            .with_context(|| format!("creating data directory {}", config.datadir.display()))?;
+        let lock_path = config.datadir.join(".lock");
+        let data_dir_lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening data directory lock {}", lock_path.display()))?;
+        data_dir_lock.try_lock_exclusive().with_context(|| {
+            format!(
+                "data directory is already in use: {}",
+                config.datadir.display()
+            )
+        })?;
         if let Some(mock_time) = config.mock_time {
             time::set_mock_time(mock_time);
         }
@@ -934,6 +952,7 @@ impl Node {
         let compact_extra_limit = config.block_reconstruction_extra_txn;
         let node = Arc::new(Self {
             config,
+            _data_dir_lock: data_dir_lock,
             chain: Arc::new(RwLock::new(chain)),
             mempool: Arc::new(RwLock::new(mempool)),
             events,
@@ -3823,6 +3842,15 @@ mod tests {
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         }
+    }
+
+    #[test]
+    fn data_directory_lock_rejects_concurrent_nodes_and_releases_on_drop() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        assert!(Node::open(test_config(directory.path())).is_err());
+        drop(node);
+        assert!(Node::open(test_config(directory.path())).is_ok());
     }
 
     #[test]

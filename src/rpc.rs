@@ -2843,7 +2843,7 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .as_i64()
                 .ok_or_else(|| anyhow!("address count must be an integer"))?;
             if count < 0 {
-                bail!("address count out of range")
+                bail!("Address count out of range")
             }
             (count != 0).then(|| usize::try_from(count).unwrap_or(usize::MAX))
         }
@@ -2863,7 +2863,7 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
             "ipv4" | "ipv6" | "onion" | "i2p" | "cjdns"
         )
     {
-        bail!("network not recognized: {network}")
+        bail!("Network not recognized: {network}")
     }
     let mut peers = node.known_network_addresses();
     peers.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
@@ -2873,6 +2873,11 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .filter(|peer| match network.as_deref() {
                 None => true,
                 Some(network) => peer.endpoint.network_name() == network,
+            })
+            .filter(|peer| {
+                peer.endpoint
+                    .socket_addr()
+                    .is_none_or(|address| !node.is_banned_for_peer(address, false))
             })
             .take(count.unwrap_or(usize::MAX))
             .map(|peer| json!({
@@ -15674,11 +15679,12 @@ mod tests {
         .unwrap();
         node.remember_address("192.0.2.20:18444".parse().unwrap(), 1, 10);
         node.remember_address("[2001:db8::20]:18444".parse().unwrap(), 8, 20);
+        set_ban(&node, &json!(["192.0.2.20", "add", 3600, false])).unwrap();
 
         let default = get_node_addresses(&node, &json!([])).unwrap();
         assert_eq!(default.as_array().unwrap().len(), 1);
         let all = get_node_addresses(&node, &json!([0])).unwrap();
-        assert_eq!(all.as_array().unwrap().len(), 2);
+        assert_eq!(all.as_array().unwrap().len(), 1);
         let ipv6 = get_node_addresses(&node, &json!([10, "ipv6"])).unwrap();
         assert_eq!(ipv6[0]["address"], "2001:db8::20");
         assert_eq!(ipv6[0]["services"], 8);

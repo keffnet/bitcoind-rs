@@ -8148,6 +8148,9 @@ fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Val
     let sighash_name = optional_str(params, 3, "DEFAULT", "sighashtype")?;
     let sighash_type = parse_raw_sighash_type(sighash_name)?;
     let mut prevouts = prevouts;
+    for prevout in prevouts.values() {
+        signing_script_context(prevout)?;
+    }
     {
         let chain = node.chain.read();
         let mempool = node.mempool.read();
@@ -8278,9 +8281,14 @@ fn parse_signing_prevouts(value: Option<&Value>) -> Result<HashMap<OutPoint, Sig
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("prevtx txid is missing"))?
                 .parse()?;
-            let vout = entry
+            let vout_value = entry
                 .get("vout")
-                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("prevtx vout is missing"))?;
+            if vout_value.as_i64().is_some_and(|vout| vout < 0) {
+                bail!("vout cannot be negative")
+            }
+            let vout = vout_value
+                .as_u64()
                 .ok_or_else(|| anyhow!("prevtx vout is missing"))?;
             let vout = u32::try_from(vout).map_err(|_| anyhow!("prevtx vout is out of range"))?;
             let script = entry
@@ -8332,6 +8340,81 @@ fn parse_signing_prevouts(value: Option<&Value>) -> Result<HashMap<OutPoint, Sig
         .collect()
 }
 
+struct SigningScriptContext {
+    script: ScriptBuf,
+    segwit: bool,
+    redeem_script: Option<ScriptBuf>,
+}
+
+fn signing_script_context(prevout: &SigningPrevout) -> Result<SigningScriptContext> {
+    let output = &prevout.output.script_pubkey;
+    if output.is_p2sh() {
+        let script = prevout
+            .witness_script
+            .as_ref()
+            .or(prevout.redeem_script.as_ref())
+            .ok_or_else(|| anyhow!("Missing redeemScript/witnessScript"))?;
+        let witness_output_script = ScriptBuf::new_p2wsh(&script.wscript_hash());
+
+        if let (Some(redeem_script), Some(witness_script)) =
+            (&prevout.redeem_script, &prevout.witness_script)
+            && redeem_script != witness_script
+            && *redeem_script != witness_output_script
+        {
+            bail!("redeemScript does not correspond to witnessScript")
+        }
+
+        let traditional_output = ScriptBuf::new_p2sh(&script.script_hash());
+        if *output == traditional_output {
+            return Ok(SigningScriptContext {
+                script: script.clone(),
+                segwit: script.is_witness_program(),
+                redeem_script: Some(script.clone()),
+            });
+        }
+
+        let nested_output = ScriptBuf::new_p2sh(&witness_output_script.script_hash());
+        if *output == nested_output {
+            return Ok(SigningScriptContext {
+                script: script.clone(),
+                segwit: true,
+                redeem_script: Some(witness_output_script),
+            });
+        }
+
+        bail!("redeemScript/witnessScript does not match scriptPubKey")
+    }
+
+    if output.is_p2wsh() {
+        let script = prevout
+            .witness_script
+            .as_ref()
+            .or(prevout.redeem_script.as_ref())
+            .ok_or_else(|| anyhow!("Missing redeemScript/witnessScript"))?;
+        if let (Some(redeem_script), Some(witness_script)) =
+            (&prevout.redeem_script, &prevout.witness_script)
+            && redeem_script != witness_script
+            && *redeem_script != ScriptBuf::new_p2wsh(&witness_script.wscript_hash())
+        {
+            bail!("redeemScript does not correspond to witnessScript")
+        }
+        if ScriptBuf::new_p2wsh(&script.wscript_hash()) != *output {
+            bail!("redeemScript/witnessScript does not match scriptPubKey")
+        }
+        return Ok(SigningScriptContext {
+            script: script.clone(),
+            segwit: true,
+            redeem_script: None,
+        });
+    }
+
+    Ok(SigningScriptContext {
+        script: output.clone(),
+        segwit: output.is_witness_program(),
+        redeem_script: None,
+    })
+}
+
 fn sign_transaction_input(
     transaction: &mut Transaction,
     input_index: usize,
@@ -8341,48 +8424,10 @@ fn sign_transaction_input(
     sighash_type: DescriptorSighashType,
     previous_outputs: Option<&[TxOut]>,
 ) -> Result<()> {
-    let nested = prevout.output.script_pubkey.is_p2sh();
-    if nested && prevout.redeem_script.is_none() && prevout.witness_script.is_none() {
-        bail!("Missing redeemScript/witnessScript")
-    }
-    if prevout.output.script_pubkey.is_p2wsh() && prevout.witness_script.is_none() {
-        bail!("Missing redeemScript/witnessScript")
-    }
-    if let Some(redeem_script) = &prevout.redeem_script {
-        if nested
-            && ScriptBuf::new_p2sh(&redeem_script.script_hash()) != prevout.output.script_pubkey
-        {
-            bail!("redeemScript/witnessScript does not match scriptPubKey")
-        }
-        if let Some(witness_script) = &prevout.witness_script {
-            if !redeem_script.is_p2wsh()
-                || ScriptBuf::new_p2wsh(&witness_script.wscript_hash()) != *redeem_script
-            {
-                bail!("redeemScript does not correspond to witnessScript")
-            }
-        } else if nested && redeem_script.is_p2wsh() {
-            bail!("Missing redeemScript/witnessScript")
-        }
-    } else if prevout.witness_script.is_some() && nested {
-        bail!("redeemScript/witnessScript does not match scriptPubKey")
-    }
-    if prevout.witness_script.is_some()
-        && !(prevout.output.script_pubkey.is_p2wsh()
-            || (nested
-                && prevout
-                    .redeem_script
-                    .as_ref()
-                    .is_some_and(|script| script.is_p2wsh())))
-    {
-        bail!("redeemScript/witnessScript does not match scriptPubKey")
-    }
-    let (signing_script, segwit) = if let Some(witness_script) = &prevout.witness_script {
-        (witness_script, true)
-    } else if let Some(redeem_script) = &prevout.redeem_script {
-        (redeem_script, redeem_script.is_witness_program())
-    } else {
-        (&prevout.output.script_pubkey, false)
-    };
+    let context = signing_script_context(prevout)?;
+    let signing_script = &context.script;
+    let segwit = context.segwit;
+    let nested = context.redeem_script.is_some();
 
     if is_p2a_script(signing_script) {
         return Ok(());
@@ -8409,10 +8454,10 @@ fn sign_transaction_input(
         };
         transaction.input[input_index].witness = Witness::p2tr_key_spend(&signature);
         if nested {
-            let redeem_script = prevout
+            let redeem_script = context
                 .redeem_script
                 .as_ref()
-                .ok_or_else(|| anyhow!("nested witness spend is missing redeemScript"))?;
+                .expect("nested signing context has a redeem script");
             transaction.input[input_index].script_sig =
                 push_script_items(&[redeem_script.to_bytes()])?;
         }
@@ -8472,10 +8517,10 @@ fn sign_transaction_input(
             items.push(signing_script.to_bytes());
             transaction.input[input_index].witness = Witness::from_slice(&items);
             if nested {
-                let redeem_script = prevout
+                let redeem_script = context
                     .redeem_script
                     .as_ref()
-                    .ok_or_else(|| anyhow!("nested witness spend is missing redeemScript"))?;
+                    .expect("nested signing context has a redeem script");
                 transaction.input[input_index].script_sig =
                     push_script_items(&[redeem_script.to_bytes()])?;
             }
@@ -8498,10 +8543,10 @@ fn sign_transaction_input(
         transaction.input[input_index].witness =
             Witness::from_slice(&[signature, public_key.to_bytes()]);
         if nested {
-            let redeem_script = prevout
+            let redeem_script = context
                 .redeem_script
                 .as_ref()
-                .ok_or_else(|| anyhow!("nested witness spend is missing redeemScript"))?;
+                .expect("nested signing context has a redeem script");
             transaction.input[input_index].script_sig =
                 push_script_items(&[redeem_script.to_bytes()])?;
         }
@@ -8515,10 +8560,10 @@ fn sign_transaction_input(
         items.push(signing_script.to_bytes());
         transaction.input[input_index].witness = Witness::from_slice(&items);
         if nested {
-            let redeem_script = prevout
+            let redeem_script = context
                 .redeem_script
                 .as_ref()
-                .ok_or_else(|| anyhow!("nested witness spend is missing redeemScript"))?;
+                .expect("nested signing context has a redeem script");
             transaction.input[input_index].script_sig =
                 push_script_items(&[redeem_script.to_bytes()])?;
         }
@@ -8528,7 +8573,13 @@ fn sign_transaction_input(
             items.push(key.public_key(secp).to_bytes());
         }
         if nested {
-            items.push(signing_script.to_bytes());
+            items.push(
+                context
+                    .redeem_script
+                    .as_ref()
+                    .expect("nested signing context has a redeem script")
+                    .to_bytes(),
+            );
         }
         transaction.input[input_index].script_sig = push_script_items(&items)?;
     } else {
@@ -11209,9 +11260,12 @@ fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("outpoint txid must be a string"))?
                 .parse()?;
-            let vout = value
-                .get("vout")
-                .and_then(Value::as_u64)
+            let vout = value.get("vout").ok_or_else(|| anyhow!("Missing vout"))?;
+            if vout.as_i64().is_some_and(|vout| vout < 0) {
+                bail!("Invalid parameter, vout cannot be negative")
+            }
+            let vout = vout
+                .as_u64()
                 .ok_or_else(|| anyhow!("outpoint vout must be an integer"))?;
             let vout = u32::try_from(vout).map_err(|_| anyhow!("outpoint vout is too large"))?;
             Ok(OutPoint::new(txid, vout))
@@ -11535,6 +11589,12 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "input not found or already spent" {
         return -25;
     }
+    if lower == "previous output scriptpubkey mismatch" {
+        return -22;
+    }
+    if lower == "amount out of range" || lower == "missing amount" {
+        return -3;
+    }
     if lower == "unknown filtertype"
         || lower == "block not found"
         || lower == "block hash not found"
@@ -11570,6 +11630,11 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.contains("specified more than once")
         || lower.contains("must be between ")
         || lower.contains("must not be negative")
+        || lower.contains("cannot be negative")
+        || lower.contains("is out of range")
+        || lower == "missing redeemscript/witnessscript"
+        || lower == "redeemscript does not correspond to witnessscript"
+        || lower == "redeemscript/witnessscript does not match scriptpubkey"
     {
         return -8;
     }
@@ -14128,6 +14193,15 @@ mod tests {
         )
         .unwrap();
         assert!(mempool_only[0].get("spendingtxid").is_none());
+        let negative_vout = get_tx_spending_prevout(
+            &node,
+            &json!([[{"txid": funding_txid.to_string(), "vout": -1}]]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            negative_vout.to_string(),
+            "Invalid parameter, vout cannot be negative"
+        );
     }
 
     #[test]
@@ -16392,6 +16466,128 @@ mod tests {
             deserialize(&hex::decode(multisig_result["hex"].as_str().unwrap()).unwrap()).unwrap();
         assert!(multisig_signed.input[0].script_sig.is_empty());
         assert_eq!(multisig_signed.input[0].witness.len(), 3);
+
+        let native_redeem_only = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                hex::encode(serialize(&witness_unsigned)),
+                [private.to_wif()],
+                [{
+                    "txid": witness_previous_txid.to_string(),
+                    "vout": 0,
+                    "scriptPubKey": hex::encode(witness_prevout_script.as_bytes()),
+                    "redeemScript": hex::encode(witness_script.as_bytes()),
+                    "amount": "1.00000000",
+                }],
+            ]),
+        )
+        .unwrap();
+        assert_eq!(native_redeem_only["complete"], true);
+
+        let nested_prevout_script = Address::p2sh(&witness_prevout_script, Network::Regtest)
+            .unwrap()
+            .script_pubkey();
+        let nested_previous_txid = Txid::from_byte_array([12; 32]);
+        let nested_unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(nested_previous_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let nested_prevtx = json!([{
+            "txid": nested_previous_txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(nested_prevout_script.as_bytes()),
+            "redeemScript": hex::encode(witness_script.as_bytes()),
+            "witnessScript": hex::encode(witness_script.as_bytes()),
+            "amount": "1.00000000",
+        }]);
+        let nested_result = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                hex::encode(serialize(&nested_unsigned)),
+                [private.to_wif()],
+                nested_prevtx,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(nested_result["complete"], true);
+        assert!(nested_result.get("errors").is_none());
+        let nested_signed: Transaction =
+            deserialize(&hex::decode(nested_result["hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            nested_signed.input[0].script_sig,
+            push_script_items(&[witness_prevout_script.to_bytes()]).unwrap()
+        );
+        assert_eq!(nested_signed.input[0].witness.len(), 3);
+
+        let missing_nested = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                hex::encode(serialize(&nested_unsigned)),
+                [],
+                [{
+                    "txid": nested_previous_txid.to_string(),
+                    "vout": 0,
+                    "scriptPubKey": hex::encode(nested_prevout_script.as_bytes()),
+                    "amount": "1.00000000",
+                }],
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            missing_nested.to_string(),
+            "Missing redeemScript/witnessScript"
+        );
+
+        let correspondence_mismatch = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                hex::encode(serialize(&nested_unsigned)),
+                [],
+                [{
+                    "txid": nested_previous_txid.to_string(),
+                    "vout": 0,
+                    "scriptPubKey": hex::encode(nested_prevout_script.as_bytes()),
+                    "redeemScript": "6a",
+                    "witnessScript": hex::encode(witness_script.as_bytes()),
+                    "amount": "1.00000000",
+                }],
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            correspondence_mismatch.to_string(),
+            "redeemScript does not correspond to witnessScript"
+        );
+
+        let script_pubkey_mismatch = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                hex::encode(serialize(&nested_unsigned)),
+                [],
+                [{
+                    "txid": nested_previous_txid.to_string(),
+                    "vout": 0,
+                    "scriptPubKey": hex::encode(nested_prevout_script.as_bytes()),
+                    "redeemScript": "6a",
+                    "amount": "1.00000000",
+                }],
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            script_pubkey_mismatch.to_string(),
+            "redeemScript/witnessScript does not match scriptPubKey"
+        );
 
         let mined = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap();
         let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();

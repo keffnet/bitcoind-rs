@@ -875,6 +875,10 @@ impl Mempool {
         self.priorities.get(txid).copied().unwrap_or(0)
     }
 
+    pub fn modified_fee_sat_for(&self, txid: &Txid, base_fee_sat: u64) -> i128 {
+        self.modified_fee_sat(txid, base_fee_sat)
+    }
+
     pub fn add_unbroadcast(&mut self, txid: Txid) {
         if self.entries.contains_key(&txid) {
             self.unbroadcast.insert(txid);

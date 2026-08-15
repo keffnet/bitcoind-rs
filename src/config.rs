@@ -841,6 +841,30 @@ pub struct Args {
     )]
     pub db_batch_size_bytes: i64,
 
+    /// Log modified fee rates while assembling mining templates.
+    #[arg(
+        long = "printpriority",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub print_priority: bool,
+
+    /// Enable non-fatal RPC result/documentation checks when available.
+    /// The wallet-free dispatcher has no generated Core doc schema, but the
+    /// option is retained so Core startup configurations remain readable.
+    #[arg(
+        long = "rpcdoccheck",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub rpc_doc_check: bool,
+
     /// Allow loading fee-estimator snapshots older than Core's 60-hour limit.
     #[arg(
         long = "acceptstalefeeestimates",
@@ -1862,6 +1886,8 @@ pub struct Config {
     pub max_sig_cache_mib: i64,
     pub db_cache_mib: i64,
     pub db_batch_size_bytes: i64,
+    pub print_priority: bool,
+    pub rpc_doc_check: bool,
     pub accept_stale_fee_estimates: bool,
     pub block_reconstruction_extra_txn: usize,
     pub user_agent_comments: Vec<String>,
@@ -2512,6 +2538,8 @@ impl Config {
             max_sig_cache_mib: args.max_sig_cache_mib,
             db_cache_mib: args.db_cache_mib,
             db_batch_size_bytes: args.db_batch_size_bytes,
+            print_priority: args.print_priority,
+            rpc_doc_check: args.rpc_doc_check,
             accept_stale_fee_estimates: args.accept_stale_fee_estimates,
             block_reconstruction_extra_txn: args.block_reconstruction_extra_txn,
             user_agent_comments,
@@ -3231,6 +3259,8 @@ mod tests {
             "--maxsigcachesize=1",
             "--dbcache=4",
             "--dbbatchsize=4096",
+            "--printpriority=1",
+            "--rpcdoccheck=1",
             "--bantime=123",
             "--deprecatedrpc=startingheight,warnings",
             "--uacomment=lab",
@@ -3254,6 +3284,8 @@ mod tests {
         assert_eq!(config.max_sig_cache_mib, 1);
         assert_eq!(config.db_cache_mib, 4);
         assert_eq!(config.db_batch_size_bytes, 4096);
+        assert!(config.print_priority);
+        assert!(config.rpc_doc_check);
         assert_eq!(config.user_agent_comments, vec!["lab".to_owned()]);
         assert_eq!(config.startup_notify.as_deref(), Some("echo start"));
         assert_eq!(config.block_notify.as_deref(), Some("echo %s"));

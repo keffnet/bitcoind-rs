@@ -4395,6 +4395,8 @@ mod tests {
             max_sig_cache_mib: 32,
             db_cache_mib: 450,
             db_batch_size_bytes: 32 * 1024 * 1024,
+            print_priority: false,
+            rpc_doc_check: false,
             accept_stale_fee_estimates: false,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,

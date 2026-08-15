@@ -850,6 +850,7 @@ impl Node {
             min_relay_fee_sat_per_kvb: config.min_relay_tx_fee_sat_per_kvb,
             incremental_relay_fee_sat_per_kvb: config.incremental_relay_fee_sat_per_kvb,
             dust_relay_fee_sat_per_kvb: config.dust_relay_fee_sat_per_kvb,
+            bytes_per_sigop: config.bytes_per_sigop,
             max_datacarrier_bytes: config.max_datacarrier_bytes,
             permit_bare_multisig: config.permit_bare_multisig,
             require_standard: !config.accept_nonstd_txn,
@@ -3812,6 +3813,7 @@ mod tests {
             incremental_relay_fee_sat_per_kvb: 100,
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
+            bytes_per_sigop: 20,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         }

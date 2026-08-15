@@ -1646,6 +1646,7 @@ mod tests {
             incremental_relay_fee_sat_per_kvb: 100,
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
+            bytes_per_sigop: 20,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })?;
@@ -1795,6 +1796,7 @@ mod tests {
                 incremental_relay_fee_sat_per_kvb: 100,
                 dust_relay_fee_sat_per_kvb: 3_000,
                 max_datacarrier_bytes: Some(100_000),
+                bytes_per_sigop: 20,
                 permit_bare_multisig: true,
                 zmq: crate::config::ZmqConfig::default(),
             })
@@ -1936,6 +1938,7 @@ mod tests {
                 incremental_relay_fee_sat_per_kvb: 100,
                 dust_relay_fee_sat_per_kvb: 3_000,
                 max_datacarrier_bytes: Some(100_000),
+                bytes_per_sigop: 20,
                 permit_bare_multisig: true,
                 zmq: crate::config::ZmqConfig::default(),
             })
@@ -2277,6 +2280,7 @@ mod tests {
                 incremental_relay_fee_sat_per_kvb: 100,
                 dust_relay_fee_sat_per_kvb: 3_000,
                 max_datacarrier_bytes: Some(100_000),
+                bytes_per_sigop: 20,
                 permit_bare_multisig: true,
                 zmq: crate::config::ZmqConfig::default(),
             })
@@ -2555,6 +2559,7 @@ mod tests {
             incremental_relay_fee_sat_per_kvb: 100,
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
+            bytes_per_sigop: 20,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })?;

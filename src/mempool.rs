@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::chain::ChainState;
 use crate::config::{
-    DEFAULT_ACCEPT_DATACARRIER, DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
+    DEFAULT_ACCEPT_DATACARRIER, DEFAULT_BYTES_PER_SIGOP, DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
     DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB, DEFAULT_MAX_DATACARRIER_BYTES,
     DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB, DEFAULT_PERMIT_BARE_MULTISIG,
 };
@@ -38,7 +38,6 @@ const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
 const MAX_TX_LEGACY_SIGOPS: usize = 2_500;
 const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
-const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
 /// BIP 431/TRUC transaction version and topology limits.
 const TRUC_VERSION: i32 = 3;
 const TRUC_ANCESTOR_LIMIT: usize = 2;
@@ -59,6 +58,7 @@ pub struct MempoolPolicy {
     pub min_relay_fee_sat_per_kvb: u64,
     pub incremental_relay_fee_sat_per_kvb: u64,
     pub dust_relay_fee_sat_per_kvb: u64,
+    pub bytes_per_sigop: u64,
     pub max_datacarrier_bytes: Option<usize>,
     pub permit_bare_multisig: bool,
     pub require_standard: bool,
@@ -70,6 +70,7 @@ impl Default for MempoolPolicy {
             min_relay_fee_sat_per_kvb: DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB,
             incremental_relay_fee_sat_per_kvb: DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
             dust_relay_fee_sat_per_kvb: DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
+            bytes_per_sigop: DEFAULT_BYTES_PER_SIGOP,
             max_datacarrier_bytes: DEFAULT_ACCEPT_DATACARRIER
                 .then_some(usize::try_from(DEFAULT_MAX_DATACARRIER_BYTES).expect("constant fits")),
             permit_bare_multisig: DEFAULT_PERMIT_BARE_MULTISIG,
@@ -591,6 +592,10 @@ impl Mempool {
 
     pub fn dust_relay_fee_sat_per_kvb(&self) -> u64 {
         self.policy.dust_relay_fee_sat_per_kvb
+    }
+
+    pub fn bytes_per_sigop(&self) -> u64 {
+        self.policy.bytes_per_sigop
     }
 
     pub fn max_datacarrier_bytes(&self) -> Option<usize> {
@@ -1863,7 +1868,7 @@ impl Mempool {
         let adjusted_weight = transaction
             .weight()
             .to_wu()
-            .max(sigop_cost.saturating_mul(DEFAULT_BYTES_PER_SIGOP));
+            .max(sigop_cost.saturating_mul(self.policy.bytes_per_sigop));
         let vsize = adjusted_weight.saturating_add(3) / 4;
         if transaction.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
             return Err(MempoolError::NonStandard("tx-size-small".to_owned()));
@@ -3627,10 +3632,25 @@ mod tests {
         assert!(expected_weight > raw_weight);
 
         let mut pool = Mempool::new(Network::Regtest);
-        let txid = pool.accept_reorg(transaction, &chain, 1).unwrap();
+        let txid = pool.accept_reorg(transaction.clone(), &chain, 1).unwrap();
         let entry = pool.get(&txid).expect("accepted transaction");
         assert_eq!(pool.adjusted_weight(&txid), expected_weight);
         assert_eq!(entry.vsize, expected_weight.saturating_add(3) / 4);
+
+        let policy = MempoolPolicy {
+            bytes_per_sigop: 10,
+            require_standard: false,
+            ..MempoolPolicy::default()
+        };
+        let mut custom_pool =
+            Mempool::with_max_bytes_and_policy(Network::Regtest, 300_000_000, policy);
+        let custom_txid = custom_pool.accept_reorg(transaction, &chain, 1).unwrap();
+        let custom_entry = custom_pool
+            .get(&custom_txid)
+            .expect("custom-policy transaction");
+        let custom_weight = raw_weight.max((sigop_count as u64).saturating_mul(4 * 10));
+        assert_eq!(custom_pool.adjusted_weight(&custom_txid), custom_weight);
+        assert_eq!(custom_entry.vsize, custom_weight.saturating_add(3) / 4);
     }
 
     #[test]

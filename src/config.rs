@@ -29,6 +29,7 @@ pub const DEFAULT_BLOCK_MIN_TX_FEE_SAT_PER_KVB: u64 = 1;
 pub const DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB: u64 = 100;
 pub const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 100;
 pub const DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB: u64 = 3_000;
+pub const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
 pub const DEFAULT_MAX_DATACARRIER_BYTES: u64 = 100_000;
 pub const DEFAULT_ACCEPT_DATACARRIER: bool = true;
 pub const DEFAULT_PERMIT_BARE_MULTISIG: bool = true;
@@ -936,6 +937,9 @@ pub struct Args {
     #[arg(long)]
     pub dustrelayfee: Option<String>,
 
+    #[arg(long = "bytespersigop", default_value_t = DEFAULT_BYTES_PER_SIGOP)]
+    pub bytes_per_sigop: u64,
+
     #[arg(
         long,
         default_value_t = DEFAULT_ACCEPT_DATACARRIER,
@@ -1442,6 +1446,7 @@ pub struct Config {
     pub min_relay_tx_fee_sat_per_kvb: u64,
     pub incremental_relay_fee_sat_per_kvb: u64,
     pub dust_relay_fee_sat_per_kvb: u64,
+    pub bytes_per_sigop: u64,
     pub max_datacarrier_bytes: Option<usize>,
     pub permit_bare_multisig: bool,
     pub peer_bloom_filters: bool,
@@ -1888,6 +1893,7 @@ impl Config {
             min_relay_tx_fee_sat_per_kvb,
             incremental_relay_fee_sat_per_kvb,
             dust_relay_fee_sat_per_kvb,
+            bytes_per_sigop: args.bytes_per_sigop,
             max_datacarrier_bytes,
             permit_bare_multisig: args.permitbaremultisig,
             peer_bloom_filters: args.peer_bloom_filters,
@@ -3500,6 +3506,7 @@ mod tests {
         assert_eq!(config.check_block_index, 1);
         assert_eq!(config.check_mempool, 1);
         assert_eq!(config.check_addrman, 0);
+        assert_eq!(config.bytes_per_sigop, DEFAULT_BYTES_PER_SIGOP);
 
         let args = Args::parse_from_with_config([
             "bitcoind-rs",
@@ -3511,6 +3518,7 @@ mod tests {
             "--checkmempool=7",
             "--checkaddrman=11",
             "--mocktime=1234",
+            "--bytespersigop=42",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
@@ -3518,6 +3526,7 @@ mod tests {
         assert_eq!(config.check_mempool, 7);
         assert_eq!(config.check_addrman, 11);
         assert_eq!(config.mock_time, Some(1234));
+        assert_eq!(config.bytes_per_sigop, 42);
 
         let args = Args::parse_from_with_config([
             "bitcoind-rs",

@@ -80,6 +80,7 @@ Use `--txospenderindex` to enable historical spender lookup for `gettxspendingpr
 Mining policy follows Core's block-creation options: `--blockmaxweight` defaults to 4,000,000, `--blockreservedweight` defaults to 8,000, and `--blockmintxfee` defaults to 1 sat/kvB. These settings affect `getblocktemplate`, `generate*`, and `getmininginfo`.
 
 Relay policy follows Core's fee and standardness switches: `--minrelaytxfee` and `--incrementalrelayfee` default to 100 sat/kvB, `--dustrelayfee` defaults to 3,000 sat/kvB, and `--permitbaremultisig`, `--datacarrier`, and `--datacarriersize` control the corresponding mempool policy checks.
+`--bytespersigop=<n>` sets the sigop-adjusted transaction weight multiplier used by relay and mining; it defaults to Core's 20 bytes per sigop.
 
 `--coinstatsindex` persists incremental UTXO statistics and enables historical `gettxoutsetinfo` queries by block hash or height.
 

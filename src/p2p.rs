@@ -238,6 +238,7 @@ const MAX_GETDATA_BATCH: usize = 1_000;
 const MAX_BLOCKS_TO_ANNOUNCE: usize = 8;
 const DNS_SEED_OUTBOUND_THRESHOLD: usize = 2;
 const DNS_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(11);
+const FIXED_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(60);
 /// Core keeps manually added connections in a separate, bounded pool rather
 /// than consuming automatic `-maxconnections` slots.
 const MAX_ADDNODE_CONNECTIONS: usize = 8;
@@ -1278,6 +1279,8 @@ impl PeerManager {
         });
         let configured_connect_nodes =
             self.node.config.connect_disabled || !self.node.config.seed_nodes.is_empty();
+        let has_seed_nodes = !self.node.config.seed_nodes_for_address_fetch.is_empty();
+        let has_add_nodes = !self.node.config.add_nodes.is_empty();
         if !configured_connect_nodes {
             for endpoint in self
                 .node
@@ -1305,6 +1308,8 @@ impl PeerManager {
             && self.node.config.dnsseed
             && !self.node.config.force_dns_seed
             && has_known_network_addresses;
+        let fixed_seed_fallback_started_at = unix_time_seconds();
+        let mut fixed_seeds_added = false;
         let connect_nodes = if should_query_dns {
             let addresses = discover_dns_seeds(self.node.config.network).await;
             let mut remembered = 0usize;
@@ -1317,19 +1322,43 @@ impl PeerManager {
                     ));
                 }
             }
-            if remembered == 0 && self.node.config.fixed_seeds {
+            let elapsed = Duration::from_secs(
+                unix_time_seconds().saturating_sub(fixed_seed_fallback_started_at),
+            );
+            if remembered == 0
+                && should_add_fixed_seed_fallback(
+                    self.node.config.fixed_seeds,
+                    self.node.config.dnsseed,
+                    has_seed_nodes,
+                    has_add_nodes,
+                    elapsed,
+                )
+                && has_empty_fixed_seed_network(&self.node)
+            {
                 remembered = add_fixed_seed_addresses(&self.node);
+                fixed_seeds_added = true;
             }
             if remembered != 0 {
                 info!(remembered, "added bootstrap peer addresses");
             }
             Vec::new()
         } else {
+            let elapsed = Duration::from_secs(
+                unix_time_seconds().saturating_sub(fixed_seed_fallback_started_at),
+            );
             if !configured_connect_nodes
                 && !has_known_network_addresses
-                && self.node.config.fixed_seeds
+                && should_add_fixed_seed_fallback(
+                    self.node.config.fixed_seeds,
+                    self.node.config.dnsseed,
+                    has_seed_nodes,
+                    has_add_nodes,
+                    elapsed,
+                )
+                && has_empty_fixed_seed_network(&self.node)
             {
                 let remembered = add_fixed_seed_addresses(&self.node);
+                fixed_seeds_added = true;
                 if remembered != 0 {
                     info!(remembered, "added fixed seed peer addresses");
                 }
@@ -1390,6 +1419,24 @@ impl PeerManager {
                                     unix_time_seconds(),
                                 );
                             }
+                        }
+                    }
+                    if !fixed_seeds_added
+                        && should_add_fixed_seed_fallback(
+                            discovery_node.config.fixed_seeds,
+                            discovery_node.config.dnsseed,
+                            has_seed_nodes,
+                            has_add_nodes,
+                            Duration::from_secs(
+                                unix_time_seconds().saturating_sub(fixed_seed_fallback_started_at),
+                            ),
+                        )
+                        && has_empty_fixed_seed_network(&discovery_node)
+                    {
+                        let remembered = add_fixed_seed_addresses(&discovery_node);
+                        fixed_seeds_added = true;
+                        if remembered != 0 {
+                            info!(remembered, "added fixed seed peer addresses");
                         }
                     }
                     let available = discovery_outbound.slots.available_permits().min(8);
@@ -1894,9 +1941,7 @@ fn select_discovery_endpoints(
         .known_network_addresses()
         .into_iter()
         .filter(|entry| {
-            entry.endpoint.port() != 0
-                && (entry.endpoint.socket_addr().is_some() || node.config.proxy.is_some())
-                && node.config.allows_network_endpoint(&entry.endpoint)
+            endpoint_can_be_discovered(node, &entry.endpoint)
                 && !connected.contains(&entry.endpoint)
                 && !entry.endpoint.legacy_socket_addr().is_some_and(|address| {
                     address.ip().is_unspecified() || node.is_banned_for_peer(address, false)
@@ -1936,6 +1981,17 @@ fn should_query_dns_seed_fallback(
     enabled
         && elapsed >= DNS_SEED_FALLBACK_DELAY
         && outbound_peer_count < DNS_SEED_OUTBOUND_THRESHOLD
+}
+
+fn should_add_fixed_seed_fallback(
+    enabled: bool,
+    dnsseed: bool,
+    has_seed_nodes: bool,
+    has_add_nodes: bool,
+    elapsed: Duration,
+) -> bool {
+    enabled
+        && ((!dnsseed && !has_seed_nodes && !has_add_nodes) || elapsed >= FIXED_SEED_FALLBACK_DELAY)
 }
 
 #[cfg(test)]
@@ -2289,9 +2345,13 @@ fn fixed_seed_addresses(network: Network) -> Vec<SocketAddr> {
 }
 
 fn add_fixed_seed_addresses(node: &Arc<Node>) -> usize {
+    let known_networks = known_discovered_networks(node);
     fixed_seed_endpoints(node.config.network)
         .into_iter()
-        .filter(|endpoint| node.config.allows_network_endpoint(endpoint))
+        .filter(|endpoint| {
+            endpoint_can_be_discovered(node, endpoint)
+                && !known_networks.contains(endpoint.network_name())
+        })
         .filter(|endpoint| {
             node.remember_network_address(
                 endpoint.clone(),
@@ -2300,6 +2360,39 @@ fn add_fixed_seed_addresses(node: &Arc<Node>) -> usize {
             )
         })
         .count()
+}
+
+fn endpoint_can_be_discovered(node: &Node, endpoint: &NetworkEndpoint) -> bool {
+    if !node.config.allows_network_endpoint(endpoint) {
+        return false;
+    }
+    if endpoint.port() == 0 && !matches!(endpoint, NetworkEndpoint::I2p { .. }) {
+        return false;
+    }
+    match endpoint {
+        NetworkEndpoint::Ip(_) | NetworkEndpoint::Cjdns { .. } => true,
+        NetworkEndpoint::OnionV2 { .. } | NetworkEndpoint::OnionV3 { .. } => {
+            node.config.proxy.is_some() || node.onion_proxy().is_some()
+        }
+        NetworkEndpoint::I2p { .. } => node.config.proxy.is_some() || node.i2p_sam.is_some(),
+        NetworkEndpoint::Dns { .. } => false,
+    }
+}
+
+fn known_discovered_networks(node: &Node) -> HashSet<&'static str> {
+    node.known_network_addresses()
+        .into_iter()
+        .filter(|entry| endpoint_can_be_discovered(node, &entry.endpoint))
+        .map(|entry| entry.endpoint.network_name())
+        .collect()
+}
+
+fn has_empty_fixed_seed_network(node: &Node) -> bool {
+    let known_networks = known_discovered_networks(node);
+    fixed_seed_endpoints(node.config.network)
+        .into_iter()
+        .filter(|endpoint| endpoint_can_be_discovered(node, endpoint))
+        .any(|endpoint| !known_networks.contains(endpoint.network_name()))
 }
 
 #[derive(Clone)]
@@ -7723,6 +7816,52 @@ mod tests {
             true,
             DNS_SEED_FALLBACK_DELAY,
             DNS_SEED_OUTBOUND_THRESHOLD - 1
+        ));
+    }
+
+    #[test]
+    fn fixed_seed_fallback_waits_for_configured_seed_sources() {
+        assert!(should_add_fixed_seed_fallback(
+            true,
+            false,
+            false,
+            false,
+            Duration::ZERO,
+        ));
+        assert!(!should_add_fixed_seed_fallback(
+            true,
+            false,
+            true,
+            false,
+            Duration::ZERO,
+        ));
+        assert!(!should_add_fixed_seed_fallback(
+            true,
+            false,
+            false,
+            true,
+            Duration::ZERO,
+        ));
+        assert!(!should_add_fixed_seed_fallback(
+            true,
+            true,
+            false,
+            false,
+            FIXED_SEED_FALLBACK_DELAY - Duration::from_secs(1),
+        ));
+        assert!(should_add_fixed_seed_fallback(
+            true,
+            true,
+            false,
+            false,
+            FIXED_SEED_FALLBACK_DELAY,
+        ));
+        assert!(!should_add_fixed_seed_fallback(
+            false,
+            false,
+            false,
+            false,
+            FIXED_SEED_FALLBACK_DELAY,
         ));
     }
 

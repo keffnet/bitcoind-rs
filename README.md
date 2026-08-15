@@ -56,6 +56,8 @@ Compact-block reconstruction also retains a bounded FIFO of recent non-mempool t
 
 `--forcednsseed` forces a DNS seed lookup even when persisted peer addresses are available; regular DNS seeding is deferred briefly in that case so the saved addresses are tried first. It cannot be combined with `--dnsseed=false`.
 
+Use `--asmap=<file>` to load Core's validated compressed IP-to-ASN map (relative paths are resolved beneath the data directory); mapped ASNs are exposed in peer/address-manager RPCs and automatic outbound selection avoids duplicate mapped ASNs. `--noasmap` or `--asmap=false` disables the map. Embedded maps are not shipped, so a bare `--asmap` reports that embedded data is unavailable.
+
 `--seednode=<host[:port]>` opens a one-shot address-fetch connection during startup; `--connect` takes precedence, matching Core's manual-connection modes.
 
 Use `--txindex` to enable confirmed transaction lookup without supplying a block hash to `getrawtransaction`; Core-style pruning and `--txindex` are mutually exclusive.

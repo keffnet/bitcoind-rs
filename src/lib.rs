@@ -2,6 +2,7 @@
 #![warn(rust_2018_idioms, clippy::all)]
 
 pub mod address;
+pub mod asmap;
 pub mod chain;
 pub mod config;
 pub mod electrum;
@@ -41,6 +42,7 @@ use tokio::sync::{Notify, broadcast};
 use tracing::{info, warn};
 
 use crate::address::NetworkEndpoint;
+use crate::asmap::AsMap;
 use crate::chain::ChainState;
 use crate::config::{Config, PeerPermissions, RpcCookiePermissions};
 use crate::mempool::{
@@ -718,6 +720,7 @@ pub struct Node {
     pub config: Config,
     _data_dir_lock: File,
     _blocks_dir_lock: Option<File>,
+    asmap: Option<Arc<AsMap>>,
     pub chain: Arc<RwLock<ChainState>>,
     pub mempool: Arc<RwLock<Mempool>>,
     pub events: broadcast::Sender<ChainEvent>,
@@ -811,6 +814,18 @@ impl Node {
             })?;
             Some(lock)
         };
+        let asmap = config
+            .asmap
+            .as_deref()
+            .map(AsMap::from_file)
+            .transpose()?
+            .map(Arc::new);
+        if let Some(asmap) = &asmap {
+            info!(
+                version = %asmap.version_hex(),
+                "Using ASMap for IP bucketing"
+            );
+        }
         if let Some(mock_time) = config.mock_time {
             time::set_mock_time(mock_time);
         }
@@ -979,6 +994,7 @@ impl Node {
             config,
             _data_dir_lock: data_dir_lock,
             _blocks_dir_lock: blocks_dir_lock,
+            asmap,
             chain: Arc::new(RwLock::new(chain)),
             mempool: Arc::new(RwLock::new(mempool)),
             events,
@@ -1030,6 +1046,7 @@ impl Node {
             node.check_addrman_consistency()
                 .context("startup address-manager consistency check failed")?;
         }
+        node.log_asmap_health();
         if node.config.stop_after_block_import {
             node.request_shutdown();
         }
@@ -1185,6 +1202,34 @@ impl Node {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn mapped_as(&self, endpoint: &NetworkEndpoint) -> Option<u32> {
+        self.asmap.as_ref()?.mapped_as(endpoint)
+    }
+
+    fn log_asmap_health(&self) {
+        let Some(asmap) = &self.asmap else {
+            return;
+        };
+        let mut clearnet_peers = 0usize;
+        let mut mapped_asns = HashSet::new();
+        let mut unmapped_peers = 0usize;
+        for entry in self.known_network_addresses() {
+            if !matches!(entry.endpoint, NetworkEndpoint::Ip(_)) {
+                continue;
+            }
+            clearnet_peers = clearnet_peers.saturating_add(1);
+            if let Some(asn) = asmap.mapped_as(&entry.endpoint) {
+                mapped_asns.insert(asn);
+            } else {
+                unmapped_peers = unmapped_peers.saturating_add(1);
+            }
+        }
+        info!(
+            "ASMap Health Check: {clearnet_peers} clearnet peers are mapped to {} ASNs with {unmapped_peers} peers being unmapped",
+            mapped_asns.len()
+        );
     }
 
     fn reconcile_mempool_after_chain_change(
@@ -3837,6 +3882,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,

@@ -1866,6 +1866,11 @@ fn select_discovery_endpoints(
         .into_iter()
         .map(|peer| peer.endpoint)
         .collect();
+    let connected_asns: HashSet<_> = node
+        .peer_infos()
+        .into_iter()
+        .filter_map(|peer| node.mapped_as(&peer.endpoint))
+        .collect();
     let added: HashSet<_> = node.added_network_endpoints().into_iter().collect();
     let attempts = outbound_attempts.lock();
     let mut candidates = node
@@ -1890,11 +1895,20 @@ fn select_discovery_endpoints(
             .then_with(|| right.time.cmp(&left.time))
             .then_with(|| left.endpoint.cmp(&right.endpoint))
     });
-    candidates
-        .into_iter()
-        .take(limit)
-        .map(|entry| entry.endpoint)
-        .collect()
+    let mut selected = Vec::with_capacity(limit);
+    let mut selected_asns = connected_asns;
+    for entry in candidates {
+        if let Some(asn) = node.mapped_as(&entry.endpoint)
+            && !selected_asns.insert(asn)
+        {
+            continue;
+        }
+        selected.push(entry.endpoint);
+        if selected.len() == limit {
+            break;
+        }
+    }
+    selected
 }
 
 fn should_query_dns_seed_fallback(
@@ -5171,6 +5185,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -5821,6 +5836,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -6010,6 +6026,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -6490,6 +6507,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -6663,6 +6681,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -6842,6 +6861,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7111,6 +7131,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7256,6 +7277,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7383,6 +7405,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7526,6 +7549,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7707,6 +7731,7 @@ mod tests {
             blocks_dir: None,
             blocks_xor: false,
             capture_messages: false,
+            asmap: None,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,

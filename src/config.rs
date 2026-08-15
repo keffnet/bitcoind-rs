@@ -615,6 +615,24 @@ pub struct Args {
     )]
     pub capture_messages: bool,
 
+    /// Optional Core ASMap file used for ASN-aware peer grouping.
+    #[arg(
+        long = "asmap",
+        value_name = "FILE",
+        num_args = 0..=1,
+        default_missing_value = "1"
+    )]
+    pub asmap: Option<String>,
+
+    #[arg(
+        long = "noasmap",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub no_asmap: bool,
+
     #[arg(long = "conf", value_name = "FILE")]
     pub config_file: Option<PathBuf>,
 
@@ -1411,6 +1429,7 @@ pub struct Config {
     pub(crate) blocks_dir: Option<PathBuf>,
     pub blocks_xor: bool,
     pub capture_messages: bool,
+    pub(crate) asmap: Option<PathBuf>,
     pub(crate) minimum_chain_work: Option<Work>,
     pub(crate) assume_valid: Option<BlockHash>,
     pub(crate) check_blocks: Option<u32>,
@@ -1533,6 +1552,24 @@ impl Config {
                 }
             })
             .transpose()?;
+        let asmap = if args.no_asmap {
+            None
+        } else {
+            match args.asmap.as_deref() {
+                None | Some("0") | Some("false") => None,
+                Some("1") | Some("true") => {
+                    bail!("Embedded asmap data not available")
+                }
+                Some(path) => {
+                    let path = PathBuf::from(path);
+                    Some(if path.is_absolute() {
+                        path
+                    } else {
+                        args.datadir.join(path)
+                    })
+                }
+            }
+        };
         if args.check_level.is_some_and(|level| level > 4) {
             bail!("--checklevel must be between 0 and 4");
         }
@@ -1861,6 +1898,7 @@ impl Config {
             blocks_dir: Some(blocks_dir),
             blocks_xor: args.blocks_xor,
             capture_messages: args.capture_messages,
+            asmap,
             minimum_chain_work,
             assume_valid,
             check_blocks: args.check_blocks,
@@ -2418,6 +2456,23 @@ mod tests {
         assert!(Config::from_args(args).unwrap().capture_messages);
         let args = Args::try_parse_from(["bitcoind-rs", "--capturemessages=false"]).unwrap();
         assert!(!Config::from_args(args).unwrap().capture_messages);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--asmap",
+            "asn.map",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().asmap,
+            Some(directory.path().join("asn.map"))
+        );
+        let args = Args::try_parse_from(["bitcoind-rs", "--noasmap"]).unwrap();
+        assert!(Config::from_args(args).unwrap().asmap.is_none());
+        let args = Args::try_parse_from(["bitcoind-rs", "--asmap"]).unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

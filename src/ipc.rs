@@ -419,6 +419,7 @@ impl crate::mining_capnp::mining::Server for MiningService {
         let options = ipc_block_create_options(params.get_options()?);
         let interrupt_generation = self.interrupt.generation();
         if params.get_cooldown() {
+            let mut chain_events = self.node.subscribe_chain();
             while self.node.chain.read().is_initial_block_download() {
                 tokio::select! {
                     _ = self.node.wait_for_shutdown() => return Ok(()),
@@ -427,7 +428,45 @@ impl crate::mining_capnp::mining::Server for MiningService {
                             return Ok(());
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    _ = chain_events.recv() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+
+            // Match Core's CooldownIfHeadersAhead: only a header chain that
+            // extends the active tip is considered, and every newly connected
+            // tip restarts the bounded cooldown window.
+            'cooldown: loop {
+                let Some(blocks_ahead) = self.node.chain.read().blocks_ahead_of_tip() else {
+                    break;
+                };
+                let cooldown_seconds = u64::from(blocks_ahead.clamp(3, 20));
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(cooldown_seconds);
+                let last_tip = self.node.chain.read().best_hash();
+                loop {
+                    if self.interrupt.was_interrupted(interrupt_generation) {
+                        return Ok(());
+                    }
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = self.node.wait_for_shutdown() => return Ok(()),
+                        _ = self.interrupt.notify.notified() => {
+                            if self.interrupt.was_interrupted(interrupt_generation) {
+                                return Ok(());
+                            }
+                        }
+                        event = chain_events.recv() => {
+                            match event {
+                                Ok(event) if event.hash != last_tip => continue 'cooldown,
+                                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            }
+                        }
+                        _ = tokio::time::sleep(remaining) => break,
+                    }
                 }
             }
         }
@@ -883,6 +922,7 @@ mod tests {
     use super::IpcServer;
     use super::parse_socket_path;
     use bitcoin::consensus::encode::deserialize;
+    use bitcoin::hashes::Hash as _;
     use bitcoin::script::Builder;
     use capnp::message::ReaderOptions;
     use capnp_rpc::RpcSystem;
@@ -974,6 +1014,46 @@ mod tests {
                 wait_request.get().set_timeout(1.0);
                 let waited = wait_request.send().promise.await.unwrap();
                 assert_eq!(waited.get().unwrap().get_result().unwrap().get_height(), 0);
+
+                // Make the active tip eligible for mining, then index a
+                // valid header-only descendant. Core's cooldown must remain
+                // pending while those headers are ahead of the tip and must
+                // be interruptible through the Mining capability.
+                node.chain.write().configure_max_tip_age(u64::MAX);
+                let genesis = *node.chain.read().header(0).unwrap();
+                let mut header_one = bitcoin::block::Header {
+                    version: bitcoin::block::Version::from_consensus(4),
+                    prev_blockhash: genesis.block_hash(),
+                    merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                    time: genesis.time.saturating_add(1),
+                    bits: genesis.bits,
+                    nonce: 0,
+                };
+                while !header_one.target().is_met_by(header_one.block_hash()) {
+                    header_one.nonce = header_one.nonce.saturating_add(1);
+                }
+                let mut header_two = bitcoin::block::Header {
+                    version: bitcoin::block::Version::from_consensus(4),
+                    prev_blockhash: header_one.block_hash(),
+                    merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                    time: header_one.time.saturating_add(1),
+                    bits: header_one.bits,
+                    nonce: 0,
+                };
+                while !header_two.target().is_met_by(header_two.block_hash()) {
+                    header_two.nonce = header_two.nonce.saturating_add(1);
+                }
+                node.chain
+                    .write()
+                    .accept_headers(&[header_one, header_two])
+                    .unwrap();
+                assert_eq!(node.chain.read().blocks_ahead_of_tip(), Some(2));
+                let cooldown_request = mining.create_new_block_request();
+                let cooldown_task = tokio::task::spawn_local(cooldown_request.send().promise);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                mining.interrupt_request().send().promise.await.unwrap();
+                let cooldown_response = cooldown_task.await.unwrap().unwrap();
+                assert!(cooldown_response.get().unwrap().get_result().is_err());
 
                 let mut create_request = mining.create_new_block_request();
                 create_request.get().set_cooldown(false);

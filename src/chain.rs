@@ -1592,6 +1592,19 @@ impl ChainState {
             .expect("genesis header is indexed")
     }
 
+    /// Return the number of header-only blocks by which the best header
+    /// extends the active tip. Competing branches are deliberately ignored,
+    /// matching Core's `ChainstateManager::BlocksAheadOfTip()` contract used
+    /// by the mining-interface cooldown.
+    pub fn blocks_ahead_of_tip(&self) -> Option<u32> {
+        let tip = self.tip();
+        let best_header = self.best_header_tip();
+        (best_header.work > tip.work
+            && best_header.height > tip.height
+            && self.ancestor_hash_at_height(&best_header.hash, tip.height) == Some(tip.hash))
+        .then_some(best_header.height - tip.height)
+    }
+
     /// Return Core v31.1's default minimum chainwork threshold for this
     /// network. Custom Signet challenges intentionally have no public-chain
     /// work assumption.
@@ -8561,6 +8574,7 @@ mod tests {
             .unwrap();
         assert_eq!(hashes, vec![parent.block_hash(), child.block_hash()]);
         assert_eq!(state.block_height_by_hash(&child.block_hash()), Some(2));
+        assert_eq!(state.blocks_ahead_of_tip(), Some(2));
         drop(state);
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(state.height(), 0);
@@ -8569,9 +8583,11 @@ mod tests {
             child.block_hash(),
             "header-only index should survive a restart"
         );
+        assert_eq!(state.blocks_ahead_of_tip(), Some(2));
         state.connect_block(parent).unwrap();
         state.connect_block(child).unwrap();
         assert_eq!(state.height(), 2);
+        assert_eq!(state.blocks_ahead_of_tip(), None);
     }
 
     #[test]

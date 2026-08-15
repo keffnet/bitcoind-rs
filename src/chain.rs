@@ -3399,6 +3399,15 @@ impl ChainState {
     }
 
     fn connect_block_internal(&mut self, block: &Block, persist: bool) -> Result<()> {
+        self.connect_block_internal_with_index_journal(block, persist, None)
+    }
+
+    fn connect_block_internal_with_index_journal(
+        &mut self,
+        block: &Block,
+        persist: bool,
+        mut tx_index_all_changes: Option<&mut HashMap<Txid, Option<TxLocation>>>,
+    ) -> Result<()> {
         let height = self.height().saturating_add(1);
         let previous = self.best_hash();
         let previous_node = self
@@ -3472,22 +3481,19 @@ impl ChainState {
             for script_hash in affected_scripts {
                 self.add_history(&script_hash, HistoryEntry { txid, height });
             }
-            self.tx_index.insert(
-                txid,
-                TxLocation {
-                    block_hash: hash,
-                    height,
-                    transaction_index,
-                },
-            );
-            self.tx_index_all.insert(
-                txid,
-                TxLocation {
-                    block_hash: hash,
-                    height,
-                    transaction_index,
-                },
-            );
+            let location = TxLocation {
+                block_hash: hash,
+                height,
+                transaction_index,
+            };
+            self.tx_index.insert(txid, location.clone());
+            if let Some(changes) = tx_index_all_changes.as_deref_mut()
+                && !changes.contains_key(&txid)
+                && self.tx_index_all.get(&txid) != Some(&location)
+            {
+                changes.insert(txid, self.tx_index_all.get(&txid).cloned());
+            }
+            self.tx_index_all.insert(txid, location);
         }
         if self.txospender_index_enabled {
             self.index_block_spends(block, height);
@@ -3695,7 +3701,7 @@ impl ChainState {
         let old_utxos = std::mem::take(&mut self.utxos);
         let old_utxos_by_script = std::mem::take(&mut self.utxos_by_script);
         let old_tx_index = std::mem::take(&mut self.tx_index);
-        let old_tx_index_all = self.tx_index_all.clone();
+        let mut tx_index_all_changes = HashMap::new();
         let old_history = std::mem::take(&mut self.history);
         let old_spent_by = std::mem::take(&mut self.spent_by);
         let old_basic_filter_cache = std::mem::take(&mut self.basic_filter_cache);
@@ -3755,12 +3761,20 @@ impl ChainState {
                     }
                 }
                 for block in &blocks {
-                    self.connect_block_internal(block, false)?;
+                    self.connect_block_internal_with_index_journal(
+                        block,
+                        false,
+                        Some(&mut tx_index_all_changes),
+                    )?;
                 }
             } else {
                 self.initialize_genesis(&blocks[0])?;
                 for block in blocks.iter().skip(1) {
-                    self.connect_block_internal(block, false)?;
+                    self.connect_block_internal_with_index_journal(
+                        block,
+                        false,
+                        Some(&mut tx_index_all_changes),
+                    )?;
                 }
             }
             self.persist_metadata()?;
@@ -3774,7 +3788,16 @@ impl ChainState {
             self.utxos = old_utxos;
             self.utxos_by_script = old_utxos_by_script;
             self.tx_index = old_tx_index;
-            self.tx_index_all = old_tx_index_all;
+            for (txid, previous) in tx_index_all_changes {
+                match previous {
+                    Some(location) => {
+                        self.tx_index_all.insert(txid, location);
+                    }
+                    None => {
+                        self.tx_index_all.remove(&txid);
+                    }
+                }
+            }
             self.history = old_history;
             self.spent_by = old_spent_by;
             self.basic_filter_cache = old_basic_filter_cache;
@@ -6414,9 +6437,20 @@ mod tests {
         );
 
         let side_one_txid = side_one.txdata[0].compute_txid();
+        let previous_location = TxLocation {
+            block_hash: genesis_hash,
+            height: 0,
+            transaction_index: 0,
+        };
+        state
+            .tx_index_all
+            .insert(side_one_txid, previous_location.clone());
         assert!(state.activate_chain(invalid_side_two.block_hash()).is_err());
         assert_eq!(state.best_hash(), genesis_hash);
-        assert!(!state.tx_index_all.contains_key(&side_one_txid));
+        assert_eq!(
+            state.tx_index_all.get(&side_one_txid),
+            Some(&previous_location)
+        );
     }
 
     #[test]

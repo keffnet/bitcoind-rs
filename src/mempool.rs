@@ -1846,13 +1846,9 @@ impl Mempool {
             &previous_entries,
         )
         .map_err(|error| MempoolError::Script(error.to_string()))?;
-        validation::validate_transaction_scripts(
-            chain.network,
-            chain.height() + 1,
-            &transaction,
-            &previous_outputs,
-        )
-        .map_err(|error| MempoolError::Script(error.to_string()))?;
+        chain
+            .validate_mempool_transaction_scripts(&transaction, &previous_outputs)
+            .map_err(|error| MempoolError::Script(error.to_string()))?;
         let output_total = transaction
             .output
             .iter()

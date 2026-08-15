@@ -4165,8 +4165,8 @@ impl ChainState {
             .iter()
             .filter(|job| {
                 let key = self.script_cache_key(
-                    block_hash,
                     height,
+                    Some(block_hash),
                     job.transaction,
                     &job.previous_outputs,
                 );
@@ -4230,8 +4230,12 @@ impl ChainState {
 
         let mut cache = self.script_cache.lock();
         for job in pending {
-            let key =
-                self.script_cache_key(block_hash, height, job.transaction, &job.previous_outputs);
+            let key = self.script_cache_key(
+                height,
+                Some(block_hash),
+                job.transaction,
+                &job.previous_outputs,
+            );
             if cache.entries.contains(&key) {
                 continue;
             }
@@ -4246,10 +4250,51 @@ impl ChainState {
         Ok(())
     }
 
+    /// Validate a mempool transaction through the same bounded script cache
+    /// used by block connection. Core shares its script-execution cache so a
+    /// transaction is not fully checked again when it later arrives in a
+    /// block; the cache key is safe across contexts because it commits to the
+    /// effective consensus flags and every spent output.
+    pub(crate) fn validate_mempool_transaction_scripts(
+        &self,
+        transaction: &Transaction,
+        previous_outputs: &[TxOut],
+    ) -> std::result::Result<(), ValidationError> {
+        let height = self.height().saturating_add(1);
+        let key = self.script_cache_key(height, None, transaction, previous_outputs);
+        if self.script_cache.lock().entries.contains(&key) {
+            return Ok(());
+        }
+        validation::validate_transaction_scripts_at_time_with_block_hash(
+            self.network,
+            height,
+            u32::MAX,
+            None,
+            transaction,
+            previous_outputs,
+        )?;
+        self.cache_script_validation(key);
+        Ok(())
+    }
+
+    fn cache_script_validation(&self, key: [u8; 32]) {
+        let mut cache = self.script_cache.lock();
+        if cache.entries.contains(&key) {
+            return;
+        }
+        if cache.order.len() >= cache.max_entries
+            && let Some(evicted) = cache.order.pop_front()
+        {
+            cache.entries.remove(&evicted);
+        }
+        cache.entries.insert(key);
+        cache.order.push_back(key);
+    }
+
     fn script_cache_key(
         &self,
-        block_hash: BlockHash,
         height: u32,
+        block_hash: Option<BlockHash>,
         transaction: &Transaction,
         previous_outputs: &[TxOut],
     ) -> [u8; 32] {
@@ -4261,13 +4306,11 @@ impl ChainState {
             Network::Signet => b"signet".as_slice(),
             Network::Regtest => b"regtest".as_slice(),
         });
-        hasher.update(height.to_le_bytes());
         hasher.update(
-            validation::script_flags_for_block_with_hash(self.network, height, Some(block_hash))
+            validation::script_flags_for_block_with_hash(self.network, height, block_hash)
                 .to_le_bytes(),
         );
-        hasher.update(block_hash.to_byte_array());
-        hasher.update(serialize(transaction));
+        hasher.update(transaction.compute_wtxid().to_byte_array());
         for output in previous_outputs {
             hasher.update(serialize(output));
         }
@@ -6810,7 +6853,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_script_checks_are_cached_by_block_context() {
+    fn successful_script_checks_share_mempool_and_block_cache() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
         let block = mine_block(&state, 1);
@@ -6837,6 +6880,10 @@ mod tests {
             }],
         }];
 
+        state
+            .validate_mempool_transaction_scripts(&transaction, &jobs[0].previous_outputs)
+            .unwrap();
+        assert_eq!(state.script_cache.lock().entries.len(), 1);
         state.validate_script_checks(&block, 1, &jobs).unwrap();
         assert_eq!(state.script_cache.lock().entries.len(), 1);
         state.validate_script_checks(&block, 1, &jobs).unwrap();

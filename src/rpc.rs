@@ -1461,12 +1461,7 @@ async fn dispatch_method_async_for_user(
                 Err(error) => Err(anyhow!("scan RPC task failed: {error}")),
             }
         }
-        _ => dispatch_method_for_user(
-            node,
-            method,
-            &normalized_params,
-            auth_user.as_deref(),
-        ),
+        _ => dispatch_method_for_user(node, method, &normalized_params, auth_user.as_deref()),
     };
     node.end_rpc_command(command_id);
     result
@@ -4518,11 +4513,14 @@ fn set_max_mempool(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if !changes.is_empty() {
         let current_height = node.chain.read().height();
         node.update_fee_estimator_for_changes(&changes, current_height);
-            let removed = changes
+        let removed = changes
             .iter()
             .filter_map(|change| {
-                matches!(&change.kind, crate::mempool::MempoolChangeKind::Removed { .. })
-                    .then_some(change.transaction.clone())
+                matches!(
+                    &change.kind,
+                    crate::mempool::MempoolChangeKind::Removed { .. }
+                )
+                .then_some(change.transaction.clone())
             })
             .collect::<Vec<_>>();
         node.notify_mempool_removals(removed);
@@ -14314,21 +14312,20 @@ mod tests {
         assert!(general["startuptime"].as_u64().is_some());
         let script_threads = dispatch_method(&node, "scriptthreadsinfo", &json!([])).unwrap();
         assert!(script_threads["enabled"].is_boolean());
-        assert!(script_threads["num_script_check_threads"].as_u64().is_some());
+        assert!(
+            script_threads["num_script_check_threads"]
+                .as_u64()
+                .is_some()
+        );
         dispatch_method(&node, "setscriptthreadsenabled", &json!([false])).unwrap();
-        let disabled_threads =
-            dispatch_method(&node, "scriptthreadsinfo", &json!([])).unwrap();
+        let disabled_threads = dispatch_method(&node, "scriptthreadsinfo", &json!([])).unwrap();
         assert_eq!(disabled_threads["enabled"], json!(false));
         assert_eq!(disabled_threads["num_script_check_threads"], json!(1));
         if script_threads["enabled"] == json!(true) {
             dispatch_method(&node, "setscriptthreadsenabled", &json!([true])).unwrap();
         }
-        let formatted = dispatch_method(
-            &node,
-            "format",
-            &json!(["getblockcount", "args_cli"]),
-        )
-        .unwrap();
+        let formatted =
+            dispatch_method(&node, "format", &json!(["getblockcount", "args_cli"])).unwrap();
         assert_eq!(formatted, json!(rpc_help("getblockcount")));
         let whitelist = dispatch_method(&node, "getrpcwhitelist", &json!([])).unwrap();
         assert_eq!(whitelist["wallets"], json!({}));
@@ -14371,12 +14368,8 @@ mod tests {
             dispatch_method(&node, "getmempoolinfo", &json!([])).unwrap()["maxmempool"],
             json!(10_000_000)
         );
-        let mempool_transactions = dispatch_method(
-            &node,
-            "listmempooltransactions",
-            &json!([]),
-        )
-        .unwrap();
+        let mempool_transactions =
+            dispatch_method(&node, "listmempooltransactions", &json!([])).unwrap();
         assert_eq!(mempool_transactions["txs"], json!([]));
         assert!(
             dispatch_method(&node, "verifychain", &json!([]))

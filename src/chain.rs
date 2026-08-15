@@ -1503,9 +1503,8 @@ impl ChainState {
         let mut target_height = requested_height.min(tip_height - MIN_BLOCKS_TO_KEEP);
         for lock in self.prune_locks.values() {
             if lock.height_first < u64::from(target_height) {
-                target_height = target_height.min(
-                    u32::try_from(lock.height_first).unwrap_or(u32::MAX),
-                );
+                target_height =
+                    target_height.min(u32::try_from(lock.height_first).unwrap_or(u32::MAX));
             }
         }
         if let Some(previous) = self.prune_height
@@ -1780,7 +1779,9 @@ impl ChainState {
 
     pub fn set_script_checks_enabled(&mut self, enabled: bool) -> Result<()> {
         if enabled && self.script_check_workers == 0 {
-            bail!("Script verification threads are disabled (single core machine or -par=<-<numcores>)")
+            bail!(
+                "Script verification threads are disabled (single core machine or -par=<-<numcores>)"
+            )
         }
         self.script_checks_enabled = enabled;
         Ok(())
@@ -2819,6 +2820,10 @@ impl ChainState {
             bail!("transaction index is inconsistent with stored block");
         };
         Ok(Some((transaction, location)))
+    }
+
+    pub fn transaction_location(&self, txid: &Txid) -> Option<TxLocation> {
+        self.tx_index.get(txid).cloned()
     }
 
     pub fn spending_transaction(

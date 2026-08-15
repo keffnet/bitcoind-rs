@@ -583,19 +583,27 @@ fn server_ping(params: &Value, protocol_version: ProtocolVersion) -> Result<Valu
     if protocol_version < PROTOCOL_1_7 {
         return Ok(Value::Null);
     }
-    let Some(value) = params.get(0) else {
-        return Ok(json!({"data": ""}));
-    };
-    let length = match value {
-        Value::Number(number) => number
-            .as_u64()
-            .ok_or_else(|| anyhow!("pong_len must be a non-negative integer"))?,
-        Value::String(_) => 0,
-        _ => bail!("pong_len must be a non-negative integer"),
-    };
+    let length = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .ok_or_else(|| anyhow!("pong_len must be a non-negative integer"))
+        })
+        .transpose()?
+        .unwrap_or_default();
     let length = usize::try_from(length).map_err(|_| anyhow!("pong_len is too large"))?;
     if length > MAX_LINE_SIZE {
         bail!("pong_len exceeds the server limit")
+    }
+    if let Some(data) = params.get(1).filter(|value| !value.is_null()) {
+        let data = data
+            .as_str()
+            .ok_or_else(|| anyhow!("data must be a hexadecimal string"))?;
+        if !data.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            bail!("data must be a hexadecimal string")
+        }
     }
     Ok(json!({"data": "0".repeat(length)}))
 }
@@ -791,6 +799,9 @@ fn optional_checkpoint(params: &Value, index: usize) -> Result<Option<u32>> {
     let checkpoint = value
         .as_u64()
         .ok_or_else(|| anyhow!("cp_height must be a non-negative integer"))?;
+    if checkpoint == 0 {
+        return Ok(None);
+    }
     Ok(Some(
         u32::try_from(checkpoint).map_err(|_| anyhow!("checkpoint is too large"))?,
     ))
@@ -1037,13 +1048,13 @@ fn electrum_transaction_json(
 
 fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
-    let requested_height = param::<u32>(params, 1)?;
+    // The height is a hint.  A client can have a stale height after a reorg,
+    // while the transaction may still be available in the active chain at a
+    // different height.
+    let _requested_height = param::<u32>(params, 1)?;
     let Some((branch, position, height)) = node.chain.write().merkle_branch(&txid)? else {
         bail!("transaction not found")
     };
-    if height != requested_height {
-        bail!("transaction is not in the requested block")
-    }
     Ok(json!({
         "block_height": height,
         "pos": position,
@@ -1345,14 +1356,18 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
             );
         }
     }
-    let mut confirmed: Vec<(OutPoint, i64, u64)> = chain
+    let mut confirmed: Vec<(OutPoint, i64, usize, u64)> = chain
         .get_utxos(script_hash)
         .into_iter()
         .filter(|(outpoint, _)| !spent.contains(outpoint))
         .map(|(outpoint, entry)| {
+            let transaction_index = chain
+                .transaction_location(&outpoint.txid)
+                .map_or(usize::MAX, |location| location.transaction_index);
             (
                 outpoint,
                 i64::from(entry.height),
+                transaction_index,
                 entry.output.value.to_sat(),
             )
         })
@@ -1360,6 +1375,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
     confirmed.sort_by(|left, right| {
         left.1
             .cmp(&right.1)
+            .then_with(|| left.2.cmp(&right.2))
             .then_with(|| left.0.txid.to_string().cmp(&right.0.txid.to_string()))
             .then_with(|| left.0.vout.cmp(&right.0.vout))
     });
@@ -1372,7 +1388,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
             if chain::electrum_script_hash(&output.script_pubkey) == script_hash {
                 let outpoint = OutPoint::new(txid, vout as u32);
                 if !spent.contains(&outpoint) {
-                    unconfirmed.push((outpoint, 0, output.value.to_sat()));
+                    unconfirmed.push((outpoint, 0, usize::MAX, output.value.to_sat()));
                 }
             }
         }
@@ -1381,7 +1397,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
     let results = confirmed;
     results
         .into_iter()
-        .map(|(outpoint, height, value)| {
+        .map(|(outpoint, height, _, value)| {
             json!({
                 "tx_hash": outpoint.txid.to_string(),
                 "tx_pos": outpoint.vout,
@@ -2167,10 +2183,9 @@ mod tests {
             &mut session,
         )
         .unwrap();
-        assert_eq!(genesis_header["branch"], json!([]));
         assert_eq!(
-            genesis_header["root"],
-            json!(node.chain.read().block_hash(0).unwrap().to_string())
+            genesis_header,
+            json!(hex::encode(serialize(node.chain.read().header(0).unwrap())))
         );
         let genesis_headers = dispatch_with_session(
             &node,
@@ -2181,11 +2196,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(genesis_headers["count"], json!(1));
-        assert_eq!(genesis_headers["branch"], json!([]));
-        assert_eq!(
-            genesis_headers["root"],
-            json!(node.chain.read().block_hash(0).unwrap().to_string())
-        );
+        assert_eq!(genesis_headers["headers"].as_array().unwrap().len(), 1);
+        assert!(genesis_headers.get("branch").is_none());
+        assert!(genesis_headers.get("root").is_none());
         assert_eq!(
             dispatch_with_session(
                 &node,
@@ -2196,6 +2209,17 @@ mod tests {
             )
             .unwrap(),
             json!({"data": "000"})
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "server.ping",
+                &json!([0, "deadbeef"]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!({"data": ""})
         );
         assert_eq!(
             dispatch_with_session(
@@ -2446,7 +2470,10 @@ mod tests {
         assert!(side_verbose.get("blocktime").is_none());
         let merkle = transaction_merkle(&node, &json!([txid.to_string(), 0])).unwrap();
         assert_eq!(merkle["block_height"], 0);
-        assert!(transaction_merkle(&node, &json!([txid.to_string(), 1])).is_err());
+        assert_eq!(
+            transaction_merkle(&node, &json!([txid.to_string(), 1])).unwrap()["block_height"],
+            json!(0)
+        );
 
         let script_hash = "00".repeat(32);
         let mut subscriptions = HashMap::new();

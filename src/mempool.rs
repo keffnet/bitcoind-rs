@@ -48,6 +48,7 @@ pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
 /// Core's default cluster limits for the v31.1 mempool policy.
 pub const MAX_CLUSTER_COUNT: usize = 64;
 pub const MAX_CLUSTER_VSIZE: u64 = 101_000;
+const MAX_REPLACEMENT_CANDIDATES: usize = 100;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MempoolPolicy {
@@ -381,6 +382,14 @@ pub enum MempoolError {
     Conflict(Txid),
     #[error("bip125-replacement-disallowed")]
     ReplacementDisallowed,
+    #[error(
+        "too many potential replacements, rejecting replacement {txid}; too many conflicting clusters ({count} > {limit})"
+    )]
+    TooManyReplacementCandidates {
+        txid: Txid,
+        count: usize,
+        limit: usize,
+    },
     #[error("replacement transaction fee is too low")]
     ReplacementFee,
     #[error("replacement transaction spends an unconfirmed output outside the conflicts")]
@@ -1013,7 +1022,9 @@ impl Mempool {
         transaction: Transaction,
         chain: &ChainState,
     ) -> Result<Txid, MempoolError> {
-        if !self.conflicts_for(&transaction).is_empty() {
+        let conflicts = self.conflicts_for(&transaction);
+        self.check_replacement_cluster_limit(transaction.compute_txid(), &conflicts)?;
+        if !conflicts.is_empty() {
             return Err(MempoolError::ReplacementDisallowed);
         }
         self.accept_without_sibling(transaction, chain)
@@ -1083,6 +1094,12 @@ impl Mempool {
                 .collect::<Vec<_>>();
             direct_conflicts.sort_by_key(ToString::to_string);
             direct_conflicts.dedup();
+            if let Some(transaction) = transactions.first() {
+                candidate.check_replacement_cluster_limit(
+                    transaction.compute_txid(),
+                    &direct_conflicts,
+                )?;
+            }
             if !direct_conflicts.is_empty() {
                 let removal = candidate.conflicts_and_descendants(&direct_conflicts);
                 if transactions.iter().any(|transaction| {
@@ -1198,9 +1215,9 @@ impl Mempool {
         let mut accepted = Vec::with_capacity(transactions.len());
         for transaction in transactions {
             let txid = transaction.compute_txid();
-            if candidate.entries.contains_key(&txid)
-                || !candidate.conflicts_for(transaction).is_empty()
-            {
+            let conflicts = candidate.conflicts_for(transaction);
+            candidate.check_replacement_cluster_limit(txid, &conflicts)?;
+            if candidate.entries.contains_key(&txid) || !conflicts.is_empty() {
                 return Err(MempoolError::ReplacementDisallowed);
             }
             accepted.push(candidate.accept_at(transaction.clone(), chain, added_at)?);
@@ -1232,6 +1249,7 @@ impl Mempool {
             return Err(MempoolError::Conflict(transaction.compute_txid()));
         }
         let direct_conflicts = self.conflicts_for(&transaction);
+        self.check_replacement_cluster_limit(transaction.compute_txid(), &direct_conflicts)?;
         let removal = self.conflicts_and_descendants(&conflicts);
         let mut allowed_unconfirmed = HashSet::new();
         for conflict in &conflicts {
@@ -1313,6 +1331,48 @@ impl Mempool {
             pending.extend(self.children(&txid));
         }
         removal
+    }
+
+    fn check_replacement_cluster_limit(
+        &self,
+        txid: Txid,
+        direct_conflicts: &[Txid],
+    ) -> Result<(), MempoolError> {
+        let count = self.conflicting_cluster_count(direct_conflicts);
+        if count > MAX_REPLACEMENT_CANDIDATES {
+            return Err(MempoolError::TooManyReplacementCandidates {
+                txid,
+                count,
+                limit: MAX_REPLACEMENT_CANDIDATES,
+            });
+        }
+        Ok(())
+    }
+
+    /// Count the distinct connected mempool clusters touched by direct
+    /// conflicts. Core limits this count rather than the number of individual
+    /// transactions so a replacement can still evict a large connected
+    /// package while bounding work across unrelated clusters.
+    fn conflicting_cluster_count(&self, direct_conflicts: &[Txid]) -> usize {
+        let mut visited = HashSet::new();
+        let mut clusters = 0;
+        for conflict in direct_conflicts {
+            if !self.entries.contains_key(conflict) || !visited.insert(*conflict) {
+                continue;
+            }
+            clusters += 1;
+            let mut pending = vec![*conflict];
+            while let Some(txid) = pending.pop() {
+                pending.extend(self.parents(&txid));
+                pending.extend(self.children(&txid));
+                for connected in std::mem::take(&mut pending) {
+                    if visited.insert(connected) {
+                        pending.push(connected);
+                    }
+                }
+            }
+        }
+        clusters
     }
 
     fn truc_sibling_for(&self, transaction: &Transaction) -> Option<Txid> {
@@ -2995,6 +3055,42 @@ mod tests {
         );
         pool.wtxids.insert(wtxid, txid);
         txid
+    }
+
+    #[test]
+    fn replacement_cluster_limit_counts_connected_clusters() {
+        let mut pool = Mempool::new(Network::Regtest);
+        let mut independent_conflicts = Vec::new();
+        for marker in 0..=100u8 {
+            let transaction = graph_transaction(Txid::from_byte_array([marker; 32]), marker);
+            independent_conflicts.push(insert_policy_entry(&mut pool, transaction));
+        }
+
+        assert_eq!(
+            pool.conflicting_cluster_count(&independent_conflicts),
+            MAX_REPLACEMENT_CANDIDATES + 1
+        );
+        assert!(matches!(
+            pool.check_replacement_cluster_limit(
+                Txid::from_byte_array([201; 32]),
+                &independent_conflicts,
+            ),
+            Err(MempoolError::TooManyReplacementCandidates {
+                count: 101,
+                limit: 100,
+                ..
+            })
+        ));
+
+        let parent = graph_transaction(Txid::from_byte_array([202; 32]), 202);
+        let parent_id = insert_policy_entry(&mut pool, parent);
+        let child = graph_transaction(parent_id, 203);
+        let child_id = insert_policy_entry(&mut pool, child);
+        assert_eq!(pool.conflicting_cluster_count(&[parent_id, child_id]), 1);
+        assert!(
+            pool.check_replacement_cluster_limit(Txid::from_byte_array([204; 32]), &[child_id])
+                .is_ok()
+        );
     }
 
     #[test]

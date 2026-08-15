@@ -9149,6 +9149,9 @@ fn mempool_reject_reason(error: &MempoolError) -> String {
     match error {
         MempoolError::AlreadyPresent => "txn-already-in-mempool".to_owned(),
         MempoolError::Conflict(_) => "txn-mempool-conflict".to_owned(),
+        MempoolError::TooManyReplacementCandidates { .. } => {
+            "too many potential replacements".to_owned()
+        }
         MempoolError::MissingInput(_) => "missing-inputs".to_owned(),
         MempoolError::FeeRate => "mempool min fee not met".to_owned(),
         MempoolError::NonStandard(reason) => reason.clone(),

@@ -575,9 +575,8 @@ pub fn validate_header_without_pow(
 
 /// Enforce the BIP94 difficulty-adjustment timestamp rule.
 ///
-/// Core enables this rule by default on Testnet4. Regtest's corresponding
-/// option is not exposed by this wallet-free node configuration, so it is not
-/// enabled here.
+/// Core enables this rule by default on Testnet4 and exposes it on regtest
+/// through the `-test=bip94` startup option.
 pub fn validate_bip94_timewarp(
     network: Network,
     height: u32,

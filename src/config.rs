@@ -1315,6 +1315,17 @@ pub struct Args {
     )]
     pub vb_params: Vec<String>,
 
+    /// Enable a Core regtest-only test option.  v31.1 currently defines
+    /// `bip94`; unknown values are accepted with a warning for forward
+    /// compatibility, matching Core's startup behavior.
+    #[arg(
+        long = "test",
+        value_name = "OPTION",
+        value_delimiter = ',',
+        hide = true
+    )]
+    pub test_options: Vec<String>,
+
     #[arg(
         long,
         default_value_t = false,
@@ -2386,8 +2397,12 @@ impl Config {
             None => None,
         };
         let signet_seed_nodes = args.signet_seed_nodes.clone();
-        let deployment_parameters =
-            parse_deployment_parameters(network, &args.test_activation_height, &args.vb_params)?;
+        let deployment_parameters = parse_deployment_parameters(
+            network,
+            &args.test_activation_height,
+            &args.vb_params,
+            &args.test_options,
+        )?;
         let assume_valid = match args.assume_valid.as_deref() {
             None => default_assume_valid(network, signet_challenge.as_deref()),
             Some(value) if value.is_empty() || value == "0" => None,
@@ -2688,10 +2703,22 @@ fn parse_deployment_parameters(
     network: Network,
     activation_heights: &[String],
     version_bits: &[String],
+    test_options: &[String],
 ) -> Result<DeploymentParameters> {
     let mut parameters = DeploymentParameters::for_network(network);
+    if !test_options.is_empty() && network != Network::Regtest {
+        bail!("--test=<option> can only be used with --regtest");
+    }
     if network != Network::Regtest {
         return Ok(parameters);
+    }
+
+    for option in test_options {
+        if option == "bip94" {
+            parameters.bip94 = true;
+        } else {
+            tracing::warn!("unrecognised option \"{option}\" provided in --test=<option>");
+        }
     }
 
     for value in activation_heights {
@@ -3140,6 +3167,7 @@ mod tests {
             "--regtest",
             "--testactivationheight=bip34@12,segwit@18",
             "--vbparams=testdummy:123:456:789",
+            "--test=bip94",
         ])
         .unwrap();
         let parameters = Config::from_args(args)
@@ -3151,6 +3179,7 @@ mod tests {
         assert_eq!(parameters.bip9[0].start_time, 123);
         assert_eq!(parameters.bip9[0].timeout, 456);
         assert_eq!(parameters.bip9[0].min_activation_height, 789);
+        assert!(parameters.bip94);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

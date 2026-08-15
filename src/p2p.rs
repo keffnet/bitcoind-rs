@@ -2286,7 +2286,7 @@ async fn discover_dns_seeds(
     signet_seed_nodes: &[String],
 ) -> Vec<std::net::SocketAddr> {
     let hosts = dns_seed_hosts(network, signet_seed_nodes);
-    let port = match network {
+    let default_port = match network {
         Network::Bitcoin => 8333,
         Network::Testnet => 18333,
         Network::Testnet4 => 48333,
@@ -2295,7 +2295,8 @@ async fn discover_dns_seeds(
     };
     let mut addresses = Vec::new();
     for host in hosts {
-        if let Ok(resolved) = tokio::net::lookup_host((host.as_str(), port)).await {
+        let (host, port) = dns_seed_target(&host, default_port);
+        if let Ok(resolved) = tokio::net::lookup_host((host, port)).await {
             addresses.extend(resolved.take(16));
         }
         if addresses.len() >= 64 {
@@ -2303,6 +2304,22 @@ async fn discover_dns_seeds(
         }
     }
     addresses
+}
+
+fn dns_seed_target(value: &str, default_port: u16) -> (&str, u16) {
+    if let Some(value) = value.strip_prefix('[')
+        && let Some((host, port)) = value.split_once("]:")
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host, port);
+    }
+    if let Some((host, port)) = value.rsplit_once(':')
+        && !host.is_empty()
+        && let Ok(port) = port.parse::<u16>()
+    {
+        return (host, port);
+    }
+    (value, default_port)
 }
 
 fn dns_seed_hosts(network: Network, signet_seed_nodes: &[String]) -> Vec<String> {
@@ -2328,7 +2345,7 @@ fn dns_seed_hosts(network: Network, signet_seed_nodes: &[String]) -> Vec<String>
         ],
         Network::Signet => &[
             "seed.signet.bitcoin.sprovoost.nl",
-            "xarb1.signet.seed.bluematt.me",
+            "seed.signet.achownodes.xyz",
         ],
         Network::Testnet4 | Network::Regtest => &[],
     };
@@ -7975,7 +7992,7 @@ mod tests {
             dns_seed_hosts(Network::Signet, &[]),
             vec![
                 "seed.signet.bitcoin.sprovoost.nl",
-                "xarb1.signet.seed.bluematt.me",
+                "seed.signet.achownodes.xyz",
             ]
         );
         assert_eq!(
@@ -7990,6 +8007,26 @@ mod tests {
                 "dnsseed.emzy.de",
                 "seed.bitcoin.wiz.biz",
             ]
+        );
+    }
+
+    #[test]
+    fn signet_seednode_supports_core_host_and_port_syntax() {
+        assert_eq!(
+            dns_seed_target("seed.example", 38333),
+            ("seed.example", 38333)
+        );
+        assert_eq!(
+            dns_seed_target("seed.example:18444", 38333),
+            ("seed.example", 18444)
+        );
+        assert_eq!(
+            dns_seed_target("[2001:db8::1]:18444", 38333),
+            ("2001:db8::1", 18444)
+        );
+        assert_eq!(
+            dns_seed_target("seed.example:not-a-port", 38333),
+            ("seed.example:not-a-port", 38333)
         );
     }
 

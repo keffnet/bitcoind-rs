@@ -6643,9 +6643,17 @@ fn psbt_inner_script_json(script: &bitcoin::Script) -> Value {
 fn psbt_unknown_json(
     values: &std::collections::BTreeMap<bitcoin::psbt::raw::Key, Vec<u8>>,
 ) -> Value {
+    psbt_unknown_json_filtered(values, &[])
+}
+
+fn psbt_unknown_json_filtered(
+    values: &std::collections::BTreeMap<bitcoin::psbt::raw::Key, Vec<u8>>,
+    recognized: &[bitcoin::psbt::raw::Key],
+) -> Value {
     Value::Object(
         values
             .iter()
+            .filter(|(key, _)| !recognized.contains(key))
             .map(|(key, value)| {
                 (
                     format!("{:02x}{}", key.type_value, hex::encode(&key.key)),
@@ -6654,6 +6662,124 @@ fn psbt_unknown_json(
             })
             .collect(),
     )
+}
+
+const PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: u8 = 0x1a;
+const PSBT_IN_MUSIG2_PUB_NONCE: u8 = 0x1b;
+const PSBT_IN_MUSIG2_PARTIAL_SIG: u8 = 0x1c;
+const PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS: u8 = 0x08;
+
+fn is_compressed_musig2_pubkey(bytes: &[u8]) -> bool {
+    bytes.len() == 33 && bitcoin::PublicKey::from_slice(bytes).is_ok()
+}
+
+fn psbt_musig2_participant_json(
+    values: &std::collections::BTreeMap<bitcoin::psbt::raw::Key, Vec<u8>>,
+    type_value: u8,
+    recognized: &mut Vec<bitcoin::psbt::raw::Key>,
+) -> Option<Value> {
+    let mut entries = Vec::<(Vec<u8>, Value)>::new();
+    for (key, value) in values {
+        if key.type_value != type_value
+            || !is_compressed_musig2_pubkey(&key.key)
+            || value.len() % 33 != 0
+            || !value.chunks_exact(33).all(is_compressed_musig2_pubkey)
+        {
+            continue;
+        }
+        recognized.push(key.clone());
+        entries.push((
+            key.key.clone(),
+            json!({
+                "aggregate_pubkey": hex::encode(&key.key),
+                "participant_pubkeys": value
+                    .chunks_exact(33)
+                    .map(hex::encode)
+                    .collect::<Vec<_>>(),
+            }),
+        ));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    (!entries.is_empty())
+        .then(|| Value::Array(entries.into_iter().map(|(_, value)| value).collect()))
+}
+
+fn psbt_musig2_data_json(
+    values: &std::collections::BTreeMap<bitcoin::psbt::raw::Key, Vec<u8>>,
+    type_value: u8,
+    value_len: usize,
+    value_name: &str,
+    recognized: &mut Vec<bitcoin::psbt::raw::Key>,
+) -> Option<Value> {
+    let mut entries = Vec::<(Vec<u8>, Vec<u8>, Vec<u8>, Value)>::new();
+    for (key, value) in values {
+        if key.type_value != type_value
+            || !matches!(key.key.len(), 66 | 98)
+            || !is_compressed_musig2_pubkey(&key.key[..33])
+            || !is_compressed_musig2_pubkey(&key.key[33..66])
+            || value.len() != value_len
+        {
+            continue;
+        }
+        recognized.push(key.clone());
+        let leaf_hash = key
+            .key
+            .get(66..)
+            .filter(|leaf| leaf.iter().any(|byte| *byte != 0));
+        let mut entry = json!({
+            "participant_pubkey": hex::encode(&key.key[..33]),
+            "aggregate_pubkey": hex::encode(&key.key[33..66]),
+            value_name: hex::encode(value),
+        });
+        if let Some(leaf_hash) = leaf_hash {
+            entry["leaf_hash"] = json!(hex::encode(leaf_hash));
+        }
+        entries.push((
+            key.key[33..66].to_vec(),
+            key.key.get(66..).unwrap_or(&[]).to_vec(),
+            key.key[..33].to_vec(),
+            entry,
+        ));
+    }
+    entries.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    (!entries.is_empty())
+        .then(|| Value::Array(entries.into_iter().map(|(_, _, _, value)| value).collect()))
+}
+
+fn psbt_musig2_input_json(
+    input: &PsbtInput,
+) -> (
+    Option<Value>,
+    Option<Value>,
+    Option<Value>,
+    Vec<bitcoin::psbt::raw::Key>,
+) {
+    let mut recognized = Vec::new();
+    let participants = psbt_musig2_participant_json(
+        &input.unknown,
+        PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
+        &mut recognized,
+    );
+    let pubnonces = psbt_musig2_data_json(
+        &input.unknown,
+        PSBT_IN_MUSIG2_PUB_NONCE,
+        66,
+        "pubnonce",
+        &mut recognized,
+    );
+    let partial_sigs = psbt_musig2_data_json(
+        &input.unknown,
+        PSBT_IN_MUSIG2_PARTIAL_SIG,
+        32,
+        "partial_sig",
+        &mut recognized,
+    );
+    (participants, pubnonces, partial_sigs, recognized)
 }
 
 fn psbt_proprietary_json(
@@ -6747,6 +6873,8 @@ fn psbt_taproot_scripts_json(
 
 fn decode_psbt_input(node: &Arc<Node>, input: &PsbtInput) -> Value {
     let mut result = json!({});
+    let (musig2_participants, musig2_pubnonces, musig2_partial_sigs, recognized_musig2) =
+        psbt_musig2_input_json(input);
     if let Some(transaction) = &input.non_witness_utxo {
         result["non_witness_utxo"] = decoded_transaction_json(transaction, node.config.network);
     }
@@ -6875,17 +7003,35 @@ fn decode_psbt_input(node: &Arc<Node>, input: &PsbtInput) -> Value {
     if input.tap_merkle_root.is_some() {
         result["taproot_merkle_root"] = json!(input.tap_merkle_root.map(|root| root.to_string()));
     }
+    if let Some(participants) = musig2_participants {
+        result["musig2_participant_pubkeys"] = participants;
+    }
+    if let Some(pubnonces) = musig2_pubnonces {
+        result["musig2_pubnonces"] = pubnonces;
+    }
+    if let Some(partial_sigs) = musig2_partial_sigs {
+        result["musig2_partial_sigs"] = partial_sigs;
+    }
     if !input.proprietary.is_empty() {
         result["proprietary"] = psbt_proprietary_json(&input.proprietary);
     }
     if !input.unknown.is_empty() {
-        result["unknown"] = psbt_unknown_json(&input.unknown);
+        let unknown = psbt_unknown_json_filtered(&input.unknown, &recognized_musig2);
+        if unknown.as_object().is_some_and(|values| !values.is_empty()) {
+            result["unknown"] = unknown;
+        }
     }
     result
 }
 
 fn decode_psbt_output(_node: &Arc<Node>, output: &bitcoin::psbt::Output) -> Value {
     let mut result = json!({});
+    let mut recognized_musig2 = Vec::new();
+    let musig2_participants = psbt_musig2_participant_json(
+        &output.unknown,
+        PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS,
+        &mut recognized_musig2,
+    );
     if let Some(script) = &output.redeem_script {
         result["redeem_script"] = psbt_inner_script_json(script.as_script());
     }
@@ -6913,6 +7059,9 @@ fn decode_psbt_output(_node: &Arc<Node>, output: &bitcoin::psbt::Output) -> Valu
     if let Some(tree) = &output.tap_tree {
         result["taproot_tree"] = psbt_taproot_tree_json(tree);
     }
+    if let Some(participants) = musig2_participants {
+        result["musig2_participant_pubkeys"] = participants;
+    }
     if !output.tap_key_origins.is_empty() {
         result["taproot_bip32_derivs"] = psbt_taproot_derivs_json(&output.tap_key_origins);
     }
@@ -6920,16 +7069,29 @@ fn decode_psbt_output(_node: &Arc<Node>, output: &bitcoin::psbt::Output) -> Valu
         result["proprietary"] = psbt_proprietary_json(&output.proprietary);
     }
     if !output.unknown.is_empty() {
-        result["unknown"] = psbt_unknown_json(&output.unknown);
+        let unknown = psbt_unknown_json_filtered(&output.unknown, &recognized_musig2);
+        if unknown.as_object().is_some_and(|values| !values.is_empty()) {
+            result["unknown"] = unknown;
+        }
     }
     result
 }
 
 fn decode_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let psbt = parse_psbt(params, 0)?;
+    let mut global_xpubs = psbt
+        .xpub
+        .iter()
+        .map(|(xpub, source)| (source, xpub))
+        .collect::<Vec<_>>();
+    global_xpubs.sort_by(|(left_source, left_xpub), (right_source, right_xpub)| {
+        left_source
+            .cmp(right_source)
+            .then_with(|| left_xpub.cmp(right_xpub))
+    });
     let mut result = json!({
         "tx": decoded_transaction_json(&psbt.unsigned_tx, node.config.network),
-        "global_xpubs": psbt.xpub.iter().map(|(xpub, source)| json!({
+        "global_xpubs": global_xpubs.into_iter().map(|(source, xpub)| json!({
             "xpub": xpub.to_string(),
             "master_fingerprint": source.0.to_string(),
             "path": psbt_path(&source.1),
@@ -7250,16 +7412,15 @@ fn psbt_missing_info(input: &PsbtInput, prevout: &TxOut) -> PsbtMissingInfo {
 
 fn psbt_prevout(psbt: &Psbt, input_index: usize) -> Option<TxOut> {
     let input = psbt.inputs.get(input_index)?;
-    if let Some(output) = &input.witness_utxo {
+    let transaction_input = psbt.unsigned_tx.input.get(input_index)?;
+    if let Some(transaction) = &input.non_witness_utxo
+        && let Some(output) = transaction
+            .output
+            .get(transaction_input.previous_output.vout as usize)
+    {
         return Some(output.clone());
     }
-    let transaction_input = psbt.unsigned_tx.input.get(input_index)?;
-    input
-        .non_witness_utxo
-        .as_ref()?
-        .output
-        .get(transaction_input.previous_output.vout as usize)
-        .cloned()
+    input.witness_utxo.clone()
 }
 
 fn push_script_items(items: &[Vec<u8>]) -> Result<ScriptBuf> {
@@ -22258,6 +22419,102 @@ mod tests {
         assert!(decoded_created["global_xpubs"].is_array());
         assert!(decoded_created.get("global_xpub").is_none());
         assert!(decoded_created["tx"].get("hex").is_none());
+
+        let input_pubkey1: bitcoin::PublicKey =
+            "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                .parse()
+                .unwrap();
+        let input_pubkey2: bitcoin::PublicKey =
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5"
+                .parse()
+                .unwrap();
+        let input_aggregate: bitcoin::PublicKey =
+            "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9"
+                .parse()
+                .unwrap();
+        let mut musig_psbt = Psbt::from_unsigned_tx(Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([0xee; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        })
+        .unwrap();
+        let participant_pubkeys = [input_pubkey1.to_bytes(), input_pubkey2.to_bytes()].concat();
+        musig_psbt.inputs[0].unknown.insert(
+            bitcoin::psbt::raw::Key {
+                type_value: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
+                key: input_aggregate.to_bytes(),
+            },
+            participant_pubkeys.clone(),
+        );
+        let leaf_hash = vec![0x42; 32];
+        let mut musig_data_key = input_pubkey1.to_bytes();
+        musig_data_key.extend_from_slice(&input_aggregate.to_bytes());
+        musig_data_key.extend_from_slice(&leaf_hash);
+        musig_psbt.inputs[0].unknown.insert(
+            bitcoin::psbt::raw::Key {
+                type_value: PSBT_IN_MUSIG2_PUB_NONCE,
+                key: musig_data_key.clone(),
+            },
+            vec![0x33; 66],
+        );
+        musig_psbt.inputs[0].unknown.insert(
+            bitcoin::psbt::raw::Key {
+                type_value: PSBT_IN_MUSIG2_PARTIAL_SIG,
+                key: musig_data_key,
+            },
+            vec![0x44; 32],
+        );
+        musig_psbt.outputs[0].unknown.insert(
+            bitcoin::psbt::raw::Key {
+                type_value: PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS,
+                key: input_aggregate.to_bytes(),
+            },
+            participant_pubkeys,
+        );
+        let decoded_musig = decode_psbt(&node, &json!([encode_psbt(&musig_psbt)])).unwrap();
+        let decoded_input = &decoded_musig["inputs"][0];
+        assert_eq!(
+            decoded_input["musig2_participant_pubkeys"][0]["aggregate_pubkey"],
+            hex::encode(input_aggregate.to_bytes())
+        );
+        assert_eq!(
+            decoded_input["musig2_participant_pubkeys"][0]["participant_pubkeys"],
+            json!([
+                hex::encode(input_pubkey1.to_bytes()),
+                hex::encode(input_pubkey2.to_bytes())
+            ])
+        );
+        assert_eq!(
+            decoded_input["musig2_pubnonces"][0]["leaf_hash"],
+            hex::encode(&leaf_hash)
+        );
+        assert_eq!(
+            decoded_input["musig2_pubnonces"][0]["pubnonce"],
+            hex::encode(vec![0x33; 66])
+        );
+        assert_eq!(
+            decoded_input["musig2_partial_sigs"][0]["partial_sig"],
+            hex::encode(vec![0x44; 32])
+        );
+        assert!(decoded_input.get("unknown").is_none());
+        assert_eq!(
+            decoded_musig["outputs"][0]["musig2_participant_pubkeys"][0]["participant_pubkeys"],
+            json!([
+                hex::encode(input_pubkey1.to_bytes()),
+                hex::encode(input_pubkey2.to_bytes())
+            ])
+        );
+        assert!(decoded_musig["outputs"][0].get("unknown").is_none());
+
         assert_eq!(
             combine_psbt(&json!([[created.clone(), created]])).unwrap(),
             json!(encode_psbt(&created_psbt))

@@ -3641,7 +3641,10 @@ impl ChainState {
             }
             total_fees = total_fees
                 .checked_add(input_total - output_total)
-                .ok_or(ValidationError::InputTotalOverflow)?;
+                .ok_or(ValidationError::AccumulatedFeeOverflow)?;
+            if total_fees > Amount::MAX_MONEY.to_sat() {
+                return Err(ValidationError::AccumulatedFeeOverflow.into());
+            }
             for (output_index, output) in transaction.output.iter().enumerate() {
                 if is_unspendable_script(&output.script_pubkey) {
                     metrics.unspendable_scripts_sat = metrics
@@ -3663,10 +3666,13 @@ impl ChainState {
                 }
             }
         }
-        let allowed_coinbase = validation::checked_money_add(
-            validation::block_subsidy_for_network(self.network, height),
-            total_fees,
-        )?;
+        // Core checks the accumulated fees against MAX_MONEY above, then
+        // compares the coinbase output with subsidy + fees. The reward sum
+        // itself is allowed to exceed MAX_MONEY; only each transaction's
+        // output total is range-limited.
+        let allowed_coinbase = validation::block_subsidy_for_network(self.network, height)
+            .checked_add(total_fees)
+            .expect("subsidy plus bounded fees fits in u64");
         let actual_coinbase = block.txdata[0]
             .output
             .iter()

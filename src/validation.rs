@@ -122,6 +122,8 @@ pub enum ValidationError {
     ImmatureCoinbase { outpoint: OutPoint },
     #[error("transaction input values exceed MAX_MONEY")]
     InputTotalOverflow,
+    #[error("accumulated transaction fees exceed MAX_MONEY")]
+    AccumulatedFeeOverflow,
     #[error("transaction {txid} creates more value than it spends")]
     NegativeFee { txid: Txid },
     #[error("block tries to overwrite an unspent transaction {0}")]
@@ -177,6 +179,7 @@ impl ValidationError {
             Self::MissingInput { .. } => "bad-txns-inputs-missingorspent".to_owned(),
             Self::ImmatureCoinbase { .. } => "bad-txns-premature-spend-of-coinbase".to_owned(),
             Self::InputTotalOverflow => "bad-txns-inputvalues-outofrange".to_owned(),
+            Self::AccumulatedFeeOverflow => "bad-txns-accumulated-fee-outofrange".to_owned(),
             Self::NegativeFee { .. } => "bad-txns-in-belowout".to_owned(),
             Self::Bip30(_) => "bad-txns-BIP30".to_owned(),
             Self::BadCoinbaseHeight => "bad-cb-height".to_owned(),
@@ -559,21 +562,6 @@ pub(crate) fn validate_block_structure_with_signet_options(
     if !first.is_coinbase() {
         return Err(ValidationError::FirstTransactionNotCoinbase);
     }
-    if first.input[0].script_sig.len() < 2 || first.input[0].script_sig.len() > 100 {
-        return Err(ValidationError::BadCoinbase);
-    }
-    if height >= buried_deployment_heights(network).bip34 {
-        let encoded_height = bitcoin::script::Builder::new()
-            .push_int(height as i64)
-            .into_script();
-        if !first.input[0]
-            .script_sig
-            .as_bytes()
-            .starts_with(encoded_height.as_bytes())
-        {
-            return Err(ValidationError::BadCoinbaseHeight);
-        }
-    }
 
     let coinbase_total = first
         .output
@@ -596,20 +584,11 @@ pub(crate) fn validate_block_structure_with_signet_options(
         if position > 0 && tx.is_coinbase() {
             return Err(ValidationError::ExtraCoinbase(txid));
         }
-        if !tx.is_coinbase() && tx.input.iter().any(|input| input.previous_output.is_null()) {
-            return Err(ValidationError::NullPrevout(txid));
-        }
         if tx.input.is_empty() {
             return Err(ValidationError::EmptyInputs(txid));
         }
         if tx.output.is_empty() {
             return Err(ValidationError::EmptyOutputs(txid));
-        }
-        let mut inputs = HashSet::with_capacity(tx.input.len());
-        for input in &tx.input {
-            if !inputs.insert(input.previous_output) {
-                return Err(ValidationError::DuplicateInput(txid));
-            }
         }
         let mut tx_total = 0u64;
         for output in &tx.output {
@@ -622,7 +601,21 @@ pub(crate) fn validate_block_structure_with_signet_options(
                 .ok_or(ValidationError::OutputTotalOverflow)?;
         }
         if tx_total > Amount::MAX_MONEY.to_sat() {
-            return Err(ValidationError::BadOutputValue(txid));
+            return Err(ValidationError::OutputTotalOverflow);
+        }
+        let mut inputs = HashSet::with_capacity(tx.input.len());
+        for input in &tx.input {
+            if !inputs.insert(input.previous_output) {
+                return Err(ValidationError::DuplicateInput(txid));
+            }
+        }
+        if !tx.is_coinbase() && tx.input.iter().any(|input| input.previous_output.is_null()) {
+            return Err(ValidationError::NullPrevout(txid));
+        }
+        if tx.is_coinbase()
+            && (tx.input[0].script_sig.len() < 2 || tx.input[0].script_sig.len() > 100)
+        {
+            return Err(ValidationError::BadCoinbase);
         }
         total_output_sat = total_output_sat
             .checked_add(tx_total)
@@ -630,6 +623,18 @@ pub(crate) fn validate_block_structure_with_signet_options(
         legacy_sigop_cost = legacy_sigop_cost.saturating_add(legacy_sigop_cost_for_transaction(tx));
         if legacy_sigop_cost > MAX_BLOCK_SIGOP_COST {
             return Err(ValidationError::TooManySigops);
+        }
+    }
+    if height >= buried_deployment_heights(network).bip34 {
+        let encoded_height = bitcoin::script::Builder::new()
+            .push_int(height as i64)
+            .into_script();
+        if !first.input[0]
+            .script_sig
+            .as_bytes()
+            .starts_with(encoded_height.as_bytes())
+        {
+            return Err(ValidationError::BadCoinbaseHeight);
         }
     }
     if coinbase_total > expected_coinbase_value {
@@ -1363,6 +1368,10 @@ mod tests {
             ValidationError::Bip30(Txid::from_byte_array([7; 32])).bip22_reject_reason(),
             "bad-txns-BIP30"
         );
+        assert_eq!(
+            ValidationError::AccumulatedFeeOverflow.bip22_reject_reason(),
+            "bad-txns-accumulated-fee-outofrange"
+        );
     }
 
     #[test]
@@ -1540,7 +1549,10 @@ mod tests {
             txdata: vec![coinbase, transaction],
         };
         block.header.merkle_root = block.compute_merkle_root().unwrap();
-        let mut invalid_height = block.clone();
+        let mut valid_height = block.clone();
+        valid_height.txdata[1].output[1].value = Amount::ZERO;
+        valid_height.header.merkle_root = valid_height.compute_merkle_root().unwrap();
+        let mut invalid_height = valid_height;
         invalid_height.txdata[0].input[0].script_sig = ScriptBuf::from_bytes(vec![1, 1]);
         invalid_height.header.merkle_root = invalid_height.compute_merkle_root().unwrap();
         assert!(matches!(
@@ -1554,7 +1566,7 @@ mod tests {
         ));
         assert!(matches!(
             validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
-            Err(ValidationError::BadOutputValue(_))
+            Err(ValidationError::OutputTotalOverflow)
         ));
     }
 

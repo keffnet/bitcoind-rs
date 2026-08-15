@@ -64,10 +64,13 @@ impl NetworkEndpoint {
                 address: <[u8; 32]>::try_from(address).ok()?,
                 port,
             }),
-            6 => Some(Self::Cjdns {
-                address: Ipv6Addr::from(<[u8; 16]>::try_from(address).ok()?),
-                port,
-            }),
+            6 => {
+                let address = <[u8; 16]>::try_from(address).ok()?;
+                (address[0] == 0xfc).then(|| Self::Cjdns {
+                    address: Ipv6Addr::from(address),
+                    port,
+                })
+            }
             _ => None,
         }
     }
@@ -174,10 +177,13 @@ impl NetworkEndpoint {
                 let ip = address.parse::<Ipv6Addr>()?;
                 Ok(Self::Ip(SocketAddr::new(ip.into(), port)))
             }
-            "cjdns" => Ok(Self::Cjdns {
-                address: address.parse::<Ipv6Addr>()?,
-                port,
-            }),
+            "cjdns" => {
+                let address = address.parse::<Ipv6Addr>()?;
+                if address.octets()[0] != 0xfc {
+                    bail!("invalid CJDNS address prefix")
+                }
+                Ok(Self::Cjdns { address, port })
+            }
             "onion" => parse_onion(address, port),
             "i2p" => Ok(Self::I2p {
                 address: decode_fixed_base32::<32>(
@@ -380,7 +386,9 @@ mod tests {
     fn rejects_invalid_bip155_lengths_and_ports() {
         assert!(NetworkEndpoint::from_addr_v2(3, &[0; 9], 8333).is_none());
         assert!(NetworkEndpoint::from_addr_v2(4, &[0; 32], 0).is_none());
+        assert!(NetworkEndpoint::from_addr_v2(6, &[0xfd; 16], 8333).is_none());
         assert!(NetworkEndpoint::parse(Some("i2p"), "abcd", Some(8333)).is_err());
+        assert!(NetworkEndpoint::parse(Some("cjdns"), "fd00::1", Some(8333)).is_err());
     }
 
     #[test]

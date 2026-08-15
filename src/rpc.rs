@@ -53,7 +53,7 @@ use crate::wire;
 use crate::{Node, ScanState};
 
 const MAX_HTTP_REQUEST: usize = 8 * 1024 * 1024;
-const DEFAULT_MAX_RAW_TX_FEE_RATE_BTC_PER_KVB: f64 = 0.1;
+const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 const MAX_SCRIPT_SIZE: usize = 10_000;
 const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
 const MAX_OPCODE: u8 = 0xb9;
@@ -7708,19 +7708,16 @@ fn abort_private_broadcast(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }))
 }
 
-fn parse_max_fee_rate(value: Option<&Value>) -> Result<Option<f64>> {
-    let max_fee_rate = value.filter(|value| !value.is_null()).map_or(
-        Ok(DEFAULT_MAX_RAW_TX_FEE_RATE_BTC_PER_KVB),
-        |value| {
-            value
-                .as_f64()
-                .ok_or_else(|| anyhow!("maxfeerate must be a number"))
-        },
-    )?;
-    if !max_fee_rate.is_finite() || !(0.0..=1.0).contains(&max_fee_rate) {
-        bail!("maxfeerate must be between 0 and 1 BTC/kvB")
+fn parse_max_fee_rate(value: Option<&Value>) -> Result<Option<u64>> {
+    let max_fee_rate = value
+        .filter(|value| !value.is_null())
+        .map(|value| parse_btc_amount(value, "maxfeerate").map(|amount| amount.to_sat()))
+        .transpose()?
+        .unwrap_or(DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB);
+    if max_fee_rate >= 100_000_000 {
+        bail!("Fee rates larger than or equal to 1BTC/kvB are not accepted")
     }
-    Ok((max_fee_rate > 0.0).then_some(max_fee_rate))
+    Ok((max_fee_rate > 0).then_some(max_fee_rate))
 }
 
 fn parse_max_burn_amount(value: Option<&Value>) -> Result<u64> {
@@ -7758,7 +7755,7 @@ fn validate_burn_amount(transaction: &Transaction, max_burn_amount: u64) -> Resu
 fn enforce_max_fee_rate(
     node: &Arc<Node>,
     transaction: &Transaction,
-    max_fee_rate: Option<f64>,
+    max_fee_rate: Option<u64>,
 ) -> Result<()> {
     let Some(max_fee_rate) = max_fee_rate else {
         return Ok(());
@@ -7769,8 +7766,7 @@ fn enforce_max_fee_rate(
     let entry = candidate
         .get(&txid)
         .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
-    let maximum_fee = max_fee_rate * 100_000_000.0 * entry.vsize as f64 / 1_000.0;
-    if entry.fee_sat as f64 > maximum_fee {
+    if exceeds_max_fee(entry.fee_sat, entry.vsize, Some(max_fee_rate)) {
         bail!("Fee exceeds maximum configured by user (e.g. maxfeerate)")
     }
     Ok(())
@@ -9322,17 +9318,20 @@ fn rejected_transaction_json(transaction: &Transaction, error: &MempoolError) ->
     })
 }
 
-fn exceeds_max_fee(fee_sat: u64, vsize: u64, max_fee_rate: Option<f64>) -> bool {
-    max_fee_rate.is_some_and(|max_fee_rate| {
-        fee_sat as f64 > max_fee_rate * 100_000_000.0 * vsize as f64 / 1_000.0
-    })
+fn exceeds_max_fee(fee_sat: u64, vsize: u64, max_fee_rate: Option<u64>) -> bool {
+    max_fee_rate.is_some_and(|max_fee_rate| fee_sat > max_fee_for_vsize(max_fee_rate, vsize))
+}
+
+fn max_fee_for_vsize(max_fee_rate_sat_per_kvb: u64, vsize: u64) -> u64 {
+    u64::try_from((u128::from(max_fee_rate_sat_per_kvb) * u128::from(vsize)).div_ceil(1_000))
+        .unwrap_or(u64::MAX)
 }
 
 fn first_max_fee_failure_index(
     transactions: &[Transaction],
     mempool: &Mempool,
     preexisting: &HashSet<Txid>,
-    max_fee_rate: Option<f64>,
+    max_fee_rate: Option<u64>,
 ) -> Option<usize> {
     max_fee_rate.and_then(|_| {
         transactions
@@ -11583,10 +11582,18 @@ mod tests {
 
     #[test]
     fn raw_transaction_fee_and_burn_limits_validate_rpc_arguments() {
-        assert_eq!(parse_max_fee_rate(None).unwrap(), Some(0.1));
+        assert_eq!(parse_max_fee_rate(None).unwrap(), Some(10_000_000));
+        assert_eq!(
+            parse_max_fee_rate(Some(&json!("0.1"))).unwrap(),
+            Some(10_000_000)
+        );
         assert_eq!(parse_max_fee_rate(Some(&json!(0))).unwrap(), None);
         assert!(parse_max_fee_rate(Some(&json!(-1))).is_err());
         assert!(parse_max_fee_rate(Some(&json!(1.1))).is_err());
+        assert!(parse_max_fee_rate(Some(&json!("1"))).is_err());
+        assert_eq!(max_fee_for_vsize(1, 101), 1);
+        assert!(!exceeds_max_fee(1, 101, Some(1)));
+        assert!(exceeds_max_fee(2, 101, Some(1)));
         assert_eq!(parse_max_burn_amount(None).unwrap(), 0);
         assert_eq!(parse_max_burn_amount(Some(&json!(0.00000001))).unwrap(), 1);
         assert_eq!(

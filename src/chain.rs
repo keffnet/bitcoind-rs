@@ -1168,7 +1168,9 @@ impl ChainState {
         {
             return Ok(previous);
         }
-        if target_height == 0 {
+        // The genesis block is retained permanently, so a boundary at
+        // height 1 would not have removed any block data yet.
+        if target_height <= 1 {
             return Ok(self.prune_height.unwrap_or_default());
         }
 
@@ -6799,6 +6801,8 @@ mod tests {
         let tip_hash = state.best_hash();
         let old_block_hash = old_block_hash.expect("prune test block");
         assert!(state.store.contains(&old_block_hash));
+        assert_eq!(state.prune(1).unwrap(), 0);
+        assert_eq!(state.prune_height(), None);
         assert_eq!(state.prune(50).unwrap(), 12);
         assert!(!state.store.contains(&old_block_hash));
         assert_eq!(

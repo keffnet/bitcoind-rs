@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fmt;
+use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use bitcoin::pow::Work;
@@ -525,7 +527,8 @@ impl From<NetworkName> for Network {
 #[command(
     name = "bitcoind-rs",
     version,
-    about = "Wallet-free Bitcoin node and Electrum server"
+    about = "Wallet-free Bitcoin node and Electrum server",
+    args_override_self = true
 )]
 pub struct Args {
     #[arg(long, value_enum, default_value_t = NetworkName::Bitcoin)]
@@ -536,6 +539,9 @@ pub struct Args {
 
     #[arg(long = "blocksdir", value_name = "PATH")]
     pub blocks_dir: Option<PathBuf>,
+
+    #[arg(long = "conf", value_name = "FILE")]
+    pub config_file: Option<PathBuf>,
 
     #[arg(long = "minimumchainwork", value_name = "HEX")]
     pub minimum_chain_work: Option<String>,
@@ -951,6 +957,191 @@ pub struct Args {
 
     #[arg(long = "zmqpubsequencehwm", default_value_t = DEFAULT_ZMQ_HWM)]
     pub zmq_pub_sequence_hwm: u32,
+}
+
+#[derive(Clone, Debug)]
+struct ConfigFileEntry {
+    section: Option<String>,
+    key: String,
+    value: String,
+}
+
+impl Args {
+    /// Parse command-line arguments after loading the default or explicitly
+    /// selected read-only configuration file.
+    pub fn parse_with_config() -> Result<Self> {
+        Self::parse_from_with_config(std::env::args_os())
+    }
+
+    fn parse_from_with_config<I, T>(args: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString> + Clone,
+    {
+        let raw = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        let datadir = raw_option_value(&raw, "datadir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("./data"));
+        let explicit_config = raw_option_value(&raw, "conf");
+        let config_path = explicit_config
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("bitcoin.conf"));
+        let config_path = if config_path.is_absolute() {
+            config_path
+        } else {
+            datadir.join(config_path)
+        };
+
+        let mut entries = Vec::new();
+        if config_path.exists() {
+            read_config_file(&config_path, &datadir, &mut entries, &mut Vec::new())?;
+        } else if explicit_config
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        {
+            bail!(
+                "configuration file does not exist: {}",
+                config_path.display()
+            );
+        }
+
+        let cli_network = raw_option_value(&raw, "network");
+        let selected_network = cli_network
+            .as_deref()
+            .map(canonical_network_name)
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| entry.section.is_none() && entry.key == "network")
+                    .map(|entry| canonical_network_name(&entry.value))
+            })
+            .unwrap_or("bitcoin");
+        let config_args = entries
+            .into_iter()
+            .filter(|entry| config_section_applies(entry.section.as_deref(), selected_network))
+            .filter_map(config_entry_to_arg)
+            .collect::<Vec<_>>();
+
+        let mut merged = Vec::with_capacity(raw.len().saturating_add(config_args.len()));
+        if let Some(program) = raw.first() {
+            merged.push(program.clone());
+        }
+        merged.extend(config_args);
+        merged.extend(raw.into_iter().skip(1));
+        Ok(Self::try_parse_from(merged)?)
+    }
+}
+
+fn raw_option_value(args: &[OsString], name: &str) -> Option<String> {
+    let prefix = format!("--{name}=");
+    for (index, argument) in args.iter().enumerate().skip(1) {
+        let value = argument.to_str()?;
+        if let Some(value) = value.strip_prefix(&prefix) {
+            return Some(value.to_owned());
+        }
+        if value == format!("--{name}") {
+            return args
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .map(ToOwned::to_owned);
+        }
+    }
+    None
+}
+
+fn read_config_file(
+    path: &Path,
+    datadir: &Path,
+    entries: &mut Vec<ConfigFileEntry>,
+    stack: &mut Vec<PathBuf>,
+) -> Result<()> {
+    let path = fs::canonicalize(path)
+        .with_context(|| format!("resolving configuration file {}", path.display()))?;
+    if stack.iter().any(|current| current == &path) {
+        bail!("configuration file include cycle at {}", path.display());
+    }
+    stack.push(path.clone());
+    let contents = fs::read_to_string(&path)
+        .with_context(|| format!("reading configuration file {}", path.display()))?;
+    let mut section = None;
+    for (line_number, line) in contents.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(section_name) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            let section_name = section_name.trim().to_ascii_lowercase();
+            if section_name.is_empty() {
+                bail!(
+                    "empty configuration section in {}:{}",
+                    path.display(),
+                    line_number + 1
+                );
+            }
+            section = Some(section_name);
+            continue;
+        }
+        let (key, value) = line.split_once('=').unwrap_or((line, "1"));
+        let key = key.trim().trim_start_matches('-').to_ascii_lowercase();
+        let value = value.trim().to_owned();
+        if key.is_empty() {
+            bail!(
+                "empty configuration option in {}:{}",
+                path.display(),
+                line_number + 1
+            );
+        }
+        if key == "includeconf" {
+            let include_path = PathBuf::from(&value);
+            let include_path = if include_path.is_absolute() {
+                include_path
+            } else {
+                datadir.join(include_path)
+            };
+            read_config_file(&include_path, datadir, entries, stack)?;
+        } else {
+            entries.push(ConfigFileEntry {
+                section: section.clone(),
+                key,
+                value,
+            });
+        }
+    }
+    stack.pop();
+    Ok(())
+}
+
+fn canonical_network_name(value: &str) -> &'static str {
+    match value.to_ascii_lowercase().as_str() {
+        "bitcoin" | "main" | "mainnet" => "bitcoin",
+        "testnet" | "test" | "testnet3" => "testnet",
+        "testnet4" => "testnet4",
+        "signet" => "signet",
+        "regtest" => "regtest",
+        _ => "invalid",
+    }
+}
+
+fn config_section_applies(section: Option<&str>, network: &str) -> bool {
+    let Some(section) = section else {
+        return true;
+    };
+    canonical_network_name(section) == network
+}
+
+fn config_entry_to_arg(entry: ConfigFileEntry) -> Option<OsString> {
+    if entry.key == "network" {
+        return Some(OsString::from(format!(
+            "--network={}",
+            canonical_network_name(&entry.value)
+        )));
+    }
+    Some(OsString::from(format!("--{}={}", entry.key, entry.value)))
 }
 
 #[derive(Clone, Debug)]
@@ -1622,6 +1813,44 @@ fn parse_byte_units(value: &str, default_multiplier: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_network_sections_and_preserves_command_line_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let included = directory.path().join("included.conf");
+        fs::write(&included, "[regtest]\nrpcallowip=192.0.2.0/24\n").unwrap();
+        let config_file = directory.path().join("bitcoin.conf");
+        fs::write(
+            &config_file,
+            "network=regtest\nserver=false\nmaxconnections=3\n[main]\nserver=true\n[regtest]\nmaxconnections=5\nincludeconf=included.conf\n",
+        )
+        .unwrap();
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--maxconnections=7",
+            "--server=true",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.network, Network::Regtest);
+        assert!(config.rpc_bind.is_some());
+        assert_eq!(config.max_peers, 7);
+        assert_eq!(config.rpc_allow_ips.len(), 1);
+        assert!(config.rpc_allow_ips[0].contains("192.0.2.7".parse().unwrap()));
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(args.network, NetworkName::Regtest);
+        assert_eq!(args.max_peers, 5);
+        assert!(!args.server);
+    }
 
     #[test]
     fn parses_core_style_network_policy_switches() {

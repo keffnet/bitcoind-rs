@@ -1,5 +1,4 @@
 use anyhow::Result;
-use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use bitcoind_rs::{
@@ -16,6 +15,6 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let config = Config::from_args(Args::parse())?;
+    let config = Config::from_args(Args::parse_with_config()?)?;
     Node::open(config)?.run().await
 }

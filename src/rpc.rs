@@ -9321,12 +9321,16 @@ fn accepted_transaction_json(
 }
 
 fn rejected_transaction_json(transaction: &Transaction, error: &MempoolError) -> Value {
-    json!({
+    let mut result = json!({
         "txid": transaction.compute_txid().to_string(),
         "wtxid": transaction.compute_wtxid().to_string(),
         "allowed": false,
         "reject-reason": mempool_reject_reason(error),
-    })
+    });
+    if !matches!(error, MempoolError::MissingInput(_)) {
+        result["reject-details"] = json!(error.to_string());
+    }
+    result
 }
 
 fn exceeds_max_fee(fee_sat: u64, vsize: u64, max_fee_rate: Option<u64>) -> bool {
@@ -11637,6 +11641,16 @@ mod tests {
             script_pubkey: ScriptBuf::from_bytes(vec![0x51; MAX_SCRIPT_SIZE + 1]),
         });
         assert!(validate_burn_amount(&transaction, 0).is_err());
+
+        let rejected = rejected_transaction_json(&transaction, &MempoolError::FeeRate);
+        assert_eq!(rejected["reject-reason"], "mempool min fee not met");
+        assert_eq!(
+            rejected["reject-details"],
+            "transaction fee rate is below the relay minimum"
+        );
+        let missing =
+            rejected_transaction_json(&transaction, &MempoolError::MissingInput(OutPoint::null()));
+        assert!(missing.get("reject-details").is_none());
     }
 
     #[test]

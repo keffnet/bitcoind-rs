@@ -3699,7 +3699,7 @@ async fn serve_peer_loop(
                         *fee_filter.lock()
                     };
                     mempool
-                        .transaction_order()
+                        .main_order()
                         .into_iter()
                         .filter_map(|txid| {
                             mempool.get(&txid).and_then(|entry| {

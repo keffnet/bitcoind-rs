@@ -754,6 +754,13 @@ impl Mempool {
         ordered
     }
 
+    /// Return the topology-aware score order used by Core's mempool
+    /// enumeration APIs. With no practical weight limit this includes every
+    /// entry while still placing ancestors before children.
+    pub fn main_order(&self) -> Vec<Txid> {
+        self.mining_order(u64::MAX, 0)
+    }
+
     /// Return transactions in ancestor-package feerate order for block
     /// assembly. A package consists of an unselected transaction and all of
     /// its unselected ancestors. Packages are scored by effective fee
@@ -1039,7 +1046,7 @@ impl Mempool {
 
     pub fn save_to_file_with_format(&self, path: &Path, legacy_v1: bool) -> Result<()> {
         let mut payload = Vec::new();
-        let transaction_ids = self.transaction_order();
+        let transaction_ids = self.main_order();
         append_u64(&mut payload, transaction_ids.len() as u64);
         let mut serialized_transactions = HashSet::with_capacity(transaction_ids.len());
         for txid in transaction_ids {
@@ -3609,6 +3616,7 @@ mod tests {
             pool.mining_order(4_000_000, 0),
             vec![parent_id, child_id, independent_id]
         );
+        assert_eq!(pool.main_order(), vec![parent_id, child_id, independent_id]);
         assert_eq!(
             pool.mining_order_with_min_fee(4_000_000, 0, 1_000),
             vec![parent_id, child_id]

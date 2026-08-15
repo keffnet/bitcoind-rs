@@ -1588,7 +1588,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 bail!("Verbose results cannot contain mempool sequence values.")
             }
             let mempool = node.mempool.read();
-            let order = mempool.transaction_order();
+            let order = mempool.main_order();
             if verbose {
                 Ok(Value::Object(
                     order
@@ -9468,7 +9468,7 @@ fn mempool_cluster_transaction_ids(mempool: &Mempool, txid: &Txid) -> Option<Vec
     }
     Some(
         mempool
-            .transaction_order()
+            .main_order()
             .into_iter()
             .filter(|candidate| cluster.contains(candidate))
             .collect(),

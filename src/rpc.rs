@@ -1982,6 +1982,12 @@ fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("conf_target must be a positive integer"))?;
     let conf_target = u32::try_from(conf_target)
         .map_err(|_| anyhow!("conf_target must be between 1 and 1008"))?;
+    if !(1..=1_008).contains(&conf_target) {
+        bail!("conf_target must be between 1 and 1008")
+    }
+    // Core cannot produce a meaningful one-block estimate and internally
+    // evaluates that request as a two-block target.
+    let conf_target = conf_target.max(2);
     let conservative = match params
         .get(1)
         .filter(|value| !value.is_null())
@@ -5338,10 +5344,13 @@ fn merge_multisig_witnesses(left: &Witness, right: &Witness) -> Option<Witness> 
 }
 
 fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let inputs = params
-        .get(0)
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("createrawtransaction inputs must be an array"))?;
+    let inputs = match params.get(0) {
+        Some(Value::Null) => &[][..],
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| anyhow!("createrawtransaction inputs must be an array"))?,
+        None => bail!("createrawtransaction inputs must be an array"),
+    };
     let outputs = params
         .get(1)
         .ok_or_else(|| anyhow!("createrawtransaction outputs are missing"))?;
@@ -5385,14 +5394,22 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("transaction input txid is missing"))?
                 .parse()?;
-            let vout = value
+            let vout_value = value
                 .get("vout")
-                .and_then(Value::as_u64)
+                .ok_or_else(|| anyhow!("transaction input vout is missing"))?;
+            if vout_value.as_i64().is_some_and(|vout| vout < 0) {
+                bail!("Invalid parameter, vout cannot be negative")
+            }
+            let vout = vout_value
+                .as_u64()
                 .ok_or_else(|| anyhow!("transaction input vout is missing"))?;
             let vout = u32::try_from(vout)
                 .map_err(|_| anyhow!("transaction input vout is out of range"))?;
             let sequence = match value.get("sequence").filter(|value| !value.is_null()) {
                 Some(value) => {
+                    if value.as_i64().is_some_and(|sequence| sequence < 0) {
+                        bail!("Invalid parameter, sequence number is out of range")
+                    }
                     let sequence = value
                         .as_u64()
                         .ok_or_else(|| anyhow!("transaction input sequence must be an integer"))?;
@@ -12365,6 +12382,8 @@ mod tests {
         let result = dispatch_method(&node, "estimatesmartfee", &json!([6])).unwrap();
         assert_eq!(result["blocks"], json!(6));
         assert!(result.get("feerate").is_none());
+        let one_block = dispatch_method(&node, "estimatesmartfee", &json!([1])).unwrap();
+        assert_eq!(one_block["blocks"], json!(2));
         assert!(dispatch_method(&node, "estimatesmartfee", &json!([0])).is_err());
         assert!(dispatch_method(&node, "estimatesmartfee", &json!([6, "invalid"])).is_err());
     }
@@ -15703,11 +15722,40 @@ mod tests {
             default_transaction.input[0].sequence.to_consensus_u32(),
             0xffff_fffd
         );
+        let null_inputs = create_raw_transaction(&node, &json!([null, {"data": "00"}])).unwrap();
+        let null_input_transaction: Transaction = deserialize(
+            &hex::decode(
+                null_inputs
+                    .as_str()
+                    .expect("null-input raw transaction hex"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(null_input_transaction.input.is_empty());
         assert!(create_raw_transaction(&node, &json!([[], {"data": "00"}, null, "yes"])).is_err());
         assert!(
             create_raw_transaction(&node, &json!([[], {"data": "00"}, null, true, 4])).is_err()
         );
         assert!(create_raw_transaction(&node, &json!([[], {"data": "00"}, "42"])).is_err());
+        assert!(
+            create_raw_transaction(
+                &node,
+                &json!([[
+                {"txid": Txid::from_byte_array([7; 32]).to_string(), "vout": -1}
+            ], {"data": "00"}])
+            )
+            .is_err()
+        );
+        assert!(
+            create_raw_transaction(
+                &node,
+                &json!([[
+                {"txid": Txid::from_byte_array([7; 32]).to_string(), "vout": 1, "sequence": -1}
+            ], {"data": "00"}])
+            )
+            .is_err()
+        );
         assert!(create_raw_transaction(
             &node,
             &json!([[

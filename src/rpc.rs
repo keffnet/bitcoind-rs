@@ -2062,7 +2062,7 @@ fn dispatch_method_for_user(
             ))
         }
         "getnetworkinfo" => {
-            let network_service = if node.chain.read().is_pruned() {
+            let network_service = if node.chain.read().is_network_limited() {
                 wire::NODE_NETWORK_LIMITED
             } else {
                 wire::NODE_NETWORK

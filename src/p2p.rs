@@ -2852,7 +2852,7 @@ async fn serve_peer_loop(
             version.receiver_port = address.port();
         }
     }
-    if peer_state.connection_type != "private-broadcast" && node.chain.read().is_pruned() {
+    if peer_state.connection_type != "private-broadcast" && node.chain.read().is_network_limited() {
         version.services &= !wire::NODE_NETWORK;
         version.services |= wire::NODE_NETWORK_LIMITED;
         version.receiver_services &= !wire::NODE_NETWORK;

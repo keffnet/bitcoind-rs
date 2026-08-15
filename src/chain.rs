@@ -1355,6 +1355,14 @@ impl ChainState {
         self.prune_mode || self.prune_height.is_some()
     }
 
+    /// Return whether the node must advertise limited historical block
+    /// service. Core keeps NODE_NETWORK disabled while an AssumeUTXO
+    /// background chainstate is validating, even when explicit prune mode is
+    /// off.
+    pub fn is_network_limited(&self) -> bool {
+        self.is_pruned() || (self.snapshot_base.is_some() && !self.snapshot_validated)
+    }
+
     pub fn prune_target_size(&self) -> Option<u64> {
         self.prune_target_size
     }
@@ -7147,6 +7155,8 @@ mod tests {
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.snapshot_provenance(), Some((base, false)));
         assert!(reopened.background_chainstate().is_some());
+        assert!(!reopened.is_pruned());
+        assert!(reopened.is_network_limited());
     }
 
     #[test]

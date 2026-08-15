@@ -830,6 +830,7 @@ pub struct Node {
         parking_lot::RwLock<HashMap<usize, tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>>>,
     peer_manager_requests:
         parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<p2p::PeerManagerRequest>>>,
+    pub(crate) electrum_peers: parking_lot::Mutex<electrum::ElectrumPeerRegistry>,
     private_broadcasts: parking_lot::Mutex<HashMap<Wtxid, PrivateBroadcastEntry>>,
     compact_extra_transactions: parking_lot::Mutex<CompactExtraTransactions>,
     orphans: parking_lot::Mutex<OrphanPool>,
@@ -1142,6 +1143,7 @@ impl Node {
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
+            electrum_peers: parking_lot::Mutex::new(electrum::ElectrumPeerRegistry::default()),
             private_broadcasts: parking_lot::Mutex::new(HashMap::new()),
             compact_extra_transactions: parking_lot::Mutex::new(CompactExtraTransactions::new(
                 compact_extra_limit,

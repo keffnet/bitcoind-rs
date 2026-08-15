@@ -1,6 +1,7 @@
 //! Electrum protocol server.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -23,6 +24,168 @@ use crate::{Node, StartupLatch};
 // per-connection allocation.
 const MAX_LINE_SIZE: usize = 2 * crate::validation::MAX_BLOCK_WEIGHT + 64 * 1024;
 const SERVER_NAME: &str = "bitcoind-rs 0.1.0";
+const MAX_ELECTRUM_PEERS: usize = 1_024;
+
+#[derive(Clone, Debug)]
+struct ElectrumPeer {
+    key: String,
+    ip: String,
+    host: String,
+    features: Vec<String>,
+}
+
+#[derive(Default)]
+pub(crate) struct ElectrumPeerRegistry {
+    order: VecDeque<String>,
+    peers: HashMap<String, ElectrumPeer>,
+}
+
+impl ElectrumPeerRegistry {
+    fn insert(&mut self, peer: ElectrumPeer) {
+        if !self.peers.contains_key(&peer.key) {
+            while self.peers.len() >= MAX_ELECTRUM_PEERS {
+                let Some(oldest) = self.order.pop_front() else {
+                    break;
+                };
+                self.peers.remove(&oldest);
+            }
+            self.order.push_back(peer.key.clone());
+        }
+        self.peers.insert(peer.key.clone(), peer);
+    }
+
+    fn as_value(&self) -> Value {
+        json!(
+            self.order
+                .iter()
+                .filter_map(|key| self.peers.get(key))
+                .map(|peer| json!([peer.ip, peer.host, peer.features]))
+                .collect::<Vec<_>>()
+        )
+    }
+}
+
+impl ElectrumPeer {
+    fn from_features(
+        node: &Node,
+        features: &serde_json::Map<String, Value>,
+        remote_address: Option<SocketAddr>,
+    ) -> Result<Option<Self>> {
+        let Some(server_version) = features.get("server_version").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        if server_version.is_empty() || server_version.len() > 256 {
+            return Ok(None);
+        }
+        let Some(genesis_hash) = features.get("genesis_hash").and_then(Value::as_str) else {
+            return Ok(None);
+        };
+        let Ok(genesis_hash) = genesis_hash.parse::<BlockHash>() else {
+            return Ok(None);
+        };
+        let expected_genesis = node.chain.read().block_hash(0).expect("genesis exists");
+        if genesis_hash != expected_genesis {
+            return Ok(None);
+        }
+        let Some(protocol_min) = features
+            .get("protocol_min")
+            .and_then(Value::as_str)
+            .and_then(|value| parse_protocol_version(value).ok())
+        else {
+            return Ok(None);
+        };
+        let Some(protocol_max) = features
+            .get("protocol_max")
+            .and_then(Value::as_str)
+            .and_then(|value| parse_protocol_version(value).ok())
+        else {
+            return Ok(None);
+        };
+        if protocol_min > protocol_max {
+            return Ok(None);
+        }
+        let Some(hosts) = features.get("hosts").and_then(Value::as_object) else {
+            return Ok(None);
+        };
+        if hosts.is_empty() || hosts.len() > 64 {
+            return Ok(None);
+        }
+
+        let mut candidates = Vec::new();
+        for (host, details) in hosts {
+            if host.is_empty()
+                || host.len() > 255
+                || host.chars().any(|character| character.is_control())
+            {
+                continue;
+            }
+            let Some(details) = details.as_object() else {
+                continue;
+            };
+            let tcp_port = peer_feature_port(details.get("tcp_port"));
+            let ssl_port = peer_feature_port(details.get("ssl_port"));
+            if tcp_port.is_none() && ssl_port.is_none() {
+                continue;
+            }
+            candidates.push((host.clone(), tcp_port, ssl_port));
+        }
+        let remote_host = remote_address.map(|address| address.ip().to_string());
+        let Some((host, tcp_port, ssl_port)) = remote_host
+            .as_deref()
+            .and_then(|remote_host| {
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.0 == remote_host)
+            })
+            .or_else(|| candidates.first())
+            .cloned()
+        else {
+            return Ok(None);
+        };
+
+        let pruning = match features.get("pruning") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("invalid pruning limit"))?,
+            ),
+        };
+        let ip = remote_address
+            .map(|address| address.ip().to_string())
+            .or_else(|| {
+                host.parse::<IpAddr>()
+                    .ok()
+                    .map(|address| address.to_string())
+            })
+            .unwrap_or_else(|| host.clone());
+        let mut feature_flags = vec![format!("v{}", protocol_version_string(protocol_max))];
+        if let Some(pruning) = pruning {
+            feature_flags.push(format!("p{pruning}"));
+        }
+        if let Some(tcp_port) = tcp_port {
+            feature_flags.push(format!("t{tcp_port}"));
+        }
+        if let Some(ssl_port) = ssl_port {
+            feature_flags.push(format!("s{ssl_port}"));
+        }
+        let key = format!("{ip}\0{host}");
+        Ok(Some(Self {
+            key,
+            ip,
+            host,
+            features: feature_flags,
+        }))
+    }
+}
+
+fn peer_feature_port(value: Option<&Value>) -> Option<u16> {
+    value
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port != 0)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProtocolVersion {
@@ -57,6 +220,7 @@ struct ElectrumSession {
     protocol_version: ProtocolVersion,
     version_negotiated: bool,
     request_seen: bool,
+    peer_address: Option<SocketAddr>,
 }
 
 impl Default for ElectrumSession {
@@ -65,6 +229,7 @@ impl Default for ElectrumSession {
             protocol_version: MIN_PROTOCOL_VERSION,
             version_negotiated: false,
             request_seen: false,
+            peer_address: None,
         }
     }
 }
@@ -129,13 +294,17 @@ impl ElectrumServer {
 }
 
 async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
+    let peer_address = stream.peer_addr().ok();
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut events = node.subscribe_chain();
     let mut mempool_events = node.subscribe_mempool();
     let mut line = Vec::new();
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
-    let mut session = ElectrumSession::default();
+    let mut session = ElectrumSession {
+        peer_address,
+        ..ElectrumSession::default()
+    };
     let mut headers_subscribed = false;
     let mut numblocks_subscribed = false;
     let mut last_chain_tip = node.chain.read().best_hash();
@@ -280,7 +449,7 @@ fn dispatch_with_session(
         "server.version" => negotiate_version(params, session),
         "server.ping" => server_ping(params, session.protocol_version),
         "server.banner" => Ok(json!("bitcoind-rs wallet-free Bitcoin node")),
-        "server.add_peer" => server_add_peer(node, params),
+        "server.add_peer" => server_add_peer(node, params, session.peer_address),
         "server.donation_address" => Ok(json!("")),
         "server.features" => Ok(server_features_for_protocol(node, session.protocol_version)),
         "blockchain.headers.subscribe" => {
@@ -529,11 +698,8 @@ fn server_features_for_protocol(node: &Arc<Node>, protocol_version: ProtocolVers
     features
 }
 
-fn server_peers_for_protocol(_node: &Arc<Node>, _protocol_version: ProtocolVersion) -> Value {
-    // Bitcoin P2P peers are not Electrum peers. Without a configured
-    // directory of Electrum servers, advertising the node's P2P addresses
-    // would make clients attempt Electrum connections to the wrong ports.
-    json!([])
+fn server_peers_for_protocol(node: &Arc<Node>, _protocol_version: ProtocolVersion) -> Value {
+    node.electrum_peers.lock().as_value()
 }
 
 fn parse_protocol_version(value: &str) -> Result<ProtocolVersion> {
@@ -644,30 +810,20 @@ fn server_ping(params: &Value, protocol_version: ProtocolVersion) -> Result<Valu
     Ok(json!({"data": "0".repeat(length)}))
 }
 
-fn server_add_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
+fn server_add_peer(
+    node: &Arc<Node>,
+    params: &Value,
+    peer_address: Option<SocketAddr>,
+) -> Result<Value> {
     let features = params
         .get(0)
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("server.add_peer expects a features object"))?;
-    let hosts = features
-        .get("hosts")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("server.add_peer features must contain hosts"))?;
-    let mut accepted = false;
-    for (host, details) in hosts {
-        let Some(port) = details.get("tcp_port").and_then(Value::as_u64) else {
-            continue;
-        };
-        let Ok(port) = u16::try_from(port) else {
-            continue;
-        };
-        let host = host.trim_start_matches('[').trim_end_matches(']');
-        let Ok(address) = host.parse() else {
-            continue;
-        };
-        accepted |= node.add_peer_address(std::net::SocketAddr::new(address, port), false);
-    }
-    Ok(json!(accepted))
+    let Some(peer) = ElectrumPeer::from_features(node, features, peer_address)? else {
+        return Ok(Value::Bool(false));
+    };
+    node.electrum_peers.lock().insert(peer);
+    Ok(Value::Bool(true))
 }
 
 fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
@@ -1649,6 +1805,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn electrum_peer_registry_is_bounded_and_fifo() {
+        let mut registry = ElectrumPeerRegistry::default();
+        for index in 0..=MAX_ELECTRUM_PEERS {
+            let host = format!("peer-{index}.example");
+            registry.insert(ElectrumPeer {
+                key: host.clone(),
+                ip: format!("192.0.2.{}", index % 254 + 1),
+                host,
+                features: vec!["v1.7".to_owned(), "t50001".to_owned()],
+            });
+        }
+        let peers = registry.as_value();
+        let peers = peers.as_array().expect("peer registry returns an array");
+        assert_eq!(peers.len(), MAX_ELECTRUM_PEERS);
+        assert_eq!(peers[0][1], json!("peer-1.example"));
+        assert_eq!(peers[MAX_ELECTRUM_PEERS - 1][1], json!("peer-1024.example"));
+    }
+
     #[tokio::test]
     async fn history_notifications_refresh_after_mempool_activity() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -2231,16 +2406,31 @@ mod tests {
             .unwrap(),
             Value::Bool(true)
         );
+        let mut peer_features = server_features(&node);
+        peer_features["hosts"] = json!({
+            "192.0.2.55": {"tcp_port": 50002, "ssl_port": null}
+        });
         assert_eq!(
             dispatch_with_session(
                 &node,
                 "server.add_peer",
-                &json!([{"hosts": {"192.0.2.55": {"tcp_port": 50002}}}]),
+                &json!([peer_features]),
                 &mut subscriptions,
                 &mut session,
             )
             .unwrap(),
             json!(true)
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "server.peers.subscribe",
+                &json!([]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!([["192.0.2.55", "192.0.2.55", ["v1.7", "t50002"]]])
         );
         assert_eq!(
             dispatch_with_session(

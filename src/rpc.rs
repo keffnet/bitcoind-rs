@@ -2502,7 +2502,8 @@ fn is_publicly_routable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
             let [first, second, third, _] = ip.octets();
-            !(first == 0
+            !(ip.is_broadcast()
+                || first == 0
                 || first == 127
                 || first == 10
                 || (first == 172 && (16..=31).contains(&second))
@@ -14974,6 +14975,14 @@ mod tests {
         assert_eq!(ranged_result["success"], true);
         assert_eq!(ranged_result["txouts"], 2);
         assert_eq!(ranged_result["unspents"][0]["height"], 2);
+    }
+
+    #[test]
+    fn publicly_routable_classification_matches_core_reserved_ranges() {
+        assert!(is_publicly_routable("8.8.8.8".parse().unwrap()));
+        assert!(!is_publicly_routable("255.255.255.255".parse().unwrap()));
+        assert!(!is_publicly_routable("192.0.2.1".parse().unwrap()));
+        assert!(!is_publicly_routable("2001:db8::1".parse().unwrap()));
     }
 
     #[test]

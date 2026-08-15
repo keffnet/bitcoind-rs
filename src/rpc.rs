@@ -2134,23 +2134,24 @@ fn estimate_raw_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 const LOG_CATEGORIES: &[&str] = &[
     "addrman",
-    "blockasset",
-    "blockencodings",
-    "blockfilter",
+    "bench",
+    "blockstorage",
+    "cmpctblock",
     "coindb",
     "estimatefee",
     "http",
+    "i2p",
+    "ipc",
+    "kernel",
     "leveldb",
     "libevent",
     "mempool",
     "mempoolrej",
     "net",
-    "netdag",
-    "netfulfilled",
-    "netlowlevel",
-    "not-found",
-    "proxy",
+    "privatebroadcast",
     "prune",
+    "proxy",
+    "qt",
     "rand",
     "reindex",
     "rpc",
@@ -2160,7 +2161,6 @@ const LOG_CATEGORIES: &[&str] = &[
     "txpackages",
     "txreconciliation",
     "validation",
-    "validationinterface",
     "walletdb",
     "zmq",
 ];
@@ -11855,6 +11855,11 @@ fn rpc_help(method: &str) -> String {
     ];
     if method.is_empty() {
         METHODS.join("\n")
+    } else if method == "logging" {
+        format!(
+            "logging: Gets and sets the logging configuration.\nvalid logging categories are: {}",
+            LOG_CATEGORIES.join(", ")
+        )
     } else if METHODS.contains(&method) {
         format!("{method}: wallet-free Bitcoin Core-compatible RPC")
     } else {
@@ -12772,6 +12777,49 @@ mod tests {
         assert_eq!(tip["block_info"]["coinbase"], json!(50.0));
         assert_eq!(tip["block_info"]["new_outputs_ex_coinbase"], json!(0.0));
         assert_eq!(tip["block_info"]["unspendable"], json!(0.0));
+    }
+
+    #[test]
+    fn logging_categories_match_core_v31() {
+        assert_eq!(
+            LOG_CATEGORIES,
+            &[
+                "addrman",
+                "bench",
+                "blockstorage",
+                "cmpctblock",
+                "coindb",
+                "estimatefee",
+                "http",
+                "i2p",
+                "ipc",
+                "kernel",
+                "leveldb",
+                "libevent",
+                "mempool",
+                "mempoolrej",
+                "net",
+                "privatebroadcast",
+                "prune",
+                "proxy",
+                "qt",
+                "rand",
+                "reindex",
+                "rpc",
+                "scan",
+                "selectcoins",
+                "tor",
+                "txpackages",
+                "txreconciliation",
+                "validation",
+                "walletdb",
+                "zmq",
+            ]
+        );
+        assert!(
+            rpc_help("logging")
+                .contains("valid logging categories are: addrman, bench, blockstorage, cmpctblock")
+        );
     }
 
     #[test]

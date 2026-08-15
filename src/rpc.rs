@@ -3034,16 +3034,24 @@ fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn derive_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let descriptor = param::<String>(params, 0)?;
+    let range_argument_supplied = params.get(1).is_some();
     let range = params
         .get(1)
         .filter(|value| !value.is_null())
         .map(parse_descriptor_range)
         .transpose()?;
-    let descriptor_body = if descriptor.contains('#') {
-        descriptor_payload(&descriptor)?.0
-    } else {
-        descriptor.as_str()
-    };
+    if !descriptor.contains('#') {
+        bail!("Missing checksum")
+    }
+    let descriptor_body = descriptor_payload(&descriptor)?.0;
+    let is_range = descriptor_body.contains('*');
+    if range_argument_supplied && !is_range {
+        bail!("Range should not be specified for an un-ranged descriptor")
+    }
+    if !range_argument_supplied && is_range {
+        bail!("Range must be specified for a ranged descriptor")
+    }
+    let range = is_range.then_some(range.unwrap_or((0, 0)));
     let multipath_payloads = expand_descriptor_multipath(descriptor_body)?;
     if multipath_payloads.len() > 1 {
         let addresses = multipath_payloads
@@ -3249,24 +3257,38 @@ fn get_descriptor_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn parse_descriptor_range(value: &Value) -> Result<(u32, u32)> {
-    let values = value
-        .as_array()
-        .ok_or_else(|| anyhow!("descriptor range must be [begin,end]"))?;
-    if values.len() != 2 {
-        bail!("descriptor range must contain begin and end")
+    let (begin, end) = if let Some(end) = value.as_i64() {
+        (0, end)
+    } else if let Some(values) = value.as_array() {
+        if values.len() != 2 {
+            bail!("descriptor range must contain begin and end")
+        }
+        let begin = values[0]
+            .as_i64()
+            .ok_or_else(|| anyhow!("descriptor range begin must be an integer"))?;
+        let end = values[1]
+            .as_i64()
+            .ok_or_else(|| anyhow!("descriptor range end must be an integer"))?;
+        (begin, end)
+    } else {
+        bail!("descriptor range must be specified as end or as [begin,end]")
+    };
+    if begin < 0 || end < 0 {
+        bail!("Range should be greater or equal than 0")
     }
-    let begin = values[0]
-        .as_u64()
-        .ok_or_else(|| anyhow!("descriptor range begin must be an integer"))?;
-    let end = values[1]
-        .as_u64()
-        .ok_or_else(|| anyhow!("descriptor range end must be an integer"))?;
-    let begin = u32::try_from(begin).map_err(|_| anyhow!("descriptor range is too large"))?;
-    let end = u32::try_from(end).map_err(|_| anyhow!("descriptor range is too large"))?;
     if end < begin {
-        bail!("descriptor range end precedes begin")
+        bail!("Range specified as [begin,end] must not have begin after end")
     }
-    Ok((begin, end))
+    if end >= 1_i64 << 31 {
+        bail!("End of range is too high")
+    }
+    if end - begin >= 1_000_000 {
+        bail!("Range is too large")
+    }
+    Ok((
+        u32::try_from(begin).expect("descriptor range begin fits in u32"),
+        u32::try_from(end).expect("descriptor range end fits in u32"),
+    ))
 }
 
 fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -7746,10 +7768,6 @@ fn parse_descriptor_spec(value: &Value) -> Result<(String, Option<(u32, u32)>)> 
 }
 
 fn parse_descriptor_process_range(value: &Value) -> Result<(u32, u32)> {
-    if let Some(end) = value.as_u64() {
-        let end = u32::try_from(end).map_err(|_| anyhow!("descriptor range is too large"))?;
-        return Ok((0, end));
-    }
     parse_descriptor_range(value)
 }
 
@@ -12304,7 +12322,7 @@ fn descriptor_public_key(
 fn descriptor_indices(wildcard: bool, range: Option<(u32, u32)>) -> Result<Vec<Option<u32>>> {
     if wildcard {
         let (start, end) = range.ok_or_else(|| anyhow!("ranged descriptor requires a range"))?;
-        if end.saturating_sub(start) >= 10_000 {
+        if end.saturating_sub(start) >= 1_000_000 {
             bail!("descriptor range is too large")
         }
         Ok((start..=end).map(Some).collect())
@@ -12772,6 +12790,8 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.starts_with("missing parameter ")
         || lower.starts_with("too many positional arguments ")
         || lower.starts_with("unknown named parameter ")
+        || lower.starts_with("range ")
+        || lower.starts_with("end of range ")
         || lower == "block is not in main chain"
         || lower == "block height out of range"
         || lower == "block does not exist at specified height"
@@ -12789,6 +12809,9 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "redeemscript/witnessscript does not match scriptpubkey"
     {
         return -8;
+    }
+    if lower == "missing checksum" {
+        return -5;
     }
     if lower.starts_with("must submit previous header")
         || matches!(
@@ -18890,7 +18913,7 @@ mod tests {
         assert_eq!(result["total_amount"], 50.0);
 
         let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
-        let ranged_descriptor = format!("wpkh({xpub}/0/*)");
+        let ranged_descriptor = descriptor_with_checksum(&format!("wpkh({xpub}/0/*)"));
         let ranged_address = derive_addresses(&node, &json!([ranged_descriptor.clone(), [0, 0]]))
             .unwrap()[0]
             .as_str()
@@ -20173,21 +20196,45 @@ mod tests {
         );
         let validated_p2tr = validate_address(&node, &json!([p2tr.to_string()])).unwrap();
         assert_eq!(validated_p2tr["isscript"], true);
-        let derived = derive_addresses(&node, &json!([format!("pkh({public_key})")])).unwrap();
+        let missing_checksum =
+            derive_addresses(&node, &json!([format!("pkh({public_key})")])).unwrap_err();
+        assert_eq!(missing_checksum.to_string(), "Missing checksum");
+        let derived = derive_addresses(
+            &node,
+            &json!([descriptor_with_checksum(&format!("pkh({public_key})"))]),
+        )
+        .unwrap();
         assert_eq!(derived.as_array().unwrap().len(), 1);
         let scripts =
             expand_descriptor_scripts(&node, &format!("wpkh({public_key})"), None).unwrap();
         assert_eq!(scripts.len(), 1);
         let xpub = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
-        let ranged =
-            derive_addresses(&node, &json!([format!("wpkh({xpub}/0/*)"), [0, 1]])).unwrap();
+        let ranged_descriptor = descriptor_with_checksum(&format!("wpkh({xpub}/0/*)"));
+        let ranged = derive_addresses(&node, &json!([ranged_descriptor.clone(), [0, 1]])).unwrap();
         assert_eq!(ranged.as_array().unwrap().len(), 2);
+        let scalar_range = derive_addresses(&node, &json!([ranged_descriptor, 2])).unwrap();
+        assert_eq!(scalar_range.as_array().unwrap().len(), 3);
         let ranged_with_origin = derive_addresses(
             &node,
-            &json!([format!("wpkh([d34db33f/84'/0'/0']{xpub}/0/*)"), [0, 1]]),
+            &json!([
+                descriptor_with_checksum(&format!("wpkh([d34db33f/84'/0'/0']{xpub}/0/*)")),
+                [0, 1]
+            ]),
         )
         .unwrap();
         assert_eq!(ranged_with_origin.as_array().unwrap().len(), 2);
+        let non_ranged_range = derive_addresses(
+            &node,
+            &json!([
+                descriptor_with_checksum(&format!("pkh({public_key})")),
+                [0, 0]
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            non_ranged_range.to_string(),
+            "Range should not be specified for an un-ranged descriptor"
+        );
         let descriptor_info =
             get_descriptor_info(&node, &json!([format!("wpkh({public_key})")])).unwrap();
         assert_eq!(descriptor_info["isrange"], false);
@@ -20211,8 +20258,11 @@ mod tests {
             2
         );
         assert!(!multipath_info["descriptor"].as_str().unwrap().contains('<'));
-        let multipath_addresses =
-            derive_addresses(&node, &json!([multipath_descriptor, [0, 1]])).unwrap();
+        let multipath_addresses = derive_addresses(
+            &node,
+            &json!([descriptor_with_checksum(&multipath_descriptor), [0, 1]]),
+        )
+        .unwrap();
         assert_eq!(multipath_addresses.as_array().unwrap().len(), 2);
         assert!(multipath_addresses[0].as_array().unwrap().len() == 2);
         assert!(multipath_addresses[1].as_array().unwrap().len() == 2);
@@ -20269,17 +20319,31 @@ mod tests {
                 .is_some_and(|script| script.is_p2wsh())
         );
         assert!(nested_miniscript_candidate.witness_script.is_some());
-        let wrapped = derive_addresses(&node, &json!([format!("sh(wpkh({public_key}))")])).unwrap();
+        let wrapped = derive_addresses(
+            &node,
+            &json!([descriptor_with_checksum(&format!("sh(wpkh({public_key}))"))]),
+        )
+        .unwrap();
         assert_eq!(wrapped.as_array().unwrap().len(), 1);
         let taproot_key = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
-        let taproot = derive_addresses(&node, &json!([format!("tr({taproot_key})")])).unwrap();
+        let taproot = derive_addresses(
+            &node,
+            &json!([descriptor_with_checksum(&format!("tr({taproot_key})"))]),
+        )
+        .unwrap();
         assert_eq!(taproot.as_array().unwrap().len(), 1);
-        let rawtr = derive_addresses(&node, &json!([format!("rawtr({taproot_key})")])).unwrap();
+        let rawtr = derive_addresses(
+            &node,
+            &json!([descriptor_with_checksum(&format!("rawtr({taproot_key})"))]),
+        )
+        .unwrap();
         assert_eq!(rawtr.as_array().unwrap().len(), 1);
         assert_ne!(rawtr[0], taproot[0]);
         let taproot_tree = derive_addresses(
             &node,
-            &json!([format!("tr({taproot_key},pk({public_key}))")]),
+            &json!([descriptor_with_checksum(&format!(
+                "tr({taproot_key},pk({public_key}))"
+            ))]),
         )
         .unwrap();
         assert_eq!(taproot_tree.as_array().unwrap().len(), 1);

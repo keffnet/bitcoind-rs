@@ -2246,29 +2246,26 @@ fn network_info(node: &Arc<Node>) -> Value {
         .config
         .proxy
         .map_or_else(String::new, |proxy| proxy.to_string());
-    let networks = [("ipv4", OnlyNet::Ipv4), ("ipv6", OnlyNet::Ipv6)]
-        .into_iter()
-        .map(|(name, network)| {
-            let reachable =
-                node.config.onlynet.is_empty() || node.config.onlynet.contains(&network);
-            json!({
-                "name": name,
-                "limited": !reachable,
-                "reachable": reachable,
-                "proxy": proxy.as_str(),
-                "proxy_randomize_credentials": false,
-            })
+    let networks = [
+        ("ipv4", OnlyNet::Ipv4, true),
+        ("ipv6", OnlyNet::Ipv6, true),
+        ("onion", OnlyNet::Onion, node.config.proxy.is_some()),
+        ("i2p", OnlyNet::I2p, node.config.proxy.is_some()),
+        ("cjdns", OnlyNet::Cjdns, true),
+    ]
+    .into_iter()
+    .map(|(name, network, transport_available)| {
+        let limited = !node.config.onlynet.is_empty() && !node.config.onlynet.contains(&network);
+        let reachable = !limited && transport_available;
+        json!({
+            "name": name,
+            "limited": limited,
+            "reachable": reachable,
+            "proxy": if node.config.proxy.is_some() { proxy.as_str() } else { "" },
+            "proxy_randomize_credentials": false,
         })
-        .chain(["onion", "i2p", "cjdns"].into_iter().map(|name| {
-            json!({
-                "name": name,
-                "limited": true,
-                "reachable": false,
-                "proxy": "",
-                "proxy_randomize_credentials": false,
-            })
-        }))
-        .collect::<Vec<_>>();
+    })
+    .collect::<Vec<_>>();
     json!(networks)
 }
 
@@ -14916,7 +14913,7 @@ mod tests {
         assert_eq!(ipv6["limited"], json!(true));
         assert_eq!(ipv6["reachable"], json!(false));
         assert_eq!(ipv6["proxy"], json!("127.0.0.1:9050"));
-        for name in ["onion", "i2p", "cjdns"] {
+        for name in ["onion", "i2p"] {
             let network = networks["networks"]
                 .as_array()
                 .unwrap()
@@ -14925,7 +14922,17 @@ mod tests {
                 .unwrap();
             assert_eq!(network["limited"], json!(true));
             assert_eq!(network["reachable"], json!(false));
+            assert_eq!(network["proxy"], json!("127.0.0.1:9050"));
         }
+        let cjdns = networks["networks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|network| network["name"] == "cjdns")
+            .unwrap();
+        assert_eq!(cjdns["limited"], json!(true));
+        assert_eq!(cjdns["reachable"], json!(false));
+        assert_eq!(cjdns["proxy"], json!("127.0.0.1:9050"));
         dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap();
         assert!(node.network_active());
         node.set_listen_address("8.8.8.8:18444".parse().unwrap());

@@ -518,6 +518,15 @@ pub struct Args {
     pub proxy: Option<SocketAddr>,
 
     #[arg(
+        long = "proxyrandomize",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub proxy_randomize: bool,
+
+    #[arg(
         long = "cjdnsreachable",
         default_value_t = false,
         num_args = 0..=1,
@@ -752,6 +761,7 @@ pub struct Config {
     pub dnsseed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
+    pub proxy_randomize: bool,
     pub cjdns_reachable: bool,
     pub peer_permissions: PeerPermissionConfig,
     pub signet_challenge: Option<Vec<u8>>,
@@ -956,6 +966,7 @@ impl Config {
             dnsseed,
             onlynet: args.onlynet,
             proxy: args.proxy,
+            proxy_randomize: args.proxy_randomize,
             cjdns_reachable: args.cjdns_reachable,
             peer_permissions,
             signet_challenge,
@@ -1081,6 +1092,7 @@ mod tests {
         assert_eq!(config.max_mempool_mb, DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB);
         assert_eq!(config.onlynet, vec![OnlyNet::Ipv4]);
         assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
+        assert!(config.proxy_randomize);
         assert!(config.allows_address("192.0.2.1:8333".parse().unwrap()));
         assert!(!config.allows_address("[2001:db8::1]:8333".parse().unwrap()));
         assert!(!config.allows_address("[fc00::1]:8333".parse().unwrap()));
@@ -1148,6 +1160,16 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert!(!config.listen);
         assert!(config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--proxy=127.0.0.1:9050",
+            "--proxyrandomize=false",
+        ])
+        .unwrap();
+        assert!(!Config::from_args(args).unwrap().proxy_randomize);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -1524,7 +1524,14 @@ fn spawn_outbound_loop(
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
-            match connect_peer_endpoint(&endpoint, node.config.proxy).await {
+            match connect_peer_endpoint_with_options(
+                &endpoint,
+                node.config.proxy,
+                false,
+                node.config.proxy_randomize,
+            )
+            .await
+            {
                 Ok(stream) => {
                     info!(endpoint = %endpoint, "connected to configured peer");
                     if let Err(error) = serve_peer(
@@ -1607,7 +1614,13 @@ fn spawn_private_broadcast_loop(
         {
             return;
         }
-        match connect_peer_endpoint_for_private_broadcast(&endpoint, node.config.proxy).await {
+        match connect_peer_endpoint_for_private_broadcast(
+            &endpoint,
+            node.config.proxy,
+            node.config.proxy_randomize,
+        )
+        .await
+        {
             Ok(stream) => {
                 info!(%address, "connected to private-broadcast peer");
                 if let Err(error) = serve_peer(
@@ -1693,24 +1706,27 @@ fn select_discovery_addresses(
         .collect()
 }
 
+#[cfg(test)]
 async fn connect_peer_endpoint(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
 ) -> Result<TcpStream> {
-    connect_peer_endpoint_with_proxy(endpoint, proxy, false).await
+    connect_peer_endpoint_with_options(endpoint, proxy, false, false).await
 }
 
 async fn connect_peer_endpoint_for_private_broadcast(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
+    proxy_randomize: bool,
 ) -> Result<TcpStream> {
-    connect_peer_endpoint_with_proxy(endpoint, proxy, true).await
+    connect_peer_endpoint_with_options(endpoint, proxy, true, proxy_randomize).await
 }
 
-async fn connect_peer_endpoint_with_proxy(
+async fn connect_peer_endpoint_with_options(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
     force_proxy: bool,
+    proxy_randomize: bool,
 ) -> Result<TcpStream> {
     let proxy = proxy.filter(|_| force_proxy || endpoint.uses_proxy_by_default());
     let target = proxy
@@ -1724,7 +1740,7 @@ async fn connect_peer_endpoint_with_proxy(
     })?;
     stream.set_nodelay(true)?;
     if proxy.is_some() {
-        socks5_connect_endpoint(&mut stream, endpoint).await?;
+        socks5_connect_endpoint_with_options(&mut stream, endpoint, proxy_randomize).await?;
     }
     Ok(stream)
 }
@@ -1734,12 +1750,55 @@ async fn socks5_connect(stream: &mut TcpStream, address: SocketAddr) -> Result<(
     socks5_connect_endpoint(stream, &NetworkEndpoint::Ip(address)).await
 }
 
+#[cfg(test)]
 async fn socks5_connect_endpoint(stream: &mut TcpStream, endpoint: &NetworkEndpoint) -> Result<()> {
-    stream.write_all(&[5, 1, 0]).await?;
+    socks5_connect_endpoint_with_options(stream, endpoint, false).await
+}
+
+fn proxy_credentials() -> String {
+    use std::sync::atomic::AtomicU64;
+
+    static PREFIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let prefix = PREFIX.get_or_init(|| format!("{}-", hex::encode(random::<[u8; 8]>())));
+    format!("{prefix}{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+async fn socks5_connect_endpoint_with_options(
+    stream: &mut TcpStream,
+    endpoint: &NetworkEndpoint,
+    proxy_randomize: bool,
+) -> Result<()> {
+    if proxy_randomize {
+        stream.write_all(&[5, 2, 0, 2]).await?;
+    } else {
+        stream.write_all(&[5, 1, 0]).await?;
+    }
     let mut greeting = [0; 2];
     stream.read_exact(&mut greeting).await?;
-    if greeting != [5, 0] {
-        bail!("SOCKS5 proxy does not support unauthenticated connections")
+    if greeting[0] != 5 {
+        bail!("SOCKS5 proxy returned an invalid greeting version")
+    }
+    match greeting[1] {
+        0 if !proxy_randomize => {}
+        0 if proxy_randomize => {}
+        2 if proxy_randomize => {
+            let credential = proxy_credentials();
+            let credential_length =
+                u8::try_from(credential.len()).context("SOCKS5 proxy credential is too long")?;
+            let mut authentication = Vec::with_capacity(3 + credential.len() * 2);
+            authentication.extend_from_slice(&[1, credential_length]);
+            authentication.extend_from_slice(credential.as_bytes());
+            authentication.push(credential_length);
+            authentication.extend_from_slice(credential.as_bytes());
+            stream.write_all(&authentication).await?;
+            let mut response = [0; 2];
+            stream.read_exact(&mut response).await?;
+            if response != [1, 0] {
+                bail!("SOCKS5 proxy authentication failed")
+            }
+        }
+        _ => bail!("SOCKS5 proxy does not support the requested authentication methods"),
     }
 
     let host = endpoint.host_string();
@@ -1832,14 +1891,20 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
     addresses
 }
 
+#[derive(Clone, Copy)]
+struct ProxyRoutingOptions {
+    proxy: Option<SocketAddr>,
+    force_proxy: bool,
+    randomize_credentials: bool,
+}
+
 async fn establish_transport(
     stream: TcpStream,
     endpoint: &NetworkEndpoint,
     outbound: bool,
     network: Network,
     transport_v2: Option<bool>,
-    proxy: Option<SocketAddr>,
-    force_proxy: bool,
+    proxy_options: ProxyRoutingOptions,
 ) -> Result<(
     PeerReader,
     PeerWriterKind,
@@ -1859,9 +1924,14 @@ async fn establish_transport(
             }
             Err(error) => {
                 debug!(%endpoint, %error, "BIP324 handshake failed; retrying with v1");
-                let fallback = connect_peer_endpoint_with_proxy(endpoint, proxy, force_proxy)
-                    .await
-                    .with_context(|| format!("reconnecting to {endpoint} with v1 transport"))?;
+                let fallback = connect_peer_endpoint_with_options(
+                    endpoint,
+                    proxy_options.proxy,
+                    proxy_options.force_proxy,
+                    proxy_options.randomize_credentials,
+                )
+                .await
+                .with_context(|| format!("reconnecting to {endpoint} with v1 transport"))?;
                 return establish_v1(fallback);
             }
         }
@@ -2008,8 +2078,11 @@ async fn serve_peer(
         options.outbound,
         node.config.network,
         options.transport_v2,
-        node.config.proxy,
-        options.connection_type == "private-broadcast",
+        ProxyRoutingOptions {
+            proxy: node.config.proxy,
+            force_proxy: options.connection_type == "private-broadcast",
+            randomize_credentials: node.config.proxy_randomize,
+        },
     )
     .await?;
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
@@ -4697,6 +4770,7 @@ mod tests {
             dnsseed: false,
             onlynet: Vec::new(),
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             signet_challenge: None,
             max_peers: 4,
@@ -5066,6 +5140,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn socks5_proxy_randomized_credentials_are_unique() {
+        let endpoint = NetworkEndpoint::Ip("8.8.8.8:18444".parse().unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut credentials = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut greeting = [0; 4];
+                stream.read_exact(&mut greeting).await.unwrap();
+                assert_eq!(greeting, [5, 2, 0, 2]);
+                stream.write_all(&[5, 2]).await.unwrap();
+
+                let mut authentication_prefix = [0; 2];
+                stream.read_exact(&mut authentication_prefix).await.unwrap();
+                assert_eq!(authentication_prefix[0], 1);
+                let username_length = usize::from(authentication_prefix[1]);
+                let mut username = vec![0; username_length];
+                stream.read_exact(&mut username).await.unwrap();
+                let mut password_length = [0; 1];
+                stream.read_exact(&mut password_length).await.unwrap();
+                let mut password = vec![0; usize::from(password_length[0])];
+                stream.read_exact(&mut password).await.unwrap();
+                assert_eq!(username, password);
+                credentials.push(username);
+                stream.write_all(&[1, 0]).await.unwrap();
+
+                let mut request = [0; 14];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request[..5], &[5, 1, 0, 3, 7]);
+                assert_eq!(&request[5..12], b"8.8.8.8");
+                assert_eq!(&request[12..], &18444u16.to_be_bytes());
+                stream
+                    .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                    .await
+                    .unwrap();
+            }
+            credentials
+        });
+
+        let first = connect_peer_endpoint_with_options(&endpoint, Some(proxy_address), false, true)
+            .await
+            .unwrap();
+        let second =
+            connect_peer_endpoint_with_options(&endpoint, Some(proxy_address), false, true)
+                .await
+                .unwrap();
+        let credentials = server.await.unwrap();
+        assert_ne!(credentials[0], credentials[1]);
+        drop((first, second));
+    }
+
+    #[tokio::test]
     async fn proxy_is_bypassed_for_unroutable_socket_targets() {
         let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_address = target_listener.local_addr().unwrap();
@@ -5142,6 +5269,7 @@ mod tests {
             dnsseed: false,
             onlynet: vec![OnlyNet::Ipv4],
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
@@ -5282,6 +5410,7 @@ mod tests {
             dnsseed: false,
             onlynet: Vec::new(),
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
@@ -5678,6 +5807,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
@@ -5802,6 +5932,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
@@ -5932,6 +6063,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
@@ -6152,6 +6284,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
@@ -6248,6 +6381,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
@@ -6325,6 +6459,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
@@ -6395,6 +6530,7 @@ mod tests {
             dnsseed: false,
             onlynet: Vec::new(),
             proxy: Some("127.0.0.1:9050".parse().unwrap()),
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
@@ -6527,6 +6663,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,

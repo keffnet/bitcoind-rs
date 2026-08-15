@@ -3152,6 +3152,7 @@ mod tests {
             dnsseed: true,
             onlynet: Vec::new(),
             proxy: None,
+            proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,

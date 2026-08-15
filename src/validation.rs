@@ -76,8 +76,10 @@ pub enum ValidationError {
     EmptyBlock,
     #[error("block merkle root is invalid")]
     BadMerkleRoot,
-    #[error("block witness commitment is invalid")]
-    BadWitnessCommitment,
+    #[error("block witness reserved value has the wrong size")]
+    BadWitnessNonceSize,
+    #[error("block witness commitment does not match the witness merkle root")]
+    BadWitnessMerkleMatch,
     #[error("block contains witness data before SegWit activation")]
     UnexpectedWitness,
     #[error("block signet solution is invalid")]
@@ -148,7 +150,8 @@ impl ValidationError {
             Self::Bip94TimeWarp => "time-timewarp-attack".to_owned(),
             Self::EmptyBlock => "bad-blk-length".to_owned(),
             Self::BadMerkleRoot => "bad-txnmrklroot".to_owned(),
-            Self::BadWitnessCommitment => "bad-witness-merkle-match".to_owned(),
+            Self::BadWitnessNonceSize => "bad-witness-nonce-size".to_owned(),
+            Self::BadWitnessMerkleMatch => "bad-witness-merkle-match".to_owned(),
             Self::UnexpectedWitness => "unexpected-witness".to_owned(),
             Self::BadSignetSolution => "bad-signet-blksig".to_owned(),
             Self::OversizedBlock => "bad-blk-weight".to_owned(),
@@ -476,23 +479,23 @@ fn validate_witness_commitment(
             let coinbase = block
                 .txdata
                 .first()
-                .ok_or(ValidationError::BadWitnessCommitment)?;
+                .ok_or(ValidationError::BadWitnessMerkleMatch)?;
             let witness = coinbase
                 .input
                 .first()
                 .map(|input| &input.witness)
-                .ok_or(ValidationError::BadWitnessCommitment)?;
+                .ok_or(ValidationError::BadWitnessNonceSize)?;
             if witness.len() != 1 || witness[0].len() != 32 {
-                return Err(ValidationError::BadWitnessCommitment);
+                return Err(ValidationError::BadWitnessNonceSize);
             }
             let commitment = WitnessCommitment::from_slice(&output.script_pubkey.as_bytes()[6..38])
-                .map_err(|_| ValidationError::BadWitnessCommitment)?;
+                .map_err(|_| ValidationError::BadWitnessMerkleMatch)?;
             let witness_root = block
                 .witness_root()
-                .ok_or(ValidationError::BadWitnessCommitment)?;
+                .ok_or(ValidationError::BadWitnessMerkleMatch)?;
             let expected = Block::compute_witness_commitment(&witness_root, &witness[0]);
             if commitment != expected {
-                return Err(ValidationError::BadWitnessCommitment);
+                return Err(ValidationError::BadWitnessMerkleMatch);
             }
         } else if block.txdata.iter().any(|transaction| {
             transaction
@@ -1339,8 +1342,20 @@ mod tests {
         block.header.merkle_root = block.compute_merkle_root().unwrap();
         assert!(matches!(
             validate_block_structure(&block, Network::Regtest, 1, Amount::MAX_MONEY.to_sat()),
-            Err(ValidationError::BadWitnessCommitment)
+            Err(ValidationError::BadWitnessNonceSize)
         ));
+    }
+
+    #[test]
+    fn witness_commitment_reject_reasons_match_core_bip22() {
+        assert_eq!(
+            ValidationError::BadWitnessNonceSize.bip22_reject_reason(),
+            "bad-witness-nonce-size"
+        );
+        assert_eq!(
+            ValidationError::BadWitnessMerkleMatch.bip22_reject_reason(),
+            "bad-witness-merkle-match"
+        );
     }
 
     #[test]

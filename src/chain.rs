@@ -2928,6 +2928,151 @@ impl ChainState {
         self.replay_utxos_for_block(hash, true)
     }
 
+    /// Reconstruct an older active-chain UTXO set by applying block undo data
+    /// backwards from the serving tip.  The normal forward replay remains the
+    /// compatibility fallback for pruned stores and historical BIP30 edge
+    /// cases, but reverse replay avoids walking the entire chain for ordinary
+    /// historical RPC and snapshot queries.
+    fn replay_active_utxos_backwards(
+        &mut self,
+        hash: BlockHash,
+    ) -> Result<Option<HashMap<OutPoint, UtxoEntry>>> {
+        if !self.is_active_block(&hash) {
+            return Ok(None);
+        }
+        let target_height = self
+            .block_height_by_hash(&hash)
+            .context("active block height is unavailable")?;
+        let tip_height = self.height();
+        if target_height >= tip_height {
+            return Ok(Some(self.utxos.clone()));
+        }
+
+        // The two historical duplicate-coinbase branches require Core's
+        // special disconnect handling.  Their undo records do not contain
+        // enough information to reproduce an overwritten coin exactly, so
+        // leave those paths to the validated forward replay below.
+        if (target_height + 1..=tip_height).any(|height| {
+            let block_hash = self.active_chain[height as usize];
+            is_bip30_repeat(self.network, height, block_hash)
+                || is_bip30_unspendable(self.network, height, block_hash)
+        }) {
+            return Ok(None);
+        }
+
+        let mut utxos = self.utxos.clone();
+        for height in (target_height + 1..=tip_height).rev() {
+            let block_hash = self.active_chain[height as usize];
+            let Some(block) = self.store.get(&block_hash)? else {
+                return Ok(None);
+            };
+            let undo = if let Some(undo) = self.block_undo_cache.get(&block_hash) {
+                undo.clone()
+            } else {
+                let Some(undo) = self.store.get_undo(&block_hash)? else {
+                    return Ok(None);
+                };
+                self.remember_block_undo(block_hash, undo.clone());
+                undo
+            };
+            self.disconnect_block_from_utxos(&mut utxos, &block, height, &undo)?;
+        }
+        Ok(Some(utxos))
+    }
+
+    fn disconnect_block_from_utxos(
+        &self,
+        utxos: &mut HashMap<OutPoint, UtxoEntry>,
+        block: &Block,
+        height: u32,
+        undo: &[Vec<TxOut>],
+    ) -> Result<()> {
+        if undo.len() != block.txdata.len() {
+            bail!(
+                "block undo contains {} transaction entries for a block with {} transactions",
+                undo.len(),
+                block.txdata.len()
+            );
+        }
+
+        // Disconnect transactions in reverse order. Removing each
+        // transaction immediately before restoring its inputs is important
+        // for transactions that spend outputs created earlier in the same
+        // block: the earlier output is restored by the child, then removed
+        // again when its own transaction is disconnected.
+        for (transaction_index, transaction) in block.txdata.iter().enumerate().rev() {
+            let txid = transaction.compute_txid();
+            for output_index in 0..transaction.output.len() {
+                utxos.remove(&OutPoint::new(txid, output_index as u32));
+            }
+            if transaction_index == 0 {
+                continue;
+            }
+            let spent_outputs = undo
+                .get(transaction_index)
+                .context("block undo is missing a transaction entry")?;
+            if spent_outputs.len() != transaction.input.len() {
+                bail!(
+                    "block undo contains {} spent outputs for transaction with {} inputs",
+                    spent_outputs.len(),
+                    transaction.input.len()
+                );
+            }
+            for (input, output) in transaction.input.iter().zip(spent_outputs).rev() {
+                let outpoint = input.previous_output;
+                let entry = self
+                    .restored_utxo_entry(&outpoint, output, block, height)
+                    .with_context(|| format!("cannot reconstruct undo metadata for {outpoint}"))?;
+                utxos.insert(outpoint, entry);
+            }
+        }
+        Ok(())
+    }
+
+    fn restored_utxo_entry(
+        &self,
+        outpoint: &OutPoint,
+        output: &TxOut,
+        current_block: &Block,
+        current_height: u32,
+    ) -> Option<UtxoEntry> {
+        let current_block_hash = current_block.block_hash();
+        let current_transaction =
+            current_block
+                .txdata
+                .iter()
+                .enumerate()
+                .find_map(|(index, transaction)| {
+                    (transaction.compute_txid() == outpoint.txid).then_some(index)
+                });
+        let (height, block_hash, transaction_index) =
+            if let Some(transaction_index) = current_transaction {
+                (current_height, current_block_hash, transaction_index)
+            } else {
+                let location = self
+                    .tx_index
+                    .get(&outpoint.txid)
+                    .or_else(|| self.tx_index_all.get(&outpoint.txid))?;
+                (
+                    location.height,
+                    location.block_hash,
+                    location.transaction_index,
+                )
+            };
+        let node = self.block_index.get(&block_hash)?;
+        let median_time_past = if height == 0 {
+            0
+        } else {
+            self.median_time_past_for_parent(node.header.prev_blockhash)
+        };
+        Some(UtxoEntry {
+            output: output.clone(),
+            height,
+            median_time_past,
+            coinbase: transaction_index == 0,
+        })
+    }
+
     fn replay_utxos_for_block(
         &mut self,
         hash: BlockHash,
@@ -2935,6 +3080,9 @@ impl ChainState {
     ) -> Result<Option<HashMap<OutPoint, UtxoEntry>>> {
         if use_active_cache && hash == self.best_hash() {
             return Ok(Some(self.utxos.clone()));
+        }
+        if let Some(utxos) = self.replay_active_utxos_backwards(hash)? {
+            return Ok(Some(utxos));
         }
         let mut path = Vec::new();
         let mut cursor = hash;
@@ -6449,6 +6597,7 @@ mod tests {
             }],
         };
         let second_txid = second.compute_txid();
+        let expected_before_spend = state.utxos.clone();
         let previous = *state.header(100).expect("height 100 header");
         let mut block = Block {
             header: Header {
@@ -6469,6 +6618,11 @@ mod tests {
         state.connect_block(block).unwrap();
         assert_eq!(state.height(), 101);
         assert!(state.utxo(&OutPoint::new(first_txid, 0)).is_none());
+        let replayed = state
+            .replay_utxos_for_block(state.block_hash(100).unwrap(), false)
+            .unwrap()
+            .expect("active historical UTXO state");
+        assert_eq!(replayed, expected_before_spend);
         assert_eq!(
             state.block_fee_stats(&block_hash).unwrap(),
             Some(BlockFeeStats {

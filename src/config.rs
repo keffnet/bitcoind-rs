@@ -817,6 +817,32 @@ pub struct Args {
     #[arg(long = "maxsigcachesize", default_value_t = DEFAULT_MAX_SIG_CACHE_MIB, hide = true)]
     pub max_sig_cache_mib: i64,
 
+    /// Deprecated Core compatibility switch; checkpoints are not configurable
+    /// in v31.1 and this option has no effect.
+    #[arg(
+        long = "checkpoints",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub checkpoints: Option<bool>,
+
+    /// Deprecated Core wallet/mempool compatibility limits. Cluster limits
+    /// supersede these values in Core v31.1, and this wallet-free build does
+    /// not apply them.
+    #[arg(long = "limitancestorcount", hide = true)]
+    pub limit_ancestor_count: Option<i64>,
+
+    #[arg(long = "limitancestorsize", hide = true)]
+    pub limit_ancestor_size: Option<i64>,
+
+    #[arg(long = "limitdescendantcount", hide = true)]
+    pub limit_descendant_count: Option<i64>,
+
+    #[arg(long = "limitdescendantsize", hide = true)]
+    pub limit_descendant_size: Option<i64>,
+
     #[arg(
         long = "blockreconstructionextratxn",
         default_value_t = DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN
@@ -2793,6 +2819,24 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("use includeconf instead"));
+    }
+
+    #[test]
+    fn parses_core_deprecated_cluster_limit_compatibility_options() {
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--checkpoints=1",
+            "--limitancestorcount=25",
+            "--limitancestorsize=100",
+            "--limitdescendantcount=25",
+            "--limitdescendantsize=100",
+        ])
+        .unwrap();
+        assert_eq!(args.checkpoints, Some(true));
+        assert_eq!(args.limit_ancestor_count, Some(25));
+        assert_eq!(args.limit_ancestor_size, Some(100));
+        assert_eq!(args.limit_descendant_count, Some(25));
+        assert_eq!(args.limit_descendant_size, Some(100));
     }
 
     #[test]

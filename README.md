@@ -49,6 +49,8 @@ JSON-RPC is enabled by default for this daemon and allows loopback clients using
 
 RPC request handling uses Core-compatible defaults of 16 worker slots, 64 queued requests, and a 30-second HTTP timeout. These can be tuned with `--rpcthreads`, `--rpcworkqueue`, and `--rpcservertimeout`.
 
+Consensus script checks use a bounded successful-validation cache; its approximate size defaults to Core's 32 MiB and can be changed with the hidden compatibility option `--maxsigcachesize=<MiB>`.
+
 For the public signet, use `--network signet`. Custom BIP325 challenges can be supplied as script hex with `--signet-challenge <hex>`.
 
 Bloom-filter peer relay is disabled by default, matching Core's default; enable it with `--peer-bloom-filters` when serving BIP37 clients.

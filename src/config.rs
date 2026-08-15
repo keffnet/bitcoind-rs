@@ -685,6 +685,9 @@ pub struct Args {
     pub persistmempool: bool,
 
     #[arg(long, default_value_t = false, hide = true)]
+    pub persistmempoolv1: bool,
+
+    #[arg(long, default_value_t = false, hide = true)]
     pub tx_reconciliation: bool,
 
     #[arg(long = "zmqpubhashtx", value_name = "ADDRESS")]
@@ -765,6 +768,8 @@ pub struct Config {
     pub mempool_expiry_hours: u64,
     /// Load and save the mempool automatically across node restarts.
     pub persist_mempool: bool,
+    /// Write persisted mempool files in Core's legacy v1 format.
+    pub persist_mempool_v1: bool,
     pub zmq: ZmqConfig,
 }
 
@@ -937,6 +942,7 @@ impl Config {
             max_mempool_mb: max_mempool,
             mempool_expiry_hours: args.mempoolexpiry,
             persist_mempool: args.persistmempool,
+            persist_mempool_v1: args.persistmempoolv1,
             zmq: ZmqConfig {
                 tx_reconciliation: args.tx_reconciliation,
                 pub_hash_tx: args.zmq_pub_hash_tx,
@@ -1334,6 +1340,15 @@ mod tests {
         ])
         .unwrap();
         assert!(!Config::from_args(args).unwrap().persist_mempool);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--persistmempoolv1",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().persist_mempool_v1);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

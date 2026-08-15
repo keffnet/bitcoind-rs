@@ -971,6 +971,10 @@ impl Mempool {
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        self.save_to_file_with_format(path, false)
+    }
+
+    pub fn save_to_file_with_format(&self, path: &Path, legacy_v1: bool) -> Result<()> {
         let mut payload = Vec::new();
         let transaction_ids = self.transaction_order();
         append_u64(&mut payload, transaction_ids.len() as u64);
@@ -1005,11 +1009,20 @@ impl Mempool {
         }
 
         let key = random::<[u8; CORE_MEMPOOL_OBFUSCATION_KEY_SIZE]>();
-        let mut bytes = Vec::with_capacity(17 + payload.len());
-        append_u64(&mut bytes, CORE_MEMPOOL_DUMP_VERSION_V2);
-        bytes.extend_from_slice(&serialize(&key.to_vec()));
-        let payload_offset = bytes.len();
-        xor_obfuscate(&mut payload, &key, payload_offset);
+        let mut bytes = Vec::with_capacity(if legacy_v1 { 8 } else { 17 } + payload.len());
+        append_u64(
+            &mut bytes,
+            if legacy_v1 {
+                CORE_MEMPOOL_DUMP_VERSION_V1
+            } else {
+                CORE_MEMPOOL_DUMP_VERSION_V2
+            },
+        );
+        if !legacy_v1 {
+            bytes.extend_from_slice(&serialize(&key.to_vec()));
+            let payload_offset = bytes.len();
+            xor_obfuscate(&mut payload, &key, payload_offset);
+        }
         bytes.extend_from_slice(&payload);
         let temp = path.with_file_name(format!(
             "{}.tmp",
@@ -3021,6 +3034,23 @@ mod tests {
         pool.save_to_file(&path).unwrap();
         let bytes = fs::read(&path).unwrap();
         assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 2);
+        let mut loaded = Mempool::new(Network::Regtest);
+        loaded.load_from_file(&path, &chain).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn persists_core_v1_without_obfuscation() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let path = directory.path().join("mempool-v1.dat");
+        Mempool::new(Network::Regtest)
+            .save_to_file_with_format(&path, true)
+            .unwrap();
+
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0);
         let mut loaded = Mempool::new(Network::Regtest);
         loaded.load_from_file(&path, &chain).unwrap();
         assert!(loaded.is_empty());

@@ -2666,7 +2666,9 @@ impl Node {
     }
 
     pub fn persist_mempool(&self) -> Result<()> {
-        self.mempool.read().save_to_file(&self.mempool_path)
+        self.mempool
+            .read()
+            .save_to_file_with_format(&self.mempool_path, self.config.persist_mempool_v1)
     }
 
     pub fn import_mempool(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -2965,6 +2967,7 @@ mod tests {
             blockfilterindex: true,
             peer_block_filters: true,
             persist_mempool: true,
+            persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,

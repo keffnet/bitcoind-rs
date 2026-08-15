@@ -601,6 +601,26 @@ pub struct Args {
     #[arg(long = "blocksdir", value_name = "PATH")]
     pub blocks_dir: Option<PathBuf>,
 
+    /// Detach the process and continue running in the background on Unix.
+    #[arg(
+        long = "daemon",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub daemon: bool,
+
+    /// Detach and wait for node initialization to complete before returning.
+    #[arg(
+        long = "daemonwait",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub daemon_wait: bool,
+
     /// Apply Core-style cyclic XOR obfuscation to block and undo records.
     #[arg(
         long = "blocksxor",
@@ -3680,6 +3700,18 @@ mod tests {
     #[test]
     fn core_release_version_is_exposed_by_clap() {
         assert_eq!(Args::command().get_version(), Some("31.1.0"));
+    }
+
+    #[test]
+    fn parses_daemon_modes() {
+        let args = Args::try_parse_from(["bitcoind-rs", "--daemon", "--daemonwait"]).unwrap();
+        assert!(args.daemon);
+        assert!(args.daemon_wait);
+
+        let args =
+            Args::try_parse_from(["bitcoind-rs", "--daemon=false", "--daemonwait=0"]).unwrap();
+        assert!(!args.daemon);
+        assert!(!args.daemon_wait);
     }
 
     #[test]

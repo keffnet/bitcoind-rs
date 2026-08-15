@@ -276,6 +276,7 @@ dependencies = [
  "clap",
  "fs2",
  "hex",
+ "libc",
  "miniscript",
  "num-bigint",
  "num-traits",

@@ -1,8 +1,11 @@
+use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::PathBuf;
 
+#[cfg(not(unix))]
+use anyhow::bail;
 use anyhow::{Context, Result};
 use time::{OffsetDateTime, macros::format_description};
 use tracing_subscriber::EnvFilter;
@@ -17,9 +20,23 @@ use bitcoind_rs::{
     config::{Args, Config},
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let config = Config::from_args(Args::parse_with_config()?)?;
+fn main() -> Result<()> {
+    let args = Args::parse_with_config()?;
+    let daemon = args.daemon || args.daemon_wait;
+    let daemon_wait = args.daemon_wait;
+    let config = Config::from_args(args)?;
+    let readiness = if daemon {
+        daemonize(daemon_wait)?
+    } else {
+        None
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run_node(config, DaemonReadyGuard::new(readiness)))
+}
+
+async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()> {
     let node = Node::open(config)?;
     let _pid_file = PidFile::create(node.config.pid_path.clone())?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -66,7 +83,149 @@ async fn main() -> Result<()> {
     } else {
         builder.init();
     }
+    readiness.notify(true);
     node.run().await
+}
+
+struct DaemonReadyGuard {
+    readiness: Option<DaemonReady>,
+}
+
+impl DaemonReadyGuard {
+    fn new(readiness: Option<DaemonReady>) -> Self {
+        Self { readiness }
+    }
+
+    fn notify(&mut self, success: bool) {
+        if let Some(readiness) = self.readiness.take() {
+            readiness.notify(success);
+        }
+    }
+}
+
+impl Drop for DaemonReadyGuard {
+    fn drop(&mut self) {
+        self.notify(false);
+    }
+}
+
+#[cfg(unix)]
+struct DaemonReady {
+    fd: Option<std::os::unix::io::RawFd>,
+}
+
+#[cfg(unix)]
+impl DaemonReady {
+    fn notify(self, success: bool) {
+        if let Some(fd) = self.fd {
+            signal_ready_fd(fd, success);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct DaemonReady;
+
+#[cfg(not(unix))]
+impl DaemonReady {
+    fn notify(self, _success: bool) {}
+}
+
+#[cfg(unix)]
+fn signal_ready_fd(fd: std::os::unix::io::RawFd, success: bool) {
+    let status = [u8::from(success)];
+    // SAFETY: `fd` is the write end of the private readiness pipe created by
+    // `daemonize`, and `status` remains alive for the duration of the write.
+    unsafe {
+        let _ = libc::write(fd, status.as_ptr().cast(), status.len());
+        libc::close(fd);
+    }
+}
+
+#[cfg(unix)]
+fn daemonize(wait: bool) -> Result<Option<DaemonReady>> {
+    use std::os::unix::io::RawFd;
+
+    let mut pipe = [-1 as RawFd; 2];
+    // SAFETY: `pipe` points to space for the two descriptors requested by
+    // libc and is not aliased during the call.
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("creating daemon readiness pipe");
+    }
+
+    // SAFETY: No Tokio runtime or other application threads exist yet; the
+    // process is forked before the async runtime is created.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        // SAFETY: both descriptors were created by the private pipe above.
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        return Err(std::io::Error::last_os_error()).context("forking daemon process");
+    }
+    if pid > 0 {
+        // SAFETY: the parent owns the read end and no longer needs the write
+        // end after forking.
+        unsafe { libc::close(pipe[1]) };
+        let mut status = [0u8; 1];
+        // SAFETY: `status` is writable storage for the one-byte child result.
+        let read = unsafe { libc::read(pipe[0], status.as_mut_ptr().cast(), status.len()) };
+        // SAFETY: the parent owns this descriptor.
+        unsafe { libc::close(pipe[0]) };
+        if read == 1 && status[0] == 1 {
+            std::process::exit(0);
+        }
+        eprintln!("daemon process failed during initialization");
+        std::process::exit(1);
+    }
+
+    let readiness_fd = pipe[1];
+    // SAFETY: the child owns the write end after the fork.
+    unsafe { libc::close(pipe[0]) };
+    // SAFETY: the child is the only process calling these process-level setup
+    // functions, before the Tokio runtime or application threads exist.
+    if unsafe { libc::setsid() } < 0 {
+        signal_ready_fd(readiness_fd, false);
+        return Err(std::io::Error::last_os_error()).context("creating daemon session");
+    }
+
+    let null_path = CString::new("/dev/null").expect("null path contains no NUL");
+    // SAFETY: `null_path` is a valid NUL-terminated path and the flags do not
+    // mutate Rust-managed memory.
+    let null_fd = unsafe { libc::open(null_path.as_ptr(), libc::O_RDWR) };
+    if null_fd < 0 {
+        signal_ready_fd(readiness_fd, false);
+        return Err(std::io::Error::last_os_error()).context("opening /dev/null");
+    }
+    for target in 0..=2 {
+        // SAFETY: `null_fd` and the standard descriptor targets are valid file
+        // descriptor integers at this point.
+        if unsafe { libc::dup2(null_fd, target) } < 0 {
+            if null_fd > 2 {
+                // SAFETY: the child owns the descriptor opened above.
+                unsafe { libc::close(null_fd) };
+            }
+            signal_ready_fd(readiness_fd, false);
+            return Err(std::io::Error::last_os_error()).context("redirecting daemon descriptors");
+        }
+    }
+    if null_fd > 2 {
+        // SAFETY: the child owns the descriptor opened above.
+        unsafe { libc::close(null_fd) };
+    }
+    if !wait {
+        signal_ready_fd(readiness_fd, true);
+        return Ok(Some(DaemonReady { fd: None }));
+    }
+    Ok(Some(DaemonReady {
+        fd: Some(readiness_fd),
+    }))
+}
+
+#[cfg(not(unix))]
+fn daemonize(_wait: bool) -> Result<Option<DaemonReady>> {
+    bail!("--daemon is only supported on Unix platforms")
 }
 
 #[derive(Clone, Copy, Debug)]

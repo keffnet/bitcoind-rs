@@ -4073,14 +4073,41 @@ fn get_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let block_hash = if let Some(hash) = requested_hash {
         hash
     } else {
-        chain
-            .transaction(&txids[0])?
-            .map(|(_, location)| location.block_hash)
-            .ok_or_else(|| anyhow!("transaction not found"))?
+        // Core can locate a block without -txindex only when one of the
+        // requested transactions still has an output in the active UTXO set.
+        // The internal active-chain index is also used by Electrum, but must
+        // not silently expand this RPC's Core-visible lookup semantics.
+        let requested_txids: HashSet<Txid> = txids.iter().copied().collect();
+        let mut utxo_blocks = HashMap::new();
+        for (outpoint, entry) in chain.all_utxos() {
+            if requested_txids.contains(&outpoint.txid)
+                && let Some(block_hash) = chain.block_hash(entry.height)
+            {
+                utxo_blocks.entry(outpoint.txid).or_insert(block_hash);
+            }
+        }
+        let mut sorted_txids = txids.clone();
+        sorted_txids.sort_unstable();
+        let utxo_block = sorted_txids
+            .iter()
+            .find_map(|txid| utxo_blocks.get(txid).copied());
+        let txindex_block = if node.config.txindex {
+            chain
+                .transaction(txids.iter().min().expect("non-empty txid set"))?
+                .map(|(_, location)| location.block_hash)
+        } else {
+            None
+        };
+        utxo_block
+            .or(txindex_block)
+            .ok_or_else(|| anyhow!("Transaction not yet in block"))?
     };
+    if chain.block_height_by_hash(&block_hash).is_none() {
+        bail!("Block not found");
+    }
     let block = chain
         .block(&block_hash)?
-        .ok_or_else(|| anyhow!("block not found"))?;
+        .ok_or_else(|| anyhow!("Block not available"))?;
     let block_txids: HashMap<Txid, usize> = block
         .txdata
         .iter()
@@ -4088,7 +4115,7 @@ fn get_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .map(|(index, transaction)| (transaction.compute_txid(), index))
         .collect();
     if txids.iter().any(|txid| !block_txids.contains_key(txid)) {
-        bail!("transaction is not in the specified block");
+        bail!("Not all transactions found in specified or retrieved block");
     }
     let proof = serialize_merkle_proof(&block, &txids)?;
     Ok(json!(hex::encode(proof)))
@@ -11700,6 +11727,8 @@ mod tests {
             dispatch_method(&node, "verifytxoutproof", &json!([hex::encode(proof)]),).unwrap(),
             json!([txid.to_string()])
         );
+        let no_index_lookup = get_txout_proof(&node, &json!([[txid.to_string()]])).unwrap_err();
+        assert_eq!(no_index_lookup.to_string(), "Transaction not yet in block");
         assert!(
             get_txout_proof(
                 &node,

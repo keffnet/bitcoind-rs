@@ -26,6 +26,10 @@ impl NetworkEndpoint {
     /// whenever CJDNS reachability is enabled.
     pub fn from_socket(address: SocketAddr) -> Self {
         match address {
+            SocketAddr::V6(address) if is_ipv4_mapped(address.ip()) => Self::Ip(SocketAddr::new(
+                IpAddr::V4(mapped_ipv4(address.ip())),
+                address.port(),
+            )),
             SocketAddr::V6(address) if address.ip().octets()[0] == 0xfc => Self::Cjdns {
                 address: *address.ip(),
                 port: address.port(),
@@ -184,6 +188,21 @@ impl NetworkEndpoint {
             _ => bail!("unknown network endpoint type '{network}'"),
         }
     }
+}
+
+fn is_ipv4_mapped(address: &Ipv6Addr) -> bool {
+    let segments = address.segments();
+    segments[..6] == [0, 0, 0, 0, 0, 0xffff]
+}
+
+fn mapped_ipv4(address: &Ipv6Addr) -> Ipv4Addr {
+    let segments = address.segments();
+    Ipv4Addr::new(
+        (segments[6] >> 8) as u8,
+        segments[6] as u8,
+        (segments[7] >> 8) as u8,
+        segments[7] as u8,
+    )
 }
 
 impl fmt::Display for NetworkEndpoint {
@@ -376,6 +395,14 @@ mod tests {
         assert_eq!(
             NetworkEndpoint::from_socket("[fd00::1]:8333".parse().unwrap()),
             NetworkEndpoint::Ip("[fd00::1]:8333".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn normalizes_ipv4_mapped_socket_addresses() {
+        assert_eq!(
+            NetworkEndpoint::from_socket("[::ffff:192.0.2.1]:8333".parse().unwrap()),
+            NetworkEndpoint::Ip("192.0.2.1:8333".parse().unwrap())
         );
     }
 }

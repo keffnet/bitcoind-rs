@@ -1478,10 +1478,12 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 bail!("nblocks must not be negative")
             }
             let depth = u32::try_from(checkblocks).map_err(|_| anyhow!("nblocks is too large"))?;
-            node.chain
+            let verified = node
+                .chain
                 .write()
-                .verify_active_chain_with_level(checklevel as u8, depth)?;
-            Ok(Value::Bool(true))
+                .verify_active_chain_with_level(checklevel as u8, depth)
+                .is_ok();
+            Ok(Value::Bool(verified))
         }
         "getmemoryinfo" => get_memory_info(params),
         "gettxout" => get_txout(node, params),

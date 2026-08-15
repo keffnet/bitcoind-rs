@@ -65,6 +65,8 @@ const MAX_EXTERNAL_BLOCK_RECORD_SIZE: usize = 4 * 1024 * 1024;
 const MAX_UPLOAD_TIMEFRAME_SECS: u64 = 24 * 60 * 60;
 const MAX_UPLOAD_BLOCK_RESERVE_BYTES: u64 = 4_000_000;
 const HISTORICAL_BLOCK_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const MAX_TIME_OFFSET_SAMPLES: usize = 50;
+const CLOCK_OUT_OF_SYNC_THRESHOLD_SECS: u64 = 10 * 60;
 pub(crate) const PRIVATE_BROADCAST_PEERS_PER_TRANSACTION: usize = 3;
 pub(crate) const PRIVATE_BROADCAST_RETRY_SECS: u64 = 60;
 
@@ -133,6 +135,21 @@ fn run_notify_command(command: Option<&str>, argument: Option<&str>) {
     if let Err(error) = result {
         warn!(%error, command = %expanded, "notification command could not be started");
     }
+}
+
+fn run_alert_notify_command(command: Option<&str>, message: &str) {
+    let safe_message = message
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    ' ' | '.' | ',' | ';' | '-' | '_' | '/' | ':' | '?' | '@' | '(' | ')'
+                )
+        })
+        .collect::<String>();
+    let shell_argument = format!("'{safe_message}'");
+    run_notify_command(command, Some(&shell_argument));
 }
 
 struct CompactExtraTransactions {
@@ -470,6 +487,18 @@ pub(crate) struct PrivateBroadcastInfo {
 struct PrivateBroadcastEntry {
     transaction: Transaction,
     peers: Vec<PrivateBroadcastPeer>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NodeWarningKind {
+    ClockOutOfSync,
+    FatalInternal,
+}
+
+#[derive(Clone, Debug)]
+struct NodeWarning {
+    kind: NodeWarningKind,
+    message: String,
 }
 
 #[derive(Clone, Debug)]
@@ -812,6 +841,8 @@ pub struct Node {
     mapped_addresses: parking_lot::RwLock<Vec<SocketAddr>>,
     listen_network_addresses: parking_lot::RwLock<Vec<NetworkEndpoint>>,
     last_mining_block: parking_lot::RwLock<Option<(u64, usize)>>,
+    time_offset_samples: parking_lot::RwLock<VecDeque<i64>>,
+    warnings: parking_lot::RwLock<Vec<NodeWarning>>,
     pub started_at: Instant,
     shutdown: Notify,
 }
@@ -1102,6 +1133,8 @@ impl Node {
             mapped_addresses: parking_lot::RwLock::new(Vec::new()),
             listen_network_addresses: parking_lot::RwLock::new(Vec::new()),
             last_mining_block: parking_lot::RwLock::new(None),
+            time_offset_samples: parking_lot::RwLock::new(VecDeque::new()),
+            warnings: parking_lot::RwLock::new(Vec::new()),
             started_at: Instant::now(),
             shutdown: Notify::new(),
         });
@@ -2750,9 +2783,73 @@ impl Node {
     }
 
     pub(crate) fn update_peer_time_offset(&self, id: usize, time_offset: i64) {
-        if let Some(peer) = self.peers.write().get_mut(&id) {
+        let outbound = if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.time_offset = time_offset;
+            !peer.inbound && peer.version.is_some()
+        } else {
+            false
+        };
+        if outbound {
+            let mut samples = self.time_offset_samples.write();
+            if samples.len() >= MAX_TIME_OFFSET_SAMPLES {
+                samples.pop_front();
+            }
+            samples.push_back(time_offset);
         }
+        self.refresh_clock_warning();
+    }
+
+    fn refresh_clock_warning(&self) {
+        let mut offsets = self
+            .time_offset_samples
+            .read()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        if offsets.len() < 5 {
+            self.unset_warning(NodeWarningKind::ClockOutOfSync);
+            return;
+        }
+        offsets.sort_unstable();
+        let median = offsets[offsets.len() / 2];
+        if median.unsigned_abs() > CLOCK_OUT_OF_SYNC_THRESHOLD_SECS {
+            self.set_warning(
+                NodeWarningKind::ClockOutOfSync,
+                "Your computer's date and time appear to be more than 10 minutes out of sync with the network, this may lead to consensus failure. After you've confirmed your computer's clock, this message should no longer appear when you restart your node. Without a restart, it should stop showing automatically after you've connected to a sufficient number of new outbound peers, which may take some time. You can inspect the timeoffset field of the getpeerinfo and getnetworkinfo RPC methods to get more info.".to_owned(),
+            );
+        } else {
+            self.unset_warning(NodeWarningKind::ClockOutOfSync);
+        }
+    }
+
+    pub(crate) fn set_warning(&self, kind: NodeWarningKind, message: String) {
+        let inserted = {
+            let mut warnings = self.warnings.write();
+            if warnings.iter().any(|warning| warning.kind == kind) {
+                false
+            } else {
+                warnings.push(NodeWarning {
+                    kind,
+                    message: message.clone(),
+                });
+                true
+            }
+        };
+        if inserted {
+            run_alert_notify_command(self.config.alert_notify.as_deref(), &message);
+        }
+    }
+
+    pub(crate) fn unset_warning(&self, kind: NodeWarningKind) {
+        self.warnings.write().retain(|warning| warning.kind != kind);
+    }
+
+    pub(crate) fn warning_messages(&self) -> Vec<String> {
+        self.warnings
+            .read()
+            .iter()
+            .map(|warning| warning.message.clone())
+            .collect()
     }
 
     pub(crate) fn enable_peer_address_relay(&self, id: usize) {
@@ -2872,6 +2969,7 @@ impl Node {
         }
         self.orphans.lock().erase_for_peer(id);
         self.maybe_check_addrman();
+        self.refresh_clock_warning();
     }
 
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
@@ -3563,6 +3661,10 @@ impl Node {
                 ticker.tick().await;
                 if let Err(error) = background_node.chain.write().poll_background_validation() {
                     warn!(%error, "background AssumeUTXO validation supervisor failed to poll");
+                    background_node.set_warning(
+                        NodeWarningKind::FatalInternal,
+                        format!("background AssumeUTXO validation failed: {error}"),
+                    );
                 }
             }
         });
@@ -4076,6 +4178,7 @@ mod tests {
             startup_notify: None,
             block_notify: None,
             shutdown_notify: None,
+            alert_notify: None,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -4789,6 +4892,50 @@ mod tests {
         node.update_peer_time_offset(4, 500);
 
         assert_eq!(node.median_outbound_time_offset(), 1);
+    }
+
+    #[test]
+    fn warning_manager_deduplicates_and_clears_warnings() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+
+        node.set_warning(
+            NodeWarningKind::FatalInternal,
+            "fatal validation error".to_owned(),
+        );
+        node.set_warning(
+            NodeWarningKind::FatalInternal,
+            "a newer fatal validation error".to_owned(),
+        );
+        assert_eq!(node.warning_messages(), vec!["fatal validation error"]);
+
+        node.unset_warning(NodeWarningKind::FatalInternal);
+        assert!(node.warning_messages().is_empty());
+    }
+
+    #[test]
+    fn clock_warning_uses_five_outbound_samples_and_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        for id in 1..=5 {
+            node.register_peer(
+                id,
+                format!("192.0.2.{id}:18444").parse().unwrap(),
+                false,
+                sender.clone(),
+            );
+            node.update_peer_version(id, 70016, 0, "/test-peer/", 0, true);
+            node.update_peer_time_offset(id, 601);
+        }
+        assert_eq!(node.warning_messages().len(), 1);
+        assert!(node.warning_messages()[0].contains("more than 10 minutes"));
+
+        for _ in 0..6 {
+            node.update_peer_time_offset(1, 0);
+        }
+        assert!(node.warning_messages().is_empty());
     }
 
     #[test]

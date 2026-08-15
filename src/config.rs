@@ -829,6 +829,9 @@ pub struct Args {
     #[arg(long = "shutdownnotify", value_name = "COMMAND")]
     pub shutdown_notify: Option<String>,
 
+    #[arg(long = "alertnotify", value_name = "COMMAND")]
+    pub alert_notify: Option<String>,
+
     #[arg(long = "stopatheight", default_value_t = 0)]
     pub stop_at_height: u32,
 
@@ -1736,6 +1739,7 @@ pub struct Config {
     pub startup_notify: Option<String>,
     pub block_notify: Option<String>,
     pub shutdown_notify: Option<String>,
+    pub alert_notify: Option<String>,
     pub stop_at_height: u32,
     pub(crate) max_tip_age_secs: u64,
     pub mock_time: Option<i64>,
@@ -2290,6 +2294,7 @@ impl Config {
             startup_notify: args.startup_notify,
             block_notify: args.block_notify,
             shutdown_notify: args.shutdown_notify,
+            alert_notify: args.alert_notify,
             stop_at_height: args.stop_at_height,
             max_tip_age_secs: args.max_tip_age,
             mock_time: args.mock_time,
@@ -2803,6 +2808,7 @@ mod tests {
             "--startupnotify=echo start",
             "--blocknotify=echo %s",
             "--shutdownnotify=echo stop",
+            "--alertnotify=echo %s",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
@@ -2820,6 +2826,7 @@ mod tests {
         assert_eq!(config.startup_notify.as_deref(), Some("echo start"));
         assert_eq!(config.block_notify.as_deref(), Some("echo %s"));
         assert_eq!(config.shutdown_notify.as_deref(), Some("echo stop"));
+        assert_eq!(config.alert_notify.as_deref(), Some("echo %s"));
         assert!(config.proxy_randomize);
         assert!(config.v2_transport);
         assert!(config.allows_address("192.0.2.1:8333".parse().unwrap()));

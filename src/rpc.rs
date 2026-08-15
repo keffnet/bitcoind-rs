@@ -2937,7 +2937,7 @@ fn add_peer_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .ok_or_else(|| anyhow!("tried must be a boolean"))?,
     };
     let endpoint = if let Ok(address) = parse_ip_address(&address) {
-        NetworkEndpoint::Ip(SocketAddr::new(address, port))
+        NetworkEndpoint::from_socket(SocketAddr::new(address, port))
     } else if address.ends_with(".onion") {
         NetworkEndpoint::parse(Some("onion"), &address, Some(port))?
     } else if address.ends_with(".b32.i2p") {
@@ -15146,15 +15146,20 @@ mod tests {
             json!({"success": true})
         );
         assert_eq!(
+            dispatch_method(&node, "addpeeraddress", &json!(["fc00::10", 18444, true]),).unwrap(),
+            json!({"success": true})
+        );
+        assert_eq!(
             dispatch_method(&node, "addpeeraddress", &json!(["192.0.2.10", 18444]),).unwrap()["success"],
             false
         );
         let info = dispatch_method(&node, "getaddrmaninfo", &json!([])).unwrap();
         assert_eq!(info["ipv4"], json!({"new": 1, "tried": 0, "total": 1}));
         assert_eq!(info["ipv6"], json!({"new": 0, "tried": 1, "total": 1}));
+        assert_eq!(info["cjdns"], json!({"new": 0, "tried": 1, "total": 1}));
         let raw = dispatch_method(&node, "getrawaddrman", &json!([])).unwrap();
         assert_eq!(raw["new"].as_object().unwrap().len(), 1);
-        assert_eq!(raw["tried"].as_object().unwrap().len(), 1);
+        assert_eq!(raw["tried"].as_object().unwrap().len(), 2);
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         node.register_peer_with_endpoint(

@@ -441,7 +441,7 @@ impl PeerPermissionConfig {
 
 impl OnlyNet {
     pub fn matches(self, address: SocketAddr) -> bool {
-        self.matches_endpoint(&NetworkEndpoint::Ip(address))
+        self.matches_endpoint(&NetworkEndpoint::from_socket(address))
     }
 
     pub fn matches_endpoint(self, endpoint: &NetworkEndpoint) -> bool {
@@ -989,7 +989,7 @@ impl Config {
     }
 
     pub fn allows_address(&self, address: SocketAddr) -> bool {
-        self.allows_network_endpoint(&NetworkEndpoint::Ip(address))
+        self.allows_network_endpoint(&NetworkEndpoint::from_socket(address))
     }
 
     pub fn allows_network_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
@@ -1064,6 +1064,9 @@ mod tests {
         assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
         assert!(config.allows_address("192.0.2.1:8333".parse().unwrap()));
         assert!(!config.allows_address("[2001:db8::1]:8333".parse().unwrap()));
+        assert!(!config.allows_address("[fc00::1]:8333".parse().unwrap()));
+        assert!(OnlyNet::Cjdns.matches("[fc00::1]:8333".parse().unwrap()));
+        assert!(!OnlyNet::Ipv6.matches("[fc00::1]:8333".parse().unwrap()));
         assert_eq!(config.prune, 0);
         assert_eq!(config.max_upload_target, 0);
 

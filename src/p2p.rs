@@ -1256,7 +1256,7 @@ impl PeerManager {
             for address in &addresses {
                 if self.node.config.allows_address(*address) {
                     self.node.remember_network_address(
-                        NetworkEndpoint::Ip(*address),
+                        NetworkEndpoint::from_socket(*address),
                         wire::NODE_NETWORK | wire::NODE_WITNESS,
                         unix_time_seconds(),
                     );
@@ -1269,7 +1269,7 @@ impl PeerManager {
                 .seed_nodes
                 .iter()
                 .copied()
-                .map(NetworkEndpoint::Ip)
+                .map(NetworkEndpoint::from_socket)
                 .collect()
         };
         for endpoint in seed_nodes {
@@ -1335,9 +1335,9 @@ impl PeerManager {
                             break;
                         };
                         let (endpoint, persistent, transport_v2, connection_type, manual) = match request {
-                            PeerManagerRequest::Add(address, transport_v2) => (NetworkEndpoint::Ip(address), true, transport_v2, "outbound-full", true),
+                            PeerManagerRequest::Add(address, transport_v2) => (NetworkEndpoint::from_socket(address), true, transport_v2, "outbound-full", true),
                             PeerManagerRequest::OneTry(address, transport_v2, connection_type) => {
-                                (NetworkEndpoint::Ip(address), false, transport_v2, connection_type, true)
+                                (NetworkEndpoint::from_socket(address), false, transport_v2, connection_type, true)
                             }
                             PeerManagerRequest::PrivateBroadcast { address, transaction } => {
                                 spawn_private_broadcast_loop(
@@ -1426,7 +1426,7 @@ async fn run_inbound_listener(
             if let Err(error) = serve_peer(
                 node,
                 stream,
-                NetworkEndpoint::Ip(address),
+                NetworkEndpoint::from_socket(address),
                 PeerConnectionOptions {
                     outbound: false,
                     transport_v2: None,
@@ -3530,7 +3530,7 @@ async fn serve_peer_loop(
                     if let Some(address) = socket_address_from_legacy(&entry)
                         && node.allow_peer_address(peer_id)
                     {
-                        let endpoint = NetworkEndpoint::Ip(address);
+                        let endpoint = NetworkEndpoint::from_socket(address);
                         if node.remember_network_address(
                             endpoint.clone(),
                             entry.services,

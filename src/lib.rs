@@ -1964,7 +1964,7 @@ impl Node {
     ) {
         self.register_peer_with_endpoint(
             id,
-            NetworkEndpoint::Ip(address),
+            NetworkEndpoint::from_socket(address),
             inbound,
             commands,
             None,
@@ -2260,7 +2260,7 @@ impl Node {
             .read()
             .values()
             .map(|peer| KnownNetworkAddress {
-                endpoint: NetworkEndpoint::Ip(peer.address),
+                endpoint: peer.endpoint.clone(),
                 services: peer.services,
                 time: peer.connected_at,
             })
@@ -2278,9 +2278,12 @@ impl Node {
             NetworkEndpoint::Ip(address) => self.is_address_tried(*address),
             NetworkEndpoint::OnionV2 { .. }
             | NetworkEndpoint::OnionV3 { .. }
-            | NetworkEndpoint::I2p { .. }
-            | NetworkEndpoint::Cjdns { .. } => {
+            | NetworkEndpoint::I2p { .. } => self.network_tried_addresses.read().contains(endpoint),
+            NetworkEndpoint::Cjdns { .. } => {
                 self.network_tried_addresses.read().contains(endpoint)
+                    || endpoint
+                        .socket_addr()
+                        .is_some_and(|address| self.is_address_tried(address))
             }
         }
     }
@@ -2355,7 +2358,7 @@ impl Node {
             PeerInfo {
                 id: 0,
                 address,
-                endpoint: NetworkEndpoint::Ip(address),
+                endpoint: NetworkEndpoint::from_socket(address),
                 local_address: None,
                 reported_local_address: None,
                 inbound: false,
@@ -2400,6 +2403,10 @@ impl Node {
         drop(known);
         if tried {
             self.tried_addresses.write().insert(address);
+            let endpoint = NetworkEndpoint::from_socket(address);
+            if matches!(endpoint, NetworkEndpoint::Cjdns { .. }) {
+                self.network_tried_addresses.write().insert(endpoint);
+            }
         }
         true
     }
@@ -2410,10 +2417,11 @@ impl Node {
             return false;
         }
         let is_new = !known.contains_key(&address);
+        let endpoint = NetworkEndpoint::from_socket(address);
         let entry = known.entry(address).or_insert_with(|| PeerInfo {
             id: 0,
             address,
-            endpoint: NetworkEndpoint::Ip(address),
+            endpoint,
             local_address: None,
             reported_local_address: None,
             inbound: false,

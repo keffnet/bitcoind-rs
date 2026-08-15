@@ -21,6 +21,19 @@ pub enum NetworkEndpoint {
 }
 
 impl NetworkEndpoint {
+    /// Classify a socket-shaped address for the networks this node can route
+    /// directly. Core treats the CJDNS fc00::/8 prefix as a separate network
+    /// whenever CJDNS reachability is enabled.
+    pub fn from_socket(address: SocketAddr) -> Self {
+        match address {
+            SocketAddr::V6(address) if address.ip().octets()[0] == 0xfc => Self::Cjdns {
+                address: *address.ip(),
+                port: address.port(),
+            },
+            address => Self::Ip(address),
+        }
+    }
+
     /// Decode a BIP155 network/address pair.
     pub fn from_addr_v2(network: u8, address: &[u8], port: u16) -> Option<Self> {
         if port == 0 {
@@ -142,7 +155,7 @@ impl NetworkEndpoint {
             if socket.port() == 0 {
                 bail!("network endpoint port must be non-zero")
             }
-            return Ok(Self::Ip(socket));
+            return Ok(Self::from_socket(socket));
         };
         let port = port.ok_or_else(|| anyhow::anyhow!("network endpoint is missing a port"))?;
         if port == 0 {
@@ -349,5 +362,20 @@ mod tests {
         assert!(NetworkEndpoint::from_addr_v2(3, &[0; 9], 8333).is_none());
         assert!(NetworkEndpoint::from_addr_v2(4, &[0; 32], 0).is_none());
         assert!(NetworkEndpoint::parse(Some("i2p"), "abcd", Some(8333)).is_err());
+    }
+
+    #[test]
+    fn classifies_cjdns_socket_addresses() {
+        assert_eq!(
+            NetworkEndpoint::from_socket("[fc00::1]:8333".parse().unwrap()),
+            NetworkEndpoint::Cjdns {
+                address: "fc00::1".parse().unwrap(),
+                port: 8333,
+            }
+        );
+        assert_eq!(
+            NetworkEndpoint::from_socket("[fd00::1]:8333".parse().unwrap()),
+            NetworkEndpoint::Ip("[fd00::1]:8333".parse().unwrap())
+        );
     }
 }

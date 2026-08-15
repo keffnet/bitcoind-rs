@@ -426,17 +426,21 @@ fn dispatch_with_session(
         }
         "blockchain.estimatefee" => {
             let conf_target = param::<u32>(params, 0)?;
+            if !(1..=1_008).contains(&conf_target) {
+                bail!("conf_target must be between 1 and 1008")
+            }
             let mode = crate::rpc::optional_str(params, 1, "UNSET", "mode")?;
             let conservative = match mode.to_ascii_uppercase().as_str() {
                 "UNSET" | "ECONOMICAL" => false,
                 "CONSERVATIVE" => true,
                 _ => bail!("mode must be UNSET, ECONOMICAL, or CONSERVATIVE"),
             };
-            let rate = node
-                .chain
-                .write()
-                .estimate_fee_rate_sat_per_kvb(conf_target, conservative)?
-                .map_or(-1.0, |rate| rate as f64 / 100_000_000.0);
+            let rate = if node.config.blocksonly {
+                None
+            } else {
+                node.estimate_smart_fee(conf_target, conservative).0
+            }
+            .map_or(-1.0, |rate| rate as f64 / 100_000_000.0);
             Ok(json!(rate))
         }
         "blockchain.relayfee" => {

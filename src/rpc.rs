@@ -9419,13 +9419,11 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
     }
 
     let chain = node.chain.read();
-    let before_transactions = node
-        .mempool
-        .read()
+    let original_mempool = node.mempool.read();
+    let before_transactions = original_mempool
         .transactions()
         .map(|transaction| (transaction.compute_txid(), transaction.clone()))
         .collect::<HashMap<_, _>>();
-    let original_mempool = node.mempool.read();
     let preexisting = transactions
         .iter()
         .filter_map(|transaction| {

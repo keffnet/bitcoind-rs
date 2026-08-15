@@ -54,6 +54,22 @@ pub const MAX_CLUSTER_COUNT: usize = MAX_CLUSTER_COUNT_LIMIT;
 pub const MAX_CLUSTER_VSIZE: u64 = DEFAULT_CLUSTER_SIZE_KVB * 1_000;
 const MAX_REPLACEMENT_CANDIDATES: usize = 100;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RbfPolicy {
+    Never,
+    OptIn,
+    #[default]
+    Always,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TrucPolicy {
+    Reject,
+    #[default]
+    Accept,
+    Enforce,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MempoolPolicy {
     pub min_relay_fee_sat_per_kvb: u64,
@@ -65,6 +81,8 @@ pub struct MempoolPolicy {
     pub require_standard: bool,
     pub cluster_count_limit: usize,
     pub cluster_vsize_limit: u64,
+    pub rbf_policy: RbfPolicy,
+    pub truc_policy: TrucPolicy,
 }
 
 impl Default for MempoolPolicy {
@@ -80,6 +98,8 @@ impl Default for MempoolPolicy {
             require_standard: true,
             cluster_count_limit: DEFAULT_CLUSTER_COUNT,
             cluster_vsize_limit: MAX_CLUSTER_VSIZE,
+            rbf_policy: RbfPolicy::default(),
+            truc_policy: TrucPolicy::default(),
         }
     }
 }
@@ -625,6 +645,18 @@ impl Mempool {
 
     pub fn permit_bare_multisig(&self) -> bool {
         self.policy.permit_bare_multisig
+    }
+
+    pub fn rbf_policy(&self) -> RbfPolicy {
+        self.policy.rbf_policy
+    }
+
+    pub fn full_rbf(&self) -> bool {
+        self.policy.rbf_policy == RbfPolicy::Always
+    }
+
+    pub fn truc_policy(&self) -> TrucPolicy {
+        self.policy.truc_policy
     }
 
     pub fn sequence(&self) -> u64 {
@@ -1419,6 +1451,7 @@ impl Mempool {
                 )?;
             }
             if !direct_conflicts.is_empty() {
+                candidate.check_replacement_policy(&direct_conflicts)?;
                 package_replaced = true;
                 let removal = candidate.conflicts_and_descendants(&direct_conflicts);
                 if transactions.iter().any(|transaction| {
@@ -1571,6 +1604,7 @@ impl Mempool {
         }
         let direct_conflicts = self.conflicts_for(&transaction);
         self.check_replacement_cluster_limit(transaction.compute_txid(), &direct_conflicts)?;
+        self.check_replacement_policy(&direct_conflicts)?;
         let removal = self.conflicts_and_descendants(&conflicts);
         let mut allowed_unconfirmed = HashSet::new();
         for conflict in &conflicts {
@@ -1669,6 +1703,23 @@ impl Mempool {
                 count,
                 limit: MAX_REPLACEMENT_CANDIDATES,
             });
+        }
+        Ok(())
+    }
+
+    fn check_replacement_policy(&self, direct_conflicts: &[Txid]) -> Result<(), MempoolError> {
+        if self.policy.rbf_policy == RbfPolicy::Never {
+            return Err(MempoolError::ReplacementDisallowed);
+        }
+        if self.policy.rbf_policy == RbfPolicy::OptIn
+            && direct_conflicts.iter().any(|txid| {
+                self.entries.get(txid).is_some_and(|entry| {
+                    entry.transaction.version.0 != TRUC_VERSION
+                        && !signals_replaceability(&entry.transaction)
+                })
+            })
+        {
+            return Err(MempoolError::ReplacementDisallowed);
         }
         Ok(())
     }
@@ -1943,7 +1994,10 @@ impl Mempool {
                 &self.policy,
             )?;
         }
+        let truc_min_fee_exempt =
+            self.policy.truc_policy == TrucPolicy::Enforce && transaction.version.0 == TRUC_VERSION;
         if enforce_fee_rate
+            && !truc_min_fee_exempt
             && !fee_rate_meets(
                 i128::from(modified_fee_sat),
                 vsize,
@@ -1953,7 +2007,13 @@ impl Mempool {
             return Err(MempoolError::FeeRate);
         }
         if enforce_mempool_policy {
-            self.check_truc_policy(&transaction, vsize)?;
+            match self.policy.truc_policy {
+                TrucPolicy::Reject if transaction.version.0 == TRUC_VERSION => {
+                    return Err(MempoolError::NonStandard("version".to_owned()));
+                }
+                TrucPolicy::Enforce => self.check_truc_policy(&transaction, vsize)?,
+                TrucPolicy::Accept | TrucPolicy::Reject => {}
+            }
             validate_ephemeral_spends(std::slice::from_ref(&transaction), self)?;
         }
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
@@ -4172,7 +4232,15 @@ mod tests {
     fn single_transaction_truc_acceptance_can_evict_a_sibling() {
         let directory = tempfile::tempdir().unwrap();
         let chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
-        let mut pool = Mempool::new(Network::Regtest);
+        let mut pool = Mempool::with_max_bytes_and_policy(
+            Network::Regtest,
+            DEFAULT_MAX_MEMPOOL_BYTES,
+            MempoolPolicy {
+                require_standard: false,
+                truc_policy: TrucPolicy::Enforce,
+                ..MempoolPolicy::default()
+            },
+        );
         let mut parent = graph_transaction(Txid::from_byte_array([40; 32]), 40);
         parent.version = Version::non_standard(TRUC_VERSION);
         parent.input[0].script_sig = ScriptBuf::from_bytes(vec![0; 8]);
@@ -4203,8 +4271,9 @@ mod tests {
         let replacement_id = replacement.compute_txid();
 
         let mut test_pool = pool.clone();
+        let test_result = test_pool.accept_without_sibling(replacement.clone(), &chain);
         assert!(matches!(
-            test_pool.accept_without_sibling(replacement.clone(), &chain),
+            test_result,
             Err(MempoolError::Truc(reason)) if reason.contains("descendant count limit")
         ));
         assert_eq!(pool.truc_sibling_for(&replacement), Some(sibling_id));
@@ -4212,6 +4281,54 @@ mod tests {
         assert!(pool.get(&sibling_id).is_none());
         assert!(pool.get(&replacement_id).is_some());
         assert_eq!(pool.children(&parent_id), vec![replacement_id]);
+    }
+
+    #[test]
+    fn replacement_policy_matches_core_modes() {
+        let old = graph_transaction(Txid::from_byte_array([50; 32]), 50);
+        let old_id = old.compute_txid();
+
+        let mut never = Mempool::with_max_bytes_and_policy(
+            Network::Regtest,
+            DEFAULT_MAX_MEMPOOL_BYTES,
+            MempoolPolicy {
+                require_standard: false,
+                rbf_policy: RbfPolicy::Never,
+                ..MempoolPolicy::default()
+            },
+        );
+        insert_policy_entry(&mut never, old.clone());
+        assert!(matches!(
+            never.check_replacement_policy(&[old_id]),
+            Err(MempoolError::ReplacementDisallowed)
+        ));
+
+        let mut opt_in = Mempool::with_max_bytes_and_policy(
+            Network::Regtest,
+            DEFAULT_MAX_MEMPOOL_BYTES,
+            MempoolPolicy {
+                require_standard: false,
+                rbf_policy: RbfPolicy::OptIn,
+                ..MempoolPolicy::default()
+            },
+        );
+        insert_policy_entry(&mut opt_in, old);
+        assert!(matches!(
+            opt_in.check_replacement_policy(&[old_id]),
+            Err(MempoolError::ReplacementDisallowed)
+        ));
+
+        let mut signaling = graph_transaction(Txid::from_byte_array([51; 32]), 51);
+        signaling.input[0].sequence = bitcoin::Sequence::from_consensus(0xffff_fffd);
+        let signaling_id = signaling.compute_txid();
+        insert_policy_entry(&mut opt_in, signaling);
+        assert!(opt_in.check_replacement_policy(&[signaling_id]).is_ok());
+
+        let mut truc = graph_transaction(Txid::from_byte_array([52; 32]), 52);
+        truc.version = Version::non_standard(TRUC_VERSION);
+        let truc_id = truc.compute_txid();
+        insert_policy_entry(&mut opt_in, truc);
+        assert!(opt_in.check_replacement_policy(&[truc_id]).is_ok());
     }
 
     #[test]

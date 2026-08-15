@@ -1013,6 +1013,8 @@ impl Node {
             require_standard: !config.accept_nonstd_txn,
             cluster_count_limit: config.cluster_count,
             cluster_vsize_limit: config.cluster_size_vbytes,
+            rbf_policy: config.rbf_policy,
+            truc_policy: config.truc_policy,
         };
         let mut mempool =
             Mempool::with_max_bytes_and_policy(config.network, max_mempool_bytes, mempool_policy);
@@ -4404,6 +4406,8 @@ mod tests {
             blocksonly: false,
             private_broadcast: false,
             accept_nonstd_txn: true,
+            rbf_policy: crate::mempool::RbfPolicy::Always,
+            truc_policy: crate::mempool::TrucPolicy::Accept,
             cjdns_reachable: true,
             prune: 0,
             fast_prune: false,

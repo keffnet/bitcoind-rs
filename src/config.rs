@@ -13,6 +13,7 @@ use clap::{Parser, ValueEnum};
 use crate::IpSubnet;
 use crate::address::NetworkEndpoint;
 use crate::i2p::I2P_SAM_PORT;
+use crate::mempool::{RbfPolicy, TrucPolicy};
 use crate::tor::DEFAULT_TOR_CONTROL_PORT;
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
@@ -1357,6 +1358,25 @@ pub struct Args {
     #[arg(long, default_value_t = DEFAULT_MEMPOOL_EXPIRY_HOURS)]
     pub mempoolexpiry: u64,
 
+    /// Configure transaction replacement as `0`, `fee,optin`, or
+    /// `fee,-optin`, matching Core's replacement policy syntax.
+    #[arg(long = "mempoolreplacement")]
+    pub mempool_replacement: Option<String>,
+
+    /// Accept replacements without BIP125 signaling. The default is true in
+    /// Core v31.1 and is overridden by an explicit mempoolreplacement mode.
+    #[arg(
+        long = "mempoolfullrbf",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub mempool_full_rbf: Option<bool>,
+
+    /// Configure version-3/TRUC transactions as reject, accept, or enforce.
+    #[arg(long = "mempooltruc")]
+    pub mempool_truc: Option<String>,
+
     #[arg(
         long,
         default_value_t = DEFAULT_PERSIST_MEMPOOL,
@@ -1872,6 +1892,8 @@ pub struct Config {
     pub cluster_count: usize,
     /// Maximum virtual size of a connected mempool cluster.
     pub cluster_size_vbytes: u64,
+    pub rbf_policy: RbfPolicy,
+    pub truc_policy: TrucPolicy,
     /// Maximum age of a mempool entry in hours.
     pub mempool_expiry_hours: u64,
     /// Load and save the mempool automatically across node restarts.
@@ -1879,6 +1901,83 @@ pub struct Config {
     /// Write persisted mempool files in Core's legacy v1 format.
     pub persist_mempool_v1: bool,
     pub zmq: ZmqConfig,
+}
+
+fn parse_boolish_policy_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Some(true),
+        "0" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_rbf_policy(replacement: Option<&str>, full_rbf: Option<bool>) -> Result<RbfPolicy> {
+    let full_rbf = full_rbf.unwrap_or(true);
+    let mut fee = false;
+    let mut opt_in = None;
+
+    if let Some(value) = replacement {
+        if let Some(enabled) = parse_boolish_policy_value(value) {
+            if !enabled {
+                return Ok(RbfPolicy::Never);
+            }
+            fee = true;
+        } else {
+            for option in value.split([',', '+']).filter(|option| !option.is_empty()) {
+                match option {
+                    "fee" => fee = true,
+                    "optin" => opt_in = Some(true),
+                    "-optin" => opt_in = Some(false),
+                    _ => bail!("--mempoolreplacement contains an unknown mode: {option}"),
+                }
+            }
+        }
+    }
+
+    Ok(match opt_in {
+        Some(true) => RbfPolicy::OptIn,
+        Some(false) if fee => RbfPolicy::Always,
+        Some(false) => RbfPolicy::Never,
+        None if fee && full_rbf => RbfPolicy::Always,
+        None if fee => RbfPolicy::OptIn,
+        None if replacement.is_some() => RbfPolicy::Never,
+        None if full_rbf => RbfPolicy::Always,
+        None => RbfPolicy::OptIn,
+    })
+}
+
+fn parse_truc_policy(value: Option<&str>) -> Result<TrucPolicy> {
+    let Some(value) = value else {
+        return Ok(TrucPolicy::Accept);
+    };
+    if let Some(enabled) = parse_boolish_policy_value(value) {
+        return Ok(if enabled {
+            TrucPolicy::Enforce
+        } else {
+            TrucPolicy::Reject
+        });
+    }
+
+    let mut accept = None;
+    let mut enforce = None;
+    for option in value.split([',', '+']).filter(|option| !option.is_empty()) {
+        match option {
+            "accept" => accept = Some(true),
+            "reject" => accept = Some(false),
+            "enforce" | "optin" => enforce = Some(true),
+            "-enforce" | "-optin" => enforce = Some(false),
+            "0" => accept = Some(false),
+            _ => bail!("--mempooltruc contains an unknown mode: {option}"),
+        }
+    }
+
+    Ok(if accept == Some(false) {
+        TrucPolicy::Reject
+    } else if enforce == Some(true) {
+        TrucPolicy::Enforce
+    } else {
+        TrucPolicy::Accept
+    })
 }
 
 impl Config {
@@ -2066,6 +2165,9 @@ impl Config {
             .and_then(|size| u32::try_from(size).ok())
             .filter(|size| *size != 0)
             .context("--maxsendbuffer must be a positive value that fits in u32")?;
+        let rbf_policy =
+            parse_rbf_policy(args.mempool_replacement.as_deref(), args.mempool_full_rbf)?;
+        let truc_policy = parse_truc_policy(args.mempool_truc.as_deref())?;
         if args.accept_nonstd_txn && network == Network::Bitcoin {
             bail!("--acceptnonstdtxn is not currently supported for main chain");
         }
@@ -2426,6 +2528,8 @@ impl Config {
             max_mempool_mb: max_mempool,
             cluster_count: args.limit_cluster_count,
             cluster_size_vbytes,
+            rbf_policy,
+            truc_policy,
             mempool_expiry_hours: args.mempoolexpiry,
             persist_mempool: args.persistmempool,
             persist_mempool_v1: args.persistmempoolv1,
@@ -2850,6 +2954,55 @@ mod tests {
         assert_eq!(args.limit_ancestor_size, Some(100));
         assert_eq!(args.limit_descendant_count, Some(25));
         assert_eq!(args.limit_descendant_size, Some(100));
+    }
+
+    #[test]
+    fn parses_core_mempool_replacement_and_truc_policies() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--mempoolreplacement=fee,optin",
+            "--mempooltruc=enforce",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.rbf_policy, RbfPolicy::OptIn);
+        assert_eq!(config.truc_policy, TrucPolicy::Enforce);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--mempoolfullrbf=false",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().rbf_policy,
+            RbfPolicy::OptIn
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--mempoolreplacement=0",
+            "--mempooltruc=0",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.rbf_policy, RbfPolicy::Never);
+        assert_eq!(config.truc_policy, TrucPolicy::Reject);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--mempoolreplacement=bogus",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
     }
 
     #[test]

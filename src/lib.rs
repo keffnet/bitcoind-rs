@@ -3275,6 +3275,7 @@ mod tests {
             persist_mempool: true,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,

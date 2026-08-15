@@ -511,6 +511,15 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub connect: Vec<String>,
 
+    #[arg(
+        long = "noconnect",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub no_connect: bool,
+
     #[arg(long = "onlynet", value_enum, value_delimiter = ',')]
     pub onlynet: Vec<OnlyNet>,
 
@@ -758,6 +767,7 @@ pub struct Config {
     pub electrum_bind: Option<SocketAddr>,
     pub rest: bool,
     pub seed_nodes: Vec<NetworkEndpoint>,
+    pub connect_disabled: bool,
     pub dnsseed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
@@ -815,13 +825,17 @@ impl Config {
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
             bail!("--proxy must use a non-zero port");
         }
+        let connect_configured = args.no_connect || !args.connect.is_empty();
         if args.privatebroadcast && args.proxy.is_none() {
             bail!("--privatebroadcast requires --proxy for private connections");
         }
-        if args.privatebroadcast && !args.connect.is_empty() {
+        if args.privatebroadcast && connect_configured {
             bail!(
                 "Private broadcast of own transactions requested (--privatebroadcast), but --connect is also configured"
             );
+        }
+        if args.no_connect && !args.connect.is_empty() {
+            bail!("--noconnect cannot be combined with --connect");
         }
         if args.proxy.is_none()
             && let Some(network) = args.onlynet.iter().find_map(|network| match network {
@@ -839,7 +853,7 @@ impl Config {
         }
         let listen = args.listen.unwrap_or(
             !args.whitebind.is_empty()
-                || (args.proxy.is_none() && args.connect.is_empty() && args.max_peers > 0),
+                || (args.proxy.is_none() && !connect_configured && args.max_peers > 0),
         );
         if !listen && !args.whitebind.is_empty() {
             bail!("--whitebind cannot be used with --listen=false");
@@ -851,7 +865,7 @@ impl Config {
                 .any(|network| matches!(network, OnlyNet::Ipv4 | OnlyNet::Ipv6));
         let dnsseed = args
             .dnsseed
-            .unwrap_or(args.connect.is_empty() && args.max_peers > 0 && clearnet_reachable);
+            .unwrap_or(!connect_configured && args.max_peers > 0 && clearnet_reachable);
         let peer_permissions = PeerPermissionConfig::from_args(
             &args.whitelist,
             &args.whitebind,
@@ -961,9 +975,12 @@ impl Config {
             bail!("--peerblockfilters requires --blockfilterindex");
         }
         let network = args.network.into();
+        let connect_disabled = args.no_connect
+            || (args.connect.len() == 1 && args.connect.first().is_some_and(|value| value == "0"));
         let seed_nodes = args
             .connect
             .iter()
+            .filter(|value| !connect_disabled || value.as_str() != "0")
             .map(|value| {
                 NetworkEndpoint::parse_manual(value, default_p2p_port(network))
                     .with_context(|| format!("parsing --connect address '{value}'"))
@@ -980,6 +997,7 @@ impl Config {
             electrum_bind: Some(args.electrum),
             rest: args.rest,
             seed_nodes,
+            connect_disabled,
             dnsseed,
             onlynet: args.onlynet,
             proxy: args.proxy,
@@ -1223,6 +1241,17 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--privatebroadcast",
             "--proxy=127.0.0.1:9050",
+            "--noconnect",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--privatebroadcast",
+            "--proxy=127.0.0.1:9050",
             "--connect=192.0.2.1:8333",
         ])
         .unwrap();
@@ -1284,6 +1313,32 @@ mod tests {
                 NetworkEndpoint::from_socket("192.0.2.1:18444".parse().unwrap()),
             ]
         );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--connect=0",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.connect_disabled);
+        assert!(config.seed_nodes.is_empty());
+        assert!(!config.listen);
+        assert!(!config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconnect",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.connect_disabled);
+        assert!(config.seed_nodes.is_empty());
+        assert!(!config.listen);
+        assert!(!config.dnsseed);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

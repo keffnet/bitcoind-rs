@@ -1285,7 +1285,7 @@ impl PeerManager {
         }
         let discovery_node = self.node.clone();
         let discovery_outbound = outbound.clone();
-        if !configured_seed_nodes {
+        if !configured_seed_nodes && !self.node.config.connect_disabled {
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(30));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4771,6 +4771,7 @@ mod tests {
                 .into_iter()
                 .map(NetworkEndpoint::from_socket)
                 .collect(),
+            connect_disabled: false,
             dnsseed: false,
             onlynet: Vec::new(),
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
@@ -5328,6 +5329,7 @@ mod tests {
             persist_mempool: false,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -5469,6 +5471,7 @@ mod tests {
             persist_mempool: false,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -5866,6 +5869,7 @@ mod tests {
             persist_mempool: true,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 4,
             max_upload_target: 0,
@@ -5991,6 +5995,7 @@ mod tests {
             persist_mempool: true,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6122,6 +6127,7 @@ mod tests {
             persist_mempool: true,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6343,6 +6349,7 @@ mod tests {
             persist_mempool: true,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6440,6 +6447,7 @@ mod tests {
             persist_mempool: true,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6519,6 +6527,7 @@ mod tests {
             persist_mempool: true,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 4,
             max_upload_target: 0,
@@ -6590,6 +6599,7 @@ mod tests {
             persist_mempool: false,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 4,
             max_upload_target: 0,
@@ -6723,6 +6733,7 @@ mod tests {
             persist_mempool: true,
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
+            connect_disabled: false,
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,

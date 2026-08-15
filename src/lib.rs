@@ -489,7 +489,7 @@ struct PrivateBroadcastEntry {
     peers: Vec<PrivateBroadcastPeer>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum NodeWarningKind {
     ClockOutOfSync,
     FatalInternal,
@@ -2846,11 +2846,14 @@ impl Node {
     }
 
     pub(crate) fn warning_messages(&self) -> Vec<String> {
-        self.warnings
+        let mut warnings = self
+            .warnings
             .read()
             .iter()
-            .map(|warning| warning.message.clone())
-            .collect()
+            .map(|warning| (warning.kind, warning.message.clone()))
+            .collect::<Vec<_>>();
+        warnings.sort_unstable_by_key(|(kind, _)| *kind);
+        warnings.into_iter().map(|(_, message)| message).collect()
     }
 
     pub(crate) fn enable_peer_address_relay(&self, id: usize) {

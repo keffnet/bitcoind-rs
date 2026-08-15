@@ -3001,7 +3001,10 @@ impl Node {
     }
 
     pub fn request_shutdown(&self) {
-        self.shutdown.notify_waiters();
+        // Keep a permit when shutdown is requested before the run loop has
+        // registered its waiter. There is one node run loop, so notify_one is
+        // sufficient and avoids losing an early stop request.
+        self.shutdown.notify_one();
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -3711,6 +3714,17 @@ mod tests {
         assert!(path.exists());
         node.remove_rpc_cookie();
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn shutdown_requested_before_run_is_not_lost() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        node.request_shutdown();
+        tokio::time::timeout(Duration::from_secs(2), node.run())
+            .await
+            .expect("pre-run shutdown should wake the node")
+            .unwrap();
     }
 
     #[test]

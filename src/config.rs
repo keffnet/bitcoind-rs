@@ -561,8 +561,8 @@ pub struct Args {
     #[arg(long = "rpcport", value_name = "PORT")]
     pub rpc_port: Option<u16>,
 
-    #[arg(long = "rpcbind", value_name = "IP:PORT", value_delimiter = ',')]
-    pub rpc_binds: Vec<SocketAddr>,
+    #[arg(long = "rpcbind", value_name = "IP[:PORT]", value_delimiter = ',')]
+    pub rpc_binds: Vec<String>,
 
     #[arg(long = "rpcallowip", value_name = "IP[/PREFIX]")]
     pub rpc_allow_ips: Vec<String>,
@@ -999,25 +999,9 @@ impl Config {
         if args.rpc.is_some() && !args.rpc_binds.is_empty() {
             bail!("--rpc cannot be combined with --rpcbind");
         }
-        if args.rpc_port.is_some() && !args.rpc_binds.is_empty() {
-            bail!("--rpcport cannot be combined with --rpcbind");
-        }
         if args.rpc_port == Some(0) {
             bail!("--rpcport must use a non-zero port");
         }
-        if args.rpc_binds.iter().any(|bind| bind.port() == 0) {
-            bail!("--rpcbind must use non-zero ports");
-        }
-        let rpc_binds = if !args.rpc_binds.is_empty() {
-            args.rpc_binds.clone()
-        } else if args.rpc.is_some() {
-            vec![rpc]
-        } else {
-            vec![
-                rpc,
-                SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], rpc.port())),
-            ]
-        };
         let rpc_allow_ips = args
             .rpc_allow_ips
             .iter()
@@ -1026,6 +1010,16 @@ impl Config {
                     .with_context(|| format!("parsing --rpcallowip subnet '{value}'"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let rpc_binds = if !args.rpc_binds.is_empty() && !rpc_allow_ips.is_empty() {
+            parse_rpc_binds(&args.rpc_binds, rpc.port())?
+        } else if args.rpc.is_some() {
+            vec![rpc]
+        } else {
+            vec![
+                rpc,
+                SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], rpc.port())),
+            ]
+        };
         let rpc_auth = parse_rpc_auth(
             &args.rpc_auth,
             args.rpc_user.as_deref(),
@@ -1387,6 +1381,30 @@ fn parse_external_addresses(values: &[String], default_port: u16) -> Result<Vec<
         .collect()
 }
 
+fn parse_rpc_binds(values: &[String], default_port: u16) -> Result<Vec<SocketAddr>> {
+    values
+        .iter()
+        .map(|value| {
+            if let Ok(address) = value.parse::<SocketAddr>() {
+                return Ok(address);
+            }
+            if let Ok(ip) = value.parse::<IpAddr>() {
+                return Ok(SocketAddr::new(ip, default_port));
+            }
+            if let Some(host) = value
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                && let Ok(ip) = host.parse::<IpAddr>()
+            {
+                return Ok(SocketAddr::new(ip, default_port));
+            }
+            Err(anyhow::anyhow!(
+                "invalid --rpcbind address '{value}'; expected IP[:PORT]"
+            ))
+        })
+        .collect()
+}
+
 fn parse_rpc_auth(
     values: &[String],
     username: Option<&str>,
@@ -1594,6 +1612,7 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--network=regtest",
             "--rpcbind=127.0.0.1:18446,127.0.0.1:18447",
+            "--rpcallowip=192.0.2.0/24",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
@@ -1605,6 +1624,40 @@ mod tests {
             ]
         );
         assert_eq!(config.rpc_bind, Some("127.0.0.1:18446".parse().unwrap()));
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--rpcport=18446",
+            "--rpcbind=127.0.0.1,[::1]",
+            "--rpcallowip=192.0.2.0/24",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().rpc_binds,
+            vec![
+                "127.0.0.1:18446".parse().unwrap(),
+                "[::1]:18446".parse().unwrap(),
+            ]
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--rpcbind=0.0.0.0:18446",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().rpc_binds,
+            vec![
+                "127.0.0.1:18443".parse().unwrap(),
+                "[::1]:18443".parse().unwrap(),
+            ]
+        );
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

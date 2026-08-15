@@ -3156,6 +3156,7 @@ mod tests {
             blocksonly: false,
             private_broadcast: false,
             accept_nonstd_txn: true,
+            cjdns_reachable: true,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,

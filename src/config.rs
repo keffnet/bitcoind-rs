@@ -517,6 +517,15 @@ pub struct Args {
     #[arg(long, value_name = "IP:PORT")]
     pub proxy: Option<SocketAddr>,
 
+    #[arg(
+        long = "cjdnsreachable",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub cjdns_reachable: bool,
+
     #[arg(long = "whitelist", value_name = "PERMISSIONS@IP[/PREFIX]")]
     pub whitelist: Vec<String>,
 
@@ -743,6 +752,7 @@ pub struct Config {
     pub dnsseed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
+    pub cjdns_reachable: bool,
     pub peer_permissions: PeerPermissionConfig,
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
@@ -803,6 +813,11 @@ impl Config {
             })
         {
             bail!("--onlynet={network} requires --proxy for outbound connections");
+        }
+        if args.onlynet.contains(&OnlyNet::Cjdns) && !args.cjdns_reachable {
+            bail!(
+                "Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is not provided"
+            );
         }
         let listen = args.listen.unwrap_or(
             !args.whitebind.is_empty()
@@ -941,6 +956,7 @@ impl Config {
             dnsseed,
             onlynet: args.onlynet,
             proxy: args.proxy,
+            cjdns_reachable: args.cjdns_reachable,
             peer_permissions,
             signet_challenge,
             max_peers: args.max_peers,
@@ -993,6 +1009,9 @@ impl Config {
     }
 
     pub fn allows_network_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
+        if matches!(endpoint, NetworkEndpoint::Cjdns { .. }) && !self.cjdns_reachable {
+            return false;
+        }
         self.onlynet.is_empty()
             || self
                 .onlynet
@@ -1067,6 +1086,7 @@ mod tests {
         assert!(!config.allows_address("[fc00::1]:8333".parse().unwrap()));
         assert!(OnlyNet::Cjdns.matches("[fc00::1]:8333".parse().unwrap()));
         assert!(!OnlyNet::Ipv6.matches("[fc00::1]:8333".parse().unwrap()));
+        assert!(!config.cjdns_reachable);
         assert_eq!(config.prune, 0);
         assert_eq!(config.max_upload_target, 0);
 
@@ -1084,6 +1104,30 @@ mod tests {
                 format!("--onlynet={network} requires --proxy for outbound connections")
             );
         }
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--onlynet=cjdns",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap_err().to_string(),
+            "Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is not provided"
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--onlynet=cjdns",
+            "--cjdnsreachable",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.cjdns_reachable);
+        assert!(config.allows_address("[fc00::1]:8333".parse().unwrap()));
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

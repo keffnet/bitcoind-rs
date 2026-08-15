@@ -904,6 +904,21 @@ pub struct Args {
     )]
     pub server: bool,
 
+    /// Keep wallet functionality disabled, matching this wallet-free build.
+    #[arg(
+        long = "disablewallet",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub disable_wallet: bool,
+
+    /// Accept Core wallet names for configuration compatibility. Wallets are
+    /// intentionally ignored because this build does not implement wallets.
+    #[arg(long = "wallet", value_name = "NAME")]
+    pub wallets: Vec<String>,
+
     #[arg(long = "rpcservertimeout", default_value_t = DEFAULT_RPC_SERVER_TIMEOUT_SECS)]
     pub rpc_server_timeout: u64,
 
@@ -1807,6 +1822,9 @@ pub struct Config {
 
 impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
+        if !args.disable_wallet {
+            bail!("wallet support is disabled in this build; use --disablewallet=1");
+        }
         let network = network_from_args(&args)?;
         let blocks_dir = args.blocks_dir.as_ref().map_or_else(
             || args.datadir.join("blocks"),
@@ -2622,7 +2640,7 @@ mod tests {
         let config_file = directory.path().join("bitcoin.conf");
         fs::write(
             &config_file,
-            "network=regtest\nserver=false\nmaxconnections=3 # overridden below\n[main]\nserver=true\n[regtest]\nmaxconnections=5\nincludeconf=included.conf\n",
+            "network=regtest\nserver=false\nwallet=compat\nmaxconnections=3 # overridden below\n[main]\nserver=true\n[regtest]\nmaxconnections=5\nincludeconf=included.conf\n",
         )
         .unwrap();
 
@@ -2649,6 +2667,7 @@ mod tests {
         .unwrap();
         assert_eq!(args.network, NetworkName::Regtest);
         assert_eq!(args.max_peers, 5);
+        assert_eq!(args.wallets, vec!["compat"]);
         assert!(!args.server);
 
         let args = Args::parse_from_with_config([
@@ -3712,6 +3731,32 @@ mod tests {
             Args::try_parse_from(["bitcoind-rs", "--daemon=false", "--daemonwait=0"]).unwrap();
         assert!(!args.daemon);
         assert!(!args.daemon_wait);
+    }
+
+    #[test]
+    fn wallet_options_keep_the_build_wallet_free() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--disablewallet",
+            "--wallet=default",
+        ])
+        .unwrap();
+        assert!(args.disable_wallet);
+        assert_eq!(args.wallets, vec!["default"]);
+        Config::from_args(args).unwrap();
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--disablewallet=false",
+        ])
+        .unwrap();
+        let error = Config::from_args(args).unwrap_err().to_string();
+        assert!(error.contains("wallet support is disabled"));
     }
 
     #[test]

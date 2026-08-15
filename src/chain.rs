@@ -27,6 +27,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config::{DEFAULT_SCRIPT_CHECK_THREADS, MAX_SCRIPT_CHECK_THREADS};
 use crate::muhash::MuHash3072;
 use crate::storage::{BlockStore, ChainstateStore, CoinStatsRecord, CoinStatsStore, FilterStore};
 use crate::validation::{self, ValidationError};
@@ -513,7 +514,29 @@ struct BackgroundValidationJob {
     base_hash: BlockHash,
     base_height: u32,
     target_tip: BlockHash,
+    script_check_workers: usize,
     cancel: Arc<AtomicBool>,
+}
+
+struct ScriptCheckJob<'a> {
+    tx_index: usize,
+    transaction: &'a Transaction,
+    previous_outputs: Vec<TxOut>,
+}
+
+fn script_check_workers(par: i32) -> usize {
+    let cores = thread::available_parallelism()
+        .map(|cores| i32::try_from(cores.get()).unwrap_or(i32::MAX))
+        .unwrap_or(1);
+    let script_threads = if par <= 0 {
+        par.saturating_add(cores)
+    } else {
+        par
+    };
+    script_threads.saturating_sub(1).clamp(
+        0,
+        i32::try_from(MAX_SCRIPT_CHECK_THREADS).unwrap_or(i32::MAX),
+    ) as usize
 }
 
 fn serialize_internal<T: Serialize>(magic: &[u8], value: &T) -> Result<Vec<u8>> {
@@ -595,6 +618,7 @@ pub struct ChainState {
     minimum_chain_work_override: Option<Work>,
     assume_valid_block: Option<BlockHash>,
     max_tip_age_secs: u64,
+    script_check_workers: usize,
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     filter_store: FilterStore,
@@ -892,6 +916,7 @@ impl ChainState {
             minimum_chain_work_override,
             assume_valid_block,
             max_tip_age_secs: MAX_TIP_AGE_SECS,
+            script_check_workers: script_check_workers(DEFAULT_SCRIPT_CHECK_THREADS),
             signet_challenge: (network == Network::Signet).then(|| {
                 signet_challenge
                     .map(ToOwned::to_owned)
@@ -1503,6 +1528,13 @@ impl ChainState {
     pub fn configure_max_tip_age(&mut self, max_tip_age_secs: u64) {
         self.max_tip_age_secs = max_tip_age_secs;
         self.update_ibd_status();
+    }
+
+    /// Configure the number of parallel script-check workers using Core's
+    /// `-par` convention. Zero autodetects, while a negative value leaves
+    /// that many cores available to the rest of the node.
+    pub fn configure_script_check_threads(&mut self, par: i32) {
+        self.script_check_workers = script_check_workers(par);
     }
 
     fn update_ibd_status(&mut self) {
@@ -3776,6 +3808,7 @@ impl ChainState {
             subsidy_sat: validation::block_subsidy_for_network(self.network, height),
             ..CoinStatsBlockMetrics::default()
         };
+        let mut script_jobs = Vec::new();
         let block_hash = block.block_hash();
         let sigop_flags =
             validation::script_flags_for_block_with_hash(self.network, height, Some(block_hash));
@@ -3796,7 +3829,7 @@ impl ChainState {
         if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
             return Err(ValidationError::TooManySigops.into());
         }
-        for transaction in block.txdata.iter().skip(1) {
+        for (transaction_index, transaction) in block.txdata.iter().enumerate().skip(1) {
             let txid = transaction.compute_txid();
             let mut input_total = 0u64;
             let mut previous_outputs = Vec::with_capacity(transaction.input.len());
@@ -3845,14 +3878,11 @@ impl ChainState {
                 &previous_entries,
             )?;
             if !skip_script_checks {
-                validation::validate_transaction_scripts_at_time_with_block_hash(
-                    self.network,
-                    height,
-                    block.header.time,
-                    Some(block_hash),
+                script_jobs.push(ScriptCheckJob {
+                    tx_index: transaction_index,
                     transaction,
-                    &previous_outputs,
-                )?;
+                    previous_outputs,
+                });
             }
             let output_total = transaction
                 .output
@@ -3890,6 +3920,9 @@ impl ChainState {
                     );
                 }
             }
+        }
+        if !skip_script_checks {
+            self.validate_script_checks(block, height, &script_jobs)?;
         }
         // Core checks the accumulated fees against MAX_MONEY above, then
         // compares the coinbase output with subsidy + fees. The reward sum
@@ -3932,6 +3965,68 @@ impl ChainState {
             spent_entries,
             metrics,
         })
+    }
+
+    fn validate_script_checks(
+        &self,
+        block: &Block,
+        height: u32,
+        jobs: &[ScriptCheckJob<'_>],
+    ) -> Result<()> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let thread_count = self.script_check_workers.saturating_add(1).min(jobs.len());
+        let network = self.network;
+        let block_hash = block.block_hash();
+        let block_time = block.header.time;
+        if thread_count <= 1 {
+            for job in jobs {
+                validation::validate_transaction_scripts_at_time_with_block_hash(
+                    network,
+                    height,
+                    block_time,
+                    Some(block_hash),
+                    job.transaction,
+                    &job.previous_outputs,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let chunk_size = jobs.len().div_ceil(thread_count);
+        let failures = thread::scope(|scope| {
+            let handles = jobs
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        for job in chunk {
+                            if let Err(error) =
+                                validation::validate_transaction_scripts_at_time_with_block_hash(
+                                    network,
+                                    height,
+                                    block_time,
+                                    Some(block_hash),
+                                    job.transaction,
+                                    &job.previous_outputs,
+                                )
+                            {
+                                return Some((job.tx_index, error));
+                            }
+                        }
+                        None
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().expect("script validation worker panicked"))
+                .collect::<Vec<_>>()
+        });
+        if let Some((_, error)) = failures.into_iter().min_by_key(|(tx_index, _)| *tx_index) {
+            return Err(error.into());
+        }
+        Ok(())
     }
 
     fn enforce_bip30(&self, height: u32, block_hash: BlockHash, parent_hash: BlockHash) -> bool {
@@ -5257,6 +5352,7 @@ impl ChainState {
         let blocks_dir = self.blocks_dir.clone();
         let network = self.network;
         let signet_challenge = self.signet_challenge.clone();
+        let script_check_workers = self.script_check_workers;
         if let Some(previous) = self.background_validation.take() {
             previous.cancel.store(true, Ordering::Release);
         }
@@ -5278,6 +5374,7 @@ impl ChainState {
             base_hash,
             base_height,
             target_tip,
+            script_check_workers,
             cancel: cancel.clone(),
         };
         self.background_validation = Some(BackgroundValidation {
@@ -5561,6 +5658,7 @@ fn open_background_replay_state(
     signet_challenge: Option<Vec<u8>>,
     active_chain: &[BlockHash],
     block_index: &HashMap<BlockHash, BlockNode>,
+    script_check_workers: usize,
 ) -> Result<ChainState> {
     let store = BlockStore::open_read_only(blocks_dir)?;
     let filter_store = FilterStore::open(data_dir.join("filters"))?;
@@ -5582,6 +5680,7 @@ fn open_background_replay_state(
         minimum_chain_work_override: None,
         assume_valid_block: None,
         max_tip_age_secs: MAX_TIP_AGE_SECS,
+        script_check_workers,
         signet_challenge,
         store,
         filter_store,
@@ -5634,6 +5733,7 @@ fn run_background_validation(
         base_hash,
         base_height,
         target_tip,
+        script_check_workers,
         cancel,
     } = job;
     let result = (|| -> Result<(HashMap<OutPoint, UtxoEntry>, bool)> {
@@ -5670,6 +5770,7 @@ fn run_background_validation(
             signet_challenge,
             &active_chain,
             &block_index,
+            script_check_workers,
         )?;
         if base_height == 0 && start_height == 0 {
             base_matches = Some(utxos == expected);
@@ -6354,6 +6455,90 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn core_par_resolves_script_worker_counts() {
+        let cores = thread::available_parallelism()
+            .map(|cores| cores.get())
+            .unwrap_or(1);
+        let max_workers = MAX_SCRIPT_CHECK_THREADS;
+        assert_eq!(
+            script_check_workers(0),
+            cores.saturating_sub(1).min(max_workers)
+        );
+        assert_eq!(
+            script_check_workers(-1),
+            cores.saturating_sub(2).min(max_workers)
+        );
+        assert_eq!(script_check_workers(1), 0);
+        assert_eq!(script_check_workers(2), 1);
+        assert_eq!(script_check_workers(15), 14);
+        assert_eq!(script_check_workers(100), max_workers);
+    }
+
+    #[test]
+    fn parallel_script_checks_report_the_lowest_transaction_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_script_check_threads(2);
+        let block = mine_block(&state, 1);
+        let first = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([1; 32]), 0),
+                script_sig: Builder::new().into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+        let second = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([2; 32]), 0),
+                script_sig: Builder::new().into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+        let first_txid = first.compute_txid();
+        let jobs = [
+            ScriptCheckJob {
+                tx_index: 1,
+                transaction: &first,
+                previous_outputs: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: Builder::new().push_int(0).into_script(),
+                }],
+            },
+            ScriptCheckJob {
+                tx_index: 2,
+                transaction: &second,
+                previous_outputs: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: Builder::new().push_int(0).into_script(),
+                }],
+            },
+        ];
+
+        let error = state.validate_script_checks(&block, 1, &jobs).unwrap_err();
+        let validation = error
+            .downcast_ref::<ValidationError>()
+            .expect("script failure retains its validation error");
+        assert!(matches!(
+            validation,
+            ValidationError::Script { txid, .. } if *txid == first_txid
+        ));
     }
 
     #[test]

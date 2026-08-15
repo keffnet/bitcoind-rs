@@ -37,6 +37,8 @@ pub const DEFAULT_RPC_THREADS: usize = 16;
 pub const DEFAULT_RPC_WORK_QUEUE: usize = 64;
 pub const DEFAULT_RPC_SERVER_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
+pub const DEFAULT_SCRIPT_CHECK_THREADS: i32 = 0;
+pub const MAX_SCRIPT_CHECK_THREADS: usize = 15;
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -604,6 +606,11 @@ pub struct Args {
 
     #[arg(long = "checklevel", value_name = "N")]
     pub check_level: Option<u8>,
+
+    /// Number of script verification threads. Zero autodetects, and negative
+    /// values leave that many cores available to the rest of the node.
+    #[arg(long = "par", default_value_t = DEFAULT_SCRIPT_CHECK_THREADS)]
+    pub script_check_threads: i32,
 
     #[arg(long = "stopatheight", default_value_t = 0)]
     pub stop_at_height: u32,
@@ -1301,6 +1308,7 @@ pub struct Config {
     pub(crate) assume_valid: Option<BlockHash>,
     pub(crate) check_blocks: Option<u32>,
     pub(crate) check_level: Option<u8>,
+    pub script_check_threads: i32,
     pub stop_at_height: u32,
     pub(crate) max_tip_age_secs: u64,
     pub p2p_bind: SocketAddr,
@@ -1688,6 +1696,7 @@ impl Config {
             assume_valid,
             check_blocks: args.check_blocks,
             check_level: args.check_level,
+            script_check_threads: args.script_check_threads,
             stop_at_height: args.stop_at_height,
             max_tip_age_secs: args.max_tip_age,
             p2p_bind: primary_p2p_bind,
@@ -2238,12 +2247,14 @@ mod tests {
             "--checkblocks=12",
             "--checklevel=4",
             "--maxtipage=42",
+            "--par=-2",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
         assert_eq!(config.check_blocks, Some(12));
         assert_eq!(config.check_level, Some(4));
         assert_eq!(config.max_tip_age_secs, 42);
+        assert_eq!(config.script_check_threads, -2);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

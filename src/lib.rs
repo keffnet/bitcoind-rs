@@ -744,6 +744,7 @@ impl Node {
                 config.assume_valid,
         )?;
         chain.configure_max_tip_age(config.max_tip_age_secs);
+        chain.configure_script_check_threads(config.script_check_threads);
         chain.configure_pruning(config.prune)?;
         // Electrum 1.7 outpoint status needs confirmed spender lookups even
         // when the standalone Core-style txospenderindex RPC option is off.
@@ -3433,6 +3434,7 @@ mod tests {
             rpc_server_timeout_secs: 30,
             rpc_threads: 16,
             rpc_work_queue: 64,
+            script_check_threads: 0,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,

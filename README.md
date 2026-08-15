@@ -54,6 +54,7 @@ Inbound P2P listening can be disabled with `--listen=false`; DNS seed lookup can
 The hidden compatibility flag `--fastprune` enables Core's regtest 100-block pruning threshold for storage/pruning tests; normal regtest pruning uses the Core 1,000-block threshold.
 
 `--timeout=<milliseconds>` bounds each initial outbound TCP connection attempt (5,000 ms by default). `--peertimeout=<seconds>` controls the inactivity ping timeout (60 seconds by default); the automatic peer connection limit defaults to Core's 125 peers.
+`--maxreceivebuffer=<n>` and `--maxsendbuffer=<n>` set the per-peer TCP receive/send socket buffers in Core's 1000-byte units (5 and 1 by default).
 Repeatable `--uacomment=<comment>` values are appended to the BIP14 P2P user-agent string; comments use Core's safe character set and the complete string is capped at 256 bytes. `--startupnotify=<command>`, `--blocknotify=<command>`, and `--shutdownnotify=<command>` run asynchronously through the platform shell; `%s` in `--blocknotify` expands to the new active tip hash.
 Compact-block reconstruction also retains a bounded FIFO of recent non-mempool transactions; tune it with `--blockreconstructionextratxn=<n>` (100 by default, `0` disables the extra cache).
 

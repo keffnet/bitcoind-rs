@@ -27,6 +27,7 @@ use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction, Txid, Witness
 use rand::random;
 use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
+use socket2::SockRef;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{
     TcpListener, TcpStream,
@@ -2497,6 +2498,9 @@ async fn serve_peer(
 ) -> Result<()> {
     let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
+    let socket = SockRef::from(&stream);
+    socket.set_recv_buffer_size(node.config.max_receive_buffer as usize)?;
+    socket.set_send_buffer_size(node.config.max_send_buffer as usize)?;
     let (mut reader, writer_half, local_address, session_id) = establish_transport(
         stream,
         &endpoint,
@@ -5331,6 +5335,8 @@ mod tests {
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             signet_challenge: None,
             max_peers: 4,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_timeout_secs: 60,
             connect_timeout_ms: 5_000,
@@ -6005,6 +6011,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
@@ -6202,6 +6210,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
@@ -6690,6 +6700,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
@@ -6871,6 +6883,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
@@ -7058,6 +7072,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
@@ -7335,6 +7351,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
@@ -7488,6 +7506,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
@@ -7623,6 +7643,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
@@ -7783,6 +7805,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
@@ -7972,6 +7996,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,

@@ -3972,6 +3972,8 @@ mod tests {
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
+            max_receive_buffer: 5_000,
+            max_send_buffer: 1_000,
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,

@@ -45,6 +45,8 @@ pub const MAX_SCRIPT_CHECK_THREADS: usize = 15;
 pub const MAX_SUBVERSION_LENGTH: usize = 256;
 pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
 pub const DEFAULT_I2P_ACCEPT_INCOMING: bool = true;
+pub const DEFAULT_MAX_RECEIVE_BUFFER_KB: u64 = 5;
+pub const DEFAULT_MAX_SEND_BUFFER_KB: u64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -988,6 +990,14 @@ pub struct Args {
     #[arg(long, visible_alias = "maxconnections", default_value_t = 125)]
     pub max_peers: usize,
 
+    /// Maximum per-peer receive socket buffer in units of 1000 bytes.
+    #[arg(long = "maxreceivebuffer", default_value_t = DEFAULT_MAX_RECEIVE_BUFFER_KB)]
+    pub max_receive_buffer_kb: u64,
+
+    /// Maximum per-peer send socket buffer in units of 1000 bytes.
+    #[arg(long = "maxsendbuffer", default_value_t = DEFAULT_MAX_SEND_BUFFER_KB)]
+    pub max_send_buffer_kb: u64,
+
     /// Maximum outbound bytes per 24-hour cycle. Lowercase units are decimal
     /// and uppercase units are powers of 1024, matching Core.
     #[arg(long = "maxuploadtarget", default_value = DEFAULT_MAX_UPLOAD_TARGET)]
@@ -1550,6 +1560,8 @@ pub struct Config {
     pub peer_permissions: PeerPermissionConfig,
     pub signet_challenge: Option<Vec<u8>>,
     pub max_peers: usize,
+    pub max_receive_buffer: u32,
+    pub max_send_buffer: u32,
     pub max_upload_target: u64,
     pub peer_timeout_secs: u64,
     pub connect_timeout_ms: u64,
@@ -1739,6 +1751,18 @@ impl Config {
         if args.timeout == 0 {
             bail!("--timeout must be greater than zero");
         }
+        let max_receive_buffer = args
+            .max_receive_buffer_kb
+            .checked_mul(1_000)
+            .and_then(|size| u32::try_from(size).ok())
+            .filter(|size| *size != 0)
+            .context("--maxreceivebuffer must be a positive value that fits in u32")?;
+        let max_send_buffer = args
+            .max_send_buffer_kb
+            .checked_mul(1_000)
+            .and_then(|size| u32::try_from(size).ok())
+            .filter(|size| *size != 0)
+            .context("--maxsendbuffer must be a positive value that fits in u32")?;
         if args.accept_nonstd_txn && network == Network::Bitcoin {
             bail!("--acceptnonstdtxn is not currently supported for main chain");
         }
@@ -2040,6 +2064,8 @@ impl Config {
             peer_permissions,
             signet_challenge,
             max_peers: args.max_peers,
+            max_receive_buffer,
+            max_send_buffer,
             max_upload_target,
             peer_timeout_secs: args.peertimeout,
             connect_timeout_ms: args.timeout,
@@ -3289,6 +3315,18 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert_eq!(config.load_blocks, vec![block_file]);
         assert!(config.stop_after_block_import);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--maxreceivebuffer=7",
+            "--maxsendbuffer=2",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.max_receive_buffer, 7_000);
+        assert_eq!(config.max_send_buffer, 2_000);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -1472,7 +1472,12 @@ pub struct Args {
     #[arg(long, default_value_t = false, hide = true)]
     pub persistmempoolv1: bool,
 
-    #[arg(long, default_value_t = false, hide = true)]
+    #[arg(
+        long = "txreconciliation",
+        alias = "tx-reconciliation",
+        default_value_t = false,
+        hide = true
+    )]
     pub tx_reconciliation: bool,
 
     #[arg(long = "zmqpubhashtx", value_name = "ADDRESS")]
@@ -4225,6 +4230,19 @@ mod tests {
             Args::try_parse_from(["bitcoind-rs", "--daemon=false", "--daemonwait=0"]).unwrap();
         assert!(!args.daemon);
         assert!(!args.daemon_wait);
+    }
+
+    #[test]
+    fn accepts_core_transaction_reconciliation_spelling() {
+        let args = Args::try_parse_from([
+            OsString::from("bitcoind-rs"),
+            normalize_core_style_argument(OsString::from("-txreconciliation")),
+        ])
+        .unwrap();
+        assert!(args.tx_reconciliation);
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--tx-reconciliation"]).unwrap();
+        assert!(args.tx_reconciliation);
     }
 
     #[test]

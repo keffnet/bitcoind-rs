@@ -16,7 +16,12 @@ use tracing::debug;
 use crate::chain;
 use crate::{Node, StartupLatch};
 
-const MAX_LINE_SIZE: usize = 1024 * 1024;
+// Electrum transports raw transactions as hexadecimal JSON strings. A
+// consensus-valid transaction can approach the 4,000,000-weight limit, so a
+// 1 MiB request cap would reject valid large transactions and padding data.
+// Keep a modest allowance for the JSON envelope while retaining a bounded
+// per-connection allocation.
+const MAX_LINE_SIZE: usize = 2 * crate::validation::MAX_BLOCK_WEIGHT + 64 * 1024;
 const SERVER_NAME: &str = "bitcoind-rs 0.1.0";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

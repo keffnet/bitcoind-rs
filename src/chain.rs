@@ -1,6 +1,6 @@
 //! Active-chain state, UTXO application, and Electrum indexing.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
@@ -38,6 +38,9 @@ const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const SNAPSHOT_INTERVAL: u32 = 1_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
 const MAX_BASIC_FILTER_CACHE_ENTRIES: usize = 256;
+// Core's default validation cache is 32 MiB. A compact 32-byte digest plus
+// hash-table/deque bookkeeping is accounted for as roughly 64 bytes here.
+const DEFAULT_SCRIPT_CACHE_ENTRIES: usize = (32 * 1024 * 1024) / 64;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
 const MAX_ORPHAN_BLOCKS: usize = 128;
 const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
@@ -516,6 +519,7 @@ struct BackgroundValidationJob {
     base_height: u32,
     target_tip: BlockHash,
     script_check_workers: usize,
+    script_cache_max_entries: usize,
     cancel: Arc<AtomicBool>,
 }
 
@@ -523,6 +527,31 @@ struct ScriptCheckJob<'a> {
     tx_index: usize,
     transaction: &'a Transaction,
     previous_outputs: Vec<TxOut>,
+}
+
+struct ScriptValidationCache {
+    entries: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+    max_entries: usize,
+}
+
+impl Default for ScriptValidationCache {
+    fn default() -> Self {
+        Self {
+            entries: HashSet::new(),
+            order: VecDeque::new(),
+            max_entries: DEFAULT_SCRIPT_CACHE_ENTRIES,
+        }
+    }
+}
+
+impl ScriptValidationCache {
+    fn with_max_entries(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            ..Self::default()
+        }
+    }
 }
 
 fn script_check_workers(par: i32) -> usize {
@@ -657,6 +686,7 @@ pub struct ChainState {
     precious_sequence: u64,
     basic_filter_cache: HashMap<BlockHash, (Vec<u8>, FilterHeader)>,
     block_undo_cache: HashMap<BlockHash, Vec<Vec<TxOut>>>,
+    script_cache: Mutex<ScriptValidationCache>,
 }
 
 impl ChainState {
@@ -1002,6 +1032,7 @@ impl ChainState {
             precious_sequence: 0,
             basic_filter_cache: HashMap::new(),
             block_undo_cache: HashMap::new(),
+            script_cache: Mutex::new(ScriptValidationCache::default()),
         };
         let snapshot = if rebuild_chainstate {
             None
@@ -1672,6 +1703,26 @@ impl ChainState {
     /// that many cores available to the rest of the node.
     pub fn configure_script_check_threads(&mut self, par: i32) {
         self.script_check_workers = script_check_workers(par);
+    }
+
+    /// Configure the bounded successful-script-validation cache. The cache
+    /// stores compact digests rather than transaction data, so its capacity
+    /// is expressed in approximate bytes to match Core's `-maxsigcachesize`.
+    pub fn configure_script_cache_size_mib(&mut self, mib: i64) {
+        let bytes = u64::try_from(mib.max(0))
+            .unwrap_or(u64::MAX)
+            .saturating_mul(1024 * 1024);
+        let mut cache = self.script_cache.lock();
+        cache.max_entries = usize::try_from(bytes / 64).unwrap_or(usize::MAX);
+        while cache.order.len() > cache.max_entries {
+            if let Some(key) = cache.order.pop_front() {
+                cache.entries.remove(&key);
+            }
+        }
+        if cache.max_entries == 0 {
+            cache.entries.clear();
+            cache.order.clear();
+        }
     }
 
     fn update_ibd_status(&mut self) {
@@ -4113,12 +4164,30 @@ impl ChainState {
         if jobs.is_empty() {
             return Ok(());
         }
-        let thread_count = self.script_check_workers.saturating_add(1).min(jobs.len());
-        let network = self.network;
         let block_hash = block.block_hash();
+        let pending = jobs
+            .iter()
+            .filter(|job| {
+                let key = self.script_cache_key(
+                    block_hash,
+                    height,
+                    job.transaction,
+                    &job.previous_outputs,
+                );
+                !self.script_cache.lock().entries.contains(&key)
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let thread_count = self
+            .script_check_workers
+            .saturating_add(1)
+            .min(pending.len());
+        let network = self.network;
         let block_time = block.header.time;
         if thread_count <= 1 {
-            for job in jobs {
+            for job in &pending {
                 validation::validate_transaction_scripts_at_time_with_block_hash(
                     network,
                     height,
@@ -4128,42 +4197,85 @@ impl ChainState {
                     &job.previous_outputs,
                 )?;
             }
-            return Ok(());
+        } else {
+            let chunk_size = pending.len().div_ceil(thread_count);
+            let failures = thread::scope(|scope| {
+                let handles = pending
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            for job in chunk {
+                                if let Err(error) =
+                                    validation::validate_transaction_scripts_at_time_with_block_hash(
+                                        network,
+                                        height,
+                                        block_time,
+                                        Some(block_hash),
+                                        job.transaction,
+                                        &job.previous_outputs,
+                                    )
+                                {
+                                    return Some((job.tx_index, error));
+                                }
+                            }
+                            None
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().expect("script validation worker panicked"))
+                    .collect::<Vec<_>>()
+            });
+            if let Some((_, error)) = failures.into_iter().min_by_key(|(tx_index, _)| *tx_index) {
+                return Err(error.into());
+            }
         }
 
-        let chunk_size = jobs.len().div_ceil(thread_count);
-        let failures = thread::scope(|scope| {
-            let handles = jobs
-                .chunks(chunk_size)
-                .map(|chunk| {
-                    scope.spawn(move || {
-                        for job in chunk {
-                            if let Err(error) =
-                                validation::validate_transaction_scripts_at_time_with_block_hash(
-                                    network,
-                                    height,
-                                    block_time,
-                                    Some(block_hash),
-                                    job.transaction,
-                                    &job.previous_outputs,
-                                )
-                            {
-                                return Some((job.tx_index, error));
-                            }
-                        }
-                        None
-                    })
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .filter_map(|handle| handle.join().expect("script validation worker panicked"))
-                .collect::<Vec<_>>()
-        });
-        if let Some((_, error)) = failures.into_iter().min_by_key(|(tx_index, _)| *tx_index) {
-            return Err(error.into());
+        let mut cache = self.script_cache.lock();
+        for job in pending {
+            let key =
+                self.script_cache_key(block_hash, height, job.transaction, &job.previous_outputs);
+            if cache.max_entries == 0 || cache.entries.contains(&key) {
+                continue;
+            }
+            if cache.order.len() >= cache.max_entries
+                && let Some(evicted) = cache.order.pop_front()
+            {
+                cache.entries.remove(&evicted);
+            }
+            cache.entries.insert(key);
+            cache.order.push_back(key);
         }
         Ok(())
+    }
+
+    fn script_cache_key(
+        &self,
+        block_hash: BlockHash,
+        height: u32,
+        transaction: &Transaction,
+        previous_outputs: &[TxOut],
+    ) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(match self.network {
+            Network::Bitcoin => b"bitcoin".as_slice(),
+            Network::Testnet => b"testnet".as_slice(),
+            Network::Testnet4 => b"testnet4".as_slice(),
+            Network::Signet => b"signet".as_slice(),
+            Network::Regtest => b"regtest".as_slice(),
+        });
+        hasher.update(height.to_le_bytes());
+        hasher.update(
+            validation::script_flags_for_block_with_hash(self.network, height, Some(block_hash))
+                .to_le_bytes(),
+        );
+        hasher.update(block_hash.to_byte_array());
+        hasher.update(serialize(transaction));
+        for output in previous_outputs {
+            hasher.update(serialize(output));
+        }
+        hasher.finalize().into()
     }
 
     fn enforce_bip30(&self, height: u32, block_hash: BlockHash, parent_hash: BlockHash) -> bool {
@@ -5491,6 +5603,7 @@ impl ChainState {
         let network = self.network;
         let signet_challenge = self.signet_challenge.clone();
         let script_check_workers = self.script_check_workers;
+        let script_cache_max_entries = self.script_cache.lock().max_entries;
         if let Some(previous) = self.background_validation.take() {
             previous.cancel.store(true, Ordering::Release);
         }
@@ -5514,6 +5627,7 @@ impl ChainState {
             base_height,
             target_tip,
             script_check_workers,
+            script_cache_max_entries,
             cancel: cancel.clone(),
         };
         self.background_validation = Some(BackgroundValidation {
@@ -5800,6 +5914,7 @@ fn open_background_replay_state(
     active_chain: &[BlockHash],
     block_index: &HashMap<BlockHash, BlockNode>,
     script_check_workers: usize,
+    script_cache_max_entries: usize,
 ) -> Result<ChainState> {
     let store = BlockStore::open_read_only_with_xor(blocks_dir, blocks_xor)?;
     let filter_store = FilterStore::open(data_dir.join("filters"))?;
@@ -5859,6 +5974,9 @@ fn open_background_replay_state(
         precious_sequence: 0,
         basic_filter_cache: HashMap::new(),
         block_undo_cache: HashMap::new(),
+        script_cache: Mutex::new(ScriptValidationCache::with_max_entries(
+            script_cache_max_entries,
+        )),
     })
 }
 
@@ -5878,6 +5996,7 @@ fn run_background_validation(
         base_height,
         target_tip,
         script_check_workers,
+        script_cache_max_entries,
         cancel,
     } = job;
     let result = (|| -> Result<(HashMap<OutPoint, UtxoEntry>, bool)> {
@@ -5916,6 +6035,7 @@ fn run_background_validation(
             &active_chain,
             &block_index,
             script_check_workers,
+            script_cache_max_entries,
         )?;
         if base_height == 0 && start_height == 0 {
             base_matches = Some(utxos == expected);
@@ -6691,6 +6811,40 @@ mod tests {
             validation,
             ValidationError::Script { txid, .. } if *txid == first_txid
         ));
+    }
+
+    #[test]
+    fn successful_script_checks_are_cached_by_block_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let block = mine_block(&state, 1);
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(bitcoin::Txid::from_byte_array([3; 32]), 0),
+                script_sig: Builder::new().into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+        let jobs = [ScriptCheckJob {
+            tx_index: 1,
+            transaction: &transaction,
+            previous_outputs: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        }];
+
+        state.validate_script_checks(&block, 1, &jobs).unwrap();
+        assert_eq!(state.script_cache.lock().entries.len(), 1);
+        state.validate_script_checks(&block, 1, &jobs).unwrap();
+        assert_eq!(state.script_cache.lock().entries.len(), 1);
     }
 
     #[test]

@@ -974,6 +974,7 @@ impl Node {
             )?;
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
+        chain.configure_script_cache_size_mib(config.max_sig_cache_mib);
         chain.configure_prune_after_height(config.network, config.fast_prune);
         chain.configure_pruning(config.prune)?;
         // Electrum 1.7 outpoint status needs confirmed spender lookups even
@@ -4179,6 +4180,7 @@ mod tests {
             block_notify: None,
             shutdown_notify: None,
             alert_notify: None,
+            max_sig_cache_mib: 32,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,

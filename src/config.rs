@@ -41,6 +41,7 @@ pub const DEFAULT_RPC_WORK_QUEUE: usize = 64;
 pub const DEFAULT_RPC_SERVER_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_SCRIPT_CHECK_THREADS: i32 = 0;
+pub const DEFAULT_MAX_SIG_CACHE_MIB: i64 = 32;
 pub const MAX_SCRIPT_CHECK_THREADS: usize = 15;
 pub const MAX_SUBVERSION_LENGTH: usize = 256;
 pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
@@ -810,6 +811,11 @@ pub struct Args {
     /// values leave that many cores available to the rest of the node.
     #[arg(long = "par", default_value_t = DEFAULT_SCRIPT_CHECK_THREADS)]
     pub script_check_threads: i32,
+
+    /// Approximate validation-cache size in MiB, matching Core's
+    /// `-maxsigcachesize` control.
+    #[arg(long = "maxsigcachesize", default_value_t = DEFAULT_MAX_SIG_CACHE_MIB, hide = true)]
+    pub max_sig_cache_mib: i64,
 
     #[arg(
         long = "blockreconstructionextratxn",
@@ -1734,6 +1740,7 @@ pub struct Config {
     pub check_mempool: usize,
     pub check_addrman: usize,
     pub script_check_threads: i32,
+    pub max_sig_cache_mib: i64,
     pub block_reconstruction_extra_txn: usize,
     pub user_agent_comments: Vec<String>,
     pub startup_notify: Option<String>,
@@ -2289,6 +2296,7 @@ impl Config {
             check_mempool,
             check_addrman,
             script_check_threads: args.script_check_threads,
+            max_sig_cache_mib: args.max_sig_cache_mib,
             block_reconstruction_extra_txn: args.block_reconstruction_extra_txn,
             user_agent_comments,
             startup_notify: args.startup_notify,
@@ -2802,6 +2810,7 @@ mod tests {
             "--onlynet=ipv4",
             "--proxy=127.0.0.1:9050",
             "--blockreconstructionextratxn=7",
+            "--maxsigcachesize=1",
             "--bantime=123",
             "--deprecatedrpc=startingheight,warnings",
             "--uacomment=lab",
@@ -2822,6 +2831,7 @@ mod tests {
         assert_eq!(config.onlynet, vec![OnlyNet::Ipv4]);
         assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
         assert_eq!(config.block_reconstruction_extra_txn, 7);
+        assert_eq!(config.max_sig_cache_mib, 1);
         assert_eq!(config.user_agent_comments, vec!["lab".to_owned()]);
         assert_eq!(config.startup_notify.as_deref(), Some("echo start"));
         assert_eq!(config.block_notify.as_deref(), Some("echo %s"));

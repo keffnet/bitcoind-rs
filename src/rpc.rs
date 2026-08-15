@@ -8731,6 +8731,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         } else {
             validation::MAX_BLOCK_SERIALIZED_SIZE / 4
         },
+        "curtime": curtime,
         "longpollid": format!("{}{}", tip.hash, mempool.sequence()),
         "height": height,
         "bits": format!("{:08x}", bits),
@@ -13326,6 +13327,7 @@ mod tests {
         assert_eq!(template["sigoplimit"], 80_000);
         assert_eq!(template["sizelimit"], 4_000_000);
         assert_eq!(template["weightlimit"], 4_000_000);
+        assert!(template["curtime"].as_u64().is_some());
         assert_eq!(template["rules"], json!(["csv", "!segwit", "taproot"]));
         assert_eq!(
             template["longpollid"],

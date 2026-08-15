@@ -1379,7 +1379,20 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getblockcount" => Ok(json!(node.chain.read().height())),
         "getbestblockhash" => Ok(json!(node.chain.read().best_hash().to_string())),
         "getblockhash" => {
-            let height = param::<u32>(params, 0)?;
+            let height = params
+                .get(0)
+                .and_then(Value::as_i64)
+                .or_else(|| {
+                    params
+                        .get(0)
+                        .and_then(Value::as_u64)
+                        .and_then(|height| i64::try_from(height).ok())
+                })
+                .ok_or_else(|| anyhow!("height must be an integer"))?;
+            if height < 0 {
+                bail!("Block height out of range")
+            }
+            let height = u32::try_from(height).map_err(|_| anyhow!("Block height out of range"))?;
             node.chain
                 .read()
                 .block_hash(height)
@@ -11958,6 +11971,13 @@ mod tests {
         );
         assert!(dispatch_method(&node, "verifychain", &json!([5])).is_err());
         assert!(dispatch_method(&node, "verifychain", &json!([3, -1])).is_err());
+        assert_eq!(
+            dispatch_method(&node, "getblockhash", &json!([0])).unwrap(),
+            json!(node.chain.read().block_hash(0).unwrap().to_string())
+        );
+        let negative_height = dispatch_method(&node, "getblockhash", &json!([-1])).unwrap_err();
+        assert_eq!(negative_height.to_string(), "Block height out of range");
+        assert_eq!(rpc_error(&negative_height)["code"], json!(-8));
         let memory = dispatch_method(&node, "getmemoryinfo", &json!([])).unwrap();
         assert!(
             memory["locked"]["used"]

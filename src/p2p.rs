@@ -2536,18 +2536,21 @@ async fn serve_peer_loop(
                     .await?;
                     continue;
                 }
-                let headers = node
-                    .chain
-                    .read()
-                    .headers_after_locator(&request.locator_hashes, request.stop_hash);
-                send_message(
-                    node,
-                    peer_id,
-                    writer,
-                    node.config.network,
-                    &Message::Headers(headers),
-                )
-                .await?;
+                let headers = node.chain.read().headers_for_getheaders(
+                    &request.locator_hashes,
+                    request.stop_hash,
+                    STALE_RELAY_AGE_LIMIT_SECS,
+                );
+                if let Some(headers) = headers {
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Headers(headers),
+                    )
+                    .await?;
+                }
             }
             Message::GetBlocks(request) => {
                 let hashes = {

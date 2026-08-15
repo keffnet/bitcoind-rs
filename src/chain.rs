@@ -1623,8 +1623,9 @@ impl ChainState {
     ///
     /// Active-chain blocks are always eligible to be served (subject to the
     /// caller discovering that pruning removed their body). A side-chain
-    /// block must have a stored body and remain within the stale-relay age in
-    /// both header time and equivalent proof-of-work time.
+    /// block must remain within the stale-relay age in both header time and
+    /// equivalent proof-of-work time; callers separately check whether its
+    /// body or filter is available.
     pub fn block_request_allowed(&self, hash: &BlockHash, max_age_secs: u64) -> bool {
         let Some(node) = self.block_index.get(hash) else {
             return false;
@@ -1636,10 +1637,6 @@ impl ChainState {
         {
             return true;
         }
-        if !self.store.contains(hash) {
-            return false;
-        }
-
         let best_header = self.best_header_tip();
         let Some(best_node) = self.block_index.get(&best_header.hash) else {
             return false;
@@ -2192,6 +2189,9 @@ impl ChainState {
         locator: &[BlockHash],
         stop_hash: BlockHash,
     ) -> Vec<bitcoin::block::Header> {
+        if locator.is_empty() {
+            return Vec::new();
+        }
         let start = locator
             .iter()
             .find_map(|hash| {
@@ -2223,6 +2223,28 @@ impl ChainState {
             .take(2_000)
             .copied()
             .collect()
+    }
+
+    /// Match Core's special `getheaders` behavior for a null locator.
+    ///
+    /// A null locator is not a request for the active chain from genesis. Core
+    /// uses it to request exactly the stop header, and ignores the request if
+    /// that hash is null, unknown, or not eligible for serving.
+    pub fn headers_for_getheaders(
+        &self,
+        locator: &[BlockHash],
+        stop_hash: BlockHash,
+        max_age_secs: u64,
+    ) -> Option<Vec<bitcoin::block::Header>> {
+        if locator.is_empty() {
+            if stop_hash == BlockHash::all_zeros()
+                || !self.block_request_allowed(&stop_hash, max_age_secs)
+            {
+                return None;
+            }
+            return self.header_by_hash(&stop_hash).map(|header| vec![header]);
+        }
+        Some(self.headers_after_locator(locator, stop_hash))
     }
 
     /// Validate and index a contiguous header batch without requiring the
@@ -6560,6 +6582,33 @@ mod tests {
         let locator = vec![state.block_hash(15).unwrap()];
         let stop_hash = state.block_hash(10).unwrap();
         assert!(state.headers_after_locator(&locator, stop_hash).is_empty());
+        assert!(
+            state
+                .headers_after_locator(&[], state.block_hash(10).unwrap())
+                .is_empty()
+        );
+
+        let stop_hash = state.block_hash(10).unwrap();
+        assert_eq!(
+            state
+                .headers_for_getheaders(&[], stop_hash, 30 * 24 * 60 * 60)
+                .unwrap(),
+            vec![*state.header(10).unwrap()]
+        );
+        assert!(
+            state
+                .headers_for_getheaders(&[], BlockHash::all_zeros(), 30 * 24 * 60 * 60)
+                .is_none()
+        );
+        assert!(
+            state
+                .headers_for_getheaders(
+                    &[],
+                    BlockHash::from_byte_array([0x55; 32]),
+                    30 * 24 * 60 * 60
+                )
+                .is_none()
+        );
     }
 
     #[test]

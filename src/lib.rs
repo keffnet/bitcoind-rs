@@ -742,7 +742,8 @@ impl Node {
                 config.txindex,
                 config.minimum_chain_work,
                 config.assume_valid,
-            )?;
+        )?;
+        chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_pruning(config.prune)?;
         // Electrum 1.7 outpoint status needs confirmed spender lookups even
         // when the standalone Core-style txospenderindex RPC option is off.
@@ -3404,6 +3405,7 @@ mod tests {
             assume_valid: None,
             check_blocks: None,
             check_level: None,
+            max_tip_age_secs: 24 * 60 * 60,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,

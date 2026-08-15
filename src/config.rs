@@ -34,6 +34,7 @@ pub const DEFAULT_BLOCKFILTERINDEX: &str = "0";
 pub const DEFAULT_RPC_THREADS: usize = 16;
 pub const DEFAULT_RPC_WORK_QUEUE: usize = 64;
 pub const DEFAULT_RPC_SERVER_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -548,6 +549,9 @@ pub struct Args {
     #[arg(long = "checklevel", value_name = "N")]
     pub check_level: Option<u8>,
 
+    #[arg(long = "maxtipage", default_value_t = DEFAULT_MAX_TIP_AGE_SECS)]
+    pub max_tip_age: u64,
+
     #[arg(long)]
     pub p2p: Option<SocketAddr>,
 
@@ -958,6 +962,7 @@ pub struct Config {
     pub(crate) assume_valid: Option<BlockHash>,
     pub(crate) check_blocks: Option<u32>,
     pub(crate) check_level: Option<u8>,
+    pub(crate) max_tip_age_secs: u64,
     pub p2p_bind: SocketAddr,
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
@@ -1343,6 +1348,7 @@ impl Config {
             assume_valid,
             check_blocks: args.check_blocks,
             check_level: args.check_level,
+            max_tip_age_secs: args.max_tip_age,
             p2p_bind: primary_p2p_bind,
             p2p_binds,
             listen,
@@ -1732,11 +1738,13 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--checkblocks=12",
             "--checklevel=4",
+            "--maxtipage=42",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
         assert_eq!(config.check_blocks, Some(12));
         assert_eq!(config.check_level, Some(4));
+        assert_eq!(config.max_tip_age_secs, 42);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

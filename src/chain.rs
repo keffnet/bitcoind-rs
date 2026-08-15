@@ -594,6 +594,7 @@ pub struct ChainState {
     blocks_dir: PathBuf,
     minimum_chain_work_override: Option<Work>,
     assume_valid_block: Option<BlockHash>,
+    max_tip_age_secs: u64,
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     filter_store: FilterStore,
@@ -890,6 +891,7 @@ impl ChainState {
             blocks_dir,
             minimum_chain_work_override,
             assume_valid_block,
+            max_tip_age_secs: MAX_TIP_AGE_SECS,
             signet_challenge: (network == Network::Signet).then(|| {
                 signet_challenge
                     .map(ToOwned::to_owned)
@@ -1497,6 +1499,12 @@ impl ChainState {
         self.initial_block_download
     }
 
+    /// Configure Core's IBD tip-age boundary and refresh the latched state.
+    pub fn configure_max_tip_age(&mut self, max_tip_age_secs: u64) {
+        self.max_tip_age_secs = max_tip_age_secs;
+        self.update_ibd_status();
+    }
+
     fn update_ibd_status(&mut self) {
         self.update_ibd_status_at(crate::time::unix_time());
     }
@@ -1510,7 +1518,7 @@ impl ChainState {
             .header(tip.height)
             .expect("the active tip header is always indexed");
         if tip.work >= self.minimum_chain_work()
-            && u64::from(header.time).saturating_add(MAX_TIP_AGE_SECS) >= now
+            && u64::from(header.time).saturating_add(self.max_tip_age_secs) >= now
         {
             self.initial_block_download = false;
         }
@@ -5573,6 +5581,7 @@ fn open_background_replay_state(
         blocks_dir: blocks_dir.to_owned(),
         minimum_chain_work_override: None,
         assume_valid_block: None,
+        max_tip_age_secs: MAX_TIP_AGE_SECS,
         signet_challenge,
         store,
         filter_store,
@@ -6525,6 +6534,14 @@ mod tests {
         assert!(!state.is_initial_block_download());
 
         state.update_ibd_status_at(genesis_time + MAX_TIP_AGE_SECS + 1_000_000);
+        assert!(!state.is_initial_block_download());
+    }
+
+    #[test]
+    fn configurable_max_tip_age_updates_the_latched_ibd_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_max_tip_age(u64::MAX);
         assert!(!state.is_initial_block_download());
     }
 

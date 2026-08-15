@@ -1277,13 +1277,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "createmultisig" => Some(&["nrequired", "keys", "address_type"]),
         "sendrawtransaction" => Some(&["hexstring", "maxfeerate", "maxburnamount"]),
         "abortprivatebroadcast" => Some(&["txid"]),
-        "signrawtransactionwithkey" => Some(&[
-            "hexstring",
-            "privkeys",
-            "prevtxs",
-            "sighashtype",
-            "maxfeerate",
-        ]),
+        "signrawtransactionwithkey" => Some(&["hexstring", "privkeys", "prevtxs", "sighashtype"]),
         "submitblock" => Some(&["hexdata", "dummy"]),
         "getblocktemplate" => Some(&["template_request"]),
         "prioritisetransaction" => Some(&["txid", "dummy", "fee_delta"]),
@@ -12444,6 +12438,20 @@ mod tests {
         assert!(normalize_rpc_params("getblockhash", &json!({"height": 0, "extra": 1})).is_err());
         assert!(normalize_rpc_params("getblockhash", &json!([0, 1])).is_err());
         assert!(normalize_rpc_params("getblockcount", &json!([1])).is_err());
+        assert!(
+            normalize_rpc_params(
+                "signrawtransactionwithkey",
+                &json!(["00", [], null, "ALL", 0])
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_rpc_params(
+                "signrawtransactionwithkey",
+                &json!({"hexstring": "00", "privkeys": [], "maxfeerate": 0}),
+            )
+            .is_err()
+        );
         assert!(normalize_rpc_params("echo", &json!([1, 2, 3])).is_ok());
     }
 

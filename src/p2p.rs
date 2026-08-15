@@ -1253,6 +1253,25 @@ impl PeerManager {
         });
         let configured_connect_nodes =
             self.node.config.connect_disabled || !self.node.config.seed_nodes.is_empty();
+        if !configured_connect_nodes {
+            for endpoint in self
+                .node
+                .config
+                .seed_nodes_for_address_fetch
+                .iter()
+                .cloned()
+            {
+                spawn_outbound_loop(
+                    self.node.clone(),
+                    endpoint,
+                    outbound.clone(),
+                    false,
+                    None,
+                    "addr-fetch",
+                    true,
+                );
+            }
+        }
         let connect_nodes = if !configured_connect_nodes && self.node.config.dnsseed {
             let addresses = discover_dns_seeds(self.node.config.network).await;
             for address in &addresses {
@@ -4778,6 +4797,7 @@ mod tests {
                 .collect(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             dnsseed: false,
             onlynet: Vec::new(),
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
@@ -5337,6 +5357,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -5480,6 +5501,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -5879,6 +5901,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
             max_upload_target: 0,
@@ -6006,6 +6029,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6139,6 +6163,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6362,6 +6387,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6461,6 +6487,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6542,6 +6569,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
             max_upload_target: 0,
@@ -6615,6 +6643,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
             max_upload_target: 0,
@@ -6750,6 +6779,7 @@ mod tests {
             seed_nodes: Vec::new(),
             connect_disabled: false,
             add_nodes: Vec::new(),
+            seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,

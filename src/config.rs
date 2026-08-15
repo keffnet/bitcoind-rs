@@ -514,6 +514,9 @@ pub struct Args {
     #[arg(long = "addnode", value_delimiter = ',')]
     pub addnode: Vec<String>,
 
+    #[arg(long = "seednode", value_delimiter = ',')]
+    pub seednode: Vec<String>,
+
     #[arg(
         long = "noconnect",
         default_value_t = false,
@@ -772,6 +775,7 @@ pub struct Config {
     pub seed_nodes: Vec<NetworkEndpoint>,
     pub connect_disabled: bool,
     pub add_nodes: Vec<NetworkEndpoint>,
+    pub seed_nodes_for_address_fetch: Vec<NetworkEndpoint>,
     pub dnsseed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
@@ -989,6 +993,8 @@ impl Config {
             .collect::<Vec<_>>();
         let seed_nodes = parse_manual_endpoints(&seed_nodes, network, "connect")?;
         let add_nodes = parse_manual_endpoints(&args.addnode, network, "addnode")?;
+        let seed_nodes_for_address_fetch =
+            parse_manual_endpoints(&args.seednode, network, "seednode")?;
         std::fs::create_dir_all(&args.datadir)
             .with_context(|| format!("creating data directory {}", args.datadir.display()))?;
         Ok(Self {
@@ -1002,6 +1008,7 @@ impl Config {
             seed_nodes,
             connect_disabled,
             add_nodes,
+            seed_nodes_for_address_fetch,
             dnsseed,
             onlynet: args.onlynet,
             proxy: args.proxy,
@@ -1347,6 +1354,22 @@ mod tests {
                 NetworkEndpoint::dns("example.invalid".to_owned(), 18444).unwrap(),
                 NetworkEndpoint::from_socket("192.0.2.2:18444".parse().unwrap()),
             ]
+        );
+        assert!(config.listen);
+        assert!(config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--seednode=seed.example",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.seed_nodes_for_address_fetch,
+            vec![NetworkEndpoint::dns("seed.example".to_owned(), 18444).unwrap()]
         );
         assert!(config.listen);
         assert!(config.dnsseed);

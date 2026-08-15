@@ -8216,7 +8216,10 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("dummy must be a string")
     }
     let bytes = hex::decode(param::<String>(params, 0)?)?;
-    let block: bitcoin::Block = deserialize(&bytes)?;
+    let mut block: bitcoin::Block = deserialize(&bytes)?;
+    node.chain
+        .read()
+        .update_uncommitted_block_structures(&mut block);
     let hash = block.block_hash();
     if let Some(status) = node.chain.read().proposal_duplicate_status(&hash)
         && status != "duplicate-inconclusive"
@@ -13371,8 +13374,10 @@ mod tests {
         assert!(descriptor_block["hex"].as_str().is_some());
         let block_hex = descriptor_block["hex"].as_str().unwrap();
         assert!(submit_block(&node, &json!([block_hex, 1])).is_err());
+        let mut uncommitted: Block = deserialize(&hex::decode(block_hex).unwrap()).unwrap();
+        uncommitted.txdata[0].input[0].witness = Witness::default();
         assert_eq!(
-            submit_block(&node, &json!([block_hex])).unwrap(),
+            submit_block(&node, &json!([hex::encode(serialize(&uncommitted))])).unwrap(),
             Value::Null
         );
         assert_eq!(

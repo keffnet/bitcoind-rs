@@ -19,6 +19,7 @@ use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::pow::{CompactTarget, Target, Work};
 use bitcoin::{
     Amount, Block, BlockHash, Network, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid,
+    Witness,
 };
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -1480,6 +1481,32 @@ impl ChainState {
             Some("duplicate")
         } else {
             Some("duplicate-inconclusive")
+        }
+    }
+
+    /// Apply Core's submitblock-only normalization for an omitted coinbase
+    /// witness reserved value. The block hash and txid are unchanged because
+    /// the witness is outside the transaction merkle tree.
+    pub fn update_uncommitted_block_structures(&self, block: &mut Block) {
+        let Some(parent) = self.block_index.get(&block.header.prev_blockhash) else {
+            return;
+        };
+        let height = parent.height.saturating_add(1);
+        if height < validation::buried_deployment_heights(self.network).segwit {
+            return;
+        }
+        let Some(coinbase) = block.txdata.first_mut() else {
+            return;
+        };
+        let has_witness_commitment = coinbase.output.iter().any(|output| {
+            output.script_pubkey.len() >= 38
+                && output.script_pubkey.as_bytes()[..6] == [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed]
+        });
+        if has_witness_commitment
+            && coinbase.input.iter().all(|input| input.witness.is_empty())
+            && let Some(input) = coinbase.input.first_mut()
+        {
+            input.witness = Witness::from_slice(&[vec![0u8; 32]]);
         }
     }
 

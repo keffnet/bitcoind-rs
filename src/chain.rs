@@ -2982,7 +2982,7 @@ impl ChainState {
     fn validate_candidate_block_internal(&self, block: &Block, check_pow: bool) -> Result<()> {
         let parent_hash = block.header.prev_blockhash;
         if parent_hash != self.best_hash() {
-            bail!("proposed block does not build on the active tip")
+            return Err(ValidationError::WrongPreviousBlock.into());
         }
         let height = self.height().saturating_add(1);
         let parent = self

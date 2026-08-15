@@ -8235,11 +8235,19 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 Ok(json!("inconclusive"))
             } else if message.contains("invalidated branch") {
                 Ok(json!("duplicate-invalid"))
+            } else if let Some(reason) = bip22_validation_result(&error) {
+                Ok(reason)
             } else {
                 Ok(json!(message))
             }
         }
     }
+}
+
+fn bip22_validation_result(error: &anyhow::Error) -> Option<Value> {
+    error
+        .downcast_ref::<validation::ValidationError>()
+        .map(|error| json!(error.bip22_reject_reason()))
 }
 
 fn generate_to_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -8594,7 +8602,12 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         if let Some(status) = chain.proposal_duplicate_status(&block.block_hash()) {
             return Ok(json!(status));
         }
-        chain.validate_candidate_block_without_pow(&block)?;
+        if let Err(error) = chain.validate_candidate_block_without_pow(&block) {
+            if let Some(reason) = bip22_validation_result(&error) {
+                return Ok(reason);
+            }
+            return Err(error);
+        }
         return Ok(Value::Null);
     }
     if mode != "template" {
@@ -13662,6 +13675,31 @@ mod tests {
             )
             .unwrap(),
             Value::Null
+        );
+
+        proposal.header.prev_blockhash = BlockHash::all_zeros();
+        assert_eq!(
+            get_block_template(
+                &node,
+                &json!([{"mode": "proposal", "data": hex::encode(serialize(&proposal))}]),
+            )
+            .unwrap(),
+            json!("inconclusive-not-best-prevblk")
+        );
+        proposal.header.prev_blockhash = parent.block_hash();
+        proposal.header.time = parent.time;
+        let invalid_proposal = hex::encode(serialize(&proposal));
+        assert_eq!(
+            get_block_template(
+                &node,
+                &json!([{"mode": "proposal", "data": invalid_proposal}]),
+            )
+            .unwrap(),
+            json!("time-too-old")
+        );
+        assert_eq!(
+            submit_block(&node, &json!([hex::encode(serialize(&proposal))])).unwrap(),
+            json!("time-too-old")
         );
 
         let mined_hash = generate_to_address(

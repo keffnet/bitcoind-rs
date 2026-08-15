@@ -134,6 +134,54 @@ pub enum ValidationError {
     },
 }
 
+impl ValidationError {
+    /// Return the reject reason used by Core's BIP22 proposal and submitblock
+    /// responses. Keep this separate from `Display`: the latter is intended
+    /// for operator diagnostics, while BIP22 exposes stable protocol strings.
+    pub(crate) fn bip22_reject_reason(&self) -> String {
+        match self {
+            Self::WrongPreviousBlock => "inconclusive-not-best-prevblk".to_owned(),
+            Self::BadTarget | Self::TargetAboveLimit => "bad-diffbits".to_owned(),
+            Self::BadProofOfWork => "high-hash".to_owned(),
+            Self::TimeTooOld => "time-too-old".to_owned(),
+            Self::TimeTooNew => "time-too-new".to_owned(),
+            Self::Bip94TimeWarp => "time-timewarp-attack".to_owned(),
+            Self::EmptyBlock => "bad-blk-length".to_owned(),
+            Self::BadMerkleRoot => "bad-txnmrklroot".to_owned(),
+            Self::BadWitnessCommitment => "bad-witness-merkle-match".to_owned(),
+            Self::UnexpectedWitness => "unexpected-witness".to_owned(),
+            Self::BadSignetSolution => "bad-signet-blksig".to_owned(),
+            Self::OversizedBlock => "bad-blk-weight".to_owned(),
+            Self::OversizedTransaction(_) => "bad-txns-oversize".to_owned(),
+            Self::TooManySigops => "bad-blk-sigops".to_owned(),
+            Self::BadBlockVersion { actual, .. } => {
+                format!("bad-version(0x{:08x})", *actual as u32)
+            }
+            Self::BadCoinbase => "bad-cb-length".to_owned(),
+            Self::FirstTransactionNotCoinbase => "bad-cb-missing".to_owned(),
+            Self::ExtraCoinbase(_) => "bad-cb-multiple".to_owned(),
+            Self::NullPrevout(_) => "bad-txns-prevout-null".to_owned(),
+            Self::EmptyInputs(_) => "bad-txns-vin-empty".to_owned(),
+            Self::EmptyOutputs(_) => "bad-txns-vout-empty".to_owned(),
+            Self::DuplicateInput(_) => "bad-txns-inputs-duplicate".to_owned(),
+            Self::DuplicateTransaction(_) => "bad-txns-duplicate".to_owned(),
+            Self::BadOutputValue(_) => "bad-txns-vout-toolarge".to_owned(),
+            Self::OutputTotalOverflow => "bad-txns-txouttotal-toolarge".to_owned(),
+            Self::SubsidyOverflow => "bad-txns-fee-outofrange".to_owned(),
+            Self::CoinbaseOverpay { .. } => "bad-cb-amount".to_owned(),
+            Self::MissingInput { .. } => "bad-txns-inputs-missingorspent".to_owned(),
+            Self::ImmatureCoinbase { .. } => "bad-txns-premature-spend-of-coinbase".to_owned(),
+            Self::InputTotalOverflow => "bad-txns-inputvalues-outofrange".to_owned(),
+            Self::NegativeFee { .. } => "bad-txns-in-belowout".to_owned(),
+            Self::BadCoinbaseHeight => "bad-cb-height".to_owned(),
+            Self::NonFinalTransaction => "bad-txns-nonfinal".to_owned(),
+            Self::Script { reason, .. } => {
+                format!("block-script-verify-flag-failed ({reason})")
+            }
+        }
+    }
+}
+
 pub fn network_params(network: Network) -> &'static Params {
     network.params()
 }

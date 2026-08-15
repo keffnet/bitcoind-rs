@@ -30,10 +30,18 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    let mut readiness = DaemonReadyGuard::new(readiness);
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?;
-    runtime.block_on(run_node(config, DaemonReadyGuard::new(readiness)))
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            readiness.notify(false);
+            return Err(error.into());
+        }
+    };
+    runtime.block_on(run_node(config, readiness))
 }
 
 async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()> {

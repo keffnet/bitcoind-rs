@@ -2556,10 +2556,14 @@ fn validate_standard_witnesses(
                     ));
                 }
                 let leaf_version = control_block[0] & 0xfe;
-                if leaf_version == 0xc0
-                    && witness_items[..witness_items.len() - 2]
-                        .iter()
-                        .any(|item| item.len() > 80)
+                if leaf_version != 0xc0 {
+                    return Err(MempoolError::NonStandard(
+                        "bad-witness-nonstandard".to_owned(),
+                    ));
+                }
+                if witness_items[..witness_items.len() - 2]
+                    .iter()
+                    .any(|item| item.len() > 80)
                 {
                     return Err(MempoolError::NonStandard(
                         "bad-witness-nonstandard".to_owned(),
@@ -3654,6 +3658,28 @@ mod tests {
         );
         assert!(matches!(
             witness_policy,
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
+        ));
+
+        let taproot_previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::from_bytes({
+                let mut bytes = vec![0x51, 0x20];
+                bytes.extend([0u8; 32]);
+                bytes
+            }),
+        };
+        let mut future_taproot = graph_transaction(Txid::from_byte_array([10; 32]), 10);
+        future_taproot.input[0].script_sig = ScriptBuf::new();
+        future_taproot.input[0].witness = Witness::from_slice(&[vec![0x51], vec![0xc2; 33]]);
+        future_taproot.output[0].value = Amount::from_sat(100_000);
+        future_taproot.output[0].script_pubkey = taproot_previous.script_pubkey.clone();
+        assert!(matches!(
+            validate_standard_policy(
+                &future_taproot,
+                std::slice::from_ref(&taproot_previous),
+                1,
+            ),
             Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
         ));
     }

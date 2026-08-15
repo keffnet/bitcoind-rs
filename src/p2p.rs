@@ -1265,22 +1265,14 @@ impl PeerManager {
             }
             Vec::new()
         } else {
-            self.node
-                .config
-                .seed_nodes
-                .iter()
-                .copied()
-                .map(NetworkEndpoint::from_socket)
-                .collect()
+            self.node.config.seed_nodes.clone()
         };
         for endpoint in seed_nodes {
             if !self.node.config.allows_network_endpoint(&endpoint) {
                 debug!(endpoint = %endpoint, "skipping peer outside onlynet policy");
                 continue;
             }
-            if let Some(address) = endpoint.legacy_socket_addr() {
-                self.node.ensure_node_added(address);
-            }
+            self.node.ensure_node_endpoint_added(endpoint.clone());
             spawn_outbound_loop(
                 self.node.clone(),
                 endpoint,
@@ -4775,7 +4767,10 @@ mod tests {
             rpc_bind: None,
             electrum_bind: None,
             rest: false,
-            seed_nodes,
+            seed_nodes: seed_nodes
+                .into_iter()
+                .map(NetworkEndpoint::from_socket)
+                .collect(),
             dnsseed: false,
             onlynet: Vec::new(),
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),

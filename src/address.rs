@@ -3,7 +3,7 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use sha3::{Digest, Sha3_256};
 
 /// A validated endpoint from one of the BIP155 address networks.
@@ -202,6 +202,36 @@ impl NetworkEndpoint {
             bail!("network endpoint port must be non-zero")
         }
         Ok(Self::Dns { host, port })
+    }
+
+    /// Parse a manual endpoint accepted by Core-style `-connect`/`addnode`
+    /// interfaces. Numeric socket addresses retain their explicit port,
+    /// numeric IP literals without a port use `default_port`, and hostnames
+    /// remain unresolved so a SOCKS5 proxy can receive the original name.
+    pub fn parse_manual(value: &str, default_port: u16) -> Result<Self> {
+        if default_port == 0 {
+            bail!("default network endpoint port must be non-zero")
+        }
+        if let Ok(address) = value.parse::<SocketAddr>() {
+            if address.port() == 0 {
+                bail!("network endpoint port must be non-zero")
+            }
+            return Ok(Self::from_socket(address));
+        }
+        if let Ok(address) = value.parse::<IpAddr>() {
+            return Ok(Self::from_socket(SocketAddr::new(address, default_port)));
+        }
+        let (host, port) = match value.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() => {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|error| anyhow!("invalid network address {value}: {error}"))?;
+                (host.trim_start_matches('[').trim_end_matches(']'), port)
+            }
+            None => (value, default_port),
+            Some(_) => bail!("invalid network address {value}"),
+        };
+        Self::dns(host.to_owned(), port)
     }
 
     /// Parse an address-manager entry. Legacy entries use the full socket
@@ -496,6 +526,29 @@ mod tests {
         assert_eq!(endpoint.host_string(), "example.invalid");
         assert_eq!(endpoint.socket_addr(), None);
         assert_eq!(endpoint.to_addr_v2(), None);
+    }
+
+    #[test]
+    fn parses_manual_endpoints_with_default_ports() {
+        assert_eq!(
+            NetworkEndpoint::parse_manual("192.0.2.1", 18444).unwrap(),
+            NetworkEndpoint::Ip("192.0.2.1:18444".parse().unwrap())
+        );
+        assert_eq!(
+            NetworkEndpoint::parse_manual("example.invalid", 18444).unwrap(),
+            NetworkEndpoint::Dns {
+                host: "example.invalid".to_owned(),
+                port: 18444,
+            }
+        );
+        assert_eq!(
+            NetworkEndpoint::parse_manual("example.invalid:9735", 18444).unwrap(),
+            NetworkEndpoint::Dns {
+                host: "example.invalid".to_owned(),
+                port: 9735,
+            }
+        );
+        assert!(NetworkEndpoint::parse_manual("example.invalid:0", 18444).is_err());
     }
 
     #[test]

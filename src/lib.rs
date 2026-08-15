@@ -668,16 +668,16 @@ impl Node {
         let added_nodes = config
             .seed_nodes
             .iter()
-            .copied()
-            .map(|address| (NetworkEndpoint::from_socket(address), None))
+            .cloned()
+            .map(|endpoint| (endpoint, None))
             .collect();
         let added_node_names = config
             .seed_nodes
             .iter()
-            .copied()
-            .map(|address| {
-                let endpoint = NetworkEndpoint::from_socket(address);
-                (endpoint, address.to_string())
+            .cloned()
+            .map(|endpoint| {
+                let name = endpoint.to_string();
+                (endpoint, name)
             })
             .collect();
         let max_mempool_bytes = config
@@ -1036,7 +1036,12 @@ impl Node {
         entry: &PrivateBroadcastEntry,
         now: u64,
     ) -> Vec<SocketAddr> {
-        let mut candidates = self.config.seed_nodes.clone();
+        let mut candidates = self
+            .config
+            .seed_nodes
+            .iter()
+            .filter_map(NetworkEndpoint::socket_addr)
+            .collect::<Vec<_>>();
         candidates.extend(self.known_addresses.read().keys().copied());
         candidates.sort_unstable();
         candidates.dedup();
@@ -2671,10 +2676,6 @@ impl Node {
         self.added_nodes.read().contains_key(endpoint)
     }
 
-    pub(crate) fn ensure_node_added(&self, address: SocketAddr) {
-        self.ensure_node_endpoint_added(NetworkEndpoint::from_socket(address));
-    }
-
     pub(crate) fn ensure_node_endpoint_added(&self, endpoint: NetworkEndpoint) {
         if let std::collections::hash_map::Entry::Vacant(entry) =
             self.added_nodes.write().entry(endpoint.clone())
@@ -3395,9 +3396,9 @@ mod tests {
         config.private_broadcast = true;
         config.proxy = Some("127.0.0.1:9050".parse().unwrap());
         config.seed_nodes = vec![
-            "192.0.2.1:18444".parse().unwrap(),
-            "192.0.2.2:18444".parse().unwrap(),
-            "192.0.2.3:18444".parse().unwrap(),
+            NetworkEndpoint::from_socket("192.0.2.1:18444".parse().unwrap()),
+            NetworkEndpoint::from_socket("192.0.2.2:18444".parse().unwrap()),
+            NetworkEndpoint::from_socket("192.0.2.3:18444".parse().unwrap()),
         ];
         config.max_peers = 3;
         let node = Node::open(config).unwrap();
@@ -3441,7 +3442,9 @@ mod tests {
         let mut config = test_config(directory.path());
         config.private_broadcast = true;
         config.proxy = Some("127.0.0.1:9050".parse().unwrap());
-        config.seed_nodes = vec!["192.0.2.1:18444".parse().unwrap()];
+        config.seed_nodes = vec![NetworkEndpoint::from_socket(
+            "192.0.2.1:18444".parse().unwrap(),
+        )];
         let node = Node::open(config).unwrap();
         let transaction = private_broadcast_test_transaction(&node);
         let wtxid = transaction.compute_wtxid();

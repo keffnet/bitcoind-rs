@@ -43,7 +43,7 @@ use tracing::debug;
 
 use crate::address::NetworkEndpoint;
 use crate::chain;
-use crate::config::OnlyNet;
+use crate::config::{OnlyNet, default_p2p_port};
 use crate::mempool::{
     MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool,
     MempoolError, MempoolLoadOptions, package_is_child_with_parents_tree,
@@ -3221,43 +3221,7 @@ fn parse_socket_address(value: &str) -> Result<SocketAddr> {
 }
 
 fn parse_node_endpoint(node: &Arc<Node>, value: &str) -> Result<NetworkEndpoint> {
-    if let Ok(address) = value.parse::<SocketAddr>() {
-        return Ok(NetworkEndpoint::from_socket(address));
-    }
-    if let Ok(address) = value.parse::<IpAddr>() {
-        return Ok(NetworkEndpoint::from_socket(SocketAddr::new(
-            address,
-            default_p2p_port(node.config.network),
-        )));
-    }
-    let port = match node.config.network {
-        Network::Bitcoin
-        | Network::Testnet
-        | Network::Testnet4
-        | Network::Signet
-        | Network::Regtest => default_p2p_port(node.config.network),
-    };
-    let (host, port) = match value.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => {
-            let port = port
-                .parse::<u16>()
-                .map_err(|error| anyhow!("invalid network address {value}: {error}"))?;
-            (host.trim_start_matches('[').trim_end_matches(']'), port)
-        }
-        None => (value, port),
-        Some(_) => bail!("invalid network address {value}"),
-    };
-    NetworkEndpoint::dns(host.to_owned(), port)
-}
-
-fn default_p2p_port(network: Network) -> u16 {
-    match network {
-        Network::Bitcoin => 8333,
-        Network::Testnet => 18333,
-        Network::Testnet4 => 48333,
-        Network::Signet => 38333,
-        Network::Regtest => 18444,
-    }
+    NetworkEndpoint::parse_manual(value, default_p2p_port(node.config.network))
 }
 
 fn parse_ip_address(value: &str) -> Result<IpAddr> {

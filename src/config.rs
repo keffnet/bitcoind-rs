@@ -509,7 +509,7 @@ pub struct Args {
     pub rest: bool,
 
     #[arg(long, value_delimiter = ',')]
-    pub connect: Vec<SocketAddr>,
+    pub connect: Vec<String>,
 
     #[arg(long = "onlynet", value_enum, value_delimiter = ',')]
     pub onlynet: Vec<OnlyNet>,
@@ -757,7 +757,7 @@ pub struct Config {
     pub rpc_bind: Option<SocketAddr>,
     pub electrum_bind: Option<SocketAddr>,
     pub rest: bool,
-    pub seed_nodes: Vec<SocketAddr>,
+    pub seed_nodes: Vec<NetworkEndpoint>,
     pub dnsseed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
@@ -952,17 +952,26 @@ impl Config {
         if args.peerblockfilters && !blockfilterindex {
             bail!("--peerblockfilters requires --blockfilterindex");
         }
+        let network = args.network.into();
+        let seed_nodes = args
+            .connect
+            .iter()
+            .map(|value| {
+                NetworkEndpoint::parse_manual(value, default_p2p_port(network))
+                    .with_context(|| format!("parsing --connect address '{value}'"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         std::fs::create_dir_all(&args.datadir)
             .with_context(|| format!("creating data directory {}", args.datadir.display()))?;
         Ok(Self {
-            network: args.network.into(),
+            network,
             datadir: args.datadir,
             p2p_bind: args.p2p,
             listen,
             rpc_bind: Some(args.rpc),
             electrum_bind: Some(args.electrum),
             rest: args.rest,
-            seed_nodes: args.connect,
+            seed_nodes,
             dnsseed,
             onlynet: args.onlynet,
             proxy: args.proxy,
@@ -1033,6 +1042,16 @@ impl Config {
 
     pub fn peer_permissions(&self, address: IpAddr, incoming: bool) -> PeerPermissions {
         self.peer_permissions.permissions_for(address, incoming)
+    }
+}
+
+pub(crate) fn default_p2p_port(network: Network) -> u16 {
+    match network {
+        Network::Bitcoin => 8333,
+        Network::Testnet => 18333,
+        Network::Testnet4 => 48333,
+        Network::Signet => 38333,
+        Network::Regtest => 18444,
     }
 }
 
@@ -1220,6 +1239,23 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert!(!config.listen);
         assert!(!config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--connect=example.invalid,192.0.2.1",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.seed_nodes,
+            vec![
+                NetworkEndpoint::dns("example.invalid".to_owned(), 18444).unwrap(),
+                NetworkEndpoint::from_socket("192.0.2.1:18444".parse().unwrap()),
+            ]
+        );
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -735,6 +735,28 @@ impl Mempool {
             .and_then(|txid| self.entries.get(txid))
     }
 
+    pub(crate) fn fee_estimation_entries(&self) -> Vec<(Txid, Transaction, u64, u64, u32)> {
+        self.entries
+            .iter()
+            .map(|(txid, entry)| {
+                (
+                    *txid,
+                    entry.transaction.clone(),
+                    entry.fee_sat,
+                    entry.vsize,
+                    entry.height,
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn has_mempool_parent(&self, transaction: &Transaction) -> bool {
+        transaction
+            .input
+            .iter()
+            .any(|input| self.entries.contains_key(&input.previous_output.txid))
+    }
+
     /// Return a transaction only when it entered the mempool before the
     /// peer's most recent inventory announcement. This mirrors Core's
     /// `info_for_relay` gate for GETDATA transaction requests.

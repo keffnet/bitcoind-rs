@@ -6,6 +6,7 @@ pub mod asmap;
 pub mod chain;
 pub mod config;
 pub mod electrum;
+pub mod fee_estimator;
 pub mod i2p;
 pub mod mempool;
 pub mod muhash;
@@ -36,7 +37,7 @@ use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid, Wtxid};
 use fs2::FileExt;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::random;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -47,6 +48,7 @@ use crate::address::NetworkEndpoint;
 use crate::asmap::AsMap;
 use crate::chain::ChainState;
 use crate::config::{Config, PeerPermissions, RpcCookiePermissions};
+use crate::fee_estimator::{FeeEstimator, RawFeeEstimate};
 use crate::mempool::{
     Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
 };
@@ -61,6 +63,7 @@ const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
+const FEE_ESTIMATOR_FLUSH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const MAX_EXTERNAL_BLOCK_RECORD_SIZE: usize = 4 * 1024 * 1024;
 const MAX_UPLOAD_TIMEFRAME_SECS: u64 = 24 * 60 * 60;
 const MAX_UPLOAD_BLOCK_RESERVE_BYTES: u64 = 4_000_000;
@@ -845,6 +848,7 @@ pub struct Node {
     time_offset_samples: parking_lot::RwLock<VecDeque<i64>>,
     warnings: parking_lot::RwLock<Vec<NodeWarning>>,
     versionbits_warning_scanned: AtomicBool,
+    fee_estimator: Mutex<FeeEstimator>,
     pub started_at: Instant,
     shutdown: Notify,
 }
@@ -998,6 +1002,7 @@ impl Node {
                 .context("startup block verification failed")?;
         }
         let mempool_path = config.datadir.join("mempool.dat");
+        let fee_estimator_path = config.datadir.join("fee_estimates.dat");
         let mempool_policy = MempoolPolicy {
             min_relay_fee_sat_per_kvb: config.min_relay_tx_fee_sat_per_kvb,
             incremental_relay_fee_sat_per_kvb: config.incremental_relay_fee_sat_per_kvb,
@@ -1036,6 +1041,16 @@ impl Node {
             }
         }
         let _ = mempool.take_changes();
+        let mut fee_estimator = FeeEstimator::new(
+            fee_estimator_path,
+            chain.height(),
+            config.accept_stale_fee_estimates,
+        );
+        for (txid, transaction, fee_sat, vsize, height) in mempool.fee_estimation_entries() {
+            if !mempool.has_mempool_parent(&transaction) {
+                fee_estimator.track_mempool_entry(txid, &transaction, fee_sat, vsize, height);
+            }
+        }
         if config.check_mempool != 0 {
             mempool
                 .check_consistency()
@@ -1139,6 +1154,7 @@ impl Node {
             time_offset_samples: parking_lot::RwLock::new(VecDeque::new()),
             warnings: parking_lot::RwLock::new(Vec::new()),
             versionbits_warning_scanned: AtomicBool::new(false),
+            fee_estimator: Mutex::new(fee_estimator),
             started_at: Instant::now(),
             shutdown: Notify::new(),
         });
@@ -1207,6 +1223,92 @@ impl Node {
         if let Err(error) = self.mempool.read().check_consistency() {
             panic!("mempool consistency check failed: {error:#}");
         }
+    }
+
+    pub(crate) fn update_fee_estimator_for_changes(
+        &self,
+        changes: &[MempoolChange],
+        current_height: u32,
+    ) {
+        self.update_fee_estimator_for_changes_except(changes, current_height, &HashSet::new());
+    }
+
+    pub(crate) fn update_fee_estimator_for_changes_except(
+        &self,
+        changes: &[MempoolChange],
+        current_height: u32,
+        excluded: &HashSet<Txid>,
+    ) {
+        if changes.is_empty() {
+            return;
+        }
+        let mempool = self.mempool.read();
+        let mut estimator = self.fee_estimator.lock();
+        for change in changes {
+            let txid = change.transaction.compute_txid();
+            match &change.kind {
+                MempoolChangeKind::Added => {
+                    if excluded.contains(&txid) {
+                        continue;
+                    }
+                    if let Some(entry) = mempool.get(&txid)
+                        && !mempool.has_mempool_parent(&entry.transaction)
+                    {
+                        estimator.track_mempool_entry(
+                            txid,
+                            &entry.transaction,
+                            entry.fee_sat,
+                            entry.vsize,
+                            entry.height,
+                        );
+                    }
+                }
+                MempoolChangeKind::Removed { notify_zmq: true } => {
+                    estimator.remove_from_mempool(&txid)
+                }
+                MempoolChangeKind::Removed { notify_zmq: false } => {
+                    // Confirmed removals are processed with their exact block
+                    // height by process_fee_estimator_block.
+                    let _ = current_height;
+                }
+            }
+        }
+    }
+
+    fn process_fee_estimator_block(&self, height: u32, confirmed: &[Txid]) {
+        self.fee_estimator.lock().process_block(height, confirmed);
+    }
+
+    pub(crate) fn estimate_smart_fee(
+        &self,
+        conf_target: u32,
+        conservative: bool,
+    ) -> (Option<u64>, u32) {
+        self.fee_estimator
+            .lock()
+            .estimate_smart_fee(conf_target, conservative)
+    }
+
+    pub(crate) fn raw_fee_estimates(
+        &self,
+        conf_target: u32,
+        threshold: f64,
+    ) -> Vec<(&'static str, RawFeeEstimate)> {
+        self.fee_estimator
+            .lock()
+            .raw_fee_estimates(conf_target, threshold)
+    }
+
+    fn flush_fee_estimates(&self, include_unconfirmed: bool) -> Result<()> {
+        let mut estimator = self.fee_estimator.lock();
+        if include_unconfirmed {
+            estimator.flush_unconfirmed();
+        }
+        estimator.flush()
+    }
+
+    pub(crate) fn save_fee_estimates(&self) -> Result<()> {
+        self.flush_fee_estimates(false)
     }
 
     fn maybe_check_block_index(&self) {
@@ -1347,13 +1449,33 @@ impl Node {
             .collect::<HashSet<_>>();
         let chain = self.chain.read();
         let mut mempool = self.mempool.write();
+        let mut fee_block_changes = Vec::with_capacity(activated_blocks.len());
+        let mut mempool_changes = Vec::new();
         for block in activated_blocks {
             mempool.remove_confirmed(block);
+            let block_changes = mempool.take_changes();
+            let confirmed = block_changes
+                .iter()
+                .filter_map(|change| {
+                    matches!(
+                        &change.kind,
+                        MempoolChangeKind::Removed { notify_zmq: false }
+                    )
+                    .then_some(change.transaction.compute_txid())
+                })
+                .collect::<Vec<_>>();
+            if let Some(height) = chain.block_height_by_hash(&block.block_hash()) {
+                fee_block_changes.push((height, confirmed));
+            }
+            mempool_changes.extend(block_changes);
         }
         let added_at = time::unix_time();
+        let mut fee_estimator_exclusions = HashSet::new();
         for block in disconnected_blocks {
             for transaction in block.txdata.iter().skip(1) {
-                let _ = mempool.accept_reorg(transaction.clone(), &chain, added_at);
+                if let Ok(txid) = mempool.accept_reorg(transaction.clone(), &chain, added_at) {
+                    fee_estimator_exclusions.insert(txid);
+                }
             }
         }
         mempool.revalidate(&chain);
@@ -1362,9 +1484,18 @@ impl Node {
             .transaction_order()
             .into_iter()
             .collect::<HashSet<_>>();
-        let mempool_changes = mempool.take_changes();
+        mempool_changes.extend(mempool.take_changes());
+        let current_height = chain.height();
         drop(mempool);
         drop(chain);
+        for (height, confirmed) in fee_block_changes {
+            self.process_fee_estimator_block(height, &confirmed);
+        }
+        self.update_fee_estimator_for_changes_except(
+            &mempool_changes,
+            current_height,
+            &fee_estimator_exclusions,
+        );
         self.announce_mempool_diff(mempool_before, mempool_after);
         self.notify_zmq_mempool_changes(mempool_changes);
     }
@@ -1672,13 +1803,14 @@ impl Node {
         &self,
         transaction: Transaction,
     ) -> std::result::Result<(Txid, Vec<MempoolChange>), MempoolError> {
-        let chain = self.chain.read();
-        let (result, changes) = {
+        let (result, changes, current_height) = {
+            let chain = self.chain.read();
             let mut mempool = self.mempool.write();
             let result = mempool.accept(transaction, &chain);
             let changes = mempool.take_changes();
-            (result, changes)
+            (result, changes, chain.height())
         };
+        self.update_fee_estimator_for_changes(&changes, current_height);
         let removed_ids = changes
             .iter()
             .filter_map(|change| match &change.kind {
@@ -1738,6 +1870,8 @@ impl Node {
         if changes.is_empty() {
             return;
         }
+        let current_height = self.chain.read().height();
+        self.update_fee_estimator_for_changes(&changes, current_height);
         let removed = changes
             .iter()
             .filter_map(|change| {
@@ -3727,6 +3861,17 @@ impl Node {
                 expiry_node.expire_mempool();
             }
         });
+        let fee_estimator_node = self.clone();
+        let fee_estimator_task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(FEE_ESTIMATOR_FLUSH_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = fee_estimator_node.flush_fee_estimates(false) {
+                    warn!(%error, "unable to flush fee estimates");
+                }
+            }
+        });
 
         let current_height = self.chain.read().height();
         if self.config.stop_at_height != 0 && current_height >= self.config.stop_at_height {
@@ -3760,7 +3905,11 @@ impl Node {
         zmq_task.abort();
         background_validation_task.abort();
         mempool_expiry_task.abort();
+        fee_estimator_task.abort();
         run_notify_command(self.config.shutdown_notify.as_deref(), None);
+        if let Err(error) = self.flush_fee_estimates(true) {
+            warn!(%error, "unable to flush fee estimates during shutdown");
+        }
         if self.config.persist_mempool {
             self.persist_mempool()?;
         }
@@ -3831,7 +3980,10 @@ impl Node {
             let changes = mempool.take_changes();
             (result, changed, changes)
         };
+        let current_height = chain.height();
+        drop(chain);
         if result.is_ok() {
+            self.update_fee_estimator_for_changes(&changes, current_height);
             self.maybe_check_mempool();
             self.notify_zmq_mempool_changes(changes);
             let mut changed = changed;
@@ -4230,6 +4382,7 @@ mod tests {
             shutdown_notify: None,
             alert_notify: None,
             max_sig_cache_mib: 32,
+            accept_stale_fee_estimates: false,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,

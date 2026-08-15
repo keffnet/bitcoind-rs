@@ -817,6 +817,17 @@ pub struct Args {
     #[arg(long = "maxsigcachesize", default_value_t = DEFAULT_MAX_SIG_CACHE_MIB, hide = true)]
     pub max_sig_cache_mib: i64,
 
+    /// Allow loading fee-estimator snapshots older than Core's 60-hour limit.
+    #[arg(
+        long = "acceptstalefeeestimates",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub accept_stale_fee_estimates: bool,
+
     /// Deprecated Core compatibility switch; checkpoints are not configurable
     /// in v31.1 and this option has no effect.
     #[arg(
@@ -1767,6 +1778,7 @@ pub struct Config {
     pub check_addrman: usize,
     pub script_check_threads: i32,
     pub max_sig_cache_mib: i64,
+    pub accept_stale_fee_estimates: bool,
     pub block_reconstruction_extra_txn: usize,
     pub user_agent_comments: Vec<String>,
     pub startup_notify: Option<String>,
@@ -2323,6 +2335,7 @@ impl Config {
             check_addrman,
             script_check_threads: args.script_check_threads,
             max_sig_cache_mib: args.max_sig_cache_mib,
+            accept_stale_fee_estimates: args.accept_stale_fee_estimates,
             block_reconstruction_extra_txn: args.block_reconstruction_extra_txn,
             user_agent_comments,
             startup_notify: args.startup_notify,
@@ -3828,6 +3841,16 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).unwrap().natpmp);
+    }
+
+    #[test]
+    fn parses_stale_fee_estimate_compatibility_option() {
+        let args = Args::try_parse_from(["bitcoind-rs", "--acceptstalefeeestimates"]).unwrap();
+        assert!(Config::from_args(args).unwrap().accept_stale_fee_estimates);
+
+        let args =
+            Args::try_parse_from(["bitcoind-rs", "--acceptstalefeeestimates=false"]).unwrap();
+        assert!(!Config::from_args(args).unwrap().accept_stale_fee_estimates);
     }
 
     #[test]

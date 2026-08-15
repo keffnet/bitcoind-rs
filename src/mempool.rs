@@ -1674,13 +1674,13 @@ impl Mempool {
             .to_wu()
             .max(sigop_cost.saturating_mul(DEFAULT_BYTES_PER_SIGOP));
         let vsize = adjusted_weight.saturating_add(3) / 4;
-        if transaction.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
-            return Err(MempoolError::NonStandard("tx-size-small".to_owned()));
-        }
         let modified_fee_sat = i64::try_from(fee_sat)
             .unwrap_or(i64::MAX)
             .saturating_add(self.fee_delta(&txid));
         if self.policy.require_standard {
+            if transaction.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
+                return Err(MempoolError::NonStandard("tx-size-small".to_owned()));
+            }
             validate_standard_policy_with_modified_fee_and_policy(
                 &transaction,
                 &previous_outputs,
@@ -3189,7 +3189,7 @@ mod tests {
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: outpoint,
-                script_sig: ScriptBuf::from_bytes(vec![0; 65]),
+                script_sig: ScriptBuf::new(),
                 sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
@@ -3210,7 +3210,7 @@ mod tests {
         );
         assert!(matches!(
             strict.accept(transaction.clone(), &chain),
-            Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
+            Err(MempoolError::NonStandard(reason)) if reason == "tx-size-small"
         ));
 
         let mut permissive_policy = strict_policy;

@@ -730,7 +730,7 @@ impl Node {
             .blocks_dir
             .clone()
             .unwrap_or_else(|| config.datadir.join("blocks"));
-        let mut chain = ChainState::open_with_options_and_tx_index_in_dirs(
+        let mut chain = ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work(
             config.network,
             &config.datadir,
             blocks_dir,
@@ -739,6 +739,7 @@ impl Node {
             config.reindex,
             config.reindex_chainstate,
             config.txindex,
+            config.minimum_chain_work,
         )?;
         chain.configure_pruning(config.prune)?;
         // Electrum 1.7 outpoint status needs confirmed spender lookups even
@@ -3390,6 +3391,7 @@ mod tests {
             network: bitcoin::Network::Regtest,
             datadir: datadir.to_owned(),
             blocks_dir: None,
+            minimum_chain_work: None,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
@@ -3712,6 +3714,25 @@ mod tests {
         assert!(directory.path().join("external-blocks/blocks.dat").exists());
         assert!(directory.path().join("chainstate.bin").exists());
         assert!(!directory.path().join("blocks/blocks.dat").exists());
+    }
+
+    #[test]
+    fn minimum_chain_work_override_reaches_chain_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--minimumchainwork=01",
+        ])
+        .unwrap();
+        let node = Node::open(Config::from_args(args).unwrap()).unwrap();
+
+        assert_eq!(
+            node.chain.read().minimum_chain_work(),
+            bitcoin::pow::Work::from_unprefixed_hex("01").unwrap()
+        );
     }
 
     #[test]

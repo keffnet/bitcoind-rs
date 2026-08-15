@@ -53,6 +53,7 @@ Inbound P2P listening can be disabled with `--listen=false`; DNS seed lookup can
 Use `--txindex` to enable confirmed transaction lookup without supplying a block hash to `getrawtransaction`; Core-style pruning and `--txindex` are mutually exclusive.
 
 Use `--blocksdir=<path>` to place the append-only block and undo records outside the data directory; relative paths are resolved beneath `--datadir`, while chainstate and indexes remain in the data directory.
+Use `--minimumchainwork=<hex>` to override Core's assumed work floor; `0` disables the assumption.
 
 Use `--txospenderindex` to enable historical spender lookup for `gettxspendingprevout`; transaction lookup indexes are unavailable in prune mode.
 

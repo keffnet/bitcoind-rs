@@ -592,6 +592,7 @@ pub struct ChainState {
     pub network: Network,
     data_dir: PathBuf,
     blocks_dir: PathBuf,
+    minimum_chain_work_override: Option<Work>,
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     filter_store: FilterStore,
@@ -720,6 +721,32 @@ impl ChainState {
         reindex_chainstate: bool,
         tx_index_all_enabled: bool,
     ) -> Result<Self> {
+        Self::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work(
+            network,
+            data_dir,
+            blocks_dir,
+            signet_challenge,
+            blockfilter_index_enabled,
+            reindex,
+            reindex_chainstate,
+            tx_index_all_enabled,
+            None,
+        )
+    }
+
+    /// Open chainstate with a Core-style minimum-chainwork override.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_options_and_tx_index_in_dirs_with_minimum_chain_work(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        blocks_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
+        reindex: bool,
+        reindex_chainstate: bool,
+        tx_index_all_enabled: bool,
+        minimum_chain_work_override: Option<Work>,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_owned();
         let blocks_dir = blocks_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
@@ -831,6 +858,7 @@ impl ChainState {
             network,
             data_dir,
             blocks_dir,
+            minimum_chain_work_override,
             signet_challenge: (network == Network::Signet).then(|| {
                 signet_challenge
                     .map(ToOwned::to_owned)
@@ -1245,6 +1273,9 @@ impl ChainState {
     /// network. Custom Signet challenges intentionally have no public-chain
     /// work assumption.
     pub fn minimum_chain_work(&self) -> Work {
+        if let Some(work) = self.minimum_chain_work_override {
+            return work;
+        }
         if self.network == Network::Signet
             && self.signet_challenge.as_deref()
                 != Some(validation::default_signet_challenge().as_slice())
@@ -5451,6 +5482,7 @@ fn open_background_replay_state(
         network,
         data_dir: data_dir.to_owned(),
         blocks_dir: blocks_dir.to_owned(),
+        minimum_chain_work_override: None,
         signet_challenge,
         store,
         filter_store,

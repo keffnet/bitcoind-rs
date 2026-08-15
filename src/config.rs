@@ -4,6 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use bitcoin::pow::Work;
 use bitcoin::{Amount, Denomination, Network};
 use clap::{Parser, ValueEnum};
 
@@ -535,6 +536,9 @@ pub struct Args {
     #[arg(long = "blocksdir", value_name = "PATH")]
     pub blocks_dir: Option<PathBuf>,
 
+    #[arg(long = "minimumchainwork", value_name = "HEX")]
+    pub minimum_chain_work: Option<String>,
+
     #[arg(long)]
     pub p2p: Option<SocketAddr>,
 
@@ -941,6 +945,7 @@ pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
     pub(crate) blocks_dir: Option<PathBuf>,
+    pub(crate) minimum_chain_work: Option<Work>,
     pub p2p_bind: SocketAddr,
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
@@ -1027,6 +1032,18 @@ impl Config {
                 }
             },
         );
+        let minimum_chain_work = args
+            .minimum_chain_work
+            .as_deref()
+            .map(|value| {
+                if value == "0" {
+                    Ok(Work::from_be_bytes([0; 32]))
+                } else {
+                    Work::from_unprefixed_hex(value)
+                        .with_context(|| format!("decoding --minimumchainwork as hex: {value}"))
+                }
+            })
+            .transpose()?;
         let p2p = args.p2p.unwrap_or_else(|| {
             SocketAddr::from((
                 [127, 0, 0, 1],
@@ -1298,6 +1315,7 @@ impl Config {
             network,
             datadir: args.datadir,
             blocks_dir: Some(blocks_dir),
+            minimum_chain_work,
             p2p_bind: primary_p2p_bind,
             p2p_binds,
             listen,
@@ -1601,6 +1619,27 @@ mod tests {
             Config::from_args(args).unwrap().blocks_dir,
             Some(directory.path().join("storage/blocks"))
         );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--minimumchainwork=0",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().minimum_chain_work,
+            Some(Work::from_be_bytes([0; 32]))
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--minimumchainwork=not-hex",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         for network in ["onion", "i2p"] {
             let args = Args::try_parse_from([

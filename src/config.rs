@@ -544,6 +544,26 @@ pub struct Args {
     )]
     pub network_active: bool,
 
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub discover: Option<bool>,
+
+    #[arg(long = "externalip", value_name = "IP")]
+    pub externalip: Vec<String>,
+
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub dns: bool,
+
     #[arg(long = "onlynet", value_enum, value_delimiter = ',')]
     pub onlynet: Vec<OnlyNet>,
 
@@ -794,6 +814,9 @@ pub struct Config {
     pub connect_disabled: bool,
     pub v2_transport: bool,
     pub network_active: bool,
+    pub discover: bool,
+    pub external_addresses: Vec<SocketAddr>,
+    pub dns_lookup: bool,
     pub add_nodes: Vec<NetworkEndpoint>,
     pub seed_nodes_for_address_fetch: Vec<NetworkEndpoint>,
     pub dnsseed: bool,
@@ -901,6 +924,9 @@ impl Config {
         let dnsseed = args
             .dnsseed
             .unwrap_or(!connect_configured && args.max_peers > 0 && clearnet_reachable);
+        let discover = args
+            .discover
+            .unwrap_or(listen && args.externalip.is_empty() && args.proxy.is_none());
         let peer_permissions = PeerPermissionConfig::from_args(
             &args.whitelist,
             &args.whitebind,
@@ -1018,6 +1044,12 @@ impl Config {
         let add_nodes = parse_manual_endpoints(&args.addnode, network, "addnode")?;
         let seed_nodes_for_address_fetch =
             parse_manual_endpoints(&args.seednode, network, "seednode")?;
+        let external_port = if p2p.port() == 0 {
+            default_p2p_port(network)
+        } else {
+            p2p.port()
+        };
+        let external_addresses = parse_external_addresses(&args.externalip, external_port)?;
         std::fs::create_dir_all(&args.datadir)
             .with_context(|| format!("creating data directory {}", args.datadir.display()))?;
         Ok(Self {
@@ -1032,6 +1064,9 @@ impl Config {
             connect_disabled,
             v2_transport: args.v2_transport,
             network_active: args.network_active,
+            discover,
+            external_addresses,
+            dns_lookup: args.dns,
             add_nodes,
             seed_nodes_for_address_fetch,
             dnsseed,
@@ -1137,6 +1172,19 @@ fn parse_manual_endpoints(
         .map(|value| {
             NetworkEndpoint::parse_manual(value, default_p2p_port(network))
                 .with_context(|| format!("parsing --{option} address '{value}'"))
+        })
+        .collect()
+}
+
+fn parse_external_addresses(values: &[String], default_port: u16) -> Result<Vec<SocketAddr>> {
+    values
+        .iter()
+        .map(|value| {
+            let endpoint = NetworkEndpoint::parse_manual(value, default_port)
+                .with_context(|| format!("parsing --externalip address '{value}'"))?;
+            endpoint
+                .socket_addr()
+                .ok_or_else(|| anyhow::anyhow!("--externalip must resolve to an IP address"))
         })
         .collect()
 }
@@ -1283,11 +1331,13 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--v2transport=false",
             "--networkactive=false",
+            "--dns=false",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
         assert!(!config.v2_transport);
         assert!(!config.network_active);
+        assert!(!config.dns_lookup);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",
@@ -1436,6 +1486,21 @@ mod tests {
         assert!(config.seed_nodes.is_empty());
         assert!(!config.listen);
         assert!(!config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--externalip=198.51.100.9",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.external_addresses,
+            vec!["198.51.100.9:18444".parse().unwrap()]
+        );
+        assert!(!config.discover);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

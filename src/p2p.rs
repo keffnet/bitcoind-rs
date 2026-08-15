@@ -1539,11 +1539,12 @@ fn spawn_outbound_loop(
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
-            match connect_peer_endpoint_with_options(
+            match connect_peer_endpoint_with_options_and_dns(
                 &endpoint,
                 node.config.proxy,
                 false,
                 node.config.proxy_randomize,
+                node.config.dns_lookup,
             )
             .await
             {
@@ -1725,7 +1726,7 @@ async fn connect_peer_endpoint(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
 ) -> Result<TcpStream> {
-    connect_peer_endpoint_with_options(endpoint, proxy, false, false).await
+    connect_peer_endpoint_with_options_and_dns(endpoint, proxy, false, false, true).await
 }
 
 async fn connect_peer_endpoint_for_private_broadcast(
@@ -1733,14 +1734,26 @@ async fn connect_peer_endpoint_for_private_broadcast(
     proxy: Option<SocketAddr>,
     proxy_randomize: bool,
 ) -> Result<TcpStream> {
-    connect_peer_endpoint_with_options(endpoint, proxy, true, proxy_randomize).await
+    connect_peer_endpoint_with_options_and_dns(endpoint, proxy, true, proxy_randomize, true).await
 }
 
+#[cfg(test)]
 async fn connect_peer_endpoint_with_options(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
     force_proxy: bool,
     proxy_randomize: bool,
+) -> Result<TcpStream> {
+    connect_peer_endpoint_with_options_and_dns(endpoint, proxy, force_proxy, proxy_randomize, true)
+        .await
+}
+
+async fn connect_peer_endpoint_with_options_and_dns(
+    endpoint: &NetworkEndpoint,
+    proxy: Option<SocketAddr>,
+    force_proxy: bool,
+    proxy_randomize: bool,
+    allow_dns_lookup: bool,
 ) -> Result<TcpStream> {
     let proxy = proxy.filter(|_| force_proxy || endpoint.uses_proxy_by_default());
     if proxy.is_none() && endpoint.requires_proxy() {
@@ -1755,6 +1768,9 @@ async fn connect_peer_endpoint_with_options(
             .await
             .with_context(|| format!("connecting to {endpoint}"))?
     } else {
+        if !allow_dns_lookup {
+            bail!("DNS lookup is disabled for hostname endpoint {endpoint}");
+        }
         let host = endpoint.host_string();
         TcpStream::connect((host.as_str(), endpoint.port()))
             .await
@@ -1918,6 +1934,7 @@ struct ProxyRoutingOptions {
     proxy: Option<SocketAddr>,
     force_proxy: bool,
     randomize_credentials: bool,
+    allow_dns_lookup: bool,
 }
 
 async fn establish_transport(
@@ -1946,11 +1963,12 @@ async fn establish_transport(
             }
             Err(error) => {
                 debug!(%endpoint, %error, "BIP324 handshake failed; retrying with v1");
-                let fallback = connect_peer_endpoint_with_options(
+                let fallback = connect_peer_endpoint_with_options_and_dns(
                     endpoint,
                     proxy_options.proxy,
                     proxy_options.force_proxy,
                     proxy_options.randomize_credentials,
+                    proxy_options.allow_dns_lookup,
                 )
                 .await
                 .with_context(|| format!("reconnecting to {endpoint} with v1 transport"))?;
@@ -2104,6 +2122,7 @@ async fn serve_peer(
             proxy: node.config.proxy,
             force_proxy: options.connection_type == "private-broadcast",
             randomize_credentials: node.config.proxy_randomize,
+            allow_dns_lookup: node.config.dns_lookup,
         },
     )
     .await?;
@@ -4805,6 +4824,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             dnsseed: false,
@@ -5330,6 +5352,17 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn disabled_dns_rejects_direct_hostname_connections() {
+        let endpoint = NetworkEndpoint::dns("peer.example".to_owned(), 18444).unwrap();
+        let error =
+            connect_peer_endpoint_with_options_and_dns(&endpoint, None, false, false, false)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("DNS lookup is disabled"));
+    }
+
     #[test]
     fn onlynet_filters_discovered_addresses_but_not_manual_nodes() {
         let directory = tempfile::tempdir().unwrap();
@@ -5367,6 +5400,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -5513,6 +5549,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -5915,6 +5954,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6045,6 +6087,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6181,6 +6226,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6407,6 +6455,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6509,6 +6560,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6593,6 +6647,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6669,6 +6726,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6807,6 +6867,9 @@ mod tests {
             connect_disabled: false,
             v2_transport: true,
             network_active: true,
+            discover: true,
+            external_addresses: Vec::new(),
+            dns_lookup: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,

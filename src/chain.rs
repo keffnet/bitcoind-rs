@@ -3541,7 +3541,7 @@ impl ChainState {
                     .enumerate()
                     .any(|(vout, _)| utxos.contains_key(&OutPoint::new(txid, vout as u32)))
                 {
-                    bail!("block tries to overwrite an unspent transaction {txid}");
+                    return Err(ValidationError::Bip30(txid).into());
                 }
             }
         }

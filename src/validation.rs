@@ -124,6 +124,8 @@ pub enum ValidationError {
     InputTotalOverflow,
     #[error("transaction {txid} creates more value than it spends")]
     NegativeFee { txid: Txid },
+    #[error("block tries to overwrite an unspent transaction {0}")]
+    Bip30(Txid),
     #[error("block height is not encoded in the coinbase script")]
     BadCoinbaseHeight,
     #[error("transaction locktime is not yet satisfied")]
@@ -176,6 +178,7 @@ impl ValidationError {
             Self::ImmatureCoinbase { .. } => "bad-txns-premature-spend-of-coinbase".to_owned(),
             Self::InputTotalOverflow => "bad-txns-inputvalues-outofrange".to_owned(),
             Self::NegativeFee { .. } => "bad-txns-in-belowout".to_owned(),
+            Self::Bip30(_) => "bad-txns-BIP30".to_owned(),
             Self::BadCoinbaseHeight => "bad-cb-height".to_owned(),
             Self::NonFinalTransaction => "bad-txns-nonfinal".to_owned(),
             Self::Script { reason, .. } => {
@@ -1355,6 +1358,10 @@ mod tests {
         assert_eq!(
             ValidationError::BadWitnessMerkleMatch.bip22_reject_reason(),
             "bad-witness-merkle-match"
+        );
+        assert_eq!(
+            ValidationError::Bip30(Txid::from_byte_array([7; 32])).bip22_reject_reason(),
+            "bad-txns-BIP30"
         );
     }
 

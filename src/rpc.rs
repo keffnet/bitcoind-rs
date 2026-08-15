@@ -1157,14 +1157,16 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
     let normalized_params = normalize_rpc_params(method, params)?;
     let command_id = node.begin_rpc_command(method);
     let result = match method {
-        "stop" => {
-            let wait = stop_wait(params)?;
-            node.request_shutdown();
-            if let Some(wait) = wait {
-                tokio::time::sleep(wait).await;
+        "stop" => match stop_wait(params) {
+            Ok(wait) => {
+                node.request_shutdown();
+                if let Some(wait) = wait {
+                    tokio::time::sleep(wait).await;
+                }
+                Ok(json!("bitcoind stopping"))
             }
-            Ok(json!("bitcoind stopping"))
-        }
+            Err(error) => Err(error),
+        },
         "waitfornewblock" => wait_for_new_block(node, &normalized_params).await,
         "waitforblock" => wait_for_block(node, &normalized_params).await,
         "waitforblockheight" => wait_for_block_height(node, &normalized_params).await,
@@ -1173,9 +1175,12 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
             let node = node.clone();
             let method = method.to_owned();
             let params = normalized_params.clone();
-            tokio::task::spawn_blocking(move || dispatch_method(&node, &method, &params))
+            match tokio::task::spawn_blocking(move || dispatch_method(&node, &method, &params))
                 .await
-                .context("scan RPC task failed")?
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow!("scan RPC task failed: {error}")),
+            }
         }
         _ => dispatch_method(node, method, &normalized_params),
     };
@@ -8146,6 +8151,13 @@ fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Val
     {
         let chain = node.chain.read();
         let mempool = node.mempool.read();
+        for (outpoint, prevout) in &prevouts {
+            if let Some(actual) = output_for_outpoint(&chain, &mempool, *outpoint)
+                && actual.script_pubkey != prevout.output.script_pubkey
+            {
+                bail!("Previous output scriptPubKey mismatch")
+            }
+        }
         for input in &transaction.input {
             if prevouts.contains_key(&input.previous_output) {
                 continue;
@@ -8281,6 +8293,9 @@ fn parse_signing_prevouts(value: Option<&Value>) -> Result<HashMap<OutPoint, Sig
                 .map(|value| parse_btc_amount(value, "prevtx amount"))
                 .transpose()?
                 .unwrap_or(Amount::ZERO);
+            if amount > Amount::MAX_MONEY {
+                bail!("Amount out of range")
+            }
             let redeem_script = entry
                 .get("redeemScript")
                 .filter(|value| !value.is_null())
@@ -12971,6 +12986,17 @@ mod tests {
         .unwrap();
 
         assert!(
+            dispatch_method_async(&node, "stop", &json!([-1]))
+                .await
+                .is_err()
+        );
+        assert!(
+            dispatch_method(&node, "getrpcinfo", &json!([])).unwrap()["active_commands"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
             dispatch_json_rpc(&node, br#"{"jsonrpc":"2.0","method":"getblockcount"}"#)
                 .await
                 .is_none()
@@ -15701,6 +15727,16 @@ mod tests {
             }])))
             .is_err()
         );
+        let amount_error = match parse_signing_prevouts(Some(&json!([{
+            "txid": Txid::from_byte_array([7; 32]).to_string(),
+            "vout": 0,
+            "scriptPubKey": "51",
+            "amount": "21000000.00000001",
+        }]))) {
+            Ok(_) => panic!("out-of-range amount was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(amount_error.to_string(), "Amount out of range");
 
         let default_raw = create_raw_transaction(
             &node,
@@ -16356,6 +16392,42 @@ mod tests {
             deserialize(&hex::decode(multisig_result["hex"].as_str().unwrap()).unwrap()).unwrap();
         assert!(multisig_signed.input[0].script_sig.is_empty());
         assert_eq!(multisig_signed.input[0].witness.len(), 3);
+
+        let mined = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap();
+        let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
+        let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
+        let funding_txid = funding.txdata[0].compute_txid();
+        let mismatch_transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(funding_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mismatch = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                hex::encode(serialize(&mismatch_transaction)),
+                [],
+                [{
+                    "txid": funding_txid.to_string(),
+                    "vout": 0,
+                    "scriptPubKey": "52",
+                }],
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            mismatch.to_string(),
+            "Previous output scriptPubKey mismatch"
+        );
     }
 
     #[test]

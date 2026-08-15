@@ -208,13 +208,16 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                     bail!("server.version must be the first Electrum request");
                 }
                 session.request_seen = true;
-                let result = dispatch_with_session(
-                    &node,
-                    method,
-                    &params,
-                    &mut subscriptions,
-                    &mut session,
-                );
+                if !session.version_negotiated && method != "server.version" {
+                    bail!("server.version must be negotiated before other requests");
+                }
+                let result = dispatch_with_session(&node, method, &params, &mut subscriptions, &mut session);
+                if method == "server.version" && !session.version_negotiated && result.is_err() {
+                    // Protocol negotiation failures are connection-fatal. This is
+                    // required for clients to retry with a compatible range and
+                    // prevents serving requests under the default 1.4 session.
+                    return Ok(());
+                }
                 if method == "blockchain.headers.subscribe" && result.is_ok() {
                     headers_subscribed = true;
                 }
@@ -243,7 +246,13 @@ fn dispatch(
     params: &Value,
     subscriptions: &mut HashMap<String, Subscription>,
 ) -> Result<Value> {
-    let mut session = ElectrumSession::default();
+    let mut session = ElectrumSession {
+        // Unit-level dispatch tests intentionally bypass the wire-level
+        // server.version exchange. Use the newest supported protocol there;
+        // handle_client enforces negotiation for real connections.
+        protocol_version: MAX_PROTOCOL_VERSION,
+        ..ElectrumSession::default()
+    };
     dispatch_with_session(node, method, params, subscriptions, &mut session)
 }
 
@@ -254,6 +263,14 @@ fn dispatch_with_session(
     subscriptions: &mut HashMap<String, Subscription>,
     session: &mut ElectrumSession,
 ) -> Result<Value> {
+    if let Some(required) = minimum_protocol_version(method)
+        && session.protocol_version < required
+    {
+        bail!(
+            "{method} requires Electrum protocol {} or newer",
+            protocol_version_string(required)
+        );
+    }
     match method {
         "server.version" => negotiate_version(params, session),
         "server.ping" => server_ping(params, session.protocol_version),
@@ -458,6 +475,20 @@ fn dispatch_with_session(
         "server.peers.subscribe" => Ok(server_peers_for_protocol(node, session.protocol_version)),
         _ => bail!("unsupported Electrum method {method}"),
     }
+}
+
+fn minimum_protocol_version(method: &str) -> Option<ProtocolVersion> {
+    if method.starts_with("blockchain.scriptpubkey.")
+        || method.starts_with("blockchain.outpoint.")
+        || method == "blockchain.transaction.testmempoolaccept"
+        || method == "mempool.recent"
+    {
+        return Some(PROTOCOL_1_7);
+    }
+    if method == "blockchain.transaction.broadcast_package" || method == "mempool.get_info" {
+        return Some(PROTOCOL_1_6);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1583,6 +1614,34 @@ mod tests {
             &json!("new-status"),
             false
         ));
+    }
+
+    #[test]
+    fn modern_electrum_methods_report_their_protocol_floor() {
+        assert_eq!(
+            minimum_protocol_version("blockchain.scriptpubkey.get_history"),
+            Some(PROTOCOL_1_7)
+        );
+        assert_eq!(
+            minimum_protocol_version("blockchain.outpoint.get_status"),
+            Some(PROTOCOL_1_7)
+        );
+        assert_eq!(
+            minimum_protocol_version("blockchain.transaction.broadcast_package"),
+            Some(PROTOCOL_1_6)
+        );
+        assert_eq!(minimum_protocol_version("server.features"), None);
+
+        let protocol_1_6 = ProtocolVersion {
+            major: 1,
+            minor: 6,
+            patch: 0,
+        };
+        assert!(protocol_1_6 < PROTOCOL_1_7);
+        assert!(
+            minimum_protocol_version("mempool.recent")
+                .is_some_and(|required| { protocol_1_6 < required })
+        );
     }
 
     #[tokio::test]

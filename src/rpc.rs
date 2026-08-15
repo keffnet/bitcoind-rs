@@ -11118,7 +11118,9 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "block not found in chain"
         || lower == "filter not found. block was not connected to active chain."
         || lower == "transaction not found"
+        || lower == "transaction not yet in block"
         || lower == "transaction not in mempool"
+        || lower == "not all transactions found in specified or retrieved block"
         || lower.starts_with("no such transaction found in the provided block.")
         || lower.starts_with("no such mempool transaction.")
         || lower.starts_with("no such mempool or blockchain transaction.")
@@ -11377,6 +11379,11 @@ mod tests {
         assert_eq!(rpc_error_code("mode must be a string"), -3);
         assert_eq!(rpc_error_code("TX decode failed"), -22);
         assert_eq!(rpc_error_code("Block not found"), -5);
+        assert_eq!(rpc_error_code("Transaction not yet in block"), -5);
+        assert_eq!(
+            rpc_error_code("Not all transactions found in specified or retrieved block"),
+            -5
+        );
         assert_eq!(rpc_error_code("Block height out of range"), -8);
         assert_eq!(
             rpc_error_code("Block does not exist at specified height"),

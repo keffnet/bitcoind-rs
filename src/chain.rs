@@ -1472,7 +1472,11 @@ impl ChainState {
         if self.has_invalid_ancestor(*hash) {
             return Some("duplicate-invalid");
         }
-        if self.store.contains(hash) {
+        // Active-chain entries remain fully validated after their block body
+        // is pruned. Core's proposal path uses the block-index validation
+        // status rather than requiring the body to remain available, so a
+        // pruned active block is still an exact duplicate.
+        if self.is_active_block(hash) || self.store.contains(hash) {
             Some("duplicate")
         } else {
             Some("duplicate-inconclusive")
@@ -6622,6 +6626,10 @@ mod tests {
         assert!(state.store.contains(&old_block_hash));
         assert_eq!(state.prune(50).unwrap(), 12);
         assert!(!state.store.contains(&old_block_hash));
+        assert_eq!(
+            state.proposal_duplicate_status(&old_block_hash),
+            Some("duplicate")
+        );
         assert_eq!(state.prune_height(), Some(12));
         let path = directory.path().to_owned();
         drop(state);

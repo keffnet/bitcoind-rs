@@ -600,6 +600,9 @@ pub struct Args {
     #[arg(long = "checklevel", value_name = "N")]
     pub check_level: Option<u8>,
 
+    #[arg(long = "stopatheight", default_value_t = 0)]
+    pub stop_at_height: u32,
+
     #[arg(long = "maxtipage", default_value_t = DEFAULT_MAX_TIP_AGE_SECS)]
     pub max_tip_age: u64,
 
@@ -1275,6 +1278,7 @@ pub struct Config {
     pub(crate) assume_valid: Option<BlockHash>,
     pub(crate) check_blocks: Option<u32>,
     pub(crate) check_level: Option<u8>,
+    pub stop_at_height: u32,
     pub(crate) max_tip_age_secs: u64,
     pub p2p_bind: SocketAddr,
     pub p2p_binds: Vec<SocketAddr>,
@@ -1661,6 +1665,7 @@ impl Config {
             assume_valid,
             check_blocks: args.check_blocks,
             check_level: args.check_level,
+            stop_at_height: args.stop_at_height,
             max_tip_age_secs: args.max_tip_age,
             p2p_bind: primary_p2p_bind,
             p2p_binds,
@@ -2115,6 +2120,9 @@ mod tests {
             Config::from_args(args).unwrap().minimum_chain_work,
             Some(Work::from_be_bytes([0; 32]))
         );
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--stopatheight=42"]).unwrap();
+        assert_eq!(Config::from_args(args).unwrap().stop_at_height, 42);
 
         let assumed_valid = "0000000000000000000000000000000000000000000000000000000000000001";
         let args = Args::try_parse_from([

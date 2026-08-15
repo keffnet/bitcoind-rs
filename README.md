@@ -59,6 +59,7 @@ Use `--minimumchainwork=<hex>` to override Core's assumed work floor; `0` disabl
 `--assumevalid=<hex>` selects Core's externally verified block for conservative script-check skipping during synchronization; `0` disables it. Public-network defaults match Core v31.1, while custom Signet challenges disable the default.
 `--maxtipage=<seconds>` controls the maximum tip age used to leave initial block download (24 hours by default).
 For explicit startup integrity checks, `--checkblocks=<n>` selects the recent block depth (`0` means all available blocks) and `--checklevel=<0..4>` selects verification thoroughness; either option enables the check.
+`--stopatheight=<n>` requests a clean shutdown after the active chain reaches height `n`; `0` disables the limit, and an already-persisted tip at or above the target exits during startup.
 
 Use `--txospenderindex` to enable historical spender lookup for `gettxspendingprevout`; transaction lookup indexes are unavailable in prune mode.
 

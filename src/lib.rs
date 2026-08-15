@@ -905,6 +905,9 @@ impl Node {
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
         }
+        if self.config.stop_at_height != 0 && tip.height >= self.config.stop_at_height {
+            self.request_shutdown();
+        }
         Ok(tip)
     }
 
@@ -3045,6 +3048,15 @@ impl Node {
             }
         });
 
+        let current_height = self.chain.read().height();
+        if self.config.stop_at_height != 0 && current_height >= self.config.stop_at_height {
+            info!(
+                target_height = self.config.stop_at_height,
+                current_height, "stop height already reached"
+            );
+            self.request_shutdown();
+        }
+
         let run_result: Result<()> = tokio::select! {
             result = &mut p2p_task => result
                 .map_err(anyhow::Error::from)
@@ -3409,6 +3421,7 @@ mod tests {
             check_blocks: None,
             check_level: None,
             max_tip_age_secs: 24 * 60 * 60,
+            stop_at_height: 0,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
@@ -3724,6 +3737,22 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), node.run())
             .await
             .expect("pre-run shutdown should wake the node")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_at_height_requests_shutdown_when_tip_reaches_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.stop_at_height = 1;
+        let node = Node::open(config).unwrap();
+        let previous = *node.chain.read().header(0).unwrap();
+        node.connect_block(mine_test_block(&previous, 1, 1))
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), node.run())
+            .await
+            .expect("stop height should wake the node")
             .unwrap();
     }
 

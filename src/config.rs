@@ -521,6 +521,9 @@ pub struct Args {
     #[arg(long = "rpcport", value_name = "PORT")]
     pub rpc_port: Option<u16>,
 
+    #[arg(long = "rpcbind", value_name = "IP:PORT", value_delimiter = ',')]
+    pub rpc_binds: Vec<SocketAddr>,
+
     #[arg(long, default_value = "127.0.0.1:30001")]
     pub electrum: SocketAddr,
 
@@ -833,6 +836,7 @@ pub struct Config {
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
     pub rpc_bind: Option<SocketAddr>,
+    pub rpc_binds: Vec<SocketAddr>,
     pub electrum_bind: Option<SocketAddr>,
     pub rest: bool,
     pub seed_nodes: Vec<NetworkEndpoint>,
@@ -918,9 +922,23 @@ impl Config {
         if args.rpc.is_some() && args.rpc_port.is_some() {
             bail!("--rpc cannot be combined with --rpcport");
         }
+        if args.rpc.is_some() && !args.rpc_binds.is_empty() {
+            bail!("--rpc cannot be combined with --rpcbind");
+        }
+        if args.rpc_port.is_some() && !args.rpc_binds.is_empty() {
+            bail!("--rpcport cannot be combined with --rpcbind");
+        }
         if args.rpc_port == Some(0) {
             bail!("--rpcport must use a non-zero port");
         }
+        if args.rpc_binds.iter().any(|bind| bind.port() == 0) {
+            bail!("--rpcbind must use non-zero ports");
+        }
+        let rpc_binds = if args.rpc_binds.is_empty() {
+            vec![rpc]
+        } else {
+            args.rpc_binds.clone()
+        };
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
         }
@@ -1117,7 +1135,8 @@ impl Config {
             p2p_bind: primary_p2p_bind,
             p2p_binds,
             listen,
-            rpc_bind: Some(rpc),
+            rpc_bind: Some(rpc_binds[0]),
+            rpc_binds,
             electrum_bind: Some(args.electrum),
             rest: args.rest,
             seed_nodes,
@@ -1397,6 +1416,24 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--rpcbind=127.0.0.1:18446,127.0.0.1:18447",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.rpc_binds,
+            vec![
+                "127.0.0.1:18446".parse().unwrap(),
+                "127.0.0.1:18447".parse().unwrap(),
+            ]
+        );
+        assert_eq!(config.rpc_bind, Some("127.0.0.1:18446".parse().unwrap()));
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

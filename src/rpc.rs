@@ -39,6 +39,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 use tracing::debug;
 
 use crate::address::NetworkEndpoint;
@@ -114,21 +115,38 @@ impl RpcServer {
     }
 
     pub async fn run(self) -> Result<()> {
-        let Some(address) = self.node.config.rpc_bind else {
-            return std::future::pending::<Result<()>>().await;
+        let binds = if self.node.config.rpc_binds.is_empty() {
+            self.node.config.rpc_bind.into_iter().collect::<Vec<_>>()
+        } else {
+            self.node.config.rpc_binds.clone()
         };
-        let listener = TcpListener::bind(address)
-            .await
-            .with_context(|| format!("binding RPC listener {address}"))?;
-        loop {
-            let (stream, peer) = listener.accept().await?;
+        if binds.is_empty() {
+            return std::future::pending::<Result<()>>().await;
+        }
+        let mut listeners = JoinSet::new();
+        for address in binds {
+            let listener = TcpListener::bind(address)
+                .await
+                .with_context(|| format!("binding RPC listener {address}"))?;
             let node = self.node.clone();
-            tokio::spawn(async move {
-                if let Err(error) = handle_connection(node, stream).await {
-                    debug!(%peer, %error, "RPC connection ended");
+            listeners.spawn(async move {
+                loop {
+                    let (stream, peer) = listener.accept().await?;
+                    let node = node.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_connection(node, stream).await {
+                            debug!(%peer, %error, "RPC connection ended");
+                        }
+                    });
                 }
+                #[allow(unreachable_code)]
+                Ok::<(), anyhow::Error>(())
             });
         }
+        while let Some(result) = listeners.join_next().await {
+            result??;
+        }
+        Ok(())
     }
 }
 
@@ -12088,6 +12106,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12324,6 +12343,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12433,6 +12453,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12567,6 +12588,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12638,6 +12660,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12712,6 +12735,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12821,6 +12845,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12962,6 +12987,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13272,6 +13298,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13375,6 +13402,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13461,6 +13489,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13540,6 +13569,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13622,6 +13652,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13691,6 +13722,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13769,6 +13801,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13836,6 +13869,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: true,
             listen: true,
@@ -13980,6 +14014,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: true,
             listen: true,
@@ -14072,6 +14107,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14158,6 +14194,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14282,6 +14319,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14370,6 +14408,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14489,6 +14528,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14690,6 +14730,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14874,6 +14915,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14942,6 +14984,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15012,6 +15055,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15087,6 +15131,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15168,6 +15213,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: true,
             listen: true,
@@ -15256,6 +15302,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15342,6 +15389,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15476,6 +15524,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15641,6 +15690,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15711,6 +15761,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15950,6 +16001,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16084,6 +16136,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16214,6 +16267,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16414,6 +16468,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16723,6 +16778,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16802,6 +16858,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17006,6 +17063,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17089,6 +17147,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17504,6 +17563,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17582,6 +17642,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17699,6 +17760,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17947,6 +18009,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18368,6 +18431,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18510,6 +18574,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18679,6 +18744,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18954,6 +19020,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -19035,6 +19102,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -19137,6 +19205,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,

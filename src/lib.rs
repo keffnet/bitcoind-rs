@@ -3313,6 +3313,7 @@ mod tests {
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
+            rpc_binds: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,

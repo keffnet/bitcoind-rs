@@ -3724,23 +3724,8 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let tip = chain.tip();
     let header_tip = chain.best_header_tip();
     let header = chain.header(tip.height).expect("tip header exists");
-    let minimum_chain_work = chain.minimum_chain_work();
     let initial_block_download = chain.is_initial_block_download();
-    let verification_progress = if !initial_block_download {
-        1.0
-    } else {
-        let work_progress = if minimum_chain_work == bitcoin::pow::Work::from_be_bytes([0; 32]) {
-            0.0
-        } else {
-            (work_to_f64(tip.work) / work_to_f64(minimum_chain_work)).min(1.0)
-        };
-        let height_progress = if header_tip.height == 0 {
-            0.0
-        } else {
-            f64::from(tip.height) / f64::from(header_tip.height)
-        };
-        work_progress.min(height_progress).clamp(0.0, 1.0)
-    };
+    let verification_progress = chain.verification_progress();
     let mut result = json!({
         "chain": network_name(chain.network),
         "blocks": tip.height,
@@ -16332,7 +16317,8 @@ mod tests {
 
         let info = get_blockchain_info(&node).unwrap();
         assert_eq!(info["initialblockdownload"], json!(true));
-        assert_eq!(info["verificationprogress"], json!(0.0));
+        let verification_progress = info["verificationprogress"].as_f64().unwrap();
+        assert!(verification_progress > 0.0 && verification_progress < 1.0);
         assert!(info.get("softforks").is_none());
     }
 

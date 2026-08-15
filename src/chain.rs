@@ -56,6 +56,13 @@ const ASSUMEUTXO_BASE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-base-v1\0";
 const ASSUMEUTXO_CHECKPOINT_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-checkpoint-v1\0";
 const ASSUMEUTXO_CHECKPOINT_INTERVAL: u32 = 256;
 
+#[derive(Clone, Copy)]
+struct ChainTxData {
+    time: i64,
+    tx_count: u64,
+    tx_rate: f64,
+}
+
 /// A hardcoded UTXO commitment from Bitcoin Core v31.1's chain parameters.
 ///
 /// These values are deliberately kept as data rather than inferred from a
@@ -1598,6 +1605,89 @@ impl ChainState {
                 work: node.chain_work,
             })
             .expect("genesis header is indexed")
+    }
+
+    /// Estimate validation progress using Core's ChainTxData model.
+    ///
+    /// Core uses the cumulative transaction count at the active tip rather
+    /// than chainwork for this RPC value.  When the tip's timestamp is recent
+    /// and the best known header extends it, the estimate uses the expected
+    /// block spacing so the value reaches exactly 1.0 for a synchronized tip.
+    pub fn verification_progress(&self) -> f64 {
+        self.verification_progress_at(crate::time::unix_time_i64())
+    }
+
+    fn verification_progress_at(&self, now: i64) -> f64 {
+        let tip = self.tip();
+        let Some(chain_tx_count) = self.chain_transaction_count(tip.height) else {
+            return 0.0;
+        };
+        if chain_tx_count == 0 {
+            return 0.0;
+        }
+
+        let tip_header = self
+            .header(tip.height)
+            .expect("active tip header is always indexed");
+        let best_header = self.best_header_tip();
+        let spacing = i64::try_from(self.network.params().pow_target_spacing).unwrap_or(i64::MAX);
+        let block_time = if best_header.height >= tip.height
+            && now.abs_diff(i64::from(tip_header.time)) <= 2 * 60 * 60
+        {
+            now.saturating_sub(
+                i64::from(best_header.height.saturating_sub(tip.height)).saturating_mul(spacing),
+            )
+        } else {
+            i64::from(tip_header.time)
+        };
+
+        let data = self.chain_tx_data();
+        let total = if chain_tx_count <= data.tx_count {
+            data.tx_count as f64 + (now - data.time) as f64 * data.tx_rate
+        } else {
+            chain_tx_count as f64 + (now - block_time) as f64 * data.tx_rate
+        };
+        (chain_tx_count as f64 / total).min(1.0)
+    }
+
+    fn chain_tx_data(&self) -> ChainTxData {
+        if self.network == Network::Signet
+            && self.signet_challenge.as_deref()
+                != Some(validation::default_signet_challenge().as_slice())
+        {
+            return ChainTxData {
+                time: 0,
+                tx_count: 0,
+                tx_rate: 0.0,
+            };
+        }
+        match self.network {
+            Network::Bitcoin => ChainTxData {
+                time: 1_772_055_173,
+                tx_count: 1_315_805_869,
+                tx_rate: 5.401_110_064_961_22,
+            },
+            Network::Testnet => ChainTxData {
+                time: 1_772_051_651,
+                tx_count: 536_108_416,
+                tx_rate: 0.026_914_790_162_571_17,
+            },
+            Network::Testnet4 => ChainTxData {
+                time: 1_772_013_387,
+                tx_count: 14_191_421,
+                tx_rate: 0.018_485_795_795_284_12,
+            },
+            Network::Signet => ChainTxData {
+                time: 1_772_055_248,
+                tx_count: 28_676_833,
+                tx_rate: 0.067_366_234_363_389_29,
+            },
+            Network::Regtest => ChainTxData {
+                time: 0,
+                tx_count: 0,
+                tx_rate: 0.001,
+            },
+        }
     }
 
     /// Return the number of header-only blocks by which the best header
@@ -7260,6 +7350,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert!(state.is_initial_block_download());
+    }
+
+    #[test]
+    fn verification_progress_matches_core_recent_header_adjustment() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let genesis_time = i64::from(state.header(0).unwrap().time);
+
+        assert_eq!(state.verification_progress_at(genesis_time), 1.0);
+        assert_eq!(
+            state.verification_progress_at(genesis_time + 2 * 60 * 60),
+            1.0
+        );
+        assert!(state.verification_progress_at(genesis_time + 2 * 60 * 60 + 1) < 1.0);
     }
 
     #[test]

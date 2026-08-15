@@ -9425,33 +9425,86 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         .transactions()
         .map(|transaction| (transaction.compute_txid(), transaction.clone()))
         .collect::<HashMap<_, _>>();
-    let mut candidate = node.mempool.read().clone();
+    let original_mempool = node.mempool.read();
     let preexisting = transactions
         .iter()
         .filter_map(|transaction| {
-            candidate
+            original_mempool
                 .get(&transaction.compute_txid())
                 .map(|_| transaction.compute_txid())
         })
         .collect::<HashSet<_>>();
-    let package_rbf = transactions.len() == 2
-        && package_is_child_with_parents_tree(&transactions)
-        && preexisting.is_empty();
+    let (candidate, package_result, package_rbf) =
+        original_mempool.accept_package_with_state(&transactions, &chain);
+    drop(original_mempool);
     let mut results = serde_json::Map::new();
-    if let Err(error) = candidate.accept_package(&transactions, &chain) {
+    if let Err(error) = package_result {
         // submitpackage exposes the detailed validation error in each
         // per-transaction result. testmempoolaccept uses the shorter
         // reject-reason classification instead.
         let reason = error.to_string();
+        let accepted = if !package_rbf {
+            transactions
+                .iter()
+                .filter(|transaction| {
+                    !preexisting.contains(&transaction.compute_txid())
+                        && candidate.get(&transaction.compute_txid()).is_some()
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let partial = !package_rbf
+            && transactions
+                .iter()
+                .any(|transaction| candidate.get(&transaction.compute_txid()).is_some())
+            && transactions
+                .iter()
+                .any(|transaction| candidate.get(&transaction.compute_txid()).is_none());
+        let mut reported_failure = false;
         for transaction in &transactions {
             let txid = transaction.compute_txid();
+            if partial && candidate.get(&txid).is_some() {
+                results.insert(
+                    transaction.compute_wtxid().to_string(),
+                    accepted_transaction_json(
+                        transaction,
+                        &transactions,
+                        &candidate,
+                        false,
+                        false,
+                        !preexisting.contains(&txid),
+                    )?,
+                );
+                continue;
+            }
+            let transaction_error = if partial && reported_failure {
+                "package-not-validated".to_owned()
+            } else {
+                reported_failure = true;
+                reason.clone()
+            };
             results.insert(
                 transaction.compute_wtxid().to_string(),
                 json!({
                     "txid": txid.to_string(),
-                    "error": reason,
+                    "error": transaction_error,
                 }),
             );
+        }
+        if partial {
+            drop(chain);
+            let replaced_transactions = if accepted.is_empty() {
+                Vec::new()
+            } else {
+                commit_submitted_package(node, candidate, before_transactions, accepted)
+            };
+            return Ok(json!({
+                "package_msg": "transaction failed",
+                "tx-results": results,
+                "replaced-transactions": replaced_transactions,
+            }));
         }
         return Ok(json!({
             "package_msg": submit_package_failure_message(&error, package_rbf),
@@ -9501,10 +9554,25 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         .filter(|transaction| !preexisting.contains(&transaction.compute_txid()))
         .cloned()
         .collect::<Vec<_>>();
+    drop(chain);
+    let replaced_transactions =
+        commit_submitted_package(node, candidate, before_transactions, accepted);
+    Ok(json!({
+        "package_msg": "success",
+        "tx-results": results,
+        "replaced-transactions": replaced_transactions,
+    }))
+}
+
+fn commit_submitted_package(
+    node: &Arc<Node>,
+    mut candidate: Mempool,
+    before_transactions: HashMap<Txid, Transaction>,
+    accepted: Vec<Transaction>,
+) -> Vec<String> {
     for transaction in &accepted {
         candidate.add_unbroadcast(transaction.compute_txid());
     }
-    drop(chain);
     let changes = candidate.take_changes();
     let removed = before_transactions
         .into_iter()
@@ -9520,11 +9588,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
     for transaction in accepted {
         node.notify_mempool_transaction(transaction);
     }
-    Ok(json!({
-        "package_msg": "success",
-        "tx-results": results,
-        "replaced-transactions": replaced_transactions,
-    }))
+    replaced_transactions
 }
 
 fn submit_package_failure_message(error: &MempoolError, package_rbf: bool) -> &'static str {
@@ -16437,6 +16501,89 @@ mod tests {
             .position(|entry| entry["txid"] == child.compute_txid().to_string())
             .expect("package child is in the template");
         assert!(parent_position < child_position);
+
+        let partial_mined = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap();
+        let partial_hash: BlockHash = partial_mined[0].as_str().unwrap().parse().unwrap();
+        let partial_block = node.chain.write().block(&partial_hash).unwrap().unwrap();
+        let partial_source = partial_block
+            .txdata
+            .iter()
+            .find(|transaction| transaction.compute_txid() == child.compute_txid())
+            .expect("earlier package child was mined");
+        let partial_outpoint = OutPoint::new(partial_source.compute_txid(), 0);
+        let partial_source_value = partial_source.output[0].value.to_sat();
+        let partial_parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: partial_outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(partial_source_value - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let partial_child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(partial_parent.compute_txid(), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(partial_source_value),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let partial_result = submit_package(
+            &node,
+            &json!([[
+                hex::encode(serialize(&partial_parent)),
+                hex::encode(serialize(&partial_child)),
+            ]]),
+        )
+        .unwrap();
+        assert_eq!(partial_result["package_msg"], "transaction failed");
+        assert!(
+            partial_result["tx-results"][partial_parent.compute_wtxid().to_string()]
+                .get("error")
+                .is_none()
+        );
+        assert_eq!(
+            partial_result["tx-results"][partial_child.compute_wtxid().to_string()]["error"],
+            "transaction spends more than its inputs"
+        );
+        let partial_mempool = node.mempool.read();
+        assert!(
+            partial_mempool
+                .get(&partial_parent.compute_txid())
+                .is_some()
+        );
+        assert!(partial_mempool.get(&partial_child.compute_txid()).is_none());
+        drop(partial_mempool);
+        let existing_parent_result = submit_package(
+            &node,
+            &json!([[
+                hex::encode(serialize(&partial_parent)),
+                hex::encode(serialize(&partial_child)),
+            ]]),
+        )
+        .unwrap();
+        assert_eq!(existing_parent_result["package_msg"], "transaction failed");
+        assert!(
+            existing_parent_result["tx-results"][partial_parent.compute_wtxid().to_string()]
+                .get("error")
+                .is_none()
+        );
+        assert_eq!(
+            existing_parent_result["tx-results"][partial_child.compute_wtxid().to_string()]["error"],
+            "transaction spends more than its inputs"
+        );
     }
 
     #[test]

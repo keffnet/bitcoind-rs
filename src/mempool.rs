@@ -1087,11 +1087,49 @@ impl Mempool {
         transactions: &[Transaction],
         chain: &ChainState,
     ) -> Result<Vec<Txid>, MempoolError> {
+        let (candidate, result, _) = self.accept_package_with_state(transactions, chain);
+        if result.is_ok() {
+            *self = candidate;
+        }
+        result
+    }
+
+    /// Validate a package on a cloned mempool and return the candidate even
+    /// when a later transaction fails. The returned boolean identifies an
+    /// actual two-transaction package-RBF attempt, rather than merely a
+    /// package that could have used the package-RBF topology. Core can commit
+    /// a valid prefix from ordinary package submission; package RBF remains
+    /// atomic.
+    pub(crate) fn accept_package_with_state(
+        &self,
+        transactions: &[Transaction],
+        chain: &ChainState,
+    ) -> (Self, Result<Vec<Txid>, MempoolError>, bool) {
+        let mut candidate = self.clone();
+        let package_has_preexisting = transactions
+            .iter()
+            .any(|transaction| candidate.get(&transaction.compute_txid()).is_some());
+        let allow_low_fee_parent = package_is_child_with_parents_tree(transactions);
+        let package_rbf = transactions.len() == 2
+            && allow_low_fee_parent
+            && !package_has_preexisting
+            && transactions
+                .iter()
+                .any(|transaction| !candidate.conflicts_for(transaction).is_empty());
+        let result = self.accept_package_inner(&mut candidate, transactions, chain);
+        (candidate, result, package_rbf)
+    }
+
+    fn accept_package_inner(
+        &self,
+        candidate: &mut Self,
+        transactions: &[Transaction],
+        chain: &ChainState,
+    ) -> Result<Vec<Txid>, MempoolError> {
         if transactions.is_empty() {
             return Err(MempoolError::Empty);
         }
         let added_at = time::unix_time();
-        let mut candidate = self.clone();
         let mut accepted = Vec::with_capacity(transactions.len());
         let mut package_fee = 0i128;
         let mut package_vsize = 0u64;
@@ -1099,8 +1137,12 @@ impl Mempool {
         let package_has_preexisting = transactions
             .iter()
             .any(|transaction| candidate.get(&transaction.compute_txid()).is_some());
-        let package_rbf =
-            transactions.len() == 2 && allow_low_fee_parent && !package_has_preexisting;
+        let package_rbf = transactions.len() == 2
+            && allow_low_fee_parent
+            && !package_has_preexisting
+            && transactions
+                .iter()
+                .any(|transaction| !candidate.conflicts_for(transaction).is_empty());
         let mut conflicting_fee = 0i128;
         let mut package_replaced = false;
         if package_rbf {
@@ -1211,11 +1253,10 @@ impl Mempool {
                 return Err(MempoolError::ReplacementFee);
             }
         }
-        if package_rbf && package_replaced && !self.improves_feerate_diagram(&candidate) {
+        if package_rbf && package_replaced && !self.improves_feerate_diagram(candidate) {
             return Err(MempoolError::ReplacementFeerateDiagram);
         }
-        validate_ephemeral_spends(transactions, &candidate)?;
-        *self = candidate;
+        validate_ephemeral_spends(transactions, candidate)?;
         Ok(accepted)
     }
 

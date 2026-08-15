@@ -9498,6 +9498,10 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         .into_iter()
         .filter_map(|(txid, transaction)| candidate.get(&txid).is_none().then_some(transaction))
         .collect::<Vec<_>>();
+    let replaced_transactions = removed
+        .iter()
+        .map(|transaction| transaction.compute_txid().to_string())
+        .collect::<Vec<_>>();
     *node.mempool.write() = candidate;
     node.notify_zmq_mempool_changes(changes);
     node.notify_mempool_removals(removed);
@@ -9507,7 +9511,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
     Ok(json!({
         "package_msg": "success",
         "tx-results": results,
-        "replaced-transactions": [],
+        "replaced-transactions": replaced_transactions,
     }))
 }
 
@@ -16234,7 +16238,14 @@ mod tests {
         assert_eq!(dry_run[0]["allowed"], false);
         assert_eq!(dry_run[0]["reject-reason"], "bip125-replacement-disallowed");
         assert!(node.mempool.read().get(&old_txid).is_some());
-        let replacement_txid = node.accept_transaction(replacement).unwrap();
+        let replacement_txid = replacement.compute_txid();
+        let package_result =
+            submit_package(&node, &json!([[hex::encode(serialize(&replacement))]])).unwrap();
+        assert_eq!(package_result["package_msg"], "success");
+        assert_eq!(
+            package_result["replaced-transactions"],
+            json!([old_txid.to_string()])
+        );
         assert_eq!(mempool_events.try_recv().unwrap(), old_txid);
         assert_eq!(mempool_events.try_recv().unwrap(), replacement_txid);
         let mempool = node.mempool.read();

@@ -1080,12 +1080,19 @@ impl Mempool {
                 accepted.push(txid);
                 continue;
             }
-            let txid = candidate.accept_at_with_policy(
-                transaction.clone(),
-                chain,
-                added_at,
-                !allow_low_fee_parent,
-            )?;
+            let txid = if transactions.len() == 1 {
+                // Core's package path still permits a single transaction to
+                // replace an existing mempool conflict, but does not apply
+                // the single-transaction TRUC sibling-eviction carve-out.
+                candidate.accept_without_sibling(transaction.clone(), chain)?
+            } else {
+                candidate.accept_at_with_policy(
+                    transaction.clone(),
+                    chain,
+                    added_at,
+                    !allow_low_fee_parent,
+                )?
+            };
             let entry = candidate.get(&txid).ok_or(MempoolError::BadOutput)?;
             package_fee =
                 package_fee.saturating_add(candidate.modified_fee_sat(&txid, entry.fee_sat));

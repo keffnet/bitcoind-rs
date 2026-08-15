@@ -7934,6 +7934,17 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .unwrap_or(true);
 
     for input_index in 0..psbt.inputs.len() {
+        let input_is_signed = psbt.inputs[input_index]
+            .final_script_sig
+            .as_ref()
+            .is_some_and(|script| !script.is_empty())
+            || psbt.inputs[input_index]
+                .final_script_witness
+                .as_ref()
+                .is_some_and(|witness| !witness.is_empty());
+        if input_is_signed {
+            continue;
+        }
         if psbt.inputs[input_index].witness_utxo.is_none()
             && psbt.inputs[input_index].non_witness_utxo.is_none()
             && let Some(outpoint) = psbt
@@ -7952,6 +7963,7 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
         let Some(prevout) = psbt_prevout(&psbt, input_index) else {
             continue;
         };
+        prepare_descriptor_sighash(&mut psbt, input_index, &prevout, sighash_type)?;
         let Some(candidate) = candidates
             .iter()
             .find(|candidate| candidate.script_pubkey == prevout.script_pubkey)
@@ -8025,9 +8037,17 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }
     }
 
+    remove_unnecessary_psbt_transactions(&mut psbt);
+
     let complete = (0..psbt.inputs.len()).all(|index| {
-        psbt.inputs[index].final_script_sig.is_some()
-            || psbt.inputs[index].final_script_witness.is_some()
+        psbt.inputs[index]
+            .final_script_sig
+            .as_ref()
+            .is_some_and(|script| !script.is_empty())
+            || psbt.inputs[index]
+                .final_script_witness
+                .as_ref()
+                .is_some_and(|witness| !witness.is_empty())
     });
     let mut result = json!({
         "psbt": encode_psbt(&psbt),
@@ -8042,25 +8062,24 @@ fn descriptor_process_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn parse_descriptor_sighash_type(value: &str) -> Result<DescriptorSighashType> {
-    let uppercase = value.to_ascii_uppercase();
-    let (ecdsa, taproot) = match uppercase.as_str() {
-        "DEFAULT" | "SIGHASH_DEFAULT" => (EcdsaSighashType::All, TapSighashType::Default),
-        "ALL" | "SIGHASH_ALL" => (EcdsaSighashType::All, TapSighashType::All),
-        "NONE" | "SIGHASH_NONE" => (EcdsaSighashType::None, TapSighashType::None),
-        "SINGLE" | "SIGHASH_SINGLE" => (EcdsaSighashType::Single, TapSighashType::Single),
-        "ALL|ANYONECANPAY" | "SIGHASH_ALL|SIGHASH_ANYONECANPAY" => (
+    let (ecdsa, taproot) = match value {
+        "DEFAULT" => (EcdsaSighashType::All, TapSighashType::Default),
+        "ALL" => (EcdsaSighashType::All, TapSighashType::All),
+        "NONE" => (EcdsaSighashType::None, TapSighashType::None),
+        "SINGLE" => (EcdsaSighashType::Single, TapSighashType::Single),
+        "ALL|ANYONECANPAY" => (
             EcdsaSighashType::AllPlusAnyoneCanPay,
             TapSighashType::AllPlusAnyoneCanPay,
         ),
-        "NONE|ANYONECANPAY" | "SIGHASH_NONE|SIGHASH_ANYONECANPAY" => (
+        "NONE|ANYONECANPAY" => (
             EcdsaSighashType::NonePlusAnyoneCanPay,
             TapSighashType::NonePlusAnyoneCanPay,
         ),
-        "SINGLE|ANYONECANPAY" | "SIGHASH_SINGLE|SIGHASH_ANYONECANPAY" => (
+        "SINGLE|ANYONECANPAY" => (
             EcdsaSighashType::SinglePlusAnyoneCanPay,
             TapSighashType::SinglePlusAnyoneCanPay,
         ),
-        _ => bail!("invalid sighash type: {value}"),
+        _ => bail!("'{value}' is not a valid sighash parameter."),
     };
     Ok(DescriptorSighashType { ecdsa, taproot })
 }
@@ -8888,6 +8907,47 @@ fn sign_descriptor_psbt_input(
     Ok(())
 }
 
+fn prepare_descriptor_sighash(
+    psbt: &mut Psbt,
+    input_index: usize,
+    prevout: &TxOut,
+    sighash_type: DescriptorSighashType,
+) -> Result<()> {
+    let taproot = prevout.script_pubkey.is_p2tr();
+    let expected_sighash = if taproot {
+        sighash_type.taproot as u8 as u32
+    } else {
+        sighash_type.ecdsa.to_u32()
+    };
+    if psbt.inputs[input_index]
+        .sighash_type
+        .is_some_and(|stored| stored.to_u32() != expected_sighash)
+        || psbt.inputs[input_index]
+            .partial_sigs
+            .values()
+            .any(|signature| signature.sighash_type.to_u32() != expected_sighash)
+        || psbt.inputs[input_index]
+            .tap_key_sig
+            .is_some_and(|signature| signature.sighash_type as u8 as u32 != expected_sighash)
+        || psbt.inputs[input_index]
+            .tap_script_sigs
+            .values()
+            .any(|signature| signature.sighash_type as u8 as u32 != expected_sighash)
+    {
+        bail!("Specified sighash value does not match value stored in PSBT")
+    }
+    let default_sighash = if taproot {
+        sighash_type.taproot == TapSighashType::Default
+    } else {
+        sighash_type.ecdsa == EcdsaSighashType::All
+    };
+    if !default_sighash {
+        psbt.inputs[input_index].sighash_type =
+            Some(bitcoin::psbt::PsbtSighashType::from_u32(expected_sighash));
+    }
+    Ok(())
+}
+
 fn sign_taproot_script_path(
     psbt: &mut Psbt,
     input_index: usize,
@@ -8975,6 +9035,28 @@ fn lookup_psbt_prevout(
     Ok(output.map(|output| (output, transaction)))
 }
 
+fn remove_unnecessary_psbt_transactions(psbt: &mut Psbt) {
+    let can_drop = psbt.inputs.iter().all(|input| {
+        let Some(witness_utxo) = &input.witness_utxo else {
+            return false;
+        };
+        let Some(version) = witness_utxo.script_pubkey.witness_version() else {
+            return false;
+        };
+        if version == bitcoin::blockdata::script::witness_version::WitnessVersion::V0 {
+            return false;
+        }
+        input
+            .sighash_type
+            .is_none_or(|sighash_type| sighash_type.to_u32() & 0x80 == 0)
+    });
+    if can_drop {
+        for input in &mut psbt.inputs {
+            input.non_witness_utxo = None;
+        }
+    }
+}
+
 fn update_psbt_utxos(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let mut psbt = parse_psbt(params, 0)?;
     for index in 0..psbt.inputs.len() {
@@ -9000,6 +9082,7 @@ fn update_psbt_utxos(node: &Arc<Node>, params: &Value) -> Result<Value> {
             psbt.inputs[index].non_witness_utxo = Some(transaction);
         }
     }
+    remove_unnecessary_psbt_transactions(&mut psbt);
     Ok(json!(encode_psbt(&psbt)))
 }
 
@@ -13092,6 +13175,9 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "previous output scriptpubkey mismatch" {
         return -22;
     }
+    if lower == "specified sighash value does not match value stored in psbt" {
+        return -22;
+    }
     if lower == "amount out of range" || lower == "missing amount" {
         return -3;
     }
@@ -13134,6 +13220,7 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.contains("must not be negative")
         || lower.contains("cannot be negative")
         || lower.contains("is out of range")
+        || lower.contains("is not a valid sighash parameter")
         || lower == "missing redeemscript/witnessscript"
         || lower == "redeemscript does not correspond to witnessscript"
         || lower == "redeemscript/witnessscript does not match scriptpubkey"
@@ -23057,7 +23144,7 @@ mod tests {
                 &json!([
                     encode_psbt(&psbt),
                     [format!("wpkh({public_key})")],
-                    "SIGHASH_ALL",
+                    "ALL",
                     1,
                     true
                 ]),
@@ -23070,16 +23157,23 @@ mod tests {
                 &json!([
                     encode_psbt(&psbt),
                     [format!("wpkh({public_key})")],
-                    "SIGHASH_ALL",
+                    "ALL",
                     true,
                     1
                 ]),
             )
             .is_err()
         );
+        assert!(
+            descriptor_process_psbt(
+                &node,
+                &json!([encode_psbt(&psbt), [descriptor], "SIGHASH_ALL", true, true]),
+            )
+            .is_err()
+        );
         let processed = descriptor_process_psbt(
             &node,
-            &json!([encode_psbt(&psbt), [descriptor], "SIGHASH_ALL", true, true]),
+            &json!([encode_psbt(&psbt), [descriptor], "ALL", true, true]),
         )
         .unwrap();
         assert_eq!(processed["complete"], true);
@@ -23094,6 +23188,35 @@ mod tests {
                 .1
                 .to_string(),
             "84'/0'/0'"
+        );
+        let any_can_pay = descriptor_process_psbt(
+            &node,
+            &json!([
+                encode_psbt(&psbt),
+                [descriptor],
+                "ALL|ANYONECANPAY",
+                true,
+                false
+            ]),
+        )
+        .unwrap();
+        let any_can_pay_psbt = parse_psbt(&json!([any_can_pay["psbt"].clone()]), 0).unwrap();
+        assert_eq!(
+            any_can_pay_psbt.inputs[0].sighash_type.unwrap().to_u32(),
+            0x81
+        );
+        assert!(
+            descriptor_process_psbt(
+                &node,
+                &json!([
+                    encode_psbt(&any_can_pay_psbt),
+                    [descriptor],
+                    "ALL",
+                    true,
+                    false
+                ]),
+            )
+            .is_err()
         );
 
         let nested_descriptor = format!("sh(wpkh({public_key}))");
@@ -23116,7 +23239,7 @@ mod tests {
             &json!([
                 encode_psbt(&nested),
                 [nested_descriptor],
-                "SIGHASH_ALL",
+                "ALL",
                 true,
                 false
             ]),
@@ -23157,7 +23280,7 @@ mod tests {
             &json!([
                 encode_psbt(&miniscript_psbt),
                 [miniscript_descriptor],
-                "SIGHASH_ALL",
+                "ALL",
                 true,
                 true
             ]),
@@ -23190,7 +23313,7 @@ mod tests {
             &json!([
                 encode_psbt(&nested_miniscript_psbt),
                 [nested_miniscript_descriptor],
-                "SIGHASH_ALL",
+                "ALL",
                 true,
                 true
             ]),
@@ -23241,7 +23364,7 @@ mod tests {
             &json!([
                 encode_psbt(&taproot_psbt),
                 [taproot_descriptor],
-                "SIGHASH_DEFAULT",
+                "DEFAULT",
                 true,
                 true
             ]),
@@ -23304,7 +23427,7 @@ mod tests {
             &json!([
                 encode_psbt(&tree_psbt),
                 [taproot_tree_descriptor],
-                "SIGHASH_DEFAULT",
+                "DEFAULT",
                 true,
                 false
             ]),
@@ -23337,7 +23460,7 @@ mod tests {
             &json!([
                 encode_psbt(&script_path_psbt),
                 [script_path_descriptor],
-                "SIGHASH_DEFAULT",
+                "DEFAULT",
                 true,
                 false
             ]),

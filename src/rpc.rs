@@ -8835,6 +8835,12 @@ fn build_mining_block_with_transactions(
         .max(chain.median_time_past_value().saturating_add(1));
     let bits = chain.next_bits(time);
     let network = chain.network;
+    let version = mining_block_version(
+        network,
+        chain.active_headers(),
+        tip.height,
+        node.config.block_version,
+    );
     let mempool = node.mempool.read();
     let mut created = HashMap::new();
     let mut fees = 0u64;
@@ -8897,7 +8903,7 @@ fn build_mining_block_with_transactions(
         transactions,
         fees,
         extra_nonce: random(),
-        version: node.config.block_version,
+        version: Some(version),
     })?;
     if block.weight().to_wu() > node.config.block_max_weight {
         bail!("generated block exceeds the block weight limit")
@@ -8935,7 +8941,7 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
     let segwit_active = height >= validation::buried_deployment_heights(network).segwit;
     let mut coinbase = Transaction {
         version: Version::ONE,
-        lock_time: LockTime::ZERO,
+        lock_time: LockTime::from_consensus(height.saturating_sub(1)),
         input: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: Builder::new()
@@ -8982,6 +8988,24 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
         .compute_merkle_root()
         .ok_or_else(|| anyhow!("cannot calculate transaction merkle root"))?;
     Ok(block)
+}
+
+fn mining_block_version(
+    network: Network,
+    headers: &[Header],
+    tip_height: u32,
+    custom_version: Option<i32>,
+) -> i32 {
+    let mut version = custom_version.unwrap_or(0x2000_0000);
+    if custom_version.is_none() {
+        for deployment in validation::bip9_deployments(network) {
+            let (state, _) = bip9_state_at_height(headers, deployment, tip_height);
+            if matches!(state, Bip9State::Started | Bip9State::LockedIn) {
+                version |= 1i32 << deployment.bit;
+            }
+        }
+    }
+    version
 }
 
 fn mine_block(mut block: Block, max_tries: u64) -> Option<Block> {
@@ -9146,6 +9170,13 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .iter()
         .filter_map(|txid| mempool.get(txid).map(|entry| entry.transaction.clone()))
         .collect::<Vec<_>>();
+    let headers = chain.active_headers();
+    let version = mining_block_version(
+        chain.network,
+        headers,
+        tip.height,
+        node.config.block_version,
+    );
     let template_block = mining_block(MiningBlockTemplate {
         network: chain.network,
         parent: *parent,
@@ -9156,7 +9187,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         transactions: selected_transactions,
         fees,
         extra_nonce: 0,
-        version: node.config.block_version,
+        version: Some(version),
     })?;
     node.record_mining_block(&template_block);
     let default_witness_commitment = segwit_active.then(|| {
@@ -9176,18 +9207,12 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if chain.network == Network::Signet {
         rules.push("!signet");
     }
-    let headers = chain.active_headers();
     let [testdummy, taproot] = validation::bip9_deployments(chain.network);
-    let custom_version = node.config.block_version;
-    let mut version = custom_version.unwrap_or(0x2000_0000);
     let mut vbavailable = serde_json::Map::new();
     for (name, deployment) in [("testdummy", testdummy), ("taproot", taproot)] {
         let (state, _) = bip9_state_at_height(headers, deployment, tip.height);
         match state {
             Bip9State::Started | Bip9State::LockedIn => {
-                if custom_version.is_none() {
-                    version |= 1i32 << deployment.bit;
-                }
                 vbavailable.insert(name.to_owned(), json!(deployment.bit));
             }
             Bip9State::Active => rules.push(name),
@@ -13950,6 +13975,10 @@ mod tests {
         assert_eq!(chain.best_hash(), hash);
         let block = chain.block(&hash).unwrap().unwrap();
         assert_eq!(block.txdata.len(), 1);
+        assert_eq!(
+            block.txdata[0].lock_time,
+            LockTime::from_consensus(chain.height().saturating_sub(1))
+        );
         assert_eq!(block.txdata[0].output[0].value.to_sat(), 5_000_000_000);
     }
 

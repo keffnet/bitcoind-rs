@@ -624,13 +624,14 @@ impl Node {
             .context("--maxmempool is too large")?;
         let max_mempool_bytes =
             usize::try_from(max_mempool_bytes).context("--maxmempool does not fit usize")?;
-        let mut chain = ChainState::open_with_options(
+        let mut chain = ChainState::open_with_options_and_tx_index(
             config.network,
             &config.datadir,
             config.signet_challenge.as_deref(),
             config.blockfilterindex,
             config.reindex,
             config.reindex_chainstate,
+            config.txindex,
         )?;
         chain.configure_pruning(config.prune)?;
         // Electrum 1.7 outpoint status needs confirmed spender lookups even

@@ -593,6 +593,7 @@ pub struct ChainState {
     filter_store: FilterStore,
     chainstate_store: ChainstateStore,
     blockfilter_index_enabled: bool,
+    tx_index_all_enabled: bool,
     coinstats_store: CoinStatsStore,
     txospender_index_enabled: bool,
     coinstats_index_enabled: bool,
@@ -660,6 +661,33 @@ impl ChainState {
         blockfilter_index_enabled: bool,
         reindex: bool,
         reindex_chainstate: bool,
+    ) -> Result<Self> {
+        Self::open_with_options_and_tx_index(
+            network,
+            data_dir,
+            signet_challenge,
+            blockfilter_index_enabled,
+            reindex,
+            reindex_chainstate,
+            true,
+        )
+    }
+
+    /// Open chainstate with optional side-chain transaction indexing.
+    ///
+    /// The active-chain transaction map is always retained because it powers
+    /// Electrum, REST, merkle proofs, and block metadata.  The second map is
+    /// only needed for Core's optional `-txindex` lookup of transactions that
+    /// are not currently active; avoiding it is a substantial memory saving
+    /// for ordinary node and Electrum deployments.
+    pub fn open_with_options_and_tx_index(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
+        reindex: bool,
+        reindex_chainstate: bool,
+        tx_index_all_enabled: bool,
     ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
@@ -779,6 +807,7 @@ impl ChainState {
             filter_store,
             chainstate_store,
             blockfilter_index_enabled,
+            tx_index_all_enabled,
             coinstats_store,
             txospender_index_enabled: false,
             coinstats_index_enabled: false,
@@ -840,10 +869,14 @@ impl ChainState {
             state.utxos = snapshot.utxos;
             state.rebuild_utxo_index();
             state.tx_index = snapshot.tx_index;
-            state.tx_index_all = if snapshot.tx_index_all.is_empty() {
-                state.tx_index.clone()
+            state.tx_index_all = if state.tx_index_all_enabled {
+                if snapshot.tx_index_all.is_empty() {
+                    state.tx_index.clone()
+                } else {
+                    snapshot.tx_index_all
+                }
             } else {
-                snapshot.tx_index_all
+                HashMap::new()
             };
             state.history = snapshot.history;
             state.prune_height = snapshot.prune_height.or(state.prune_height);
@@ -2487,7 +2520,9 @@ impl ChainState {
             .clone()
             .context("historical UTXO hash was not calculated")?;
         let coins_written = snapshot.utxos.len() as u64;
-        let nchaintx = snapshot.tx_index_all.len();
+        let nchaintx = self
+            .chain_transaction_count(target_height)
+            .unwrap_or(snapshot.tx_index.len() as u64) as usize;
         let path = path.as_ref();
         write_core_utxo_snapshot(path, self.network, target_hash, &snapshot.utxos)?;
         Ok((
@@ -2744,16 +2779,19 @@ impl ChainState {
             if entry.output.value > Amount::MAX_MONEY {
                 bail!("UTXO snapshot contains an output above the money range")
             }
-            let location = self
-                .tx_index_all
-                .get(&outpoint.txid)
-                .or_else(|| self.tx_index.get(&outpoint.txid))
-                .with_context(|| {
-                    format!(
-                        "UTXO snapshot references unknown transaction {}",
-                        outpoint.txid
-                    )
-                })?;
+            let location = if self.tx_index_all_enabled {
+                self.tx_index_all
+                    .get(&outpoint.txid)
+                    .or_else(|| self.tx_index.get(&outpoint.txid))
+            } else {
+                self.tx_index.get(&outpoint.txid)
+            }
+            .with_context(|| {
+                format!(
+                    "UTXO snapshot references unknown transaction {}",
+                    outpoint.txid
+                )
+            })?;
             if location.height != entry.height
                 || self.ancestor_hash(tip_hash, location.height) != Some(location.block_hash)
             {
@@ -3559,13 +3597,15 @@ impl ChainState {
                 transaction_index,
             };
             self.tx_index.insert(txid, location.clone());
-            if let Some(changes) = tx_index_all_changes.as_deref_mut()
-                && !changes.contains_key(&txid)
-                && self.tx_index_all.get(&txid) != Some(&location)
-            {
-                changes.insert(txid, self.tx_index_all.get(&txid).cloned());
+            if self.tx_index_all_enabled {
+                if let Some(changes) = tx_index_all_changes.as_deref_mut()
+                    && !changes.contains_key(&txid)
+                    && self.tx_index_all.get(&txid) != Some(&location)
+                {
+                    changes.insert(txid, self.tx_index_all.get(&txid).cloned());
+                }
+                self.tx_index_all.insert(txid, location);
             }
-            self.tx_index_all.insert(txid, location);
         }
         if self.txospender_index_enabled {
             self.index_block_spends(block, height);
@@ -4153,14 +4193,16 @@ impl ChainState {
                     transaction_index,
                 },
             );
-            self.tx_index_all.insert(
-                txid,
-                TxLocation {
-                    block_hash: block.block_hash(),
-                    height,
-                    transaction_index,
-                },
-            );
+            if self.tx_index_all_enabled {
+                self.tx_index_all.insert(
+                    txid,
+                    TxLocation {
+                        block_hash: block.block_hash(),
+                        height,
+                        transaction_index,
+                    },
+                );
+            }
         }
         if self.txospender_index_enabled {
             self.index_block_spends(block, height);
@@ -4218,10 +4260,14 @@ impl ChainState {
             if node.height != *height || !active_chain.contains(block_hash) {
                 bail!("spent index references an inactive or mismatched block");
             }
-            let location = self
-                .tx_index_all
-                .get(txid)
-                .with_context(|| format!("spent index references unknown transaction {txid}"))?;
+            let location = if self.tx_index_all_enabled {
+                self.tx_index_all
+                    .get(txid)
+                    .or_else(|| self.tx_index.get(txid))
+            } else {
+                self.tx_index.get(txid)
+            }
+            .with_context(|| format!("spent index references unknown transaction {txid}"))?;
             if location.block_hash != *block_hash || location.height != *height {
                 bail!(
                     "spent index transaction {} does not match its spending block",
@@ -4236,6 +4282,9 @@ impl ChainState {
     }
 
     fn index_all_transactions(&mut self, block: &Block, height: u32) {
+        if !self.tx_index_all_enabled {
+            return;
+        }
         for (transaction_index, transaction) in block.txdata.iter().enumerate() {
             let txid = transaction.compute_txid();
             self.tx_index_all.insert(
@@ -4639,7 +4688,9 @@ impl ChainState {
                 bail!("chainstate delta contains invalid transaction metadata")
             }
             self.tx_index.insert(*txid, location.clone());
-            self.tx_index_all.insert(*txid, location.clone());
+            if self.tx_index_all_enabled {
+                self.tx_index_all.insert(*txid, location.clone());
+            }
         }
         if self.txospender_index_enabled {
             for (outpoint, spender) in delta.spent_by {
@@ -4838,7 +4889,11 @@ impl ChainState {
             headers: self.headers.clone(),
             utxos: self.utxos.clone(),
             tx_index: self.tx_index.clone(),
-            tx_index_all: self.tx_index_all.clone(),
+            tx_index_all: if self.tx_index_all_enabled {
+                self.tx_index_all.clone()
+            } else {
+                HashMap::new()
+            },
             history: self.history.clone(),
             spent_by: self.txospender_index_enabled.then(|| self.spent_by.clone()),
             prune_height: self.prune_height,
@@ -4909,7 +4964,12 @@ impl ChainState {
 
     fn tx_counts_from_index(&self) -> Option<Vec<u32>> {
         let mut counts = vec![0u32; self.active_chain.len()];
-        for location in self.tx_index_all.values() {
+        let index = if self.tx_index_all_enabled {
+            &self.tx_index_all
+        } else {
+            &self.tx_index
+        };
+        for location in index.values() {
             let height = usize::try_from(location.height).ok()?;
             if self.active_chain.get(height) != Some(&location.block_hash) {
                 continue;
@@ -5067,6 +5127,7 @@ fn open_background_replay_state(
         filter_store,
         chainstate_store,
         blockfilter_index_enabled: false,
+        tx_index_all_enabled: false,
         coinstats_store,
         txospender_index_enabled: false,
         coinstats_index_enabled: false,
@@ -6616,6 +6677,51 @@ mod tests {
         let replayed = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(replayed.best_hash(), second_hash);
         assert_eq!(replayed.utxo_stats(), expected_stats);
+    }
+
+    #[test]
+    fn omits_side_chain_transactions_without_the_optional_txindex() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open_with_options_and_tx_index(
+            Network::Regtest,
+            directory.path(),
+            None,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let main = mine_block(&state, 1);
+        let main_hash = main.block_hash();
+        let main_txid = main.txdata[0].compute_txid();
+        state.connect_block(main).unwrap();
+        assert!(state.tx_index_all.is_empty());
+        assert!(state.transaction(&main_txid).unwrap().is_some());
+
+        let genesis = *state.header(0).unwrap();
+        let side = mine_block_from_header(&genesis, 1, 77);
+        let side_hash = side.block_hash();
+        let side_txid = side.txdata[0].compute_txid();
+        state.connect_block(side).unwrap();
+        assert_eq!(state.best_hash(), main_hash);
+        assert!(!state.is_active_block(&side_hash));
+        assert!(state.transaction(&side_txid).unwrap().is_none());
+
+        drop(state);
+        let mut reopened = ChainState::open_with_options_and_tx_index(
+            Network::Regtest,
+            directory.path(),
+            None,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(reopened.tx_index_all.is_empty());
+        assert!(reopened.transaction(&main_txid).unwrap().is_some());
+        assert!(reopened.transaction(&side_txid).unwrap().is_none());
     }
 
     fn mine_block(state: &ChainState, height: u32) -> Block {

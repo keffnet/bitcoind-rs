@@ -3205,11 +3205,11 @@ fn bip9_state_at_height(
     deployment: validation::Bip9Deployment,
     next_height: u32,
 ) -> (Bip9State, u32) {
-    if deployment.start_time == -1 {
+    if deployment.start_time == validation::Bip9Deployment::ALWAYS_ACTIVE_TIME {
         return (Bip9State::Active, 0);
     }
-    if deployment.start_time == -2 {
-        return (Bip9State::Defined, 0);
+    if deployment.start_time == validation::Bip9Deployment::NEVER_ACTIVE_TIME {
+        return (Bip9State::Failed, 0);
     }
     let period = deployment.period.max(1);
     let mut state = Bip9State::Defined;
@@ -3369,10 +3369,14 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         );
     }
     let [testdummy, taproot] = validation::bip9_deployments(chain.network);
-    deployments.insert(
-        "testdummy".to_owned(),
-        bip9_deployment_json(&headers, height, testdummy),
-    );
+    // Core does not register NEVER_ACTIVE deployments in getdeploymentinfo.
+    // Regtest intentionally keeps testdummy enabled for versionbits tests.
+    if testdummy.is_enabled() {
+        deployments.insert(
+            "testdummy".to_owned(),
+            bip9_deployment_json(&headers, height, testdummy),
+        );
+    }
     deployments.insert(
         "taproot".to_owned(),
         bip9_deployment_json(&headers, height, taproot),
@@ -3803,6 +3807,9 @@ fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
     };
     if rollback.is_some() && !dump_type.is_empty() && dump_type != "rollback" {
         bail!("Invalid snapshot type \"{dump_type}\" specified with rollback option")
+    }
+    if dump_type.is_empty() && rollback.is_none() {
+        bail!("Invalid snapshot type \"\" specified. Please specify \"rollback\" or \"latest\"")
     }
     if !dump_type.is_empty() && dump_type != "latest" && dump_type != "rollback" {
         bail!(
@@ -16398,7 +16405,8 @@ mod tests {
         .unwrap();
         let path = directory.path().join("utxos.snapshot");
         assert!(dump_txoutset(&node, &json!([path.to_string_lossy(), 1])).is_err());
-        let dumped = dump_txoutset(&node, &json!([path.to_string_lossy()])).unwrap();
+        assert!(dump_txoutset(&node, &json!([path.to_string_lossy()])).is_err());
+        let dumped = dump_txoutset(&node, &json!([path.to_string_lossy(), "latest"])).unwrap();
         assert_eq!(dumped["base_height"], 0);
         assert_eq!(dumped["coins_written"], 0);
         assert_eq!(dumped["nchaintx"], 1);

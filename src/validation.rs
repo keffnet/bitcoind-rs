@@ -47,6 +47,15 @@ pub struct Bip9Deployment {
     pub period: u32,
 }
 
+impl Bip9Deployment {
+    pub const ALWAYS_ACTIVE_TIME: i64 = -1;
+    pub const NEVER_ACTIVE_TIME: i64 = -2;
+
+    pub fn is_enabled(self) -> bool {
+        self.start_time != Self::NEVER_ACTIVE_TIME
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ValidationError {
     #[error("block does not extend the active tip")]
@@ -175,7 +184,7 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
         },
         Network::Bitcoin | Network::Signet => Bip9Deployment {
             bit: 28,
-            start_time: -2,
+            start_time: Bip9Deployment::NEVER_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
             threshold: 1815,
@@ -183,7 +192,7 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
         },
         Network::Testnet | Network::Testnet4 => Bip9Deployment {
             bit: 28,
-            start_time: -2,
+            start_time: Bip9Deployment::NEVER_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
             threshold: 1512,
@@ -209,7 +218,7 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
         },
         Network::Testnet4 => Bip9Deployment {
             bit: 2,
-            start_time: -1,
+            start_time: Bip9Deployment::ALWAYS_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
             threshold: 1512,
@@ -217,7 +226,7 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
         },
         Network::Signet => Bip9Deployment {
             bit: 2,
-            start_time: -1,
+            start_time: Bip9Deployment::ALWAYS_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
             threshold: 1815,
@@ -225,7 +234,7 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
         },
         Network::Regtest => Bip9Deployment {
             bit: 2,
-            start_time: -1,
+            start_time: Bip9Deployment::ALWAYS_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
             threshold: 108,

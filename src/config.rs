@@ -595,6 +595,16 @@ pub struct Args {
     #[arg(long = "blocksdir", value_name = "PATH")]
     pub blocks_dir: Option<PathBuf>,
 
+    /// Apply Core-style cyclic XOR obfuscation to block and undo records.
+    #[arg(
+        long = "blocksxor",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub blocks_xor: bool,
+
     #[arg(long = "conf", value_name = "FILE")]
     pub config_file: Option<PathBuf>,
 
@@ -1389,6 +1399,7 @@ pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
     pub(crate) blocks_dir: Option<PathBuf>,
+    pub blocks_xor: bool,
     pub(crate) minimum_chain_work: Option<Work>,
     pub(crate) assume_valid: Option<BlockHash>,
     pub(crate) check_blocks: Option<u32>,
@@ -1837,6 +1848,7 @@ impl Config {
             network,
             datadir: args.datadir,
             blocks_dir: Some(blocks_dir),
+            blocks_xor: args.blocks_xor,
             minimum_chain_work,
             assume_valid,
             check_blocks: args.check_blocks,
@@ -2384,6 +2396,11 @@ mod tests {
             Config::from_args(args).unwrap().blocks_dir,
             Some(directory.path().join("storage/blocks"))
         );
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--network=regtest"]).unwrap();
+        assert!(Config::from_args(args).unwrap().blocks_xor);
+        let args = Args::try_parse_from(["bitcoind-rs", "--blocksxor=false"]).unwrap();
+        assert!(!Config::from_args(args).unwrap().blocks_xor);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

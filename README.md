@@ -59,6 +59,7 @@ Compact-block reconstruction also retains a bounded FIFO of recent non-mempool t
 Use `--txindex` to enable confirmed transaction lookup without supplying a block hash to `getrawtransaction`; Core-style pruning and `--txindex` are mutually exclusive.
 
 Use `--blocksdir=<path>` to place the append-only block and undo records outside the data directory; relative paths are resolved beneath `--datadir`, while chainstate and indexes remain in the data directory.
+Block and undo records use Core-style 8-byte cyclic XOR obfuscation by default; `--blocksxor=false` keeps a clear store. A fresh blocks directory receives a random key in `xor.dat`, while an existing clear directory receives a zero key. Disabling XOR after a nonzero key has been stored is rejected.
 Use `--minimumchainwork=<hex>` to override Core's assumed work floor; `0` disables the assumption.
 `--assumevalid=<hex>` selects Core's externally verified block for conservative script-check skipping during synchronization; `0` disables it. Public-network defaults match Core v31.1, while custom Signet challenges disable the default.
 `--maxtipage=<seconds>` controls the maximum tip age used to leave initial block download (24 hours by default).

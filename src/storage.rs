@@ -15,12 +15,14 @@ use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, BlockHash, TxOut};
+use rand::random;
 use serde::{Deserialize, Serialize};
 
 const MAX_STORED_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_FILTER_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_CHAINSTATE_DELTA_SIZE: usize = 64 * 1024 * 1024;
+const XOR_KEY_SIZE: usize = 8;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
 
@@ -28,6 +30,57 @@ const INDEX_RECORD_SIZE: u64 = 44;
 struct Record {
     offset: u64,
     length: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct XorKey([u8; XOR_KEY_SIZE]);
+
+impl XorKey {
+    fn apply(self, bytes: &mut [u8], offset: u64) {
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            let key_index = ((offset.saturating_add(index as u64)) % XOR_KEY_SIZE as u64) as usize;
+            *byte ^= self.0[key_index];
+        }
+    }
+}
+
+fn read_xor_key(path: &Path) -> Result<XorKey> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading blocksdir XOR key {}", path.display()))?;
+    let bytes: [u8; XOR_KEY_SIZE] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("blocksdir XOR key must be exactly {XOR_KEY_SIZE} bytes"))?;
+    Ok(XorKey(bytes))
+}
+
+fn init_xor_key(directory: &Path, use_xor: bool) -> Result<XorKey> {
+    let path = directory.join("xor.dat");
+    let key = if path.exists() {
+        read_xor_key(&path)?
+    } else {
+        let first_run = std::fs::read_dir(directory)?.try_fold(true, |first_run, entry| {
+            let entry = entry?;
+            let hidden = entry.file_name().to_string_lossy().starts_with('.');
+            Ok::<_, std::io::Error>(first_run && hidden)
+        })?;
+        let key = if use_xor && first_run {
+            XorKey(random())
+        } else {
+            XorKey::default()
+        };
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("creating blocksdir XOR key {}", path.display()))?;
+        file.write_all(&key.0)?;
+        file.sync_all()?;
+        key
+    };
+    if !use_xor && key.0.iter().any(|byte| *byte != 0) {
+        bail!("the blocksdir XOR key cannot be disabled when a random key is already stored");
+    }
+    Ok(key)
 }
 
 pub struct BlockStore {
@@ -38,13 +91,23 @@ pub struct BlockStore {
     undo_file: File,
     undo_index_file: File,
     undo_index: HashMap<BlockHash, Record>,
+    xor_key: XorKey,
 }
 
 impl BlockStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_xor(directory, false)
+    }
+
+    /// Open the block and undo stores with Core-compatible blocksdir
+    /// obfuscation.  The key is persisted in `xor.dat`; a fresh directory gets
+    /// a random key when enabled, while an existing clear directory gets a
+    /// zero key so upgrading does not rewrite historical data.
+    pub fn open_with_xor(directory: impl AsRef<Path>, use_xor: bool) -> Result<Self> {
         let directory = directory.as_ref();
         create_dir_all(directory)
             .with_context(|| format!("creating block directory {}", directory.display()))?;
+        let xor_key = init_xor_key(directory, use_xor)?;
         let path = directory.join("blocks.dat");
         let mut file = OpenOptions::new()
             .create(true)
@@ -64,7 +127,7 @@ impl BlockStore {
         let index = match load_index(&mut index_file, data_len)? {
             Some(index) => index,
             None => {
-                let index = scan_index(&mut file)
+                let index = scan_index(&mut file, xor_key)
                     .with_context(|| format!("scanning {}", path.display()))?;
                 rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
                 index
@@ -89,7 +152,7 @@ impl BlockStore {
         let undo_index = match load_index(&mut undo_index_file, undo_data_len)? {
             Some(index) => index,
             None => {
-                let index = scan_undo_index(&mut undo_file)
+                let index = scan_undo_index(&mut undo_file, xor_key)
                     .with_context(|| format!("scanning {}", undo_path.display()))?;
                 rewrite_index(&mut undo_index_file, undo_file.metadata()?.len(), &index)?;
                 index
@@ -103,6 +166,7 @@ impl BlockStore {
             undo_file,
             undo_index_file,
             undo_index,
+            xor_key,
         })
     }
 
@@ -111,7 +175,16 @@ impl BlockStore {
     /// file descriptor so seeks in the validator cannot race the active
     /// chain's reads or writes.
     pub fn open_read_only(directory: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_with_xor(directory, false)
+    }
+
+    pub fn open_read_only_with_xor(directory: impl AsRef<Path>, use_xor: bool) -> Result<Self> {
         let directory = directory.as_ref();
+        let xor_key = if use_xor {
+            read_xor_key(&directory.join("xor.dat"))?
+        } else {
+            XorKey::default()
+        };
         let path = directory.join("blocks.dat");
         let mut file = OpenOptions::new()
             .read(true)
@@ -125,9 +198,8 @@ impl BlockStore {
         let data_len = file.metadata()?.len();
         let index = match load_index(&mut index_file, data_len)? {
             Some(index) => index,
-            None => {
-                scan_index(&mut file).with_context(|| format!("scanning {}", path.display()))?
-            }
+            None => scan_index(&mut file, xor_key)
+                .with_context(|| format!("scanning {}", path.display()))?,
         };
 
         let undo_path = directory.join("undo.dat");
@@ -143,7 +215,7 @@ impl BlockStore {
         let undo_data_len = undo_file.metadata()?.len();
         let undo_index = match load_index(&mut undo_index_file, undo_data_len)? {
             Some(index) => index,
-            None => scan_undo_index(&mut undo_file)
+            None => scan_undo_index(&mut undo_file, xor_key)
                 .with_context(|| format!("scanning {}", undo_path.display()))?,
         };
 
@@ -155,6 +227,7 @@ impl BlockStore {
             undo_file,
             undo_index_file,
             undo_index,
+            xor_key,
         })
     }
 
@@ -198,8 +271,11 @@ impl BlockStore {
         }
         let offset = self.file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("block length does not fit u32")?;
-        self.file.write_all(&length.to_le_bytes())?;
-        self.file.write_all(&bytes)?;
+        let mut record = Vec::with_capacity(4 + bytes.len());
+        record.extend_from_slice(&length.to_le_bytes());
+        record.extend_from_slice(&bytes);
+        self.xor_key.apply(&mut record, offset);
+        self.file.write_all(&record)?;
         self.file.sync_data()?;
         persist_index_entry(
             &mut self.index_file,
@@ -218,12 +294,14 @@ impl BlockStore {
         self.file.seek(SeekFrom::Start(record.offset))?;
         let mut length = [0u8; 4];
         self.file.read_exact(&mut length)?;
+        self.xor_key.apply(&mut length, record.offset);
         let actual = u32::from_le_bytes(length);
         if actual != record.length {
             bail!("block store index disagrees with record length");
         }
         let mut bytes = vec![0u8; record.length as usize];
         self.file.read_exact(&mut bytes)?;
+        self.xor_key.apply(&mut bytes, record.offset + 4);
         let block: Block = deserialize(&bytes).context("decoding stored block")?;
         if block.block_hash() != *hash {
             bail!("stored block hash does not match block index");
@@ -238,12 +316,14 @@ impl BlockStore {
         self.undo_file.seek(SeekFrom::Start(record.offset))?;
         let mut length = [0u8; 4];
         self.undo_file.read_exact(&mut length)?;
+        self.xor_key.apply(&mut length, record.offset);
         let actual = u32::from_le_bytes(length);
         if actual != record.length {
             bail!("undo store index disagrees with record length");
         }
         let mut bytes = vec![0u8; record.length as usize];
         self.undo_file.read_exact(&mut bytes)?;
+        self.xor_key.apply(&mut bytes, record.offset + 4);
         let (stored_hash, undo) = decode_undo_record(&bytes)?;
         if stored_hash != *hash {
             bail!("stored block undo hash does not match undo index");
@@ -261,8 +341,11 @@ impl BlockStore {
         }
         let offset = self.undo_file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("undo length does not fit u32")?;
-        self.undo_file.write_all(&length.to_le_bytes())?;
-        self.undo_file.write_all(&bytes)?;
+        let mut record = Vec::with_capacity(4 + bytes.len());
+        record.extend_from_slice(&length.to_le_bytes());
+        record.extend_from_slice(&bytes);
+        self.xor_key.apply(&mut record, offset);
+        self.undo_file.write_all(&record)?;
         self.undo_file.sync_data()?;
         persist_index_entry(
             &mut self.undo_index_file,
@@ -299,7 +382,8 @@ impl BlockStore {
                 .with_context(|| format!("block {hash} disappeared during pruning"))?;
             block_records.push((hash, serialize(&block)));
         }
-        let (file, index, data_len) = rewrite_record_file(&self.path, &block_records)?;
+        let (file, index, data_len) =
+            rewrite_record_file(&self.path, &block_records, self.xor_key)?;
         self.file = file;
         self.index = index;
         rewrite_index(&mut self.index_file, data_len, &self.index)?;
@@ -323,7 +407,7 @@ impl BlockStore {
             undo_records.push((hash, encode_undo_record(hash, &undo)?));
         }
         let (undo_file, undo_index, undo_data_len) =
-            rewrite_record_file(&undo_path, &undo_records)?;
+            rewrite_record_file(&undo_path, &undo_records, self.xor_key)?;
         self.undo_file = undo_file;
         self.undo_index = undo_index;
         rewrite_index(&mut self.undo_index_file, undo_data_len, &self.undo_index)?;
@@ -334,6 +418,7 @@ impl BlockStore {
 fn rewrite_record_file(
     path: &Path,
     records: &[(BlockHash, Vec<u8>)],
+    xor_key: XorKey,
 ) -> Result<(File, HashMap<BlockHash, Record>, u64)> {
     let temp_path = path.with_file_name(format!(
         "{}.prune.tmp",
@@ -350,8 +435,11 @@ fn rewrite_record_file(
     for (hash, bytes) in records {
         let offset = temp.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("record length does not fit u32")?;
-        temp.write_all(&length.to_le_bytes())?;
-        temp.write_all(bytes)?;
+        let mut record = Vec::with_capacity(4 + bytes.len());
+        record.extend_from_slice(&length.to_le_bytes());
+        record.extend_from_slice(bytes);
+        xor_key.apply(&mut record, offset);
+        temp.write_all(&record)?;
         index.insert(*hash, Record { offset, length });
     }
     temp.sync_all()?;
@@ -1105,7 +1193,7 @@ fn index_layout_is_contiguous(index: &HashMap<BlockHash, Record>, data_len: u64)
     expected_offset == data_len
 }
 
-fn scan_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
+fn scan_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash, Record>> {
     file.seek(SeekFrom::Start(0))?;
     let mut index = HashMap::new();
     let data_len = file.metadata()?.len();
@@ -1120,6 +1208,7 @@ fn scan_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
             }
             Err(error) => return Err(error.into()),
         }
+        xor_key.apply(&mut length_bytes, offset);
         let length = u32::from_le_bytes(length_bytes);
         let end = offset.saturating_add(4).saturating_add(u64::from(length));
         if end > data_len {
@@ -1137,6 +1226,7 @@ fn scan_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
         file.read_exact(&mut bytes).map_err(|error| {
             anyhow::anyhow!("truncated block record at offset {}: {}", offset, error)
         })?;
+        xor_key.apply(&mut bytes, offset + 4);
         let block: Block = deserialize(&bytes).context("decoding block record")?;
         if index
             .insert(block.block_hash(), Record { offset, length })
@@ -1149,7 +1239,7 @@ fn scan_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
     Ok(index)
 }
 
-fn scan_undo_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
+fn scan_undo_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash, Record>> {
     file.seek(SeekFrom::Start(0))?;
     let mut index = HashMap::new();
     let mut max_end = 0u64;
@@ -1165,6 +1255,7 @@ fn scan_undo_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
             }
             Err(error) => return Err(error.into()),
         }
+        xor_key.apply(&mut length_bytes, offset);
         let length = u32::from_le_bytes(length_bytes);
         let end = offset.saturating_add(4).saturating_add(u64::from(length));
         if end > data_len {
@@ -1178,6 +1269,7 @@ fn scan_undo_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
         file.read_exact(&mut bytes).map_err(|error| {
             anyhow::anyhow!("truncated undo record at offset {}: {}", offset, error)
         })?;
+        xor_key.apply(&mut bytes, offset + 4);
         let (hash, _) = decode_undo_record(&bytes)?;
         if index.insert(hash, Record { offset, length }).is_some() {
             bail!("duplicate block hash in undo store")
@@ -1261,6 +1353,53 @@ mod tests {
         let mut reopened = BlockStore::open(directory.path()).unwrap();
         assert!(reopened.contains(&hash));
         assert_eq!(reopened.get(&hash).unwrap().unwrap(), block);
+    }
+
+    #[test]
+    fn persists_and_recovers_xored_blocks_and_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let block = genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+        let undo = vec![vec![TxOut {
+            value: bitcoin::Amount::from_sat(42),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+        }]];
+        {
+            let mut store = BlockStore::open_with_xor(directory.path(), true).unwrap();
+            store.insert(&block).unwrap();
+            store.insert_undo(hash, &undo).unwrap();
+            assert_eq!(store.get(&hash).unwrap(), Some(block.clone()));
+            assert_eq!(store.get_undo(&hash).unwrap(), Some(undo.clone()));
+        }
+
+        let key = read_xor_key(&directory.path().join("xor.dat")).unwrap();
+        assert_eq!(
+            std::fs::metadata(directory.path().join("xor.dat"))
+                .unwrap()
+                .len(),
+            XOR_KEY_SIZE as u64
+        );
+        let mut raw = std::fs::read(directory.path().join("blocks.dat")).unwrap();
+        key.apply(&mut raw, 0);
+        let mut expected = (serialize(&block).len() as u32).to_le_bytes().to_vec();
+        expected.extend_from_slice(&serialize(&block));
+        assert_eq!(raw, expected);
+
+        std::fs::write(directory.path().join("blocks.index"), b"corrupt").unwrap();
+        std::fs::write(directory.path().join("undo.index"), b"corrupt").unwrap();
+        let mut reopened = BlockStore::open_with_xor(directory.path(), true).unwrap();
+        assert_eq!(reopened.get(&hash).unwrap(), Some(block));
+        assert_eq!(reopened.get_undo(&hash).unwrap(), Some(undo));
+    }
+
+    #[test]
+    fn cannot_disable_a_nonzero_xor_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let _store = BlockStore::open_with_xor(directory.path(), true).unwrap();
+        let key = read_xor_key(&directory.path().join("xor.dat")).unwrap();
+        if key.0.iter().any(|byte| *byte != 0) {
+            assert!(BlockStore::open_with_xor(directory.path(), false).is_err());
+        }
     }
 
     #[test]
@@ -1501,7 +1640,7 @@ mod tests {
         let first_hash = first.block_hash();
         let second_hash = second.block_hash();
         let retained = HashSet::from([second_hash]);
-        let mut store = BlockStore::open(directory.path()).unwrap();
+        let mut store = BlockStore::open_with_xor(directory.path(), true).unwrap();
         store.insert(&first).unwrap();
         store.insert(&second).unwrap();
         store.insert_undo(first_hash, &[Vec::new()]).unwrap();

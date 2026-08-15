@@ -507,6 +507,7 @@ struct BackgroundValidation {
 struct BackgroundValidationJob {
     data_dir: PathBuf,
     blocks_dir: PathBuf,
+    blocks_xor: bool,
     network: Network,
     signet_challenge: Option<Vec<u8>>,
     active_chain: Vec<BlockHash>,
@@ -615,6 +616,7 @@ pub struct ChainState {
     pub network: Network,
     data_dir: PathBuf,
     blocks_dir: PathBuf,
+    blocks_xor: bool,
     minimum_chain_work_override: Option<Work>,
     assume_valid_block: Option<BlockHash>,
     max_tip_age_secs: u64,
@@ -802,11 +804,42 @@ impl ChainState {
         minimum_chain_work_override: Option<Work>,
         assume_valid_block: Option<BlockHash>,
     ) -> Result<Self> {
+        Self::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor(
+            network,
+            data_dir,
+            blocks_dir,
+            signet_challenge,
+            blockfilter_index_enabled,
+            reindex,
+            reindex_chainstate,
+            tx_index_all_enabled,
+            minimum_chain_work_override,
+            assume_valid_block,
+            false,
+        )
+    }
+
+    /// Open chainstate with Core-style chainwork, assume-valid, and blocksdir
+    /// XOR configuration.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        blocks_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
+        reindex: bool,
+        reindex_chainstate: bool,
+        tx_index_all_enabled: bool,
+        minimum_chain_work_override: Option<Work>,
+        assume_valid_block: Option<BlockHash>,
+        blocks_xor: bool,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_owned();
         let blocks_dir = blocks_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
-        let mut store = BlockStore::open(&blocks_dir)?;
+        let mut store = BlockStore::open_with_xor(&blocks_dir, blocks_xor)?;
         let filter_store = FilterStore::open(data_dir.join("filters"))?;
         let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
         let genesis = genesis_block(network);
@@ -913,6 +946,7 @@ impl ChainState {
             network,
             data_dir,
             blocks_dir,
+            blocks_xor,
             minimum_chain_work_override,
             assume_valid_block,
             max_tip_age_secs: MAX_TIP_AGE_SECS,
@@ -5435,6 +5469,7 @@ impl ChainState {
         let block_index = self.block_index.clone();
         let data_dir = self.data_dir.clone();
         let blocks_dir = self.blocks_dir.clone();
+        let blocks_xor = self.blocks_xor;
         let network = self.network;
         let signet_challenge = self.signet_challenge.clone();
         let script_check_workers = self.script_check_workers;
@@ -5452,6 +5487,7 @@ impl ChainState {
         let job = BackgroundValidationJob {
             data_dir,
             blocks_dir,
+            blocks_xor,
             network,
             signet_challenge,
             active_chain,
@@ -5736,16 +5772,18 @@ fn persist_assumeutxo_checkpoint(data_dir: &Path, checkpoint: &AssumeUtxoCheckpo
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn open_background_replay_state(
     network: Network,
     data_dir: &Path,
     blocks_dir: &Path,
+    blocks_xor: bool,
     signet_challenge: Option<Vec<u8>>,
     active_chain: &[BlockHash],
     block_index: &HashMap<BlockHash, BlockNode>,
     script_check_workers: usize,
 ) -> Result<ChainState> {
-    let store = BlockStore::open_read_only(blocks_dir)?;
+    let store = BlockStore::open_read_only_with_xor(blocks_dir, blocks_xor)?;
     let filter_store = FilterStore::open(data_dir.join("filters"))?;
     let chainstate_store = ChainstateStore::open(data_dir.join("chainstate"))?;
     let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
@@ -5762,6 +5800,7 @@ fn open_background_replay_state(
         network,
         data_dir: data_dir.to_owned(),
         blocks_dir: blocks_dir.to_owned(),
+        blocks_xor,
         minimum_chain_work_override: None,
         assume_valid_block: None,
         max_tip_age_secs: MAX_TIP_AGE_SECS,
@@ -5811,6 +5850,7 @@ fn run_background_validation(
     let BackgroundValidationJob {
         data_dir,
         blocks_dir,
+        blocks_xor,
         network,
         signet_challenge,
         active_chain,
@@ -5852,6 +5892,7 @@ fn run_background_validation(
             network,
             &data_dir,
             &blocks_dir,
+            blocks_xor,
             signet_challenge,
             &active_chain,
             &block_index,

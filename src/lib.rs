@@ -812,7 +812,7 @@ impl Node {
             .clone()
             .unwrap_or_else(|| config.datadir.join("blocks"));
         let mut chain =
-            ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid(
+            ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor(
                 config.network,
                 &config.datadir,
                 blocks_dir,
@@ -823,7 +823,8 @@ impl Node {
                 config.txindex,
                 config.minimum_chain_work,
                 config.assume_valid,
-        )?;
+                config.blocks_xor,
+            )?;
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
         chain.configure_pruning(config.prune)?;
@@ -3732,6 +3733,7 @@ mod tests {
             network: bitcoin::Network::Regtest,
             datadir: datadir.to_owned(),
             blocks_dir: None,
+            blocks_xor: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -4116,6 +4118,7 @@ mod tests {
         .unwrap();
         let _node = Node::open(Config::from_args(args).unwrap()).unwrap();
         assert!(directory.path().join("external-blocks/blocks.dat").exists());
+        assert!(directory.path().join("external-blocks/xor.dat").exists());
         assert!(directory.path().join("chainstate.bin").exists());
         assert!(!directory.path().join("blocks/blocks.dat").exists());
     }

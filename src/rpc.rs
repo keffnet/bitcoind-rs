@@ -6497,6 +6497,170 @@ fn inferred_script_descriptor(node: &Arc<Node>, script: &bitcoin::Script) -> Str
     inferred_script_descriptor_for_network(node.config.network, script)
 }
 
+fn descriptor_origin_path(
+    origin: &(bitcoin::bip32::Fingerprint, bitcoin::bip32::DerivationPath),
+) -> String {
+    let path = origin
+        .1
+        .into_iter()
+        .map(|child| format!("{child:#}"))
+        .collect::<Vec<_>>()
+        .join("/");
+    if path.is_empty() {
+        format!("[{}]", origin.0)
+    } else {
+        format!("[{}/{}]", origin.0, path)
+    }
+}
+
+fn descriptor_public_key_string(
+    public_key: bitcoin::PublicKey,
+    origin: Option<&(bitcoin::bip32::Fingerprint, bitcoin::bip32::DerivationPath)>,
+) -> String {
+    origin.map_or_else(
+        || public_key.to_string(),
+        |origin| format!("{}{}", descriptor_origin_path(origin), public_key),
+    )
+}
+
+fn descriptor_xonly_key_string(
+    public_key: bitcoin::XOnlyPublicKey,
+    origin: Option<&(bitcoin::bip32::Fingerprint, bitcoin::bip32::DerivationPath)>,
+) -> String {
+    origin.map_or_else(
+        || public_key.to_string(),
+        |origin| format!("{}{}", descriptor_origin_path(origin), public_key),
+    )
+}
+
+fn candidate_public_key_string(
+    candidate: &DescriptorCandidate,
+    public_key: bitcoin::PublicKey,
+) -> String {
+    candidate
+        .keys
+        .iter()
+        .find(|key| key.public_key == Some(public_key))
+        .map_or_else(
+            || public_key.to_string(),
+            |key| descriptor_public_key_string(public_key, key.origin.as_ref()),
+        )
+}
+
+fn candidate_xonly_key_string(
+    candidate: &DescriptorCandidate,
+    public_key: bitcoin::XOnlyPublicKey,
+) -> String {
+    candidate
+        .keys
+        .iter()
+        .find(|key| {
+            key.public_key
+                .is_some_and(|key| bitcoin::XOnlyPublicKey::from(key) == public_key)
+        })
+        .map_or_else(
+            || public_key.to_string(),
+            |key| descriptor_xonly_key_string(public_key, key.origin.as_ref()),
+        )
+}
+
+fn inferred_multisig_descriptor_body(
+    script: &bitcoin::Script,
+    candidate: &DescriptorCandidate,
+) -> Option<String> {
+    let (required, public_keys) = multisig_script_keys(script)?;
+    let keys = public_keys
+        .into_iter()
+        .map(|public_key| candidate_public_key_string(candidate, public_key))
+        .collect::<Vec<_>>();
+    Some(format!("multi({required},{})", keys.join(",")))
+}
+
+fn inferred_descriptor_body_for_candidate(
+    network: Network,
+    script: &bitcoin::Script,
+    candidate: &DescriptorCandidate,
+    top_level: bool,
+) -> String {
+    if script.is_p2sh()
+        && let Some(redeem_script) = candidate.redeem_script.as_deref()
+    {
+        return format!(
+            "sh({})",
+            inferred_descriptor_body_for_candidate(network, redeem_script, candidate, false,)
+        );
+    }
+    if script.is_p2wsh()
+        && let Some(witness_script) = candidate.witness_script.as_deref()
+    {
+        return format!(
+            "wsh({})",
+            inferred_descriptor_body_for_candidate(network, witness_script, candidate, false,)
+        );
+    }
+    if let Some(public_key) = script.p2pk_public_key() {
+        return format!("pk({})", candidate_public_key_string(candidate, public_key));
+    }
+    if script.is_p2pkh()
+        && let Some(public_key) = candidate.keys.iter().find_map(|key| {
+            key.public_key.filter(|public_key| {
+                Address::p2pkh(*public_key, Network::Bitcoin)
+                    .script_pubkey()
+                    .as_script()
+                    == script
+            })
+        })
+    {
+        return format!(
+            "pkh({})",
+            candidate_public_key_string(candidate, public_key)
+        );
+    }
+    if script.is_p2wpkh()
+        && let Some(public_key) = candidate.keys.iter().find_map(|key| {
+            key.public_key.filter(|public_key| {
+                bitcoin::CompressedPublicKey::try_from(*public_key).is_ok_and(|compressed| {
+                    Address::p2wpkh(&compressed, Network::Bitcoin)
+                        .script_pubkey()
+                        .as_script()
+                        == script
+                })
+            })
+        })
+    {
+        return format!(
+            "wpkh({})",
+            candidate_public_key_string(candidate, public_key)
+        );
+    }
+    if let Some(multisig) = inferred_multisig_descriptor_body(script, candidate) {
+        return multisig;
+    }
+    if script.is_p2tr()
+        && let Some(bytes) = script.as_bytes().get(2..)
+        && let Ok(public_key) = bitcoin::XOnlyPublicKey::from_slice(bytes)
+    {
+        return format!(
+            "rawtr({})",
+            candidate_xonly_key_string(candidate, public_key)
+        );
+    }
+    if top_level && let Ok(address) = Address::from_script(script, network) {
+        return format!("addr({address})");
+    }
+    format!("raw({})", hex::encode(script.as_bytes()))
+}
+
+fn inferred_descriptor_for_candidate(node: &Arc<Node>, candidate: &DescriptorCandidate) -> String {
+    let body = inferred_descriptor_body_for_candidate(
+        node.config.network,
+        &candidate.script_pubkey,
+        candidate,
+        true,
+    );
+    descriptor_with_checksum(&body)
+}
+
 fn decoded_script_json(node: &Arc<Node>, script: &bitcoin::Script, include_hex: bool) -> Value {
     let script_type = script_type_for_decode(script);
     let mut result = json!({
@@ -8115,7 +8279,12 @@ fn descriptor_candidates(
     } else {
         descriptor
     };
-    descriptor_candidates_inner(node, descriptor, range)
+    let multipath_payloads = expand_descriptor_multipath(descriptor)?;
+    multipath_payloads
+        .iter()
+        .map(|payload| descriptor_candidates_inner(node, payload, range))
+        .collect::<Result<Vec<Vec<_>>>>()
+        .map(|candidates| candidates.into_iter().flatten().collect())
 }
 
 fn miniscript_taproot_candidates(
@@ -8736,6 +8905,17 @@ fn descriptor_derived_key(
     public_key: bitcoin::PublicKey,
     origin: Option<(bitcoin::bip32::Fingerprint, bitcoin::bip32::DerivationPath)>,
 ) -> Result<DescriptorDerivedKey> {
+    let origin = origin.or_else(|| match key {
+        DescriptorKey::Xpriv(xpriv) => Some((
+            xpriv.fingerprint(&Secp256k1::new()),
+            bitcoin::bip32::DerivationPath::default(),
+        )),
+        DescriptorKey::Xpub(xpub) => Some((
+            xpub.fingerprint(),
+            bitcoin::bip32::DerivationPath::default(),
+        )),
+        DescriptorKey::PublicKey(_) | DescriptorKey::XOnlyPublicKey(_) => None,
+    });
     let private_key = if let DescriptorKey::Xpriv(xpriv) = key {
         let mut derivation = path.clone();
         if let Some(index) = index {
@@ -11856,8 +12036,11 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .to_owned()
                 };
                 let range = scan_descriptor_range(object, &descriptor)?;
-                for script in expand_descriptor_scripts(node, &descriptor, range)? {
-                    descriptors.push((descriptor.clone(), script));
+                for candidate in descriptor_candidates(node, &descriptor, range)? {
+                    descriptors.push((
+                        candidate.script_pubkey.clone(),
+                        inferred_descriptor_for_candidate(node, &candidate),
+                    ));
                 }
             }
             let chain = node.chain.read();
@@ -11882,9 +12065,9 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .min(100)
                 };
                 node.txout_scan.progress.store(progress, Ordering::Release);
-                let Some((_, _)) = descriptors
+                let Some((_, descriptor)) = descriptors
                     .iter()
-                    .find(|(_, script)| *script == entry.output.script_pubkey)
+                    .find(|(script, _)| *script == entry.output.script_pubkey)
                 else {
                     continue;
                 };
@@ -11893,7 +12076,7 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     "txid": outpoint.txid.to_string(),
                     "vout": outpoint.vout,
                     "scriptPubKey": hex::encode(entry.output.script_pubkey.as_bytes()),
-                    "desc": inferred_script_descriptor(node, &entry.output.script_pubkey),
+                    "desc": descriptor,
                     "amount": sat_to_btc(entry.output.value.to_sat()),
                     "coinbase": entry.coinbase,
                     "height": entry.height,
@@ -19329,6 +19512,12 @@ mod tests {
         assert_eq!(ranged_result["success"], true);
         assert_eq!(ranged_result["txouts"], 2);
         assert_eq!(ranged_result["unspents"][0]["height"], 2);
+        assert_eq!(
+            ranged_result["unspents"][0]["desc"],
+            descriptor_with_checksum(
+                "wpkh([3442193e/0/0]02756de182c5dd4b717ea87e693006da62dbb3cddaa4a5cad2ed1f5bbab755f0f5)"
+            )
+        );
     }
 
     #[test]

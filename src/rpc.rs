@@ -1663,6 +1663,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         | "getchainstates"
         | "getchaintips"
         | "getnetworkinfo"
+        | "getgeneralinfo"
         | "getpeerinfo"
         | "getnettotals"
         | "getaddrmaninfo"
@@ -2108,6 +2109,19 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "getrpcinfo" => Ok(json!({
             "active_commands": node.active_rpc_commands(),
             "logpath": node.config.debug_log_path.to_string_lossy(),
+        })),
+        "getgeneralinfo" => Ok(json!({
+            "clientversion": "31.1.0",
+            "useragent": "/bitcoind-rs:0.1.0/",
+            "datadir": node.config.datadir.to_string_lossy(),
+            "blocksdir": node
+                .config
+                .blocks_dir
+                .clone()
+                .unwrap_or_else(|| node.config.datadir.join("blocks"))
+                .to_string_lossy(),
+            "startuptime": crate::time::unix_time()
+                .saturating_sub(node.started_at.elapsed().as_secs()),
         })),
         "help" => Ok(json!(rpc_help(method_params_string(params)))),
         "estimatesmartfee" => estimate_smart_fee(node, params),
@@ -12200,6 +12214,7 @@ fn rpc_help(method: &str) -> String {
         "getchainstates",
         "getchaintips",
         "getnetworkinfo",
+        "getgeneralinfo",
         "getpeerinfo",
         "getnettotals",
         "getnodeaddresses",
@@ -13949,6 +13964,18 @@ mod tests {
             dispatch_method(&node, "echoipc", &json!(["hello"])).unwrap(),
             json!("hello")
         );
+        let general = dispatch_method(&node, "getgeneralinfo", &json!([])).unwrap();
+        assert_eq!(general["clientversion"], json!("31.1.0"));
+        assert_eq!(general["useragent"], json!("/bitcoind-rs:0.1.0/"));
+        assert_eq!(
+            general["datadir"],
+            json!(directory.path().to_string_lossy())
+        );
+        assert_eq!(
+            general["blocksdir"],
+            json!(directory.path().join("blocks").to_string_lossy())
+        );
+        assert!(general["startuptime"].as_u64().is_some());
         assert!(
             dispatch_method(&node, "verifychain", &json!([]))
                 .unwrap()

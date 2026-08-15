@@ -605,6 +605,16 @@ pub struct Args {
     )]
     pub blocks_xor: bool,
 
+    /// Capture decoded P2P application messages in Core's debug format.
+    #[arg(
+        long = "capturemessages",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub capture_messages: bool,
+
     #[arg(long = "conf", value_name = "FILE")]
     pub config_file: Option<PathBuf>,
 
@@ -1400,6 +1410,7 @@ pub struct Config {
     pub datadir: PathBuf,
     pub(crate) blocks_dir: Option<PathBuf>,
     pub blocks_xor: bool,
+    pub capture_messages: bool,
     pub(crate) minimum_chain_work: Option<Work>,
     pub(crate) assume_valid: Option<BlockHash>,
     pub(crate) check_blocks: Option<u32>,
@@ -1849,6 +1860,7 @@ impl Config {
             datadir: args.datadir,
             blocks_dir: Some(blocks_dir),
             blocks_xor: args.blocks_xor,
+            capture_messages: args.capture_messages,
             minimum_chain_work,
             assume_valid,
             check_blocks: args.check_blocks,
@@ -2401,6 +2413,11 @@ mod tests {
         assert!(Config::from_args(args).unwrap().blocks_xor);
         let args = Args::try_parse_from(["bitcoind-rs", "--blocksxor=false"]).unwrap();
         assert!(!Config::from_args(args).unwrap().blocks_xor);
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--capturemessages"]).unwrap();
+        assert!(Config::from_args(args).unwrap().capture_messages);
+        let args = Args::try_parse_from(["bitcoind-rs", "--capturemessages=false"]).unwrap();
+        assert!(!Config::from_args(args).unwrap().capture_messages);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

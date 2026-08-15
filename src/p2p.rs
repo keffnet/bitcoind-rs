@@ -2686,6 +2686,7 @@ async fn serve_peer_loop(
             message = reader.read_message(node.config.network) => {
                 let (message, bytes) = message?;
                 node.record_bytes_received(peer_id, bytes, message.command());
+                node.capture_message(peer_id, true, &message)?;
                 message
             },
             _ = ping_interval.tick(), if version_received && verack_received && !*peer_state.private_broadcast_peer.lock() => {
@@ -4661,6 +4662,7 @@ async fn send_message(
             bytes
         }
     };
+    node.capture_message(peer_id, false, message)?;
     node.record_bytes_sent(peer_id, bytes, message.command());
     Ok(())
 }
@@ -5168,6 +5170,7 @@ mod tests {
             datadir: datadir.to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -5817,6 +5820,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -6005,6 +6009,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -6484,6 +6489,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -6656,6 +6662,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -6834,6 +6841,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7102,6 +7110,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7246,6 +7255,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7372,6 +7382,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7514,6 +7525,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -7694,6 +7706,7 @@ mod tests {
             datadir: directory.path().to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,

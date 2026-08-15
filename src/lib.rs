@@ -19,6 +19,7 @@ pub mod zmq;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::process::Command;
@@ -1951,6 +1952,63 @@ impl Node {
         }
     }
 
+    /// Append a decoded application-layer P2P message in Core's
+    /// `-capturemessages` format. The transport envelope is deliberately not
+    /// included, so v1 and BIP324 captures have the same record structure.
+    pub(crate) fn capture_message(
+        &self,
+        peer_id: usize,
+        incoming: bool,
+        message: &wire::Message,
+    ) -> Result<()> {
+        if !self.config.capture_messages {
+            return Ok(());
+        }
+        let endpoint = self
+            .peers
+            .read()
+            .get(&peer_id)
+            .map(|peer| peer.endpoint.clone());
+        let Some(endpoint) = endpoint else {
+            return Ok(());
+        };
+        let command = message.command();
+        let command_bytes = command.as_bytes();
+        if command_bytes.len() > 12 {
+            bail!("P2P command exceeds capture header width: {command}");
+        }
+        let payload = wire::encode_message_payload(message)?;
+        let payload_len = u32::try_from(payload.len())
+            .context("P2P capture payload exceeds the on-disk length field")?;
+        let directory = self
+            .config
+            .datadir
+            .join("message_capture")
+            .join(endpoint.to_string().replace(':', "_"));
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("creating P2P capture directory {}", directory.display()))?;
+        let path = directory.join(if incoming {
+            "msgs_recv.dat"
+        } else {
+            "msgs_sent.dat"
+        });
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening P2P capture file {}", path.display()))?;
+        let timestamp =
+            u64::try_from(time::unix_time_millis().saturating_mul(1_000)).unwrap_or(u64::MAX);
+        file.write_all(&timestamp.to_le_bytes())?;
+        let mut command_header = [0u8; 12];
+        command_header[..command_bytes.len()].copy_from_slice(command_bytes);
+        file.write_all(&command_header)?;
+        file.write_all(&payload_len.to_le_bytes())?;
+        file.write_all(&payload)?;
+        file.flush()?;
+        Ok(())
+    }
+
     pub(crate) fn record_bytes_received(&self, peer_id: usize, bytes: usize, command: &str) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.total_bytes_received
@@ -3753,6 +3811,7 @@ mod tests {
             datadir: datadir.to_owned(),
             blocks_dir: None,
             blocks_xor: false,
+            capture_messages: false,
             minimum_chain_work: None,
             assume_valid: None,
             check_blocks: None,
@@ -3851,6 +3910,29 @@ mod tests {
         assert!(Node::open(test_config(directory.path())).is_err());
         drop(node);
         assert!(Node::open(test_config(directory.path())).is_ok());
+    }
+
+    #[test]
+    fn capture_messages_uses_core_record_framing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.capture_messages = true;
+        let node = Node::open(config).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        let message = wire::Message::Ping(42);
+        node.capture_message(1, false, &message).unwrap();
+
+        let path = directory
+            .path()
+            .join("message_capture/192.0.2.1_18444/msgs_sent.dat");
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(bytes.len(), 8 + 12 + 4 + 8);
+        assert_ne!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 0);
+        assert_eq!(&bytes[8..12], b"ping");
+        assert!(bytes[12..20].iter().all(|byte| *byte == 0));
+        assert_eq!(u32::from_le_bytes(bytes[20..24].try_into().unwrap()), 8);
+        assert_eq!(u64::from_le_bytes(bytes[24..32].try_into().unwrap()), 42);
     }
 
     #[test]

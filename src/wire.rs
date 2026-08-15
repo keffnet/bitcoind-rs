@@ -481,6 +481,14 @@ fn encode_payload(message: &Message) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Encode the application payload used by the legacy Bitcoin message frame.
+///
+/// This is also the payload captured by Core's `-capturemessages` debug
+/// facility. Transport-specific headers are intentionally excluded.
+pub(crate) fn encode_message_payload(message: &Message) -> Result<Vec<u8>> {
+    encode_payload(message)
+}
+
 /// Encode the application-layer contents used inside a BIP324 packet.
 ///
 /// Unlike v1 framing, the network magic, length, checksum, and 12-byte

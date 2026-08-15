@@ -737,6 +737,15 @@ pub struct Args {
     #[arg(long = "noconf", default_value_t = false)]
     pub no_config: bool,
 
+    #[arg(
+        long = "allowignoredconf",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub allow_ignored_conf: bool,
+
     /// Path to the runtime settings JSON file.
     #[arg(long = "settings", value_name = "FILE")]
     pub settings_file: Option<PathBuf>,
@@ -1355,6 +1364,31 @@ impl Args {
                     config_path.display()
                 );
             }
+        }
+
+        let base_config_path = datadir.join("bitcoin.conf");
+        let base_config_matches_selected = config_path == base_config_path
+            || fs::canonicalize(&config_path)
+                .ok()
+                .zip(fs::canonicalize(&base_config_path).ok())
+                .is_some_and(|(selected, base)| selected == base);
+        let allow_ignored_conf = raw_bool_option(&raw, "allowignoredconf")
+            || entries
+                .iter()
+                .rev()
+                .find(|entry| entry.key == "allowignoredconf")
+                .is_some_and(|entry| is_true(&entry.value));
+        if !no_config
+            && explicit_config
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            && base_config_path.exists()
+            && !base_config_matches_selected
+            && !allow_ignored_conf
+        {
+            bail!(
+                "data directory contains bitcoin.conf, but a different configuration file is selected; use --allowignoredconf=1 to ignore it"
+            );
         }
 
         let cli_network = raw_option_value(&raw, "network");
@@ -2608,12 +2642,24 @@ mod tests {
 
         let alias_config = directory.path().join("aliases.conf");
         fs::write(&alias_config, "regtest=1\n[regtest]\nserver=false\n").unwrap();
+        let error = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--conf",
+            alias_config.to_str().unwrap(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("allowignoredconf"));
+
         let args = Args::parse_from_with_config([
             "bitcoind-rs",
             "--datadir",
             directory.path().to_str().unwrap(),
             "--conf",
             alias_config.to_str().unwrap(),
+            "--allowignoredconf",
         ])
         .unwrap();
         assert_eq!(Config::from_args(args).unwrap().network, Network::Regtest);
@@ -2624,6 +2670,7 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--conf",
             alias_config.to_str().unwrap(),
+            "--allowignoredconf",
             "--network=bitcoin",
         ])
         .unwrap();
@@ -2635,6 +2682,7 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--conf",
             alias_config.to_str().unwrap(),
+            "--allowignoredconf",
             "--network=regtest",
             "--network=testnet",
         ])
@@ -2647,6 +2695,7 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--conf",
             alias_config.to_str().unwrap(),
+            "--allowignoredconf",
             "--regtest=false",
         ])
         .unwrap();
@@ -2660,6 +2709,7 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--conf",
             invalid_config.to_str().unwrap(),
+            "--allowignoredconf",
         ])
         .unwrap_err()
         .to_string();
@@ -2673,6 +2723,7 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--conf",
             invalid_config.to_str().unwrap(),
+            "--allowignoredconf",
         ])
         .unwrap_err()
         .to_string();

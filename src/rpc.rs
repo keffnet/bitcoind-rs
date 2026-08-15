@@ -42,7 +42,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio::task::JoinSet;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::address::NetworkEndpoint;
 use crate::chain;
@@ -151,10 +151,16 @@ impl RpcServer {
         ));
         let request_timeout = Duration::from_secs(self.node.config.rpc_server_timeout_secs);
         let mut listeners = JoinSet::new();
+        let mut bound = 0usize;
         for address in binds {
-            let listener = TcpListener::bind(address)
-                .await
-                .with_context(|| format!("binding RPC listener {address}"))?;
+            let listener = match TcpListener::bind(address).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    warn!(%address, %error, "unable to bind RPC listener; continuing");
+                    continue;
+                }
+            };
+            bound += 1;
             let node = self.node.clone();
             let work_queue = work_queue.clone();
             listeners.spawn(async move {
@@ -173,6 +179,9 @@ impl RpcServer {
                 #[allow(unreachable_code)]
                 Ok::<(), anyhow::Error>(())
             });
+        }
+        if bound == 0 {
+            bail!("unable to bind any RPC listener");
         }
         while let Some(result) = listeners.join_next().await {
             result??;

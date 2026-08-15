@@ -491,6 +491,7 @@ struct PrivateBroadcastEntry {
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum NodeWarningKind {
+    UnknownRulesActive,
     ClockOutOfSync,
     FatalInternal,
 }
@@ -843,6 +844,7 @@ pub struct Node {
     last_mining_block: parking_lot::RwLock<Option<(u64, usize)>>,
     time_offset_samples: parking_lot::RwLock<VecDeque<i64>>,
     warnings: parking_lot::RwLock<Vec<NodeWarning>>,
+    versionbits_warning_scanned: AtomicBool,
     pub started_at: Instant,
     shutdown: Notify,
 }
@@ -1136,6 +1138,7 @@ impl Node {
             last_mining_block: parking_lot::RwLock::new(None),
             time_offset_samples: parking_lot::RwLock::new(VecDeque::new()),
             warnings: parking_lot::RwLock::new(Vec::new()),
+            versionbits_warning_scanned: AtomicBool::new(false),
             started_at: Instant::now(),
             shutdown: Notify::new(),
         });
@@ -1143,6 +1146,7 @@ impl Node {
             node.check_addrman_consistency()
                 .context("startup address-manager consistency check failed")?;
         }
+        node.refresh_versionbits_warning();
         node.log_asmap_health();
         if node.config.stop_after_block_import {
             node.request_shutdown();
@@ -1183,6 +1187,7 @@ impl Node {
             let hash = tip.hash.to_string();
             run_notify_command(self.config.block_notify.as_deref(), Some(&hash));
         }
+        self.refresh_versionbits_warning();
         self.maybe_check_block_index();
         Ok(tip)
     }
@@ -1928,6 +1933,7 @@ impl Node {
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
+        self.refresh_versionbits_warning();
         self.maybe_check_block_index();
         Ok(tip)
     }
@@ -1956,6 +1962,7 @@ impl Node {
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
+        self.refresh_versionbits_warning();
         self.maybe_check_block_index();
         Ok(tip)
     }
@@ -1984,6 +1991,7 @@ impl Node {
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
+        self.refresh_versionbits_warning();
         self.maybe_check_block_index();
         Ok(tip)
     }
@@ -2820,6 +2828,44 @@ impl Node {
             );
         } else {
             self.unset_warning(NodeWarningKind::ClockOutOfSync);
+        }
+    }
+
+    fn refresh_versionbits_warning(&self) {
+        let unknown_bit = {
+            if self
+                .warnings
+                .read()
+                .iter()
+                .any(|warning| warning.kind == NodeWarningKind::UnknownRulesActive)
+            {
+                return;
+            }
+            let chain = self.chain.read();
+            if chain.is_initial_block_download() {
+                return;
+            }
+            let headers = chain.active_headers();
+            let period =
+                usize::try_from(validation::bip9_deployments(self.config.network)[0].period)
+                    .unwrap_or(1)
+                    .max(1);
+            let first_scan = !self
+                .versionbits_warning_scanned
+                .swap(true, Ordering::AcqRel);
+            if first_scan {
+                validation::unknown_versionbits_active(headers, self.config.network)
+            } else if headers.len() % period == 0 {
+                validation::unknown_versionbits_active_at_boundary(headers, self.config.network)
+            } else {
+                None
+            }
+        };
+        if let Some(bit) = unknown_bit {
+            self.set_warning(
+                NodeWarningKind::UnknownRulesActive,
+                format!("Unknown new rules activated (versionbit {bit})"),
+            );
         }
     }
 
@@ -4916,6 +4962,42 @@ mod tests {
 
         node.unset_warning(NodeWarningKind::FatalInternal);
         assert!(node.warning_messages().is_empty());
+    }
+
+    #[test]
+    fn node_surfaces_an_unknown_versionbits_activation_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.max_tip_age_secs = u64::MAX;
+        let node = Node::open(config).unwrap();
+
+        for height in 1..=431 {
+            let previous = *node.chain.read().header(height - 1).unwrap();
+            let mut block = mine_test_block(&previous, height, height as u8);
+            let mut remine = false;
+            let subsidy = validation::block_subsidy_for_network(Network::Regtest, height);
+            if block.txdata[0].output[0].value.to_sat() != subsidy {
+                block.txdata[0].output[0].value = Amount::from_sat(subsidy);
+                block.header.merkle_root = block.compute_merkle_root().unwrap();
+                remine = true;
+            }
+            if (144..=251).contains(&height) {
+                block.header.version = BlockVersion::from_consensus(0x2000_0000 | (1 << 27));
+                remine = true;
+            }
+            if remine {
+                block.header.nonce = 0;
+                while !block.header.target().is_met_by(block.block_hash()) {
+                    block.header.nonce = block.header.nonce.wrapping_add(1);
+                }
+            }
+            node.connect_block(block).unwrap();
+        }
+
+        assert_eq!(
+            node.warning_messages(),
+            vec!["Unknown new rules activated (versionbit 27)".to_owned()]
+        );
     }
 
     #[test]

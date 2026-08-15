@@ -301,6 +301,134 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
     [testdummy, taproot]
 }
 
+/// Return the first unknown BIP9 version bit that has reached the active
+/// state on the supplied active chain.
+///
+/// Core runs the same threshold state machine for every version bit that is
+/// not currently assigned to a known deployment. An unknown bit is warned
+/// about only after it has met the network threshold for one complete period
+/// and then spent a complete period locked in. The headers slice is expected
+/// to start at the network genesis block and remain in height order.
+pub fn unknown_versionbits_active(
+    headers: &[bitcoin::block::Header],
+    network: Network,
+) -> Option<u8> {
+    const VERSIONBITS_TOP_MASK: u32 = 0xe000_0000;
+    const VERSIONBITS_TOP_BITS: u32 = 0x2000_0000;
+    const VERSIONBITS_NUM_BITS: u8 = 29;
+
+    if headers.is_empty() {
+        return None;
+    }
+
+    let [testdummy, taproot] = bip9_deployments(network);
+    let known_bits = (1u32 << testdummy.bit) | (1u32 << taproot.bit);
+    let period = usize::try_from(testdummy.period).ok()?;
+    let threshold = usize::try_from(testdummy.threshold).ok()?;
+    if period == 0 || threshold > period {
+        return None;
+    }
+    let min_warning_height = match network {
+        Network::Bitcoin => 483_840,
+        Network::Testnet => 836_640,
+        Network::Testnet4 | Network::Signet | Network::Regtest => 0,
+    };
+
+    // Every period starts with the state produced by the previous period.
+    // The first period is DEFINED, the first boundary moves it to STARTED,
+    // a successful signaling period moves it to LOCKED_IN, and the following
+    // boundary moves it to ACTIVE.
+    for bit in 0..VERSIONBITS_NUM_BITS {
+        if known_bits & (1u32 << bit) != 0 {
+            continue;
+        }
+
+        let mut state = 0u8; // 0=DEFINED, 1=STARTED, 2=LOCKED_IN, 3=ACTIVE
+        let complete_periods = headers.len() / period;
+        for period_index in 0..complete_periods {
+            let start = period_index * period;
+            let end = start + period;
+            match state {
+                0 => state = 1,
+                1 => {
+                    let count = headers[start..end]
+                        .iter()
+                        .enumerate()
+                        .filter(|(offset, header)| {
+                            let height = start + *offset;
+                            let version = header.version.to_consensus() as u32;
+                            height >= min_warning_height
+                                && version & VERSIONBITS_TOP_MASK == VERSIONBITS_TOP_BITS
+                                && version & (1u32 << bit) != 0
+                        })
+                        .count();
+                    if count >= threshold {
+                        state = 2;
+                    }
+                }
+                2 => state = 3,
+                _ => return Some(bit),
+            }
+            if state == 3 {
+                return Some(bit);
+            }
+        }
+    }
+    None
+}
+
+/// Check only the period immediately preceding a complete current period.
+/// Once the historical chain has been checked, this is sufficient to detect
+/// a newly active unknown bit without rescanning the entire chain on every
+/// period boundary.
+pub fn unknown_versionbits_active_at_boundary(
+    headers: &[bitcoin::block::Header],
+    network: Network,
+) -> Option<u8> {
+    const VERSIONBITS_TOP_MASK: u32 = 0xe000_0000;
+    const VERSIONBITS_TOP_BITS: u32 = 0x2000_0000;
+    const VERSIONBITS_NUM_BITS: u8 = 29;
+
+    let [testdummy, taproot] = bip9_deployments(network);
+    let known_bits = (1u32 << testdummy.bit) | (1u32 << taproot.bit);
+    let period = usize::try_from(testdummy.period).ok()?;
+    let threshold = usize::try_from(testdummy.threshold).ok()?;
+    if period == 0 || threshold > period || headers.len() < period * 3 {
+        return None;
+    }
+    if headers.len() % period != 0 {
+        return None;
+    }
+    let min_warning_height = match network {
+        Network::Bitcoin => 483_840,
+        Network::Testnet => 836_640,
+        Network::Testnet4 | Network::Signet | Network::Regtest => 0,
+    };
+    let start = headers.len() - period * 2;
+    let end = headers.len() - period;
+
+    for bit in 0..VERSIONBITS_NUM_BITS {
+        if known_bits & (1u32 << bit) != 0 {
+            continue;
+        }
+        let count = headers[start..end]
+            .iter()
+            .enumerate()
+            .filter(|(offset, header)| {
+                let height = start + *offset;
+                let version = header.version.to_consensus() as u32;
+                height >= min_warning_height
+                    && version & VERSIONBITS_TOP_MASK == VERSIONBITS_TOP_BITS
+                    && version & (1u32 << bit) != 0
+            })
+            .count();
+        if count >= threshold {
+            return Some(bit);
+        }
+    }
+    None
+}
+
 pub fn script_flags_for_block(network: Network, height: u32, block_time: u32) -> u32 {
     let _ = block_time;
     script_flags_for_block_with_hash(network, height, None)
@@ -1235,6 +1363,49 @@ mod tests {
                 required: 2
             })
         ));
+    }
+
+    #[test]
+    fn unknown_versionbits_require_lock_in_period_before_warning() {
+        let [deployment, _] = bip9_deployments(Network::Regtest);
+        let period = usize::try_from(deployment.period).unwrap();
+        let threshold = usize::try_from(deployment.threshold).unwrap();
+        let unknown_bit = 27u32;
+        let mut headers = Vec::with_capacity(period * 3);
+        for height in 0..period * 2 {
+            let signals = height >= period && height < period + threshold;
+            headers.push(Header {
+                version: BlockVersion::from_consensus(if signals {
+                    0x2000_0000 | (1 << unknown_bit)
+                } else {
+                    4
+                }),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: u32::try_from(height + 1).unwrap(),
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            });
+        }
+
+        assert_eq!(unknown_versionbits_active(&headers, Network::Regtest), None);
+
+        headers.extend((period * 2..period * 3).map(|height| Header {
+            version: BlockVersion::from_consensus(4),
+            prev_blockhash: BlockHash::all_zeros(),
+            merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+            time: u32::try_from(height + 1).unwrap(),
+            bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        }));
+        assert_eq!(
+            unknown_versionbits_active(&headers, Network::Regtest),
+            Some(unknown_bit as u8)
+        );
+        assert_eq!(
+            unknown_versionbits_active_at_boundary(&headers, Network::Regtest),
+            Some(unknown_bit as u8)
+        );
     }
 
     #[test]

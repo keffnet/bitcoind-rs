@@ -548,6 +548,25 @@ mod tests {
                 .write_all(format!("STREAM STATUS RESULT=OK\n{peer_destination_b64}\n").as_bytes())
                 .await
                 .unwrap();
+
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = tokio::io::BufReader::new(stream);
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(line.trim_end(), "HELLO VERSION MIN=3.1 MAX=3.1");
+            reader
+                .get_mut()
+                .write_all(b"HELLO REPLY RESULT=OK VERSION=3.1\n")
+                .await
+                .unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            assert!(line.contains(&format!("DESTINATION={private_key_b64}")));
+            reader
+                .get_mut()
+                .write_all(b"SESSION STATUS RESULT=OK\n")
+                .await
+                .unwrap();
         });
 
         let datadir = tempfile::tempdir()?;
@@ -564,6 +583,14 @@ mod tests {
         assert_eq!(peer.port(), I2P_SAM_PORT);
         assert_eq!(peer.network_name(), "i2p");
         stream.shutdown().await?;
+        drop(sam);
+        let restarted = I2pSam::new(
+            address,
+            datadir.path().to_owned(),
+            Duration::from_secs(1),
+            true,
+        );
+        assert_eq!(restarted.local_endpoint().await?, local);
         server.await.unwrap();
         Ok(())
     }

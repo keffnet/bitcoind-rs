@@ -41,6 +41,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio::task::JoinSet;
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::address::NetworkEndpoint;
@@ -10304,6 +10305,13 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
     if let Some(longpoll_id) = longpoll_id {
         let mut chain_events = node.subscribe_chain();
         let mut mempool_events = node.subscribe_mempool();
+        // Core wakes immediately for a new best tip, but polls the mempool
+        // transaction counter after one minute and then every ten seconds.
+        // Keep the timer running across mempool notifications so a burst of
+        // transactions does not turn longpoll into a busy notification loop.
+        let check_interval = Duration::from_secs(60);
+        let check_timer = sleep(check_interval);
+        tokio::pin!(check_timer);
         loop {
             if current_block_template_longpoll_id(node) != longpoll_id {
                 break;
@@ -10314,8 +10322,16 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 event = mempool_events.recv() => match event {
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
                     Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = &mut check_timer => {
+                    if current_block_template_longpoll_id(node) != longpoll_id {
+                        break;
+                    }
+                    check_timer
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + Duration::from_secs(10));
                 },
             }
         }

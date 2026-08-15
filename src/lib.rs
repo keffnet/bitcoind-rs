@@ -71,6 +71,27 @@ fn expand_notify_command(command: &str, argument: Option<&str>) -> String {
     command.replace("%s", argument.unwrap_or_default())
 }
 
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut interrupt = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+        let mut terminate =
+            signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+        tokio::select! {
+            _ = interrupt.recv() => Ok(()),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .context("waiting for shutdown signal")
+    }
+}
+
 fn run_notify_command(command: Option<&str>, argument: Option<&str>) {
     let Some(command) = command else {
         return;
@@ -3517,7 +3538,7 @@ impl Node {
             result = &mut zmq_task => result
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result),
-            result = tokio::signal::ctrl_c() => result.map_err(anyhow::Error::from),
+            result = wait_for_shutdown_signal() => result,
             _ = self.shutdown.notified() => Ok(()),
         };
 

@@ -3045,7 +3045,22 @@ impl Node {
             self.persist_mempool()?;
         }
         self.persist_known_addresses()?;
+        self.remove_rpc_cookie();
         Ok(())
+    }
+
+    fn remove_rpc_cookie(&self) {
+        if self.rpc_cookie.is_none() {
+            return;
+        }
+        let Some(path) = self.config.rpc_cookie_path.as_deref() else {
+            return;
+        };
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(path = %path.display(), %error, "unable to remove RPC authentication cookie");
+        }
     }
 
     pub fn persist_mempool(&self) -> Result<()> {
@@ -3649,6 +3664,23 @@ mod tests {
                 mode
             );
         }
+    }
+
+    #[test]
+    fn generated_rpc_cookie_is_removed_on_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpccookiefile=auth/rpc.cookie",
+        ])
+        .unwrap();
+        let node = Node::open(Config::from_args(args).unwrap()).unwrap();
+        let path = directory.path().join("auth/rpc.cookie");
+        assert!(path.exists());
+        node.remove_rpc_cookie();
+        assert!(!path.exists());
     }
 
     #[test]

@@ -33,6 +33,7 @@ const LONG_BLOCK_PERIODS: usize = 42;
 const LONG_SCALE: u32 = 24;
 const LONG_DECAY: f64 = 0.99931;
 const MAX_TRACKED_CONFIRMS: u32 = 1_008;
+const OLDEST_ESTIMATE_HISTORY: u32 = 6 * MAX_TRACKED_CONFIRMS;
 
 const HALF_SUCCESS_PCT: f64 = 0.60;
 const SUCCESS_PCT: f64 = 0.85;
@@ -513,9 +514,14 @@ impl FeeEstimator {
         self.short = short;
         self.long = long;
         self.best_height = current_height;
-        self.first_recorded_height = value.first_recorded_height;
-        self.historical_first = value.historical_first;
-        self.historical_best = value.historical_best;
+        self.first_recorded_height = 0;
+        if value.historical_first <= value.historical_best
+            && value.historical_best <= value.best_height
+            && value.historical_best <= current_height
+        {
+            self.historical_first = value.historical_first;
+            self.historical_best = value.historical_best;
+        }
     }
 
     pub(crate) fn track_mempool_entry(
@@ -796,19 +802,41 @@ impl FeeEstimator {
         } else {
             self.best_height.saturating_sub(self.first_recorded_height)
         };
-        let historical_span = self.historical_best.saturating_sub(self.historical_first);
+        let historical_span = self.historical_block_span();
         self.long
             .max_confirms()
             .min(block_span.max(historical_span) / 2)
     }
 
+    fn historical_block_span(&self) -> u32 {
+        if self.historical_first == 0
+            || self.historical_best < self.historical_first
+            || self.best_height.saturating_sub(self.historical_best) > OLDEST_ESTIMATE_HISTORY
+        {
+            0
+        } else {
+            self.historical_best - self.historical_first
+        }
+    }
+
     pub(crate) fn flush(&mut self) -> Result<()> {
+        let block_span = if self.first_recorded_height == 0 {
+            0
+        } else {
+            self.best_height.saturating_sub(self.first_recorded_height)
+        };
+        let historical_span = self.historical_block_span();
+        let (historical_first, historical_best) = if block_span > historical_span / 2 {
+            (self.first_recorded_height, self.best_height)
+        } else {
+            (self.historical_first, self.historical_best)
+        };
         let persisted = PersistedEstimator {
             version: CURRENT_FILE_VERSION,
             best_height: self.best_height,
-            first_recorded_height: self.first_recorded_height,
-            historical_first: self.historical_first,
-            historical_best: self.historical_best,
+            first_recorded_height: 0,
+            historical_first,
+            historical_best,
             buckets: self.buckets.clone(),
             medium: self.medium.persisted(),
             short: self.short.persisted(),

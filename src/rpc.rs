@@ -3882,13 +3882,20 @@ fn bip9_deployment_json(
             0
         };
         bip9["bit"] = json!(deployment.bit);
-        bip9["statistics"] = json!({
+        let mut statistics = json!({
             "period": period,
             "elapsed": elapsed,
             "count": count,
-            "threshold": deployment.threshold,
-            "possible": count.saturating_add(period.saturating_sub(elapsed)) >= deployment.threshold,
         });
+        // Core reports threshold/possible only while signalling is still
+        // actionable. Once the deployment is locked in, its statistics keep
+        // the period counters but omit those two fields.
+        if state == Bip9State::Started {
+            statistics["threshold"] = json!(deployment.threshold);
+            statistics["possible"] =
+                json!(count.saturating_add(period.saturating_sub(elapsed)) >= deployment.threshold);
+        }
+        bip9["statistics"] = statistics;
         bip9["signalling"] = json!(signalling);
     }
     let mut result = json!({
@@ -17533,6 +17540,20 @@ mod tests {
             None,
         );
         assert_eq!(active, 0x2000_0000);
+
+        let locked_in_info =
+            bip9_deployment_json(&headers, u32::try_from(period * 2 - 1).unwrap(), deployment);
+        assert_eq!(locked_in_info["bip9"]["status"], json!("locked_in"));
+        assert!(
+            locked_in_info["bip9"]["statistics"]
+                .get("threshold")
+                .is_none()
+        );
+        assert!(
+            locked_in_info["bip9"]["statistics"]
+                .get("possible")
+                .is_none()
+        );
     }
 
     #[test]

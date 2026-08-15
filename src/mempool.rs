@@ -1070,6 +1070,43 @@ impl Mempool {
         let mut package_fee = 0i128;
         let mut package_vsize = 0u64;
         let allow_low_fee_parent = package_is_child_with_parents_tree(transactions);
+        let package_has_preexisting = transactions
+            .iter()
+            .any(|transaction| candidate.get(&transaction.compute_txid()).is_some());
+        let package_rbf =
+            transactions.len() == 2 && allow_low_fee_parent && !package_has_preexisting;
+        let mut conflicting_fee = 0i128;
+        if package_rbf {
+            let mut direct_conflicts = transactions
+                .iter()
+                .flat_map(|transaction| candidate.conflicts_for(transaction))
+                .collect::<Vec<_>>();
+            direct_conflicts.sort_by_key(ToString::to_string);
+            direct_conflicts.dedup();
+            if !direct_conflicts.is_empty() {
+                let removal = candidate.conflicts_and_descendants(&direct_conflicts);
+                if transactions.iter().any(|transaction| {
+                    transaction.input.iter().any(|input| {
+                        candidate.entries.contains_key(&input.previous_output.txid)
+                            && !removal.contains(&input.previous_output.txid)
+                    })
+                }) {
+                    return Err(MempoolError::ReplacementUnconfirmedInput);
+                }
+                conflicting_fee = removal
+                    .iter()
+                    .filter_map(|txid| {
+                        candidate
+                            .entries
+                            .get(txid)
+                            .map(|entry| candidate.modified_fee_sat(txid, entry.fee_sat))
+                    })
+                    .fold(0i128, i128::saturating_add);
+                for txid in removal {
+                    candidate.remove(&txid);
+                }
+            }
+        }
         let mut new_count = 0usize;
         for transaction in transactions {
             let txid = transaction.compute_txid();
@@ -1122,6 +1159,23 @@ impl Mempool {
             )
         {
             return Err(MempoolError::FeeRate);
+        }
+        if package_rbf && conflicting_fee > 0 {
+            let required_fee = conflicting_fee.saturating_add(fee_for_rate(
+                candidate.policy.incremental_relay_fee_sat_per_kvb,
+                package_vsize,
+            ));
+            if package_fee < required_fee {
+                return Err(MempoolError::ReplacementFee);
+            }
+            let parent_txid = transactions[0].compute_txid();
+            let parent = candidate.get(&parent_txid).ok_or(MempoolError::BadOutput)?;
+            let parent_fee = candidate.modified_fee_sat(&parent_txid, parent.fee_sat);
+            if package_fee.saturating_mul(i128::from(parent.vsize))
+                <= parent_fee.saturating_mul(i128::from(package_vsize))
+            {
+                return Err(MempoolError::ReplacementFee);
+            }
         }
         validate_ephemeral_spends(transactions, &candidate)?;
         *self = candidate;

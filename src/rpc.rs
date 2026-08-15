@@ -16251,6 +16251,53 @@ mod tests {
         let mempool = node.mempool.read();
         assert!(mempool.get(&old_txid).is_none());
         assert!(mempool.get(&replacement_txid).is_some());
+        drop(mempool);
+
+        let package_parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let package_child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(package_parent.compute_txid(), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_995_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let package_parent_txid = package_parent.compute_txid();
+        let package_child_txid = package_child.compute_txid();
+        let package_result = submit_package(
+            &node,
+            &json!([[
+                hex::encode(serialize(&package_parent)),
+                hex::encode(serialize(&package_child)),
+            ]]),
+        )
+        .unwrap();
+        assert_eq!(package_result["package_msg"], "success");
+        assert_eq!(
+            package_result["replaced-transactions"],
+            json!([replacement_txid.to_string()])
+        );
+        assert!(node.mempool.read().get(&package_parent_txid).is_some());
+        assert!(node.mempool.read().get(&package_child_txid).is_some());
     }
 
     #[test]

@@ -11844,9 +11844,6 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .get(1)
                 .and_then(Value::as_array)
                 .ok_or_else(|| anyhow!("scantxoutset start expects an array of descriptors"))?;
-            if scan_objects.is_empty() {
-                bail!("scantxoutset requires at least one descriptor")
-            }
             let mut descriptors = Vec::with_capacity(scan_objects.len());
             for object in scan_objects {
                 let descriptor = if let Some(descriptor) = object.as_str() {
@@ -19301,6 +19298,11 @@ mod tests {
             Value::Bool(false)
         );
         generate_to_address(&node, &json!([1, address])).unwrap();
+        let empty_result = scan_txout_set(&node, &json!(["start", []])).unwrap();
+        assert_eq!(empty_result["success"], true);
+        assert_eq!(empty_result["txouts"], 1);
+        assert_eq!(empty_result["unspents"], json!([]));
+        assert_eq!(empty_result["total_amount"], 0.0);
         let result =
             scan_txout_set(&node, &json!(["start", [format!("addr({address})")]])).unwrap();
         assert_eq!(result["success"], true);

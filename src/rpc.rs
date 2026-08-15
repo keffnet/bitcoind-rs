@@ -1158,8 +1158,9 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
     let command_id = node.begin_rpc_command(method);
     let result = match method {
         "stop" => {
+            let wait = stop_wait(params)?;
             node.request_shutdown();
-            if let Some(wait) = stop_wait(params)? {
+            if let Some(wait) = wait {
                 tokio::time::sleep(wait).await;
             }
             Ok(json!("bitcoind stopping"))
@@ -1427,8 +1428,9 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
 fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
     match method {
         "stop" => {
+            let wait = stop_wait(params)?;
             node.request_shutdown();
-            if let Some(wait) = stop_wait(params)? {
+            if let Some(wait) = wait {
                 std::thread::sleep(wait);
             }
             Ok(json!("bitcoind stopping"))

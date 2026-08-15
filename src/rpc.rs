@@ -1139,6 +1139,12 @@ fn rest_get_utxos(
     format: &str,
     body: &[u8],
 ) -> Result<(&'static str, Vec<u8>)> {
+    // Core's CCoinsViewMemPool uses this sentinel for outputs created by a
+    // transaction that has not entered a block.  REST serializes the coin's
+    // height directly; the coinbase flag is deliberately not part of the
+    // BIP64 CCoin response.
+    const MEMPOOL_HEIGHT: u32 = 0x7fff_ffff;
+
     let suffix = route
         .strip_prefix("getutxos")
         .ok_or_else(|| anyhow!("invalid getutxos path"))?
@@ -1205,12 +1211,9 @@ fn rest_get_utxos(
     let mut bitmap_string = String::with_capacity(outpoints.len());
     let mut utxos = Vec::new();
     for (index, outpoint) in outpoints.iter().enumerate() {
-        let mut value = chain.utxo(outpoint).map(|entry| {
-            (
-                entry.height | if entry.coinbase { 1 << 31 } else { 0 },
-                entry.output.clone(),
-            )
-        });
+        let mut value = chain
+            .utxo(outpoint)
+            .map(|entry| (entry.height, entry.output.clone()));
         if let Some(pool) = mempool.as_ref()
             && pool.is_spent(outpoint)
         {
@@ -1222,7 +1225,7 @@ fn rest_get_utxos(
             && let Some(output) = entry.transaction.output.get(outpoint.vout as usize)
             && !pool.is_spent(outpoint)
         {
-            value = Some((0, output.clone()));
+            value = Some((MEMPOOL_HEIGHT, output.clone()));
         }
         if let Some((height, output)) = value {
             bitmap[index / 8] |= 1 << (index % 8);
@@ -18446,6 +18449,41 @@ mod tests {
         assert_eq!(
             hex::decode(hex_response.strip_suffix(b"\n").unwrap()).unwrap(),
             binary
+        );
+
+        let mempool_transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(42),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let mempool_txid = mempool_transaction.compute_txid();
+        node.mempool
+            .write()
+            .insert_test_entry(crate::mempool::MempoolEntry {
+                vsize: mempool_transaction.vsize() as u64,
+                fee_sat: 0,
+                added_at: 0,
+                height: 0,
+                transaction: mempool_transaction,
+            });
+        let (_, mempool_response) = dispatch_rest(
+            &node,
+            &format!("/rest/getutxos/checkmempool/{mempool_txid}-0.json"),
+        )
+        .unwrap();
+        let mempool_response: Value = serde_json::from_slice(&mempool_response).unwrap();
+        assert_eq!(
+            mempool_response["utxos"][0]["height"],
+            json!(0x7fff_ffffu32)
         );
     }
 

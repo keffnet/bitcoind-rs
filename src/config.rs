@@ -59,6 +59,43 @@ pub const DEFAULT_CLUSTER_COUNT: usize = 64;
 pub const MAX_CLUSTER_COUNT_LIMIT: usize = 64;
 pub const DEFAULT_CLUSTER_SIZE_KVB: u64 = 101;
 
+/// Logging categories accepted by Bitcoin Core's `-debug` and
+/// `-debugexclude` options in v31.1.  The Rust logger maps these categories
+/// to module targets where it has an equivalent; retaining the complete list
+/// still makes Core configuration validation deterministic.
+pub const CORE_LOG_CATEGORIES: &[&str] = &[
+    "net",
+    "tor",
+    "mempool",
+    "http",
+    "bench",
+    "zmq",
+    "walletdb",
+    "rpc",
+    "estimatefee",
+    "addrman",
+    "selectcoins",
+    "reindex",
+    "cmpctblock",
+    "rand",
+    "prune",
+    "proxy",
+    "mempoolrej",
+    "libevent",
+    "coindb",
+    "qt",
+    "leveldb",
+    "validation",
+    "i2p",
+    "ipc",
+    "blockstorage",
+    "txreconciliation",
+    "scan",
+    "txpackages",
+    "kernel",
+    "privatebroadcast",
+];
+
 fn total_system_memory_bytes() -> Option<u64> {
     #[cfg(unix)]
     {
@@ -207,6 +244,32 @@ pub enum RpcCookiePermissions {
     Owner,
     Group,
     All,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+}
+
+impl LogLevel {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "trace" => Some(Self::Trace),
+            "debug" => Some(Self::Debug),
+            "info" => Some(Self::Info),
+            _ => None,
+        }
+    }
+
+    fn as_tracing_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+        }
+    }
 }
 
 impl fmt::Debug for RpcAuth {
@@ -772,6 +835,27 @@ pub struct Args {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub log_level_always: bool,
+
+    /// Enable Core-compatible debug logging categories.  Supplying the
+    /// option without a value enables all categories; it can be repeated.
+    #[arg(
+        long = "debug",
+        value_name = "CATEGORY",
+        num_args = 0..=1,
+        default_missing_value = "1",
+        hide = true
+    )]
+    pub debug_categories: Vec<String>,
+
+    /// Exclude a Core-compatible debug logging category.  This can be
+    /// repeated and takes precedence over `--debug`.
+    #[arg(long = "debugexclude", value_name = "CATEGORY", hide = true)]
+    pub debug_exclude: Vec<String>,
+
+    /// Set the global or category-specific debug severity.  Supported
+    /// values are `trace`, `debug`, `info`, or `category:level`.
+    #[arg(long = "loglevel", value_name = "LEVEL", hide = true)]
+    pub log_levels: Vec<String>,
 
     /// Optional Core ASMap file used for ASN-aware peer grouping.
     #[arg(
@@ -1885,6 +1969,10 @@ pub struct LoggingConfig {
     pub thread_names: bool,
     pub source_locations: bool,
     pub level_always: bool,
+    pub debug_all: bool,
+    pub debug_categories: Vec<String>,
+    pub category_levels: HashMap<String, LogLevel>,
+    pub level: LogLevel,
 }
 
 impl Default for LoggingConfig {
@@ -1895,8 +1983,170 @@ impl Default for LoggingConfig {
             thread_names: false,
             source_locations: false,
             level_always: false,
+            debug_all: false,
+            debug_categories: Vec::new(),
+            category_levels: HashMap::new(),
+            level: LogLevel::Debug,
         }
     }
+}
+
+impl LoggingConfig {
+    /// Build an EnvFilter expression from the Core category settings.
+    ///
+    /// Tracing records in this project are naturally grouped by Rust module,
+    /// rather than by Core's logging bit flags.  Categories that share a
+    /// module target are combined at the most verbose requested level.  This
+    /// preserves Core's important enable/disable behavior while avoiding an
+    /// inaccurate claim that unrelated records belong to a category.
+    pub fn tracing_filter(&self) -> String {
+        let mut targets = HashMap::<&'static str, LogLevel>::new();
+        let categories = if self.debug_all {
+            CORE_LOG_CATEGORIES
+                .iter()
+                .map(|category| (*category).to_owned())
+                .collect::<Vec<_>>()
+        } else {
+            self.debug_categories.clone()
+        };
+        for category in categories {
+            let Some(target) = logging_category_target(&category) else {
+                continue;
+            };
+            let level = self
+                .category_levels
+                .get(&category)
+                .copied()
+                .unwrap_or(self.level);
+            targets
+                .entry(target)
+                .and_modify(|current| *current = (*current).min(level))
+                .or_insert(level);
+        }
+        let mut directives = vec!["bitcoind_rs=info".to_owned()];
+        if self.debug_all && self.debug_categories.is_empty() {
+            directives[0] = format!("bitcoind_rs={}", self.level.as_tracing_str());
+        }
+        let mut target_directives = targets
+            .into_iter()
+            .map(|(target, level)| format!("{target}={}", level.as_tracing_str()))
+            .collect::<Vec<_>>();
+        target_directives.sort_unstable();
+        directives.extend(target_directives);
+        directives.join(",")
+    }
+}
+
+fn logging_category_target(category: &str) -> Option<&'static str> {
+    Some(match category {
+        "net" | "addrman" | "cmpctblock" | "proxy" | "txreconciliation" | "privatebroadcast"
+        | "txpackages" => "bitcoind_rs::p2p",
+        "tor" => "bitcoind_rs::tor",
+        "i2p" => "bitcoind_rs::i2p",
+        "mempool" | "mempoolrej" => "bitcoind_rs::mempool",
+        "http" | "rpc" => "bitcoind_rs::rpc",
+        "estimatefee" => "bitcoind_rs::fee_estimator",
+        "zmq" => "bitcoind_rs::zmq",
+        "reindex" | "prune" | "coindb" | "leveldb" | "validation" | "blockstorage" | "scan"
+        | "kernel" => "bitcoind_rs::chain",
+        // These categories are valid Core settings but have no distinct
+        // Rust subsystem in the wallet-free build.
+        "bench" | "walletdb" | "selectcoins" | "rand" | "libevent" | "qt" | "ipc" => return None,
+        _ => return None,
+    })
+}
+
+struct ParsedLoggingConfig {
+    debug_all: bool,
+    debug_categories: Vec<String>,
+    category_levels: HashMap<String, LogLevel>,
+    level: LogLevel,
+}
+
+#[inline(never)]
+fn parse_logging_config(args: &Args) -> Result<ParsedLoggingConfig> {
+    let mut debug_all = false;
+    let mut categories = Vec::new();
+    let mut seen = HashSet::new();
+    let last_reset = args
+        .debug_categories
+        .iter()
+        .rposition(|category| matches!(category.as_str(), "0" | "none"));
+    let debug_values = last_reset.map_or(args.debug_categories.as_slice(), |index| {
+        &args.debug_categories[index.saturating_add(1)..]
+    });
+    for category in debug_values {
+        let category = category.to_ascii_lowercase();
+        if category.is_empty() || category == "1" || category == "all" {
+            debug_all = true;
+            continue;
+        }
+        if !CORE_LOG_CATEGORIES.contains(&category.as_str()) {
+            bail!("unsupported logging category --debug={category}");
+        }
+        if seen.insert(category.clone()) {
+            categories.push(category);
+        }
+    }
+
+    for category in &args.debug_exclude {
+        let category = category.to_ascii_lowercase();
+        if category == "all" || category == "1" {
+            debug_all = false;
+            categories.clear();
+            seen.clear();
+            continue;
+        }
+        if !CORE_LOG_CATEGORIES.contains(&category.as_str()) {
+            bail!("unsupported logging category --debugexclude={category}");
+        }
+        if debug_all {
+            // Expand `all` lazily so exclusions remain visible to the
+            // tracing filter without changing the order of user settings.
+            categories.clear();
+            categories.extend(
+                CORE_LOG_CATEGORIES
+                    .iter()
+                    .filter(|candidate| **candidate != category)
+                    .map(|candidate| (*candidate).to_owned()),
+            );
+            seen.clear();
+            seen.extend(categories.iter().cloned());
+            debug_all = false;
+        } else if seen.remove(&category) {
+            categories.retain(|candidate| candidate != &category);
+        }
+    }
+
+    let mut level = if debug_all || !categories.is_empty() {
+        LogLevel::Debug
+    } else {
+        LogLevel::Info
+    };
+    let mut category_levels = HashMap::new();
+    for value in &args.log_levels {
+        let value = value.to_ascii_lowercase();
+        if let Some((category, level_value)) = value.split_once(':') {
+            if !CORE_LOG_CATEGORIES.contains(&category) {
+                bail!("unsupported logging category in --loglevel={value}");
+            }
+            let Some(parsed) = LogLevel::parse(level_value) else {
+                bail!("unsupported logging level in --loglevel={value}");
+            };
+            category_levels.insert(category.to_owned(), parsed);
+        } else {
+            let Some(parsed) = LogLevel::parse(&value) else {
+                bail!("unsupported global logging level --loglevel={value}");
+            };
+            level = parsed;
+        }
+    }
+    Ok(ParsedLoggingConfig {
+        debug_all,
+        debug_categories: categories,
+        category_levels,
+        level,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -2117,6 +2367,7 @@ impl Config {
         if !args.disable_wallet {
             bail!("wallet support is disabled in this build; use --disablewallet=1");
         }
+        let logging = parse_logging_config(&args)?;
         let network = network_from_args(&args)?;
         let blocks_dir = args.blocks_dir.as_ref().map_or_else(
             || args.datadir.join("blocks"),
@@ -2561,6 +2812,10 @@ impl Config {
                 thread_names: args.log_thread_names,
                 source_locations: args.log_source_locations,
                 level_always: args.log_level_always,
+                debug_all: logging.debug_all,
+                debug_categories: logging.debug_categories,
+                category_levels: logging.category_levels,
+                level: logging.level,
             },
             debug_log_file_enabled: !args.no_debug_log_file,
             print_to_console: args.print_to_console,
@@ -3179,6 +3434,70 @@ mod tests {
     }
 
     #[test]
+    fn parses_core_debug_categories_and_log_levels() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--debug=net",
+            "--debug=rpc",
+            "--debugexclude=rpc",
+            "--loglevel=trace",
+            "--loglevel=net:info",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(!config.logging.debug_all);
+        assert_eq!(config.logging.debug_categories, ["net"]);
+        assert_eq!(config.logging.level, LogLevel::Trace);
+        assert_eq!(
+            config.logging.category_levels.get("net"),
+            Some(&LogLevel::Info)
+        );
+        assert_eq!(
+            config.logging.tracing_filter(),
+            "bitcoind_rs=info,bitcoind_rs::p2p=info"
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--debug=net",
+            "--debug=none",
+            "--debug=rpc",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.logging.debug_categories, ["rpc"]);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--debug",
+            "--debugexclude=net",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(!config.logging.debug_all);
+        assert_eq!(
+            config.logging.debug_categories.len(),
+            CORE_LOG_CATEGORIES.len() - 1
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--debug=not-a-core-category",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+    }
+
+    #[test]
     fn parses_core_mempool_replacement_and_truc_policies() {
         let directory = tempfile::tempdir().unwrap();
         let args = Args::try_parse_from([
@@ -3283,6 +3602,16 @@ mod tests {
 
     #[test]
     fn parses_core_style_network_policy_switches() {
+        std::thread::Builder::new()
+            .name("config-network-policy".to_owned())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(parses_core_style_network_policy_switches_inner)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn parses_core_style_network_policy_switches_inner() {
         let directory = tempfile::tempdir().unwrap();
         let args = Args::try_parse_from([
             "bitcoind-rs",

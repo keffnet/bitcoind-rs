@@ -48,7 +48,8 @@ fn main() -> Result<()> {
 async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()> {
     let node = Node::open(config)?;
     let _pid_file = PidFile::create(node.config.pid_path.clone())?;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(node.config.logging.tracing_filter()));
     let (writer, log_file) = if let Some(path) = node
         .config
         .debug_log_file_enabled

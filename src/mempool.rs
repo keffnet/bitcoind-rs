@@ -2430,6 +2430,63 @@ fn is_minimal_push_encoding(script: &Script) -> bool {
     true
 }
 
+fn contains_tapscript_op_success(script: &[u8]) -> bool {
+    let mut offset = 0usize;
+    while offset < script.len() {
+        let opcode = script[offset];
+        offset += 1;
+        if opcode == 0x50
+            || opcode == 0x62
+            || (0x7e..=0x81).contains(&opcode)
+            || (0x83..=0x86).contains(&opcode)
+            || (0x89..=0x8a).contains(&opcode)
+            || (0x8d..=0x8e).contains(&opcode)
+            || (0x95..=0x99).contains(&opcode)
+            || (0xbb..=0xfe).contains(&opcode)
+        {
+            return true;
+        }
+        let length = match opcode {
+            0x00 | 0x51..=0x60 | 0x61..=0xff => continue,
+            0x01..=0x4b => usize::from(opcode),
+            0x4c => {
+                let Some(&length) = script.get(offset) else {
+                    return false;
+                };
+                offset += 1;
+                usize::from(length)
+            }
+            0x4d => {
+                let Some(length) = script.get(offset..offset.saturating_add(2)) else {
+                    return false;
+                };
+                offset += 2;
+                usize::from(u16::from_le_bytes([length[0], length[1]]))
+            }
+            0x4e => {
+                let Some(length) = script.get(offset..offset.saturating_add(4)) else {
+                    return false;
+                };
+                offset += 4;
+                usize::try_from(u32::from_le_bytes([
+                    length[0], length[1], length[2], length[3],
+                ]))
+                .ok()
+                .unwrap_or(usize::MAX)
+            }
+            _ => continue,
+        };
+        let Some(end) = offset.checked_add(length) else {
+            return false;
+        };
+        if end > script.len() {
+            return false;
+        }
+        offset = end;
+    }
+    false
+}
+
 fn validate_standard_inputs(
     transaction: &Transaction,
     previous_outputs: &[TxOut],
@@ -2557,6 +2614,11 @@ fn validate_standard_witnesses(
                 }
                 let leaf_version = control_block[0] & 0xfe;
                 if leaf_version != 0xc0 {
+                    return Err(MempoolError::NonStandard(
+                        "bad-witness-nonstandard".to_owned(),
+                    ));
+                }
+                if contains_tapscript_op_success(witness_items[witness_items.len() - 2]) {
                     return Err(MempoolError::NonStandard(
                         "bad-witness-nonstandard".to_owned(),
                     ));
@@ -3674,6 +3736,15 @@ mod tests {
         future_taproot.input[0].witness = Witness::from_slice(&[vec![0x51], vec![0xc2; 33]]);
         future_taproot.output[0].value = Amount::from_sat(100_000);
         future_taproot.output[0].script_pubkey = taproot_previous.script_pubkey.clone();
+        assert!(matches!(
+            validate_standard_policy(
+                &future_taproot,
+                std::slice::from_ref(&taproot_previous),
+                1,
+            ),
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
+        ));
+        future_taproot.input[0].witness = Witness::from_slice(&[vec![0x50], vec![0xc0; 33]]);
         assert!(matches!(
             validate_standard_policy(
                 &future_taproot,

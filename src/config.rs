@@ -575,6 +575,15 @@ pub struct Args {
     #[arg(long = "rpcport", value_name = "PORT")]
     pub rpc_port: Option<u16>,
 
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub server: bool,
+
     #[arg(long = "rpcservertimeout", default_value_t = DEFAULT_RPC_SERVER_TIMEOUT_SECS)]
     pub rpc_server_timeout: u64,
 
@@ -1055,7 +1064,9 @@ impl Config {
                     .with_context(|| format!("parsing --rpcallowip subnet '{value}'"))
             })
             .collect::<Result<Vec<_>>>()?;
-        let rpc_binds = if !args.rpc_binds.is_empty() && !rpc_allow_ips.is_empty() {
+        let rpc_binds = if !args.server {
+            Vec::new()
+        } else if !args.rpc_binds.is_empty() && !rpc_allow_ips.is_empty() {
             parse_rpc_binds(&args.rpc_binds, rpc.port())?
         } else if args.rpc.is_some() {
             vec![rpc]
@@ -1076,7 +1087,7 @@ impl Config {
         if args.no_rpc_cookie_file && args.rpc_cookie_file.is_some() {
             bail!("--norpccookiefile cannot be combined with --rpccookiefile");
         }
-        let rpc_cookie_path = if args.no_rpc_cookie_file {
+        let rpc_cookie_path = if !args.server || args.no_rpc_cookie_file {
             None
         } else {
             let path = args
@@ -1290,7 +1301,7 @@ impl Config {
             p2p_bind: primary_p2p_bind,
             p2p_binds,
             listen,
-            rpc_bind: Some(rpc_binds[0]),
+            rpc_bind: rpc_binds.first().copied(),
             rpc_binds,
             rpc_allow_ips,
             rpc_auth,
@@ -1930,6 +1941,18 @@ mod tests {
                 "[::1]:18446".parse().unwrap(),
             ]
         );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--server=false",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.rpc_bind.is_none());
+        assert!(config.rpc_binds.is_empty());
+        assert!(config.rpc_cookie_path.is_none());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

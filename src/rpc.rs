@@ -2292,14 +2292,27 @@ fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn estimator_bucket_json(bucket: &EstimatorBucket) -> Value {
-    let finite = |value: f64| if value.is_finite() { value } else { -1.0 };
+    let range = |value: f64| {
+        if value.is_finite() {
+            value.round()
+        } else {
+            -1.0
+        }
+    };
+    let count = |value: f64| {
+        if value.is_finite() {
+            (value * 100.0).round() / 100.0
+        } else {
+            0.0
+        }
+    };
     json!({
-        "startrange": finite(bucket.start),
-        "endrange": finite(bucket.end),
-        "withintarget": bucket.within_target,
-        "totalconfirmed": bucket.total_confirmed,
-        "inmempool": bucket.in_mempool,
-        "leftmempool": bucket.left_mempool,
+        "startrange": range(bucket.start),
+        "endrange": range(bucket.end),
+        "withintarget": count(bucket.within_target),
+        "totalconfirmed": count(bucket.total_confirmed),
+        "inmempool": count(bucket.in_mempool),
+        "leftmempool": count(bucket.left_mempool),
     })
 }
 

@@ -645,7 +645,9 @@ impl FeeEstimator {
         {
             estimate = Some(estimate.map_or(double, |current| current.max(double)));
         }
-        if conservative && let Some(value) = self.estimate_conservative(target.saturating_mul(2)) {
+        if (conservative || estimate.is_none())
+            && let Some(value) = self.estimate_conservative(target.saturating_mul(2))
+        {
             estimate = Some(estimate.map_or(value, |current| current.max(value)));
         }
         (estimate.map(|value| value.round().max(1.0) as u64), target)
@@ -748,7 +750,7 @@ impl FeeEstimator {
                         .0;
                     if let Some(candidate) = candidate {
                         estimate =
-                            Some(estimate.map_or(candidate, |current| current.max(candidate)));
+                            Some(estimate.map_or(candidate, |current| current.min(candidate)));
                     }
                 }
             }

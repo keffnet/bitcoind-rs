@@ -8999,6 +8999,12 @@ fn mining_block_version(
     tip_height: u32,
     custom_version: Option<i32>,
 ) -> i32 {
+    // Core only applies -blockversion on regtest, where it is a deliberate
+    // fork-testing hook. Other networks retain the versionbits-computed
+    // default even if the option was supplied.
+    let custom_version = (network == Network::Regtest)
+        .then_some(custom_version)
+        .flatten();
     let mut version = custom_version.unwrap_or(0x2000_0000);
     if custom_version.is_none() {
         for deployment in validation::bip9_deployments(network) {
@@ -14362,6 +14368,10 @@ mod tests {
                 .is_some_and(|value| value.starts_with("6a24aa21a9ed"))
         );
         assert_eq!(template["version"], json!(1337));
+        assert_eq!(
+            mining_block_version(Network::Bitcoin, &[], 0, Some(1337)),
+            0x2000_0000
+        );
         assert!(get_block_template(&node, &json!([{"mode": 1, "rules": ["segwit"]}])).is_err());
         assert!(get_block_template(&node, &json!([{"rules": 1}])).is_err());
         assert!(get_block_template(&node, &json!([{"rules": [1]}])).is_err());

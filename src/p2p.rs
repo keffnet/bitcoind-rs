@@ -232,6 +232,12 @@ const OVERLOADED_PEER_TX_DELAY: Duration = Duration::from_secs(2);
 const GETDATA_TX_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_GETDATA_BATCH: usize = 1_000;
 const MAX_BLOCKS_TO_ANNOUNCE: usize = 8;
+/// Core keeps manually added connections in a separate, bounded pool rather
+/// than consuming automatic `-maxconnections` slots.
+const MAX_ADDNODE_CONNECTIONS: usize = 8;
+/// Private broadcast connections are short-lived and have their own limit in
+/// Core, independent of ordinary peer slots.
+const MAX_PRIVATE_BROADCAST_CONNECTIONS: usize = 64;
 const INVENTORY_BROADCAST_TARGET: usize = 70;
 const INVENTORY_BROADCAST_MAX: usize = 1_000;
 
@@ -911,6 +917,8 @@ type OutboundAttempts = Arc<parking_lot::Mutex<HashSet<NetworkEndpoint>>>;
 #[derive(Clone)]
 struct OutboundContext {
     slots: Arc<Semaphore>,
+    manual_slots: Arc<Semaphore>,
+    private_slots: Arc<Semaphore>,
     peers: PeerRegistry,
     next_peer_id: Arc<AtomicUsize>,
     attempts: OutboundAttempts,
@@ -1136,10 +1144,14 @@ impl PeerManager {
             Vec::new()
         };
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
+        let manual_slots = Arc::new(Semaphore::new(MAX_ADDNODE_CONNECTIONS));
+        let private_slots = Arc::new(Semaphore::new(MAX_PRIVATE_BROADCAST_CONNECTIONS));
         let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let next_peer_id = Arc::new(AtomicUsize::new(1));
         let outbound = OutboundContext {
             slots: slots.clone(),
+            manual_slots,
+            private_slots,
             peers: peers.clone(),
             next_peer_id: next_peer_id.clone(),
             attempts: Arc::new(parking_lot::Mutex::new(HashSet::new())),
@@ -1275,6 +1287,7 @@ impl PeerManager {
                 true,
                 None,
                 "outbound-full",
+                true,
             );
         }
         let discovery_node = self.node.clone();
@@ -1304,6 +1317,7 @@ impl PeerManager {
                             false,
                             None,
                             "outbound-full",
+                            false,
                         );
                     }
                 }
@@ -1320,10 +1334,10 @@ impl PeerManager {
                         let Some(request) = request else {
                             break;
                         };
-                        let (endpoint, persistent, transport_v2, connection_type) = match request {
-                            PeerManagerRequest::Add(address) => (NetworkEndpoint::Ip(address), true, None, "outbound-full"),
+                        let (endpoint, persistent, transport_v2, connection_type, manual) = match request {
+                            PeerManagerRequest::Add(address) => (NetworkEndpoint::Ip(address), true, None, "outbound-full", true),
                             PeerManagerRequest::OneTry(address, transport_v2, connection_type) => {
-                                (NetworkEndpoint::Ip(address), false, transport_v2, connection_type)
+                                (NetworkEndpoint::Ip(address), false, transport_v2, connection_type, true)
                             }
                             PeerManagerRequest::PrivateBroadcast { address, transaction } => {
                                 spawn_private_broadcast_loop(
@@ -1342,6 +1356,7 @@ impl PeerManager {
                             persistent,
                             transport_v2,
                             connection_type,
+                            manual,
                         );
                     }
                     _ = private_retry_interval.tick() => {
@@ -1438,6 +1453,7 @@ fn spawn_outbound_loop(
     persistent: bool,
     transport_v2: Option<bool>,
     connection_type: &'static str,
+    manual: bool,
 ) {
     {
         let mut attempts = outbound.attempts.lock();
@@ -1448,6 +1464,7 @@ fn spawn_outbound_loop(
     let peer_id = outbound.next_peer_id.fetch_add(1, Ordering::Relaxed);
     let OutboundContext {
         slots,
+        manual_slots,
         peers,
         attempts: outbound_attempts,
         ..
@@ -1468,7 +1485,12 @@ fn spawn_outbound_loop(
             endpoint: endpoint.clone(),
             attempts: outbound_attempts,
         };
-        let Ok(_permit) = slots.acquire_owned().await else {
+        let permit = if manual {
+            manual_slots.acquire_owned().await
+        } else {
+            slots.acquire_owned().await
+        };
+        let Ok(_permit) = permit else {
             return;
         };
         if !node.config.allows_network_endpoint(&endpoint) {
@@ -1555,7 +1577,7 @@ fn spawn_private_broadcast_loop(
     }
     let peer_id = outbound.next_peer_id.fetch_add(1, Ordering::Relaxed);
     let OutboundContext {
-        slots,
+        private_slots,
         peers,
         attempts: outbound_attempts,
         ..
@@ -1576,7 +1598,7 @@ fn spawn_private_broadcast_loop(
             endpoint: endpoint.clone(),
             attempts: outbound_attempts,
         };
-        let Ok(_permit) = slots.acquire_owned().await else {
+        let Ok(_permit) = private_slots.acquire_owned().await else {
             return;
         };
         if !node.config.allows_address(address)

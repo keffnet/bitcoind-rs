@@ -3628,13 +3628,15 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
     let verbosity = parse_verbosity(params.get(1), 1)?;
     let mut chain = node.chain.write();
+    let height = chain
+        .block_height_by_hash(&hash)
+        .ok_or_else(|| anyhow!("Block not found"))?;
     let block = chain
         .block(&hash)?
-        .ok_or_else(|| anyhow!("Block not found"))?;
+        .ok_or_else(|| anyhow!("Block not available"))?;
     if verbosity <= 0 {
         return Ok(json!(hex::encode(serialize(&block))));
     }
-    let height = chain.block_height_by_hash(&hash).unwrap_or(0);
     let confirmations = if chain.is_active_block(&hash) {
         chain.height().saturating_sub(height) as i64 + 1
     } else {
@@ -13178,6 +13180,10 @@ mod tests {
             get_block(&node, &json!([block_hash.to_string(), true])).unwrap()["hash"],
             json!(block_hash.to_string())
         );
+        let unknown_hash = BlockHash::from_byte_array([0xff; 32]);
+        let unknown_block = get_block(&node, &json!([unknown_hash.to_string()])).unwrap_err();
+        assert_eq!(unknown_block.to_string(), "Block not found");
+        assert_eq!(rpc_error(&unknown_block)["code"], json!(-5));
         let spending = get_tx_spending_prevout(
             &node,
             &json!([[{"txid": funding_txid.to_string(), "vout": 0}], {"return_spending_tx": true}]),

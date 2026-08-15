@@ -3682,23 +3682,25 @@ impl ChainState {
             .into_iter()
             .enumerate()
             .map(|(index, block)| {
-                block.with_context(|| format!("candidate block {} is missing", path[index]))
+                block.with_context(|| {
+                    format!("candidate block {} is missing", path[replay_start + index])
+                })
             })
             .collect::<Result<Vec<Block>>>()?;
 
-        let old_active_chain = self.active_chain.clone();
-        let old_headers = self.headers.clone();
-        let old_active_tx_counts = self.active_tx_counts.clone();
-        let old_active_tx_totals = self.active_tx_totals.clone();
-        let old_utxos = self.utxos.clone();
-        let old_utxos_by_script = self.utxos_by_script.clone();
-        let old_tx_index = self.tx_index.clone();
+        let old_active_chain = std::mem::take(&mut self.active_chain);
+        let old_headers = std::mem::take(&mut self.headers);
+        let old_active_tx_counts = std::mem::take(&mut self.active_tx_counts);
+        let old_active_tx_totals = std::mem::take(&mut self.active_tx_totals);
+        let old_utxos = std::mem::take(&mut self.utxos);
+        let old_utxos_by_script = std::mem::take(&mut self.utxos_by_script);
+        let old_tx_index = std::mem::take(&mut self.tx_index);
         let old_tx_index_all = self.tx_index_all.clone();
-        let old_history = self.history.clone();
-        let old_spent_by = self.spent_by.clone();
-        let old_basic_filter_cache = self.basic_filter_cache.clone();
-        let old_block_undo_cache = self.block_undo_cache.clone();
-        let old_coin_stats = self.coin_stats.clone();
+        let old_history = std::mem::take(&mut self.history);
+        let old_spent_by = std::mem::take(&mut self.spent_by);
+        let old_basic_filter_cache = std::mem::take(&mut self.basic_filter_cache);
+        let old_block_undo_cache = std::mem::take(&mut self.block_undo_cache);
+        let old_coin_stats = std::mem::take(&mut self.coin_stats);
         let old_snapshot_base = self.snapshot_base;
         let old_snapshot_validated = self.snapshot_validated;
         let old_snapshot_validation_error = self.snapshot_validation_error.clone();

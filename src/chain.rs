@@ -691,10 +691,37 @@ impl ChainState {
         reindex_chainstate: bool,
         tx_index_all_enabled: bool,
     ) -> Result<Self> {
+        let data_dir = data_dir.as_ref();
+        Self::open_with_options_and_tx_index_in_dirs(
+            network,
+            data_dir,
+            data_dir.join("blocks"),
+            signet_challenge,
+            blockfilter_index_enabled,
+            reindex,
+            reindex_chainstate,
+            tx_index_all_enabled,
+        )
+    }
+
+    /// Open chainstate with block records stored in a separate directory.
+    /// Metadata, indexes, and chainstate remain rooted in `data_dir`, matching
+    /// Core's `-blocksdir` layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_options_and_tx_index_in_dirs(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        blocks_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
+        reindex: bool,
+        reindex_chainstate: bool,
+        tx_index_all_enabled: bool,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
-        let mut store = BlockStore::open(data_dir.join("blocks"))?;
+        let mut store = BlockStore::open(blocks_dir)?;
         let filter_store = FilterStore::open(data_dir.join("filters"))?;
         let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
         let genesis = genesis_block(network);

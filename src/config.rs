@@ -532,6 +532,9 @@ pub struct Args {
     #[arg(long, default_value = "./data")]
     pub datadir: PathBuf,
 
+    #[arg(long = "blocksdir", value_name = "PATH")]
+    pub blocks_dir: Option<PathBuf>,
+
     #[arg(long)]
     pub p2p: Option<SocketAddr>,
 
@@ -928,6 +931,7 @@ pub struct Args {
 pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
+    pub(crate) blocks_dir: Option<PathBuf>,
     pub p2p_bind: SocketAddr,
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
@@ -1004,6 +1008,16 @@ pub struct Config {
 impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
         let network = args.network.into();
+        let blocks_dir = args.blocks_dir.as_ref().map_or_else(
+            || args.datadir.join("blocks"),
+            |path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    args.datadir.join(path)
+                }
+            },
+        );
         let p2p = args.p2p.unwrap_or_else(|| {
             SocketAddr::from((
                 [127, 0, 0, 1],
@@ -1272,6 +1286,7 @@ impl Config {
         Ok(Self {
             network,
             datadir: args.datadir,
+            blocks_dir: Some(blocks_dir),
             p2p_bind: primary_p2p_bind,
             p2p_binds,
             listen,
@@ -1563,6 +1578,18 @@ mod tests {
         assert!(!config.cjdns_reachable);
         assert_eq!(config.prune, 0);
         assert_eq!(config.max_upload_target, 0);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--blocksdir=storage/blocks",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().blocks_dir,
+            Some(directory.path().join("storage/blocks"))
+        );
 
         for network in ["onion", "i2p"] {
             let args = Args::try_parse_from([

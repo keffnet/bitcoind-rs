@@ -1561,6 +1561,7 @@ mod tests {
         let node = Node::open(Config {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
+            blocks_dir: None,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
@@ -1687,6 +1688,7 @@ mod tests {
             Node::open(Config {
                 network: Network::Regtest,
                 datadir: directory.path().to_owned(),
+                blocks_dir: None,
                 p2p_bind: "127.0.0.1:0".parse().unwrap(),
                 p2p_binds: Vec::new(),
                 rpc_bind: None,
@@ -1803,6 +1805,7 @@ mod tests {
             Node::open(Config {
                 network: Network::Regtest,
                 datadir: directory.path().to_owned(),
+                blocks_dir: None,
                 p2p_bind: "127.0.0.1:0".parse().unwrap(),
                 p2p_binds: Vec::new(),
                 rpc_bind: None,
@@ -2123,6 +2126,7 @@ mod tests {
             Node::open(Config {
                 network: Network::Regtest,
                 datadir: directory.path().to_owned(),
+                blocks_dir: None,
                 p2p_bind: "127.0.0.1:0".parse().unwrap(),
                 p2p_binds: Vec::new(),
                 rpc_bind: None,
@@ -2378,6 +2382,7 @@ mod tests {
         let node = Node::open(Config {
             network: Network::Regtest,
             datadir: directory.path().to_owned(),
+            blocks_dir: None,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,

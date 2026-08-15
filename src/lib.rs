@@ -726,9 +726,14 @@ impl Node {
             .context("--maxmempool is too large")?;
         let max_mempool_bytes =
             usize::try_from(max_mempool_bytes).context("--maxmempool does not fit usize")?;
-        let mut chain = ChainState::open_with_options_and_tx_index(
+        let blocks_dir = config
+            .blocks_dir
+            .clone()
+            .unwrap_or_else(|| config.datadir.join("blocks"));
+        let mut chain = ChainState::open_with_options_and_tx_index_in_dirs(
             config.network,
             &config.datadir,
+            blocks_dir,
             config.signet_challenge.as_deref(),
             config.blockfilterindex,
             config.reindex,
@@ -3384,6 +3389,7 @@ mod tests {
         Config {
             network: bitcoin::Network::Regtest,
             datadir: datadir.to_owned(),
+            blocks_dir: None,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
@@ -3689,6 +3695,23 @@ mod tests {
         assert!(path.exists());
         node.remove_rpc_cookie();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn blocks_directory_can_be_separated_from_chainstate() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--blocksdir=external-blocks",
+        ])
+        .unwrap();
+        let _node = Node::open(Config::from_args(args).unwrap()).unwrap();
+        assert!(directory.path().join("external-blocks/blocks.dat").exists());
+        assert!(directory.path().join("chainstate.bin").exists());
+        assert!(!directory.path().join("blocks/blocks.dat").exists());
     }
 
     #[test]

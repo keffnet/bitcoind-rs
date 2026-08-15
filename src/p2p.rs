@@ -3445,8 +3445,14 @@ async fn serve_peer_loop(
                 {
                     anyhow::bail!("filterload received while bloom filters are disabled");
                 }
-                install_bloom_filter(bloom_filter, relay_transactions, filter)?;
-                node.update_peer_relay_transactions(peer_id, true);
+                if let Err(error) = install_bloom_filter(bloom_filter, relay_transactions, filter) {
+                    // Core records an invalid filter as peer misbehavior but keeps
+                    // the connection alive. This node has no score-based
+                    // discouragement subsystem, so retain the socket and log it.
+                    debug!(peer_id, %error, "ignoring malformed bloom filter");
+                } else {
+                    node.update_peer_relay_transactions(peer_id, true);
+                }
             }
             Message::FilterAdd(FilterAdd { data }) => {
                 if !node.config.peer_bloom_filters
@@ -3456,14 +3462,12 @@ async fn serve_peer_loop(
                 {
                     anyhow::bail!("filteradd received while bloom filters are disabled");
                 }
-                if data.len() > MAX_BLOOM_ELEMENT_SIZE {
-                    anyhow::bail!("bloom filter element exceeds the 520-byte limit");
+                if !apply_bloom_filter_add(bloom_filter, &data) {
+                    // Core marks an oversized element or an add before
+                    // filterload as misbehavior without immediately closing the
+                    // connection. Keep processing later messages.
+                    debug!(peer_id, "ignoring malformed bloom filter element");
                 }
-                let mut filter = bloom_filter.lock();
-                let Some(filter) = filter.as_mut() else {
-                    anyhow::bail!("filteradd received before filterload");
-                };
-                filter.insert(&data);
             }
             Message::FilterClear => {
                 if !node.config.peer_bloom_filters
@@ -4559,6 +4563,21 @@ fn install_bloom_filter(
     *bloom_filter.lock() = Some(BloomFilter::from_message(filter)?);
     *relay_transactions.lock() = true;
     Ok(())
+}
+
+fn apply_bloom_filter_add(
+    bloom_filter: &parking_lot::Mutex<Option<BloomFilter>>,
+    data: &[u8],
+) -> bool {
+    if data.len() > MAX_BLOOM_ELEMENT_SIZE {
+        return false;
+    }
+    let mut filter = bloom_filter.lock();
+    let Some(filter) = filter.as_mut() else {
+        return false;
+    };
+    filter.insert(data);
+    true
 }
 
 fn clear_bloom_filter(
@@ -5990,6 +6009,28 @@ mod tests {
         *relay_transactions.lock() = false;
         assert!(install_bloom_filter(&bloom_filter, &relay_transactions, invalid_filter).is_err());
         assert!(!*relay_transactions.lock());
+    }
+
+    #[test]
+    fn malformed_bloom_filter_adds_are_ignored_without_mutating_state() {
+        let bloom_filter = parking_lot::Mutex::new(None);
+        assert!(!apply_bloom_filter_add(&bloom_filter, &[0x42]));
+
+        let filter = FilterLoad {
+            filter: vec![0; 32],
+            hash_funcs: 5,
+            tweak: 0,
+            flags: BloomFlags::All,
+        };
+        let relay_transactions = parking_lot::Mutex::new(false);
+        install_bloom_filter(&bloom_filter, &relay_transactions, filter).unwrap();
+
+        assert!(!apply_bloom_filter_add(
+            &bloom_filter,
+            &vec![0; MAX_BLOOM_ELEMENT_SIZE + 1]
+        ));
+        assert!(apply_bloom_filter_add(&bloom_filter, &[0x42]));
+        assert!(bloom_filter.lock().as_ref().unwrap().contains(&[0x42]));
     }
 
     #[test]

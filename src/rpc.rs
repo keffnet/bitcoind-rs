@@ -6997,8 +6997,8 @@ fn join_psbts(params: &Value) -> Result<Value> {
         .get(0)
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("joinpsbts expects an array of PSBTs"))?;
-    if values.is_empty() {
-        bail!("joinpsbts requires at least one PSBT")
+    if values.len() <= 1 {
+        bail!("At least two PSBTs are required to join PSBTs.")
     }
     let psbts = values
         .iter()
@@ -7011,16 +7011,21 @@ fn join_psbts(params: &Value) -> Result<Value> {
             )?)
         })
         .collect::<Result<Vec<_>>>()?;
-    let version = psbts[0].unsigned_tx.version;
-    let lock_time = psbts[0].unsigned_tx.lock_time;
+    let version = psbts
+        .iter()
+        .map(|psbt| psbt.unsigned_tx.version.0)
+        .max()
+        .unwrap_or(1);
+    let version = Version::non_standard(version);
+    let lock_time = psbts
+        .iter()
+        .map(|psbt| psbt.unsigned_tx.lock_time)
+        .min_by_key(|lock_time| lock_time.to_consensus_u32())
+        .expect("joinpsbts has at least two PSBTs");
     let mut input_outpoints = HashSet::new();
-    let mut output_bytes = HashSet::new();
     let mut inputs = Vec::new();
     let mut outputs = Vec::new();
     for psbt in &psbts {
-        if psbt.unsigned_tx.version != version || psbt.unsigned_tx.lock_time != lock_time {
-            bail!("PSBTs must use the same transaction version and locktime")
-        }
         for (index, input) in psbt.unsigned_tx.input.iter().enumerate() {
             if !input_outpoints.insert(input.previous_output) {
                 bail!("PSBTs contain duplicate inputs")
@@ -7028,27 +7033,38 @@ fn join_psbts(params: &Value) -> Result<Value> {
             inputs.push((input.clone(), psbt.inputs[index].clone()));
         }
         for (index, output) in psbt.unsigned_tx.output.iter().enumerate() {
-            if !output_bytes.insert(serialize(output)) {
-                bail!("PSBTs contain duplicate outputs")
-            }
             outputs.push((output.clone(), psbt.outputs[index].clone()));
         }
     }
+    let mut input_indices = (0..inputs.len()).collect::<Vec<_>>();
+    input_indices.shuffle(&mut rand::rng());
+    let mut output_indices = (0..outputs.len()).collect::<Vec<_>>();
+    output_indices.shuffle(&mut rand::rng());
     let transaction = Transaction {
         version,
         lock_time,
-        input: inputs.iter().map(|(input, _)| input.clone()).collect(),
-        output: outputs.iter().map(|(output, _)| output.clone()).collect(),
+        input: input_indices
+            .iter()
+            .map(|index| inputs[*index].0.clone())
+            .collect(),
+        output: output_indices
+            .iter()
+            .map(|index| outputs[*index].0.clone())
+            .collect(),
     };
     let mut joined = Psbt::from_unsigned_tx(transaction)?;
     for psbt in psbts {
-        joined.version = joined.version.max(psbt.version);
         joined.xpub.extend(psbt.xpub);
-        joined.proprietary.extend(psbt.proprietary);
         joined.unknown.extend(psbt.unknown);
     }
-    joined.inputs = inputs.into_iter().map(|(_, input)| input).collect();
-    joined.outputs = outputs.into_iter().map(|(_, output)| output).collect();
+    joined.inputs = input_indices
+        .into_iter()
+        .map(|index| inputs[index].1.clone())
+        .collect();
+    joined.outputs = output_indices
+        .into_iter()
+        .map(|index| outputs[index].1.clone())
+        .collect();
     Ok(json!(encode_psbt(&joined)))
 }
 
@@ -22253,9 +22269,16 @@ mod tests {
         .unwrap();
         let joined_second = create_psbt(
             &node,
-            &json!([[{"txid": Txid::from_byte_array([12; 32]), "vout": 0}], {"data": "02"}]),
+            &json!([
+                [{"txid": Txid::from_byte_array([12; 32]), "vout": 0}],
+                {"data": "01"},
+                5,
+                null,
+                3
+            ]),
         )
         .unwrap();
+        assert!(join_psbts(&json!([[joined_first.clone()]])).is_err());
         let joined = parse_psbt(
             &json!([join_psbts(&json!([[joined_first, joined_second]])).unwrap()]),
             0,
@@ -22263,6 +22286,8 @@ mod tests {
         .unwrap();
         assert_eq!(joined.unsigned_tx.input.len(), 2);
         assert_eq!(joined.unsigned_tx.output.len(), 2);
+        assert_eq!(joined.unsigned_tx.version, Version::non_standard(3));
+        assert_eq!(joined.unsigned_tx.lock_time, LockTime::ZERO);
 
         let mined = generate_to_descriptor(&node, &json!([1, "raw(51)"])).unwrap();
         let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();

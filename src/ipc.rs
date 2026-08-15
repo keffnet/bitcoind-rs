@@ -645,8 +645,13 @@ impl crate::mining_capnp::block_template::Server for BlockTemplateService {
     ) -> Result<(), capnp::Error> {
         let params = params.get()?;
         let coinbase_bytes = params.get_coinbase()?.to_vec();
-        let coinbase: Transaction = deserialize(&coinbase_bytes)
-            .map_err(|error| capnp::Error::failed(format!("{error}")))?;
+        let coinbase: Transaction = deserialize(&coinbase_bytes).map_err(|error| {
+            if coinbase_bytes.is_empty() {
+                capnp::Error::failed("std::exception: SpanReader::read(): end of data:".to_owned())
+            } else {
+                capnp::Error::failed(format!("{error}"))
+            }
+        })?;
         let block = {
             let mut data = self.data.lock();
             let mut block = data.template.block.clone();
@@ -1081,6 +1086,16 @@ mod tests {
                 );
                 assert!(coinbase.has_witness());
                 assert_eq!(coinbase.get_required_outputs().unwrap().len(), 1);
+
+                let mut malformed_submit = template.submit_solution_request();
+                malformed_submit.get().set_coinbase(&[]);
+                let malformed_result = malformed_submit.send().promise.await;
+                assert!(matches!(
+                    malformed_result,
+                    Err(error) if error
+                        .to_string()
+                        .contains("SpanReader::read(): end of data:")
+                ));
 
                 let mut payout = bitcoin::Transaction {
                     version: bitcoin::transaction::Version::non_standard(

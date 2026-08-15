@@ -4050,6 +4050,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            ban_time_secs: 86_400,
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,

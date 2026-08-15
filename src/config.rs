@@ -47,6 +47,7 @@ pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
 pub const DEFAULT_I2P_ACCEPT_INCOMING: bool = true;
 pub const DEFAULT_MAX_RECEIVE_BUFFER_KB: u64 = 5;
 pub const DEFAULT_MAX_SEND_BUFFER_KB: u64 = 1;
+pub const DEFAULT_BAN_TIME_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_CLUSTER_COUNT: usize = 64;
 pub const MAX_CLUSTER_COUNT_LIMIT: usize = 64;
 pub const DEFAULT_CLUSTER_SIZE_KVB: u64 = 101;
@@ -1061,6 +1062,9 @@ pub struct Args {
     #[arg(long, visible_alias = "maxconnections", default_value_t = 125)]
     pub max_peers: usize,
 
+    #[arg(long = "bantime", default_value_t = DEFAULT_BAN_TIME_SECS)]
+    pub ban_time: u64,
+
     /// Maximum per-peer receive socket buffer in units of 1000 bytes.
     #[arg(long = "maxreceivebuffer", default_value_t = DEFAULT_MAX_RECEIVE_BUFFER_KB)]
     pub max_receive_buffer_kb: u64,
@@ -1695,6 +1699,7 @@ pub struct Config {
     pub max_send_buffer: u32,
     pub max_upload_target: u64,
     pub peer_timeout_secs: u64,
+    pub ban_time_secs: u64,
     pub connect_timeout_ms: u64,
     pub block_max_weight: u64,
     pub block_reserved_weight: u64,
@@ -2243,6 +2248,7 @@ impl Config {
             max_send_buffer,
             max_upload_target,
             peer_timeout_secs: args.peertimeout,
+            ban_time_secs: args.ban_time,
             connect_timeout_ms: args.timeout,
             block_max_weight: args.blockmaxweight.max(args.blockreservedweight),
             block_reserved_weight: args.blockreservedweight,
@@ -2677,6 +2683,7 @@ mod tests {
             "--onlynet=ipv4",
             "--proxy=127.0.0.1:9050",
             "--blockreconstructionextratxn=7",
+            "--bantime=123",
             "--uacomment=lab",
             "--startupnotify=echo start",
             "--blocknotify=echo %s",
@@ -2688,6 +2695,7 @@ mod tests {
         assert!(!config.dnsseed);
         assert!(config.blocksonly);
         assert_eq!(config.max_mempool_mb, DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB);
+        assert_eq!(config.ban_time_secs, 123);
         assert_eq!(config.onlynet, vec![OnlyNet::Ipv4]);
         assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
         assert_eq!(config.block_reconstruction_extra_txn, 7);

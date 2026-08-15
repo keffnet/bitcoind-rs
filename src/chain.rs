@@ -1737,6 +1737,8 @@ impl ChainState {
                     .ok_or(bitcoin::bip158::Error::UtxoMissing(*outpoint))
             })?;
             let filter_header = filter.filter_header(&previous_filter_header);
+            self.filter_store
+                .insert(block_hash, &filter.content, filter_header)?;
             self.basic_filter_cache
                 .insert(block_hash, (filter.content.clone(), filter_header));
             filters.push((block_hash, filter, filter_header));
@@ -5640,6 +5642,35 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .1
+        );
+    }
+
+    #[test]
+    fn backfilled_basic_filters_survive_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        let tip_hash = state.best_hash();
+        state.persist_snapshot().unwrap();
+        drop(state);
+
+        fs::remove_dir_all(directory.path().join("filters")).unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(state.filter_store.len(), 0);
+        let expected = state
+            .basic_filter_for_block(&tip_hash)
+            .unwrap()
+            .expect("backfilled tip filter");
+        assert_eq!(state.filter_store.len(), 4);
+        drop(state);
+
+        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.filter_store.len(), 4);
+        assert_eq!(
+            reopened.basic_filter_header_for_block(&tip_hash).unwrap(),
+            Some(expected.1)
         );
     }
 

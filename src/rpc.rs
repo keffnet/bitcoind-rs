@@ -1500,7 +1500,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 "loaded": true,
                 "size": mempool.len(),
                 "bytes": mempool.vbytes(),
-                "usage": mempool.bytes(),
+                "usage": mempool.dynamic_memory_usage(),
                 "maxmempool": mempool.max_bytes(),
                 "mempoolminfee": sat_to_btc(mempool.mempool_min_fee_sat_per_kvb()),
                 "minrelaytxfee": sat_to_btc(mempool.min_relay_fee_sat_per_kvb()),

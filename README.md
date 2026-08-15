@@ -48,7 +48,7 @@ Use `--txindex` to enable confirmed transaction lookup without supplying a block
 
 Use `--txospenderindex` to enable historical spender lookup for `gettxspendingprevout`; transaction lookup indexes are unavailable in prune mode.
 
-`--maxmempool=<MB>` sets the transaction pool's byte limit (300 MB by default, or 5 MB in `--blocksonly` mode unless explicitly set); admission uses the existing package-aware eviction policy when the limit is reached.
+`--maxmempool=<MB>` sets the transaction pool's dynamic-memory limit (300 MB by default, or 5 MB in `--blocksonly` mode unless explicitly set); admission uses the existing package-aware eviction policy when the limit is reached.
 
 `--mempoolexpiry=<hours>` controls automatic mempool expiration (336 hours by default, matching Core).
 

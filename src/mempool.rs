@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs;
+use std::mem::size_of;
 use std::path::Path;
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::consensus::encode::{VarInt, deserialize_partial, serialize};
 use bitcoin::{
-    Amount, Network, OutPoint, PublicKey, Script, ScriptBuf, Transaction, TxOut, Txid, Wtxid,
+    Amount, Network, OutPoint, PublicKey, Script, ScriptBuf, Transaction, TxIn, TxOut, Txid, Wtxid,
 };
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -306,6 +307,42 @@ pub struct MempoolEntry {
     pub height: u32,
 }
 
+/// Estimate the dynamic allocation footprint of a transaction and its
+/// mempool indexes. Core's `CTxMemPool::DynamicMemoryUsage` is necessarily an
+/// allocator-specific estimate. Keep the Rust implementation deterministic
+/// while accounting for the same categories: transaction-owned buffers,
+/// entry/index nodes, and spent-input relationships.
+fn mempool_entry_memory_usage(transaction: &Transaction) -> usize {
+    let pointer_bytes = size_of::<usize>();
+    let index_node_bytes = size_of::<usize>() * 3;
+    let mut usage = size_of::<MempoolEntry>()
+        .saturating_add(pointer_bytes.saturating_mul(9))
+        // entries, adjusted_weights, wtxids, and relay_sequences
+        .saturating_add(index_node_bytes.saturating_mul(4))
+        .saturating_add(
+            transaction.input.len().saturating_mul(
+                size_of::<OutPoint>()
+                    .saturating_add(size_of::<Txid>())
+                    .saturating_add(index_node_bytes.saturating_mul(2)),
+            ),
+        );
+
+    usage = usage.saturating_add(transaction.input.len().saturating_mul(size_of::<TxIn>()));
+    usage = usage.saturating_add(transaction.output.len().saturating_mul(size_of::<TxOut>()));
+    for input in &transaction.input {
+        usage = usage.saturating_add(input.script_sig.as_bytes().len());
+        let witness = input.witness.to_vec();
+        usage = usage.saturating_add(witness.capacity().saturating_mul(pointer_bytes * 3));
+        for item in witness {
+            usage = usage.saturating_add(item.capacity());
+        }
+    }
+    for output in &transaction.output {
+        usage = usage.saturating_add(output.script_pubkey.as_bytes().len());
+    }
+    usage
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum MempoolChangeKind {
     Added,
@@ -324,6 +361,10 @@ pub struct Mempool {
     pub network: Network,
     policy: MempoolPolicy,
     max_bytes: usize,
+    /// Estimated dynamic memory used by admitted entries and their indexes.
+    /// This is separate from `bytes`, which is the serialized transaction
+    /// total retained for diagnostics and Core's vsize `bytes` field.
+    memory_usage: usize,
     bytes: usize,
     vbytes: u64,
     rolling_min_fee_sat_per_kvb: f64,
@@ -457,6 +498,7 @@ impl Mempool {
             network,
             policy,
             max_bytes: max_bytes.max(1),
+            memory_usage: 0,
             bytes: 0,
             vbytes: 0,
             rolling_min_fee_sat_per_kvb: 0.0,
@@ -485,6 +527,25 @@ impl Mempool {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// Return the deterministic dynamic-memory estimate used by the pool
+    /// limit and exposed as Core's `getmempoolinfo.usage` value.
+    pub fn dynamic_memory_usage(&self) -> usize {
+        let index_node_bytes = size_of::<usize>() * 3;
+        self.memory_usage
+            // Fee deltas and unbroadcast transaction ids may outlive an
+            // entry, just as Core's auxiliary mempool maps do.
+            .saturating_add(
+                self.priorities
+                    .len()
+                    .saturating_mul(size_of::<Txid>() + size_of::<i64>() + index_node_bytes),
+            )
+            .saturating_add(
+                self.unbroadcast
+                    .len()
+                    .saturating_mul(size_of::<Txid>() + index_node_bytes),
+            )
     }
 
     /// Sum of virtual transaction sizes, matching Core's `getmempoolinfo.bytes`.
@@ -1718,10 +1779,11 @@ impl Mempool {
             validate_ephemeral_spends(std::slice::from_ref(&transaction), self)?;
         }
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
+        let memory_usage = mempool_entry_memory_usage(&transaction);
         if enforce_mempool_policy {
             self.check_cluster_limits_with_vsize(&transaction, vsize)?;
             let protected = self.ancestors_for_transaction(&transaction);
-            self.ensure_space(size, &protected)?;
+            self.ensure_space(memory_usage, &protected)?;
         }
         let entry = MempoolEntry {
             transaction,
@@ -1740,6 +1802,7 @@ impl Mempool {
                     .insert(txid);
             }
         }
+        self.memory_usage = self.memory_usage.saturating_add(memory_usage);
         self.bytes += size;
         self.vbytes = self.vbytes.saturating_add(vsize);
         self.entries.insert(txid, entry);
@@ -1791,13 +1854,13 @@ impl Mempool {
 
     fn ensure_space(
         &mut self,
-        additional_bytes: usize,
+        additional_memory: usize,
         protected: &HashSet<Txid>,
     ) -> Result<(), MempoolError> {
-        if additional_bytes > self.max_bytes {
+        if additional_memory > self.max_bytes {
             return Err(MempoolError::Full);
         }
-        while self.bytes.saturating_add(additional_bytes) > self.max_bytes {
+        while self.memory_usage.saturating_add(additional_memory) > self.max_bytes {
             let Some((package, package_vsize, package_fee)) =
                 self.lowest_eviction_package(protected)
             else {
@@ -1829,9 +1892,9 @@ impl Mempool {
             return;
         }
         let mut halflife = ROLLING_FEE_HALFLIFE_SECS;
-        if self.bytes < self.max_bytes / 4 {
+        if self.memory_usage < self.max_bytes / 4 {
             halflife /= 4.0;
-        } else if self.bytes < self.max_bytes / 2 {
+        } else if self.memory_usage < self.max_bytes / 2 {
             halflife /= 2.0;
         }
         let elapsed = now.saturating_sub(self.rolling_fee_last_updated) as f64;
@@ -2068,6 +2131,7 @@ impl Mempool {
         self.children.clear();
         self.wtxids.clear();
         let relay_sequences = std::mem::take(&mut self.relay_sequences);
+        self.memory_usage = 0;
         self.bytes = 0;
         self.vbytes = 0;
         let unbroadcast = std::mem::take(&mut self.unbroadcast);
@@ -2100,6 +2164,9 @@ impl Mempool {
         self.wtxids.remove(&entry.transaction.compute_wtxid());
         self.relay_sequences.remove(txid);
         let size = bitcoin::consensus::encode::serialize(&entry.transaction).len();
+        self.memory_usage = self
+            .memory_usage
+            .saturating_sub(mempool_entry_memory_usage(&entry.transaction));
         self.bytes = self.bytes.saturating_sub(size);
         self.vbytes = self.vbytes.saturating_sub(entry.vsize);
         for input in &entry.transaction.input {
@@ -3569,13 +3636,16 @@ mod tests {
         let low_id = low.compute_txid();
         let high = graph_transaction(Txid::from_byte_array([21; 32]), 21);
         let high_id = high.compute_txid();
-        let low_size = bitcoin::consensus::encode::serialize(&low).len();
-        let high_size = bitcoin::consensus::encode::serialize(&high).len();
+        let low_memory = mempool_entry_memory_usage(&low);
+        let high_memory = mempool_entry_memory_usage(&high);
         let mut pool = Mempool::new(Network::Regtest);
-        pool.max_bytes = low_size.saturating_add(high_size).saturating_sub(1);
+        pool.max_bytes = low_memory.saturating_add(high_memory).saturating_sub(1);
         for (transaction, fee_sat) in [(low, 1), (high, 100)] {
             let txid = transaction.compute_txid();
             let wtxid = transaction.compute_wtxid();
+            pool.memory_usage = pool
+                .memory_usage
+                .saturating_add(mempool_entry_memory_usage(&transaction));
             pool.bytes = pool
                 .bytes
                 .saturating_add(bitcoin::consensus::encode::serialize(&transaction).len());
@@ -3599,9 +3669,11 @@ mod tests {
         let parent = graph_transaction(Txid::from_byte_array([22; 32]), 22);
         let parent_id = parent.compute_txid();
         let parent_size = bitcoin::consensus::encode::serialize(&parent).len();
+        let parent_memory = mempool_entry_memory_usage(&parent);
         let mut protected_pool = Mempool::new(Network::Regtest);
-        protected_pool.max_bytes = parent_size;
+        protected_pool.max_bytes = parent_memory;
         protected_pool.bytes = parent_size;
+        protected_pool.memory_usage = parent_memory;
         protected_pool.entries.insert(
             parent_id,
             MempoolEntry {

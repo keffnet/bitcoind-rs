@@ -480,8 +480,8 @@ pub struct Args {
     #[arg(long, default_value = "./data")]
     pub datadir: PathBuf,
 
-    #[arg(long, default_value = "127.0.0.1:8333")]
-    pub p2p: SocketAddr,
+    #[arg(long)]
+    pub p2p: Option<SocketAddr>,
 
     #[arg(
         long,
@@ -499,8 +499,8 @@ pub struct Args {
     )]
     pub dnsseed: Option<bool>,
 
-    #[arg(long, default_value = "127.0.0.1:8332")]
-    pub rpc: SocketAddr,
+    #[arg(long)]
+    pub rpc: Option<SocketAddr>,
 
     #[arg(long, default_value = "127.0.0.1:30001")]
     pub electrum: SocketAddr,
@@ -844,6 +844,13 @@ pub struct Config {
 
 impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
+        let network = args.network.into();
+        let p2p = args
+            .p2p
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_p2p_port(network))));
+        let rpc = args
+            .rpc
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_rpc_port(network))));
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
         }
@@ -979,10 +986,7 @@ impl Config {
         {
             bail!("ZMQ high water marks must be greater than zero");
         }
-        if listen
-            && args.p2p.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-            && args.p2p.port() == 0
-        {
+        if listen && p2p.ip() == IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) && p2p.port() == 0 {
             bail!("--p2p must use a non-zero port when binding all interfaces");
         }
         let signet_challenge = match args.signet_challenge {
@@ -1002,7 +1006,6 @@ impl Config {
         if args.peerblockfilters && !blockfilterindex {
             bail!("--peerblockfilters requires --blockfilterindex");
         }
-        let network = args.network.into();
         let connect_disabled = args.no_connect
             || (args.connect.len() == 1 && args.connect.first().is_some_and(|value| value == "0"));
         let seed_nodes = args
@@ -1020,9 +1023,9 @@ impl Config {
         Ok(Self {
             network,
             datadir: args.datadir,
-            p2p_bind: args.p2p,
+            p2p_bind: p2p,
             listen,
-            rpc_bind: Some(args.rpc),
+            rpc_bind: Some(rpc),
             electrum_bind: Some(args.electrum),
             rest: args.rest,
             seed_nodes,
@@ -1111,6 +1114,16 @@ pub(crate) fn default_p2p_port(network: Network) -> u16 {
         Network::Testnet4 => 48333,
         Network::Signet => 38333,
         Network::Regtest => 18444,
+    }
+}
+
+fn default_rpc_port(network: Network) -> u16 {
+    match network {
+        Network::Bitcoin => 8332,
+        Network::Testnet => 18332,
+        Network::Testnet4 => 48332,
+        Network::Signet => 38332,
+        Network::Regtest => 18443,
     }
 }
 
@@ -1390,6 +1403,8 @@ mod tests {
                 NetworkEndpoint::from_socket("192.0.2.2:18444".parse().unwrap()),
             ]
         );
+        assert_eq!(config.p2p_bind, "127.0.0.1:18444".parse().unwrap());
+        assert_eq!(config.rpc_bind, Some("127.0.0.1:18443".parse().unwrap()));
         assert!(config.listen);
         assert!(config.dnsseed);
 

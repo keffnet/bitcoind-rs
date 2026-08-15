@@ -1053,13 +1053,16 @@ impl Args {
         }
 
         let cli_network = raw_option_value(&raw, "network");
+        let cli_network_alias = ["mainnet", "testnet", "testnet4", "signet", "regtest"]
+            .into_iter()
+            .find(|name| raw_option_present(&raw, name));
+        let cli_network_selector = cli_network.is_some() || cli_network_alias.is_some();
         let selected_network = cli_network
             .as_deref()
             .map(canonical_network_name)
             .or_else(|| {
-                ["mainnet", "testnet", "testnet4", "signet", "regtest"]
-                    .into_iter()
-                    .find(|name| raw_bool_option(&raw, name))
+                cli_network_alias
+                    .filter(|name| raw_bool_option(&raw, name))
                     .map(canonical_network_name)
             })
             .or_else(|| {
@@ -1085,8 +1088,13 @@ impl Args {
         let config_args = entries
             .into_iter()
             .filter(|entry| config_section_applies(entry.section.as_deref(), selected_network))
+            .filter(|entry| !is_network_selector_key(&entry.key))
             .filter_map(config_entry_to_arg)
             .collect::<Vec<_>>();
+        let mut config_args = config_args;
+        if !cli_network_selector {
+            config_args.push(OsString::from(format!("--network={selected_network}")));
+        }
 
         let mut merged = Vec::with_capacity(raw.len().saturating_add(config_args.len()));
         if let Some(program) = raw.first() {
@@ -1100,7 +1108,8 @@ impl Args {
 
 fn raw_option_value(args: &[OsString], name: &str) -> Option<String> {
     let prefix = format!("--{name}=");
-    for (index, argument) in args.iter().enumerate().skip(1) {
+    for index in (1..args.len()).rev() {
+        let argument = &args[index];
         let value = argument.to_str()?;
         if let Some(value) = value.strip_prefix(&prefix) {
             return Some(value.to_owned());
@@ -1122,23 +1131,46 @@ fn is_true(value: &str) -> bool {
     )
 }
 
+fn raw_option_present(args: &[OsString], name: &str) -> bool {
+    let exact = format!("--{name}");
+    let prefix = format!("{exact}=");
+    args.iter().skip(1).any(|argument| {
+        argument
+            .to_str()
+            .is_some_and(|value| value == exact || value.starts_with(&prefix))
+    })
+}
+
 fn raw_bool_option(args: &[OsString], name: &str) -> bool {
     let exact = format!("--{name}");
     let prefix = format!("{exact}=");
-    args.iter().enumerate().skip(1).any(|(index, argument)| {
+    let mut selected = None;
+    for (index, argument) in args.iter().enumerate().skip(1) {
         let Some(value) = argument.to_str() else {
-            return false;
+            continue;
         };
         if let Some(value) = value.strip_prefix(&prefix) {
-            return is_true(value);
+            selected = Some(is_true(value));
+            continue;
         }
         if value != exact {
-            return false;
+            continue;
         }
-        args.get(index + 1)
-            .and_then(|value| value.to_str())
-            .is_none_or(|value| value.starts_with('-') || is_true(value))
-    })
+        selected = Some(
+            args.get(index + 1)
+                .and_then(|value| value.to_str())
+                .is_none_or(|value| value.starts_with('-') || is_true(value)),
+        );
+    }
+    selected.unwrap_or(false)
+}
+
+fn is_network_selector_key(key: &str) -> bool {
+    key == "network"
+        || matches!(
+            key,
+            "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
+        )
 }
 
 fn read_config_file(
@@ -1976,6 +2008,40 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(Config::from_args(args).unwrap().network, Network::Regtest);
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--conf",
+            alias_config.to_str().unwrap(),
+            "--network=bitcoin",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().network, Network::Bitcoin);
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--conf",
+            alias_config.to_str().unwrap(),
+            "--network=regtest",
+            "--network=testnet",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().network, Network::Testnet);
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--conf",
+            alias_config.to_str().unwrap(),
+            "--regtest=false",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().network, Network::Bitcoin);
     }
 
     #[test]

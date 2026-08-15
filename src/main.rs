@@ -88,10 +88,20 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     } else {
         builder.init();
     }
-    readiness.notify(true);
     #[cfg(unix)]
     let log_reopen_task = log_file.map(|log_file| tokio::spawn(reopen_log_on_sighup(log_file)));
-    let result = node.run().await;
+    let (startup_sender, startup_receiver) = tokio::sync::oneshot::channel();
+    let mut node_run = Box::pin(node.run_with_startup(Some(startup_sender)));
+    let result = tokio::select! {
+        ready = startup_receiver => {
+            readiness.notify(ready.is_ok());
+            node_run.await
+        }
+        result = &mut node_run => {
+            readiness.notify(false);
+            result
+        }
+    };
     #[cfg(unix)]
     if let Some(task) = log_reopen_task {
         task.abort();

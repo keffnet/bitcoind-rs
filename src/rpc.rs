@@ -53,7 +53,7 @@ use crate::mempool::{
 };
 use crate::validation;
 use crate::wire;
-use crate::{Node, ScanState};
+use crate::{Node, ScanState, StartupLatch};
 
 const MAX_HTTP_REQUEST: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
@@ -136,12 +136,19 @@ impl RpcServer {
     }
 
     pub async fn run(self) -> Result<()> {
+        self.run_with_startup(None).await
+    }
+
+    pub(crate) async fn run_with_startup(self, startup: Option<Arc<StartupLatch>>) -> Result<()> {
         let binds = if self.node.config.rpc_binds.is_empty() {
             self.node.config.rpc_bind.into_iter().collect::<Vec<_>>()
         } else {
             self.node.config.rpc_binds.clone()
         };
         if binds.is_empty() {
+            if let Some(startup) = startup.as_deref() {
+                startup.service_ready();
+            }
             return std::future::pending::<Result<()>>().await;
         }
         let work_queue = Arc::new(RpcWorkQueue::new(
@@ -181,6 +188,9 @@ impl RpcServer {
         }
         if bound == 0 {
             bail!("unable to bind any RPC listener");
+        }
+        if let Some(startup) = startup.as_deref() {
+            startup.service_ready();
         }
         while let Some(result) = listeners.join_next().await {
             result??;

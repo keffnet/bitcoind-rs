@@ -39,7 +39,7 @@ use parking_lot::RwLock;
 use rand::random;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, broadcast, oneshot};
 use tracing::{info, warn};
 
 use crate::address::NetworkEndpoint;
@@ -89,6 +89,28 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         tokio::signal::ctrl_c()
             .await
             .context("waiting for shutdown signal")
+    }
+}
+
+pub(crate) struct StartupLatch {
+    remaining: AtomicUsize,
+    sender: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl StartupLatch {
+    pub(crate) fn new(sender: oneshot::Sender<()>, services: usize) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: AtomicUsize::new(services),
+            sender: parking_lot::Mutex::new(Some(sender)),
+        })
+    }
+
+    pub(crate) fn service_ready(&self) {
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1
+            && let Some(sender) = self.sender.lock().take()
+        {
+            let _ = sender.send(());
+        }
     }
 }
 
@@ -3478,10 +3500,22 @@ impl Node {
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
+        self.run_with_startup(None).await
+    }
+
+    pub async fn run_with_startup(
+        self: Arc<Self>,
+        startup_sender: Option<oneshot::Sender<()>>,
+    ) -> Result<()> {
+        let startup = startup_sender.map(|sender| StartupLatch::new(sender, 4));
         let p2p = p2p::PeerManager::new(self.clone());
         let rpc = rpc::RpcServer::new(self.clone());
         let electrum = electrum::ElectrumServer::new(self.clone());
-        let mut zmq_task = tokio::spawn(zmq::run(self.config.zmq.clone(), self.subscribe_zmq()));
+        let mut zmq_task = tokio::spawn(zmq::run_with_startup(
+            self.config.zmq.clone(),
+            self.subscribe_zmq(),
+            startup.clone(),
+        ));
 
         info!(
             network = ?self.config.network,
@@ -3491,9 +3525,9 @@ impl Node {
             "starting wallet-free Bitcoin node"
         );
 
-        let mut p2p_task = tokio::spawn(p2p.run());
-        let mut rpc_task = tokio::spawn(rpc.run());
-        let mut electrum_task = tokio::spawn(electrum.run());
+        let mut p2p_task = tokio::spawn(p2p.run_with_startup(startup.clone()));
+        let mut rpc_task = tokio::spawn(rpc.run_with_startup(startup.clone()));
+        let mut electrum_task = tokio::spawn(electrum.run_with_startup(startup));
         run_notify_command(self.config.startup_notify.as_deref(), None);
         let background_node = self.clone();
         let background_validation_task = tokio::spawn(async move {

@@ -48,7 +48,7 @@ use crate::wire::{
 };
 use crate::{
     MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, PRIVATE_BROADCAST_RETRY_SECS, PeerRegistrationOptions,
-    unix_time_seconds,
+    StartupLatch, unix_time_seconds,
 };
 
 enum PeerReader {
@@ -1131,6 +1131,10 @@ impl PeerManager {
     }
 
     pub async fn run(self) -> Result<()> {
+        self.run_with_startup(None).await
+    }
+
+    pub(crate) async fn run_with_startup(self, startup: Option<Arc<StartupLatch>>) -> Result<()> {
         let listeners = if self.node.config.listen {
             let binds = if self.node.config.p2p_binds.is_empty() {
                 vec![self.node.config.p2p_bind]
@@ -1170,6 +1174,9 @@ impl PeerManager {
         } else {
             Vec::new()
         };
+        if let Some(startup) = startup.as_deref() {
+            startup.service_ready();
+        }
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
         let manual_slots = Arc::new(Semaphore::new(MAX_ADDNODE_CONNECTIONS));
         let private_slots = Arc::new(Semaphore::new(MAX_PRIVATE_BROADCAST_CONNECTIONS));

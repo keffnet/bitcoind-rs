@@ -13,8 +13,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::debug;
 
-use crate::Node;
 use crate::chain;
+use crate::{Node, StartupLatch};
 
 const MAX_LINE_SIZE: usize = 1024 * 1024;
 const SERVER_NAME: &str = "bitcoind-rs 0.1.0";
@@ -95,12 +95,22 @@ impl ElectrumServer {
     }
 
     pub async fn run(self) -> Result<()> {
+        self.run_with_startup(None).await
+    }
+
+    pub(crate) async fn run_with_startup(self, startup: Option<Arc<StartupLatch>>) -> Result<()> {
         let Some(address) = self.node.config.electrum_bind else {
+            if let Some(startup) = startup.as_deref() {
+                startup.service_ready();
+            }
             return std::future::pending::<Result<()>>().await;
         };
         let listener = TcpListener::bind(address)
             .await
             .with_context(|| format!("binding Electrum listener {address}"))?;
+        if let Some(startup) = startup.as_deref() {
+            startup.service_ready();
+        }
         loop {
             let (stream, peer) = listener.accept().await?;
             let node = self.node.clone();

@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 use tracing::warn;
 use zeromq::{PubSocket, Socket, SocketSend, ZmqMessage};
 
+use crate::StartupLatch;
 use crate::config::ZmqConfig;
 
 #[derive(Clone, Debug)]
@@ -57,9 +58,16 @@ impl TopicSequences {
     }
 }
 
-pub(crate) async fn run(config: ZmqConfig, mut events: broadcast::Receiver<Event>) -> Result<()> {
+pub(crate) async fn run_with_startup(
+    config: ZmqConfig,
+    mut events: broadcast::Receiver<Event>,
+    startup: Option<Arc<StartupLatch>>,
+) -> Result<()> {
     let notifications = config.notifications();
     if !config.is_enabled() {
+        if let Some(startup) = startup.as_deref() {
+            startup.service_ready();
+        }
         return std::future::pending::<Result<()>>().await;
     }
 
@@ -72,6 +80,9 @@ pub(crate) async fn run(config: ZmqConfig, mut events: broadcast::Receiver<Event
                 .await
                 .with_context(|| format!("binding ZMQ publisher {}", notification.address))?;
         }
+    }
+    if let Some(startup) = startup.as_deref() {
+        startup.service_ready();
     }
 
     let enabled_hash_tx = !config.pub_hash_tx.is_empty();

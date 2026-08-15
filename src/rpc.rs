@@ -13225,11 +13225,7 @@ mod tests {
         assert!(info.get("currentblocktx").is_none());
         get_block_template(&node, &json!([{"rules": ["segwit"]}])).unwrap();
         let info = get_mining_info(&node).unwrap();
-        assert!(
-            info["currentblockweight"]
-                .as_u64()
-                .is_some_and(|weight| weight > 0)
-        );
+        assert_eq!(info["currentblockweight"], json!(8_000));
         assert_eq!(info["currentblocktx"], json!(0));
     }
 

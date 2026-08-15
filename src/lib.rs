@@ -1929,8 +1929,18 @@ impl Node {
     }
 
     pub(crate) fn record_mining_block(&self, block: &Block) {
-        *self.last_mining_block.write() =
-            Some((block.weight().to_wu(), block.txdata.len().saturating_sub(1)));
+        let transaction_weight = block
+            .txdata
+            .iter()
+            .skip(1)
+            .map(|transaction| transaction.weight().to_wu())
+            .sum::<u64>();
+        *self.last_mining_block.write() = Some((
+            self.config
+                .block_reserved_weight
+                .saturating_add(transaction_weight),
+            block.txdata.len().saturating_sub(1),
+        ));
     }
 
     pub(crate) fn last_mining_block(&self) -> Option<(u64, usize)> {

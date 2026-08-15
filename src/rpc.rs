@@ -8897,6 +8897,7 @@ fn build_mining_block_with_transactions(
         transactions,
         fees,
         extra_nonce: random(),
+        version: node.config.block_version,
     })?;
     if block.weight().to_wu() > node.config.block_max_weight {
         bail!("generated block exceeds the block weight limit")
@@ -8915,6 +8916,7 @@ struct MiningBlockTemplate {
     transactions: Vec<Transaction>,
     fees: u64,
     extra_nonce: u32,
+    version: Option<i32>,
 }
 
 fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
@@ -8928,6 +8930,7 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
         transactions,
         fees,
         extra_nonce,
+        version,
     } = template;
     let segwit_active = height >= validation::buried_deployment_heights(network).segwit;
     let mut coinbase = Transaction {
@@ -8954,7 +8957,7 @@ fn mining_block(template: MiningBlockTemplate) -> Result<Block> {
     }
     let mut block = Block {
         header: Header {
-            version: BlockVersion::from_consensus(0x2000_0000),
+            version: BlockVersion::from_consensus(version.unwrap_or(0x2000_0000)),
             prev_blockhash: parent.block_hash(),
             merkle_root: bitcoin::TxMerkleNode::all_zeros(),
             time,
@@ -9153,6 +9156,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         transactions: selected_transactions,
         fees,
         extra_nonce: 0,
+        version: node.config.block_version,
     })?;
     node.record_mining_block(&template_block);
     let default_witness_commitment = segwit_active.then(|| {
@@ -9174,13 +9178,16 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     let headers = chain.active_headers();
     let [testdummy, taproot] = validation::bip9_deployments(chain.network);
-    let mut version = 0x2000_0000u32;
+    let custom_version = node.config.block_version;
+    let mut version = custom_version.unwrap_or(0x2000_0000);
     let mut vbavailable = serde_json::Map::new();
     for (name, deployment) in [("testdummy", testdummy), ("taproot", taproot)] {
         let (state, _) = bip9_state_at_height(headers, deployment, tip.height);
         match state {
             Bip9State::Started | Bip9State::LockedIn => {
-                version |= 1u32 << deployment.bit;
+                if custom_version.is_none() {
+                    version |= 1i32 << deployment.bit;
+                }
                 vbavailable.insert(name.to_owned(), json!(deployment.bit));
             }
             Bip9State::Active => rules.push(name),
@@ -12010,6 +12017,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -12232,6 +12240,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -12327,6 +12336,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -12447,6 +12457,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -12504,6 +12515,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -12564,6 +12576,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -12659,6 +12672,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -12743,6 +12757,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13039,6 +13054,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13128,6 +13144,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13200,6 +13217,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13265,6 +13283,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13333,6 +13352,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13388,6 +13408,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13452,6 +13473,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13505,6 +13527,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13635,6 +13658,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13713,6 +13737,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13785,6 +13810,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13895,6 +13921,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -13965,6 +13992,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14070,6 +14098,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14238,6 +14267,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 120_000,
             block_reserved_weight: 8_000,
+            block_version: Some(1337),
             block_min_tx_fee_sat_per_kvb: 1_000,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14267,6 +14297,7 @@ mod tests {
                 .as_str()
                 .is_some_and(|value| value.starts_with("6a24aa21a9ed"))
         );
+        assert_eq!(template["version"], json!(1337));
         assert!(get_block_template(&node, &json!([{"mode": 1, "rules": ["segwit"]}])).is_err());
         assert!(get_block_template(&node, &json!([{"rules": 1}])).is_err());
         assert!(get_block_template(&node, &json!([{"rules": [1]}])).is_err());
@@ -14282,6 +14313,7 @@ mod tests {
             transactions: Vec::new(),
             fees: 0,
             extra_nonce: 0,
+            version: None,
         })
         .unwrap();
         assert!(pre_segwit_block.txdata[0].input[0].witness.is_empty());
@@ -14303,6 +14335,7 @@ mod tests {
             transactions: Vec::new(),
             fees: 0,
             extra_nonce: 0,
+            version: None,
         })
         .unwrap();
         while proposal.header.target().is_met_by(proposal.block_hash()) {
@@ -14401,6 +14434,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14455,6 +14489,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14511,6 +14546,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14572,6 +14608,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14639,6 +14676,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14713,6 +14751,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14785,6 +14824,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14871,6 +14911,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -14990,6 +15031,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -15047,6 +15089,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -15264,6 +15307,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -15384,6 +15428,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -15464,6 +15509,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -15650,6 +15696,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -15945,6 +15992,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -16010,6 +16058,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -16200,6 +16249,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -16269,6 +16319,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -16670,6 +16721,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -16734,6 +16786,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -16837,6 +16890,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -17071,6 +17125,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -17478,6 +17533,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -17606,6 +17662,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -17761,6 +17818,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -18022,6 +18080,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -18089,6 +18148,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,
@@ -18177,6 +18237,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,

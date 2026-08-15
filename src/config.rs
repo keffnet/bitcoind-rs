@@ -560,6 +560,9 @@ pub struct Args {
     #[arg(long, default_value_t = DEFAULT_BLOCK_RESERVED_WEIGHT)]
     pub blockreservedweight: u64,
 
+    #[arg(long)]
+    pub blockversion: Option<i32>,
+
     #[arg(long, default_value = "0.00000001")]
     pub blockmintxfee: String,
 
@@ -747,6 +750,7 @@ pub struct Config {
     pub peer_timeout_secs: u64,
     pub block_max_weight: u64,
     pub block_reserved_weight: u64,
+    pub block_version: Option<i32>,
     pub block_min_tx_fee_sat_per_kvb: u64,
     pub min_relay_tx_fee_sat_per_kvb: u64,
     pub incremental_relay_fee_sat_per_kvb: u64,
@@ -935,6 +939,7 @@ impl Config {
             peer_timeout_secs: args.peertimeout,
             block_max_weight: args.blockmaxweight.max(args.blockreservedweight),
             block_reserved_weight: args.blockreservedweight,
+            block_version: args.blockversion,
             block_min_tx_fee_sat_per_kvb,
             min_relay_tx_fee_sat_per_kvb,
             incremental_relay_fee_sat_per_kvb,
@@ -1434,6 +1439,8 @@ mod tests {
             "2500000",
             "--blockreservedweight",
             "9000",
+            "--blockversion",
+            "1337",
             "--blockmintxfee",
             "0.00001000",
         ])
@@ -1441,6 +1448,7 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert_eq!(config.block_max_weight, 2_500_000);
         assert_eq!(config.block_reserved_weight, 9_000);
+        assert_eq!(config.block_version, Some(1337));
         assert_eq!(config.block_min_tx_fee_sat_per_kvb, 1_000);
 
         let args = Args::try_parse_from([

@@ -3169,6 +3169,7 @@ mod tests {
             peer_timeout_secs: 60,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
+            block_version: None,
             block_min_tx_fee_sat_per_kvb: 1,
             min_relay_tx_fee_sat_per_kvb: 100,
             incremental_relay_fee_sat_per_kvb: 100,

@@ -3585,6 +3585,7 @@ mod tests {
             onlynet: Vec::new(),
             proxy: None,
             i2p_sam: None,
+            onion_proxy: None,
             i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),

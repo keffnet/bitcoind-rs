@@ -30,6 +30,9 @@ pub const DEFAULT_PERMIT_BARE_MULTISIG: bool = true;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 pub const DEFAULT_PERSIST_MEMPOOL: bool = true;
 pub const DEFAULT_BLOCKFILTERINDEX: &str = "0";
+pub const DEFAULT_RPC_THREADS: usize = 16;
+pub const DEFAULT_RPC_WORK_QUEUE: usize = 64;
+pub const DEFAULT_RPC_SERVER_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -561,6 +564,15 @@ pub struct Args {
     #[arg(long = "rpcport", value_name = "PORT")]
     pub rpc_port: Option<u16>,
 
+    #[arg(long = "rpcservertimeout", default_value_t = DEFAULT_RPC_SERVER_TIMEOUT_SECS)]
+    pub rpc_server_timeout: u64,
+
+    #[arg(long = "rpcthreads", default_value_t = DEFAULT_RPC_THREADS)]
+    pub rpc_threads: usize,
+
+    #[arg(long = "rpcworkqueue", default_value_t = DEFAULT_RPC_WORK_QUEUE)]
+    pub rpc_work_queue: usize,
+
     #[arg(long = "rpcbind", value_name = "IP[:PORT]", value_delimiter = ',')]
     pub rpc_binds: Vec<String>,
 
@@ -911,6 +923,9 @@ pub struct Config {
     pub(crate) rpc_cookie_path: Option<PathBuf>,
     pub(crate) rpc_whitelist: HashMap<String, HashSet<String>>,
     pub(crate) rpc_whitelist_default: bool,
+    pub rpc_server_timeout_secs: u64,
+    pub rpc_threads: usize,
+    pub rpc_work_queue: usize,
     pub electrum_bind: Option<SocketAddr>,
     pub rest: bool,
     pub seed_nodes: Vec<NetworkEndpoint>,
@@ -1025,6 +1040,9 @@ impl Config {
             args.rpc_user.as_deref(),
             args.rpc_password.as_deref(),
         )?;
+        let rpc_server_timeout_secs = args.rpc_server_timeout.max(1);
+        let rpc_threads = args.rpc_threads.max(1);
+        let rpc_work_queue = args.rpc_work_queue.max(1);
         if args.no_rpc_cookie_file && args.rpc_cookie_file.is_some() {
             bail!("--norpccookiefile cannot be combined with --rpccookiefile");
         }
@@ -1248,6 +1266,9 @@ impl Config {
             rpc_cookie_path,
             rpc_whitelist,
             rpc_whitelist_default,
+            rpc_server_timeout_secs,
+            rpc_threads,
+            rpc_work_queue,
             electrum_bind: Some(args.electrum),
             rest: args.rest,
             seed_nodes,
@@ -1865,6 +1886,20 @@ mod tests {
                 "[::1]:18446".parse().unwrap(),
             ]
         );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpcservertimeout=0",
+            "--rpcthreads=0",
+            "--rpcworkqueue=0",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.rpc_server_timeout_secs, 1);
+        assert_eq!(config.rpc_threads, 1);
+        assert_eq!(config.rpc_work_queue, 1);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

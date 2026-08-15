@@ -36,6 +36,8 @@ The default configuration listens on the selected network’s loopback P2P and J
 
 JSON-RPC allows loopback clients by default and uses the standard cookie file at `<datadir>/.cookie`; clients should send it as HTTP Basic authentication (`curl --user "$(cat data/.cookie)" ...`). Add repeatable `--rpcallowip=<ip[/prefix]>` rules for additional source networks, or use Core-style dotted IPv4 netmasks. `--rpcuser`/`--rpcpassword` enables plaintext credential authentication instead of the cookie, while repeatable `--rpcauth=USER:SALT$HASH` enables salted HMAC-SHA-256 credentials alongside cookie authentication. Use `--rpccookiefile=<path>` to relocate the generated cookie relative to the data directory, or `--norpccookiefile` when alternate credentials are configured. Repeatable `--rpcwhitelist=USER:METHOD[,METHOD]` rules restrict authenticated users to named RPC methods; specifying any rule enables the Core default that users without a rule are denied, overridable with `--rpcwhitelistdefault=false`.
 
+RPC request handling uses Core-compatible defaults of 16 worker slots, 64 queued requests, and a 30-second HTTP timeout. These can be tuned with `--rpcthreads`, `--rpcworkqueue`, and `--rpcservertimeout`.
+
 For the public signet, use `--network signet`. Custom BIP325 challenges can be supplied as script hex with `--signet-challenge <hex>`.
 
 Bloom-filter peer relay is disabled by default, matching Core's default; enable it with `--peer-bloom-filters` when serving BIP37 clients.

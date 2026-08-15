@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock, atomic::Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -39,7 +40,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::broadcast;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio::task::JoinSet;
 use tracing::debug;
 
@@ -110,6 +111,26 @@ pub struct RpcServer {
     node: Arc<Node>,
 }
 
+struct RpcWorkQueue {
+    pending: Arc<Semaphore>,
+    workers: Arc<Semaphore>,
+}
+
+impl RpcWorkQueue {
+    fn new(threads: usize, queue_depth: usize) -> Self {
+        Self {
+            pending: Arc::new(Semaphore::new(threads.saturating_add(queue_depth).max(1))),
+            workers: Arc::new(Semaphore::new(threads.max(1))),
+        }
+    }
+
+    async fn acquire(&self) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let pending = self.pending.clone().try_acquire_owned().ok()?;
+        let worker = self.workers.clone().acquire_owned().await.ok()?;
+        Some((pending, worker))
+    }
+}
+
 impl RpcServer {
     pub fn new(node: Arc<Node>) -> Self {
         Self { node }
@@ -124,18 +145,27 @@ impl RpcServer {
         if binds.is_empty() {
             return std::future::pending::<Result<()>>().await;
         }
+        let work_queue = Arc::new(RpcWorkQueue::new(
+            self.node.config.rpc_threads,
+            self.node.config.rpc_work_queue,
+        ));
+        let request_timeout = Duration::from_secs(self.node.config.rpc_server_timeout_secs);
         let mut listeners = JoinSet::new();
         for address in binds {
             let listener = TcpListener::bind(address)
                 .await
                 .with_context(|| format!("binding RPC listener {address}"))?;
             let node = self.node.clone();
+            let work_queue = work_queue.clone();
             listeners.spawn(async move {
                 loop {
                     let (stream, peer) = listener.accept().await?;
                     let node = node.clone();
+                    let work_queue = work_queue.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_connection(node, stream, peer).await {
+                        if let Err(error) =
+                            handle_connection(node, stream, peer, work_queue, request_timeout).await
+                        {
                             debug!(%peer, %error, "RPC connection ended");
                         }
                     });
@@ -151,7 +181,13 @@ impl RpcServer {
     }
 }
 
-async fn handle_connection(node: Arc<Node>, stream: TcpStream, peer: SocketAddr) -> Result<()> {
+async fn handle_connection(
+    node: Arc<Node>,
+    stream: TcpStream,
+    peer: SocketAddr,
+    work_queue: Arc<RpcWorkQueue>,
+    request_timeout: Duration,
+) -> Result<()> {
     stream.set_nodelay(true)?;
     let mut connection = HttpConnection::new(stream);
     if !rpc_client_allowed(&node, peer.ip()) {
@@ -166,7 +202,11 @@ async fn handle_connection(node: Arc<Node>, stream: TcpStream, peer: SocketAddr)
         return Ok(());
     }
     loop {
-        let Some(request) = connection.read_request().await? else {
+        let request = match tokio::time::timeout(request_timeout, connection.read_request()).await {
+            Ok(request) => request?,
+            Err(_) => return Ok(()),
+        };
+        let Some(request) = request else {
             return Ok(());
         };
         let keep_alive = request.keep_alive;
@@ -175,12 +215,32 @@ async fn handle_connection(node: Arc<Node>, stream: TcpStream, peer: SocketAddr)
                 || request.method.eq_ignore_ascii_case("POST"))
             && request.target.starts_with("/rest/")
         {
-            match dispatch_rest_with_body(&node, &request.target, &request.body) {
-                Ok((content_type, body)) => ("200 OK", content_type, body),
-                Err(error) => (
+            let Some((_pending, _worker)) = work_queue.acquire().await else {
+                connection
+                    .write_response(
+                        "503 Service Unavailable",
+                        "text/plain",
+                        b"RPC work queue depth exceeded\r\n",
+                        false,
+                    )
+                    .await?;
+                return Ok(());
+            };
+            match tokio::time::timeout(request_timeout, async {
+                dispatch_rest_with_body(&node, &request.target, &request.body)
+            })
+            .await
+            {
+                Ok(Ok((content_type, body))) => ("200 OK", content_type, body),
+                Ok(Err(error)) => (
                     rest_error_status(&error),
                     "text/plain",
                     format!("{error}\r\n").into_bytes(),
+                ),
+                Err(_) => (
+                    "500 Internal Server Error",
+                    "text/plain",
+                    b"RPC request timed out\r\n".to_vec(),
                 ),
             }
         } else {
@@ -207,20 +267,44 @@ async fn handle_connection(node: Arc<Node>, stream: TcpStream, peer: SocketAddr)
                     .await?;
                 return Ok(());
             }
-            let response = dispatch_json_rpc_http(&node, &request.body).await;
-            let body = response
-                .body
-                .map(|value| {
-                    let mut body = serde_json::to_vec(&value)?;
-                    body.push(b'\n');
-                    Ok::<_, serde_json::Error>(body)
-                })
-                .transpose()?;
-            (
-                response.status,
-                "application/json",
-                body.unwrap_or_default(),
+            let Some((_pending, _worker)) = work_queue.acquire().await else {
+                connection
+                    .write_response(
+                        "503 Service Unavailable",
+                        "text/plain",
+                        b"RPC work queue depth exceeded\r\n",
+                        false,
+                    )
+                    .await?;
+                return Ok(());
+            };
+            match tokio::time::timeout(
+                request_timeout,
+                dispatch_json_rpc_http(&node, &request.body),
             )
+            .await
+            {
+                Ok(response) => {
+                    let body = response
+                        .body
+                        .map(|value| {
+                            let mut body = serde_json::to_vec(&value)?;
+                            body.push(b'\n');
+                            Ok::<_, serde_json::Error>(body)
+                        })
+                        .transpose()?;
+                    (
+                        response.status,
+                        "application/json",
+                        body.unwrap_or_default(),
+                    )
+                }
+                Err(_) => (
+                    "500 Internal Server Error",
+                    "text/plain",
+                    b"RPC request timed out\r\n".to_vec(),
+                ),
+            }
         };
         connection
             .write_response(status, content_type, &body, keep_alive)
@@ -12094,6 +12178,22 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn rpc_work_queue_caps_pending_requests() {
+        let queue = RpcWorkQueue::new(1, 1);
+        let first = queue.acquire().await.expect("first request permit");
+        let pending = queue
+            .pending
+            .clone()
+            .try_acquire_owned()
+            .expect("configured queue slot");
+        assert!(queue.pending.clone().try_acquire_owned().is_err());
+        assert_eq!(queue.workers.available_permits(), 0);
+        drop(pending);
+        drop(first);
+        assert!(queue.acquire().await.is_some());
+    }
+
     fn basic_auth_header(username: &str, password: &str) -> String {
         let credentials = format!("{username}:{password}");
         format!(
@@ -12348,6 +12448,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -12590,6 +12693,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -12705,6 +12811,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -12845,6 +12954,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -12922,6 +13034,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -13002,6 +13117,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -13117,6 +13235,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -13264,6 +13385,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -13580,6 +13704,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -13689,6 +13816,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -13781,6 +13911,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -13866,6 +13999,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -13954,6 +14090,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -14029,6 +14168,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -14113,6 +14255,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -14186,6 +14331,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -14336,6 +14484,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -14434,6 +14585,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -14526,6 +14680,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -14656,6 +14813,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -14750,6 +14910,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -14875,6 +15038,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -15082,6 +15248,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -15272,6 +15441,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -15346,6 +15518,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -15422,6 +15597,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -15503,6 +15681,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -15590,6 +15771,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -15684,6 +15868,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -15776,6 +15963,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -15916,6 +16106,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -16087,6 +16280,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -16163,6 +16359,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -16408,6 +16607,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -16548,6 +16750,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -16684,6 +16889,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -16890,6 +17098,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -17205,6 +17416,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -17290,6 +17504,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -17500,6 +17717,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -17589,6 +17809,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -18010,6 +18233,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -18094,6 +18320,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -18217,6 +18446,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -18471,6 +18703,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -18898,6 +19133,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -19046,6 +19284,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -19221,6 +19462,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -19502,6 +19746,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -19589,6 +19836,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,
@@ -19697,6 +19947,9 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_server_timeout_secs: 30,
+            rpc_threads: 16,
+            rpc_work_queue: 64,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,

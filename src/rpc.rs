@@ -8304,16 +8304,41 @@ fn sign_transaction_input(
     previous_outputs: Option<&[TxOut]>,
 ) -> Result<()> {
     let nested = prevout.output.script_pubkey.is_p2sh();
-    let (signing_script, segwit) = if let Some(witness_script) = &prevout.witness_script {
-        if !(prevout.output.script_pubkey.is_p2wsh()
+    if nested && prevout.redeem_script.is_none() && prevout.witness_script.is_none() {
+        bail!("Missing redeemScript/witnessScript")
+    }
+    if prevout.output.script_pubkey.is_p2wsh() && prevout.witness_script.is_none() {
+        bail!("Missing redeemScript/witnessScript")
+    }
+    if let Some(redeem_script) = &prevout.redeem_script {
+        if nested
+            && ScriptBuf::new_p2sh(&redeem_script.script_hash()) != prevout.output.script_pubkey
+        {
+            bail!("redeemScript/witnessScript does not match scriptPubKey")
+        }
+        if let Some(witness_script) = &prevout.witness_script {
+            if !redeem_script.is_p2wsh()
+                || ScriptBuf::new_p2wsh(&witness_script.wscript_hash()) != *redeem_script
+            {
+                bail!("redeemScript does not correspond to witnessScript")
+            }
+        } else if nested && redeem_script.is_p2wsh() {
+            bail!("Missing redeemScript/witnessScript")
+        }
+    } else if prevout.witness_script.is_some() && nested {
+        bail!("redeemScript/witnessScript does not match scriptPubKey")
+    }
+    if prevout.witness_script.is_some()
+        && !(prevout.output.script_pubkey.is_p2wsh()
             || (nested
                 && prevout
                     .redeem_script
                     .as_ref()
                     .is_some_and(|script| script.is_p2wsh())))
-        {
-            bail!("witnessScript does not match the prevout script")
-        }
+    {
+        bail!("redeemScript/witnessScript does not match scriptPubKey")
+    }
+    let (signing_script, segwit) = if let Some(witness_script) = &prevout.witness_script {
         (witness_script, true)
     } else if let Some(redeem_script) = &prevout.redeem_script {
         (redeem_script, redeem_script.is_witness_program())

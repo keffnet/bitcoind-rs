@@ -2470,18 +2470,19 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(result)
 }
 
-fn peer_services_names(services: u64) -> Vec<&'static str> {
-    [
-        (wire::NODE_NETWORK, "NETWORK"),
-        (wire::NODE_NETWORK_LIMITED, "NETWORK_LIMITED"),
-        (wire::NODE_BLOOM, "BLOOM"),
-        (wire::NODE_WITNESS, "WITNESS"),
-        (wire::NODE_COMPACT_FILTERS, "COMPACT_FILTERS"),
-        (wire::NODE_P2P_V2, "P2P_V2"),
-    ]
-    .into_iter()
-    .filter_map(|(bit, name)| (services & bit != 0).then_some(name))
-    .collect()
+fn peer_services_names(services: u64) -> Vec<String> {
+    (0..64)
+        .filter(|bit| services & (1u64 << bit) != 0)
+        .map(|bit| match bit {
+            0 => "NETWORK".to_owned(),
+            2 => "BLOOM".to_owned(),
+            3 => "WITNESS".to_owned(),
+            6 => "COMPACT_FILTERS".to_owned(),
+            10 => "NETWORK_LIMITED".to_owned(),
+            11 => "P2P_V2".to_owned(),
+            bit => format!("UNKNOWN[2^{bit}]"),
+        })
+        .collect()
 }
 
 fn peer_network_name(endpoint: &NetworkEndpoint) -> &'static str {
@@ -14975,6 +14976,32 @@ mod tests {
         assert_eq!(ranged_result["success"], true);
         assert_eq!(ranged_result["txouts"], 2);
         assert_eq!(ranged_result["unspents"][0]["height"], 2);
+    }
+
+    #[test]
+    fn service_names_match_core_for_known_and_unknown_bits() {
+        assert_eq!(
+            peer_services_names(
+                wire::NODE_NETWORK
+                    | wire::NODE_NETWORK_LIMITED
+                    | wire::NODE_BLOOM
+                    | wire::NODE_WITNESS
+                    | wire::NODE_COMPACT_FILTERS
+                    | wire::NODE_P2P_V2
+                    | (1u64 << 4)
+                    | (1u64 << 63)
+            ),
+            vec![
+                "NETWORK",
+                "BLOOM",
+                "WITNESS",
+                "UNKNOWN[2^4]",
+                "COMPACT_FILTERS",
+                "NETWORK_LIMITED",
+                "P2P_V2",
+                "UNKNOWN[2^63]",
+            ]
+        );
     }
 
     #[test]

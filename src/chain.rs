@@ -780,7 +780,8 @@ impl ChainState {
                 state.activate_chain(best)?;
             }
         } else if let Some((snapshot, _)) = snapshot {
-            state.active_chain = active_chain.clone();
+            let snapshot_chain_len = snapshot.headers.len();
+            state.active_chain = active_chain[..snapshot_chain_len].to_vec();
             state.headers = snapshot.headers;
             state.utxos = snapshot.utxos;
             state.rebuild_utxo_index();
@@ -793,6 +794,8 @@ impl ChainState {
             state.history = snapshot.history;
             state.prune_height = snapshot.prune_height.or(state.prune_height);
             let persisted_spent_by = snapshot.spent_by;
+            state.active_tx_counts.truncate(snapshot_chain_len);
+            state.active_tx_totals.truncate(snapshot_chain_len);
             let headers = state.headers.clone();
             state.index_active_headers(&headers)?;
             if state.txospender_index_enabled {
@@ -804,6 +807,13 @@ impl ChainState {
                 }
             } else {
                 state.spent_by.clear();
+            }
+            for hash in active_chain.iter().skip(snapshot_chain_len) {
+                let block = state
+                    .store
+                    .get(hash)?
+                    .with_context(|| format!("active block {hash} is missing from block store"))?;
+                state.connect_block_internal(&block, false)?;
             }
         } else {
             state.snapshot_base = None;
@@ -4251,15 +4261,17 @@ impl ChainState {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(error.into()),
         };
-        let Some(tip) = active_chain.last() else {
+        let Some(snapshot_height) = snapshot.headers.len().checked_sub(1) else {
             return Ok(None);
         };
-        if snapshot.tip != tip.to_string()
-            || snapshot.headers.len() != active_chain.len()
+        if snapshot.headers.len() > active_chain.len()
+            || active_chain
+                .get(snapshot_height)
+                .is_none_or(|hash| snapshot.tip != hash.to_string())
             || snapshot
                 .headers
                 .iter()
-                .zip(active_chain)
+                .zip(active_chain.iter())
                 .any(|(header, hash)| header.block_hash() != *hash)
         {
             return Ok(None);
@@ -5492,6 +5504,38 @@ mod tests {
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.snapshot_provenance(), Some((base, false)));
         assert!(reopened.background_chainstate().is_some());
+    }
+
+    #[test]
+    fn reopens_from_a_prefix_snapshot_without_old_block_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        state.persist_snapshot().unwrap();
+        for height in 4..=5 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        let expected_tip = state.best_hash();
+        let expected_stats = state.utxo_stats();
+        let retained_blocks = [
+            state.block_hash(0).unwrap(),
+            state.block_hash(4).unwrap(),
+            state.block_hash(5).unwrap(),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        state
+            .store
+            .prune(&retained_blocks, &retained_blocks)
+            .unwrap();
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), expected_tip);
+        assert_eq!(reopened.utxo_stats(), expected_stats);
+        assert_eq!(reopened.height(), 5);
     }
 
     #[test]

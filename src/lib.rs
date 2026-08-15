@@ -764,6 +764,9 @@ pub struct Node {
 
 impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
+        if let Some(mock_time) = config.mock_time {
+            time::set_mock_time(mock_time);
+        }
         let network_active = config.network_active;
         let i2p_sam = config.i2p_sam.map(|address| {
             Arc::new(i2p::I2pSam::new(
@@ -3733,6 +3736,7 @@ mod tests {
             check_mempool: 0,
             check_addrman: 0,
             max_tip_age_secs: 24 * 60 * 60,
+            mock_time: None,
             stop_at_height: 0,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),

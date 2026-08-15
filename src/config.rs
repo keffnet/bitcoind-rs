@@ -655,6 +655,9 @@ pub struct Args {
     #[arg(long = "maxtipage", default_value_t = DEFAULT_MAX_TIP_AGE_SECS)]
     pub max_tip_age: u64,
 
+    #[arg(long = "mocktime", value_name = "N")]
+    pub mock_time: Option<i64>,
+
     #[arg(long)]
     pub p2p: Option<SocketAddr>,
 
@@ -1388,6 +1391,7 @@ pub struct Config {
     pub shutdown_notify: Option<String>,
     pub stop_at_height: u32,
     pub(crate) max_tip_age_secs: u64,
+    pub mock_time: Option<i64>,
     pub p2p_bind: SocketAddr,
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
@@ -1833,6 +1837,7 @@ impl Config {
             shutdown_notify: args.shutdown_notify,
             stop_at_height: args.stop_at_height,
             max_tip_age_secs: args.max_tip_age,
+            mock_time: args.mock_time,
             p2p_bind: primary_p2p_bind,
             p2p_binds,
             listen,
@@ -3505,12 +3510,14 @@ mod tests {
             "--checkblockindex=9",
             "--checkmempool=7",
             "--checkaddrman=11",
+            "--mocktime=1234",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
         assert_eq!(config.check_block_index, 9);
         assert_eq!(config.check_mempool, 7);
         assert_eq!(config.check_addrman, 11);
+        assert_eq!(config.mock_time, Some(1234));
 
         let args = Args::parse_from_with_config([
             "bitcoind-rs",

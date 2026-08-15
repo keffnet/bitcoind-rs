@@ -132,7 +132,7 @@ fn normalize_address(address: &str) -> String {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum NetworkName {
-    #[value(alias = "mainnet")]
+    #[value(alias = "main", alias = "mainnet")]
     Bitcoin,
     #[value(alias = "test", alias = "testnet3")]
     Testnet,
@@ -550,7 +550,12 @@ impl From<NetworkName> for Network {
     args_override_self = true
 )]
 pub struct Args {
-    #[arg(long, value_enum, default_value_t = NetworkName::Bitcoin)]
+    #[arg(
+        long,
+        visible_alias = "chain",
+        value_enum,
+        default_value_t = NetworkName::Bitcoin
+    )]
     pub network: NetworkName,
 
     #[arg(
@@ -1164,7 +1169,7 @@ pub struct Args {
     )]
     pub whitelistforcerelay: bool,
 
-    #[arg(long, value_name = "HEX")]
+    #[arg(long, visible_alias = "signetchallenge", value_name = "HEX")]
     pub signet_challenge: Option<String>,
 
     /// Override the DNS seed hostnames used by Signet, matching Core's
@@ -1529,7 +1534,8 @@ impl Args {
             );
         }
 
-        let cli_network = raw_option_value(&raw, "network");
+        let cli_network =
+            raw_option_value(&raw, "network").or_else(|| raw_option_value(&raw, "chain"));
         let cli_network_alias = ["mainnet", "testnet", "testnet4", "signet", "regtest"]
             .into_iter()
             .find(|name| raw_option_present(&raw, name));
@@ -1545,7 +1551,9 @@ impl Args {
             .or_else(|| {
                 entries
                     .iter()
-                    .find(|entry| entry.section.is_none() && entry.key == "network")
+                    .find(|entry| {
+                        entry.section.is_none() && matches!(entry.key.as_str(), "network" | "chain")
+                    })
                     .map(|entry| canonical_network_name(&entry.value))
             })
             .or_else(|| {
@@ -1663,7 +1671,7 @@ fn raw_bool_option(args: &[OsString], name: &str) -> bool {
 }
 
 fn is_network_selector_key(key: &str) -> bool {
-    key == "network"
+    matches!(key, "network" | "chain")
         || matches!(
             key,
             "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
@@ -4104,6 +4112,16 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert_eq!(config.network, Network::Regtest);
         assert_eq!(config.max_peers, 7);
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--chain=regtest"]).unwrap();
+        assert_eq!(Config::from_args(args).unwrap().network, Network::Regtest);
+
+        let args =
+            Args::try_parse_from(["bitcoind-rs", "--signet", "--signetchallenge=00"]).unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().signet_challenge,
+            Some(vec![0])
+        );
     }
 
     #[test]

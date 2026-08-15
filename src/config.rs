@@ -1001,10 +1001,15 @@ impl Config {
         if args.rpc_binds.iter().any(|bind| bind.port() == 0) {
             bail!("--rpcbind must use non-zero ports");
         }
-        let rpc_binds = if args.rpc_binds.is_empty() {
+        let rpc_binds = if !args.rpc_binds.is_empty() {
+            args.rpc_binds.clone()
+        } else if args.rpc.is_some() {
             vec![rpc]
         } else {
-            args.rpc_binds.clone()
+            vec![
+                rpc,
+                SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], rpc.port())),
+            ]
         };
         let rpc_allow_ips = args
             .rpc_allow_ips
@@ -1764,6 +1769,24 @@ mod tests {
         assert_eq!(
             Config::from_args(args).unwrap().rpc_bind,
             Some("127.0.0.1:18446".parse().unwrap())
+        );
+        assert_eq!(
+            Config::from_args(
+                Args::try_parse_from([
+                    "bitcoind-rs",
+                    "--datadir",
+                    directory.path().to_str().unwrap(),
+                    "--network=regtest",
+                    "--rpcport=18446",
+                ])
+                .unwrap(),
+            )
+            .unwrap()
+            .rpc_binds,
+            vec![
+                "127.0.0.1:18446".parse().unwrap(),
+                "[::1]:18446".parse().unwrap(),
+            ]
         );
 
         let args = Args::try_parse_from([

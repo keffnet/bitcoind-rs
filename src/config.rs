@@ -483,6 +483,9 @@ pub struct Args {
     #[arg(long)]
     pub p2p: Option<SocketAddr>,
 
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
+
     #[arg(
         long,
         num_args = 0..=1,
@@ -868,9 +871,12 @@ pub struct Config {
 impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
         let network = args.network.into();
-        let p2p = args
-            .p2p
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_p2p_port(network))));
+        let p2p = args.p2p.unwrap_or_else(|| {
+            SocketAddr::from((
+                [127, 0, 0, 1],
+                args.port.unwrap_or_else(|| default_p2p_port(network)),
+            ))
+        });
         let rpc = args
             .rpc
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_rpc_port(network))));
@@ -1457,6 +1463,19 @@ mod tests {
         assert_eq!(config.rpc_bind, Some("127.0.0.1:18443".parse().unwrap()));
         assert!(config.listen);
         assert!(config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--port=18445",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().p2p_bind,
+            "127.0.0.1:18445".parse().unwrap()
+        );
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

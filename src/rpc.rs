@@ -2228,6 +2228,9 @@ fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
 }
 
 fn local_addresses(node: &Arc<Node>) -> Value {
+    if node.config.proxy.is_some() {
+        return json!([]);
+    }
     let Some(address) = node
         .listen_address()
         .filter(|address| is_routable_ip(address.ip()) && node.config.allows_address(*address))
@@ -15008,7 +15011,7 @@ mod tests {
         node.set_listen_address("8.8.8.8:18444".parse().unwrap());
         assert_eq!(
             dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["localaddresses"],
-            json!([{"address": "8.8.8.8", "port": 18444, "score": 2}])
+            json!([])
         );
         node.set_listen_address("[2001:4860:4860::8888]:18444".parse().unwrap());
         assert_eq!(

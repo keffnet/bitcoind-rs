@@ -35,6 +35,7 @@ const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
 const MAX_TX_LEGACY_SIGOPS: usize = 2_500;
 const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
+const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
 /// BIP 431/TRUC transaction version and topology limits.
 const TRUC_VERSION: i32 = 3;
 const TRUC_ANCESTOR_LIMIT: usize = 2;
@@ -326,6 +327,10 @@ pub struct Mempool {
     block_since_last_rolling_fee_bump: bool,
     sequence: u64,
     entries: HashMap<Txid, MempoolEntry>,
+    /// Cached sigop-adjusted transaction weights used by Core's mining and
+    /// mempool feerate calculations. Synthetic test entries fall back to
+    /// their raw transaction weight when this map has no record.
+    adjusted_weights: HashMap<Txid, u64>,
     spent: HashMap<OutPoint, Txid>,
     children: HashMap<Txid, HashSet<Txid>>,
     wtxids: HashMap<Wtxid, Txid>,
@@ -449,6 +454,7 @@ impl Mempool {
             block_since_last_rolling_fee_bump: false,
             sequence: 1,
             entries: HashMap::new(),
+            adjusted_weights: HashMap::new(),
             spent: HashMap::new(),
             children: HashMap::new(),
             wtxids: HashMap::new(),
@@ -474,6 +480,19 @@ impl Mempool {
     /// Sum of virtual transaction sizes, matching Core's `getmempoolinfo.bytes`.
     pub fn vbytes(&self) -> u64 {
         self.vbytes
+    }
+
+    /// Return Core's sigop-adjusted weight for a mempool transaction.
+    pub fn adjusted_weight(&self, txid: &Txid) -> u64 {
+        self.adjusted_weights
+            .get(txid)
+            .copied()
+            .or_else(|| {
+                self.entries
+                    .get(txid)
+                    .map(|entry| entry.transaction.weight().to_wu())
+            })
+            .unwrap_or_default()
     }
 
     pub fn max_bytes(&self) -> usize {
@@ -701,8 +720,7 @@ impl Mempool {
             }
             let package_weight = package
                 .iter()
-                .filter_map(|candidate| self.entries.get(candidate))
-                .map(|entry| entry.transaction.weight().to_wu())
+                .map(|candidate| self.adjusted_weight(candidate))
                 .fold(0u64, u64::saturating_add);
             let package_fee = package
                 .iter()
@@ -744,8 +762,7 @@ impl Mempool {
             }
             let package_weight = package
                 .iter()
-                .filter_map(|candidate| self.entries.get(candidate))
-                .map(|entry| entry.transaction.weight().to_wu())
+                .map(|candidate| self.adjusted_weight(candidate))
                 .fold(0u64, u64::saturating_add);
             let mut package_order = Vec::with_capacity(package.len());
             append_mining_package(self, txid, &package, &mut selected, &mut package_order);
@@ -761,11 +778,7 @@ impl Mempool {
                         i128::from(entry.fee_sat) + i128::from(self.fee_delta(&selected_txid))
                     })
                     .unwrap_or_default();
-                let weight = self
-                    .entries
-                    .get(&selected_txid)
-                    .map(|entry| entry.transaction.weight().to_wu())
-                    .unwrap_or_default();
+                let weight = self.adjusted_weight(&selected_txid);
                 let mut descendants = vec![selected_txid];
                 let mut index = 0;
                 while let Some(current) = descendants.get(index).copied() {
@@ -1394,7 +1407,7 @@ impl Mempool {
             append_feerate_chunk(
                 &mut chunks,
                 self.modified_fee_sat(&txid, entry.fee_sat),
-                entry.transaction.weight().to_wu(),
+                self.adjusted_weight(&txid),
             );
         }
         chunks
@@ -1600,7 +1613,16 @@ impl Mempool {
             return Err(MempoolError::BadOutput);
         }
         let fee_sat = input_total - output_total;
-        let vsize = transaction.vsize() as u64;
+        let script_flags =
+            validation::script_flags_for_block(chain.network, chain.height().saturating_add(1), 0);
+        let sigop_cost =
+            validation::transaction_sigop_cost(&transaction, &previous_outputs, script_flags)
+                as u64;
+        let adjusted_weight = transaction
+            .weight()
+            .to_wu()
+            .max(sigop_cost.saturating_mul(DEFAULT_BYTES_PER_SIGOP));
+        let vsize = adjusted_weight.saturating_add(3) / 4;
         if transaction.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
             return Err(MempoolError::NonStandard("tx-size-small".to_owned()));
         }
@@ -1631,7 +1653,7 @@ impl Mempool {
         }
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
         if enforce_mempool_policy {
-            self.check_cluster_limits(&transaction)?;
+            self.check_cluster_limits_with_vsize(&transaction, vsize)?;
             let protected = self.ancestors_for_transaction(&transaction);
             self.ensure_space(size, &protected)?;
         }
@@ -1655,6 +1677,7 @@ impl Mempool {
         self.bytes += size;
         self.vbytes = self.vbytes.saturating_add(vsize);
         self.entries.insert(txid, entry);
+        self.adjusted_weights.insert(txid, adjusted_weight);
         self.wtxids.insert(wtxid, txid);
         self.relay_sequences.insert(txid, self.sequence);
         if record_sequence {
@@ -1874,7 +1897,16 @@ impl Mempool {
         best.map(|(package, _, package_vsize, package_fee)| (package, package_vsize, package_fee))
     }
 
+    #[cfg(test)]
     fn check_cluster_limits(&self, transaction: &Transaction) -> Result<(), MempoolError> {
+        self.check_cluster_limits_with_vsize(transaction, transaction.vsize() as u64)
+    }
+
+    fn check_cluster_limits_with_vsize(
+        &self,
+        transaction: &Transaction,
+        transaction_vsize: u64,
+    ) -> Result<(), MempoolError> {
         let mut connected = HashSet::new();
         let mut pending = transaction
             .input
@@ -1902,7 +1934,8 @@ impl Mempool {
             .iter()
             .filter_map(|txid| self.entries.get(txid))
             .map(|entry| entry.vsize)
-            .fold(transaction.vsize() as u64, u64::saturating_add);
+            .fold(0u64, u64::saturating_add)
+            .saturating_add(transaction_vsize);
         if connected.len().saturating_add(1) > MAX_CLUSTER_COUNT
             || connected_vsize > MAX_CLUSTER_VSIZE
         {
@@ -1964,6 +1997,7 @@ impl Mempool {
             visit(txid, &entries, &mut visited, &mut visiting, &mut ordered);
         }
         self.entries.clear();
+        self.adjusted_weights.clear();
         self.spent.clear();
         self.children.clear();
         self.wtxids.clear();
@@ -1995,6 +2029,7 @@ impl Mempool {
 
     fn remove_with_notification(&mut self, txid: &Txid, notify_zmq: bool) -> Option<MempoolEntry> {
         let entry = self.entries.remove(txid)?;
+        self.adjusted_weights.remove(txid);
         self.unbroadcast.remove(txid);
         self.wtxids.remove(&entry.transaction.compute_wtxid());
         self.relay_sequences.remove(txid);
@@ -2899,6 +2934,56 @@ mod tests {
         pool.take_changes();
         pool.accept_reorg(transaction, &chain, 1).unwrap();
         assert_eq!(pool.relay_sequences[&txid], 0);
+    }
+
+    #[test]
+    fn accepted_entries_use_sigop_adjusted_weight_for_vsize() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=101 {
+            let previous = chain.header(height - 1).expect("previous header");
+            chain
+                .connect_block(mine_regtest_block(previous, height))
+                .unwrap();
+        }
+        let (outpoint, entry) = chain
+            .all_utxos()
+            .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
+            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+            .expect("matured coinbase output");
+
+        let sigop_count = 100usize;
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: Builder::new().push_int(1).into_script(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(entry.output.value.to_sat() - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    bitcoin::opcodes::all::OP_CHECKSIG
+                        .to_u8();
+                    sigop_count
+                ]),
+            }],
+        };
+        let raw_weight = transaction.weight().to_wu();
+        let expected_weight = raw_weight.max(
+            (sigop_count as u64)
+                .saturating_mul(4)
+                .saturating_mul(DEFAULT_BYTES_PER_SIGOP),
+        );
+        assert!(expected_weight > raw_weight);
+
+        let mut pool = Mempool::new(Network::Regtest);
+        let txid = pool.accept_reorg(transaction, &chain, 1).unwrap();
+        let entry = pool.get(&txid).expect("accepted transaction");
+        assert_eq!(pool.adjusted_weight(&txid), expected_weight);
+        assert_eq!(entry.vsize, expected_weight.saturating_add(3) / 4);
     }
 
     #[test]

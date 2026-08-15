@@ -8328,7 +8328,7 @@ fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Bloc
         let Some(entry) = mempool.get(&txid) else {
             continue;
         };
-        let next_weight = transaction_weight.saturating_add(entry.transaction.weight().to_wu());
+        let next_weight = transaction_weight.saturating_add(mempool.adjusted_weight(&txid));
         if next_weight.saturating_add(node.config.block_reserved_weight)
             > node.config.block_max_weight
         {
@@ -8976,13 +8976,13 @@ fn mempool_cluster_chunks(mempool: &Mempool, txid: &Txid) -> Option<(u64, Vec<Me
         if !cluster.contains(&candidate) {
             continue;
         }
-        let Some(entry) = mempool.get(&candidate) else {
+        if mempool.get(&candidate).is_none() {
             continue;
-        };
+        }
         append_mempool_chunk(
             &mut chunks,
             candidate,
-            entry.transaction.weight().to_wu(),
+            mempool.adjusted_weight(&candidate),
             modified_mempool_fee_sat(mempool, &candidate),
         );
     }
@@ -9023,13 +9023,13 @@ fn get_mempool_fee_rate_diagram(node: &Arc<Node>) -> Result<Value> {
     let mempool = node.mempool.read();
     let mut chunks = Vec::new();
     for txid in mempool.mining_order(u64::MAX, 0) {
-        let Some(entry) = mempool.get(&txid) else {
+        if mempool.get(&txid).is_none() {
             continue;
-        };
+        }
         append_mempool_chunk(
             &mut chunks,
             txid,
-            entry.transaction.weight().to_wu(),
+            mempool.adjusted_weight(&txid),
             modified_mempool_fee_sat(&mempool, &txid),
         );
     }

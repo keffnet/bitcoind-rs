@@ -39,6 +39,8 @@ use tracing::{debug, info, warn};
 use crate::address::{NetworkEndpoint, is_core_routable_ip};
 use crate::chain::BasicFilterRange;
 use crate::config::PeerPermissions;
+#[cfg(test)]
+use crate::config::DEFAULT_CONNECT_TIMEOUT_MS;
 use crate::mempool::MempoolError;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
@@ -1552,12 +1554,13 @@ fn spawn_outbound_loop(
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
-            match connect_peer_endpoint_with_options_and_dns(
+            match connect_peer_endpoint_with_options_and_dns_with_timeout(
                 &endpoint,
                 node.config.proxy,
                 false,
                 node.config.proxy_randomize,
                 node.config.dns_lookup,
+                Duration::from_millis(node.config.connect_timeout_ms),
             )
             .await
             {
@@ -1647,6 +1650,7 @@ fn spawn_private_broadcast_loop(
             &endpoint,
             node.config.proxy,
             node.config.proxy_randomize,
+            Duration::from_millis(node.config.connect_timeout_ms),
         )
         .await
         {
@@ -1746,8 +1750,17 @@ async fn connect_peer_endpoint_for_private_broadcast(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
     proxy_randomize: bool,
+    connect_timeout: Duration,
 ) -> Result<TcpStream> {
-    connect_peer_endpoint_with_options_and_dns(endpoint, proxy, true, proxy_randomize, true).await
+    connect_peer_endpoint_with_options_and_dns_with_timeout(
+        endpoint,
+        proxy,
+        true,
+        proxy_randomize,
+        true,
+        connect_timeout,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -1761,6 +1774,7 @@ async fn connect_peer_endpoint_with_options(
         .await
 }
 
+#[cfg(test)]
 async fn connect_peer_endpoint_with_options_and_dns(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
@@ -1768,32 +1782,74 @@ async fn connect_peer_endpoint_with_options_and_dns(
     proxy_randomize: bool,
     allow_dns_lookup: bool,
 ) -> Result<TcpStream> {
+    connect_peer_endpoint_with_options_and_dns_with_timeout(
+        endpoint,
+        proxy,
+        force_proxy,
+        proxy_randomize,
+        allow_dns_lookup,
+        Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS),
+    )
+    .await
+}
+
+async fn connect_peer_endpoint_with_options_and_dns_with_timeout(
+    endpoint: &NetworkEndpoint,
+    proxy: Option<SocketAddr>,
+    force_proxy: bool,
+    proxy_randomize: bool,
+    allow_dns_lookup: bool,
+    connect_timeout: Duration,
+) -> Result<TcpStream> {
     let proxy = proxy.filter(|_| force_proxy || endpoint.uses_proxy_by_default());
     if proxy.is_none() && endpoint.requires_proxy() {
         bail!("endpoint {endpoint} requires a SOCKS5 proxy");
     }
     let mut stream = if let Some(proxy) = proxy {
-        TcpStream::connect(proxy)
-            .await
-            .with_context(|| format!("connecting to {endpoint} through proxy {proxy}"))?
+        connect_tcp_with_timeout(
+            proxy,
+            connect_timeout,
+            format!("connecting to {endpoint} through proxy {proxy}"),
+        )
+        .await?
     } else if let Some(target) = endpoint.socket_addr() {
-        TcpStream::connect(target)
-            .await
-            .with_context(|| format!("connecting to {endpoint}"))?
+        connect_tcp_with_timeout(target, connect_timeout, format!("connecting to {endpoint}"))
+            .await?
     } else {
         if !allow_dns_lookup {
             bail!("DNS lookup is disabled for hostname endpoint {endpoint}");
         }
         let host = endpoint.host_string();
-        TcpStream::connect((host.as_str(), endpoint.port()))
-            .await
-            .with_context(|| format!("resolving and connecting to {host}:{}", endpoint.port()))?
+        connect_tcp_with_timeout(
+            (host.as_str(), endpoint.port()),
+            connect_timeout,
+            format!("resolving and connecting to {host}:{}", endpoint.port()),
+        )
+        .await?
     };
     stream.set_nodelay(true)?;
     if proxy.is_some() {
         socks5_connect_endpoint_with_options(&mut stream, endpoint, proxy_randomize).await?;
     }
     Ok(stream)
+}
+
+async fn connect_tcp_with_timeout<A>(
+    address: A,
+    timeout: Duration,
+    context: String,
+) -> Result<TcpStream>
+where
+    A: tokio::net::ToSocketAddrs,
+{
+    let timeout_context = context.clone();
+    match tokio::time::timeout(timeout, TcpStream::connect(address)).await {
+        Ok(result) => result.with_context(|| context),
+        Err(_) => bail!(
+            "{timeout_context}; timed out after {} ms",
+            timeout.as_millis()
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1948,6 +2004,7 @@ struct ProxyRoutingOptions {
     force_proxy: bool,
     randomize_credentials: bool,
     allow_dns_lookup: bool,
+    connect_timeout: Duration,
 }
 
 async fn establish_transport(
@@ -1976,12 +2033,13 @@ async fn establish_transport(
             }
             Err(error) => {
                 debug!(%endpoint, %error, "BIP324 handshake failed; retrying with v1");
-                let fallback = connect_peer_endpoint_with_options_and_dns(
+                let fallback = connect_peer_endpoint_with_options_and_dns_with_timeout(
                     endpoint,
                     proxy_options.proxy,
                     proxy_options.force_proxy,
                     proxy_options.randomize_credentials,
                     proxy_options.allow_dns_lookup,
+                    proxy_options.connect_timeout,
                 )
                 .await
                 .with_context(|| format!("reconnecting to {endpoint} with v1 transport"))?;
@@ -2136,6 +2194,7 @@ async fn serve_peer(
             force_proxy: options.connection_type == "private-broadcast",
             randomize_credentials: node.config.proxy_randomize,
             allow_dns_lookup: node.config.dns_lookup,
+            connect_timeout: Duration::from_millis(node.config.connect_timeout_ms),
         },
     )
     .await?;
@@ -4892,6 +4951,7 @@ mod tests {
             max_peers: 4,
             max_upload_target: 0,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -5465,6 +5525,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -5615,6 +5676,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -6023,6 +6085,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -6157,6 +6220,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -6297,6 +6361,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -6527,6 +6592,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -6633,6 +6699,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -6721,6 +6788,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -6801,6 +6869,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,
@@ -6943,6 +7012,7 @@ mod tests {
             max_upload_target: 0,
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
+            connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
             block_version: None,

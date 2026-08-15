@@ -13,6 +13,7 @@ pub const DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB: u64 = 5;
 pub const DEFAULT_MAX_UPLOAD_TARGET: &str = "0M";
 pub const DEFAULT_MEMPOOL_EXPIRY_HOURS: u64 = 336;
 pub const DEFAULT_PEER_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 5_000;
 pub const DEFAULT_BLOCK_MAX_WEIGHT: u64 = 4_000_000;
 pub const DEFAULT_BLOCK_RESERVED_WEIGHT: u64 = 8_000;
 pub const MINIMUM_BLOCK_RESERVED_WEIGHT: u64 = 2_000;
@@ -631,6 +632,11 @@ pub struct Args {
     #[arg(long, default_value_t = DEFAULT_PEER_TIMEOUT_SECS)]
     pub peertimeout: u64,
 
+    /// Initial TCP connection timeout in milliseconds, matching Core's
+    /// `-timeout` option.
+    #[arg(long, default_value_t = DEFAULT_CONNECT_TIMEOUT_MS)]
+    pub timeout: u64,
+
     #[arg(long, default_value_t = DEFAULT_BLOCK_MAX_WEIGHT)]
     pub blockmaxweight: u64,
 
@@ -836,6 +842,7 @@ pub struct Config {
     pub max_peers: usize,
     pub max_upload_target: u64,
     pub peer_timeout_secs: u64,
+    pub connect_timeout_ms: u64,
     pub block_max_weight: u64,
     pub block_reserved_weight: u64,
     pub block_version: Option<i32>,
@@ -894,6 +901,9 @@ impl Config {
             .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_rpc_port(network))));
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
+        }
+        if args.timeout == 0 {
+            bail!("--timeout must be greater than zero");
         }
         if args.accept_nonstd_txn && args.network == NetworkName::Bitcoin {
             bail!("--acceptnonstdtxn is not currently supported for main chain");
@@ -1103,6 +1113,7 @@ impl Config {
             max_peers: args.max_peers,
             max_upload_target,
             peer_timeout_secs: args.peertimeout,
+            connect_timeout_ms: args.timeout,
             block_max_weight: args.blockmaxweight.max(args.blockreservedweight),
             block_reserved_weight: args.blockreservedweight,
             block_version: args.blockversion,
@@ -1630,7 +1641,25 @@ mod tests {
             "bitcoind-rs",
             "--datadir",
             directory.path().to_str().unwrap(),
+            "--timeout=1250",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().connect_timeout_ms, 1_250);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
             "--peertimeout=0",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--timeout=0",
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());

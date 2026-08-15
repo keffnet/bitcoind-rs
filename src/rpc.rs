@@ -4417,13 +4417,16 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .ok_or_else(|| anyhow!("block height out of range"))?
     };
     let mut chain = node.chain.write();
+    let height = chain
+        .block_height_by_hash(&hash)
+        .ok_or_else(|| anyhow!("Block not found"))?;
     let block = chain
         .block(&hash)?
-        .ok_or_else(|| anyhow!("Block not found"))?;
-    let height = chain.block_height_by_hash(&hash);
+        .ok_or_else(|| anyhow!("Block not available"))?;
     let fee_stats = chain
         .block_fee_stats(&hash)?
-        .ok_or_else(|| anyhow!("Block not found"))?;
+        .ok_or_else(|| anyhow!("Undo data not available"))?;
+    let height = Some(height);
     let transaction_fees = fee_stats.transaction_fees_sat;
     let mut total_out = 0u64;
     let mut inputs = 0usize;
@@ -4563,7 +4566,7 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         let value = result
             .get(statistic)
             .cloned()
-            .ok_or_else(|| anyhow!("unknown block statistic: {statistic}"))?;
+            .ok_or_else(|| anyhow!("Invalid selected statistic '{statistic}'"))?;
         filtered.insert(statistic.to_owned(), value);
     }
     Ok(Value::Object(filtered))
@@ -10873,6 +10876,7 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.starts_with("invalid block count:")
         || lower.starts_with("invalid blockhash:")
         || lower.starts_with("invalid nblocks.")
+        || lower.starts_with("invalid selected statistic ")
         || lower.contains("specified more than once")
         || lower.contains("must be between ")
         || lower.contains("must not be negative")
@@ -11558,6 +11562,14 @@ mod tests {
                 "feerate_percentiles": [0, 0, 0, 0, 0],
             })
         );
+        let invalid_statistic =
+            get_block_stats(&node, &json!([hash.to_string(), ["not_a_block_statistic"]]))
+                .unwrap_err();
+        assert_eq!(
+            invalid_statistic.to_string(),
+            "Invalid selected statistic 'not_a_block_statistic'"
+        );
+        assert_eq!(rpc_error(&invalid_statistic)["code"], json!(-8));
         let header = get_block_header(&node, &json!([hash.to_string()])).unwrap();
         assert!(header.get("previousblockhash").is_none());
         assert!(header.get("nextblockhash").is_none());

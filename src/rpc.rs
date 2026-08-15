@@ -3030,7 +3030,7 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .transpose()?;
     match command.as_str() {
         "add" => {
-            if !node.add_node(address) {
+            if !node.add_node_with_transport(address, transport_v2) {
                 bail!("node has already been added")
             }
             Ok(Value::Null)

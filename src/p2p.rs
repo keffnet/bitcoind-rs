@@ -1098,7 +1098,7 @@ pub(crate) enum PeerCommand {
 
 #[derive(Debug)]
 pub(crate) enum PeerManagerRequest {
-    Add(SocketAddr),
+    Add(SocketAddr, Option<bool>),
     OneTry(SocketAddr, Option<bool>, &'static str),
     PrivateBroadcast {
         address: SocketAddr,
@@ -1335,7 +1335,7 @@ impl PeerManager {
                             break;
                         };
                         let (endpoint, persistent, transport_v2, connection_type, manual) = match request {
-                            PeerManagerRequest::Add(address) => (NetworkEndpoint::Ip(address), true, None, "outbound-full", true),
+                            PeerManagerRequest::Add(address, transport_v2) => (NetworkEndpoint::Ip(address), true, transport_v2, "outbound-full", true),
                             PeerManagerRequest::OneTry(address, transport_v2, connection_type) => {
                                 (NetworkEndpoint::Ip(address), false, transport_v2, connection_type, true)
                             }

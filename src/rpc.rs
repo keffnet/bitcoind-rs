@@ -1157,6 +1157,13 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
     let normalized_params = normalize_rpc_params(method, params)?;
     let command_id = node.begin_rpc_command(method);
     let result = match method {
+        "stop" => {
+            node.request_shutdown();
+            if let Some(wait) = stop_wait(params)? {
+                tokio::time::sleep(wait).await;
+            }
+            Ok(json!("bitcoind stopping"))
+        }
         "waitfornewblock" => wait_for_new_block(node, &normalized_params).await,
         "waitforblock" => wait_for_block(node, &normalized_params).await,
         "waitforblockheight" => wait_for_block_height(node, &normalized_params).await,
@@ -1173,6 +1180,18 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
     };
     node.end_rpc_command(command_id);
     result
+}
+
+fn stop_wait(params: &Value) -> Result<Option<std::time::Duration>> {
+    let Some(value) = params.get(0).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let milliseconds = value
+        .as_i64()
+        .ok_or_else(|| anyhow!("wait must be a non-negative integer"))?;
+    let milliseconds =
+        u64::try_from(milliseconds).map_err(|_| anyhow!("wait must be a non-negative integer"))?;
+    Ok(Some(std::time::Duration::from_millis(milliseconds)))
 }
 
 fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
@@ -1409,6 +1428,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
     match method {
         "stop" => {
             node.request_shutdown();
+            if let Some(wait) = stop_wait(params)? {
+                std::thread::sleep(wait);
+            }
             Ok(json!("bitcoind stopping"))
         }
         "getblockchaininfo" => get_blockchain_info(node),
@@ -12530,6 +12552,17 @@ mod tests {
             .is_err()
         );
         assert!(normalize_rpc_params("echo", &json!([1, 2, 3])).is_ok());
+    }
+
+    #[test]
+    fn stop_wait_accepts_non_negative_integer_milliseconds() {
+        assert_eq!(stop_wait(&json!([])).unwrap(), None);
+        assert_eq!(
+            stop_wait(&json!([250])).unwrap(),
+            Some(std::time::Duration::from_millis(250))
+        );
+        assert!(stop_wait(&json!([-1])).is_err());
+        assert!(stop_wait(&json!(["250"])).is_err());
     }
 
     #[test]

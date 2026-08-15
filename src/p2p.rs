@@ -3229,12 +3229,13 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetCFilters(request) => {
-                if !(node.config.blockfilterindex && node.config.peer_block_filters) {
-                    continue;
-                }
-                if request.filter_type != 0 {
-                    continue;
-                }
+                validate_basic_filter_request(
+                    node,
+                    request.filter_type,
+                    request.start_height,
+                    request.stop_hash,
+                    1_000,
+                )?;
                 let Some(range) =
                     basic_filter_range(node, request.start_height, request.stop_hash, 1_000)?
                 else {
@@ -3256,12 +3257,13 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetCFHeaders(request) => {
-                if !(node.config.blockfilterindex && node.config.peer_block_filters) {
-                    continue;
-                }
-                if request.filter_type != 0 {
-                    continue;
-                }
+                validate_basic_filter_request(
+                    node,
+                    request.filter_type,
+                    request.start_height,
+                    request.stop_hash,
+                    2_000,
+                )?;
                 let Some(range) =
                     basic_filter_range(node, request.start_height, request.stop_hash, 2_000)?
                 else {
@@ -3292,36 +3294,36 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::GetCFCheckpt(request) => {
-                if !(node.config.blockfilterindex && node.config.peer_block_filters) {
-                    continue;
-                }
-                if request.filter_type != 0 {
-                    continue;
-                }
+                validate_basic_filter_request(
+                    node,
+                    request.filter_type,
+                    0,
+                    request.stop_hash,
+                    u32::MAX,
+                )?;
                 let (stop_hash, filter_headers) = {
                     let mut chain = node.chain.write();
-                    let stop_hash = if request.stop_hash == BlockHash::all_zeros() {
-                        chain.best_hash()
+                    let stop_hash = request.stop_hash;
+                    let stop_height = chain.block_height_by_hash(&stop_hash).ok_or_else(|| {
+                        anyhow::anyhow!("compact filter stop block is unavailable")
+                    })?;
+                    let filter_headers = if stop_height < 999 {
+                        Vec::new()
                     } else {
-                        request.stop_hash
+                        (999..=stop_height)
+                            .step_by(1_000)
+                            .map(|height| {
+                                let block_hash = chain
+                                    .ancestor_hash_at_height(&stop_hash, height)
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("compact filter height is out of range")
+                                    })?;
+                                chain
+                                    .basic_filter_header_for_block(&block_hash)?
+                                    .ok_or_else(|| anyhow::anyhow!("compact filter is missing"))
+                            })
+                            .collect::<Result<Vec<_>>>()?
                     };
-                    let Some(stop_height) = chain.block_height_by_hash(&stop_hash) else {
-                        continue;
-                    };
-                    if !chain.is_active_block(&stop_hash) {
-                        continue;
-                    }
-                    let filter_headers = (999..=stop_height)
-                        .step_by(1_000)
-                        .map(|height| {
-                            let block_hash = chain.block_hash(height).ok_or_else(|| {
-                                anyhow::anyhow!("compact filter height is out of range")
-                            })?;
-                            chain
-                                .basic_filter_header_for_block(&block_hash)?
-                                .ok_or_else(|| anyhow::anyhow!("compact filter is missing"))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
                     (stop_hash, filter_headers)
                 };
                 send_message(
@@ -3697,6 +3699,34 @@ async fn serve_peer_loop(
     }
 }
 
+fn validate_basic_filter_request(
+    node: &Arc<Node>,
+    filter_type: u8,
+    start_height: u32,
+    stop_hash: BlockHash,
+    max_height_diff: u32,
+) -> Result<()> {
+    if !(node.config.blockfilterindex && node.config.peer_block_filters) || filter_type != 0 {
+        anyhow::bail!("peer requested unsupported block filter type")
+    }
+    let chain = node.chain.read();
+    let Some(stop_height) = chain.block_height_by_hash(&stop_hash) else {
+        anyhow::bail!("peer requested invalid block hash")
+    };
+    if start_height > stop_height {
+        anyhow::bail!(
+            "peer sent invalid getcfilters/getcfheaders with start height {start_height} and stop height {stop_height}"
+        )
+    }
+    if stop_height.saturating_sub(start_height) >= max_height_diff {
+        anyhow::bail!(
+            "peer requested too many cfilters/cfheaders: {} / {max_height_diff}",
+            stop_height.saturating_sub(start_height).saturating_add(1)
+        )
+    }
+    Ok(())
+}
+
 fn basic_filter_range(
     node: &Arc<Node>,
     start_height: u32,
@@ -3704,15 +3734,11 @@ fn basic_filter_range(
     limit: usize,
 ) -> Result<Option<BasicFilterRange>> {
     let mut chain = node.chain.write();
-    let stop_hash = if requested_stop_hash == BlockHash::all_zeros() {
-        chain.best_hash()
-    } else {
-        requested_stop_hash
-    };
+    let stop_hash = requested_stop_hash;
     let Some(stop_height) = chain.block_height_by_hash(&stop_hash) else {
         return Ok(None);
     };
-    if !chain.is_active_block(&stop_hash) || start_height > stop_height {
+    if start_height > stop_height || limit == 0 {
         return Ok(None);
     }
     let Some(range) = chain.basic_filter_range(start_height, stop_hash, limit)? else {
@@ -4560,6 +4586,7 @@ mod tests {
     use bitcoin::blockdata::script::{Builder, ScriptBuf};
     use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
     use bitcoin::blockdata::witness::Witness;
+    use bitcoin::p2p::message_filter::GetCFilters;
 
     use crate::config::OnlyNet;
     use crate::{Config, Node};
@@ -4771,6 +4798,89 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(target_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn malformed_compact_filter_request_disconnects_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(private_broadcast_test_config(
+            directory.path(),
+            false,
+            Vec::new(),
+        ))
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address);
+        let server = listener.accept();
+        let (client, server) = tokio::join!(client, server);
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+        let client_address = client.local_addr().unwrap();
+        let server_task = tokio::spawn(serve_peer(
+            node.clone(),
+            server,
+            NetworkEndpoint::Ip(client_address),
+            PeerConnectionOptions {
+                outbound: false,
+                transport_v2: Some(false),
+                connection_type: "inbound",
+                permissions: None,
+                private_broadcast_transaction: None,
+            },
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            1,
+        ));
+
+        let (mut reader, mut writer) = client.into_split();
+        wire::write_message_with_size(
+            &mut writer,
+            Network::Regtest,
+            &Message::Version(VersionMessage::with_bloom(0, random(), false)),
+        )
+        .await
+        .unwrap();
+        let first_message = tokio::time::timeout(
+            Duration::from_secs(5),
+            wire::read_message(&mut reader, Network::Regtest),
+        )
+        .await
+        .expect("server did not send version")
+        .unwrap();
+        assert!(matches!(first_message, Message::Version(_)));
+        loop {
+            let message = tokio::time::timeout(
+                Duration::from_secs(5),
+                wire::read_message(&mut reader, Network::Regtest),
+            )
+            .await
+            .expect("server did not complete version handshake")
+            .unwrap();
+            if matches!(message, Message::Verack) {
+                break;
+            }
+        }
+        wire::write_message_with_size(&mut writer, Network::Regtest, &Message::Verack)
+            .await
+            .unwrap();
+        let stop_hash = node.chain.read().best_hash();
+        wire::write_message_with_size(
+            &mut writer,
+            Network::Regtest,
+            &Message::GetCFilters(GetCFilters {
+                filter_type: 255,
+                start_height: 0,
+                stop_hash,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
     }
 
     #[test]
@@ -5533,6 +5643,24 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn compact_filter_request_validation_matches_core_disconnect_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(private_broadcast_test_config(
+            directory.path(),
+            false,
+            Vec::new(),
+        ))
+        .unwrap();
+        let stop_hash = node.chain.read().best_hash();
+
+        assert!(validate_basic_filter_request(&node, 255, 0, stop_hash, 1_000).is_err());
+        assert!(validate_basic_filter_request(&node, 0, 0, BlockHash::all_zeros(), 1_000).is_err());
+        assert!(validate_basic_filter_request(&node, 0, 1, stop_hash, 1_000).is_err());
+        assert!(validate_basic_filter_request(&node, 0, 0, stop_hash, 0).is_err());
+        assert!(validate_basic_filter_request(&node, 0, 0, stop_hash, 1_000).is_ok());
     }
 
     #[test]

@@ -1618,6 +1618,10 @@ impl ChainState {
         self.block_index.get(hash).map(|node| node.height)
     }
 
+    pub fn ancestor_hash_at_height(&self, hash: &BlockHash, height: u32) -> Option<BlockHash> {
+        self.ancestor_hash(*hash, height)
+    }
+
     pub fn next_block_hash(&self, hash: &BlockHash) -> Option<BlockHash> {
         let node = self.block_index.get(hash)?;
         self.active_chain
@@ -2002,20 +2006,20 @@ impl ChainState {
         let Some(stop_height) = self.block_height_by_hash(&stop_hash) else {
             return Ok(None);
         };
-        if self.block_hash(stop_height) != Some(stop_hash) || start_height > stop_height {
+        if start_height > stop_height || limit == 0 {
             return Ok(None);
         }
         let end_height = start_height
             .saturating_add(u32::try_from(limit.saturating_sub(1)).unwrap_or(u32::MAX))
             .min(stop_height);
         let end_hash = self
-            .block_hash(end_height)
+            .ancestor_hash(stop_hash, end_height)
             .ok_or_else(|| anyhow::anyhow!("compact filter height is out of range"))?;
         let previous_filter_header = if start_height == 0 {
             FilterHeader::all_zeros()
         } else {
             let previous_hash = self
-                .block_hash(start_height - 1)
+                .ancestor_hash(stop_hash, start_height - 1)
                 .ok_or_else(|| anyhow::anyhow!("compact filter predecessor is unavailable"))?;
             self.basic_filter_for_block(&previous_hash)?
                 .map(|(_, filter_header)| filter_header)
@@ -2027,7 +2031,7 @@ impl ChainState {
             filters.reserve(usize::try_from(range_len).unwrap_or(usize::MAX));
             for height in start_height..=end_height {
                 let block_hash = self
-                    .block_hash(height)
+                    .ancestor_hash(stop_hash, height)
                     .ok_or_else(|| anyhow::anyhow!("compact filter height is out of range"))?;
                 let (content, filter_header) = self
                     .basic_filter_for_block(&block_hash)?
@@ -6403,6 +6407,43 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .1
+        );
+    }
+
+    #[test]
+    fn basic_filter_ranges_follow_side_chain_ancestry() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let main_one = mine_block(&state, 1);
+        state.connect_block(main_one).unwrap();
+        let main_two = mine_block(&state, 2);
+        let main_two_hash = main_two.block_hash();
+        state.connect_block(main_two).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 1);
+        let side_one_hash = side_one.block_hash();
+        state.connect_block(side_one).unwrap();
+        let side_one_header = state.block_index[&side_one_hash].header;
+        let side_two = mine_block_from_header(&side_one_header, 2, 2);
+        let side_two_hash = side_two.block_hash();
+        state.connect_block(side_two).unwrap();
+
+        assert_eq!(state.best_hash(), main_two_hash);
+        let range = state
+            .basic_filter_range(1, side_two_hash, 2)
+            .unwrap()
+            .expect("side-chain filter range");
+        assert_eq!(range.stop_hash, side_two_hash);
+        assert_eq!(range.filters.len(), 2);
+        assert_eq!(range.filters[0].0, side_one_hash);
+        assert_eq!(range.filters[1].0, side_two_hash);
+        assert_eq!(
+            range.previous_filter_header,
+            state
+                .basic_filter_header_for_block(&state.block_hash(0).unwrap())
+                .unwrap()
+                .expect("genesis filter header")
         );
     }
 

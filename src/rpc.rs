@@ -36,6 +36,7 @@ use miniscript::{
 use rand::random;
 use rand::seq::SliceRandom;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
@@ -44,7 +45,7 @@ use tracing::debug;
 
 use crate::address::NetworkEndpoint;
 use crate::chain;
-use crate::config::{OnlyNet, default_p2p_port};
+use crate::config::{OnlyNet, RpcAuth, default_p2p_port};
 use crate::mempool::{
     MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool,
     MempoolError, MempoolLoadOptions, package_is_child_with_parents_tree,
@@ -134,7 +135,7 @@ impl RpcServer {
                     let (stream, peer) = listener.accept().await?;
                     let node = node.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle_connection(node, stream).await {
+                        if let Err(error) = handle_connection(node, stream, peer).await {
                             debug!(%peer, %error, "RPC connection ended");
                         }
                     });
@@ -150,9 +151,20 @@ impl RpcServer {
     }
 }
 
-async fn handle_connection(node: Arc<Node>, stream: TcpStream) -> Result<()> {
+async fn handle_connection(node: Arc<Node>, stream: TcpStream, peer: SocketAddr) -> Result<()> {
     stream.set_nodelay(true)?;
     let mut connection = HttpConnection::new(stream);
+    if !rpc_client_allowed(&node, peer.ip()) {
+        connection
+            .write_response(
+                "403 Forbidden",
+                "text/plain",
+                b"RPC client address is not allowed\r\n",
+                false,
+            )
+            .await?;
+        return Ok(());
+    }
     loop {
         let Some(request) = connection.read_request().await? else {
             return Ok(());
@@ -342,16 +354,96 @@ fn header_has_token(headers: &str, wanted_name: &str, wanted_value: &str) -> boo
 }
 
 fn authorized(node: &Arc<Node>, headers: &str) -> bool {
-    let Some(cookie) = node.rpc_cookie.as_deref() else {
-        return true;
+    let Some(value) = header_value(headers, "Authorization") else {
+        return node.rpc_cookie.is_none() && node.config.rpc_auth.is_empty();
     };
-    let expected = format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD.encode(cookie.as_bytes())
-    );
-    authorization_matches(headers, &expected)
+    let Some(encoded) = value.trim().strip_prefix("Basic ") else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
+        return false;
+    };
+    if let Some(cookie) = node.rpc_cookie.as_deref()
+        && constant_time_eq(&decoded, cookie.as_bytes())
+    {
+        return true;
+    }
+    let Ok(decoded) = String::from_utf8(decoded) else {
+        return false;
+    };
+    let Some((username, password)) = decoded.split_once(':') else {
+        return false;
+    };
+    node.config.rpc_auth.iter().any(|auth| match auth {
+        RpcAuth::Plain {
+            username: expected_username,
+            password: expected_password,
+        } => {
+            constant_time_eq(username.as_bytes(), expected_username.as_bytes())
+                && constant_time_eq(password.as_bytes(), expected_password.as_bytes())
+        }
+        RpcAuth::Hmac {
+            username: expected_username,
+            salt,
+            hash,
+        } => {
+            constant_time_eq(username.as_bytes(), expected_username.as_bytes())
+                && constant_time_eq(&hmac_sha256(salt, password.as_bytes()), hash)
+        }
+    })
 }
 
+fn rpc_client_allowed(node: &Arc<Node>, address: IpAddr) -> bool {
+    address.is_loopback()
+        || node
+            .config
+            .rpc_allow_ips
+            .iter()
+            .any(|subnet| subnet.contains(address))
+}
+
+fn header_value<'a>(headers: &'a str, wanted_name: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case(wanted_name)
+            .then_some(value.trim())
+    })
+}
+
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    const BLOCK_SIZE: usize = 64;
+    let mut key_block = [0u8; BLOCK_SIZE];
+    if key.len() > BLOCK_SIZE {
+        key_block[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0u8; BLOCK_SIZE];
+    let mut outer_pad = [0u8; BLOCK_SIZE];
+    for index in 0..BLOCK_SIZE {
+        inner_pad[index] = key_block[index] ^ 0x36;
+        outer_pad[index] = key_block[index] ^ 0x5c;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_hash = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_hash);
+    outer.finalize().into()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = (left.len() ^ right.len()) as u8;
+    for index in 0..left.len().max(right.len()) {
+        difference |= left.get(index).copied().unwrap_or_default()
+            ^ right.get(index).copied().unwrap_or_default();
+    }
+    difference == 0
+}
+
+#[cfg(test)]
 fn authorization_matches(headers: &str, expected: &str) -> bool {
     headers.lines().any(|line| {
         let Some((name, value)) = line.split_once(':') else {
@@ -11936,7 +12028,7 @@ fn rpc_help(method: &str) -> String {
 mod tests {
     use super::*;
     use crate::Node;
-    use crate::config::Config;
+    use crate::config::{Args, Config};
     use bitcoin::Network;
     use bitcoin::absolute::LockTime;
     use bitcoin::block::{Header, Version as BlockVersion};
@@ -11944,6 +12036,7 @@ mod tests {
     use bitcoin::blockdata::transaction::{OutPoint, TxIn, TxOut, Version};
     use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
+    use clap::Parser;
 
     #[test]
     fn http_connection_token_matching_is_case_insensitive() {
@@ -11962,6 +12055,69 @@ mod tests {
             "X-Authorization: Basic secret\r\n",
             "Basic secret"
         ));
+    }
+
+    fn basic_auth_header(username: &str, password: &str) -> String {
+        let credentials = format!("{username}:{password}");
+        format!(
+            "Authorization: Basic {}\r\n",
+            base64::engine::general_purpose::STANDARD.encode(credentials)
+        )
+    }
+
+    #[test]
+    fn rpc_acl_and_configured_authentication_match_core_modes() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpcallowip=192.0.2.0/24",
+            "--rpcuser=rpc-user",
+            "--rpcpassword=rpc-password",
+        ])
+        .unwrap();
+        let node = Node::open(Config::from_args(args).unwrap()).unwrap();
+        assert!(node.rpc_cookie.is_none());
+        assert!(rpc_client_allowed(&node, "127.0.0.1".parse().unwrap()));
+        assert!(rpc_client_allowed(&node, "192.0.2.7".parse().unwrap()));
+        assert!(!rpc_client_allowed(&node, "198.51.100.7".parse().unwrap()));
+        assert!(authorized(
+            &node,
+            &basic_auth_header("rpc-user", "rpc-password")
+        ));
+        assert!(!authorized(
+            &node,
+            &basic_auth_header("rpc-user", "wrong-password")
+        ));
+
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpcauth=hashed:salt$84ec44c7d6fc41917953a1dafca3c7d7856f7a9d0328b991b76f0d36be1224b9",
+        ])
+        .unwrap();
+        let node = Node::open(Config::from_args(args).unwrap()).unwrap();
+        assert!(node.rpc_cookie.is_some());
+        assert!(authorized(&node, &basic_auth_header("hashed", "password")));
+        assert!(!authorized(
+            &node,
+            &basic_auth_header("hashed", "incorrect")
+        ));
+        assert!(authorized(
+            &node,
+            &basic_auth_header("__cookie__", &node.rpc_cookie.as_deref().unwrap()[11..])
+        ));
+    }
+
+    #[test]
+    fn rpc_hmac_matches_sha256_hmac_vector() {
+        assert_eq!(
+            hex::encode(hmac_sha256(b"salt", b"password")),
+            "84ec44c7d6fc41917953a1dafca3c7d7856f7a9d0328b991b76f0d36be1224b9"
+        );
     }
 
     #[test]
@@ -12107,6 +12263,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12344,6 +12502,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12454,6 +12614,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12589,6 +12751,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12661,6 +12825,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12736,6 +12902,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12846,6 +13014,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -12988,6 +13158,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13299,6 +13471,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13403,6 +13577,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13490,6 +13666,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13570,6 +13748,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13653,6 +13833,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13723,6 +13905,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13802,6 +13986,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -13870,6 +14056,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: true,
             listen: true,
@@ -14015,6 +14203,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: true,
             listen: true,
@@ -14108,6 +14298,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14195,6 +14387,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14320,6 +14514,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14409,6 +14605,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14529,6 +14727,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14731,6 +14931,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14916,6 +15118,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -14985,6 +15189,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15056,6 +15262,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15132,6 +15340,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15214,6 +15424,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: true,
             listen: true,
@@ -15303,6 +15515,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15390,6 +15604,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15525,6 +15741,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15691,6 +15909,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -15762,6 +15982,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16002,6 +16224,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16137,6 +16361,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16268,6 +16494,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16469,6 +16697,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16779,6 +17009,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -16859,6 +17091,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17064,6 +17298,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17148,6 +17384,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17564,6 +17802,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17643,6 +17883,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -17761,6 +18003,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18010,6 +18254,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18432,6 +18678,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18575,6 +18823,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -18745,6 +18995,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -19021,6 +19273,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -19103,6 +19357,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -19206,6 +19462,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,

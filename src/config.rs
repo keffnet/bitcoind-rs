@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
@@ -5,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use bitcoin::{Amount, Denomination, Network};
 use clap::{Parser, ValueEnum};
 
+use crate::IpSubnet;
 use crate::address::NetworkEndpoint;
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
@@ -119,6 +121,43 @@ pub enum OnlyNet {
     Onion,
     I2p,
     Cjdns,
+}
+
+#[derive(Clone)]
+pub(crate) enum RpcAuth {
+    Plain {
+        username: String,
+        password: String,
+    },
+    Hmac {
+        username: String,
+        salt: Vec<u8>,
+        hash: [u8; 32],
+    },
+}
+
+impl RpcAuth {
+    pub(crate) fn uses_plaintext_password(&self) -> bool {
+        matches!(self, Self::Plain { .. })
+    }
+}
+
+impl fmt::Debug for RpcAuth {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Plain { username, .. } => formatter
+                .debug_struct("Plain")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+            Self::Hmac { username, .. } => formatter
+                .debug_struct("Hmac")
+                .field("username", username)
+                .field("salt", &"<redacted>")
+                .field("hash", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -524,6 +563,18 @@ pub struct Args {
     #[arg(long = "rpcbind", value_name = "IP:PORT", value_delimiter = ',')]
     pub rpc_binds: Vec<SocketAddr>,
 
+    #[arg(long = "rpcallowip", value_name = "IP[/PREFIX]")]
+    pub rpc_allow_ips: Vec<String>,
+
+    #[arg(long = "rpcuser", value_name = "USER")]
+    pub rpc_user: Option<String>,
+
+    #[arg(long = "rpcpassword", value_name = "PASSWORD")]
+    pub rpc_password: Option<String>,
+
+    #[arg(long = "rpcauth", value_name = "USER:SALT$HASH")]
+    pub rpc_auth: Vec<String>,
+
     #[arg(long, default_value = "127.0.0.1:30001")]
     pub electrum: SocketAddr,
 
@@ -837,6 +888,8 @@ pub struct Config {
     pub listen: bool,
     pub rpc_bind: Option<SocketAddr>,
     pub rpc_binds: Vec<SocketAddr>,
+    pub(crate) rpc_allow_ips: Vec<IpSubnet>,
+    pub(crate) rpc_auth: Vec<RpcAuth>,
     pub electrum_bind: Option<SocketAddr>,
     pub rest: bool,
     pub seed_nodes: Vec<NetworkEndpoint>,
@@ -939,6 +992,19 @@ impl Config {
         } else {
             args.rpc_binds.clone()
         };
+        let rpc_allow_ips = args
+            .rpc_allow_ips
+            .iter()
+            .map(|value| {
+                IpSubnet::parse(value)
+                    .with_context(|| format!("parsing --rpcallowip subnet '{value}'"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rpc_auth = parse_rpc_auth(
+            &args.rpc_auth,
+            args.rpc_user.as_deref(),
+            args.rpc_password.as_deref(),
+        )?;
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
         }
@@ -1137,6 +1203,8 @@ impl Config {
             listen,
             rpc_bind: Some(rpc_binds[0]),
             rpc_binds,
+            rpc_allow_ips,
+            rpc_auth,
             electrum_bind: Some(args.electrum),
             rest: args.rest,
             seed_nodes,
@@ -1268,6 +1336,42 @@ fn parse_external_addresses(values: &[String], default_port: u16) -> Result<Vec<
                 .ok_or_else(|| anyhow::anyhow!("--externalip must resolve to an IP address"))
         })
         .collect()
+}
+
+fn parse_rpc_auth(
+    values: &[String],
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<Vec<RpcAuth>> {
+    let mut credentials = Vec::with_capacity(values.len() + usize::from(password.is_some()));
+    if let Some(password) = password {
+        credentials.push(RpcAuth::Plain {
+            username: username.unwrap_or_default().to_owned(),
+            password: password.to_owned(),
+        });
+    }
+    for value in values {
+        let (username, salt_and_hash) = value
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("invalid --rpcauth value; expected USER:SALT$HASH"))?;
+        let (salt, encoded_hash) = salt_and_hash
+            .split_once('$')
+            .ok_or_else(|| anyhow::anyhow!("invalid --rpcauth value; expected USER:SALT$HASH"))?;
+        if username.is_empty() || salt.is_empty() || encoded_hash.is_empty() {
+            bail!("invalid --rpcauth value; expected USER:SALT$HASH");
+        }
+        let hash =
+            hex::decode(encoded_hash).with_context(|| "decoding --rpcauth hash as hexadecimal")?;
+        let hash: [u8; 32] = hash
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("--rpcauth hash must contain 32 bytes"))?;
+        credentials.push(RpcAuth::Hmac {
+            username: username.to_owned(),
+            salt: salt.as_bytes().to_vec(),
+            hash,
+        });
+    }
+    Ok(credentials)
 }
 
 fn parse_fee_rate(value: Option<&str>, default: &str, name: &str) -> Result<u64> {
@@ -1623,6 +1727,37 @@ mod tests {
             Config::from_args(args).unwrap().rpc_bind,
             Some("127.0.0.1:18446".parse().unwrap())
         );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpcallowip=192.0.2.0/255.255.255.0",
+            "--rpcallowip=2001:db8::/32",
+            "--rpcuser=rpc-user",
+            "--rpcpassword=rpc-password",
+            "--rpcauth=hashed:salt$84ec44c7d6fc41917953a1dafca3c7d7856f7a9d0328b991b76f0d36be1224b9",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.rpc_allow_ips[0].contains("192.0.2.77".parse().unwrap()));
+        assert!(config.rpc_allow_ips[1].contains("2001:db8::7".parse().unwrap()));
+        assert_eq!(config.rpc_auth.len(), 2);
+        assert!(matches!(
+            config.rpc_auth[0],
+            RpcAuth::Plain { ref username, ref password }
+                if username == "rpc-user" && password == "rpc-password"
+        ));
+        assert!(matches!(config.rpc_auth[1], RpcAuth::Hmac { .. }));
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpcallowip=192.0.2.0/255.0.255.0",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -475,9 +475,15 @@ impl IpSubnet {
             .parse::<IpAddr>()
             .map_err(|_| anyhow::anyhow!("invalid IP/Subnet"))?;
         let prefix = match parts.next() {
-            Some(prefix) => prefix
-                .parse::<u8>()
-                .map_err(|_| anyhow::anyhow!("invalid IP/Subnet"))?,
+            Some(prefix) => match prefix.parse::<u8>() {
+                Ok(prefix) => prefix,
+                Err(_) => {
+                    let netmask = prefix
+                        .parse::<IpAddr>()
+                        .map_err(|_| anyhow::anyhow!("invalid IP/Subnet"))?;
+                    prefix_from_netmask(address, netmask)?
+                }
+            },
             None => address_bits(address),
         };
         if parts.next().is_some() {
@@ -530,6 +536,36 @@ fn address_bits(address: IpAddr) -> u8 {
         IpAddr::V4(_) => 32,
         IpAddr::V6(_) => 128,
     }
+}
+
+fn prefix_from_netmask(address: IpAddr, netmask: IpAddr) -> Result<u8> {
+    let prefix = match (address, netmask) {
+        (IpAddr::V4(_), IpAddr::V4(netmask)) => {
+            netmask.octets().into_iter().fold(0u8, |prefix, octet| {
+                prefix.saturating_add(octet.leading_ones() as u8)
+            })
+        }
+        (IpAddr::V6(_), IpAddr::V6(netmask)) => {
+            netmask.segments().into_iter().fold(0u8, |prefix, segment| {
+                prefix.saturating_add(segment.leading_ones() as u8)
+            })
+        }
+        _ => bail!("invalid IP/Subnet"),
+    };
+    let all_ones = match address {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::from(u32::MAX)),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::from(u128::MAX)),
+    };
+    let expected = mask_address(all_ones, prefix);
+    if expected
+        != match netmask {
+            IpAddr::V4(netmask) => IpAddr::V4(netmask),
+            IpAddr::V6(netmask) => IpAddr::V6(netmask),
+        }
+    {
+        bail!("invalid IP/Subnet")
+    }
+    Ok(prefix)
 }
 
 fn mask_address(address: IpAddr, prefix: u8) -> IpAddr {
@@ -776,6 +812,12 @@ impl Node {
         let zmq_mempool_sequence = mempool.sequence();
         let rpc_cookie = config
             .rpc_bind
+            .filter(|_| {
+                !config
+                    .rpc_auth
+                    .iter()
+                    .any(|auth| auth.uses_plaintext_password())
+            })
             .map(|_| load_rpc_cookie(&config.datadir))
             .transpose()?;
         Ok(Arc::new(Self {
@@ -3314,6 +3356,8 @@ mod tests {
             p2p_binds: Vec::new(),
             rpc_bind: None,
             rpc_binds: Vec::new(),
+            rpc_allow_ips: Vec::new(),
+            rpc_auth: Vec::new(),
             electrum_bind: None,
             rest: false,
             listen: true,
@@ -3531,6 +3575,9 @@ mod tests {
         assert_eq!(subnet.display(), "192.0.2.0/24");
         assert!(subnet.contains("192.0.2.99".parse().unwrap()));
         assert!(!subnet.contains("192.0.3.1".parse().unwrap()));
+        let netmask = IpSubnet::parse("192.0.2.7/255.255.255.0").unwrap();
+        assert_eq!(netmask.display(), "192.0.2.0/24");
+        assert!(IpSubnet::parse("192.0.2.7/255.0.255.0").is_err());
 
         let directory = tempfile::tempdir().unwrap();
         let legacy = serde_json::json!([{

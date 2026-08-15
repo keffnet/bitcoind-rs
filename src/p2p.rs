@@ -51,6 +51,23 @@ use crate::{
     StartupLatch, unix_time_seconds,
 };
 
+macro_rules! peer_log {
+    ($node:expr, $level:ident, $endpoint:expr, $message:literal) => {
+        if $node.config.logging.log_ips {
+            $level!(endpoint = %$endpoint, $message);
+        } else {
+            $level!($message);
+        }
+    };
+    ($node:expr, $level:ident, $endpoint:expr, $error:expr, $message:literal) => {
+        if $node.config.logging.log_ips {
+            $level!(endpoint = %$endpoint, error = %$error, $message);
+        } else {
+            $level!(error = %$error, $message);
+        }
+    };
+}
+
 enum PeerReader {
     V1(OwnedReadHalf),
     V2(Box<V2Reader>),
@@ -1612,12 +1629,17 @@ async fn run_i2p_listener(
                 let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
                     let Ok(_permit) = slots.try_acquire_owned() else {
-                        debug!(%endpoint, "rejecting I2P peer because peer limit is reached");
+                        peer_log!(
+                            node,
+                            debug,
+                            endpoint,
+                            "rejecting I2P peer because peer limit is reached"
+                        );
                         return;
                     };
                     let transport_v2 = (!node.config.v2_transport).then_some(false);
                     if let Err(error) = serve_peer(
-                        node,
+                        node.clone(),
                         stream,
                         endpoint.clone(),
                         PeerConnectionOptions {
@@ -1632,7 +1654,7 @@ async fn run_i2p_listener(
                     )
                     .await
                     {
-                        debug!(%endpoint, %error, "I2P peer ended");
+                        peer_log!(node, debug, endpoint, error, "I2P peer ended");
                     }
                 });
             }
@@ -1710,11 +1732,16 @@ async fn run_inbound_listener(
         let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let Ok(permit) = slots.try_acquire_owned() else {
-                debug!(%address, "rejecting peer because peer limit is reached");
+                peer_log!(
+                    node,
+                    debug,
+                    address,
+                    "rejecting peer because peer limit is reached"
+                );
                 return;
             };
             if let Err(error) = serve_peer(
-                node,
+                node.clone(),
                 stream,
                 NetworkEndpoint::from_socket(address),
                 PeerConnectionOptions {
@@ -1729,7 +1756,7 @@ async fn run_inbound_listener(
             )
             .await
             {
-                debug!(%address, %error, "inbound peer ended");
+                peer_log!(node, debug, address, error, "inbound peer ended");
             }
             drop(permit);
         });
@@ -1785,7 +1812,12 @@ fn spawn_outbound_loop(
             return;
         };
         if !manual && !node.config.allows_network_endpoint(&endpoint) {
-            debug!(endpoint = %endpoint, "skipping outbound peer outside onlynet policy");
+            peer_log!(
+                node,
+                debug,
+                endpoint,
+                "skipping outbound peer outside onlynet policy"
+            );
             return;
         }
         loop {
@@ -1824,7 +1856,7 @@ fn spawn_outbound_loop(
             .await
             {
                 Ok(stream) => {
-                    info!(endpoint = %endpoint, "connected to configured peer");
+                    peer_log!(node, info, endpoint, "connected to configured peer");
                     if let Err(error) = serve_peer(
                         node.clone(),
                         stream,
@@ -1841,7 +1873,7 @@ fn spawn_outbound_loop(
                     )
                     .await
                     {
-                        debug!(endpoint = %endpoint, %error, "outbound peer ended");
+                        peer_log!(node, debug, endpoint, error, "outbound peer ended");
                     }
                     if !persistent {
                         return;
@@ -1849,10 +1881,22 @@ fn spawn_outbound_loop(
                 }
                 Err(error) => {
                     if !persistent {
-                        debug!(endpoint = %endpoint, %error, "one-shot peer connection failed");
+                        peer_log!(
+                            node,
+                            debug,
+                            endpoint,
+                            error,
+                            "one-shot peer connection failed"
+                        );
                         return;
                     }
-                    warn!(endpoint = %endpoint, %error, "unable to connect to configured peer");
+                    peer_log!(
+                        node,
+                        warn,
+                        endpoint,
+                        error,
+                        "unable to connect to configured peer"
+                    );
                 }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -1914,7 +1958,7 @@ fn spawn_private_broadcast_loop(
         .await
         {
             Ok(stream) => {
-                info!(%address, "connected to private-broadcast peer");
+                peer_log!(node, info, address, "connected to private-broadcast peer");
                 if let Err(error) = serve_peer(
                     node.clone(),
                     stream,
@@ -1931,11 +1975,17 @@ fn spawn_private_broadcast_loop(
                 )
                 .await
                 {
-                    debug!(%address, %error, "private-broadcast peer ended");
+                    peer_log!(node, debug, address, error, "private-broadcast peer ended");
                 }
             }
             Err(error) => {
-                debug!(%address, %error, "private-broadcast connection failed");
+                peer_log!(
+                    node,
+                    debug,
+                    address,
+                    error,
+                    "private-broadcast connection failed"
+                );
             }
         }
     });
@@ -2464,6 +2514,7 @@ async fn establish_transport(
     outbound: bool,
     network: Network,
     transport_v2: Option<bool>,
+    log_ips: bool,
     proxy_options: ProxyRoutingOptions,
 ) -> Result<(
     PeerReader,
@@ -2483,7 +2534,11 @@ async fn establish_transport(
                 return Ok((reader, writer, local_address, session_id));
             }
             Err(error) => {
-                debug!(%endpoint, %error, "BIP324 handshake failed; retrying with v1");
+                if log_ips {
+                    debug!(%endpoint, %error, "BIP324 handshake failed; retrying with v1");
+                } else {
+                    debug!(%error, "BIP324 handshake failed; retrying with v1");
+                }
                 let fallback = connect_peer_endpoint_with_options_and_dns_with_i2p(
                     endpoint,
                     proxy_options.proxy,
@@ -2645,6 +2700,7 @@ async fn serve_peer(
         options.outbound,
         node.config.network,
         options.transport_v2,
+        node.config.logging.log_ips,
         ProxyRoutingOptions {
             proxy: node.config.proxy,
             onion_proxy: node.onion_proxy(),

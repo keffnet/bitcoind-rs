@@ -56,6 +56,23 @@ use crate::validation;
 use crate::wire;
 use crate::{Node, ScanState, StartupLatch};
 
+macro_rules! rpc_address_log {
+    ($node:expr, $level:ident, $address:expr, $error:expr, $message:literal) => {
+        if $node.config.logging.log_ips {
+            $level!(address = %$address, error = %$error, $message);
+        } else {
+            $level!(error = %$error, $message);
+        }
+    };
+    ($node:expr, $level:ident, $address:expr, $message:literal) => {
+        if $node.config.logging.log_ips {
+            $level!(%$address, $message);
+        } else {
+            $level!($message);
+        }
+    };
+}
+
 const MAX_HTTP_REQUEST: usize = 8 * 1024 * 1024;
 const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 const MAX_SCRIPT_SIZE: usize = 10_000;
@@ -163,7 +180,13 @@ impl RpcServer {
             let listener = match TcpListener::bind(address).await {
                 Ok(listener) => listener,
                 Err(error) => {
-                    warn!(%address, %error, "unable to bind RPC listener; continuing");
+                    rpc_address_log!(
+                        self.node,
+                        warn,
+                        address,
+                        error,
+                        "unable to bind RPC listener; continuing"
+                    );
                     continue;
                 }
             };
@@ -176,10 +199,16 @@ impl RpcServer {
                     let node = node.clone();
                     let work_queue = work_queue.clone();
                     tokio::spawn(async move {
-                        if let Err(error) =
-                            handle_connection(node, stream, peer, work_queue, request_timeout).await
+                        if let Err(error) = handle_connection(
+                            node.clone(),
+                            stream,
+                            peer,
+                            work_queue,
+                            request_timeout,
+                        )
+                        .await
                         {
-                            debug!(%peer, %error, "RPC connection ended");
+                            rpc_address_log!(node, debug, peer, error, "RPC connection ended");
                         }
                     });
                 }

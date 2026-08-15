@@ -836,6 +836,17 @@ pub struct Args {
     )]
     pub log_level_always: bool,
 
+    /// Include network addresses in diagnostic log records.
+    #[arg(
+        long = "logips",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub log_ips: bool,
+
     /// Enable Core-compatible debug logging categories.  Supplying the
     /// option without a value enables all categories; it can be repeated.
     #[arg(
@@ -1985,6 +1996,7 @@ pub struct LoggingConfig {
     pub thread_names: bool,
     pub source_locations: bool,
     pub level_always: bool,
+    pub log_ips: bool,
     pub debug_all: bool,
     pub debug_categories: Vec<String>,
     pub category_levels: HashMap<String, LogLevel>,
@@ -1999,6 +2011,7 @@ impl Default for LoggingConfig {
             thread_names: false,
             source_locations: false,
             level_always: false,
+            log_ips: false,
             debug_all: false,
             debug_categories: Vec::new(),
             category_levels: HashMap::new(),
@@ -2828,6 +2841,7 @@ impl Config {
                 thread_names: args.log_thread_names,
                 source_locations: args.log_source_locations,
                 level_always: args.log_level_always,
+                log_ips: args.log_ips,
                 debug_all: logging.debug_all,
                 debug_categories: logging.debug_categories,
                 category_levels: logging.category_levels,
@@ -3789,6 +3803,7 @@ mod tests {
             "--logthreadnames",
             "--logsourcelocations",
             "--loglevelalways",
+            "--logips",
         ])
         .unwrap();
         let logging = Config::from_args(args).unwrap().logging;
@@ -3797,6 +3812,7 @@ mod tests {
         assert!(logging.thread_names);
         assert!(logging.source_locations);
         assert!(logging.level_always);
+        assert!(logging.log_ips);
 
         assert!(Args::try_parse_from(["bitcoind-rs", "--pid="]).is_err());
 

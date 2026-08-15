@@ -925,13 +925,16 @@ impl Mempool {
         if bytes.first() == Some(&b'[') {
             let entries: Vec<DiskMempoolEntry> = serde_json::from_slice(&bytes)
                 .with_context(|| format!("decoding legacy JSON mempool {}", path.display()))?;
+            let cutoff = now.saturating_sub(expiry.as_secs());
             for entry in entries {
                 let added_at = if options.use_current_time {
                     now
                 } else {
                     entry.added_at
                 };
-                let _ = self.accept_at(entry.transaction, chain, added_at);
+                if added_at > cutoff {
+                    let _ = self.accept_at(entry.transaction, chain, added_at);
+                }
             }
         } else {
             let (entries, deltas, unbroadcast) = decode_core_mempool(&bytes)
@@ -943,14 +946,14 @@ impl Mempool {
                 } else {
                     entry.added_at
                 };
+                let txid = entry.transaction.compute_txid();
+                if options.apply_fee_delta_priority && entry.fee_delta != 0 {
+                    // Core restores transaction-specific prioritisation before
+                    // re-admission so it affects the fee-rate policy check.
+                    self.prioritise(txid, entry.fee_delta);
+                }
                 if added_at > cutoff {
-                    let txid = entry.transaction.compute_txid();
-                    if self.accept_at(entry.transaction, chain, added_at).is_ok()
-                        && options.apply_fee_delta_priority
-                        && entry.fee_delta != 0
-                    {
-                        self.prioritise(txid, entry.fee_delta);
-                    }
+                    let _ = self.accept_at(entry.transaction, chain, added_at);
                 }
             }
             if options.apply_fee_delta_priority {
@@ -964,7 +967,6 @@ impl Mempool {
                 }
             }
         }
-        self.clear_expired(now, expiry);
         Ok(())
     }
 
@@ -3044,6 +3046,64 @@ mod tests {
         assert_eq!(entries[0].fee_delta, 123);
         assert!(deltas.is_empty());
         assert_eq!(unbroadcast, vec![txid]);
+    }
+
+    #[test]
+    fn restores_entry_fee_delta_before_policy_admission() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut previous = *chain.header(0).unwrap();
+        let mut funding_txid = None;
+        for height in 1..=101 {
+            let block = mine_regtest_block(&previous, height);
+            if height == 1 {
+                funding_txid = Some(block.txdata[0].compute_txid());
+            }
+            previous = block.header;
+            chain.connect_block(block).unwrap();
+        }
+        let funding_txid = funding_txid.expect("funding block was mined");
+
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(funding_txid, 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x61; 10]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_999),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let txid = transaction.compute_txid();
+        let path = directory.path().join("mempool.dat");
+        let mut source = Mempool::new(Network::Regtest);
+        insert_policy_entry(&mut source, transaction.clone());
+        source.prioritise(txid, 10_000_000);
+        source.save_to_file(&path).unwrap();
+
+        let policy = MempoolPolicy {
+            min_relay_fee_sat_per_kvb: 100_000,
+            require_standard: false,
+            ..MempoolPolicy::default()
+        };
+        let mut probe = Mempool::with_max_bytes_and_policy(Network::Regtest, 300_000_000, policy);
+        probe.prioritise(txid, 10_000_000);
+        let probe_result = probe.accept_at(transaction.clone(), &chain, 1);
+        assert!(
+            probe_result.is_ok(),
+            "probe admission failed: {probe_result:?}"
+        );
+        let mut loaded = Mempool::with_max_bytes_and_policy(Network::Regtest, 300_000_000, policy);
+        loaded
+            .load_from_file_with_expiry(&path, &chain, Duration::from_secs(u64::MAX))
+            .unwrap();
+
+        assert!(loaded.get(&txid).is_some());
+        assert_eq!(loaded.fee_delta(&txid), 10_000_000);
     }
 
     #[test]

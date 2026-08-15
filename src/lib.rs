@@ -5,6 +5,7 @@ pub mod address;
 pub mod chain;
 pub mod config;
 pub mod electrum;
+pub mod i2p;
 pub mod mempool;
 pub mod muhash;
 pub mod p2p;
@@ -721,6 +722,7 @@ pub struct Node {
     pub(crate) txout_scan: Arc<ScanState>,
     pub(crate) blockfilter_scan: Arc<ScanState>,
     pub rpc_cookie: Option<String>,
+    pub(crate) i2p_sam: Option<Arc<i2p::I2pSam>>,
     mempool_path: std::path::PathBuf,
     pub peer_count: AtomicUsize,
     zmq_mempool_sequence: AtomicU64,
@@ -749,6 +751,7 @@ pub struct Node {
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
     listen_address: parking_lot::RwLock<Option<SocketAddr>>,
     listen_addresses: parking_lot::RwLock<Vec<SocketAddr>>,
+    listen_network_addresses: parking_lot::RwLock<Vec<NetworkEndpoint>>,
     last_mining_block: parking_lot::RwLock<Option<(u64, usize)>>,
     pub started_at: Instant,
     shutdown: Notify,
@@ -757,6 +760,14 @@ pub struct Node {
 impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
         let network_active = config.network_active;
+        let i2p_sam = config.i2p_sam.map(|address| {
+            Arc::new(i2p::I2pSam::new(
+                address,
+                config.datadir.clone(),
+                Duration::from_millis(config.connect_timeout_ms),
+                config.i2p_accept_incoming,
+            ))
+        });
         let added_nodes = config
             .seed_nodes
             .iter()
@@ -904,6 +915,7 @@ impl Node {
             txout_scan: Arc::new(ScanState::default()),
             blockfilter_scan: Arc::new(ScanState::default()),
             rpc_cookie,
+            i2p_sam,
             mempool_path,
             peer_count: AtomicUsize::new(0),
             zmq_mempool_sequence: AtomicU64::new(zmq_mempool_sequence),
@@ -932,6 +944,7 @@ impl Node {
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
             listen_address: parking_lot::RwLock::new(None),
             listen_addresses: parking_lot::RwLock::new(Vec::new()),
+            listen_network_addresses: parking_lot::RwLock::new(Vec::new()),
             last_mining_block: parking_lot::RwLock::new(None),
             started_at: Instant::now(),
             shutdown: Notify::new(),
@@ -2122,6 +2135,17 @@ impl Node {
 
     pub(crate) fn listen_addresses(&self) -> Vec<SocketAddr> {
         self.listen_addresses.read().clone()
+    }
+
+    pub(crate) fn add_listen_network_address(&self, endpoint: NetworkEndpoint) {
+        let mut addresses = self.listen_network_addresses.write();
+        if !addresses.contains(&endpoint) {
+            addresses.push(endpoint);
+        }
+    }
+
+    pub(crate) fn listen_network_addresses(&self) -> Vec<NetworkEndpoint> {
+        self.listen_network_addresses.read().clone()
     }
 
     pub(crate) fn listen_address(&self) -> Option<SocketAddr> {
@@ -3560,6 +3584,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,

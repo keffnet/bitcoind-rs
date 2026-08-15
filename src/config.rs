@@ -12,6 +12,7 @@ use clap::{Parser, ValueEnum};
 
 use crate::IpSubnet;
 use crate::address::NetworkEndpoint;
+use crate::i2p::I2P_SAM_PORT;
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
@@ -41,6 +42,7 @@ pub const DEFAULT_SCRIPT_CHECK_THREADS: i32 = 0;
 pub const MAX_SCRIPT_CHECK_THREADS: usize = 15;
 pub const MAX_SUBVERSION_LENGTH: usize = 256;
 pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
+pub const DEFAULT_I2P_ACCEPT_INCOMING: bool = true;
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -803,6 +805,19 @@ pub struct Args {
     #[arg(long, value_name = "IP:PORT")]
     pub proxy: Option<SocketAddr>,
 
+    /// I2P SAM v3.1 control service used for I2P peer connections.
+    #[arg(long = "i2psam", value_name = "IP:PORT")]
+    pub i2p_sam: Option<SocketAddr>,
+
+    #[arg(
+        long = "i2pacceptincoming",
+        default_value_t = DEFAULT_I2P_ACCEPT_INCOMING,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub i2p_accept_incoming: bool,
+
     #[arg(
         long = "proxyrandomize",
         default_value_t = true,
@@ -1365,6 +1380,8 @@ pub struct Config {
     pub force_dns_seed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
+    pub i2p_sam: Option<SocketAddr>,
+    pub i2p_accept_incoming: bool,
     pub proxy_randomize: bool,
     pub cjdns_reachable: bool,
     pub peer_permissions: PeerPermissionConfig,
@@ -1526,6 +1543,9 @@ impl Config {
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
             bail!("--proxy must use a non-zero port");
         }
+        if args.i2p_sam.is_some_and(|address| address.port() == 0) {
+            bail!("--i2psam must use a non-zero port");
+        }
         let connect_configured = args.no_connect || !args.connect.is_empty();
         if args.privatebroadcast && args.proxy.is_none() {
             bail!("--privatebroadcast requires --proxy for private connections");
@@ -1538,14 +1558,11 @@ impl Config {
         if args.no_connect && !args.connect.is_empty() {
             bail!("--noconnect cannot be combined with --connect");
         }
-        if args.proxy.is_none()
-            && let Some(network) = args.onlynet.iter().find_map(|network| match network {
-                OnlyNet::Onion => Some("onion"),
-                OnlyNet::I2p => Some("i2p"),
-                OnlyNet::Ipv4 | OnlyNet::Ipv6 | OnlyNet::Cjdns => None,
-            })
-        {
-            bail!("--onlynet={network} requires --proxy for outbound connections");
+        if args.proxy.is_none() && args.onlynet.contains(&OnlyNet::Onion) {
+            bail!("--onlynet=onion requires --proxy for outbound connections");
+        }
+        if args.i2p_sam.is_none() && args.onlynet.contains(&OnlyNet::I2p) {
+            bail!("--onlynet=i2p requires --i2psam for outbound connections");
         }
         if args.onlynet.contains(&OnlyNet::Cjdns) && !args.cjdns_reachable {
             bail!(
@@ -1560,6 +1577,7 @@ impl Config {
         if !listen && (!args.bind.is_empty() || !args.whitebind.is_empty()) {
             bail!("--bind/--whitebind cannot be used with --listen=false");
         }
+        let i2p_accept_incoming = args.i2p_accept_incoming && listen;
         let clearnet_reachable = args.onlynet.is_empty()
             || args
                 .onlynet
@@ -1778,6 +1796,8 @@ impl Config {
             force_dns_seed: args.force_dns_seed,
             onlynet: args.onlynet,
             proxy: args.proxy,
+            i2p_sam: args.i2p_sam,
+            i2p_accept_incoming,
             proxy_randomize: args.proxy_randomize,
             cjdns_reachable: args.cjdns_reachable,
             peer_permissions,
@@ -1917,10 +1937,28 @@ fn parse_manual_endpoints(
     values
         .iter()
         .map(|value| {
-            NetworkEndpoint::parse_manual(value, default_p2p_port(network))
+            NetworkEndpoint::parse_manual(value, default_network_endpoint_port(value, network))
                 .with_context(|| format!("parsing --{option} address '{value}'"))
         })
         .collect()
+}
+
+pub(crate) fn default_network_endpoint_port(value: &str, network: Network) -> u16 {
+    if value
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.parse::<u16>().is_ok())
+    {
+        return default_p2p_port(network);
+    }
+    if value
+        .trim_start_matches('[')
+        .to_ascii_lowercase()
+        .ends_with(".b32.i2p")
+    {
+        I2P_SAM_PORT
+    } else {
+        default_p2p_port(network)
+    }
 }
 
 fn parse_external_addresses(values: &[String], default_port: u16) -> Result<Vec<SocketAddr>> {
@@ -2328,7 +2366,17 @@ mod tests {
         let args = Args::try_parse_from(["bitcoind-rs", "--uacomment=unsafe!"]).unwrap();
         assert!(Config::from_args(args).is_err());
 
-        for network in ["onion", "i2p"] {
+        let expected_errors = [
+            (
+                "onion",
+                "--onlynet=onion requires --proxy for outbound connections",
+            ),
+            (
+                "i2p",
+                "--onlynet=i2p requires --i2psam for outbound connections",
+            ),
+        ];
+        for (network, expected_error) in expected_errors {
             let args = Args::try_parse_from([
                 "bitcoind-rs",
                 "--datadir",
@@ -2337,11 +2385,30 @@ mod tests {
             ])
             .unwrap();
             let error = Config::from_args(args).unwrap_err().to_string();
-            assert_eq!(
-                error,
-                format!("--onlynet={network} requires --proxy for outbound connections")
-            );
+            assert_eq!(error, expected_error);
         }
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--i2psam=127.0.0.1:7656",
+            "--onlynet=i2p",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.i2p_sam, Some("127.0.0.1:7656".parse().unwrap()));
+        assert!(config.i2p_accept_incoming);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--i2psam=127.0.0.1:7656",
+            "--listen=false",
+        ])
+        .unwrap();
+        assert!(!Config::from_args(args).unwrap().i2p_accept_incoming);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

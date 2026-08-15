@@ -46,7 +46,7 @@ use tracing::{debug, warn};
 
 use crate::address::NetworkEndpoint;
 use crate::chain;
-use crate::config::{OnlyNet, RpcAuth, default_p2p_port};
+use crate::config::{OnlyNet, RpcAuth, default_network_endpoint_port};
 use crate::mempool::{
     MAX_CLUSTER_COUNT, MAX_CLUSTER_VSIZE, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool,
     MempoolError, MempoolLoadOptions, package_is_child_with_parents_tree,
@@ -2476,7 +2476,7 @@ fn local_addresses(node: &Arc<Node>) -> Value {
     let mut addresses = Vec::new();
     for address in &node.config.external_addresses {
         if is_routable_ip(address.ip()) && node.config.allows_address(*address) {
-            addresses.push((*address, 4));
+            addresses.push((address.ip().to_string(), address.port(), 4));
         }
     }
     if node.config.discover && node.config.proxy.is_none() {
@@ -2485,17 +2485,29 @@ fn local_addresses(node: &Arc<Node>) -> Value {
             .into_iter()
             .filter(|address| is_routable_ip(address.ip()) && node.config.allows_address(*address))
         {
-            if !addresses.iter().any(|(known, _)| known == &address) {
-                addresses.push((address, 2));
+            if !addresses
+                .iter()
+                .any(|(host, port, _)| host == &address.ip().to_string() && *port == address.port())
+            {
+                addresses.push((address.ip().to_string(), address.port(), 2));
             }
+        }
+    }
+    for endpoint in node.listen_network_addresses() {
+        if node.config.allows_network_endpoint(&endpoint)
+            && !addresses
+                .iter()
+                .any(|(host, port, _)| host == &endpoint.host_string() && *port == endpoint.port())
+        {
+            addresses.push((endpoint.host_string(), endpoint.port(), 4));
         }
     }
     json!(
         addresses
             .into_iter()
-            .map(|(address, score)| json!({
-                "address": address.ip().to_string(),
-                "port": address.port(),
+            .map(|(address, port, score)| json!({
+                "address": address,
+                "port": port,
                 "score": score,
             }))
             .collect::<Vec<_>>()
@@ -2507,11 +2519,16 @@ fn network_info(node: &Arc<Node>) -> Value {
         .config
         .proxy
         .map_or_else(String::new, |proxy| proxy.to_string());
+    let i2p_sam_configured = node.config.i2p_sam.is_some();
+    let i2p_proxy = node
+        .config
+        .i2p_sam
+        .map_or_else(|| proxy.clone(), |proxy| proxy.to_string());
     let networks = [
         ("ipv4", OnlyNet::Ipv4, true),
         ("ipv6", OnlyNet::Ipv6, true),
         ("onion", OnlyNet::Onion, node.config.proxy.is_some()),
-        ("i2p", OnlyNet::I2p, node.config.proxy.is_some()),
+        ("i2p", OnlyNet::I2p, node.config.i2p_sam.is_some()),
         ("cjdns", OnlyNet::Cjdns, node.config.cjdns_reachable),
     ]
     .into_iter()
@@ -2522,9 +2539,16 @@ fn network_info(node: &Arc<Node>) -> Value {
             "name": name,
             "limited": limited,
             "reachable": reachable,
-            "proxy": if node.config.proxy.is_some() { proxy.as_str() } else { "" },
+            "proxy": if name == "i2p" {
+                i2p_proxy.as_str()
+            } else if node.config.proxy.is_some() {
+                proxy.as_str()
+            } else {
+                ""
+            },
             "proxy_randomize_credentials": node.config.proxy.is_some()
-                && node.config.proxy_randomize,
+                && node.config.proxy_randomize
+                && (name != "i2p" || !i2p_sam_configured),
         })
     })
     .collect::<Vec<_>>();
@@ -3484,7 +3508,10 @@ fn parse_socket_address(value: &str) -> Result<SocketAddr> {
 }
 
 fn parse_node_endpoint(node: &Arc<Node>, value: &str) -> Result<NetworkEndpoint> {
-    NetworkEndpoint::parse_manual(value, default_p2p_port(node.config.network))
+    NetworkEndpoint::parse_manual(
+        value,
+        default_network_endpoint_port(value, node.config.network),
+    )
 }
 
 fn parse_ip_address(value: &str) -> Result<IpAddr> {
@@ -12487,6 +12514,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -12746,6 +12775,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -12878,6 +12909,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -13035,6 +13068,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -13129,6 +13164,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -13226,6 +13263,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -13358,6 +13397,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -13522,6 +13563,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -13855,6 +13898,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -13981,6 +14026,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -14090,6 +14137,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -14192,6 +14241,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -14297,6 +14348,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -14389,6 +14442,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -14490,6 +14545,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -14580,6 +14637,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -14747,6 +14806,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -14862,6 +14923,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -14971,6 +15034,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -15118,6 +15183,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -15229,6 +15296,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -15371,6 +15440,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -15595,6 +15666,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -15802,6 +15875,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -15893,6 +15968,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -15986,6 +16063,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -16084,6 +16163,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -16188,6 +16269,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -16299,6 +16382,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -16408,6 +16493,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -16565,6 +16652,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: vec![OnlyNet::Ipv4],
             proxy: Some("127.0.0.1:9050".parse().unwrap()),
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -16753,6 +16842,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -16846,6 +16937,8 @@ mod tests {
             cjdns_reachable: true,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -17108,6 +17201,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -17265,6 +17360,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -17418,6 +17515,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -17641,6 +17740,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -17973,6 +18074,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -18075,6 +18178,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -18302,6 +18407,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -18408,6 +18515,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -18846,6 +18955,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -18947,6 +19058,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -19087,6 +19200,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -19358,6 +19473,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -19802,6 +19919,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -19967,6 +20086,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -20159,6 +20280,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -20457,6 +20580,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -20561,6 +20686,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,
@@ -20686,6 +20813,8 @@ mod tests {
             cjdns_reachable: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             prune: 0,

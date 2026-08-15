@@ -231,6 +231,13 @@ impl NetworkEndpoint {
             None => (value, default_port),
             Some(_) => bail!("invalid network address {value}"),
         };
+        if host.to_ascii_lowercase().ends_with(".b32.i2p") {
+            let label = &host[..host.len() - ".b32.i2p".len()];
+            let address = base32_decode(label)?.try_into().map_err(|bytes: Vec<u8>| {
+                anyhow!("invalid I2P address length {}, expected 32", bytes.len())
+            })?;
+            return Ok(Self::I2p { address, port });
+        }
         Self::dns(host.to_owned(), port)
     }
 
@@ -549,6 +556,15 @@ mod tests {
             }
         );
         assert!(NetworkEndpoint::parse_manual("example.invalid:0", 18444).is_err());
+    }
+
+    #[test]
+    fn parses_b32_i2p_manual_endpoints() {
+        let host = format!("{}.b32.i2p", "a".repeat(52));
+        let endpoint = NetworkEndpoint::parse_manual(&host, 18444).unwrap();
+        assert_eq!(endpoint.network_name(), "i2p");
+        assert_eq!(endpoint.port(), 18444);
+        assert_eq!(endpoint.host_string(), host);
     }
 
     #[test]

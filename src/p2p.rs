@@ -1457,6 +1457,17 @@ impl PeerManager {
                 Some(permissions),
             ));
         }
+        if self.node.config.listen && self.node.config.i2p_accept_incoming {
+            if let Some(i2p_sam) = self.node.i2p_sam.clone() {
+                inbound_listeners.spawn(run_i2p_listener(
+                    self.node.clone(),
+                    i2p_sam,
+                    slots.clone(),
+                    peers.clone(),
+                    next_peer_id.clone(),
+                ));
+            }
+        }
         if inbound_listeners.is_empty() {
             return std::future::pending::<Result<()>>().await;
         }
@@ -1464,6 +1475,73 @@ impl PeerManager {
             result??;
         }
         Ok(())
+    }
+}
+
+async fn run_i2p_listener(
+    node: Arc<Node>,
+    i2p_sam: Arc<crate::i2p::I2pSam>,
+    slots: Arc<Semaphore>,
+    peers: PeerRegistry,
+    next_peer_id: Arc<AtomicUsize>,
+) -> Result<()> {
+    let mut advertised = false;
+    loop {
+        if let Ok(endpoint) = i2p_sam.local_endpoint().await {
+            if !advertised {
+                node.add_listen_network_address(endpoint);
+                advertised = true;
+            }
+        } else if !advertised {
+            // SAM startup is independent of the Bitcoin listener. Retry in
+            // the background so a temporarily unavailable I2P router does
+            // not prevent clearnet operation from starting.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
+
+        match i2p_sam.accept().await {
+            Ok((stream, endpoint)) => {
+                if !node.network_active() {
+                    continue;
+                }
+                let node = node.clone();
+                let slots = slots.clone();
+                let peers = peers.clone();
+                let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let Ok(_permit) = slots.try_acquire_owned() else {
+                        debug!(%endpoint, "rejecting I2P peer because peer limit is reached");
+                        return;
+                    };
+                    let transport_v2 = (!node.config.v2_transport).then_some(false);
+                    if let Err(error) = serve_peer(
+                        node,
+                        stream,
+                        endpoint.clone(),
+                        PeerConnectionOptions {
+                            outbound: false,
+                            transport_v2,
+                            connection_type: "inbound",
+                            permissions: None,
+                            private_broadcast_transaction: None,
+                        },
+                        peers,
+                        peer_id,
+                    )
+                    .await
+                    {
+                        debug!(%endpoint, %error, "I2P peer ended");
+                    }
+                });
+            }
+            Err(error) => {
+                debug!(%error, "I2P SAM accept failed; recreating session");
+                i2p_sam.reset().await;
+                advertised = false;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
@@ -1592,13 +1670,14 @@ fn spawn_outbound_loop(
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
-            match connect_peer_endpoint_with_options_and_dns_with_timeout(
+            match connect_peer_endpoint_with_options_and_dns_with_i2p(
                 &endpoint,
                 node.config.proxy,
                 false,
                 node.config.proxy_randomize,
                 node.config.dns_lookup,
                 Duration::from_millis(node.config.connect_timeout_ms),
+                node.i2p_sam.clone(),
             )
             .await
             {
@@ -1849,6 +1928,32 @@ async fn connect_peer_endpoint_with_options_and_dns_with_timeout(
     allow_dns_lookup: bool,
     connect_timeout: Duration,
 ) -> Result<TcpStream> {
+    connect_peer_endpoint_with_options_and_dns_with_i2p(
+        endpoint,
+        proxy,
+        force_proxy,
+        proxy_randomize,
+        allow_dns_lookup,
+        connect_timeout,
+        None,
+    )
+    .await
+}
+
+async fn connect_peer_endpoint_with_options_and_dns_with_i2p(
+    endpoint: &NetworkEndpoint,
+    proxy: Option<SocketAddr>,
+    force_proxy: bool,
+    proxy_randomize: bool,
+    allow_dns_lookup: bool,
+    connect_timeout: Duration,
+    i2p_sam: Option<Arc<crate::i2p::I2pSam>>,
+) -> Result<TcpStream> {
+    if let Some(i2p_sam) = i2p_sam
+        && matches!(endpoint, NetworkEndpoint::I2p { .. })
+    {
+        return i2p_sam.connect(endpoint).await;
+    }
     let proxy = proxy.filter(|_| force_proxy || endpoint.uses_proxy_by_default());
     if proxy.is_none() && endpoint.requires_proxy() {
         bail!("endpoint {endpoint} requires a SOCKS5 proxy");
@@ -2046,13 +2151,14 @@ async fn discover_dns_seeds(network: Network) -> Vec<std::net::SocketAddr> {
     addresses
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ProxyRoutingOptions {
     proxy: Option<SocketAddr>,
     force_proxy: bool,
     randomize_credentials: bool,
     allow_dns_lookup: bool,
     connect_timeout: Duration,
+    i2p_sam: Option<Arc<crate::i2p::I2pSam>>,
 }
 
 async fn establish_transport(
@@ -2081,13 +2187,14 @@ async fn establish_transport(
             }
             Err(error) => {
                 debug!(%endpoint, %error, "BIP324 handshake failed; retrying with v1");
-                let fallback = connect_peer_endpoint_with_options_and_dns_with_timeout(
+                let fallback = connect_peer_endpoint_with_options_and_dns_with_i2p(
                     endpoint,
                     proxy_options.proxy,
                     proxy_options.force_proxy,
                     proxy_options.randomize_credentials,
                     proxy_options.allow_dns_lookup,
                     proxy_options.connect_timeout,
+                    proxy_options.i2p_sam,
                 )
                 .await
                 .with_context(|| format!("reconnecting to {endpoint} with v1 transport"))?;
@@ -2243,6 +2350,7 @@ async fn serve_peer(
             randomize_credentials: node.config.proxy_randomize,
             allow_dns_lookup: node.config.dns_lookup,
             connect_timeout: Duration::from_millis(node.config.connect_timeout_ms),
+            i2p_sam: node.i2p_sam.clone(),
         },
     )
     .await?;
@@ -5038,6 +5146,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             signet_challenge: None,
@@ -5609,6 +5719,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: vec![OnlyNet::Ipv4],
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
@@ -5784,6 +5896,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
@@ -6250,6 +6364,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
@@ -6409,6 +6525,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
@@ -6574,6 +6692,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
@@ -6829,6 +6949,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
@@ -6960,6 +7082,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
@@ -7073,6 +7197,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
@@ -7202,6 +7328,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: Some("127.0.0.1:9050".parse().unwrap()),
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
@@ -7369,6 +7497,8 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: None,
+            i2p_sam: None,
+            i2p_accept_incoming: false,
             proxy_randomize: false,
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,

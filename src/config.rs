@@ -539,6 +539,12 @@ pub struct Args {
     #[arg(long = "minimumchainwork", value_name = "HEX")]
     pub minimum_chain_work: Option<String>,
 
+    #[arg(long = "checkblocks", value_name = "N")]
+    pub check_blocks: Option<u32>,
+
+    #[arg(long = "checklevel", value_name = "N")]
+    pub check_level: Option<u8>,
+
     #[arg(long)]
     pub p2p: Option<SocketAddr>,
 
@@ -946,6 +952,8 @@ pub struct Config {
     pub datadir: PathBuf,
     pub(crate) blocks_dir: Option<PathBuf>,
     pub(crate) minimum_chain_work: Option<Work>,
+    pub(crate) check_blocks: Option<u32>,
+    pub(crate) check_level: Option<u8>,
     pub p2p_bind: SocketAddr,
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
@@ -1044,6 +1052,9 @@ impl Config {
                 }
             })
             .transpose()?;
+        if args.check_level.is_some_and(|level| level > 4) {
+            bail!("--checklevel must be between 0 and 4");
+        }
         let p2p = args.p2p.unwrap_or_else(|| {
             SocketAddr::from((
                 [127, 0, 0, 1],
@@ -1316,6 +1327,8 @@ impl Config {
             datadir: args.datadir,
             blocks_dir: Some(blocks_dir),
             minimum_chain_work,
+            check_blocks: args.check_blocks,
+            check_level: args.check_level,
             p2p_bind: primary_p2p_bind,
             p2p_binds,
             listen,
@@ -1637,6 +1650,27 @@ mod tests {
             "--datadir",
             directory.path().to_str().unwrap(),
             "--minimumchainwork=not-hex",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--checkblocks=12",
+            "--checklevel=4",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.check_blocks, Some(12));
+        assert_eq!(config.check_level, Some(4));
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--checklevel=5",
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());

@@ -753,6 +753,13 @@ impl Node {
             import_external_block_file(&mut chain, path, config.network)?;
         }
         chain.maybe_auto_prune()?;
+        if config.check_blocks.is_some() || config.check_level.is_some() {
+            let check_blocks = config.check_blocks.unwrap_or(6);
+            let check_level = config.check_level.unwrap_or(3);
+            chain
+                .verify_active_chain_with_level(check_level, check_blocks)
+                .context("startup block verification failed")?;
+        }
         let mempool_path = config.datadir.join("mempool.dat");
         let mempool_policy = MempoolPolicy {
             min_relay_fee_sat_per_kvb: config.min_relay_tx_fee_sat_per_kvb,
@@ -3392,6 +3399,8 @@ mod tests {
             datadir: datadir.to_owned(),
             blocks_dir: None,
             minimum_chain_work: None,
+            check_blocks: None,
+            check_level: None,
             p2p_bind: "127.0.0.1:0".parse().unwrap(),
             p2p_binds: Vec::new(),
             rpc_bind: None,
@@ -3733,6 +3742,34 @@ mod tests {
             node.chain.read().minimum_chain_work(),
             bitcoin::pow::Work::from_unprefixed_hex("01").unwrap()
         );
+    }
+
+    #[test]
+    fn explicit_startup_block_checks_verify_persisted_chainstate() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+        ])
+        .unwrap();
+        let node = Node::open(Config::from_args(args).unwrap()).unwrap();
+        let previous = *node.chain.read().header(0).unwrap();
+        node.connect_block(mine_test_block(&previous, 1, 1))
+            .unwrap();
+        drop(node);
+
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--checkblocks=1",
+            "--checklevel=4",
+        ])
+        .unwrap();
+        Node::open(Config::from_args(args).unwrap()).unwrap();
     }
 
     #[test]

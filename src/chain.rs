@@ -1674,8 +1674,8 @@ impl ChainState {
     }
 
     /// Build the BIP158 basic filter and filter header for every block from
-    /// genesis through `hash`. Filters are computed on demand until a durable
-    /// filter index is added.
+    /// genesis through `hash`. Missing filters are computed on demand and
+    /// appended to the durable filter index in one batch.
     pub fn basic_filter_chain(
         &mut self,
         hash: &BlockHash,
@@ -1737,10 +1737,6 @@ impl ChainState {
                     .ok_or(bitcoin::bip158::Error::UtxoMissing(*outpoint))
             })?;
             let filter_header = filter.filter_header(&previous_filter_header);
-            self.filter_store
-                .insert(block_hash, &filter.content, filter_header)?;
-            self.basic_filter_cache
-                .insert(block_hash, (filter.content.clone(), filter_header));
             filters.push((block_hash, filter, filter_header));
             previous_filter_header = filter_header;
 
@@ -1757,6 +1753,18 @@ impl ChainState {
                     }
                 }
             }
+        }
+
+        let filter_records = filters
+            .iter()
+            .map(|(block_hash, filter, filter_header)| {
+                (*block_hash, filter.content.as_slice(), *filter_header)
+            })
+            .collect::<Vec<_>>();
+        self.filter_store.insert_batch(&filter_records)?;
+        for (block_hash, filter, filter_header) in &filters {
+            self.basic_filter_cache
+                .insert(*block_hash, (filter.content.clone(), *filter_header));
         }
         Ok(Some(filters))
     }

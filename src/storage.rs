@@ -491,29 +491,69 @@ impl FilterStore {
     }
 
     pub fn insert(&mut self, hash: BlockHash, content: &[u8], header: FilterHeader) -> Result<()> {
-        if self.index.contains_key(&hash) {
+        self.insert_batch(&[(hash, content, header)])
+    }
+
+    /// Append multiple immutable filters with one data sync and one index
+    /// sync.  A crash after the data file is durable but before the index is
+    /// durable is recoverable because `open` falls back to scanning the
+    /// append-only records when the index length is stale.
+    pub fn insert_batch(&mut self, entries: &[(BlockHash, &[u8], FilterHeader)]) -> Result<()> {
+        let mut seen = HashSet::new();
+        let mut pending = Vec::new();
+        let mut data_len = self.file.seek(SeekFrom::End(0))?;
+
+        for (hash, content, header) in entries {
+            if self.index.contains_key(hash) || !seen.insert(*hash) {
+                continue;
+            }
+            if content.len() > MAX_STORED_FILTER_SIZE {
+                bail!("basic filter is too large: {} bytes", content.len());
+            }
+            let bytes_len = 64usize
+                .checked_add(content.len())
+                .context("filter record length overflow")?;
+            let length = u32::try_from(bytes_len).context("filter length does not fit u32")?;
+            let record_end = data_len
+                .checked_add(4)
+                .and_then(|offset| offset.checked_add(u64::from(length)))
+                .context("filter store size overflow")?;
+            pending.push((*hash, *content, *header, data_len, length));
+            data_len = record_end;
+        }
+
+        if pending.is_empty() {
             return Ok(());
         }
-        if content.len() > MAX_STORED_FILTER_SIZE {
-            bail!("basic filter is too large: {} bytes", content.len());
+
+        let mut records = Vec::with_capacity(pending.len());
+        for (hash, content, header, offset, length) in pending {
+            let mut bytes = Vec::with_capacity(usize::try_from(length).expect("u32 fits usize"));
+            bytes.extend_from_slice(&hash.to_byte_array());
+            bytes.extend_from_slice(&header.to_byte_array());
+            bytes.extend_from_slice(content);
+            debug_assert_eq!(
+                bytes.len(),
+                usize::try_from(length).expect("u32 fits usize")
+            );
+            self.file.write_all(&length.to_le_bytes())?;
+            self.file.write_all(&bytes)?;
+            records.push((hash, Record { offset, length }));
         }
-        let mut bytes = Vec::with_capacity(64 + content.len());
-        bytes.extend_from_slice(&hash.to_byte_array());
-        bytes.extend_from_slice(&header.to_byte_array());
-        bytes.extend_from_slice(content);
-        let offset = self.file.seek(SeekFrom::End(0))?;
-        let length = u32::try_from(bytes.len()).context("filter length does not fit u32")?;
-        self.file.write_all(&length.to_le_bytes())?;
-        self.file.write_all(&bytes)?;
         self.file.sync_data()?;
-        let record = Record { offset, length };
-        persist_index_entry(
-            &mut self.index_file,
-            offset + 4 + bytes.len() as u64,
-            hash,
-            record,
-        )?;
-        self.index.insert(hash, record);
+
+        self.index_file.seek(SeekFrom::Start(0))?;
+        self.index_file.write_all(&data_len.to_le_bytes())?;
+        self.index_file.seek(SeekFrom::End(0))?;
+        for (hash, record) in &records {
+            self.index_file.write_all(&hash.to_byte_array())?;
+            self.index_file.write_all(&record.offset.to_le_bytes())?;
+            self.index_file.write_all(&record.length.to_le_bytes())?;
+        }
+        self.index_file.sync_data()?;
+        for (hash, record) in records {
+            self.index.insert(hash, record);
+        }
         Ok(())
     }
 }
@@ -1133,6 +1173,45 @@ mod tests {
                 .unwrap()
                 .len(),
             filter_len
+        );
+    }
+
+    #[test]
+    fn batches_filter_records_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_hash = BlockHash::from_byte_array([1; 32]);
+        let second_hash = BlockHash::from_byte_array([2; 32]);
+        let first_header = FilterHeader::from_byte_array([3; 32]);
+        let second_header = FilterHeader::from_byte_array([4; 32]);
+        let first_content = [5, 6, 7];
+        let second_content = [8, 9];
+        {
+            let mut store = FilterStore::open(directory.path()).unwrap();
+            store
+                .insert_batch(&[
+                    (first_hash, first_content.as_slice(), first_header),
+                    (second_hash, second_content.as_slice(), second_header),
+                ])
+                .unwrap();
+            assert_eq!(store.len(), 2);
+            assert_eq!(
+                store.get(&first_hash).unwrap(),
+                Some((first_content.to_vec(), first_header))
+            );
+            assert_eq!(
+                store.get(&second_hash).unwrap(),
+                Some((second_content.to_vec(), second_header))
+            );
+        }
+        let mut reopened = FilterStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(
+            reopened.get_header(&first_hash).unwrap(),
+            Some(first_header)
+        );
+        assert_eq!(
+            reopened.get(&second_hash).unwrap(),
+            Some((second_content.to_vec(), second_header))
         );
     }
 

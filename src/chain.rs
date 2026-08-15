@@ -3662,8 +3662,21 @@ impl ChainState {
             cursor = node.header.prev_blockhash;
         }
         path.reverse();
+        let snapshot_invalidated = self.snapshot_base.is_some_and(|base| !path.contains(&base));
+        let replay_snapshot = if !snapshot_invalidated {
+            self.load_snapshot(&path)
+                .ok()
+                .flatten()
+                .and_then(|(snapshot, verified)| verified.then_some(snapshot))
+        } else {
+            None
+        };
+        let replay_start = replay_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.headers.len());
         let blocks = path
             .iter()
+            .skip(replay_start)
             .map(|hash| self.store.get(hash))
             .collect::<Result<Vec<Option<Block>>>>()?
             .into_iter()
@@ -3690,7 +3703,6 @@ impl ChainState {
         let old_snapshot_validated = self.snapshot_validated;
         let old_snapshot_validation_error = self.snapshot_validation_error.clone();
         let old_background_validation = self.background_validation.take();
-        let snapshot_invalidated = self.snapshot_base.is_some_and(|base| !path.contains(&base));
         self.active_chain.clear();
         self.headers.clear();
         self.active_tx_counts.clear();
@@ -3707,9 +3719,47 @@ impl ChainState {
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
             }
-            self.initialize_genesis(&blocks[0])?;
-            for block in blocks.iter().skip(1) {
-                self.connect_block_internal(block, false)?;
+            if let Some(snapshot) = replay_snapshot {
+                let snapshot_chain_len = snapshot.headers.len();
+                self.active_chain = path[..snapshot_chain_len].to_vec();
+                self.headers = snapshot.headers;
+                self.utxos = snapshot.utxos;
+                self.rebuild_utxo_index();
+                self.tx_index = snapshot.tx_index;
+                self.history = snapshot.history;
+                self.active_tx_counts = old_active_tx_counts
+                    .get(..snapshot_chain_len)
+                    .unwrap_or_default()
+                    .to_vec();
+                self.active_tx_totals = cumulative_tx_counts(&self.active_tx_counts);
+                if self.txospender_index_enabled {
+                    self.spent_by = old_spent_by.clone();
+                    self.spent_by.retain(|_, (_, _, block_hash, height)| {
+                        usize::try_from(*height)
+                            .ok()
+                            .and_then(|height| self.active_chain.get(height))
+                            == Some(block_hash)
+                    });
+                    if self.spent_by.is_empty() {
+                        self.spent_by = snapshot.spent_by.unwrap_or_default();
+                    }
+                }
+                let headers = self.headers.clone();
+                self.index_active_headers(&headers)?;
+                if let Some(stats) = self.coin_stats.as_mut() {
+                    *stats = CoinStatsState::from_utxos(&self.utxos);
+                    if let Some(record) = self.coinstats_store.get(&path[snapshot_chain_len - 1])? {
+                        stats.load_cumulative_from_record(&record);
+                    }
+                }
+                for block in &blocks {
+                    self.connect_block_internal(block, false)?;
+                }
+            } else {
+                self.initialize_genesis(&blocks[0])?;
+                for block in blocks.iter().skip(1) {
+                    self.connect_block_internal(block, false)?;
+                }
             }
             self.persist_metadata()?;
             self.persist_snapshot()
@@ -6242,6 +6292,55 @@ mod tests {
         assert_eq!(reopened.best_hash(), side_three_hash);
         assert_eq!(reopened.block_hash(1), Some(side_one_hash));
         assert!(reopened.transaction(&main_two_coinbase).unwrap().is_some());
+    }
+
+    #[test]
+    fn reorg_reuses_a_verified_prefix_snapshot_without_old_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        state.persist_snapshot().unwrap();
+        let prefix_tip = state.best_hash();
+        let side_four = mine_block_from_header(state.header(3).unwrap(), 4, 71);
+        let side_five = mine_block_from_header(&side_four.header, 5, 72);
+        let side_four_hash = side_four.block_hash();
+        let side_five_hash = side_five.block_hash();
+        state.store.insert(&side_four).unwrap();
+        state.store.insert(&side_five).unwrap();
+        state.index_all_transactions(&side_four, 4);
+        state.index_all_transactions(&side_five, 5);
+        let prefix_work = state.block_index[&prefix_tip].chain_work;
+        let side_four_work = prefix_work + side_four.header.work();
+        state.block_index.insert(
+            side_four_hash,
+            BlockNode {
+                header: side_four.header,
+                height: 4,
+                chain_work: side_four_work,
+            },
+        );
+        state.block_index.insert(
+            side_five_hash,
+            BlockNode {
+                header: side_five.header,
+                height: 5,
+                chain_work: side_four_work + side_five.header.work(),
+            },
+        );
+        let retained = [state.block_hash(0).unwrap(), side_four_hash, side_five_hash]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        state.store.prune(&retained, &retained).unwrap();
+        assert!(!state.store.contains(&state.block_hash(1).unwrap()));
+        assert!(!state.store.contains(&state.block_hash(3).unwrap()));
+
+        state.activate_chain(side_five_hash).unwrap();
+        assert_eq!(state.best_hash(), side_five_hash);
+        assert_eq!(state.block_hash(3), Some(prefix_tip));
+        assert_eq!(state.block_hash(4), Some(side_four_hash));
+        assert_eq!(state.height(), 5);
     }
 
     #[test]

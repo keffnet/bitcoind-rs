@@ -4625,24 +4625,31 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .first()
             .is_some_and(|transaction| transaction.compute_txid() == txid)
     {
-        bail!("The genesis block coinbase is not considered an ordinary transaction")
+        bail!(
+            "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved"
+        )
     }
     let found = if let Some(block_hash) = requested_block {
+        let height = chain
+            .block_height_by_hash(&block_hash)
+            .ok_or_else(|| anyhow!("Block hash not found"))?;
         let block = chain
             .block(&block_hash)?
-            .ok_or_else(|| anyhow!("Block not found"))?;
+            .ok_or_else(|| anyhow!("Block not available"))?;
         let Some(transaction_index) = block
             .txdata
             .iter()
             .position(|transaction| transaction.compute_txid() == txid)
         else {
-            bail!("No such transaction in specified block");
+            bail!(
+                "No such transaction found in the provided block. Use gettransaction for wallet transactions."
+            );
         };
         Some((
             block.txdata[transaction_index].clone(),
             chain::TxLocation {
                 block_hash,
-                height: chain.block_height_by_hash(&block_hash).unwrap_or(0),
+                height,
                 transaction_index,
             },
         ))
@@ -4665,7 +4672,14 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
             },
         )
     } else {
-        bail!("No such mempool or blockchain transaction");
+        let message = if requested_block.is_some() {
+            "No such transaction found in the provided block. Use gettransaction for wallet transactions."
+        } else if !node.config.txindex {
+            "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."
+        } else {
+            "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."
+        };
+        bail!(message);
     };
     if verbosity <= 0 {
         return Ok(json!(chain::transaction_hex(&transaction)));
@@ -10809,11 +10823,16 @@ fn rpc_error_code(message: &str) -> i32 {
     }
     if lower == "unknown filtertype"
         || lower == "block not found"
+        || lower == "block hash not found"
         || lower == "block not found in chain"
         || lower == "filter not found. block was not connected to active chain."
         || lower == "transaction not found"
         || lower == "transaction not in mempool"
+        || lower.starts_with("no such transaction found in the provided block.")
+        || lower.starts_with("no such mempool transaction.")
+        || lower.starts_with("no such mempool or blockchain transaction.")
         || lower.contains("not in private broadcast queue")
+        || lower.starts_with("the genesis block coinbase is not considered")
     {
         return -5;
     }
@@ -14531,7 +14550,50 @@ mod tests {
             .unwrap()
             .txdata[0]
             .compute_txid();
-        assert!(get_raw_transaction(&node, &json!([genesis_txid.to_string(), 1])).is_err());
+        let genesis_error =
+            get_raw_transaction(&node, &json!([genesis_txid.to_string(), 1])).unwrap_err();
+        assert_eq!(
+            genesis_error.to_string(),
+            "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved"
+        );
+        assert_eq!(rpc_error(&genesis_error)["code"], json!(-5));
+        let unknown_hash = BlockHash::from_byte_array([0xff; 32]);
+        let block_hash_error = get_raw_transaction(
+            &node,
+            &json!([
+                Txid::from_byte_array([8; 32]).to_string(),
+                0,
+                unknown_hash.to_string()
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(block_hash_error.to_string(), "Block hash not found");
+        assert_eq!(rpc_error(&block_hash_error)["code"], json!(-5));
+        let missing_transaction = get_raw_transaction(
+            &node,
+            &json!([
+                Txid::from_byte_array([8; 32]).to_string(),
+                0,
+                genesis_hash.to_string()
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            missing_transaction.to_string(),
+            "No such transaction found in the provided block. Use gettransaction for wallet transactions."
+        );
+        assert_eq!(rpc_error(&missing_transaction)["code"], json!(-5));
+        let missing_without_txindex = get_raw_transaction(
+            &node,
+            &json!([Txid::from_byte_array([9; 32]).to_string(), 0]),
+        )
+        .unwrap_err();
+        assert!(
+            missing_without_txindex
+                .to_string()
+                .starts_with("No such mempool transaction. Use -txindex")
+        );
+        assert_eq!(rpc_error(&missing_without_txindex)["code"], json!(-5));
         let raw = create_raw_transaction(
             &node,
             &json!([

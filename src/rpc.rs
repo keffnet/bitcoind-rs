@@ -34,6 +34,7 @@ use miniscript::{
     Miniscript, Segwitv0, Tap,
 };
 use rand::random;
+use rand::seq::SliceRandom;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -2865,20 +2866,23 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
     {
         bail!("Network not recognized: {network}")
     }
-    let mut peers = node.known_network_addresses();
-    peers.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
+    let mut peers = node
+        .known_network_addresses()
+        .into_iter()
+        .filter(|peer| match network.as_deref() {
+            None => true,
+            Some(network) => peer.endpoint.network_name() == network,
+        })
+        .filter(|peer| {
+            peer.endpoint
+                .socket_addr()
+                .is_none_or(|address| !node.is_banned_for_peer(address, false))
+        })
+        .collect::<Vec<_>>();
+    peers.shuffle(&mut rand::rng());
     Ok(json!(
         peers
             .into_iter()
-            .filter(|peer| match network.as_deref() {
-                None => true,
-                Some(network) => peer.endpoint.network_name() == network,
-            })
-            .filter(|peer| {
-                peer.endpoint
-                    .socket_addr()
-                    .is_none_or(|address| !node.is_banned_for_peer(address, false))
-            })
             .take(count.unwrap_or(usize::MAX))
             .map(|peer| json!({
                 "address": peer.endpoint.host_string(),

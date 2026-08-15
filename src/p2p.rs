@@ -1726,36 +1726,17 @@ async fn socks5_connect_endpoint(stream: &mut TcpStream, endpoint: &NetworkEndpo
         bail!("SOCKS5 proxy does not support unauthenticated connections")
     }
 
-    let mut request = Vec::with_capacity(22);
+    let host = endpoint.host_string();
+    let host = host.as_bytes();
+    let length = u8::try_from(host.len()).context("SOCKS5 domain name is too long")?;
+    let mut request = Vec::with_capacity(7 + host.len());
     request.extend_from_slice(&[5, 1, 0]);
-    match endpoint {
-        NetworkEndpoint::Ip(address) if address.is_ipv4() => {
-            request.push(1);
-            if let std::net::IpAddr::V4(ip) = address.ip() {
-                request.extend_from_slice(&ip.octets());
-            }
-        }
-        NetworkEndpoint::Ip(address) => {
-            request.push(4);
-            if let std::net::IpAddr::V6(ip) = address.ip() {
-                request.extend_from_slice(&ip.octets());
-            }
-        }
-        NetworkEndpoint::Cjdns { address, .. } => {
-            request.push(4);
-            request.extend_from_slice(&address.octets());
-        }
-        NetworkEndpoint::OnionV2 { .. }
-        | NetworkEndpoint::OnionV3 { .. }
-        | NetworkEndpoint::I2p { .. } => {
-            let host = endpoint.host_string();
-            let host = host.as_bytes();
-            let length = u8::try_from(host.len()).context("SOCKS5 domain name is too long")?;
-            request.push(3);
-            request.push(length);
-            request.extend_from_slice(host);
-        }
-    }
+    // Core deliberately uses the domain-name form for every destination,
+    // including numeric IPv4/IPv6 addresses. This keeps proxy behavior
+    // consistent across address families and matches Tor's SOCKS5 handling.
+    request.push(3);
+    request.push(length);
+    request.extend_from_slice(host);
     request.extend_from_slice(&endpoint.port().to_be_bytes());
     stream.write_all(&request).await?;
 
@@ -5043,11 +5024,16 @@ mod tests {
             assert_eq!(greeting, [5, 1, 0]);
             stream.write_all(&[5, 0]).await.unwrap();
 
-            let mut request = [0; 10];
-            stream.read_exact(&mut request).await.unwrap();
-            assert_eq!(&request[..4], &[5, 1, 0, 1]);
-            assert_eq!(&request[4..8], &[192, 0, 2, 44]);
-            assert_eq!(&request[8..], &18444u16.to_be_bytes());
+            let mut prefix = [0; 5];
+            stream.read_exact(&mut prefix).await.unwrap();
+            assert_eq!(&prefix[..4], &[5, 1, 0, 3]);
+            assert_eq!(usize::from(prefix[4]), "192.0.2.44".len());
+            let mut host = vec![0; usize::from(prefix[4])];
+            stream.read_exact(&mut host).await.unwrap();
+            assert_eq!(host, b"192.0.2.44");
+            let mut port = [0; 2];
+            stream.read_exact(&mut port).await.unwrap();
+            assert_eq!(port, 18444u16.to_be_bytes());
             stream
                 .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
                 .await

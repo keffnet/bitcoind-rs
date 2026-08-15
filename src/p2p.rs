@@ -3152,16 +3152,14 @@ async fn serve_peer_loop(
                     .await?;
                     continue;
                 }
-                let mut transactions = Vec::with_capacity(request.indexes.len());
-                for index in &request.indexes {
-                    let Ok(index) = usize::try_from(*index) else {
-                        anyhow::bail!("compact block transaction index is too large");
-                    };
-                    let Some(transaction) = block.txdata.get(index) else {
-                        anyhow::bail!("compact block transaction index is out of bounds");
-                    };
-                    transactions.push(transaction.clone());
-                }
+                let Some(transactions) = requested_block_transactions(&block, &request.indexes)
+                else {
+                    // Core records this as peer misbehavior and returns without
+                    // sending a response. There is no score accumulator here,
+                    // so keep the connection alive and ignore the request.
+                    debug!("compact block transaction index is out of bounds");
+                    continue;
+                };
                 send_message(
                     node,
                     peer_id,
@@ -4528,6 +4526,17 @@ fn compact_block_indexes_are_strictly_increasing(indexes: &[u64]) -> bool {
     indexes.windows(2).all(|pair| pair[0] < pair[1])
 }
 
+fn requested_block_transactions(block: &Block, indexes: &[u64]) -> Option<Vec<Transaction>> {
+    indexes
+        .iter()
+        .map(|index| {
+            usize::try_from(*index)
+                .ok()
+                .and_then(|index| block.txdata.get(index).cloned())
+        })
+        .collect()
+}
+
 fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
     height >= tip_height.saturating_sub(MAX_BLOCKTXN_DEPTH)
 }
@@ -5467,6 +5476,42 @@ mod tests {
         assert!(compact_block_indexes_are_strictly_increasing(&[0, 1, 4, 9]));
         assert!(!compact_block_indexes_are_strictly_increasing(&[0, 1, 1]));
         assert!(!compact_block_indexes_are_strictly_increasing(&[2, 1]));
+    }
+
+    #[test]
+    fn out_of_bounds_compact_block_indexes_do_not_produce_transactions() {
+        let transaction = Transaction {
+            version: bitcoin::blockdata::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
+        };
+        let block = Block {
+            header: bitcoin::block::Header {
+                version: bitcoin::block::Version::TWO,
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: transaction.compute_txid().to_raw_hash().into(),
+                time: 1,
+                bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![transaction.clone()],
+        };
+
+        assert_eq!(
+            requested_block_transactions(&block, &[0]).unwrap(),
+            vec![transaction]
+        );
+        assert!(requested_block_transactions(&block, &[1]).is_none());
+        assert!(requested_block_transactions(&block, &[u64::MAX]).is_none());
     }
 
     #[test]

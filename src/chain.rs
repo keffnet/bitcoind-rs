@@ -34,6 +34,7 @@ const DIFFICULTY_INTERVAL: u32 = 2016;
 const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const SNAPSHOT_INTERVAL: u32 = 1_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
+const MAX_BASIC_FILTER_CACHE_ENTRIES: usize = 256;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
 const MAX_ORPHAN_BLOCKS: usize = 128;
 const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
@@ -1673,6 +1674,24 @@ impl ChainState {
         Ok(Some(estimate.max(1_000)))
     }
 
+    /// Keep only a bounded working set of filter bodies in memory. The
+    /// durable filter store remains the source of truth for older blocks.
+    fn cache_basic_filter(
+        &mut self,
+        hash: BlockHash,
+        content: Vec<u8>,
+        filter_header: FilterHeader,
+    ) {
+        if !self.basic_filter_cache.contains_key(&hash)
+            && self.basic_filter_cache.len() >= MAX_BASIC_FILTER_CACHE_ENTRIES
+            && let Some(evicted) = self.basic_filter_cache.keys().next().copied()
+        {
+            self.basic_filter_cache.remove(&evicted);
+        }
+        self.basic_filter_cache
+            .insert(hash, (content, filter_header));
+    }
+
     /// Build the BIP158 basic filter and filter header for every block from
     /// genesis through `hash`. Missing filters are computed on demand and
     /// appended to the durable filter index in one batch.
@@ -1686,29 +1705,28 @@ impl ChainState {
         let Some(headers) = self.headers_to_hash(hash) else {
             return Ok(None);
         };
+        let mut stored_filters = Vec::with_capacity(headers.len());
+        let mut all_filters_stored = true;
         for header in &headers {
             let block_hash = header.block_hash();
-            if !self.basic_filter_cache.contains_key(&block_hash)
-                && let Some((content, filter_header)) = self.filter_store.get(&block_hash)?
-            {
-                self.basic_filter_cache
-                    .insert(block_hash, (content, filter_header));
-            }
+            let filter =
+                if let Some((content, filter_header)) = self.basic_filter_cache.get(&block_hash) {
+                    Some((content.clone(), *filter_header))
+                } else {
+                    self.filter_store.get(&block_hash)?
+                };
+            let Some(filter) = filter else {
+                all_filters_stored = false;
+                break;
+            };
+            stored_filters.push((block_hash, filter.0, filter.1));
         }
-        if headers
-            .iter()
-            .all(|header| self.basic_filter_cache.contains_key(&header.block_hash()))
-        {
+        if all_filters_stored {
             return Ok(Some(
-                headers
+                stored_filters
                     .into_iter()
-                    .map(|header| {
-                        let block_hash = header.block_hash();
-                        let (content, filter_header) = self
-                            .basic_filter_cache
-                            .get(&block_hash)
-                            .expect("filter cache was checked above");
-                        (block_hash, BlockFilter::new(content), *filter_header)
+                    .map(|(block_hash, content, filter_header)| {
+                        (block_hash, BlockFilter::new(&content), filter_header)
                     })
                     .collect(),
             ));
@@ -1762,10 +1780,6 @@ impl ChainState {
             })
             .collect::<Vec<_>>();
         self.filter_store.insert_batch(&filter_records)?;
-        for (block_hash, filter, filter_header) in &filters {
-            self.basic_filter_cache
-                .insert(*block_hash, (filter.content.clone(), *filter_header));
-        }
         Ok(Some(filters))
     }
 
@@ -1787,8 +1801,7 @@ impl ChainState {
             return Ok(Some((content.clone(), *filter_header)));
         }
         if let Some((content, filter_header)) = self.filter_store.get(hash)? {
-            self.basic_filter_cache
-                .insert(*hash, (content.clone(), filter_header));
+            self.cache_basic_filter(*hash, content.clone(), filter_header);
             return Ok(Some((content, filter_header)));
         }
         Ok(self.basic_filter_chain(hash)?.and_then(|filters| {
@@ -3735,8 +3748,7 @@ impl ChainState {
         let filter_header = filter.filter_header(previous_filter_header);
         self.filter_store
             .insert(block.block_hash(), &filter.content, filter_header)?;
-        self.basic_filter_cache
-            .insert(block.block_hash(), (filter.content, filter_header));
+        self.cache_basic_filter(block.block_hash(), filter.content, filter_header);
         Ok(())
     }
 
@@ -5680,6 +5692,17 @@ mod tests {
             reopened.basic_filter_header_for_block(&tip_hash).unwrap(),
             Some(expected.1)
         );
+    }
+
+    #[test]
+    fn basic_filter_cache_is_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=u32::try_from(MAX_BASIC_FILTER_CACHE_ENTRIES).unwrap() + 16 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        assert!(state.basic_filter_cache.len() <= MAX_BASIC_FILTER_CACHE_ENTRIES);
+        assert!(state.basic_filter_cache.contains_key(&state.best_hash()));
     }
 
     #[test]

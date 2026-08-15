@@ -1072,7 +1072,9 @@ mod tests {
                 let mut options = create_request.get().init_options();
                 options.set_use_mempool(false);
                 options.set_block_reserved_weight(8_000);
-                options.set_coinbase_output_max_additional_sigops(400);
+                options.set_coinbase_output_max_additional_sigops(
+                    crate::rpc::DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS,
+                );
                 let template_response = create_request.send().promise.await.unwrap();
                 let template = template_response.get().unwrap().get_result().unwrap();
                 let block_response = template.get_block_request().send().promise.await.unwrap();

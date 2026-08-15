@@ -788,6 +788,14 @@ impl Mempool {
         self.entries.get(txid)
     }
 
+    #[cfg(test)]
+    pub(crate) fn insert_test_entry(&mut self, entry: MempoolEntry) {
+        let txid = entry.transaction.compute_txid();
+        let wtxid = entry.transaction.compute_wtxid();
+        self.entries.insert(txid, entry);
+        self.wtxids.insert(wtxid, txid);
+    }
+
     pub fn get_by_wtxid(&self, wtxid: &Wtxid) -> Option<&MempoolEntry> {
         self.wtxids
             .get(wtxid)

@@ -82,6 +82,11 @@ const MIN_MERKLE_TRANSACTION_WEIGHT: usize = 4 * 60;
 const MAX_MERKLE_PROOF_TRANSACTIONS: usize =
     validation::MAX_BLOCK_WEIGHT / MIN_MERKLE_TRANSACTION_WEIGHT;
 const SCAN_BLOCKFILTER_BATCH_SIZE: usize = 10_000;
+/// Core's default sigop allowance for the coinbase output when assembling a
+/// block.  The allowance is reserved before selecting mempool transactions,
+/// so every mining entry point must use the same value as getblocktemplate
+/// and the IPC mining interface.
+pub(crate) const DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS: u64 = 400;
 const MEMORY_STATS_ARENA_SIZE: usize = 256 * 1024;
 
 /// Wallet-free replacement for Core's locked allocator bookkeeping. The
@@ -9533,30 +9538,37 @@ fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Block> {
+    let chain = node.chain.read();
     let mempool = node.mempool.read();
-    let mut transactions = Vec::new();
-    let mut transaction_weight = 0u64;
-    for txid in mempool.mining_order_with_min_fee(
-        node.config.block_max_weight,
-        node.config.block_reserved_weight,
-        node.config.block_min_tx_fee_sat_per_kvb,
-    ) {
-        let Some(entry) = mempool.get(&txid) else {
-            continue;
-        };
+    let selected = filter_mining_transaction_ids(
+        mempool.mining_order_with_min_fee(
+            node.config.block_max_weight,
+            node.config.block_reserved_weight,
+            node.config.block_min_tx_fee_sat_per_kvb,
+        ),
+        &chain,
+        &mempool,
+        DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS,
+    );
+    let transactions = selected
+        .into_iter()
+        .filter_map(|txid| mempool.get(&txid).map(|entry| entry.transaction.clone()))
+        .collect::<Vec<_>>();
+    /*
+     * mining_order_with_min_fee already applies the block weight limit.  The
+     * sigop pass above may remove entries, but never adds any, so retaining
+     * that ordering is sufficient for generate* just as it is for GBT.
+     */
+    for transaction in &transactions {
         if node.config.print_priority {
-            log_modified_mining_fee(&mempool, &txid, entry);
+            let txid = transaction.compute_txid();
+            if let Some(entry) = mempool.get(&txid) {
+                log_modified_mining_fee(&mempool, &txid, entry);
+            }
         }
-        let next_weight = transaction_weight.saturating_add(entry.transaction.weight().to_wu());
-        if next_weight.saturating_add(node.config.block_reserved_weight)
-            > node.config.block_max_weight
-        {
-            break;
-        }
-        transaction_weight = next_weight;
-        transactions.push(entry.transaction.clone());
     }
     drop(mempool);
+    drop(chain);
     build_mining_block_with_transactions(node, script_pubkey, transactions)
 }
 
@@ -10120,7 +10132,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
         ),
         &chain,
         &mempool,
-        400,
+        DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS,
     );
     let positions = selected
         .iter()
@@ -13207,6 +13219,64 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         }
+    }
+
+    #[test]
+    fn mining_selection_reserves_coinbase_sigops() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = chain::ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut mempool = Mempool::new(Network::Regtest);
+
+        let high_sigop_transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    bitcoin::blockdata::opcodes::all::OP_CHECKSIG.to_u8();
+                    79_600
+                ]),
+            }],
+        };
+        let low_sigop_transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([2; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let high_sigop_id = high_sigop_transaction.compute_txid();
+        let low_sigop_id = low_sigop_transaction.compute_txid();
+        for transaction in [high_sigop_transaction, low_sigop_transaction] {
+            mempool.insert_test_entry(crate::mempool::MempoolEntry {
+                vsize: transaction.vsize() as u64,
+                fee_sat: 1,
+                added_at: 0,
+                height: 0,
+                transaction,
+            });
+        }
+
+        let selected = filter_mining_transaction_ids(
+            [high_sigop_id, low_sigop_id],
+            &chain,
+            &mempool,
+            DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS,
+        );
+        assert_eq!(selected, vec![low_sigop_id]);
     }
 
     #[test]

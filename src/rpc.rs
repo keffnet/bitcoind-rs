@@ -1189,6 +1189,41 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
     let Some(object) = params.as_object() else {
         bail!("RPC params must be an array or object")
     };
+    if matches!(method, "echo" | "echojson") {
+        let mut values = object
+            .get("args")
+            .map(|args| {
+                args.as_array()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("RPC args must be an array"))
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if values.len() > 10 {
+            bail!("too many positional arguments for {method}")
+        }
+        let mut specified = vec![true; values.len()];
+        for (name, value) in object {
+            if name == "args" {
+                continue;
+            }
+            let Some(index) = name
+                .strip_prefix("arg")
+                .and_then(|index| index.parse::<usize>().ok())
+                .filter(|index| *index < 10)
+            else {
+                bail!("unknown named parameter {name} for {method}")
+            };
+            if specified.get(index).copied().unwrap_or(false) {
+                bail!("parameter {name} specified more than once")
+            }
+            values.resize(index.saturating_add(1), Value::Null);
+            specified.resize(index.saturating_add(1), false);
+            values[index] = value.clone();
+            specified[index] = true;
+        }
+        return Ok(Value::Array(values));
+    }
     let Some(names) = rpc_parameter_names(method) else {
         bail!("named parameters are not supported for {method}")
     };
@@ -1219,6 +1254,12 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
         }
         values[index] = if method == "dumptxoutset" && name == "rollback" {
             json!({"rollback": value})
+        } else if method == "gettxspendingprevout"
+            && matches!(name.as_str(), "mempool_only" | "return_spending_tx")
+        {
+            json!({name: value})
+        } else if method == "scanblocks" && name == "filter_false_positives" {
+            json!({"filter_false_positives": value})
         } else {
             value.clone()
         };
@@ -1231,6 +1272,8 @@ fn rpc_parameter_alias(method: &str, name: &str) -> Option<&'static str> {
     match (method, name) {
         ("getblock" | "getrawtransaction", "verbose") => Some("verbosity"),
         ("dumptxoutset", "rollback") => Some("options"),
+        ("gettxspendingprevout", "mempool_only" | "return_spending_tx") => Some("options"),
+        ("scanblocks", "filter_false_positives") => Some("options"),
         _ => None,
     }
 }
@@ -1282,21 +1325,21 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "getblocktemplate" => Some(&["template_request"]),
         "prioritisetransaction" => Some(&["txid", "dummy", "fee_delta"]),
         "generatetoaddress" => Some(&["nblocks", "address", "maxtries"]),
-        "generatetodescriptor" => Some(&["nblocks", "descriptor", "maxtries"]),
+        "generatetodescriptor" => Some(&["num_blocks", "descriptor", "maxtries"]),
         "generateblock" => Some(&["output", "transactions", "submit"]),
         "generate" => Some(&[]),
         "submitpackage" => Some(&["package", "maxfeerate", "maxburnamount"]),
         "testmempoolaccept" => Some(&["rawtxs", "maxfeerate"]),
         "setmocktime" => Some(&["timestamp"]),
         "mockscheduler" => Some(&["delta_time"]),
+        "echoipc" => Some(&["arg"]),
         "verifychain" => Some(&["checklevel", "nblocks"]),
         "getmemoryinfo" => Some(&["mode"]),
         "gettxout" => Some(&["txid", "n", "include_mempool"]),
         "gettxspendingprevout" => Some(&["outputs", "options"]),
         "getrawmempool" => Some(&["verbose", "mempool_sequence"]),
-        "getmempoolentry" | "getmempoolancestors" | "getmempooldescendants" => {
-            Some(&["txid", "verbose"])
-        }
+        "getmempoolentry" => Some(&["txid"]),
+        "getmempoolancestors" | "getmempooldescendants" => Some(&["txid", "verbose"]),
         "getorphantxs" => Some(&["verbosity"]),
         "getmempoolcluster" => Some(&["txid"]),
         "importmempool" => Some(&["filepath", "options"]),
@@ -12418,11 +12461,40 @@ mod tests {
         let normalized =
             normalize_rpc_params("setnetworkactive", &json!({"state": false})).unwrap();
         assert_eq!(normalized, json!([false]));
+        let normalized = normalize_rpc_params("echo", &json!({"arg0": 0, "arg9": 9})).unwrap();
+        assert_eq!(
+            normalized,
+            json!([0, null, null, null, null, null, null, null, null, 9])
+        );
+        let normalized =
+            normalize_rpc_params("echojson", &json!({"args": [0, 1], "arg3": 3, "arg5": 5}))
+                .unwrap();
+        assert_eq!(normalized, json!([0, 1, null, 3, null, 5]));
+        let normalized = normalize_rpc_params("echoipc", &json!({"arg": "hello"})).unwrap();
+        assert_eq!(normalized, json!(["hello"]));
 
         let normalized = normalize_rpc_params("gettxout", &json!({"txid": "00", "n": 1})).unwrap();
         assert_eq!(normalized, json!(["00", 1, null]));
         let normalized = normalize_rpc_params("getorphantxs", &json!({"verbosity": 2})).unwrap();
         assert_eq!(normalized, json!([2]));
+        let normalized =
+            normalize_rpc_params("generatetodescriptor", &json!({"num_blocks": 1})).unwrap();
+        assert_eq!(normalized, json!([1, null, null]));
+        let normalized = normalize_rpc_params(
+            "gettxspendingprevout",
+            &json!({"outputs": [], "mempool_only": true}),
+        )
+        .unwrap();
+        assert_eq!(normalized, json!([[], {"mempool_only": true}]));
+        let normalized = normalize_rpc_params(
+            "scanblocks",
+            &json!({"action": "status", "filter_false_positives": true}),
+        )
+        .unwrap();
+        assert_eq!(
+            normalized,
+            json!(["status", null, null, null, null, {"filter_false_positives": true}])
+        );
         let normalized = normalize_rpc_params(
             "dumptxoutset",
             &json!({"path": "utxo.dat", "type": "latest", "options": {}}),
@@ -12438,6 +12510,11 @@ mod tests {
         assert!(normalize_rpc_params("getblockhash", &json!({"height": 0, "extra": 1})).is_err());
         assert!(normalize_rpc_params("getblockhash", &json!([0, 1])).is_err());
         assert!(normalize_rpc_params("getblockcount", &json!([1])).is_err());
+        assert!(normalize_rpc_params("getmempoolentry", &json!(["00", false])).is_err());
+        assert!(
+            normalize_rpc_params("getmempoolentry", &json!({"txid": "00", "verbose": true}),)
+                .is_err()
+        );
         assert!(
             normalize_rpc_params(
                 "signrawtransactionwithkey",

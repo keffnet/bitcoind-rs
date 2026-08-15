@@ -1191,7 +1191,10 @@ fn read_config_file(
     let contents = fs::read_to_string(&path)
         .with_context(|| format!("reading configuration file {}", path.display()))?;
     let mut section = None;
-    for (line_number, line) in contents.lines().enumerate() {
+    for (line_number, raw_line) in contents.lines().enumerate() {
+        let (line, used_hash) = raw_line
+            .split_once('#')
+            .map_or((raw_line, false), |(line, _)| (line, true));
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
@@ -1218,6 +1221,12 @@ fn read_config_file(
             bail!(
                 "empty configuration option in {}:{}",
                 path.display(),
+                line_number + 1
+            );
+        }
+        if used_hash && key == "rpcpassword" {
+            bail!(
+                "configuration line {} uses # in rpcpassword; this is ambiguous and should be avoided",
                 line_number + 1
             );
         }
@@ -1973,7 +1982,7 @@ mod tests {
         let config_file = directory.path().join("bitcoin.conf");
         fs::write(
             &config_file,
-            "network=regtest\nserver=false\nmaxconnections=3\n[main]\nserver=true\n[regtest]\nmaxconnections=5\nincludeconf=included.conf\n",
+            "network=regtest\nserver=false\nmaxconnections=3 # overridden below\n[main]\nserver=true\n[regtest]\nmaxconnections=5\nincludeconf=included.conf\n",
         )
         .unwrap();
 
@@ -2047,6 +2056,19 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(Config::from_args(args).unwrap().network, Network::Bitcoin);
+
+        let invalid_config = directory.path().join("invalid.conf");
+        fs::write(&invalid_config, "rpcpassword=secret#fragment\n").unwrap();
+        let error = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--conf",
+            invalid_config.to_str().unwrap(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("# in rpcpassword"));
     }
 
     #[test]

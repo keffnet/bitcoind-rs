@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::{Hash as _, HashEngine as _};
-use bitcoin::{Block, Transaction};
+use bitcoin::{Block, BlockHash, Transaction};
 use capnp::capability::Rc;
 use capnp::message::ReaderOptions;
 use capnp_rpc::rpc_twoparty_capnp::Side;
@@ -226,6 +226,20 @@ fn block_template_client(
         options,
         interrupt: InterruptHandle::default(),
     })
+}
+
+fn ipc_template_tip_requires_refresh(node: &Node, previous: BlockHash) -> bool {
+    let chain = node.chain.read();
+    if chain.best_hash() != previous {
+        return true;
+    }
+    if !chain.network.params().allow_min_difficulty_blocks {
+        return false;
+    }
+    let Some(tip_header) = chain.header(chain.height()) else {
+        return false;
+    };
+    crate::time::unix_time() > u64::from(tip_header.time).saturating_add(20 * 60)
 }
 
 fn coinbase_merkle_path(block: &Block) -> Vec<[u8; 32]> {
@@ -691,9 +705,7 @@ impl crate::mining_capnp::block_template::Server for BlockTemplateService {
             if self.interrupt.was_interrupted(generation) {
                 return Ok(());
             }
-            let tip_changed =
-                self.node.chain.read().best_hash() != current.block.header.prev_blockhash;
-            if tip_changed {
+            if ipc_template_tip_requires_refresh(&self.node, current.block.header.prev_blockhash) {
                 let template = crate::rpc::create_ipc_block_template(&self.node, self.options)
                     .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 results.get().set_result(block_template_client(
@@ -728,7 +740,7 @@ impl crate::mining_capnp::block_template::Server for BlockTemplateService {
                 Some(WaitEvent::Chain | WaitEvent::Mempool | WaitEvent::Tick) => {}
             }
 
-            if self.node.chain.read().best_hash() != current.block.header.prev_blockhash {
+            if ipc_template_tip_requires_refresh(&self.node, current.block.header.prev_blockhash) {
                 let template = crate::rpc::create_ipc_block_template(&self.node, self.options)
                     .map_err(|error| capnp::Error::failed(error.to_string()))?;
                 results.get().set_result(block_template_client(

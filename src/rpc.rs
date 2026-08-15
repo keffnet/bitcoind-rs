@@ -1384,7 +1384,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "addpeeraddress" => Some(&["address", "port", "tried"]),
         "sendmsgtopeer" => Some(&["peer_id", "msg_type", "msg"]),
         "addconnection" => Some(&["address", "connection_type", "v2transport"]),
-        "addnode" => Some(&["node", "command"]),
+        "addnode" => Some(&["node", "command", "v2transport"]),
         "disconnectnode" => Some(&["address", "nodeid"]),
         "getaddednodeinfo" => Some(&["node"]),
         "setban" => Some(&["subnet", "command", "bantime", "absolute"]),
@@ -3019,6 +3019,15 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let address = param::<String>(params, 0)?;
     let address = parse_socket_address(&address)?;
     let command = param::<String>(params, 1)?;
+    let transport_v2 = params
+        .get(2)
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("v2transport must be a boolean"))
+        })
+        .transpose()?;
     match command.as_str() {
         "add" => {
             if !node.add_node(address) {
@@ -3027,7 +3036,7 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
             Ok(Value::Null)
         }
         "onetry" => {
-            node.request_one_try(address, None);
+            node.request_one_try(address, transport_v2);
             Ok(Value::Null)
         }
         "remove" => {
@@ -12569,6 +12578,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(normalized, json!([[], [], null, null, 3]));
+        let normalized = normalize_rpc_params(
+            "addnode",
+            &json!({"node": "127.0.0.1:18444", "command": "onetry", "v2transport": false}),
+        )
+        .unwrap();
+        assert_eq!(normalized, json!(["127.0.0.1:18444", "onetry", false]));
         assert!(normalize_rpc_params("getblockhash", &json!({"height": 0, "extra": 1})).is_err());
         assert!(normalize_rpc_params("getblockhash", &json!([0, 1])).is_err());
         assert!(normalize_rpc_params("getblockcount", &json!([1])).is_err());

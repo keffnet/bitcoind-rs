@@ -3157,12 +3157,10 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "warnings": [],
     });
     if chain.is_pruned() {
-        result["pruneheight"] = json!(
-            chain
-                .prune_height()
-                .map(|height| height.saturating_add(1))
-                .unwrap_or_default()
-        );
+        // ChainState stores the first retained block height. Core exposes
+        // the same boundary as getblockchaininfo.pruneheight (last pruned
+        // height plus one).
+        result["pruneheight"] = json!(chain.prune_height().unwrap_or_default());
         result["automatic_pruning"] = json!(chain.prune_target_size().is_some());
         if let Some(target_size) = chain.prune_target_size() {
             result["prune_target_size"] = json!(target_size);
@@ -3913,7 +3911,13 @@ fn prune_blockchain(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if requested < 0 {
         bail!("Negative block height.");
     }
-    Ok(json!(node.chain.write().prune(requested as u64)?))
+    let first_retained = node.chain.write().prune(requested as u64)?;
+    // ChainState keeps the first retained block as its pruning boundary;
+    // Core's RPC returns the last block actually pruned, or -1 when none
+    // has been pruned yet.
+    Ok(json!(
+        first_retained.checked_sub(1).map(i64::from).unwrap_or(-1)
+    ))
 }
 
 async fn wait_for_new_block(node: &Arc<Node>, params: &Value) -> Result<Value> {

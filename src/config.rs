@@ -588,6 +588,9 @@ pub struct Args {
     #[arg(long = "conf", value_name = "FILE")]
     pub config_file: Option<PathBuf>,
 
+    #[arg(long = "noconf", default_value_t = false)]
+    pub no_config: bool,
+
     #[arg(long = "minimumchainwork", value_name = "HEX")]
     pub minimum_chain_work: Option<String>,
 
@@ -1030,6 +1033,7 @@ impl Args {
         let datadir = raw_option_value(&raw, "datadir")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./data"));
+        let no_config = raw_bool_option(&raw, "noconf");
         let explicit_config = raw_option_value(&raw, "conf");
         let config_path = explicit_config
             .as_deref()
@@ -1043,16 +1047,18 @@ impl Args {
         };
 
         let mut entries = Vec::new();
-        if config_path.exists() {
-            read_config_file(&config_path, &datadir, &mut entries, &mut Vec::new())?;
-        } else if explicit_config
-            .as_deref()
-            .is_some_and(|value| !value.is_empty())
-        {
-            bail!(
-                "configuration file does not exist: {}",
-                config_path.display()
-            );
+        if !no_config {
+            if config_path.exists() {
+                read_config_file(&config_path, &datadir, &mut entries, &mut Vec::new())?;
+            } else if explicit_config
+                .as_deref()
+                .is_some_and(|value| !value.is_empty())
+            {
+                bail!(
+                    "configuration file does not exist: {}",
+                    config_path.display()
+                );
+            }
         }
 
         let cli_network = raw_option_value(&raw, "network");
@@ -2016,6 +2022,15 @@ mod tests {
         assert_eq!(args.network, NetworkName::Regtest);
         assert_eq!(args.max_peers, 5);
         assert!(!args.server);
+
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--noconf",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().network, Network::Bitcoin);
 
         let alias_config = directory.path().join("aliases.conf");
         fs::write(&alias_config, "regtest=1\n[regtest]\nserver=false\n").unwrap();

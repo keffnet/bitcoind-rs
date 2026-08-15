@@ -9436,7 +9436,10 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         .collect::<HashSet<_>>();
     let mut results = serde_json::Map::new();
     if let Err(error) = candidate.accept_package(&transactions, &chain) {
-        let reason = mempool_reject_reason(&error);
+        // submitpackage exposes the detailed validation error in each
+        // per-transaction result. testmempoolaccept uses the shorter
+        // reject-reason classification instead.
+        let reason = error.to_string();
         for transaction in &transactions {
             let txid = transaction.compute_txid();
             results.insert(

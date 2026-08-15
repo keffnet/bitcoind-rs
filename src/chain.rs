@@ -412,6 +412,18 @@ struct ChainMetadata {
     invalid_blocks: Vec<String>,
     #[serde(default)]
     prune_height: Option<u32>,
+    #[serde(default)]
+    prune_locks: HashMap<String, PruneLock>,
+}
+
+/// A Core-style pruning lock. An unbounded upper height is represented by
+/// `u64::MAX`, matching the way Core serializes an omitted range end.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PruneLock {
+    pub desc: String,
+    pub height_first: u64,
+    pub height_last: u64,
+    pub temporary: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -650,6 +662,7 @@ pub struct ChainState {
     assume_valid_block: Option<BlockHash>,
     max_tip_age_secs: u64,
     script_check_workers: usize,
+    script_checks_enabled: bool,
     signet_challenge: Option<Vec<u8>>,
     pub store: BlockStore,
     filter_store: FilterStore,
@@ -673,6 +686,7 @@ pub struct ChainState {
     orphans: HashMap<BlockHash, Vec<Block>>,
     invalid_blocks: HashSet<BlockHash>,
     prune_height: Option<u32>,
+    prune_locks: HashMap<String, PruneLock>,
     prune_mode: bool,
     prune_target_size: Option<u64>,
     prune_after_height: u32,
@@ -915,7 +929,7 @@ impl ChainState {
                 }
             }
         }
-        let (active_chain, persisted_headers, invalid_blocks, prune_height) =
+        let (active_chain, persisted_headers, invalid_blocks, prune_height, prune_locks) =
             if !rebuild_chainstate && (metadata_path.exists() || legacy_metadata_path.exists()) {
                 let metadata = if metadata_path.exists() {
                     let bytes = fs::read(&metadata_path)
@@ -950,9 +964,16 @@ impl ChainState {
                     metadata.headers,
                     invalid_blocks,
                     metadata.prune_height,
+                    metadata.prune_locks,
                 )
             } else {
-                (vec![genesis_hash], Vec::new(), HashSet::new(), None)
+                (
+                    vec![genesis_hash],
+                    Vec::new(),
+                    HashSet::new(),
+                    None,
+                    HashMap::new(),
+                )
             };
         let persisted_tx_counts = if rebuild_chainstate {
             None
@@ -982,6 +1003,7 @@ impl ChainState {
             assume_valid_block,
             max_tip_age_secs: MAX_TIP_AGE_SECS,
             script_check_workers: script_check_workers(DEFAULT_SCRIPT_CHECK_THREADS),
+            script_checks_enabled: script_check_workers(DEFAULT_SCRIPT_CHECK_THREADS) > 0,
             signet_challenge: (network == Network::Signet).then(|| {
                 signet_challenge
                     .map(ToOwned::to_owned)
@@ -1017,6 +1039,7 @@ impl ChainState {
             orphans: HashMap::new(),
             invalid_blocks,
             prune_height,
+            prune_locks,
             prune_mode: false,
             prune_target_size: None,
             // Keep the direct ChainState API's historical test behavior until
@@ -1298,6 +1321,36 @@ impl ChainState {
         self.prune_target_size
     }
 
+    pub fn prune_locks(&self) -> Vec<(String, PruneLock)> {
+        let mut locks = self
+            .prune_locks
+            .iter()
+            .map(|(id, lock)| (id.clone(), lock.clone()))
+            .collect::<Vec<_>>();
+        locks.sort_by(|(left, _), (right, _)| left.cmp(right));
+        locks
+    }
+
+    /// Add, replace, or remove a pruning lock and persist non-temporary
+    /// changes with the chain metadata. Deleting `*` succeeds even when no
+    /// locks are currently installed, as in Core.
+    pub fn set_prune_lock(&mut self, id: &str, lock: Option<PruneLock>) -> Result<bool> {
+        let success = if let Some(lock) = lock {
+            if id == "*" {
+                bail!("id \"*\" only makes sense when deleting")
+            }
+            self.prune_locks.insert(id.to_owned(), lock);
+            true
+        } else if id == "*" {
+            self.prune_locks.clear();
+            true
+        } else {
+            self.prune_locks.remove(id).is_some()
+        };
+        self.persist_metadata()?;
+        Ok(success)
+    }
+
     /// Apply Core's network-specific minimum chain height for pruning. The
     /// debug-only fast-prune mode changes regtest's threshold from 1000 to
     /// 100, as in Core v31.1.
@@ -1447,7 +1500,14 @@ impl ChainState {
         if requested_height > tip_height {
             bail!("Blockchain is shorter than the attempted prune height.");
         }
-        let target_height = requested_height.min(tip_height - MIN_BLOCKS_TO_KEEP);
+        let mut target_height = requested_height.min(tip_height - MIN_BLOCKS_TO_KEEP);
+        for lock in self.prune_locks.values() {
+            if lock.height_first < u64::from(target_height) {
+                target_height = target_height.min(
+                    u32::try_from(lock.height_first).unwrap_or(u32::MAX),
+                );
+            }
+        }
         if let Some(previous) = self.prune_height
             && target_height <= previous
         {
@@ -1703,6 +1763,27 @@ impl ChainState {
     /// that many cores available to the rest of the node.
     pub fn configure_script_check_threads(&mut self, par: i32) {
         self.script_check_workers = script_check_workers(par);
+        self.script_checks_enabled = self.script_check_workers > 0;
+    }
+
+    pub fn script_checks_enabled(&self) -> bool {
+        self.script_checks_enabled && self.script_check_workers > 0
+    }
+
+    pub fn script_check_thread_count(&self) -> usize {
+        if self.script_checks_enabled() {
+            self.script_check_workers.saturating_add(1)
+        } else {
+            1
+        }
+    }
+
+    pub fn set_script_checks_enabled(&mut self, enabled: bool) -> Result<()> {
+        if enabled && self.script_check_workers == 0 {
+            bail!("Script verification threads are disabled (single core machine or -par=<-<numcores>)")
+        }
+        self.script_checks_enabled = enabled;
+        Ok(())
     }
 
     /// Configure the bounded successful-script-validation cache. The cache
@@ -4176,10 +4257,7 @@ impl ChainState {
         if pending.is_empty() {
             return Ok(());
         }
-        let thread_count = self
-            .script_check_workers
-            .saturating_add(1)
-            .min(pending.len());
+        let thread_count = self.script_check_thread_count().min(pending.len());
         let network = self.network;
         let block_time = block.header.time;
         if thread_count <= 1 {
@@ -5313,6 +5391,12 @@ impl ChainState {
                 .map(ToString::to_string)
                 .collect(),
             prune_height: self.prune_height,
+            prune_locks: self
+                .prune_locks
+                .iter()
+                .filter(|(_, lock)| !lock.temporary)
+                .map(|(id, lock)| (id.clone(), lock.clone()))
+                .collect(),
         };
         let bytes = serialize_internal(CHAIN_METADATA_MAGIC, &metadata)?;
         let path = self.data_dir.join("chainstate.bin");
@@ -5977,6 +6061,7 @@ fn open_background_replay_state(
         assume_valid_block: None,
         max_tip_age_secs: MAX_TIP_AGE_SECS,
         script_check_workers,
+        script_checks_enabled: script_check_workers > 0,
         signet_challenge,
         store,
         filter_store,
@@ -6000,6 +6085,7 @@ fn open_background_replay_state(
         orphans: HashMap::new(),
         invalid_blocks: HashSet::new(),
         prune_height: None,
+        prune_locks: HashMap::new(),
         prune_mode: false,
         prune_target_size: None,
         prune_after_height: MIN_BLOCKS_TO_KEEP,
@@ -7146,6 +7232,7 @@ mod tests {
                 .map(ToString::to_string)
                 .collect(),
             prune_height: state.prune_height,
+            prune_locks: HashMap::new(),
         };
         let snapshot = state.current_snapshot();
         let metadata_json = serde_json::to_vec_pretty(&metadata).unwrap();
@@ -7577,6 +7664,42 @@ mod tests {
         state.configure_pruning(550).unwrap();
         assert!(state.is_pruned());
         assert_eq!(state.prune_target_size(), Some(550 * 1024 * 1024));
+    }
+
+    #[test]
+    fn prune_locks_persist_only_non_temporary_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state
+            .set_prune_lock(
+                "persistent",
+                Some(PruneLock {
+                    desc: "keep history".to_owned(),
+                    height_first: 100,
+                    height_last: u64::MAX,
+                    temporary: false,
+                }),
+            )
+            .unwrap();
+        state
+            .set_prune_lock(
+                "temporary",
+                Some(PruneLock {
+                    desc: "one run".to_owned(),
+                    height_first: 200,
+                    height_last: 300,
+                    temporary: true,
+                }),
+            )
+            .unwrap();
+        assert_eq!(state.prune_locks().len(), 2);
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let locks = reopened.prune_locks();
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[0].0, "persistent");
+        assert_eq!(locks[0].1.height_first, 100);
     }
 
     #[test]

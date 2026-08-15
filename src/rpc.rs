@@ -299,7 +299,7 @@ async fn handle_connection(
             };
             match tokio::time::timeout(
                 request_timeout,
-                dispatch_json_rpc_http(&node, &request.body),
+                dispatch_json_rpc_http(&node, &request.body, Some(username)),
             )
             .await
             {
@@ -1260,10 +1260,14 @@ struct JsonRpcHttpResponse {
 
 #[cfg(test)]
 async fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Option<Value> {
-    dispatch_json_rpc_http(node, body).await.body
+    dispatch_json_rpc_http(node, body, None).await.body
 }
 
-async fn dispatch_json_rpc_http(node: &Arc<Node>, body: &[u8]) -> JsonRpcHttpResponse {
+async fn dispatch_json_rpc_http(
+    node: &Arc<Node>,
+    body: &[u8],
+    auth_user: Option<String>,
+) -> JsonRpcHttpResponse {
     let request: Value = match serde_json::from_slice(body) {
         Ok(value) => value,
         Err(error) => {
@@ -1284,7 +1288,7 @@ async fn dispatch_json_rpc_http(node: &Arc<Node>, body: &[u8]) -> JsonRpcHttpRes
         }
         let mut responses = Vec::with_capacity(batch.len());
         for request in batch {
-            if let Some(response) = dispatch_request(node, request).await {
+            if let Some(response) = dispatch_request(node, request, auth_user.as_deref()).await {
                 responses.push(response);
             }
         }
@@ -1300,7 +1304,7 @@ async fn dispatch_json_rpc_http(node: &Arc<Node>, body: &[u8]) -> JsonRpcHttpRes
             }
         };
     }
-    let body = dispatch_request(node, &request).await;
+    let body = dispatch_request(node, &request, auth_user.as_deref()).await;
     let status = match body.as_ref() {
         Some(response) => {
             let is_json_rpc_2 = request.get("jsonrpc").and_then(Value::as_str) == Some("2.0");
@@ -1320,7 +1324,11 @@ async fn dispatch_json_rpc_http(node: &Arc<Node>, body: &[u8]) -> JsonRpcHttpRes
     JsonRpcHttpResponse { status, body }
 }
 
-async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Option<Value> {
+async fn dispatch_request(
+    node: &Arc<Node>,
+    request: &Value,
+    auth_user: Option<&str>,
+) -> Option<Value> {
     let Some(request_object) = request.as_object() else {
         return Some(json_rpc_invalid_request(
             Value::Null,
@@ -1357,7 +1365,14 @@ async fn dispatch_request(node: &Arc<Node>, request: &Value) -> Option<Value> {
             ));
         }
     };
-    let response = match dispatch_method_async(node, method, &params).await {
+    let response = match dispatch_method_async_for_user(
+        node,
+        method,
+        &params,
+        auth_user.map(ToOwned::to_owned),
+    )
+    .await
+    {
         Ok(result) if json_rpc_2 => json!({
             "jsonrpc": "2.0",
             "result": result,
@@ -1404,7 +1419,17 @@ fn json_rpc_error_status(response: &Value) -> &'static str {
     }
 }
 
+#[cfg(test)]
 async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
+    dispatch_method_async_for_user(node, method, params, None).await
+}
+
+async fn dispatch_method_async_for_user(
+    node: &Arc<Node>,
+    method: &str,
+    params: &Value,
+    auth_user: Option<String>,
+) -> Result<Value> {
     let normalized_params = normalize_rpc_params(method, params)?;
     let command_id = node.begin_rpc_command(method);
     let result = match method {
@@ -1426,14 +1451,22 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
             let node = node.clone();
             let method = method.to_owned();
             let params = normalized_params.clone();
-            match tokio::task::spawn_blocking(move || dispatch_method(&node, &method, &params))
-                .await
+            let auth_user = auth_user.clone();
+            match tokio::task::spawn_blocking(move || {
+                dispatch_method_for_user(&node, &method, &params, auth_user.as_deref())
+            })
+            .await
             {
                 Ok(result) => result,
                 Err(error) => Err(anyhow!("scan RPC task failed: {error}")),
             }
         }
-        _ => dispatch_method(node, method, &normalized_params),
+        _ => dispatch_method_for_user(
+            node,
+            method,
+            &normalized_params,
+            auth_user.as_deref(),
+        ),
     };
     node.end_rpc_command(command_id);
     result
@@ -1558,12 +1591,15 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
     match method {
         "stop" => Some(&["wait"]),
         "help" => Some(&["command"]),
+        "format" => Some(&["command", "output"]),
         "getdeploymentinfo" => Some(&["blockhash"]),
         "getblockhash" => Some(&["height"]),
         "getblockheader" => Some(&["blockhash", "verbose"]),
         "getblock" => Some(&["blockhash", "verbosity"]),
         "getblockfilter" => Some(&["blockhash", "filtertype"]),
         "getblockstats" => Some(&["hash_or_height", "stats"]),
+        "getblockfileinfo" => Some(&["file_number"]),
+        "getblocklocations" => Some(&["blockhash", "nblocks"]),
         "getchaintxstats" => Some(&["nblocks", "blockhash"]),
         "getnetworkhashps" => Some(&["nblocks", "height"]),
         "gettxoutproof" => Some(&["txids", "blockhash"]),
@@ -1614,6 +1650,8 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "gettxout" => Some(&["txid", "n", "include_mempool"]),
         "gettxspendingprevout" => Some(&["outputs", "options"]),
         "getrawmempool" => Some(&["verbose", "mempool_sequence"]),
+        "listmempooltransactions" => Some(&["start_sequence", "verbose"]),
+        "maxmempool" => Some(&["megabytes"]),
         "getmempoolentry" => Some(&["txid"]),
         "getmempoolancestors" | "getmempooldescendants" => Some(&["txid", "verbose"]),
         "getorphantxs" => Some(&["verbosity"]),
@@ -1623,6 +1661,8 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "dumptxoutset" => Some(&["path", "type", "options"]),
         "loadtxoutset" => Some(&["path"]),
         "pruneblockchain" => Some(&["height"]),
+        "setprunelock" => Some(&["id", "lock_info"]),
+        "setscriptthreadsenabled" => Some(&["state"]),
         "waitfornewblock" => Some(&["timeout", "current_tip"]),
         "waitforblock" => Some(&["blockhash", "timeout"]),
         "waitforblockheight" => Some(&["height", "timeout"]),
@@ -1664,6 +1704,9 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         | "getchaintips"
         | "getnetworkinfo"
         | "getgeneralinfo"
+        | "scriptthreadsinfo"
+        | "listprunelocks"
+        | "getrpcwhitelist"
         | "getpeerinfo"
         | "getnettotals"
         | "getaddrmaninfo"
@@ -1684,6 +1727,15 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
 }
 
 fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
+    dispatch_method_for_user(node, method, params, None)
+}
+
+fn dispatch_method_for_user(
+    node: &Arc<Node>,
+    method: &str,
+    params: &Value,
+    auth_user: Option<&str>,
+) -> Result<Value> {
     match method {
         "stop" => {
             let wait = stop_wait(params)?;
@@ -1866,6 +1918,8 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 }
             }
         }
+        "listmempooltransactions" => list_mempool_transactions(node, params),
+        "maxmempool" => set_max_mempool(node, params),
         "getorphantxs" => get_orphan_transactions(node, params),
         "getmempoolentry" => {
             let txid: Txid = param::<String>(params, 0)?.parse()?;
@@ -1943,6 +1997,22 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
         "dumptxoutset" => dump_txoutset(node, params),
         "loadtxoutset" => load_txoutset(node, params),
         "pruneblockchain" => prune_blockchain(node, params),
+        "getblockfileinfo" => get_block_file_info(node, params),
+        "getblocklocations" => get_block_locations(node, params),
+        "listprunelocks" => list_prune_locks(node),
+        "setprunelock" => set_prune_lock(node, params),
+        "scriptthreadsinfo" => {
+            let chain = node.chain.read();
+            Ok(json!({
+                "enabled": chain.script_checks_enabled(),
+                "num_script_check_threads": chain.script_check_thread_count(),
+            }))
+        }
+        "setscriptthreadsenabled" => {
+            let state = param::<bool>(params, 0)?;
+            node.chain.write().set_script_checks_enabled(state)?;
+            Ok(Value::Null)
+        }
         "scantxoutset" => scan_txout_set(node, params),
         "scanblocks" => scan_blocks(node, params),
         "getdescriptoractivity" => get_descriptor_activity(node, params),
@@ -2110,6 +2180,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "active_commands": node.active_rpc_commands(),
             "logpath": node.config.debug_log_path.to_string_lossy(),
         })),
+        "getrpcwhitelist" => get_rpc_whitelist(node, auth_user),
         "getgeneralinfo" => Ok(json!({
             "clientversion": "31.1.0",
             "useragent": "/bitcoind-rs:0.1.0/",
@@ -2124,6 +2195,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                 .saturating_sub(node.started_at.elapsed().as_secs()),
         })),
         "help" => Ok(json!(rpc_help(method_params_string(params)))),
+        "format" => format_rpc_command(params),
         "estimatesmartfee" => estimate_smart_fee(node, params),
         "estimaterawfee" => estimate_raw_fee(node, params),
         "savefeeestimates" => save_fee_estimates(node),
@@ -4394,6 +4466,260 @@ fn prune_blockchain(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(
         first_retained.checked_sub(1).map(i64::from).unwrap_or(-1)
     ))
+}
+
+fn list_mempool_transactions(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let start_sequence = optional_u64(params, 0, 0, "start_sequence")?;
+    let verbose = optional_bool(params, 1, false, "verbose")?;
+    let mempool = node.mempool.read();
+    let transactions = mempool
+        .transactions_since_sequence(start_sequence)
+        .into_iter()
+        .filter_map(|(entry_sequence, txid)| {
+            let entry = mempool.get(&txid)?;
+            let value = if verbose {
+                let mut value = decoded_transaction_json(&entry.transaction, node.config.network);
+                value["entry_sequence"] = json!(entry_sequence);
+                value
+            } else {
+                json!({
+                    "entry_sequence": entry_sequence,
+                    "txid": txid.to_string(),
+                })
+            };
+            Some(value)
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "mempool_sequence": mempool.sequence(),
+        "txs": transactions,
+    }))
+}
+
+fn set_max_mempool(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let megabytes = param::<i64>(params, 0)?;
+    if megabytes < 0 {
+        bail!("MaxMempool size is too small")
+    }
+    let max_bytes = u64::try_from(megabytes)
+        .ok()
+        .and_then(|megabytes| megabytes.checked_mul(1_000_000))
+        .context("MaxMempool size is too large")?;
+    let mut mempool = node.mempool.write();
+    let minimum_bytes = mempool.cluster_vsize_limit().saturating_mul(40);
+    if max_bytes < minimum_bytes {
+        bail!("MaxMempool size {megabytes} is too small")
+    }
+    let max_bytes = usize::try_from(max_bytes).context("MaxMempool size is too large")?;
+    mempool.set_max_bytes(max_bytes);
+    mempool.enforce_size_limit();
+    let changes = mempool.take_changes();
+    drop(mempool);
+    if !changes.is_empty() {
+        let current_height = node.chain.read().height();
+        node.update_fee_estimator_for_changes(&changes, current_height);
+            let removed = changes
+            .iter()
+            .filter_map(|change| {
+                matches!(&change.kind, crate::mempool::MempoolChangeKind::Removed { .. })
+                    .then_some(change.transaction.clone())
+            })
+            .collect::<Vec<_>>();
+        node.notify_mempool_removals(removed);
+        node.notify_zmq_mempool_changes(changes);
+        node.maybe_check_mempool();
+    }
+    Ok(Value::Null)
+}
+
+fn get_block_file_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let file_number = param::<i64>(params, 0)?;
+    if file_number < 0 {
+        bail!("Invalid block number")
+    }
+    if file_number != 0 {
+        bail!("block file not found")
+    }
+    let chain = node.chain.read();
+    let mut heights = chain
+        .store
+        .hashes()
+        .filter_map(|hash| chain.block_height_by_hash(hash))
+        .collect::<Vec<_>>();
+    heights.sort_unstable();
+    Ok(json!({
+        "blocks_num": chain.store.len(),
+        "lowest_block": heights.first().copied().unwrap_or_default(),
+        "highest_block": heights.last().copied().unwrap_or_default(),
+        "data_size": chain.store.data_size()?,
+        "undo_size": chain.store.undo_size()?,
+    }))
+}
+
+fn get_block_locations(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    let requested = param::<u64>(params, 1)?.max(1);
+    let chain = node.chain.read();
+    if chain.is_pruned() {
+        bail!("Block locations are not available in prune mode")
+    }
+    if chain.block_height_by_hash(&hash).is_none() {
+        bail!("Block not found")
+    }
+    let mut cursor = hash;
+    let mut locations = Vec::new();
+    loop {
+        let header = chain
+            .header_by_hash(&cursor)
+            .with_context(|| format!("Block {cursor} not found"))?;
+        let data = chain
+            .store
+            .block_location(&cursor)
+            .with_context(|| format!("Block data for {cursor} is not available"))?;
+        let mut location = json!({
+            // This implementation uses one append-only blocks.dat file.
+            "file": 0,
+            "data": data,
+            "prev": header.prev_blockhash.to_string(),
+        });
+        if let Some(undo) = chain.store.undo_location(&cursor) {
+            location["undo"] = json!(undo);
+        }
+        locations.push(location);
+        if u64::try_from(locations.len()).unwrap_or(u64::MAX) >= requested
+            || header.prev_blockhash == BlockHash::all_zeros()
+        {
+            break;
+        }
+        cursor = header.prev_blockhash;
+    }
+    Ok(Value::Array(locations))
+}
+
+fn list_prune_locks(node: &Arc<Node>) -> Result<Value> {
+    let chain = node.chain.read();
+    Ok(json!({
+        "prune_locks": chain
+            .prune_locks()
+            .into_iter()
+            .map(|(id, lock)| {
+                let height = if lock.height_last == u64::MAX {
+                    json!([lock.height_first])
+                } else {
+                    json!([lock.height_first, lock.height_last])
+                };
+                json!({
+                    "id": id,
+                    "desc": lock.desc,
+                    "height": height,
+                    "temporary": lock.temporary,
+                })
+            })
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn prune_lock_range(value: Option<&Value>) -> Result<Option<(u64, u64)>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let values = match value {
+        Value::Array(values) => values,
+        _ => std::slice::from_ref(value),
+    };
+    if values.is_empty() || values.len() > 2 {
+        bail!("prune lock height must be a number or a range")
+    }
+    if values[0].is_null() {
+        if values.get(1).is_none_or(Value::is_null) {
+            return Ok(None);
+        }
+        bail!("Invalid start height")
+    }
+    let first = values[0]
+        .as_u64()
+        .ok_or_else(|| anyhow!("Invalid start height"))?;
+    let last = values
+        .get(1)
+        .filter(|value| !value.is_null())
+        .map(|value| value.as_u64().ok_or_else(|| anyhow!("Invalid end height")))
+        .transpose()?
+        .unwrap_or(u64::MAX);
+    if last < first {
+        bail!("Invalid prune lock height range")
+    }
+    Ok(Some((first, last)))
+}
+
+fn set_prune_lock(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let id = param::<String>(params, 0)?;
+    let lock_info = params
+        .get(1)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow!("lock_info must be an object"))?;
+    let range = prune_lock_range(lock_info.get("height"))?;
+    let temporary = lock_info
+        .get("temporary")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("temporary must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    let lock = range.map(|(height_first, height_last)| {
+        let desc = lock_info
+            .get("desc")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        crate::chain::PruneLock {
+            desc,
+            height_first,
+            height_last,
+            temporary,
+        }
+    });
+    if lock.is_some() && lock.as_ref().is_some_and(|lock| lock.desc.is_empty()) {
+        bail!("Missing prune lock description")
+    }
+    let success = node.chain.write().set_prune_lock(&id, lock)?;
+    Ok(json!({"success": success}))
+}
+
+fn get_rpc_whitelist(node: &Arc<Node>, auth_user: Option<&str>) -> Result<Value> {
+    let whitelist = auth_user
+        .and_then(|user| node.config.rpc_whitelist.get(user))
+        .or_else(|| {
+            auth_user
+                .is_none()
+                .then(|| node.config.rpc_whitelist.get(""))
+                .flatten()
+        });
+    let methods = if let Some(whitelist) = whitelist {
+        let mut methods = whitelist.iter().cloned().collect::<Vec<_>>();
+        methods.sort();
+        methods
+    } else if node.config.rpc_whitelist_default {
+        Vec::new()
+    } else {
+        rpc_help("").lines().map(ToOwned::to_owned).collect()
+    };
+    let methods = methods
+        .into_iter()
+        .map(|method| (method, Value::Null))
+        .collect::<serde_json::Map<_, _>>();
+    Ok(json!({"methods": methods, "wallets": {}}))
+}
+
+fn format_rpc_command(params: &Value) -> Result<Value> {
+    let command = param::<String>(params, 0)?;
+    let output = param::<String>(params, 1)?;
+    if output != "args_cli" {
+        bail!("unrecogonized help format")
+    }
+    Ok(Value::String(rpc_help(&command)))
 }
 
 async fn wait_for_new_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -12145,7 +12471,9 @@ fn rpc_help(method: &str) -> String {
         "getblockheader",
         "getblock",
         "getblockfilter",
+        "getblocklocations",
         "getblockstats",
+        "getblockfileinfo",
         "getchaintxstats",
         "getnetworkhashps",
         "getmemoryinfo",
@@ -12192,6 +12520,8 @@ fn rpc_help(method: &str) -> String {
         "gettxout",
         "gettxspendingprevout",
         "getmempoolinfo",
+        "listmempooltransactions",
+        "maxmempool",
         "getrawmempool",
         "getorphantxs",
         "getmempoolentry",
@@ -12205,6 +12535,10 @@ fn rpc_help(method: &str) -> String {
         "dumptxoutset",
         "loadtxoutset",
         "pruneblockchain",
+        "listprunelocks",
+        "setprunelock",
+        "scriptthreadsinfo",
+        "setscriptthreadsenabled",
         "waitfornewblock",
         "waitforblock",
         "waitforblockheight",
@@ -12232,6 +12566,8 @@ fn rpc_help(method: &str) -> String {
         "ping",
         "setnetworkactive",
         "getrpcinfo",
+        "getrpcwhitelist",
+        "format",
         "stop",
         "estimatesmartfee",
         "estimaterawfee",
@@ -13976,6 +14312,72 @@ mod tests {
             json!(directory.path().join("blocks").to_string_lossy())
         );
         assert!(general["startuptime"].as_u64().is_some());
+        let script_threads = dispatch_method(&node, "scriptthreadsinfo", &json!([])).unwrap();
+        assert!(script_threads["enabled"].is_boolean());
+        assert!(script_threads["num_script_check_threads"].as_u64().is_some());
+        dispatch_method(&node, "setscriptthreadsenabled", &json!([false])).unwrap();
+        let disabled_threads =
+            dispatch_method(&node, "scriptthreadsinfo", &json!([])).unwrap();
+        assert_eq!(disabled_threads["enabled"], json!(false));
+        assert_eq!(disabled_threads["num_script_check_threads"], json!(1));
+        if script_threads["enabled"] == json!(true) {
+            dispatch_method(&node, "setscriptthreadsenabled", &json!([true])).unwrap();
+        }
+        let formatted = dispatch_method(
+            &node,
+            "format",
+            &json!(["getblockcount", "args_cli"]),
+        )
+        .unwrap();
+        assert_eq!(formatted, json!(rpc_help("getblockcount")));
+        let whitelist = dispatch_method(&node, "getrpcwhitelist", &json!([])).unwrap();
+        assert_eq!(whitelist["wallets"], json!({}));
+        assert!(whitelist["methods"]["getblockcount"].is_null());
+        let genesis_locations = dispatch_method(
+            &node,
+            "getblocklocations",
+            &json!([node.chain.read().best_hash().to_string(), 10]),
+        )
+        .unwrap();
+        assert_eq!(genesis_locations.as_array().unwrap().len(), 1);
+        assert_eq!(genesis_locations[0]["file"], json!(0));
+        assert_eq!(genesis_locations[0]["data"], json!(0));
+        let file_info = dispatch_method(&node, "getblockfileinfo", &json!([0])).unwrap();
+        assert_eq!(file_info["blocks_num"], json!(1));
+        assert_eq!(file_info["lowest_block"], json!(0));
+        assert_eq!(file_info["highest_block"], json!(0));
+        assert!(file_info["data_size"].as_u64().is_some_and(|size| size > 0));
+        assert_eq!(
+            dispatch_method(&node, "listprunelocks", &json!([])).unwrap(),
+            json!({"prune_locks": []})
+        );
+        assert_eq!(
+            dispatch_method(
+                &node,
+                "setprunelock",
+                &json!(["rpc-test", {"desc": "RPC test", "height": [0, 100]}]),
+            )
+            .unwrap(),
+            json!({"success": true})
+        );
+        let locks = dispatch_method(&node, "listprunelocks", &json!([])).unwrap();
+        assert_eq!(locks["prune_locks"][0]["id"], json!("rpc-test"));
+        assert_eq!(
+            dispatch_method(&node, "setprunelock", &json!(["rpc-test", {}])).unwrap(),
+            json!({"success": true})
+        );
+        dispatch_method(&node, "maxmempool", &json!([10])).unwrap();
+        assert_eq!(
+            dispatch_method(&node, "getmempoolinfo", &json!([])).unwrap()["maxmempool"],
+            json!(10_000_000)
+        );
+        let mempool_transactions = dispatch_method(
+            &node,
+            "listmempooltransactions",
+            &json!([]),
+        )
+        .unwrap();
+        assert_eq!(mempool_transactions["txs"], json!([]));
         assert!(
             dispatch_method(&node, "verifychain", &json!([]))
                 .unwrap()

@@ -248,8 +248,28 @@ impl BlockStore {
             .context("block store disk usage overflowed")
     }
 
+    pub fn data_size(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+
+    pub fn undo_size(&self) -> Result<u64> {
+        Ok(self.undo_file.metadata()?.len())
+    }
+
     pub fn contains(&self, hash: &BlockHash) -> bool {
         self.index.contains_key(hash)
+    }
+
+    /// Return the record offset in the implementation's single block data
+    /// file. This is exposed for the experimental getblocklocations RPC.
+    pub fn block_location(&self, hash: &BlockHash) -> Option<u64> {
+        self.index.get(hash).map(|record| record.offset)
+    }
+
+    /// Return the record offset in the implementation's single undo data
+    /// file, when undo data is available for the block.
+    pub fn undo_location(&self, hash: &BlockHash) -> Option<u64> {
+        self.undo_index.get(hash).map(|record| record.offset)
     }
 
     pub fn len(&self) -> usize {

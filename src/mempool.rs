@@ -578,6 +578,14 @@ impl Mempool {
         self.max_bytes
     }
 
+    /// Change the memory limit used by admission and eviction. Core's RPC
+    /// validates the minimum before mutating the pool; keeping the setter
+    /// small lets callers apply that policy while reusing the normal eviction
+    /// path and its sequence/change notifications.
+    pub fn set_max_bytes(&mut self, max_bytes: usize) {
+        self.max_bytes = max_bytes.max(1);
+    }
+
     pub fn min_relay_fee_sat_per_kvb(&self) -> u64 {
         self.policy.min_relay_fee_sat_per_kvb
     }
@@ -621,6 +629,25 @@ impl Mempool {
 
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Return entries whose admission sequence is at least `start_sequence`.
+    /// The sequence is assigned once when an entry enters the pool and is
+    /// deliberately kept separate from the topology/mining order.
+    pub fn transactions_since_sequence(&self, start_sequence: u64) -> Vec<(u64, Txid)> {
+        let mut transactions = self
+            .relay_sequences
+            .iter()
+            .filter_map(|(txid, sequence)| {
+                (*sequence >= start_sequence).then_some((*sequence, *txid))
+            })
+            .collect::<Vec<_>>();
+        transactions.sort_by(|(left_sequence, left_txid), (right_sequence, right_txid)| {
+            left_sequence
+                .cmp(right_sequence)
+                .then_with(|| left_txid.to_string().cmp(&right_txid.to_string()))
+        });
+        transactions
     }
 
     /// Verify the bidirectional indexes and accounting maintained by the

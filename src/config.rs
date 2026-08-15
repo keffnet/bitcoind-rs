@@ -146,6 +146,14 @@ impl RpcAuth {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+pub enum RpcCookiePermissions {
+    #[default]
+    Owner,
+    Group,
+    All,
+}
+
 impl fmt::Debug for RpcAuth {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -591,6 +599,13 @@ pub struct Args {
     #[arg(long = "rpccookiefile", value_name = "PATH")]
     pub rpc_cookie_file: Option<PathBuf>,
 
+    #[arg(
+        long = "rpccookieperms",
+        value_enum,
+        default_value_t = RpcCookiePermissions::Owner
+    )]
+    pub rpc_cookie_permissions: RpcCookiePermissions,
+
     #[arg(long = "norpccookiefile", default_value_t = false)]
     pub no_rpc_cookie_file: bool,
 
@@ -921,6 +936,7 @@ pub struct Config {
     pub(crate) rpc_allow_ips: Vec<IpSubnet>,
     pub(crate) rpc_auth: Vec<RpcAuth>,
     pub(crate) rpc_cookie_path: Option<PathBuf>,
+    pub(crate) rpc_cookie_permissions: RpcCookiePermissions,
     pub(crate) rpc_whitelist: HashMap<String, HashSet<String>>,
     pub(crate) rpc_whitelist_default: bool,
     pub rpc_server_timeout_secs: u64,
@@ -1264,6 +1280,7 @@ impl Config {
             rpc_allow_ips,
             rpc_auth,
             rpc_cookie_path,
+            rpc_cookie_permissions: args.rpc_cookie_permissions,
             rpc_whitelist,
             rpc_whitelist_default,
             rpc_server_timeout_secs,
@@ -1944,6 +1961,7 @@ mod tests {
             "--datadir",
             directory.path().to_str().unwrap(),
             "--rpccookiefile=auth/rpc.cookie",
+            "--rpccookieperms=group",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
@@ -1951,6 +1969,7 @@ mod tests {
             config.rpc_cookie_path,
             Some(directory.path().join("auth/rpc.cookie"))
         );
+        assert_eq!(config.rpc_cookie_permissions, RpcCookiePermissions::Group);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

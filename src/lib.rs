@@ -37,7 +37,7 @@ use tracing::{info, warn};
 
 use crate::address::NetworkEndpoint;
 use crate::chain::ChainState;
-use crate::config::{Config, PeerPermissions};
+use crate::config::{Config, PeerPermissions, RpcCookiePermissions};
 use crate::mempool::{
     Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
 };
@@ -819,7 +819,7 @@ impl Node {
                     .iter()
                     .any(|auth| auth.uses_plaintext_password())
             })
-            .map(|path| load_rpc_cookie(&path))
+            .map(|path| load_rpc_cookie(&path, config.rpc_cookie_permissions))
             .transpose()?;
         Ok(Arc::new(Self {
             config,
@@ -3320,7 +3320,7 @@ fn unix_time_seconds() -> u64 {
     time::unix_time()
 }
 
-fn load_rpc_cookie(path: &Path) -> Result<String> {
+fn load_rpc_cookie(path: &Path, permissions: RpcCookiePermissions) -> Result<String> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -3332,8 +3332,15 @@ fn load_rpc_cookie(path: &Path) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+        let mode = match permissions {
+            RpcCookiePermissions::Owner => 0o600,
+            RpcCookiePermissions::Group => 0o640,
+            RpcCookiePermissions::All => 0o644,
+        };
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(mode))?;
     }
+    #[cfg(not(unix))]
+    let _ = permissions;
     std::fs::rename(temp, path)?;
     Ok(cookie)
 }
@@ -3361,6 +3368,7 @@ mod tests {
             rpc_allow_ips: Vec::new(),
             rpc_auth: Vec::new(),
             rpc_cookie_path: None,
+            rpc_cookie_permissions: crate::config::RpcCookiePermissions::Owner,
             rpc_server_timeout_secs: 30,
             rpc_threads: 16,
             rpc_work_queue: 64,
@@ -3612,8 +3620,8 @@ mod tests {
     fn rpc_cookie_rotates_on_each_startup() {
         let directory = tempfile::tempdir().unwrap();
         let cookie_path = directory.path().join(".cookie");
-        let first = load_rpc_cookie(&cookie_path).unwrap();
-        let second = load_rpc_cookie(&cookie_path).unwrap();
+        let first = load_rpc_cookie(&cookie_path, RpcCookiePermissions::Owner).unwrap();
+        let second = load_rpc_cookie(&cookie_path, RpcCookiePermissions::Owner).unwrap();
         assert_ne!(first, second);
         assert_eq!(
             fs::read_to_string(directory.path().join(".cookie"))
@@ -3621,6 +3629,26 @@ mod tests {
                 .trim(),
             second
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rpc_cookie_permissions_follow_core_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cookie_path = directory.path().join(".cookie");
+        for (permissions, mode) in [
+            (RpcCookiePermissions::Owner, 0o600),
+            (RpcCookiePermissions::Group, 0o640),
+            (RpcCookiePermissions::All, 0o644),
+        ] {
+            load_rpc_cookie(&cookie_path, permissions).unwrap();
+            assert_eq!(
+                fs::metadata(&cookie_path).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
     }
 
     #[test]

@@ -1177,6 +1177,14 @@ impl PeerManager {
         if let Some(startup) = startup.as_deref() {
             startup.service_ready();
         }
+        if self.node.config.natpmp
+            && let Some(address) = listeners
+                .iter()
+                .filter_map(|listener| listener.local_addr().ok())
+                .find(|address| !address.ip().is_loopback() && address.port() != 0)
+        {
+            tokio::spawn(crate::portmap::run(self.node.clone(), address.port()));
+        }
         let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
         let manual_slots = Arc::new(Semaphore::new(MAX_ADDNODE_CONNECTIONS));
         let private_slots = Arc::new(Semaphore::new(MAX_PRIVATE_BROADCAST_CONNECTIONS));
@@ -4669,6 +4677,11 @@ fn advertised_local_address(node: &Node, peer: &PeerState) -> Option<SocketAddr>
         .copied()
         .find(|address| usable(*address))
         .or_else(|| {
+            node.mapped_addresses()
+                .into_iter()
+                .find(|address| usable(*address))
+        })
+        .or_else(|| {
             node.config
                 .discover
                 .then_some(peer.local_address)
@@ -5455,6 +5468,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -6090,6 +6104,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -6296,6 +6311,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -6793,6 +6809,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -6983,6 +7000,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -7179,6 +7197,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -7465,6 +7484,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -7627,6 +7647,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -7771,6 +7792,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -8007,6 +8029,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),
@@ -8205,6 +8228,7 @@ mod tests {
             cjdns_reachable: false,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),

@@ -863,6 +863,17 @@ pub struct Args {
     )]
     pub listen_onion: Option<bool>,
 
+    /// Use PCP or NAT-PMP to map the P2P listening port when a gateway
+    /// supports automatic port forwarding.
+    #[arg(
+        long = "natpmp",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub natpmp: bool,
+
     #[arg(
         long,
         num_args = 0..=1,
@@ -1732,6 +1743,7 @@ pub struct Config {
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
     pub listen_onion: bool,
+    pub natpmp: bool,
     pub rpc_bind: Option<SocketAddr>,
     pub rpc_binds: Vec<SocketAddr>,
     pub(crate) rpc_allow_ips: Vec<IpSubnet>,
@@ -2285,6 +2297,7 @@ impl Config {
             p2p_binds,
             listen,
             listen_onion,
+            natpmp: args.natpmp,
             rpc_bind: rpc_binds.first().copied(),
             rpc_binds,
             rpc_allow_ips,
@@ -3731,6 +3744,29 @@ mod tests {
             Args::try_parse_from(["bitcoind-rs", "--daemon=false", "--daemonwait=0"]).unwrap();
         assert!(!args.daemon);
         assert!(!args.daemon_wait);
+    }
+
+    #[test]
+    fn parses_natpmp_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--natpmp=false",
+        ])
+        .unwrap();
+        assert!(!args.natpmp);
+        assert!(!Config::from_args(args).unwrap().natpmp);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--natpmp",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().natpmp);
     }
 
     #[test]

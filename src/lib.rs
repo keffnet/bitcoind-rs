@@ -10,6 +10,7 @@ pub mod i2p;
 pub mod mempool;
 pub mod muhash;
 pub mod p2p;
+pub mod portmap;
 pub mod rpc;
 pub mod storage;
 pub mod time;
@@ -790,6 +791,7 @@ pub struct Node {
     network_active: AtomicBool,
     block_stalling_timeout_secs: AtomicU64,
     block_stalling_since: parking_lot::RwLock<HashMap<usize, Instant>>,
+    shutdown_requested: AtomicBool,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
     peer_commands:
         parking_lot::RwLock<HashMap<usize, tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>>>,
@@ -807,6 +809,7 @@ pub struct Node {
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
     listen_address: parking_lot::RwLock<Option<SocketAddr>>,
     listen_addresses: parking_lot::RwLock<Vec<SocketAddr>>,
+    mapped_addresses: parking_lot::RwLock<Vec<SocketAddr>>,
     listen_network_addresses: parking_lot::RwLock<Vec<NetworkEndpoint>>,
     last_mining_block: parking_lot::RwLock<Option<(u64, usize)>>,
     pub started_at: Instant,
@@ -1078,6 +1081,7 @@ impl Node {
             network_active: AtomicBool::new(network_active),
             block_stalling_timeout_secs: AtomicU64::new(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
             block_stalling_since: parking_lot::RwLock::new(HashMap::new()),
+            shutdown_requested: AtomicBool::new(false),
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
@@ -1095,6 +1099,7 @@ impl Node {
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
             listen_address: parking_lot::RwLock::new(None),
             listen_addresses: parking_lot::RwLock::new(Vec::new()),
+            mapped_addresses: parking_lot::RwLock::new(Vec::new()),
             listen_network_addresses: parking_lot::RwLock::new(Vec::new()),
             last_mining_block: parking_lot::RwLock::new(None),
             started_at: Instant::now(),
@@ -2502,6 +2507,17 @@ impl Node {
         self.listen_addresses.read().clone()
     }
 
+    pub(crate) fn add_mapped_address(&self, address: SocketAddr) {
+        let mut addresses = self.mapped_addresses.write();
+        if !addresses.contains(&address) {
+            addresses.push(address);
+        }
+    }
+
+    pub(crate) fn mapped_addresses(&self) -> Vec<SocketAddr> {
+        self.mapped_addresses.read().clone()
+    }
+
     pub(crate) fn add_listen_network_address(&self, endpoint: NetworkEndpoint) {
         let mut addresses = self.listen_network_addresses.write();
         if !addresses.contains(&endpoint) {
@@ -2521,6 +2537,18 @@ impl Node {
 
     pub(crate) fn listen_address(&self) -> Option<SocketAddr> {
         *self.listen_address.read()
+    }
+
+    pub(crate) async fn wait_for_shutdown(&self) {
+        loop {
+            let notified = self.shutdown.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.shutdown_requested.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn onion_proxy(&self) -> Option<SocketAddr> {
@@ -3493,10 +3521,8 @@ impl Node {
     }
 
     pub fn request_shutdown(&self) {
-        // Keep a permit when shutdown is requested before the run loop has
-        // registered its waiter. There is one node run loop, so notify_one is
-        // sufficient and avoids losing an early stop request.
-        self.shutdown.notify_one();
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.shutdown.notify_waiters();
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
@@ -3573,7 +3599,7 @@ impl Node {
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result),
             result = wait_for_shutdown_signal() => result,
-            _ = self.shutdown.notified() => Ok(()),
+            _ = self.wait_for_shutdown() => Ok(()),
         };
 
         p2p_task.abort();
@@ -4074,6 +4100,7 @@ mod tests {
             cjdns_reachable: true,
             prune: 0,
             fast_prune: false,
+            natpmp: false,
             reindex: false,
             reindex_chainstate: false,
             load_blocks: Vec::new(),

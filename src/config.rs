@@ -679,6 +679,20 @@ pub struct Args {
     #[arg(long = "noconf", default_value_t = false)]
     pub no_config: bool,
 
+    /// Path to the runtime settings JSON file.
+    #[arg(long = "settings", value_name = "FILE")]
+    pub settings_file: Option<PathBuf>,
+
+    /// Disable reading and creating the runtime settings JSON file.
+    #[arg(
+        long = "nosettings",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub no_settings: bool,
+
     #[arg(long = "minimumchainwork", value_name = "HEX")]
     pub minimum_chain_work: Option<String>,
 
@@ -1502,6 +1516,7 @@ pub struct Config {
     pub debug_log_file_enabled: bool,
     pub print_to_console: bool,
     pub shrink_debug_file: bool,
+    pub(crate) settings_path: Option<PathBuf>,
     pub(crate) asmap: Option<PathBuf>,
     pub(crate) minimum_chain_work: Option<Work>,
     pub(crate) assume_valid: Option<BlockHash>,
@@ -1626,6 +1641,22 @@ impl Config {
             debug_log_path
         } else {
             args.datadir.join(debug_log_path)
+        };
+        let settings_path = if args.no_settings {
+            None
+        } else {
+            let path = args
+                .settings_file
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("settings.json"));
+            if path.as_os_str().is_empty() {
+                bail!("--settings must not be empty");
+            }
+            Some(if path.is_absolute() {
+                path
+            } else {
+                args.datadir.join(path)
+            })
         };
         let minimum_chain_work = args
             .minimum_chain_work
@@ -2006,6 +2037,7 @@ impl Config {
             debug_log_file_enabled: !args.no_debug_log_file,
             print_to_console: args.print_to_console,
             shrink_debug_file: args.shrink_debug_file,
+            settings_path,
             asmap,
             minimum_chain_work,
             assume_valid,
@@ -2598,6 +2630,20 @@ mod tests {
         assert!(!config.debug_log_file_enabled);
         assert!(!config.print_to_console);
         assert!(!config.shrink_debug_file);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--settings=runtime.json",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().settings_path,
+            Some(directory.path().join("runtime.json"))
+        );
+        let args = Args::try_parse_from(["bitcoind-rs", "--nosettings"]).unwrap();
+        assert!(Config::from_args(args).unwrap().settings_path.is_none());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

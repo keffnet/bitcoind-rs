@@ -1348,7 +1348,12 @@ impl ChainState {
     }
 
     pub fn is_active_block(&self, hash: &BlockHash) -> bool {
-        self.active_chain.contains(hash)
+        let Some(node) = self.block_index.get(hash) else {
+            return false;
+        };
+        self.active_chain
+            .get(node.height as usize)
+            .is_some_and(|active_hash| active_hash == hash)
     }
 
     /// Return the BIP22 proposal result for a block already known to the
@@ -1468,10 +1473,12 @@ impl ChainState {
     }
 
     pub fn next_block_hash(&self, hash: &BlockHash) -> Option<BlockHash> {
+        let node = self.block_index.get(hash)?;
         self.active_chain
-            .iter()
-            .position(|candidate| candidate == hash)
-            .and_then(|position| self.active_chain.get(position + 1).copied())
+            .get(node.height as usize)
+            .is_some_and(|active_hash| active_hash == hash)
+            .then(|| self.active_chain.get(node.height as usize + 1).copied())
+            .flatten()
     }
 
     pub fn median_time_past_for_hash(&self, hash: &BlockHash) -> Option<u32> {
@@ -1996,20 +2003,24 @@ impl ChainState {
         let start = locator
             .iter()
             .find_map(|hash| {
+                let node = self.block_index.get(hash)?;
                 self.active_chain
-                    .iter()
-                    .position(|candidate| candidate == hash)
+                    .get(node.height as usize)
+                    .is_some_and(|active_hash| active_hash == hash)
+                    .then_some(node.height as usize + 1)
             })
-            .map_or(0, |position| position.saturating_add(1));
+            .unwrap_or(0);
         let stop = if stop_hash == BlockHash::all_zeros() {
             self.active_chain.len()
         } else {
-            self.active_chain
-                .iter()
-                .position(|hash| *hash == stop_hash)
-                .map_or(self.active_chain.len(), |position| {
-                    position.saturating_add(1)
+            self.block_index
+                .get(&stop_hash)
+                .filter(|node| {
+                    self.active_chain
+                        .get(node.height as usize)
+                        .is_some_and(|active_hash| active_hash == &stop_hash)
                 })
+                .map_or(self.active_chain.len(), |node| node.height as usize + 1)
         };
         let stop = stop.min(self.headers.len());
         if start >= stop {

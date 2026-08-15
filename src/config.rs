@@ -938,11 +938,12 @@ impl Config {
             );
         }
         let listen = args.listen.unwrap_or(
-            !args.whitebind.is_empty()
+            !args.bind.is_empty()
+                || !args.whitebind.is_empty()
                 || (args.proxy.is_none() && !connect_configured && args.max_peers > 0),
         );
-        if !listen && !args.whitebind.is_empty() {
-            bail!("--whitebind cannot be used with --listen=false");
+        if !listen && (!args.bind.is_empty() || !args.whitebind.is_empty()) {
+            bail!("--bind/--whitebind cannot be used with --listen=false");
         }
         let clearnet_reachable = args.onlynet.is_empty()
             || args
@@ -1454,6 +1455,26 @@ mod tests {
         let config = Config::from_args(args).unwrap();
         assert!(!config.listen);
         assert!(!config.dnsseed);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--connect=192.0.2.1:8333",
+            "--bind=127.0.0.1:8333",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().listen);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--bind=127.0.0.1:8333",
+            "--listen=false",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

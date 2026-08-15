@@ -1224,6 +1224,12 @@ fn read_config_file(
                 line_number + 1
             );
         }
+        if key == "conf" {
+            bail!(
+                "configuration line {} sets conf; use includeconf instead",
+                line_number + 1
+            );
+        }
         if used_hash && key == "rpcpassword" {
             bail!(
                 "configuration line {} uses # in rpcpassword; this is ambiguous and should be avoided",
@@ -2069,6 +2075,19 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("# in rpcpassword"));
+
+        let invalid_config = directory.path().join("invalid-conf.conf");
+        fs::write(&invalid_config, "conf=other.conf\n").unwrap();
+        let error = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--conf",
+            invalid_config.to_str().unwrap(),
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("use includeconf instead"));
     }
 
     #[test]

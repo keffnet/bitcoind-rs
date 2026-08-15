@@ -9686,6 +9686,13 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }
         "start" => {
             let _reservation = reserve_scan(&node.blockfilter_scan)?;
+            let filter_type = optional_str(params, 4, "basic", "filtertype")?;
+            if filter_type != "basic" {
+                bail!("Unknown filtertype")
+            }
+            if !node.config.blockfilterindex {
+                bail!("Index is not enabled for filtertype {filter_type}")
+            }
             let scan_objects = params
                 .get(1)
                 .and_then(Value::as_array)
@@ -9707,10 +9714,6 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
             }
             let stop_height =
                 u32::try_from(stop_height).map_err(|_| anyhow!("stop_height is out of range"))?;
-            let filter_type = optional_str(params, 4, "basic", "filtertype")?;
-            if filter_type != "basic" {
-                bail!("only the basic block filter is available")
-            }
             let filter_false_positives = match params.get(5).filter(|value| !value.is_null()) {
                 None => false,
                 Some(options) => {
@@ -16517,7 +16520,13 @@ mod tests {
             )
             .is_err()
         );
-        assert!(scan_blocks(&node, &json!(["start", [descriptor.clone()], 0, 1, 1])).is_err());
+        let unknown_filter_type = scan_blocks(
+            &node,
+            &json!(["start", [descriptor.clone()], 0, 1, "extended"]),
+        )
+        .unwrap_err();
+        assert_eq!(unknown_filter_type.to_string(), "Unknown filtertype");
+        assert_eq!(rpc_error(&unknown_filter_type)["code"], json!(-5));
         assert!(
             scan_blocks(
                 &node,

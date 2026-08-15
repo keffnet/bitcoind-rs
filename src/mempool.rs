@@ -2371,6 +2371,65 @@ fn validate_standard_policy_with_modified_fee_and_policy(
     validate_standard_witnesses(transaction, previous_outputs)
 }
 
+fn is_minimal_push_encoding(script: &Script) -> bool {
+    let bytes = script.as_bytes();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let opcode = bytes[offset];
+        offset += 1;
+        let length = match opcode {
+            0x00 => 0,
+            0x51..=0x60 => continue,
+            0x01..=0x4b => usize::from(opcode),
+            0x4c => {
+                let Some(&length) = bytes.get(offset) else {
+                    return false;
+                };
+                offset += 1;
+                usize::from(length)
+            }
+            0x4d => {
+                let Some(length) = bytes.get(offset..offset.saturating_add(2)) else {
+                    return false;
+                };
+                offset += 2;
+                usize::from(u16::from_le_bytes([length[0], length[1]]))
+            }
+            0x4e => {
+                let Some(length) = bytes.get(offset..offset.saturating_add(4)) else {
+                    return false;
+                };
+                offset += 4;
+                usize::try_from(u32::from_le_bytes([
+                    length[0], length[1], length[2], length[3],
+                ]))
+                .ok()
+                .unwrap_or(usize::MAX)
+            }
+            _ => return false,
+        };
+        let Some(end) = offset.checked_add(length) else {
+            return false;
+        };
+        let Some(data) = bytes.get(offset..end) else {
+            return false;
+        };
+        if length == 0 {
+            if opcode != 0x00 {
+                return false;
+            }
+        } else if (length == 1 && ((1..=16).contains(&data[0]) || data[0] == 0x81))
+            || (opcode == 0x4c && length <= 75)
+            || (opcode == 0x4d && length <= 255)
+            || (opcode == 0x4e && length <= 65_535)
+        {
+            return false;
+        }
+        offset = end;
+    }
+    true
+}
+
 fn validate_standard_inputs(
     transaction: &Transaction,
     previous_outputs: &[TxOut],
@@ -2381,6 +2440,11 @@ fn validate_standard_inputs(
         ));
     }
     for (input, previous) in transaction.input.iter().zip(previous_outputs) {
+        if !is_minimal_push_encoding(&input.script_sig) {
+            return Err(MempoolError::NonStandard(
+                "bad-txns-nonstandard-inputs".to_owned(),
+            ));
+        }
         let mut spending_script = &previous.script_pubkey as &Script;
         if previous.script_pubkey.is_p2sh() {
             let Some(redeem_script) = last_push_data(&input.script_sig) else {
@@ -2437,7 +2501,21 @@ fn validate_standard_witnesses(
                 "bad-witness-nonstandard".to_owned(),
             ));
         }
-        if spending_script.is_p2wsh() {
+        if spending_script.is_p2wpkh() {
+            let Some(pubkey) = input.witness.iter().nth(1) else {
+                return Err(MempoolError::NonStandard(
+                    "bad-witness-nonstandard".to_owned(),
+                ));
+            };
+            if input.witness.len() != 2
+                || pubkey.len() != 33
+                || !matches!(pubkey.first(), Some(0x02) | Some(0x03))
+            {
+                return Err(MempoolError::NonStandard(
+                    "bad-witness-nonstandard".to_owned(),
+                ));
+            }
+        } else if spending_script.is_p2wsh() {
             let Some(witness_script) = input.witness.last() else {
                 return Err(MempoolError::NonStandard(
                     "bad-witness-nonstandard".to_owned(),
@@ -3531,6 +3609,13 @@ mod tests {
         nonstandard.output[0].value = Amount::from_sat(100_000);
         assert!(validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1).is_ok());
 
+        nonstandard.input[0].script_sig = ScriptBuf::from_bytes(vec![0x4c, 0x01, 0x01]);
+        assert!(matches!(
+            validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1),
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-txns-nonstandard-inputs"
+        ));
+        nonstandard.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00]);
+
         nonstandard.output[0].value = Amount::from_sat(1);
         assert!(is_dust_output(&nonstandard.output[0]));
 
@@ -3543,6 +3628,33 @@ mod tests {
         assert!(matches!(
             validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1),
             Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
+        ));
+
+        let wpkh_previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::from_bytes({
+                let mut bytes = vec![0x00, 0x14];
+                bytes.extend([0u8; 20]);
+                bytes
+            }),
+        };
+        let mut witness_transaction = graph_transaction(Txid::from_byte_array([9; 32]), 9);
+        witness_transaction.input[0].script_sig = ScriptBuf::new();
+        witness_transaction.input[0].witness = Witness::from_slice(&[vec![1u8], vec![0x04; 65]]);
+        witness_transaction.output[0].script_pubkey = ScriptBuf::from_bytes({
+            let mut bytes = vec![0x00, 0x14];
+            bytes.extend([0u8; 20]);
+            bytes
+        });
+        witness_transaction.output[0].value = Amount::from_sat(100_000);
+        let witness_policy = validate_standard_policy(
+            &witness_transaction,
+            std::slice::from_ref(&wpkh_previous),
+            1,
+        );
+        assert!(matches!(
+            witness_policy,
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
         ));
     }
 

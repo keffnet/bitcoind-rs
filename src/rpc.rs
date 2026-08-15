@@ -7641,8 +7641,9 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let bytes = hex::decode(param::<String>(params, 0)?)?;
-    let transaction: Transaction = deserialize(&bytes)?;
+    let bytes = hex::decode(param::<String>(params, 0)?).context("TX decode failed")?;
+    let transaction: Transaction = deserialize(&bytes)
+        .context("TX decode failed. Make sure the tx has at least one input.")?;
     let max_fee_rate = parse_max_fee_rate(params.get(1))?;
     let max_burn_amount = parse_max_burn_amount(params.get(2))?;
     validate_burn_amount(&transaction, max_burn_amount)?;
@@ -7790,8 +7791,9 @@ struct SigningPrevout {
 }
 
 fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let bytes = hex::decode(param::<String>(params, 0)?)?;
-    let mut transaction: Transaction = deserialize(&bytes)?;
+    let bytes = hex::decode(param::<String>(params, 0)?).context("TX decode failed")?;
+    let mut transaction: Transaction = deserialize(&bytes)
+        .context("TX decode failed. Make sure the tx has at least one input.")?;
     let private_keys = params
         .get(1)
         .and_then(Value::as_array)
@@ -11430,6 +11432,7 @@ mod tests {
         assert_eq!(rpc_error_code("unknown mode foobar"), -8);
         assert_eq!(rpc_error_code("mode must be a string"), -3);
         assert_eq!(rpc_error_code("TX decode failed"), -22);
+        assert_eq!(rpc_error_code("TX decode failed: invalid hex"), -22);
         assert_eq!(rpc_error_code("Block not found"), -5);
         assert_eq!(rpc_error_code("Transaction not yet in block"), -5);
         assert_eq!(

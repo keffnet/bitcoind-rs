@@ -1990,7 +1990,7 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             "logpath": node.config.debug_log_path.to_string_lossy(),
             "relayfee": sat_to_btc(mempool.min_relay_fee_sat_per_kvb()),
             "incrementalfee": sat_to_btc(mempool.incremental_relay_fee_sat_per_kvb()),
-            "warnings": [],
+            "warnings": rpc_warnings(node),
             }))
         }
         "getpeerinfo" => Ok(json!(
@@ -2046,6 +2046,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                         "transport_protocol_type": peer.transport_protocol_type,
                         "session_id": peer.session_id,
                     });
+                    if node.config.deprecated_rpcs.contains("startingheight") {
+                        info["startingheight"] = json!(peer.start_height);
+                    }
                     if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
                         info["mapped_as"] = json!(mapped_as);
                     }
@@ -3556,6 +3559,14 @@ fn unix_time() -> u64 {
     crate::time::unix_time()
 }
 
+fn rpc_warnings(node: &Arc<Node>) -> Value {
+    if node.config.deprecated_rpcs.contains("warnings") {
+        Value::String(String::new())
+    } else {
+        Value::Array(Vec::new())
+    }
+}
+
 fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let chain = node.chain.read();
     let tip = chain.tip();
@@ -3593,7 +3604,7 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
         "initialblockdownload": initial_block_download,
         "pruned": chain.is_pruned(),
         "size_on_disk": chain.store.disk_usage().unwrap_or(0),
-        "warnings": [],
+        "warnings": rpc_warnings(node),
     });
     if chain.is_pruned() {
         // ChainState stores the first retained block height. Core exposes
@@ -4077,7 +4088,7 @@ fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
             ),
         },
         "target": format!("{:064x}", header.target()),
-        "warnings": [],
+        "warnings": rpc_warnings(node),
     });
     if let Some((weight, transactions)) = node.last_mining_block() {
         result["currentblockweight"] = json!(weight);
@@ -12602,6 +12613,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -12891,6 +12903,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -13053,6 +13066,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -13240,6 +13254,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -13364,6 +13379,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -13491,6 +13507,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -13653,6 +13670,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -13847,6 +13865,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -14210,6 +14229,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -14366,6 +14386,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -14505,6 +14526,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -14637,6 +14659,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -14772,6 +14795,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -14894,6 +14918,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -15025,6 +15050,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -15145,6 +15171,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -15342,6 +15369,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -15487,6 +15515,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -15626,6 +15655,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -15803,6 +15833,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -15944,6 +15975,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -16116,6 +16148,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -16370,6 +16403,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 120_000,
             block_reserved_weight: 8_000,
@@ -16607,6 +16641,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -16728,6 +16763,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -16851,6 +16887,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -16979,6 +17016,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -17113,6 +17151,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -17254,6 +17293,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -17393,6 +17433,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -17580,6 +17621,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -17599,6 +17641,15 @@ mod tests {
         assert_eq!(
             localservices["localservicesnames"],
             json!(["NETWORK", "WITNESS", "COMPACT_FILTERS"])
+        );
+        Arc::get_mut(&mut node)
+            .unwrap()
+            .config
+            .deprecated_rpcs
+            .insert("warnings".to_owned());
+        assert_eq!(
+            dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["warnings"],
+            json!("")
         );
         Arc::get_mut(&mut node)
             .unwrap()
@@ -17797,6 +17848,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -17921,6 +17973,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::from(["startingheight".to_owned()]),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -18028,7 +18081,7 @@ mod tests {
         assert_eq!(peer_info[0]["transport_protocol_type"], json!("v2"));
         assert_eq!(peer_info[0]["session_id"], json!("ab".repeat(32)));
         assert_eq!(peer_info[0]["inv_to_send"], json!(3));
-        assert!(peer_info[0].get("startingheight").is_none());
+        assert_eq!(peer_info[0]["startingheight"], json!(0));
         assert!(peer_info[0].get("pingtime").is_none());
         assert_eq!(peer_info[0]["synced_headers"], json!(-1));
         assert_eq!(peer_info[0]["synced_blocks"], json!(-1));
@@ -18213,6 +18266,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 123,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -18400,6 +18454,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -18583,6 +18638,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -18836,6 +18892,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -19198,6 +19255,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -19330,6 +19388,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -19587,6 +19646,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -19723,6 +19783,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -20191,6 +20252,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -20322,6 +20384,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -20492,6 +20555,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -20793,6 +20857,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -21267,6 +21332,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -21462,6 +21528,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -21684,6 +21751,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -22012,6 +22080,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -22146,6 +22215,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,
@@ -22301,6 +22371,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,

@@ -915,6 +915,11 @@ pub struct Args {
     #[arg(long = "rpcwhitelist", value_name = "USER:METHOD[,METHOD]")]
     pub rpc_whitelist: Vec<String>,
 
+    /// Re-enable selected RPC fields deprecated by Core, such as
+    /// `startingheight` and the legacy string-shaped `warnings` field.
+    #[arg(long = "deprecatedrpc", value_name = "METHOD", value_delimiter = ',')]
+    pub deprecated_rpc: Vec<String>,
+
     #[arg(
         long = "rpcwhitelistdefault",
         num_args = 0..=1,
@@ -1666,6 +1671,7 @@ pub struct Config {
     pub(crate) rpc_cookie_permissions: RpcCookiePermissions,
     pub(crate) rpc_whitelist: HashMap<String, HashSet<String>>,
     pub(crate) rpc_whitelist_default: bool,
+    pub deprecated_rpcs: HashSet<String>,
     pub rpc_server_timeout_secs: u64,
     pub rpc_threads: usize,
     pub rpc_work_queue: usize,
@@ -2215,6 +2221,11 @@ impl Config {
             rpc_cookie_permissions: args.rpc_cookie_permissions,
             rpc_whitelist,
             rpc_whitelist_default,
+            deprecated_rpcs: args
+                .deprecated_rpc
+                .into_iter()
+                .map(|method| method.to_ascii_lowercase())
+                .collect(),
             rpc_server_timeout_secs,
             rpc_threads,
             rpc_work_queue,
@@ -2684,6 +2695,7 @@ mod tests {
             "--proxy=127.0.0.1:9050",
             "--blockreconstructionextratxn=7",
             "--bantime=123",
+            "--deprecatedrpc=startingheight,warnings",
             "--uacomment=lab",
             "--startupnotify=echo start",
             "--blocknotify=echo %s",
@@ -2696,6 +2708,8 @@ mod tests {
         assert!(config.blocksonly);
         assert_eq!(config.max_mempool_mb, DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB);
         assert_eq!(config.ban_time_secs, 123);
+        assert!(config.deprecated_rpcs.contains("startingheight"));
+        assert!(config.deprecated_rpcs.contains("warnings"));
         assert_eq!(config.onlynet, vec![OnlyNet::Ipv4]);
         assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
         assert_eq!(config.block_reconstruction_extra_txn, 7);

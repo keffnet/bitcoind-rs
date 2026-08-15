@@ -4051,6 +4051,7 @@ mod tests {
             peer_bloom_filters: false,
             peer_timeout_secs: 60,
             ban_time_secs: 86_400,
+            deprecated_rpcs: std::collections::HashSet::new(),
             connect_timeout_ms: 5_000,
             block_max_weight: 4_000_000,
             block_reserved_weight: 8_000,

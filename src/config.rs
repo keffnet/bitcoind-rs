@@ -534,6 +534,51 @@ pub struct Args {
     #[arg(long, value_enum, default_value_t = NetworkName::Bitcoin)]
     pub network: NetworkName,
 
+    #[arg(
+        long = "mainnet",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub mainnet: bool,
+
+    #[arg(
+        long = "testnet",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub testnet: bool,
+
+    #[arg(
+        long = "testnet4",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub testnet4: bool,
+
+    #[arg(
+        long = "signet",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub signet: bool,
+
+    #[arg(
+        long = "regtest",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub regtest: bool,
+
     #[arg(long, default_value = "./data")]
     pub datadir: PathBuf,
 
@@ -1012,10 +1057,29 @@ impl Args {
             .as_deref()
             .map(canonical_network_name)
             .or_else(|| {
+                ["mainnet", "testnet", "testnet4", "signet", "regtest"]
+                    .into_iter()
+                    .find(|name| raw_bool_option(&raw, name))
+                    .map(canonical_network_name)
+            })
+            .or_else(|| {
                 entries
                     .iter()
                     .find(|entry| entry.section.is_none() && entry.key == "network")
                     .map(|entry| canonical_network_name(&entry.value))
+            })
+            .or_else(|| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.section.is_none()
+                            && matches!(
+                                entry.key.as_str(),
+                                "mainnet" | "testnet" | "testnet4" | "signet" | "regtest"
+                            )
+                            && is_true(&entry.value)
+                    })
+                    .map(|entry| canonical_network_name(&entry.key))
             })
             .unwrap_or("bitcoin");
         let config_args = entries
@@ -1049,6 +1113,32 @@ fn raw_option_value(args: &[OsString], name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn is_true(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn raw_bool_option(args: &[OsString], name: &str) -> bool {
+    let exact = format!("--{name}");
+    let prefix = format!("{exact}=");
+    args.iter().enumerate().skip(1).any(|(index, argument)| {
+        let Some(value) = argument.to_str() else {
+            return false;
+        };
+        if let Some(value) = value.strip_prefix(&prefix) {
+            return is_true(value);
+        }
+        if value != exact {
+            return false;
+        }
+        args.get(index + 1)
+            .and_then(|value| value.to_str())
+            .is_none_or(|value| value.starts_with('-') || is_true(value))
+    })
 }
 
 fn read_config_file(
@@ -1229,7 +1319,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
-        let network = args.network.into();
+        let network = network_from_args(&args)?;
         let blocks_dir = args.blocks_dir.as_ref().map_or_else(
             || args.datadir.join("blocks"),
             |path| {
@@ -1338,7 +1428,7 @@ impl Config {
         if args.timeout == 0 {
             bail!("--timeout must be greater than zero");
         }
-        if args.accept_nonstd_txn && args.network == NetworkName::Bitcoin {
+        if args.accept_nonstd_txn && network == Network::Bitcoin {
             bail!("--acceptnonstdtxn is not currently supported for main chain");
         }
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
@@ -1485,7 +1575,7 @@ impl Config {
             }
         }
         let signet_challenge = match args.signet_challenge {
-            Some(_challenge) if args.network != NetworkName::Signet => {
+            Some(_challenge) if network != Network::Signet => {
                 bail!("--signet-challenge requires --network signet")
             }
             Some(challenge) => Some(
@@ -1658,6 +1748,30 @@ fn default_rpc_port(network: Network) -> u16 {
         Network::Signet => 38332,
         Network::Regtest => 18443,
     }
+}
+
+fn network_from_args(args: &Args) -> Result<Network> {
+    let aliases = [
+        (args.mainnet, Network::Bitcoin),
+        (args.testnet, Network::Testnet),
+        (args.testnet4, Network::Testnet4),
+        (args.signet, Network::Signet),
+        (args.regtest, Network::Regtest),
+    ];
+    let selected = aliases
+        .into_iter()
+        .filter_map(|(enabled, network)| enabled.then_some(network))
+        .collect::<Vec<_>>();
+    if selected.len() > 1 {
+        bail!("network selector aliases are mutually exclusive");
+    }
+    if let Some(alias) = selected.first().copied() {
+        if args.network != NetworkName::Bitcoin && Network::from(args.network) != alias {
+            bail!("--network cannot be combined with a different network selector");
+        }
+        return Ok(alias);
+    }
+    Ok(args.network.into())
 }
 
 fn default_assume_valid(network: Network, signet_challenge: Option<&[u8]>) -> Option<BlockHash> {
@@ -1850,6 +1964,18 @@ mod tests {
         assert_eq!(args.network, NetworkName::Regtest);
         assert_eq!(args.max_peers, 5);
         assert!(!args.server);
+
+        let alias_config = directory.path().join("aliases.conf");
+        fs::write(&alias_config, "regtest=1\n[regtest]\nserver=false\n").unwrap();
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--conf",
+            alias_config.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().network, Network::Regtest);
     }
 
     #[test]
@@ -1893,6 +2019,12 @@ mod tests {
                     .unwrap(),
             )
         );
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--regtest"]).unwrap();
+        assert_eq!(Config::from_args(args).unwrap().network, Network::Regtest);
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--network=regtest", "--testnet"]).unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

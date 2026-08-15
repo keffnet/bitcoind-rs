@@ -1,14 +1,17 @@
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[cfg(not(unix))]
 use anyhow::bail;
 use anyhow::{Context, Result};
 use time::{OffsetDateTime, macros::format_description};
+use tracing::Metadata;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::{
     format::Writer,
@@ -59,12 +62,19 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
             .with_context(|| format!("Could not open debug log file {}", path.display()))?;
         let log_file_for_signal = log_file.clone();
         if node.config.print_to_console {
-            (
-                BoxMakeWriter::new(std::io::stdout.and(log_file)),
-                Some(log_file_for_signal),
-            )
+            let writer = if node.config.logging.log_rate_limit {
+                BoxMakeWriter::new(std::io::stdout.and(RateLimitedLogFile::new(log_file.clone())))
+            } else {
+                BoxMakeWriter::new(std::io::stdout.and(log_file.clone()))
+            };
+            (writer, Some(log_file_for_signal))
         } else {
-            (BoxMakeWriter::new(log_file), Some(log_file_for_signal))
+            let writer = if node.config.logging.log_rate_limit {
+                BoxMakeWriter::new(RateLimitedLogFile::new(log_file.clone()))
+            } else {
+                BoxMakeWriter::new(log_file.clone())
+            };
+            (writer, Some(log_file_for_signal))
         }
     } else if node.config.print_to_console {
         (BoxMakeWriter::new(std::io::stdout), None)
@@ -184,6 +194,197 @@ impl<'a> MakeWriter<'a> for ReloadableLogFile {
     fn make_writer(&'a self) -> Self::Writer {
         ReloadableLogWriter {
             file: self.file.clone(),
+            buffer: Vec::new(),
+        }
+    }
+}
+
+const LOG_RATE_LIMIT_MAX_BYTES: u64 = 1024 * 1024;
+const LOG_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct LogSource {
+    file: Option<String>,
+    line: Option<u32>,
+    module: Option<String>,
+    target: String,
+    name: &'static str,
+}
+
+impl LogSource {
+    fn from_metadata(metadata: &Metadata<'_>) -> Self {
+        Self {
+            file: metadata.file().map(str::to_owned),
+            line: metadata.line(),
+            module: metadata.module_path().map(str::to_owned),
+            target: metadata.target().to_owned(),
+            name: metadata.name(),
+        }
+    }
+
+    #[cfg(test)]
+    fn test(name: &'static str) -> Self {
+        Self {
+            file: Some("test.rs".to_owned()),
+            line: Some(1),
+            module: Some("test".to_owned()),
+            target: "test".to_owned(),
+            name,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LogSourceStats {
+    available_bytes: u64,
+    dropped_bytes: u64,
+}
+
+#[derive(Debug)]
+struct LogRateLimitState {
+    window_started: Instant,
+    sources: HashMap<LogSource, LogSourceStats>,
+}
+
+#[derive(Debug)]
+struct LogRateLimiter {
+    state: Mutex<LogRateLimitState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LogRateLimitDecision {
+    Allowed { suppression_active: bool },
+    NewlySuppressed,
+    Suppressed,
+}
+
+impl LogRateLimiter {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(LogRateLimitState {
+                window_started: Instant::now(),
+                sources: HashMap::new(),
+            }),
+        }
+    }
+
+    fn consume(&self, source: LogSource, bytes: usize) -> LogRateLimitDecision {
+        let Ok(mut state) = self.state.lock() else {
+            // Logging must not take down the node if the limiter is poisoned.
+            return LogRateLimitDecision::Allowed {
+                suppression_active: false,
+            };
+        };
+        if state.window_started.elapsed() >= LOG_RATE_LIMIT_WINDOW {
+            state.window_started = Instant::now();
+            state.sources.clear();
+        }
+
+        let bytes = bytes as u64;
+        let stats = state
+            .sources
+            .entry(source)
+            .or_insert_with(|| LogSourceStats {
+                available_bytes: LOG_RATE_LIMIT_MAX_BYTES,
+                dropped_bytes: 0,
+            });
+        if stats.dropped_bytes > 0 {
+            stats.dropped_bytes = stats.dropped_bytes.saturating_add(bytes);
+            return LogRateLimitDecision::Suppressed;
+        }
+        if bytes > stats.available_bytes {
+            stats.dropped_bytes = bytes;
+            return LogRateLimitDecision::NewlySuppressed;
+        }
+        stats.available_bytes -= bytes;
+        let suppression_active = state
+            .sources
+            .values()
+            .any(|source| source.dropped_bytes > 0);
+        LogRateLimitDecision::Allowed { suppression_active }
+    }
+}
+
+#[derive(Clone)]
+struct RateLimitedLogFile {
+    file: ReloadableLogFile,
+    limiter: Arc<LogRateLimiter>,
+}
+
+impl RateLimitedLogFile {
+    fn new(file: ReloadableLogFile) -> Self {
+        Self {
+            file,
+            limiter: Arc::new(LogRateLimiter::new()),
+        }
+    }
+}
+
+struct RateLimitedLogWriter {
+    inner: ReloadableLogWriter,
+    limiter: Arc<LogRateLimiter>,
+    source: LogSource,
+    buffer: Vec<u8>,
+}
+
+impl Write for RateLimitedLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let buffer = std::mem::take(&mut self.buffer);
+        match self.limiter.consume(self.source.clone(), buffer.len()) {
+            LogRateLimitDecision::Suppressed => Ok(()),
+            LogRateLimitDecision::NewlySuppressed => {
+                self.inner.write_all(b"[*] ")?;
+                self.inner.write_all(&buffer)?;
+                self.inner.flush()
+            }
+            LogRateLimitDecision::Allowed { suppression_active } => {
+                if suppression_active {
+                    self.inner.write_all(b"[*] ")?;
+                }
+                self.inner.write_all(&buffer)?;
+                self.inner.flush()
+            }
+        }
+    }
+}
+
+impl Drop for RateLimitedLogWriter {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+impl<'a> MakeWriter<'a> for RateLimitedLogFile {
+    type Writer = RateLimitedLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        RateLimitedLogWriter {
+            inner: self.file.make_writer(),
+            limiter: self.limiter.clone(),
+            source: LogSource {
+                file: None,
+                line: None,
+                module: None,
+                target: "unknown".to_owned(),
+                name: "unknown",
+            },
+            buffer: Vec::new(),
+        }
+    }
+
+    fn make_writer_for(&'a self, metadata: &Metadata<'_>) -> Self::Writer {
+        RateLimitedLogWriter {
+            inner: self.file.make_writer(),
+            limiter: self.limiter.clone(),
+            source: LogSource::from_metadata(metadata),
             buffer: Vec::new(),
         }
     }
@@ -460,5 +661,30 @@ mod tests {
 
         assert_eq!(fs::read_to_string(rotated).unwrap(), "before rotation\n");
         assert_eq!(fs::read_to_string(path).unwrap(), "after rotation\n");
+    }
+
+    #[test]
+    fn log_rate_limiter_is_per_source_and_preserves_the_transition_record() {
+        let limiter = LogRateLimiter::new();
+        let first = LogSource::test("first");
+        let second = LogSource::test("second");
+
+        assert_eq!(
+            limiter.consume(first.clone(), LOG_RATE_LIMIT_MAX_BYTES as usize),
+            LogRateLimitDecision::Allowed {
+                suppression_active: false
+            }
+        );
+        assert_eq!(
+            limiter.consume(first.clone(), 1),
+            LogRateLimitDecision::NewlySuppressed
+        );
+        assert_eq!(limiter.consume(first, 1), LogRateLimitDecision::Suppressed);
+        assert_eq!(
+            limiter.consume(second, LOG_RATE_LIMIT_MAX_BYTES as usize),
+            LogRateLimitDecision::Allowed {
+                suppression_active: true
+            }
+        );
     }
 }

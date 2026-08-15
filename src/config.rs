@@ -847,6 +847,17 @@ pub struct Args {
     )]
     pub log_ips: bool,
 
+    /// Rate-limit unconditional file logging to mitigate disk-filling attacks.
+    #[arg(
+        long = "logratelimit",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub log_rate_limit: bool,
+
     /// Enable Core-compatible debug logging categories.  Supplying the
     /// option without a value enables all categories; it can be repeated.
     #[arg(
@@ -2003,6 +2014,7 @@ pub struct LoggingConfig {
     pub source_locations: bool,
     pub level_always: bool,
     pub log_ips: bool,
+    pub log_rate_limit: bool,
     pub debug_all: bool,
     pub debug_categories: Vec<String>,
     pub category_levels: HashMap<String, LogLevel>,
@@ -2018,6 +2030,7 @@ impl Default for LoggingConfig {
             source_locations: false,
             level_always: false,
             log_ips: false,
+            log_rate_limit: true,
             debug_all: false,
             debug_categories: Vec::new(),
             category_levels: HashMap::new(),
@@ -2849,6 +2862,7 @@ impl Config {
                 source_locations: args.log_source_locations,
                 level_always: args.log_level_always,
                 log_ips: args.log_ips,
+                log_rate_limit: args.log_rate_limit,
                 debug_all: logging.debug_all,
                 debug_categories: logging.debug_categories,
                 category_levels: logging.category_levels,
@@ -3812,6 +3826,7 @@ mod tests {
             "--logsourcelocations",
             "--loglevelalways",
             "--logips",
+            "--logratelimit=false",
         ])
         .unwrap();
         let logging = Config::from_args(args).unwrap().logging;
@@ -3821,6 +3836,7 @@ mod tests {
         assert!(logging.source_locations);
         assert!(logging.level_always);
         assert!(logging.log_ips);
+        assert!(!logging.log_rate_limit);
 
         assert!(Args::try_parse_from(["bitcoind-rs", "--pid="]).is_err());
 

@@ -45,6 +45,8 @@ pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_SCRIPT_CHECK_THREADS: i32 = 0;
 pub const DEFAULT_MAX_SIG_CACHE_MIB: i64 = 32;
 pub const DEFAULT_DB_CACHE_MIB: i64 = 450;
+pub const HIGH_DEFAULT_DB_CACHE_MIB: i64 = 1_024;
+const HIGH_DEFAULT_DB_CACHE_MIN_RAM_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
 pub const DEFAULT_DB_BATCH_SIZE_BYTES: i64 = 32 * 1024 * 1024;
 pub const MAX_SCRIPT_CHECK_THREADS: usize = 15;
 pub const MAX_SUBVERSION_LENGTH: usize = 256;
@@ -56,6 +58,34 @@ pub const DEFAULT_BAN_TIME_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_CLUSTER_COUNT: usize = 64;
 pub const MAX_CLUSTER_COUNT_LIMIT: usize = 64;
 pub const DEFAULT_CLUSTER_SIZE_KVB: u64 = 101;
+
+fn total_system_memory_bytes() -> Option<u64> {
+    #[cfg(unix)]
+    {
+        // Bitcoin Core uses physical system RAM for this default. Keep the
+        // same conservative fallback when the platform cannot report it.
+        let memory = fs::read_to_string("/proc/meminfo").ok()?;
+        memory.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            (name == "MemTotal")
+                .then_some(value.trim().strip_suffix(" kB")?)
+                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(|value| value.checked_mul(1_024))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn default_db_cache_mib() -> i64 {
+    (std::mem::size_of::<usize>() >= 8)
+        .then(total_system_memory_bytes)
+        .flatten()
+        .filter(|bytes| *bytes >= HIGH_DEFAULT_DB_CACHE_MIN_RAM_BYTES)
+        .map_or(DEFAULT_DB_CACHE_MIB, |_| HIGH_DEFAULT_DB_CACHE_MIB)
+}
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -828,7 +858,12 @@ pub struct Args {
 
     /// Approximate decoded block-record cache size in MiB. The custom storage
     /// backend maps Core's `-dbcache` to this bounded historical-block cache.
-    #[arg(long = "dbcache", value_name = "MiB", default_value_t = DEFAULT_DB_CACHE_MIB, hide = true)]
+    #[arg(
+        long = "dbcache",
+        value_name = "MiB",
+        default_value_t = default_db_cache_mib(),
+        hide = true
+    )]
     pub db_cache_mib: i64,
 
     /// Maximum chainstate write batch in bytes, matching Core's hidden
@@ -4187,6 +4222,15 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+    }
+
+    #[test]
+    fn dbcache_default_matches_core_ram_tier_and_explicit_values() {
+        let args = Args::try_parse_from(["bitcoind-rs"]).unwrap();
+        assert_eq!(args.db_cache_mib, default_db_cache_mib());
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--dbcache=450"]).unwrap();
+        assert_eq!(args.db_cache_mib, DEFAULT_DB_CACHE_MIB);
     }
 
     #[test]

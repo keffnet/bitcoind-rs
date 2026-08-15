@@ -4207,15 +4207,11 @@ fn reconstruct_compact_block(
     let mut candidates: HashMap<ShortId, Option<Transaction>> = HashMap::new();
     let mempool = node.mempool.read();
     for transaction in mempool.transactions() {
-        let short_id = compact_short_id(transaction, version, siphash_keys);
-        match candidates.entry(short_id) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(Some(transaction.clone()));
-            }
-            std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.insert(None);
-            }
-        }
+        add_compact_candidate(&mut candidates, transaction, version, siphash_keys);
+    }
+    drop(mempool);
+    for transaction in node.compact_extra_transactions() {
+        add_compact_candidate(&mut candidates, &transaction, version, siphash_keys);
     }
 
     let mut missing = Vec::new();
@@ -4236,6 +4232,30 @@ fn reconstruct_compact_block(
         anyhow::bail!("compact block has too many short ids");
     }
     Ok((transactions, missing))
+}
+
+fn add_compact_candidate(
+    candidates: &mut HashMap<ShortId, Option<Transaction>>,
+    transaction: &Transaction,
+    version: u64,
+    siphash_keys: (u64, u64),
+) {
+    let short_id = compact_short_id(transaction, version, siphash_keys);
+    match candidates.entry(short_id) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(Some(transaction.clone()));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if entry
+                .get()
+                .as_ref()
+                .is_some_and(|candidate| candidate == transaction)
+            {
+                return;
+            }
+            entry.insert(None);
+        }
+    }
 }
 
 fn compact_short_id(transaction: &Transaction, version: u64, siphash_keys: (u64, u64)) -> ShortId {
@@ -4993,6 +5013,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -5574,6 +5595,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -5748,6 +5770,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -6076,6 +6099,39 @@ mod tests {
     }
 
     #[test]
+    fn compact_reconstruction_uses_recent_non_mempool_transactions() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(private_broadcast_test_config(
+            directory.path(),
+            false,
+            Vec::new(),
+        ))
+        .unwrap();
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+        assert!(node.accept_peer_transaction(transaction.clone()).is_err());
+        let mut block = genesis_block(Network::Regtest);
+        block.txdata.push(transaction.clone());
+        let compact = HeaderAndShortIds::from_block(&block, 17, 2, &[]).unwrap();
+
+        let (reconstructed, missing) = reconstruct_compact_block(&compact, &node, 2).unwrap();
+        assert!(missing.is_empty());
+        assert_eq!(reconstructed[1], Some(transaction));
+    }
+
+    #[test]
     fn out_of_bounds_compact_block_indexes_do_not_produce_transactions() {
         let transaction = Transaction {
             version: bitcoin::blockdata::transaction::Version::TWO,
@@ -6180,6 +6236,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -6338,6 +6395,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -6502,6 +6560,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -6756,6 +6815,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -6886,6 +6946,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -6998,6 +7059,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -7126,6 +7188,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -7292,6 +7355,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,

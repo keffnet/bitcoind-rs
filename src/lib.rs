@@ -84,6 +84,34 @@ fn run_notify_command(command: Option<&str>, argument: Option<&str>) {
     }
 }
 
+struct CompactExtraTransactions {
+    limit: usize,
+    transactions: VecDeque<Transaction>,
+}
+
+impl CompactExtraTransactions {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            transactions: VecDeque::with_capacity(limit.min(1_024)),
+        }
+    }
+
+    fn insert(&mut self, transaction: Transaction) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.transactions.len() == self.limit {
+            self.transactions.pop_front();
+        }
+        self.transactions.push_back(transaction);
+    }
+
+    fn snapshot(&self) -> Vec<Transaction> {
+        self.transactions.iter().cloned().collect()
+    }
+}
+
 fn core_block_download_timeout(
     block_interval: Duration,
     other_downloading_peers: usize,
@@ -710,6 +738,7 @@ pub struct Node {
     peer_manager_requests:
         parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<p2p::PeerManagerRequest>>>,
     private_broadcasts: parking_lot::Mutex<HashMap<Wtxid, PrivateBroadcastEntry>>,
+    compact_extra_transactions: parking_lot::Mutex<CompactExtraTransactions>,
     orphans: parking_lot::Mutex<OrphanPool>,
     known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
     tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
@@ -863,6 +892,7 @@ impl Node {
             })
             .map(|path| load_rpc_cookie(&path, config.rpc_cookie_permissions))
             .transpose()?;
+        let compact_extra_limit = config.block_reconstruction_extra_txn;
         Ok(Arc::new(Self {
             config,
             chain: Arc::new(RwLock::new(chain)),
@@ -889,6 +919,9 @@ impl Node {
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
             private_broadcasts: parking_lot::Mutex::new(HashMap::new()),
+            compact_extra_transactions: parking_lot::Mutex::new(CompactExtraTransactions::new(
+                compact_extra_limit,
+            )),
             orphans: parking_lot::Mutex::new(OrphanPool::default()),
             known_addresses: parking_lot::RwLock::new(known_addresses),
             tried_addresses: parking_lot::RwLock::new(tried_addresses),
@@ -1248,11 +1281,23 @@ impl Node {
                 Ok(txid)
             }
             Err(error @ MempoolError::MissingInput(_)) => {
+                self.add_compact_extra_transaction(transaction.clone());
                 self.orphans.lock().add(transaction, Some(peer_id));
                 Err(error.into())
             }
-            Err(error) => Err(error.into()),
+            Err(error) => {
+                self.add_compact_extra_transaction(transaction);
+                Err(error.into())
+            }
         }
+    }
+
+    fn add_compact_extra_transaction(&self, transaction: Transaction) {
+        self.compact_extra_transactions.lock().insert(transaction);
+    }
+
+    pub(crate) fn compact_extra_transactions(&self) -> Vec<Transaction> {
+        self.compact_extra_transactions.lock().snapshot()
     }
 
     pub fn orphan_count(&self) -> usize {
@@ -1281,6 +1326,11 @@ impl Node {
                 MempoolChangeKind::Added => None,
             })
             .collect::<Vec<_>>();
+        for change in &changes {
+            if matches!(&change.kind, MempoolChangeKind::Removed { .. }) {
+                self.add_compact_extra_transaction(change.transaction.clone());
+            }
+        }
         self.announce_mempool_changes(removed_ids);
         self.notify_zmq_mempool_changes(changes.clone());
         result.map(|txid| (txid, changes))
@@ -3452,6 +3502,27 @@ mod tests {
         assert_eq!(expand_notify_command("echo ready", None), "echo ready");
     }
 
+    #[test]
+    fn compact_extra_transaction_cache_is_bounded_fifo() {
+        let mut cache = CompactExtraTransactions::new(2);
+        let transaction = |value| Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: Vec::new(),
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let first = transaction(1);
+        let second = transaction(2);
+        let third = transaction(3);
+        cache.insert(first.clone());
+        cache.insert(second.clone());
+        cache.insert(third.clone());
+        assert_eq!(cache.snapshot(), vec![second, third]);
+    }
+
     fn test_config(datadir: &Path) -> Config {
         Config {
             network: bitcoin::Network::Regtest,
@@ -3475,6 +3546,7 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            block_reconstruction_extra_txn: 100,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,

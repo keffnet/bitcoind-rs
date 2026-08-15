@@ -10675,8 +10675,12 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
         .iter()
         .find(|chunk| chunk.txids.contains(txid))
         .expect("mempool entry must have a chunk");
-    let parents = mempool
-        .parents(txid)
+    let mut parents = mempool.parents(txid);
+    // Core's GetParents is backed by std::set<Txid>, so the RPC field uses
+    // raw transaction-hash ordering rather than the display-string ordering
+    // used by the shared graph helper.
+    parents.sort_unstable();
+    let parents = parents
         .into_iter()
         .map(|parent| parent.to_string())
         .collect::<Vec<_>>();

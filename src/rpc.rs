@@ -1157,7 +1157,7 @@ async fn dispatch_method_async(node: &Arc<Node>, method: &str, params: &Value) -
     let normalized_params = normalize_rpc_params(method, params)?;
     let command_id = node.begin_rpc_command(method);
     let result = match method {
-        "stop" => match stop_wait(params) {
+        "stop" => match stop_wait(&normalized_params) {
             Ok(wait) => {
                 node.request_shutdown();
                 if let Some(wait) = wait {
@@ -12850,6 +12850,8 @@ mod tests {
 
     #[test]
     fn named_rpc_parameters_are_normalized_with_holes_and_strict_names() {
+        let normalized = normalize_rpc_params("stop", &json!({"wait": 250})).unwrap();
+        assert_eq!(normalized, json!([250]));
         let normalized = normalize_rpc_params(
             "getblockheader",
             &json!({"verbose": false, "blockhash": "00"}),

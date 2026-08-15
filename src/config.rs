@@ -526,6 +526,15 @@ pub struct Args {
     )]
     pub no_connect: bool,
 
+    #[arg(
+        long = "v2transport",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub v2_transport: bool,
+
     #[arg(long = "onlynet", value_enum, value_delimiter = ',')]
     pub onlynet: Vec<OnlyNet>,
 
@@ -774,6 +783,7 @@ pub struct Config {
     pub rest: bool,
     pub seed_nodes: Vec<NetworkEndpoint>,
     pub connect_disabled: bool,
+    pub v2_transport: bool,
     pub add_nodes: Vec<NetworkEndpoint>,
     pub seed_nodes_for_address_fetch: Vec<NetworkEndpoint>,
     pub dnsseed: bool,
@@ -1007,6 +1017,7 @@ impl Config {
             rest: args.rest,
             seed_nodes,
             connect_disabled,
+            v2_transport: args.v2_transport,
             add_nodes,
             seed_nodes_for_address_fetch,
             dnsseed,
@@ -1163,6 +1174,7 @@ mod tests {
         assert_eq!(config.onlynet, vec![OnlyNet::Ipv4]);
         assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
         assert!(config.proxy_randomize);
+        assert!(config.v2_transport);
         assert!(config.allows_address("192.0.2.1:8333".parse().unwrap()));
         assert!(!config.allows_address("[2001:db8::1]:8333".parse().unwrap()));
         assert!(!config.allows_address("[fc00::1]:8333".parse().unwrap()));
@@ -1240,6 +1252,15 @@ mod tests {
         ])
         .unwrap();
         assert!(!Config::from_args(args).unwrap().proxy_randomize);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--v2transport=false",
+        ])
+        .unwrap();
+        assert!(!Config::from_args(args).unwrap().v2_transport);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

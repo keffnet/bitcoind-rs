@@ -1718,7 +1718,11 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             };
             let local_services = network_service
                 | wire::NODE_WITNESS
-                | wire::NODE_P2P_V2
+                | if node.config.v2_transport {
+                    wire::NODE_P2P_V2
+                } else {
+                    0
+                }
                 | if node.config.blockfilterindex && node.config.peer_block_filters {
                     wire::NODE_COMPACT_FILTERS
                 } else {
@@ -3022,6 +3026,9 @@ fn add_connection(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("invalid connection type")
     }
     let transport_v2 = param::<bool>(params, 2)?;
+    if transport_v2 && !node.config.v2_transport {
+        bail!("v2transport requested but not enabled (see --v2transport)");
+    }
     let connection_type = match requested_connection_type.as_str() {
         "outbound-full-relay" => "outbound-full",
         "block-relay-only" => "block-relay-only",
@@ -3057,6 +3064,9 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .ok_or_else(|| anyhow!("v2transport must be a boolean"))
         })
         .transpose()?;
+    if transport_v2 == Some(true) && !node.config.v2_transport {
+        bail!("v2transport requested but not enabled (see --v2transport)");
+    }
     match command.as_str() {
         "add" => {
             if !node.add_node_endpoint_with_transport(endpoint, display_name, transport_v2) {
@@ -12091,6 +12101,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -12319,6 +12330,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -12420,6 +12432,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -12546,6 +12559,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -12609,6 +12623,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -12675,6 +12690,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -12776,6 +12792,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -12909,6 +12926,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13211,6 +13229,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13306,6 +13325,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13384,6 +13404,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13455,6 +13476,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13529,6 +13551,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13590,6 +13613,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13660,6 +13684,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13719,6 +13744,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13855,6 +13881,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -13939,6 +13966,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14017,6 +14045,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14133,6 +14162,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14213,6 +14243,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14324,6 +14355,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14517,6 +14549,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14693,6 +14726,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14753,6 +14787,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14815,6 +14850,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14882,6 +14918,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -14955,6 +14992,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -15035,6 +15073,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -15113,6 +15152,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -15239,6 +15279,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: false,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -15258,6 +15299,11 @@ mod tests {
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
+        let localservices = dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap();
+        assert_eq!(
+            localservices["localservicesnames"],
+            json!(["NETWORK", "WITNESS", "COMPACT_FILTERS"])
+        );
         dispatch_method(&node, "setnetworkactive", &json!([false])).unwrap();
         assert_eq!(
             dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["networkactive"],
@@ -15365,6 +15411,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             max_peers: 1,
@@ -15427,6 +15474,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -15658,6 +15706,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -15784,6 +15833,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -15906,6 +15956,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -16098,6 +16149,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -16399,6 +16451,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -16470,6 +16523,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -16666,6 +16720,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -16741,6 +16796,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -17148,6 +17204,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -17218,6 +17275,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -17327,6 +17385,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -17567,6 +17626,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -17980,6 +18040,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -18114,6 +18175,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -18275,6 +18337,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -18542,6 +18605,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -18615,6 +18679,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -18709,6 +18774,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,

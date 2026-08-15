@@ -1434,6 +1434,7 @@ async fn run_inbound_listener(
         let node = node.clone();
         let slots = slots.clone();
         let peers = peers.clone();
+        let transport_v2 = (!node.config.v2_transport).then_some(false);
         let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
             let Ok(permit) = slots.try_acquire_owned() else {
@@ -1446,7 +1447,7 @@ async fn run_inbound_listener(
                 NetworkEndpoint::from_socket(address),
                 PeerConnectionOptions {
                     outbound: false,
-                    transport_v2: None,
+                    transport_v2,
                     connection_type: "inbound",
                     permissions,
                     private_broadcast_transaction: None,
@@ -1478,6 +1479,7 @@ fn spawn_outbound_loop(
             return;
         }
     }
+    let transport_v2 = transport_v2.or_else(|| (!node.config.v2_transport).then_some(false));
     let peer_id = outbound.next_peer_id.fetch_add(1, Ordering::Relaxed);
     let OutboundContext {
         slots,
@@ -1642,7 +1644,7 @@ fn spawn_private_broadcast_loop(
                     endpoint.clone(),
                     PeerConnectionOptions {
                         outbound: true,
-                        transport_v2: None,
+                        transport_v2: (!node.config.v2_transport).then_some(false),
                         connection_type: "private-broadcast",
                         permissions: None,
                         private_broadcast_transaction: Some(transaction),
@@ -2238,6 +2240,11 @@ async fn serve_peer_loop(
         version.receiver_services |= wire::NODE_NETWORK_LIMITED;
         version.sender_services &= !wire::NODE_NETWORK;
         version.sender_services |= wire::NODE_NETWORK_LIMITED;
+    }
+    if peer_state.connection_type != "private-broadcast" && !node.config.v2_transport {
+        version.services &= !wire::NODE_P2P_V2;
+        version.receiver_services &= !wire::NODE_P2P_V2;
+        version.sender_services &= !wire::NODE_P2P_V2;
     }
     if peer_state.connection_type != "private-broadcast"
         && !(node.config.blockfilterindex && node.config.peer_block_filters)
@@ -4796,6 +4803,7 @@ mod tests {
                 .map(NetworkEndpoint::from_socket)
                 .collect(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             dnsseed: false,
@@ -5356,6 +5364,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -5500,6 +5509,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -5900,6 +5910,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6028,6 +6039,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6162,6 +6174,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6386,6 +6399,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6486,6 +6500,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6568,6 +6583,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6642,6 +6658,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,
@@ -6778,6 +6795,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,

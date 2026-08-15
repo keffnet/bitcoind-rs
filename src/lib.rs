@@ -3324,6 +3324,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            v2_transport: true,
             add_nodes: Vec::new(),
             seed_nodes_for_address_fetch: Vec::new(),
             signet_challenge: None,

@@ -9,7 +9,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::consensus::encode::{VarInt, deserialize_partial, serialize};
-use bitcoin::{Amount, Network, OutPoint, PublicKey, Script, Transaction, TxOut, Txid, Wtxid};
+use bitcoin::{
+    Amount, Network, OutPoint, PublicKey, Script, ScriptBuf, Transaction, TxOut, Txid, Wtxid,
+};
 use rand::random;
 use serde::{Deserialize, Serialize};
 
@@ -2348,8 +2350,8 @@ fn validate_standard_policy_with_modified_fee_and_policy(
         legacy_sigops = legacy_sigops
             .saturating_add(input.script_sig.count_sigops())
             .saturating_add(if previous.script_pubkey.is_p2sh() {
-                last_push_data(&input.script_sig)
-                    .map(|redeem| Script::from_bytes(redeem).count_sigops())
+                push_only_stack_top(&input.script_sig)
+                    .map(|redeem| Script::from_bytes(&redeem).count_sigops())
                     .unwrap_or_default()
             } else {
                 previous.script_pubkey.count_sigops()
@@ -2381,7 +2383,7 @@ fn is_minimal_push_encoding(script: &Script) -> bool {
         offset += 1;
         let length = match opcode {
             0x00 => 0,
-            0x51..=0x60 => continue,
+            0x4f | 0x51..=0x60 => continue,
             0x01..=0x4b => usize::from(opcode),
             0x4c => {
                 let Some(&length) = bytes.get(offset) else {
@@ -2504,21 +2506,24 @@ fn validate_standard_inputs(
                 "bad-txns-nonstandard-inputs".to_owned(),
             ));
         }
-        let mut spending_script = &previous.script_pubkey as &Script;
-        if previous.script_pubkey.is_p2sh() {
-            let Some(redeem_script) = last_push_data(&input.script_sig) else {
+        let redeem_script = if previous.script_pubkey.is_p2sh() {
+            let Some(redeem_script) = push_only_stack_top(&input.script_sig) else {
                 return Err(MempoolError::NonStandard(
                     "bad-txns-nonstandard-inputs".to_owned(),
                 ));
             };
-            let redeem_script = Script::from_bytes(redeem_script);
-            if redeem_script.count_sigops() > 15 {
+            let redeem_script = ScriptBuf::from_bytes(redeem_script);
+            let redeem_script_view = redeem_script.as_script();
+            if redeem_script_view.count_sigops() > 15 {
                 return Err(MempoolError::NonStandard(
                     "bad-txns-nonstandard-inputs".to_owned(),
                 ));
             }
-            spending_script = redeem_script;
-        }
+            Some(redeem_script)
+        } else {
+            None
+        };
+        let spending_script = redeem_script.as_deref().unwrap_or(&previous.script_pubkey);
         if spending_script.is_witness_program()
             && !(spending_script.is_p2wpkh()
                 || spending_script.is_p2wsh()
@@ -2546,16 +2551,17 @@ fn validate_standard_witnesses(
         if input.witness.is_empty() {
             continue;
         }
-        let spending_script = if previous.script_pubkey.is_p2sh() {
-            let Some(redeem_script) = last_push_data(&input.script_sig) else {
+        let redeem_script = if previous.script_pubkey.is_p2sh() {
+            let Some(redeem_script) = push_only_stack_top(&input.script_sig) else {
                 return Err(MempoolError::NonStandard(
                     "bad-witness-nonstandard".to_owned(),
                 ));
             };
-            Script::from_bytes(redeem_script)
+            Some(ScriptBuf::from_bytes(redeem_script))
         } else {
-            &previous.script_pubkey
+            None
         };
+        let spending_script = redeem_script.as_deref().unwrap_or(&previous.script_pubkey);
         if !spending_script.is_witness_program() {
             return Err(MempoolError::NonStandard(
                 "bad-witness-nonstandard".to_owned(),
@@ -2668,12 +2674,20 @@ fn is_core_nulldata(script: &Script) -> bool {
         && Script::from_bytes(&script.as_bytes()[1..]).is_push_only()
 }
 
-fn last_push_data(script: &Script) -> Option<&[u8]> {
+fn push_only_stack_top(script: &Script) -> Option<Vec<u8>> {
     let mut last = None;
     for instruction in script.instructions() {
         match instruction {
-            Ok(Instruction::PushBytes(bytes)) => last = Some(bytes.as_bytes()),
-            Ok(Instruction::Op(_)) => {}
+            Ok(Instruction::PushBytes(bytes)) => last = Some(bytes.as_bytes().to_vec()),
+            Ok(Instruction::Op(op)) => {
+                let value = match op.to_u8() {
+                    0x00 => Vec::new(),
+                    0x4f => vec![0x81],
+                    0x51..=0x60 => vec![op.to_u8() - 0x50],
+                    _ => return None,
+                };
+                last = Some(value);
+            }
             Err(_) => return None,
         }
     }
@@ -3725,6 +3739,40 @@ mod tests {
             validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1),
             Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
         ));
+
+        let redeem_script = ScriptBuf::new();
+        let redeem_hash = bitcoin::hashes::hash160::Hash::hash(redeem_script.as_bytes());
+        let mut p2sh = vec![0xa9, 0x14];
+        p2sh.extend_from_slice(&redeem_hash.to_byte_array());
+        p2sh.push(0x87);
+        let p2sh_previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::from_bytes(p2sh),
+        };
+        let mut empty_redeem = graph_transaction(Txid::from_byte_array([12; 32]), 12);
+        empty_redeem.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00]);
+        empty_redeem.output[0].value = Amount::from_sat(100_000);
+        empty_redeem.output[0].script_pubkey = previous.script_pubkey.clone();
+        assert!(validate_standard_policy(&empty_redeem, &[p2sh_previous], 0).is_ok());
+
+        let negative_one_redeem = ScriptBuf::from_bytes(vec![0x81]);
+        let negative_one_hash =
+            bitcoin::hashes::hash160::Hash::hash(negative_one_redeem.as_bytes());
+        let mut negative_one_p2sh = vec![0xa9, 0x14];
+        negative_one_p2sh.extend_from_slice(&negative_one_hash.to_byte_array());
+        negative_one_p2sh.push(0x87);
+        empty_redeem.input[0].script_sig = ScriptBuf::from_bytes(vec![0x4f]);
+        assert!(
+            validate_standard_policy(
+                &empty_redeem,
+                &[TxOut {
+                    value: Amount::from_sat(100_000),
+                    script_pubkey: ScriptBuf::from_bytes(negative_one_p2sh),
+                }],
+                0,
+            )
+            .is_ok()
+        );
 
         let wpkh_previous = TxOut {
             value: Amount::from_sat(100_000),

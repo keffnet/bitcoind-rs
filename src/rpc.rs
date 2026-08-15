@@ -9305,7 +9305,7 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
     let chain = node.chain.read();
     let mut candidate = node.mempool.read().clone();
     if transactions.len() > 1 {
-        if let Err(error) = candidate.accept_package(&transactions, &chain) {
+        if let Err(error) = candidate.accept_package_for_test(&transactions, &chain) {
             return Ok(json!(
                 transactions
                     .iter()
@@ -9348,7 +9348,7 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
         return Ok(Value::Array(result));
     }
 
-    match candidate.accept_without_sibling(transactions[0].clone(), &chain) {
+    match candidate.accept_for_test(transactions[0].clone(), &chain) {
         Ok(txid) => {
             let entry = candidate
                 .get(&txid)
@@ -16145,7 +16145,7 @@ mod tests {
     }
 
     #[test]
-    fn mempool_replacement_requires_and_pays_for_rbf() {
+    fn mempool_full_rbf_requires_replacement_fees() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
             network: Network::Regtest,
@@ -16200,7 +16200,7 @@ mod tests {
             input: vec![TxIn {
                 previous_output: outpoint,
                 script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
-                sequence: bitcoin::Sequence::from_consensus(0xffff_fffd),
+                sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
             output: vec![TxOut {
@@ -16210,13 +16210,14 @@ mod tests {
         };
         let old_txid = node.accept_transaction(old).unwrap();
         assert_eq!(mempool_events.try_recv().unwrap(), old_txid);
+        assert!(!node.mempool.read().is_replaceable(&old_txid));
         let replacement = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![TxIn {
                 previous_output: outpoint,
                 script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
-                sequence: bitcoin::Sequence::from_consensus(0xffff_fffd),
+                sequence: bitcoin::Sequence::MAX,
                 witness: Witness::default(),
             }],
             output: vec![TxOut {
@@ -16224,6 +16225,15 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         };
+        let dry_run = dispatch_method(
+            &node,
+            "testmempoolaccept",
+            &json!([[hex::encode(serialize(&replacement))]]),
+        )
+        .unwrap();
+        assert_eq!(dry_run[0]["allowed"], false);
+        assert_eq!(dry_run[0]["reject-reason"], "bip125-replacement-disallowed");
+        assert!(node.mempool.read().get(&old_txid).is_some());
         let replacement_txid = node.accept_transaction(replacement).unwrap();
         assert_eq!(mempool_events.try_recv().unwrap(), old_txid);
         assert_eq!(mempool_events.try_recv().unwrap(), replacement_txid);

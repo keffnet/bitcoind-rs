@@ -379,8 +379,8 @@ pub enum MempoolError {
     AlreadyPresent,
     #[error("transaction input is already spent by mempool transaction {0}")]
     Conflict(Txid),
-    #[error("conflicting transaction does not signal replaceability")]
-    ReplacementNotSignaled,
+    #[error("bip125-replacement-disallowed")]
+    ReplacementDisallowed,
     #[error("replacement transaction fee is too low")]
     ReplacementFee,
     #[error("replacement transaction spends an unconfirmed output outside the conflicts")]
@@ -1004,6 +1004,21 @@ impl Mempool {
         self.accept_with_sibling(transaction, chain, false)
     }
 
+    /// Validate a transaction for testmempoolaccept without allowing it to
+    /// replace an existing mempool transaction. Core deliberately keeps
+    /// replacement disabled for this dry-run RPC even though normal local
+    /// admission uses full-RBF.
+    pub(crate) fn accept_for_test(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+    ) -> Result<Txid, MempoolError> {
+        if !self.conflicts_for(&transaction).is_empty() {
+            return Err(MempoolError::ReplacementDisallowed);
+        }
+        self.accept_without_sibling(transaction, chain)
+    }
+
     fn accept_with_sibling(
         &mut self,
         transaction: Transaction,
@@ -1106,6 +1121,34 @@ impl Mempool {
         Ok(accepted)
     }
 
+    /// Validate a package for testmempoolaccept. Package feerates and
+    /// replacement are intentionally disabled for this dry-run path, just as
+    /// in Core's PackageTestAccept arguments.
+    pub(crate) fn accept_package_for_test(
+        &mut self,
+        transactions: &[Transaction],
+        chain: &ChainState,
+    ) -> Result<Vec<Txid>, MempoolError> {
+        if transactions.is_empty() {
+            return Err(MempoolError::Empty);
+        }
+        let added_at = time::unix_time();
+        let mut candidate = self.clone();
+        let mut accepted = Vec::with_capacity(transactions.len());
+        for transaction in transactions {
+            let txid = transaction.compute_txid();
+            if candidate.entries.contains_key(&txid)
+                || !candidate.conflicts_for(transaction).is_empty()
+            {
+                return Err(MempoolError::ReplacementDisallowed);
+            }
+            accepted.push(candidate.accept_at(transaction.clone(), chain, added_at)?);
+        }
+        validate_ephemeral_spends(transactions, &candidate)?;
+        *self = candidate;
+        Ok(accepted)
+    }
+
     fn replace(
         &mut self,
         transaction: Transaction,
@@ -1128,12 +1171,6 @@ impl Mempool {
             return Err(MempoolError::Conflict(transaction.compute_txid()));
         }
         let direct_conflicts = self.conflicts_for(&transaction);
-        if direct_conflicts
-            .iter()
-            .any(|txid| !self.is_replaceable(txid))
-        {
-            return Err(MempoolError::ReplacementNotSignaled);
-        }
         let removal = self.conflicts_and_descendants(&conflicts);
         let mut allowed_unconfirmed = HashSet::new();
         for conflict in &conflicts {

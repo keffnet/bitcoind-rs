@@ -655,6 +655,7 @@ pub struct Node {
     network_addresses: parking_lot::RwLock<HashMap<NetworkEndpoint, KnownNetworkAddress>>,
     network_tried_addresses: parking_lot::RwLock<HashSet<NetworkEndpoint>>,
     added_nodes: parking_lot::RwLock<HashMap<SocketAddr, Option<bool>>>,
+    added_node_names: parking_lot::RwLock<HashMap<SocketAddr, String>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
     listen_address: parking_lot::RwLock<Option<SocketAddr>>,
     last_mining_block: parking_lot::RwLock<Option<(u64, usize)>>,
@@ -669,6 +670,12 @@ impl Node {
             .iter()
             .copied()
             .map(|address| (address, None))
+            .collect();
+        let added_node_names = config
+            .seed_nodes
+            .iter()
+            .copied()
+            .map(|address| (address, address.to_string()))
             .collect();
         let max_mempool_bytes = config
             .max_mempool_mb
@@ -777,6 +784,7 @@ impl Node {
             network_addresses: parking_lot::RwLock::new(network_addresses),
             network_tried_addresses: parking_lot::RwLock::new(network_tried_addresses),
             added_nodes: parking_lot::RwLock::new(added_nodes),
+            added_node_names: parking_lot::RwLock::new(added_node_names),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
             listen_address: parking_lot::RwLock::new(None),
             last_mining_block: parking_lot::RwLock::new(None),
@@ -2548,6 +2556,15 @@ impl Node {
         address: SocketAddr,
         transport_v2: Option<bool>,
     ) -> bool {
+        self.add_node_with_transport_name(address, address.to_string(), transport_v2)
+    }
+
+    pub(crate) fn add_node_with_transport_name(
+        &self,
+        address: SocketAddr,
+        display_name: String,
+        transport_v2: Option<bool>,
+    ) -> bool {
         if !self.config.allows_address(address) {
             return false;
         }
@@ -2559,6 +2576,7 @@ impl Node {
             }
         };
         if inserted {
+            self.added_node_names.write().insert(address, display_name);
             if let Some(sender) = self.peer_manager_requests.read().as_ref() {
                 let _ = sender.send(p2p::PeerManagerRequest::Add(address, transport_v2));
             }
@@ -2590,6 +2608,9 @@ impl Node {
 
     pub fn remove_node(&self, address: &SocketAddr) -> bool {
         let removed = self.added_nodes.write().remove(address);
+        if removed.is_some() {
+            self.added_node_names.write().remove(address);
+        }
         self.disconnect_peer_at(*address);
         removed.is_some()
     }
@@ -2603,7 +2624,18 @@ impl Node {
     }
 
     pub(crate) fn ensure_node_added(&self, address: SocketAddr) {
-        self.added_nodes.write().entry(address).or_insert(None);
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.added_nodes.write().entry(address)
+        {
+            entry.insert(None);
+            self.added_node_names
+                .write()
+                .insert(address, address.to_string());
+        }
+    }
+
+    pub(crate) fn added_node_name(&self, address: SocketAddr) -> Option<String> {
+        self.added_node_names.read().get(&address).cloned()
     }
 
     pub(crate) fn set_peer_manager_sender(

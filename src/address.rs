@@ -8,9 +8,10 @@ use sha3::{Digest, Sha3_256};
 
 /// A validated endpoint from one of the BIP155 address networks.
 ///
-/// Connected peers still use [`SocketAddr`] because a live TCP connection has
-/// already resolved its destination. The address manager keeps the network
-/// identity here so Tor, I2P, and CJDNS records survive persistence and relay.
+/// Connected peers normally use [`SocketAddr`], while manual hostname peers
+/// retain a `Dns` identity so proxy routing and RPC reporting do not lose the
+/// unresolved destination. The address manager keeps the network identity
+/// here so Tor, I2P, and CJDNS records survive persistence and relay.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum NetworkEndpoint {
     Ip(SocketAddr),

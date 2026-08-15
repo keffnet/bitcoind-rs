@@ -652,6 +652,7 @@ impl Node {
             dust_relay_fee_sat_per_kvb: config.dust_relay_fee_sat_per_kvb,
             max_datacarrier_bytes: config.max_datacarrier_bytes,
             permit_bare_multisig: config.permit_bare_multisig,
+            require_standard: !config.accept_nonstd_txn,
         };
         let mut mempool =
             Mempool::with_max_bytes_and_policy(config.network, max_mempool_bytes, mempool_policy);
@@ -2942,6 +2943,7 @@ mod tests {
             peer_permissions: crate::config::PeerPermissionConfig::default(),
             blocksonly: false,
             private_broadcast: false,
+            accept_nonstd_txn: true,
             prune: 0,
             reindex: false,
             reindex_chainstate: false,

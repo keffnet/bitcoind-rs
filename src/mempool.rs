@@ -60,6 +60,7 @@ pub struct MempoolPolicy {
     pub dust_relay_fee_sat_per_kvb: u64,
     pub max_datacarrier_bytes: Option<usize>,
     pub permit_bare_multisig: bool,
+    pub require_standard: bool,
 }
 
 impl Default for MempoolPolicy {
@@ -71,6 +72,7 @@ impl Default for MempoolPolicy {
             max_datacarrier_bytes: DEFAULT_ACCEPT_DATACARRIER
                 .then_some(usize::try_from(DEFAULT_MAX_DATACARRIER_BYTES).expect("constant fits")),
             permit_bare_multisig: DEFAULT_PERMIT_BARE_MULTISIG,
+            require_standard: true,
         }
     }
 }
@@ -437,7 +439,13 @@ impl Mempool {
     }
 
     pub fn with_max_bytes(network: Network, max_bytes: usize) -> Self {
-        Self::with_max_bytes_and_policy(network, max_bytes, MempoolPolicy::default())
+        // Preserve the low-level helper's historical behavior for synthetic
+        // regtest fixtures. Node::open supplies the explicit Core policy.
+        let policy = MempoolPolicy {
+            require_standard: network != Network::Regtest,
+            ..MempoolPolicy::default()
+        };
+        Self::with_max_bytes_and_policy(network, max_bytes, policy)
     }
 
     pub fn with_max_bytes_and_policy(
@@ -1672,7 +1680,7 @@ impl Mempool {
         let modified_fee_sat = i64::try_from(fee_sat)
             .unwrap_or(i64::MAX)
             .saturating_add(self.fee_delta(&txid));
-        if chain.network != Network::Regtest {
+        if self.policy.require_standard {
             validate_standard_policy_with_modified_fee_and_policy(
                 &transaction,
                 &previous_outputs,
@@ -3159,6 +3167,60 @@ mod tests {
         pool.take_changes();
         pool.accept_reorg(transaction, &chain, 1).unwrap();
         assert_eq!(pool.relay_sequences[&txid], 0);
+    }
+
+    #[test]
+    fn standardness_policy_can_be_explicitly_disabled_on_regtest() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=101 {
+            let previous = chain.header(height - 1).expect("previous header");
+            chain
+                .connect_block(mine_regtest_block(previous, height))
+                .unwrap();
+        }
+        let (outpoint, entry) = chain
+            .all_utxos()
+            .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
+            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+            .expect("matured coinbase output");
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0; 65]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(entry.output.value.to_sat() - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        let strict_policy = MempoolPolicy {
+            require_standard: true,
+            ..MempoolPolicy::default()
+        };
+        let mut strict = Mempool::with_max_bytes_and_policy(
+            Network::Regtest,
+            DEFAULT_MAX_MEMPOOL_BYTES,
+            strict_policy,
+        );
+        assert!(matches!(
+            strict.accept(transaction.clone(), &chain),
+            Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
+        ));
+
+        let mut permissive_policy = strict_policy;
+        permissive_policy.require_standard = false;
+        let mut permissive = Mempool::with_max_bytes_and_policy(
+            Network::Regtest,
+            DEFAULT_MAX_MEMPOOL_BYTES,
+            permissive_policy,
+        );
+        assert!(permissive.accept(transaction, &chain).is_ok());
     }
 
     #[test]

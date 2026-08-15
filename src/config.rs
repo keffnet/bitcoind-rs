@@ -610,6 +610,15 @@ pub struct Args {
     )]
     pub privatebroadcast: bool,
 
+    #[arg(
+        long = "acceptnonstdtxn",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub accept_nonstd_txn: bool,
+
     #[arg(long, default_value_t = 0)]
     pub prune: u64,
 
@@ -737,6 +746,9 @@ pub struct Config {
     pub peer_bloom_filters: bool,
     pub blocksonly: bool,
     pub private_broadcast: bool,
+    /// Permit non-standard transactions on test chains, matching Core's
+    /// `-acceptnonstdtxn` option. Mainnet never permits this override.
+    pub accept_nonstd_txn: bool,
     /// Pruning mode: 0 disabled, 1 manual, or a target size in MiB.
     pub prune: u64,
     pub reindex: bool,
@@ -760,6 +772,9 @@ impl Config {
     pub fn from_args(args: Args) -> Result<Self> {
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
+        }
+        if args.accept_nonstd_txn && args.network == NetworkName::Bitcoin {
+            bail!("--acceptnonstdtxn is not currently supported for main chain");
         }
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
             bail!("--proxy must use a non-zero port");
@@ -909,6 +924,7 @@ impl Config {
             peer_bloom_filters: args.peer_bloom_filters,
             blocksonly: args.blocksonly,
             private_broadcast: args.privatebroadcast,
+            accept_nonstd_txn: args.accept_nonstd_txn,
             prune: args.prune,
             reindex: args.reindex,
             reindex_chainstate: args.reindex_chainstate,
@@ -1012,6 +1028,25 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).unwrap().private_broadcast);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--acceptnonstdtxn",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).unwrap().accept_nonstd_txn);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--acceptnonstdtxn",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

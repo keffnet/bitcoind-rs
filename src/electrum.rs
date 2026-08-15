@@ -708,15 +708,14 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
 
 fn block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = param::<u32>(params, 0)?;
-    let checkpoint = crate::rpc::optional_u64(params, 1, 0, "cp_height")?;
-    let checkpoint = u32::try_from(checkpoint).map_err(|_| anyhow!("checkpoint is too large"))?;
+    let checkpoint = optional_checkpoint(params, 1)?;
     let chain = node.chain.read();
     let header = chain
         .header(height)
         .ok_or_else(|| anyhow!("block height out of range"))?;
-    if checkpoint == 0 {
+    let Some(checkpoint) = checkpoint else {
         return Ok(json!(hex::encode(serialize(header))));
-    }
+    };
     if height > checkpoint {
         bail!("checkpoint height must not precede requested height")
     }
@@ -735,9 +734,11 @@ fn block_headers_for_protocol(
 ) -> Result<Value> {
     let start = param::<u32>(params, 0)?;
     let count = param::<u32>(params, 1)?.min(2_016);
-    let checkpoint = crate::rpc::optional_u64(params, 2, 0, "cp_height")?;
-    let checkpoint = u32::try_from(checkpoint).map_err(|_| anyhow!("checkpoint is too large"))?;
-    if checkpoint != 0 && count != 0 && start.saturating_add(count.saturating_sub(1)) > checkpoint {
+    let checkpoint = optional_checkpoint(params, 2)?;
+    if checkpoint.is_some()
+        && count != 0
+        && start.saturating_add(count.saturating_sub(1)) > checkpoint.unwrap_or_default()
+    {
         bail!("checkpoint height is below the requested header range")
     }
     let chain = node.chain.read();
@@ -758,13 +759,27 @@ fn block_headers_for_protocol(
     } else {
         json!({"count": actual, "hex": hex::encode(bytes), "max": 2_016})
     };
-    if checkpoint != 0 && actual != 0 {
+    if let Some(checkpoint) = checkpoint
+        && actual != 0
+    {
         let last_height = start + actual - 1;
         let (branch, root) = header_merkle_proof(&chain, last_height, checkpoint)?;
         result["branch"] = json!(branch.iter().map(ToString::to_string).collect::<Vec<_>>());
         result["root"] = json!(root.to_string());
     }
     Ok(result)
+}
+
+fn optional_checkpoint(params: &Value, index: usize) -> Result<Option<u32>> {
+    let Some(value) = params.get(index).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let checkpoint = value
+        .as_u64()
+        .ok_or_else(|| anyhow!("cp_height must be a non-negative integer"))?;
+    Ok(Some(
+        u32::try_from(checkpoint).map_err(|_| anyhow!("checkpoint is too large"))?,
+    ))
 }
 
 fn mempool_info(node: &Arc<Node>) -> Value {
@@ -1908,6 +1923,33 @@ mod tests {
         .unwrap();
         assert!(headers.get("headers").is_some());
         assert!(headers.get("hex").is_none());
+        let genesis_header = dispatch_with_session(
+            &node,
+            "blockchain.block.header",
+            &json!([0, 0]),
+            &mut subscriptions,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(genesis_header["branch"], json!([]));
+        assert_eq!(
+            genesis_header["root"],
+            json!(node.chain.read().block_hash(0).unwrap().to_string())
+        );
+        let genesis_headers = dispatch_with_session(
+            &node,
+            "blockchain.block.headers",
+            &json!([0, 1, 0]),
+            &mut subscriptions,
+            &mut session,
+        )
+        .unwrap();
+        assert_eq!(genesis_headers["count"], json!(1));
+        assert_eq!(genesis_headers["branch"], json!([]));
+        assert_eq!(
+            genesis_headers["root"],
+            json!(node.chain.read().block_hash(0).unwrap().to_string())
+        );
         assert_eq!(
             dispatch_with_session(
                 &node,

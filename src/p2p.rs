@@ -36,7 +36,7 @@ use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
-use crate::address::NetworkEndpoint;
+use crate::address::{NetworkEndpoint, is_core_routable_ip};
 use crate::chain::BasicFilterRange;
 use crate::config::PeerPermissions;
 use crate::mempool::MempoolError;
@@ -712,6 +712,8 @@ fn headers_sync_work_threshold(chain: &crate::chain::ChainState) -> Work {
 }
 
 struct PeerState {
+    endpoint: NetworkEndpoint,
+    local_address: Option<SocketAddr>,
     writer: PeerWriter,
     connection_type: &'static str,
     permissions: PeerPermissions,
@@ -2138,6 +2140,7 @@ async fn serve_peer(
     )
     .await?;
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
+    let peer_endpoint = endpoint.clone();
     let (commands, command_receiver) = mpsc::unbounded_channel();
     let permissions = options.permissions.unwrap_or_else(|| {
         endpoint
@@ -2161,6 +2164,8 @@ async fn serve_peer(
     node.set_peer_session_id(peer_id, session_id);
     node.set_peer_connection_type(peer_id, options.connection_type);
     let peer_state = Arc::new(PeerState {
+        endpoint: peer_endpoint,
+        local_address,
         writer: Arc::new(Mutex::new(writer_half)),
         connection_type: options.connection_type,
         permissions,
@@ -2263,6 +2268,16 @@ async fn serve_peer_loop(
                     .contains(PeerPermissions::BLOOM_FILTER),
         )
     };
+    if peer_state.connection_type != "private-broadcast" {
+        if let Some(address) = advertised_local_address(node, peer_state) {
+            version.sender_address = socket_address_bytes(address);
+            version.sender_port = address.port();
+        }
+        if let Some(address) = peer_state.endpoint.socket_addr() {
+            version.receiver_address = socket_address_bytes(address);
+            version.receiver_port = address.port();
+        }
+    }
     if peer_state.connection_type != "private-broadcast" && node.chain.read().is_pruned() {
         version.services &= !wire::NODE_NETWORK;
         version.services |= wire::NODE_NETWORK_LIMITED;
@@ -4141,6 +4156,33 @@ fn complete_compact_block(
     Ok(block)
 }
 
+fn advertised_local_address(node: &Node, peer: &PeerState) -> Option<SocketAddr> {
+    let peer_network = peer.endpoint.network_name();
+    let matches_peer_network = |address: SocketAddr| {
+        let endpoint = NetworkEndpoint::from_socket(address);
+        peer_network == "not_publicly_routable" || endpoint.network_name() == peer_network
+    };
+    let usable = |address: SocketAddr| {
+        (is_core_routable_ip(address.ip())
+            || (NetworkEndpoint::from_socket(address).network_name() == "cjdns"
+                && node.config.cjdns_reachable))
+            && node.config.allows_address(address)
+            && matches_peer_network(address)
+    };
+    node.config
+        .external_addresses
+        .iter()
+        .copied()
+        .find(|address| usable(*address))
+        .or_else(|| {
+            node.config
+                .discover
+                .then_some(peer.local_address)
+                .flatten()
+                .filter(|address| usable(*address))
+        })
+}
+
 fn socket_address_bytes(address: std::net::SocketAddr) -> [u8; 16] {
     match address.ip() {
         std::net::IpAddr::V4(ip) => {
@@ -5596,6 +5638,8 @@ mod tests {
         let (mut server_reader, _) = server.into_split();
         let writer = Arc::new(Mutex::new(PeerWriterKind::V1(client_writer)));
         let state = Arc::new(PeerState {
+            endpoint: NetworkEndpoint::Ip(address),
+            local_address: None,
             writer: writer.clone(),
             connection_type: "outbound-full",
             permissions: PeerPermissions::empty(),
@@ -6922,6 +6966,8 @@ mod tests {
         let (mut server_reader, _) = server.into_split();
         let writer = Arc::new(Mutex::new(PeerWriterKind::V1(client_writer)));
         let peer_state = PeerState {
+            endpoint: NetworkEndpoint::Ip(address),
+            local_address: None,
             writer: writer.clone(),
             connection_type: "outbound-full",
             permissions: PeerPermissions::empty(),

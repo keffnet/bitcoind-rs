@@ -292,7 +292,7 @@ fn mapped_ipv4(address: &Ipv6Addr) -> Ipv4Addr {
     )
 }
 
-fn is_core_routable_ip(address: IpAddr) -> bool {
+pub(crate) fn is_core_routable_ip(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
             let [first, second, third, _] = address.octets();

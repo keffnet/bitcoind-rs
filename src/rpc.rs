@@ -1564,6 +1564,9 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
             }))
         }
         "importmempool" => {
+            if node.chain.read().is_initial_block_download() {
+                bail!("Can only import the mempool after the block download and sync is done.");
+            }
             let path = param::<String>(params, 0)?;
             let options = params
                 .get(1)
@@ -1611,7 +1614,10 @@ fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Val
                     apply_fee_delta_priority,
                     apply_unbroadcast_set,
                 },
-            )?;
+            )
+            .map_err(|error| {
+                anyhow!("Unable to import mempool file, see debug.log for details: {error}")
+            })?;
             Ok(json!({}))
         }
         "gettxoutsetinfo" => get_txout_set_info(node, params),
@@ -11122,6 +11128,9 @@ fn rpc_error_code(message: &str) -> i32 {
     if message == "Method not found" {
         return -32601;
     }
+    if lower == "can only import the mempool after the block download and sync is done." {
+        return -28;
+    }
     if lower.contains("tx decode failed")
         || lower.contains("transaction decode failed")
         || lower.contains("block decode failed")
@@ -11390,6 +11399,12 @@ mod tests {
         assert_eq!(
             rpc_error(&anyhow!("Method not found"))["code"],
             json!(-32601)
+        );
+        assert_eq!(
+            rpc_error_code(
+                "Can only import the mempool after the block download and sync is done."
+            ),
+            -28
         );
         assert_eq!(rpc_error_code("unknown mode foobar"), -8);
         assert_eq!(rpc_error_code("mode must be a string"), -3);
@@ -16424,6 +16439,17 @@ mod tests {
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
+        let initial_download_error = dispatch_method(
+            &node,
+            "importmempool",
+            &json!([directory.path().join("missing.dat").to_string_lossy()]),
+        )
+        .unwrap_err();
+        assert!(
+            initial_download_error
+                .to_string()
+                .contains("Can only import the mempool after the block download and sync is done.")
+        );
         let hashes = generate_to_descriptor(&node, &json!([101, "raw(51)"])).unwrap();
         let funding_hash: BlockHash = hashes[0].as_str().unwrap().parse().unwrap();
         let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
@@ -16479,6 +16505,18 @@ mod tests {
             json!({})
         );
         assert!(node.mempool.read().get(&txid).is_some());
+
+        let missing_error = dispatch_method(
+            &node,
+            "importmempool",
+            &json!([directory.path().join("missing.dat").to_string_lossy()]),
+        )
+        .unwrap_err();
+        assert!(
+            missing_error
+                .to_string()
+                .contains("Unable to import mempool file")
+        );
     }
 
     #[test]

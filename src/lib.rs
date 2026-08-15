@@ -668,7 +668,16 @@ impl Node {
                         .then_some(legacy_mempool_path.as_path())
                 });
             if let Some(load_path) = load_path {
-                mempool.load_from_file_with_expiry(load_path, &chain, expiry)?;
+                if let Err(error) = mempool.load_from_file_with_expiry(load_path, &chain, expiry) {
+                    // Core treats a failed startup mempool load as non-fatal.  Keep any
+                    // entries that were admitted before a malformed record and continue
+                    // bringing up the node; importmempool remains strict for RPC callers.
+                    warn!(
+                        %error,
+                        path = %load_path.display(),
+                        "failed to load persisted mempool; continuing without it"
+                    );
+                }
             }
         }
         let _ = mempool.take_changes();
@@ -2676,6 +2685,10 @@ impl Node {
         path: impl AsRef<Path>,
         options: MempoolLoadOptions,
     ) -> Result<()> {
+        let path = path.as_ref();
+        if !path.exists() {
+            bail!("mempool file {} does not exist", path.display());
+        }
         let chain = self.chain.read();
         let (result, changed, changes) = {
             let mut mempool = self.mempool.write();
@@ -2685,12 +2698,8 @@ impl Node {
                 .collect::<HashSet<_>>();
             let expiry =
                 Duration::from_secs(self.config.mempool_expiry_hours.saturating_mul(60 * 60));
-            let result = mempool.load_from_file_with_expiry_and_options(
-                path.as_ref(),
-                &chain,
-                expiry,
-                options,
-            );
+            let result =
+                mempool.load_from_file_with_expiry_and_options(path, &chain, expiry, options);
             let after = mempool
                 .transaction_order()
                 .into_iter()
@@ -2971,6 +2980,16 @@ mod tests {
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         }
+    }
+
+    #[test]
+    fn corrupt_startup_mempool_does_not_abort_node_open() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("mempool.dat"), b"not a mempool dump").unwrap();
+
+        let node = Node::open(test_config(directory.path())).unwrap();
+
+        assert!(node.mempool.read().is_empty());
     }
 
     fn private_broadcast_test_transaction(node: &Arc<Node>) -> Transaction {

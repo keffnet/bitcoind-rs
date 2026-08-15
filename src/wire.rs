@@ -137,11 +137,25 @@ impl VersionMessage {
     }
 
     pub fn with_bloom(start_height: i32, nonce: u64, bloom_filters: bool) -> Self {
+        Self::with_bloom_and_comments(start_height, nonce, bloom_filters, &[])
+    }
+
+    pub fn with_bloom_and_comments(
+        start_height: i32,
+        nonce: u64,
+        bloom_filters: bool,
+        comments: &[String],
+    ) -> Self {
         let services = NODE_NETWORK
             | NODE_WITNESS
             | NODE_COMPACT_FILTERS
             | NODE_P2P_V2
             | if bloom_filters { NODE_BLOOM } else { 0 };
+        let user_agent = if comments.is_empty() {
+            "/bitcoind-rs:0.1.0/".to_owned()
+        } else {
+            format!("/bitcoind-rs:0.1.0({})/", comments.join("; "))
+        };
         Self {
             version: Self::PROTOCOL_VERSION,
             services,
@@ -153,7 +167,7 @@ impl VersionMessage {
             sender_address: [0; 16],
             sender_port: 0,
             nonce,
-            user_agent: "/bitcoind-rs:0.1.0/".to_owned(),
+            user_agent,
             start_height,
             relay: true,
         }
@@ -1041,6 +1055,22 @@ mod tests {
         let message = Message::Version(VersionMessage::new(12, 99));
         let frame = encode_message(Network::Bitcoin, &message).unwrap();
         assert_eq!(decode_message(Network::Bitcoin, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn version_user_agent_comments_follow_bip14_format() {
+        let message = VersionMessage::with_bloom_and_comments(
+            12,
+            99,
+            false,
+            &["lab".to_owned(), "operator".to_owned()],
+        );
+        assert_eq!(message.user_agent, "/bitcoind-rs:0.1.0(lab; operator)/");
+        let frame = encode_message(Network::Bitcoin, &Message::Version(message.clone())).unwrap();
+        assert_eq!(
+            decode_message(Network::Bitcoin, &frame).unwrap(),
+            Message::Version(message)
+        );
     }
 
     #[test]

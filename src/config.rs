@@ -39,6 +39,7 @@ pub const DEFAULT_RPC_SERVER_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_SCRIPT_CHECK_THREADS: i32 = 0;
 pub const MAX_SCRIPT_CHECK_THREADS: usize = 15;
+pub const MAX_SUBVERSION_LENGTH: usize = 256;
 
 #[derive(Clone, Debug)]
 pub struct ZmqConfig {
@@ -611,6 +612,18 @@ pub struct Args {
     /// values leave that many cores available to the rest of the node.
     #[arg(long = "par", default_value_t = DEFAULT_SCRIPT_CHECK_THREADS)]
     pub script_check_threads: i32,
+
+    #[arg(long = "uacomment", value_name = "COMMENT")]
+    pub user_agent_comments: Vec<String>,
+
+    #[arg(long = "startupnotify", value_name = "COMMAND")]
+    pub startup_notify: Option<String>,
+
+    #[arg(long = "blocknotify", value_name = "COMMAND")]
+    pub block_notify: Option<String>,
+
+    #[arg(long = "shutdownnotify", value_name = "COMMAND")]
+    pub shutdown_notify: Option<String>,
 
     #[arg(long = "stopatheight", default_value_t = 0)]
     pub stop_at_height: u32,
@@ -1309,6 +1322,10 @@ pub struct Config {
     pub(crate) check_blocks: Option<u32>,
     pub(crate) check_level: Option<u8>,
     pub script_check_threads: i32,
+    pub user_agent_comments: Vec<String>,
+    pub startup_notify: Option<String>,
+    pub block_notify: Option<String>,
+    pub shutdown_notify: Option<String>,
     pub stop_at_height: u32,
     pub(crate) max_tip_age_secs: u64,
     pub p2p_bind: SocketAddr,
@@ -1686,6 +1703,26 @@ impl Config {
             primary_p2p_bind.port()
         };
         let external_addresses = parse_external_addresses(&args.externalip, external_port)?;
+        let user_agent_comments = args.user_agent_comments.clone();
+        if let Some(comment) = user_agent_comments.iter().find(|comment| {
+            !comment.chars().all(|character| {
+                character.is_ascii_alphanumeric() || " .,;-_?@".contains(character)
+            })
+        }) {
+            bail!("user agent comment contains unsafe characters: {comment}");
+        }
+        let comments = user_agent_comments.join("; ");
+        let user_agent_length = "/bitcoind-rs:0.1.0/".len()
+            + if user_agent_comments.is_empty() {
+                0
+            } else {
+                comments.len() + 2
+            };
+        if user_agent_length > MAX_SUBVERSION_LENGTH {
+            bail!(
+                "total user agent length {user_agent_length} exceeds maximum {MAX_SUBVERSION_LENGTH}"
+            );
+        }
         std::fs::create_dir_all(&args.datadir)
             .with_context(|| format!("creating data directory {}", args.datadir.display()))?;
         Ok(Self {
@@ -1697,6 +1734,10 @@ impl Config {
             check_blocks: args.check_blocks,
             check_level: args.check_level,
             script_check_threads: args.script_check_threads,
+            user_agent_comments,
+            startup_notify: args.startup_notify,
+            block_notify: args.block_notify,
+            shutdown_notify: args.shutdown_notify,
             stop_at_height: args.stop_at_height,
             max_tip_age_secs: args.max_tip_age,
             p2p_bind: primary_p2p_bind,
@@ -2130,6 +2171,10 @@ mod tests {
             "--blocksonly=1",
             "--onlynet=ipv4",
             "--proxy=127.0.0.1:9050",
+            "--uacomment=lab",
+            "--startupnotify=echo start",
+            "--blocknotify=echo %s",
+            "--shutdownnotify=echo stop",
         ])
         .unwrap();
         let config = Config::from_args(args).unwrap();
@@ -2139,6 +2184,10 @@ mod tests {
         assert_eq!(config.max_mempool_mb, DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB);
         assert_eq!(config.onlynet, vec![OnlyNet::Ipv4]);
         assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
+        assert_eq!(config.user_agent_comments, vec!["lab".to_owned()]);
+        assert_eq!(config.startup_notify.as_deref(), Some("echo start"));
+        assert_eq!(config.block_notify.as_deref(), Some("echo %s"));
+        assert_eq!(config.shutdown_notify.as_deref(), Some("echo stop"));
         assert!(config.proxy_randomize);
         assert!(config.v2_transport);
         assert!(config.allows_address("192.0.2.1:8333".parse().unwrap()));
@@ -2263,6 +2312,9 @@ mod tests {
             "--checklevel=5",
         ])
         .unwrap();
+        assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--uacomment=unsafe!"]).unwrap();
         assert!(Config::from_args(args).is_err());
 
         for network in ["onion", "i2p"] {

@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
+use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -58,6 +59,30 @@ const MAX_UPLOAD_BLOCK_RESERVE_BYTES: u64 = 4_000_000;
 const HISTORICAL_BLOCK_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 pub(crate) const PRIVATE_BROADCAST_PEERS_PER_TRANSACTION: usize = 3;
 pub(crate) const PRIVATE_BROADCAST_RETRY_SECS: u64 = 60;
+
+fn expand_notify_command(command: &str, argument: Option<&str>) -> String {
+    command.replace("%s", argument.unwrap_or_default())
+}
+
+fn run_notify_command(command: Option<&str>, argument: Option<&str>) {
+    let Some(command) = command else {
+        return;
+    };
+    let expanded = expand_notify_command(command, argument);
+    let result = {
+        #[cfg(windows)]
+        {
+            Command::new("cmd").args(["/C", &expanded]).spawn()
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("sh").args(["-c", &expanded]).spawn()
+        }
+    };
+    if let Err(error) = result {
+        warn!(%error, command = %expanded, "notification command could not be started");
+    }
+}
 
 fn core_block_download_timeout(
     block_interval: Duration,
@@ -908,6 +933,10 @@ impl Node {
         }
         if self.config.stop_at_height != 0 && tip.height >= self.config.stop_at_height {
             self.request_shutdown();
+        }
+        if tip.hash != previous_tip {
+            let hash = tip.hash.to_string();
+            run_notify_command(self.config.block_notify.as_deref(), Some(&hash));
         }
         Ok(tip)
     }
@@ -3028,6 +3057,7 @@ impl Node {
         let mut p2p_task = tokio::spawn(p2p.run());
         let mut rpc_task = tokio::spawn(rpc.run());
         let mut electrum_task = tokio::spawn(electrum.run());
+        run_notify_command(self.config.startup_notify.as_deref(), None);
         let background_node = self.clone();
         let background_validation_task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -3081,6 +3111,7 @@ impl Node {
         zmq_task.abort();
         background_validation_task.abort();
         mempool_expiry_task.abort();
+        run_notify_command(self.config.shutdown_notify.as_deref(), None);
         if self.config.persist_mempool {
             self.persist_mempool()?;
         }
@@ -3412,6 +3443,15 @@ mod tests {
     use bitcoin::hashes::Hash;
     use clap::Parser;
 
+    #[test]
+    fn notification_commands_expand_tip_hash_placeholders() {
+        assert_eq!(
+            expand_notify_command("echo %s >> /tmp/tips", Some("abc123")),
+            "echo abc123 >> /tmp/tips"
+        );
+        assert_eq!(expand_notify_command("echo ready", None), "echo ready");
+    }
+
     fn test_config(datadir: &Path) -> Config {
         Config {
             network: bitcoin::Network::Regtest,
@@ -3435,6 +3475,10 @@ mod tests {
             rpc_threads: 16,
             rpc_work_queue: 64,
             script_check_threads: 0,
+            user_agent_comments: Vec::new(),
+            startup_notify: None,
+            block_notify: None,
+            shutdown_notify: None,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
             electrum_bind: None,

@@ -32,7 +32,7 @@ The node never creates, imports, or stores private keys. A private extended key 
 cargo run -- --network regtest --datadir ./data
 ```
 
-The default configuration listens on the selected network’s loopback P2P and JSON-RPC ports (`8333`/`8332` on mainnet, `18333`/`18332` on testnet, `48333`/`48332` on testnet4, `38333`/`38332` on signet, and `18444`/`18443` on regtest), with Electrum on `127.0.0.1:30001`. `--port` changes the default loopback P2P port; explicit `--p2p` and `--rpc` values override these defaults.
+The default configuration listens on the selected network’s loopback P2P and JSON-RPC ports (`8333`/`8332` on mainnet, `18333`/`18332` on testnet, `48333`/`48332` on testnet4, `38333`/`38332` on signet, and `18444`/`18443` on regtest), with Electrum on `127.0.0.1:30001`. `--port` changes the default loopback P2P port and `--rpcport` changes the default loopback RPC port; explicit `--p2p` and `--rpc` values override these defaults.
 
 JSON-RPC uses the standard cookie file at `<datadir>/.cookie`; clients should send it as HTTP Basic authentication (`curl --user "$(cat data/.cookie)" ...`).
 

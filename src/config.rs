@@ -518,6 +518,9 @@ pub struct Args {
     #[arg(long)]
     pub rpc: Option<SocketAddr>,
 
+    #[arg(long = "rpcport", value_name = "PORT")]
+    pub rpc_port: Option<u16>,
+
     #[arg(long, default_value = "127.0.0.1:30001")]
     pub electrum: SocketAddr,
 
@@ -906,9 +909,18 @@ impl Config {
         } else {
             args.bind.clone()
         };
-        let rpc = args
-            .rpc
-            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], default_rpc_port(network))));
+        let rpc = args.rpc.unwrap_or_else(|| {
+            SocketAddr::from((
+                [127, 0, 0, 1],
+                args.rpc_port.unwrap_or_else(|| default_rpc_port(network)),
+            ))
+        });
+        if args.rpc.is_some() && args.rpc_port.is_some() {
+            bail!("--rpc cannot be combined with --rpcport");
+        }
+        if args.rpc_port == Some(0) {
+            bail!("--rpcport must use a non-zero port");
+        }
         if args.peertimeout == 0 {
             bail!("--peertimeout must be greater than zero");
         }
@@ -1561,6 +1573,28 @@ mod tests {
             Config::from_args(args).unwrap().p2p_bind,
             "127.0.0.1:18445".parse().unwrap()
         );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--rpcport=18446",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().rpc_bind,
+            Some("127.0.0.1:18446".parse().unwrap())
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--rpcport=0",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

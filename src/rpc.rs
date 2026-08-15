@@ -10409,11 +10409,14 @@ fn get_mempool_relationship(node: &Arc<Node>, params: &Value, ancestors: bool) -
     if mempool.get(&txid).is_none() {
         bail!("Transaction not in mempool");
     }
-    let related = if ancestors {
+    let mut related = if ancestors {
         mempool.ancestors(&txid)
     } else {
         mempool.descendants(&txid)
     };
+    // Core's CalculateMemPoolAncestors/CalculateDescendants return setEntries,
+    // which is ordered by the raw transaction hash rather than mining order.
+    related.sort_unstable();
     if verbose {
         let mut result = serde_json::Map::new();
         for related_txid in related {
@@ -10650,8 +10653,12 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
         .into_iter()
         .map(|parent| parent.to_string())
         .collect::<Vec<_>>();
-    let children = mempool
-        .children(txid)
+    let mut children = mempool.children(txid).into_iter().collect::<Vec<_>>();
+    // Core's GetChildren sorts by the raw transaction hash. The public
+    // `children` helper keeps display ordering for graph traversal, so sort
+    // this RPC-only projection to match Core's spentby field.
+    children.sort_unstable();
+    let children = children
         .into_iter()
         .map(|child| child.to_string())
         .collect::<Vec<_>>();

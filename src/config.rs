@@ -115,7 +115,9 @@ fn normalize_address(address: &str) -> String {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum NetworkName {
+    #[value(alias = "mainnet")]
     Bitcoin,
+    #[value(alias = "test", alias = "testnet3")]
     Testnet,
     Testnet4,
     Signet,
@@ -2152,6 +2154,9 @@ mod tests {
 
         let args = Args::try_parse_from(["bitcoind-rs", "--peerbloomfilters"]).unwrap();
         assert!(Config::from_args(args).unwrap().peer_bloom_filters);
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--network=testnet3"]).unwrap();
+        assert_eq!(Config::from_args(args).unwrap().network, Network::Testnet);
 
         let args = Args::try_parse_from(["bitcoind-rs", "--network=regtest", "--testnet"]).unwrap();
         assert!(Config::from_args(args).is_err());

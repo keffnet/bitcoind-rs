@@ -36,6 +36,8 @@ Automatic Tor onion listening is enabled whenever P2P listening is active. Disab
 cargo run -- --network regtest --datadir ./data
 ```
 
+The command-line parser accepts both Core's single-dash long options (for example `-regtest` and `-rpcport=18443`) and the GNU-style `--regtest`/`--rpcport=18443` spelling. `--version` (or `-version`) reports the v31.1 compatibility release.
+
 The default configuration listens on the selected network’s loopback P2P and JSON-RPC ports (`8333`/`8332` on mainnet, `18333`/`18332` on testnet, `48333`/`48332` on testnet4, `38333`/`38332` on signet, and `18444`/`18443` on regtest), with Electrum on `127.0.0.1:30001`. Select a network with `--network=<name>` or Core-compatible `--mainnet`, `--testnet`, `--testnet4`, `--signet`, or `--regtest` aliases. `--port` changes the default loopback P2P port and `--rpcport` changes the default loopback RPC port; explicit `--p2p` and `--rpc` values override these defaults. Repeatable comma-delimited `--bind` and `--rpcbind` options expose multiple P2P or RPC listeners. As in Core, `--rpcbind` is honored only when at least one `--rpcallowip` rule is supplied; its port is optional and otherwise inherits `--rpcport`.
 
 The default read-only configuration file is `<datadir>/bitcoin.conf`; use `--conf=<path>` for another file or `--noconf` to suppress config-file loading. Options are written as `name=value`, may be grouped under `[main]`, `[testnet]`, `[testnet4]`, `[signet]`, or `[regtest]`, and may include another file with `includeconf=<path>`. Command-line options take precedence.

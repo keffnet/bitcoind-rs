@@ -538,7 +538,7 @@ impl From<NetworkName> for Network {
 #[derive(Parser, Debug)]
 #[command(
     name = "bitcoind-rs",
-    version,
+    version = "31.1.0",
     about = "Wallet-free Bitcoin node and Electrum server",
     args_override_self = true
 )]
@@ -1243,7 +1243,11 @@ impl Args {
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        let raw = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        let raw = args
+            .into_iter()
+            .map(Into::into)
+            .map(normalize_core_style_argument)
+            .collect::<Vec<_>>();
         let datadir = raw_option_value(&raw, "datadir")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("./data"));
@@ -1327,6 +1331,26 @@ impl Args {
         merged.extend(raw.into_iter().skip(1));
         Ok(Self::try_parse_from(merged)?)
     }
+}
+
+/// Core uses a single dash for long options (for example, `-regtest` and
+/// `-rpcport=18443`).  Clap's long-option spelling is deliberately retained
+/// for help output and config-file generated arguments, but normalize the
+/// command-line form at the boundary so both conventions work.  Short help,
+/// version, and numeric values remain untouched.
+fn normalize_core_style_argument(argument: OsString) -> OsString {
+    let Some(value) = argument.to_str() else {
+        return argument;
+    };
+    if value.len() <= 2
+        || !value.starts_with('-')
+        || value.starts_with("--")
+        || matches!(value, "-h" | "-V")
+        || value.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
+    {
+        return argument;
+    }
+    OsString::from(format!("--{}", &value[1..]))
 }
 
 fn raw_option_value(args: &[OsString], name: &str) -> Option<String> {
@@ -2394,6 +2418,8 @@ fn parse_byte_units(value: &str, default_multiplier: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use clap::CommandFactory;
+
     use super::*;
 
     #[test]
@@ -3409,6 +3435,27 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+    }
+
+    #[test]
+    fn core_single_dash_long_options_are_normalized() {
+        let directory = tempfile::tempdir().unwrap();
+        let args = Args::parse_from_with_config([
+            "bitcoind-rs",
+            "-datadir",
+            directory.path().to_str().unwrap(),
+            "-regtest",
+            "-maxconnections=7",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(config.network, Network::Regtest);
+        assert_eq!(config.max_peers, 7);
+    }
+
+    #[test]
+    fn core_release_version_is_exposed_by_clap() {
+        assert_eq!(Args::command().get_version(), Some("31.1.0"));
     }
 
     #[test]

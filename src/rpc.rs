@@ -10847,8 +10847,11 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.starts_with("too many positional arguments ")
         || lower.starts_with("unknown named parameter ")
         || lower == "block is not in main chain"
+        || lower == "block height out of range"
+        || lower == "block does not exist at specified height"
         || lower.starts_with("invalid block count:")
         || lower.starts_with("invalid blockhash:")
+        || lower.starts_with("invalid nblocks.")
         || lower.contains("specified more than once")
         || lower.contains("must be between ")
         || lower.contains("must not be negative")
@@ -11084,6 +11087,15 @@ mod tests {
         assert_eq!(rpc_error_code("mode must be a string"), -3);
         assert_eq!(rpc_error_code("TX decode failed"), -22);
         assert_eq!(rpc_error_code("Block not found"), -5);
+        assert_eq!(rpc_error_code("Block height out of range"), -8);
+        assert_eq!(
+            rpc_error_code("Block does not exist at specified height"),
+            -8
+        );
+        assert_eq!(
+            rpc_error_code("Invalid nblocks. Must be a positive number or -1."),
+            -8
+        );
         assert_eq!(rpc_error_code("Unknown filtertype"), -5);
         assert_eq!(
             rpc_error_code("Index is not enabled for filtertype basic"),

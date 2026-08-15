@@ -1404,7 +1404,7 @@ async fn run_inbound_listener(
             Some(permissions) => node.is_banned_for_permissions(address, permissions),
             None => node.is_banned_for_peer(address, true),
         };
-        if !node.network_active() || banned || !node.config.allows_address(address) {
+        if !node.network_active() || banned {
             continue;
         }
         let node = node.clone();

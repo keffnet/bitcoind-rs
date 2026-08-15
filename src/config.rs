@@ -511,6 +511,9 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub connect: Vec<String>,
 
+    #[arg(long = "addnode", value_delimiter = ',')]
+    pub addnode: Vec<String>,
+
     #[arg(
         long = "noconnect",
         default_value_t = false,
@@ -768,6 +771,7 @@ pub struct Config {
     pub rest: bool,
     pub seed_nodes: Vec<NetworkEndpoint>,
     pub connect_disabled: bool,
+    pub add_nodes: Vec<NetworkEndpoint>,
     pub dnsseed: bool,
     pub onlynet: Vec<OnlyNet>,
     pub proxy: Option<SocketAddr>,
@@ -981,11 +985,10 @@ impl Config {
             .connect
             .iter()
             .filter(|value| !connect_disabled || value.as_str() != "0")
-            .map(|value| {
-                NetworkEndpoint::parse_manual(value, default_p2p_port(network))
-                    .with_context(|| format!("parsing --connect address '{value}'"))
-            })
-            .collect::<Result<Vec<_>>>()?;
+            .cloned()
+            .collect::<Vec<_>>();
+        let seed_nodes = parse_manual_endpoints(&seed_nodes, network, "connect")?;
+        let add_nodes = parse_manual_endpoints(&args.addnode, network, "addnode")?;
         std::fs::create_dir_all(&args.datadir)
             .with_context(|| format!("creating data directory {}", args.datadir.display()))?;
         Ok(Self {
@@ -998,6 +1001,7 @@ impl Config {
             rest: args.rest,
             seed_nodes,
             connect_disabled,
+            add_nodes,
             dnsseed,
             onlynet: args.onlynet,
             proxy: args.proxy,
@@ -1079,6 +1083,20 @@ pub(crate) fn default_p2p_port(network: Network) -> u16 {
         Network::Signet => 38333,
         Network::Regtest => 18444,
     }
+}
+
+fn parse_manual_endpoints(
+    values: &[String],
+    network: Network,
+    option: &str,
+) -> Result<Vec<NetworkEndpoint>> {
+    values
+        .iter()
+        .map(|value| {
+            NetworkEndpoint::parse_manual(value, default_p2p_port(network))
+                .with_context(|| format!("parsing --{option} address '{value}'"))
+        })
+        .collect()
 }
 
 fn parse_fee_rate(value: Option<&str>, default: &str, name: &str) -> Result<u64> {
@@ -1313,6 +1331,25 @@ mod tests {
                 NetworkEndpoint::from_socket("192.0.2.1:18444".parse().unwrap()),
             ]
         );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
+            "--addnode=example.invalid,192.0.2.2",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.add_nodes,
+            vec![
+                NetworkEndpoint::dns("example.invalid".to_owned(), 18444).unwrap(),
+                NetworkEndpoint::from_socket("192.0.2.2:18444".parse().unwrap()),
+            ]
+        );
+        assert!(config.listen);
+        assert!(config.dnsseed);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

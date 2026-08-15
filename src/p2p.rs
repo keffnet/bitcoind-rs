@@ -1251,8 +1251,9 @@ impl PeerManager {
                 .await;
             }
         });
-        let configured_seed_nodes = !self.node.config.seed_nodes.is_empty();
-        let seed_nodes = if !configured_seed_nodes && self.node.config.dnsseed {
+        let configured_connect_nodes =
+            self.node.config.connect_disabled || !self.node.config.seed_nodes.is_empty();
+        let connect_nodes = if !configured_connect_nodes && self.node.config.dnsseed {
             let addresses = discover_dns_seeds(self.node.config.network).await;
             for address in &addresses {
                 if self.node.config.allows_address(*address) {
@@ -1267,11 +1268,15 @@ impl PeerManager {
         } else {
             self.node.config.seed_nodes.clone()
         };
-        for endpoint in seed_nodes {
-            if !self.node.config.allows_network_endpoint(&endpoint) {
-                debug!(endpoint = %endpoint, "skipping peer outside onlynet policy");
-                continue;
-            }
+        let manual_nodes = self
+            .node
+            .config
+            .add_nodes
+            .iter()
+            .cloned()
+            .chain(connect_nodes)
+            .collect::<Vec<_>>();
+        for endpoint in manual_nodes {
             self.node.ensure_node_endpoint_added(endpoint.clone());
             spawn_outbound_loop(
                 self.node.clone(),
@@ -1285,7 +1290,7 @@ impl PeerManager {
         }
         let discovery_node = self.node.clone();
         let discovery_outbound = outbound.clone();
-        if !configured_seed_nodes && !self.node.config.connect_disabled {
+        if !configured_connect_nodes {
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(30));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -4772,6 +4777,7 @@ mod tests {
                 .map(NetworkEndpoint::from_socket)
                 .collect(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             dnsseed: false,
             onlynet: Vec::new(),
             proxy: private_broadcast.then(|| "127.0.0.1:9050".parse().unwrap()),
@@ -5330,6 +5336,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -5472,6 +5479,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -5870,6 +5878,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
             max_upload_target: 0,
@@ -5996,6 +6005,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6128,6 +6138,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6350,6 +6361,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6448,6 +6460,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,
@@ -6528,6 +6541,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
             max_upload_target: 0,
@@ -6600,6 +6614,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 4,
             max_upload_target: 0,
@@ -6734,6 +6749,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,

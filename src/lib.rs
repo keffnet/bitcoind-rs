@@ -668,12 +668,14 @@ impl Node {
         let added_nodes = config
             .seed_nodes
             .iter()
+            .chain(config.add_nodes.iter())
             .cloned()
             .map(|endpoint| (endpoint, None))
             .collect();
         let added_node_names = config
             .seed_nodes
             .iter()
+            .chain(config.add_nodes.iter())
             .cloned()
             .map(|endpoint| {
                 let name = endpoint.to_string();
@@ -3322,6 +3324,7 @@ mod tests {
             persist_mempool_v1: false,
             seed_nodes: Vec::new(),
             connect_disabled: false,
+            add_nodes: Vec::new(),
             signet_challenge: None,
             max_peers: 1,
             max_upload_target: 0,

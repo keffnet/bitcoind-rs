@@ -9434,6 +9434,9 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 .map(|_| transaction.compute_txid())
         })
         .collect::<HashSet<_>>();
+    let package_rbf = transactions.len() == 2
+        && package_is_child_with_parents_tree(&transactions)
+        && preexisting.is_empty();
     let mut results = serde_json::Map::new();
     if let Err(error) = candidate.accept_package(&transactions, &chain) {
         // submitpackage exposes the detailed validation error in each
@@ -9451,7 +9454,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
             );
         }
         return Ok(json!({
-            "package_msg": "transaction failed",
+            "package_msg": submit_package_failure_message(&error, package_rbf),
             "tx-results": results,
             "replaced-transactions": [],
         }));
@@ -9522,6 +9525,21 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         "tx-results": results,
         "replaced-transactions": replaced_transactions,
     }))
+}
+
+fn submit_package_failure_message(error: &MempoolError, package_rbf: bool) -> &'static str {
+    if !package_rbf {
+        return "transaction failed";
+    }
+    match error {
+        MempoolError::ReplacementFeerateDiagram => {
+            "package RBF failed: insufficient feerate: does not improve feerate diagram"
+        }
+        MempoolError::ReplacementUnconfirmedInput => {
+            "package RBF failed: new transaction cannot have mempool ancestors"
+        }
+        _ => "transaction failed",
+    }
 }
 
 fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -16439,6 +16457,22 @@ mod tests {
         };
         assert!(package_weight(std::slice::from_ref(&transaction)) > MAX_PACKAGE_WEIGHT);
         assert_eq!(package_policy_error(&[transaction]), None);
+    }
+
+    #[test]
+    fn submit_package_preserves_core_rbf_failure_messages() {
+        assert_eq!(
+            submit_package_failure_message(&MempoolError::ReplacementFeerateDiagram, true),
+            "package RBF failed: insufficient feerate: does not improve feerate diagram"
+        );
+        assert_eq!(
+            submit_package_failure_message(&MempoolError::ReplacementUnconfirmedInput, true),
+            "package RBF failed: new transaction cannot have mempool ancestors"
+        );
+        assert_eq!(
+            submit_package_failure_message(&MempoolError::ReplacementFeerateDiagram, false),
+            "transaction failed"
+        );
     }
 
     #[test]

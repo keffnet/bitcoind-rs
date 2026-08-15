@@ -873,7 +873,7 @@ pub struct Args {
     )]
     pub permitbaremultisig: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, visible_alias = "peerbloomfilters", default_value_t = false)]
     pub peer_bloom_filters: bool,
 
     #[arg(
@@ -2134,6 +2134,9 @@ mod tests {
 
         let args = Args::try_parse_from(["bitcoind-rs", "--regtest"]).unwrap();
         assert_eq!(Config::from_args(args).unwrap().network, Network::Regtest);
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--peerbloomfilters"]).unwrap();
+        assert!(Config::from_args(args).unwrap().peer_bloom_filters);
 
         let args = Args::try_parse_from(["bitcoind-rs", "--network=regtest", "--testnet"]).unwrap();
         assert!(Config::from_args(args).is_err());

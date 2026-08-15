@@ -9152,6 +9152,9 @@ fn mempool_reject_reason(error: &MempoolError) -> String {
         MempoolError::TooManyReplacementCandidates { .. } => {
             "too many potential replacements".to_owned()
         }
+        MempoolError::ReplacementFeerateDiagram => {
+            "insufficient feerate: does not improve feerate diagram".to_owned()
+        }
         MempoolError::MissingInput(_) => "missing-inputs".to_owned(),
         MempoolError::FeeRate => "mempool min fee not met".to_owned(),
         MempoolError::NonStandard(reason) => reason.clone(),

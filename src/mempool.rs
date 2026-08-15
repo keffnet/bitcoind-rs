@@ -394,6 +394,8 @@ pub enum MempoolError {
     ReplacementFee,
     #[error("replacement transaction spends an unconfirmed output outside the conflicts")]
     ReplacementUnconfirmedInput,
+    #[error("insufficient feerate: does not improve feerate diagram")]
+    ReplacementFeerateDiagram,
     #[error("transaction {0} input is missing")]
     MissingInput(OutPoint),
     #[error("transaction contains a duplicate input")]
@@ -1087,6 +1089,7 @@ impl Mempool {
         let package_rbf =
             transactions.len() == 2 && allow_low_fee_parent && !package_has_preexisting;
         let mut conflicting_fee = 0i128;
+        let mut package_replaced = false;
         if package_rbf {
             let mut direct_conflicts = transactions
                 .iter()
@@ -1101,6 +1104,7 @@ impl Mempool {
                 )?;
             }
             if !direct_conflicts.is_empty() {
+                package_replaced = true;
                 let removal = candidate.conflicts_and_descendants(&direct_conflicts);
                 if transactions.iter().any(|transaction| {
                     transaction.input.iter().any(|input| {
@@ -1193,6 +1197,9 @@ impl Mempool {
             {
                 return Err(MempoolError::ReplacementFee);
             }
+        }
+        if package_rbf && package_replaced && !self.improves_feerate_diagram(&candidate) {
+            return Err(MempoolError::ReplacementFeerateDiagram);
         }
         validate_ephemeral_spends(transactions, &candidate)?;
         *self = candidate;
@@ -1306,6 +1313,9 @@ impl Mempool {
                 }
             }
         }
+        if !self.improves_feerate_diagram(&candidate) {
+            return Err(MempoolError::ReplacementFeerateDiagram);
+        }
         *self = candidate;
         Ok(txid)
     }
@@ -1373,6 +1383,26 @@ impl Mempool {
             }
         }
         clusters
+    }
+
+    fn feerate_diagram(&self) -> Vec<(i128, u64)> {
+        let mut chunks = Vec::new();
+        for txid in self.mining_order(u64::MAX, 0) {
+            let Some(entry) = self.entries.get(&txid) else {
+                continue;
+            };
+            append_feerate_chunk(
+                &mut chunks,
+                self.modified_fee_sat(&txid, entry.fee_sat),
+                entry.transaction.weight().to_wu(),
+            );
+        }
+        chunks
+    }
+
+    fn improves_feerate_diagram(&self, candidate: &Self) -> bool {
+        compare_fee_rate_diagrams(&candidate.feerate_diagram(), &self.feerate_diagram())
+            == Some(Ordering::Greater)
     }
 
     fn truc_sibling_for(&self, transaction: &Transaction) -> Option<Txid> {
@@ -2043,6 +2073,113 @@ fn fee_rate_from_package(fee_sat: i128, vsize: u64) -> u64 {
 
 fn fee_for_rate(fee_rate_sat_per_kvb: u64, vsize: u64) -> i128 {
     (i128::from(fee_rate_sat_per_kvb) * i128::from(vsize) + 999) / 1_000
+}
+
+fn append_feerate_chunk(chunks: &mut Vec<(i128, u64)>, fee: i128, size: u64) {
+    if size == 0 {
+        return;
+    }
+    chunks.push((fee, size));
+    while chunks.len() >= 2 {
+        let right = chunks.len() - 1;
+        let left = right - 1;
+        let should_merge = compare_fee_rate(
+            chunks[left].0,
+            chunks[left].1,
+            chunks[right].0,
+            chunks[right].1,
+        ) == Ordering::Less;
+        if !should_merge {
+            break;
+        }
+        let (right_fee, right_size) = chunks.pop().expect("right feerate chunk exists");
+        let left = chunks.last_mut().expect("left feerate chunk exists");
+        left.0 = left.0.saturating_add(right_fee);
+        left.1 = left.1.saturating_add(right_size);
+    }
+}
+
+fn compare_fee_rate(left_fee: i128, left_size: u64, right_fee: i128, right_size: u64) -> Ordering {
+    if left_size == 0 || right_size == 0 {
+        return left_size.cmp(&right_size);
+    }
+    left_fee
+        .saturating_mul(i128::from(right_size))
+        .cmp(&right_fee.saturating_mul(i128::from(left_size)))
+}
+
+/// Compare the convexified fee-rate diagrams represented by sorted chunks.
+/// `Greater` means the left diagram is strictly better, `Less` means the
+/// right diagram is strictly better, and `None` means the diagrams cross.
+fn compare_fee_rate_diagrams(left: &[(i128, u64)], right: &[(i128, u64)]) -> Option<Ordering> {
+    let diagrams = [left, right];
+    let mut next = [0usize; 2];
+    let mut accumulated_fee = [0i128; 2];
+    let mut accumulated_size = [0u64; 2];
+    let mut better = [false; 2];
+
+    loop {
+        let done = [next[0] == diagrams[0].len(), next[1] == diagrams[1].len()];
+        if done[0] && done[1] {
+            break;
+        }
+
+        let side = if done[0] {
+            1
+        } else if done[1] {
+            0
+        } else {
+            let left_size = accumulated_size[0].saturating_add(diagrams[0][next[0]].1);
+            let right_size = accumulated_size[1].saturating_add(diagrams[1][next[1]].1);
+            usize::from(left_size > right_size)
+        };
+        let other = 1 - side;
+        let point_fee = accumulated_fee[side].saturating_add(diagrams[side][next[side]].0);
+        let point_size = accumulated_size[side].saturating_add(diagrams[side][next[side]].1);
+        let previous_fee = accumulated_fee[other];
+        let previous_size = accumulated_size[other];
+        let slope_fee = point_fee.saturating_sub(previous_fee);
+        let slope_size = point_size.saturating_sub(previous_size);
+
+        let comparison = if done[other] {
+            compare_fee_rate(slope_fee, slope_size, 0, 1)
+        } else {
+            let next_fee = accumulated_fee[other].saturating_add(diagrams[other][next[other]].0);
+            let next_size = accumulated_size[other].saturating_add(diagrams[other][next[other]].1);
+            if next_size == point_size {
+                accumulated_fee[other] = next_fee;
+                accumulated_size[other] = next_size;
+                next[other] += 1;
+            }
+            compare_fee_rate(
+                slope_fee,
+                slope_size,
+                next_fee.saturating_sub(previous_fee),
+                next_size.saturating_sub(previous_size),
+            )
+        };
+
+        if comparison == Ordering::Greater {
+            better[side] = true;
+        } else if comparison == Ordering::Less {
+            better[other] = true;
+        }
+        if better[0] && better[1] {
+            return None;
+        }
+
+        accumulated_fee[side] = point_fee;
+        accumulated_size[side] = point_size;
+        next[side] += 1;
+    }
+
+    if better[0] == better[1] {
+        Some(Ordering::Equal)
+    } else if better[0] {
+        Some(Ordering::Greater)
+    } else {
+        Some(Ordering::Less)
+    }
 }
 
 #[cfg(test)]
@@ -3090,6 +3227,31 @@ mod tests {
         assert!(
             pool.check_replacement_cluster_limit(Txid::from_byte_array([204; 32]), &[child_id])
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn feerate_diagram_comparison_matches_core_ordering() {
+        let old = vec![(950, 300), (100, 100)];
+        let new = vec![(1_000, 300), (50, 100)];
+        assert_eq!(
+            compare_fee_rate_diagrams(&new, &old),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(compare_fee_rate_diagrams(&old, &new), Some(Ordering::Less));
+
+        let incomparable = vec![(750, 100), (249, 250), (151, 650)];
+        assert_eq!(compare_fee_rate_diagrams(&old, &incomparable), None);
+        assert_eq!(compare_fee_rate_diagrams(&incomparable, &old), None);
+
+        let smaller_tail = vec![(950, 300), (100, 99)];
+        assert_eq!(
+            compare_fee_rate_diagrams(&smaller_tail, &old),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            compare_fee_rate_diagrams(&old, &smaller_tail),
+            Some(Ordering::Less)
         );
     }
 

@@ -1,10 +1,16 @@
+use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use time::{OffsetDateTime, macros::format_description};
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::fmt::{
+    format::Writer,
+    time::FormatTime,
+    writer::{BoxMakeWriter, MakeWriterExt},
+};
 
 use bitcoind_rs::{
     Node,
@@ -17,7 +23,7 @@ async fn main() -> Result<()> {
     let node = Node::open(config)?;
     let _pid_file = PidFile::create(node.config.pid_path.clone())?;
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    if let Some(path) = node
+    let writer = if let Some(path) = node
         .config
         .debug_log_file_enabled
         .then_some(&node.config.debug_log_path)
@@ -33,31 +39,54 @@ async fn main() -> Result<()> {
             .open(path)
             .with_context(|| format!("Could not open debug log file {}", path.display()))?;
         if node.config.print_to_console {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .with_writer(std::io::stdout.and(file))
-                .init();
+            BoxMakeWriter::new(std::io::stdout.and(file))
         } else {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .with_writer(file)
-                .init();
+            BoxMakeWriter::new(file)
         }
     } else if node.config.print_to_console {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
+        BoxMakeWriter::new(std::io::stdout)
+    } else {
+        BoxMakeWriter::new(std::io::sink)
+    };
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_ansi(false)
+        .with_writer(writer)
+        .with_level(node.config.logging.level_always)
+        .with_thread_names(node.config.logging.thread_names)
+        .with_file(node.config.logging.source_locations)
+        .with_line_number(node.config.logging.source_locations);
+    if !node.config.logging.timestamps {
+        builder.without_time().init();
+    } else if node.config.logging.time_micros {
+        builder
+            .with_timer(CoreLogTimer { microseconds: true })
             .init();
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .with_writer(std::io::sink)
-            .init();
+        builder.init();
     }
     node.run().await
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CoreLogTimer {
+    microseconds: bool,
+}
+
+impl FormatTime for CoreLogTimer {
+    fn format_time(&self, writer: &mut Writer<'_>) -> fmt::Result {
+        let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+        let format = if self.microseconds {
+            format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:6]"
+            )
+        } else {
+            format_description!("[year]-[month]-[day] [hour]:[minute]:[second]")
+        };
+        let timestamp = now.format(format).map_err(|_| fmt::Error)?;
+        write!(writer, "{timestamp}")
+    }
 }
 
 #[derive(Debug)]

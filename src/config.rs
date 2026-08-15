@@ -659,6 +659,56 @@ pub struct Args {
     )]
     pub shrink_debug_file: bool,
 
+    /// Prepend log records with a wall-clock timestamp.
+    #[arg(
+        long = "logtimestamps",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub log_timestamps: bool,
+
+    /// Include microsecond precision in log timestamps.
+    #[arg(
+        long = "logtimemicros",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub log_time_micros: bool,
+
+    /// Prepend log records with the originating thread name.
+    #[arg(
+        long = "logthreadnames",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub log_thread_names: bool,
+
+    /// Include source file and line information in log records.
+    #[arg(
+        long = "logsourcelocations",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub log_source_locations: bool,
+
+    /// Always include the tracing severity level in log records.
+    #[arg(
+        long = "loglevelalways",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub log_level_always: bool,
+
     /// Optional Core ASMap file used for ASN-aware peer grouping.
     #[arg(
         long = "asmap",
@@ -1533,6 +1583,27 @@ fn config_entry_to_arg(entry: ConfigFileEntry) -> Option<OsString> {
 }
 
 #[derive(Clone, Debug)]
+pub struct LoggingConfig {
+    pub timestamps: bool,
+    pub time_micros: bool,
+    pub thread_names: bool,
+    pub source_locations: bool,
+    pub level_always: bool,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            timestamps: true,
+            time_micros: false,
+            thread_names: false,
+            source_locations: false,
+            level_always: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
@@ -1542,6 +1613,7 @@ pub struct Config {
     pub capture_messages: bool,
     pub debug_log_path: PathBuf,
     pub pid_path: PathBuf,
+    pub logging: LoggingConfig,
     pub debug_log_file_enabled: bool,
     pub print_to_console: bool,
     pub shrink_debug_file: bool,
@@ -2072,6 +2144,13 @@ impl Config {
             capture_messages: args.capture_messages,
             debug_log_path,
             pid_path,
+            logging: LoggingConfig {
+                timestamps: args.log_timestamps,
+                time_micros: args.log_time_micros,
+                thread_names: args.log_thread_names,
+                source_locations: args.log_source_locations,
+                level_always: args.log_level_always,
+            },
             debug_log_file_enabled: !args.no_debug_log_file,
             print_to_console: args.print_to_console,
             shrink_debug_file: args.shrink_debug_file,
@@ -2682,6 +2761,22 @@ mod tests {
             Config::from_args(args).unwrap().pid_path,
             directory.path().join("run/node.pid")
         );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--logtimestamps=false",
+            "--logtimemicros",
+            "--logthreadnames",
+            "--logsourcelocations",
+            "--loglevelalways",
+        ])
+        .unwrap();
+        let logging = Config::from_args(args).unwrap().logging;
+        assert!(!logging.timestamps);
+        assert!(logging.time_micros);
+        assert!(logging.thread_names);
+        assert!(logging.source_locations);
+        assert!(logging.level_always);
 
         assert!(Args::try_parse_from(["bitcoind-rs", "--pid="]).is_err());
 

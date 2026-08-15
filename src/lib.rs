@@ -1858,6 +1858,25 @@ impl Node {
         self.block_stalling_since.write().remove(&peer_id);
     }
 
+    fn clear_peer_block_requests_for_hash(&self, hash: BlockHash) {
+        let mut cleared_peers = Vec::new();
+        {
+            let mut peers = self.peers.write();
+            for (peer_id, peer) in peers.iter_mut() {
+                let before = peer.inflight_blocks.len();
+                peer.inflight_blocks
+                    .retain(|inflight| inflight.hash != hash);
+                if peer.inflight_blocks.len() != before {
+                    cleared_peers.push(*peer_id);
+                }
+            }
+        }
+        let mut stalling = self.block_stalling_since.write();
+        for peer_id in cleared_peers {
+            stalling.remove(&peer_id);
+        }
+    }
+
     pub(crate) fn record_pong(&self, peer_id: usize, nonce: u64) -> bool {
         let mut peers = self.peers.write();
         let Some(peer) = peers.get_mut(&peer_id) else {
@@ -2546,16 +2565,42 @@ impl Node {
     }
 
     pub fn request_block_from_peer(&self, peer_id: usize, hash: bitcoin::BlockHash) -> Result<()> {
+        {
+            let chain = self.chain.read();
+            let height = chain
+                .block_height_by_hash(&hash)
+                .ok_or_else(|| anyhow::anyhow!("Block header missing"))?;
+            if chain.is_pruned() && height > chain.height() {
+                bail!(
+                    "In prune mode, only blocks that the node has already synced previously can be fetched from a peer"
+                );
+            }
+            if chain.store.contains(&hash) {
+                bail!("Block already downloaded");
+            }
+        }
         let sender = self
             .peer_commands
             .read()
             .get(&peer_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("peer {peer_id} is not connected"))?;
-        sender
-            .send(p2p::PeerCommand::RequestBlock(hash))
-            .map_err(|_| anyhow::anyhow!("peer {peer_id} disconnected"))?;
-        self.track_peer_block_request(peer_id, hash);
+        if self
+            .peers
+            .read()
+            .get(&peer_id)
+            .is_some_and(|peer| peer.services & wire::NODE_WITNESS == 0)
+        {
+            bail!("Pre-SegWit peer");
+        }
+        self.clear_peer_block_requests_for_hash(hash);
+        if !self.track_peer_block_request(peer_id, hash) {
+            bail!("block request limit reached for peer {peer_id}");
+        }
+        if sender.send(p2p::PeerCommand::RequestBlock(hash)).is_err() {
+            self.clear_peer_block_request(peer_id, hash);
+            bail!("peer {peer_id} disconnected");
+        }
         Ok(())
     }
 

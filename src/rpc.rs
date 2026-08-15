@@ -14511,6 +14511,15 @@ mod tests {
             crate::config::PeerPermissions::FORCE_RELAY,
         );
         let genesis = node.chain.read().best_hash();
+        let header_only = generate_block(&node, &json!(["raw(51)", [], false])).unwrap();
+        let header_only_block: bitcoin::Block =
+            deserialize(&hex::decode(header_only["hex"].as_str().unwrap()).unwrap()).unwrap();
+        let requested_hash = header_only_block.block_hash();
+        submit_header(
+            &node,
+            &json!([hex::encode(serialize(&header_only_block.header))]),
+        )
+        .unwrap();
         let unversioned_peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(unversioned_peer_info[0]["relaytxes"], json!(false));
         assert_eq!(
@@ -14524,7 +14533,14 @@ mod tests {
         assert_eq!(unversioned_peer_info[0]["synced_headers"], json!(-1));
         assert_eq!(unversioned_peer_info[0]["synced_blocks"], json!(-1));
         assert_eq!(unversioned_peer_info[0]["addr_relay_enabled"], json!(true));
-        node.update_peer_version(7, 70016, 0, "/test-peer/", 0, true);
+        node.update_peer_version(
+            7,
+            70016,
+            crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+            "/test-peer/",
+            0,
+            true,
+        );
         node.update_peer_time_offset(7, 42);
         node.update_peer_bip152_highbandwidth_from(7, true);
         node.update_peer_reported_local_address(7, Some("198.51.100.2:18444".parse().unwrap()));
@@ -14595,21 +14611,37 @@ mod tests {
         assert_eq!(payload, vec![1, 2]);
 
         assert_eq!(
-            dispatch_method(&node, "getblockfrompeer", &json!([genesis.to_string(), 7]),).unwrap(),
+            dispatch_method(
+                &node,
+                "getblockfrompeer",
+                &json!([requested_hash.to_string(), 7]),
+            )
+            .unwrap(),
             json!({})
         );
         let crate::p2p::PeerCommand::RequestBlock(hash) = receiver.try_recv().unwrap() else {
             panic!("expected block request command");
         };
-        assert_eq!(hash, genesis);
+        assert_eq!(hash, requested_hash);
         assert_eq!(
             dispatch_method(&node, "getpeerinfo", &json!([])).unwrap()[0]["inflight"],
-            json!([0])
+            json!([1])
         );
-        node.clear_peer_block_request(7, genesis);
+        node.clear_peer_block_request(7, requested_hash);
         assert_eq!(
             dispatch_method(&node, "getpeerinfo", &json!([])).unwrap()[0]["inflight"],
             json!([])
+        );
+        assert!(
+            dispatch_method(&node, "getblockfrompeer", &json!([genesis.to_string(), 7]),).is_err()
+        );
+        assert!(
+            dispatch_method(
+                &node,
+                "getblockfrompeer",
+                &json!([BlockHash::all_zeros().to_string(), 7]),
+            )
+            .is_err()
         );
     }
 

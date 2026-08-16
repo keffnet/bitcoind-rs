@@ -2317,9 +2317,39 @@ fn get_memory_info(params: &Value) -> Result<Value> {
         .unwrap_or("stats");
     match mode {
         "stats" => Ok(json!({"locked": rpc_locked_memory_info()})),
-        "mallocinfo" => bail!("mallocinfo mode not available"),
+        "mallocinfo" => rpc_malloc_info(),
         _ => bail!("unknown mode {mode}"),
     }
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn rpc_malloc_info() -> Result<Value> {
+    use std::{ptr, slice};
+
+    let mut buffer = ptr::null_mut();
+    let mut size = 0usize;
+    // glibc owns the stream buffer and updates both pointers when the stream
+    // is flushed or closed. This mirrors Core's open_memstream/malloc_info
+    // implementation while keeping the unsafe boundary limited to this RPC.
+    let stream = unsafe { libc::open_memstream(&mut buffer, &mut size) };
+    if stream.is_null() {
+        return Ok(Value::String(String::new()));
+    }
+    unsafe {
+        libc::malloc_info(0, stream);
+        libc::fclose(stream);
+    }
+    if buffer.is_null() {
+        return Ok(Value::String(String::new()));
+    }
+    let bytes = unsafe { slice::from_raw_parts(buffer.cast::<u8>(), size).to_vec() };
+    unsafe { libc::free(buffer.cast()) };
+    Ok(Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn rpc_malloc_info() -> Result<Value> {
+    bail!("mallocinfo mode not available")
 }
 
 fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -15927,7 +15957,15 @@ mod tests {
             memory["locked"]["used"].as_u64().unwrap() + memory["locked"]["free"].as_u64().unwrap(),
             memory["locked"]["total"].as_u64().unwrap()
         );
-        assert!(dispatch_method(&node, "getmemoryinfo", &json!(["mallocinfo"])).is_err());
+        let malloc_info = dispatch_method(&node, "getmemoryinfo", &json!(["mallocinfo"]));
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let malloc_info = malloc_info.unwrap().as_str().unwrap().to_owned();
+            assert!(malloc_info.starts_with("<malloc version=\"1\">"));
+            assert!(malloc_info.ends_with("</malloc>\n"));
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        assert!(malloc_info.is_err());
         assert!(dispatch_method(&node, "getmemoryinfo", &json!([1])).is_err());
         let net_totals = dispatch_method(&node, "getnettotals", &json!([])).unwrap();
         assert!(net_totals["uploadtarget"]["bytes_left_in_cycle"].is_number());

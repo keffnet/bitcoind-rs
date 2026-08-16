@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(rust_2018_idioms, clippy::all)]
 
 pub mod address;

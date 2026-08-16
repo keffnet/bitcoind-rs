@@ -1926,7 +1926,10 @@ fn dispatch_method_for_user(
                 "unbroadcastcount": mempool.unbroadcast_txids().len(),
                 "incrementalrelayfee": sat_to_btc(mempool.incremental_relay_fee_sat_per_kvb()),
                 "total_fee": sat_to_btc(total_fee),
-                "fullrbf": mempool.full_rbf(),
+                // Core 31.1 keeps this deprecated compatibility field
+                // unconditionally true, even when the configured replacement
+                // policy still requires BIP125 signaling.
+                "fullrbf": true,
                 "permitbaremultisig": mempool.permit_bare_multisig(),
                 "maxdatacarriersize": mempool.max_datacarrier_bytes().unwrap_or_default(),
                 "limitclustercount": mempool.cluster_count_limit(),
@@ -24743,6 +24746,10 @@ mod tests {
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
+        assert_eq!(
+            dispatch_method(&node, "getmempoolinfo", &json!([])).unwrap()["fullrbf"],
+            json!(true)
+        );
         let hashes = generate_to_descriptor(&node, &json!([101, "raw(51)"])).unwrap();
         let funding_hash: BlockHash = hashes[0].as_str().unwrap().parse().unwrap();
         let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();

@@ -2214,7 +2214,7 @@ fn dispatch_method_for_user(
         "setnetworkactive" => {
             let active = param::<bool>(params, 0)?;
             node.set_network_active(active);
-            Ok(Value::Bool(true))
+            Ok(Value::Bool(node.network_active()))
         }
         "getrpcinfo" => Ok(json!({
             "active_commands": node.active_rpc_commands(),
@@ -19769,7 +19769,10 @@ mod tests {
             ])
         );
         Arc::get_mut(&mut node).unwrap().config.proxy = Some("127.0.0.1:9050".parse().unwrap());
-        dispatch_method(&node, "setnetworkactive", &json!([false])).unwrap();
+        assert_eq!(
+            dispatch_method(&node, "setnetworkactive", &json!([false])).unwrap(),
+            json!(false)
+        );
         assert_eq!(
             dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["networkactive"],
             false
@@ -19822,7 +19825,10 @@ mod tests {
         assert_eq!(cjdns["limited"], json!(true));
         assert_eq!(cjdns["reachable"], json!(false));
         assert_eq!(cjdns["proxy"], json!("127.0.0.1:9050"));
-        dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap();
+        assert_eq!(
+            dispatch_method(&node, "setnetworkactive", &json!([true])).unwrap(),
+            json!(true)
+        );
         assert!(node.network_active());
         node.set_listen_address("8.8.8.8:18444".parse().unwrap());
         assert_eq!(

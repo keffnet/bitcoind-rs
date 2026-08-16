@@ -3673,7 +3673,14 @@ async fn serve_peer_loop(
                             }
                         }
                         InventoryType::CompactBlock => {
-                            let (block, recent) = {
+                            if node.historical_block_serving_limit_reached(
+                                &item.hash,
+                                false,
+                                peer_state.permissions,
+                            ) {
+                                anyhow::bail!("historical block serving limit reached");
+                            }
+                            let (block, recent, direct_fetch_allowed) = {
                                 let mut chain = node.chain.write();
                                 if !chain
                                     .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
@@ -3684,12 +3691,20 @@ async fn serve_peer_loop(
                                     continue;
                                 };
                                 let recent = compact_block_is_recent(height, chain.height());
+                                let direct_fetch_allowed =
+                                    chain.header(chain.height()).is_some_and(|header| {
+                                        can_direct_fetch(
+                                            header.time,
+                                            crate::time::unix_time_i64(),
+                                            chain.network.params().pow_target_spacing,
+                                        )
+                                    });
                                 let Some(block) = chain.block(&item.hash)? else {
                                     continue;
                                 };
-                                (block, recent)
+                                (block, recent, direct_fetch_allowed)
                             };
-                            if !recent {
+                            if !recent || !direct_fetch_allowed {
                                 send_message(
                                     node,
                                     peer_id,
@@ -5413,6 +5428,12 @@ fn compact_block_is_recent(height: u32, tip_height: u32) -> bool {
     height >= tip_height.saturating_sub(MAX_CMPCTBLOCK_DEPTH)
 }
 
+fn can_direct_fetch(tip_time: u32, now: i64, target_spacing: u64) -> bool {
+    let target_spacing = i64::try_from(target_spacing).unwrap_or(i64::MAX);
+    let freshness_window = target_spacing.saturating_mul(20);
+    i64::from(tip_time) > now.saturating_sub(freshness_window)
+}
+
 fn fee_rate_sat_per_kvb(fee_sat: u64, vsize: u64) -> i64 {
     if vsize == 0 {
         return i64::MAX;
@@ -6889,6 +6910,9 @@ mod tests {
         assert!(compact_block_is_recent(100, 100));
         assert!(!compact_block_is_recent(94, 100));
         assert!(compact_block_is_recent(0, 5));
+
+        assert!(can_direct_fetch(1_000, 1_000 + 20 * 600 - 1, 600));
+        assert!(!can_direct_fetch(1_000, 1_000 + 20 * 600, 600));
     }
 
     #[test]

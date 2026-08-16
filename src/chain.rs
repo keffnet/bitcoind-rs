@@ -218,6 +218,36 @@ pub struct UtxoEntry {
     pub coinbase: bool,
 }
 
+trait UtxoLookup {
+    fn contains(&self, outpoint: &OutPoint) -> Result<bool>;
+    fn get(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>>;
+}
+
+impl UtxoLookup for HashMap<OutPoint, UtxoEntry> {
+    fn contains(&self, outpoint: &OutPoint) -> Result<bool> {
+        Ok(self.contains_key(outpoint))
+    }
+
+    fn get(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>> {
+        Ok(HashMap::get(self, outpoint).cloned())
+    }
+}
+
+impl UtxoLookup for UtxoStore {
+    fn contains(&self, outpoint: &OutPoint) -> Result<bool> {
+        Ok(UtxoStore::contains(self, outpoint))
+    }
+
+    fn get(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>> {
+        Ok(UtxoStore::get(self, outpoint)?.map(|entry| UtxoEntry {
+            output: entry.output,
+            height: entry.height,
+            median_time_past: entry.median_time_past,
+            coinbase: entry.coinbase,
+        }))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TxLocation {
     pub block_hash: BlockHash,
@@ -4202,7 +4232,7 @@ impl ChainState {
             check_pow,
             check_merkle_root,
         )?;
-        self.validate_block_transactions(block, height, &self.utxos, median_time_past)?;
+        self.validate_block_transactions(block, height, &self.utxo_store, median_time_past)?;
         Ok(())
     }
 
@@ -4734,11 +4764,11 @@ impl ChainState {
         Ok(Some(utxos))
     }
 
-    fn validate_block_transactions(
+    fn validate_block_transactions<U: UtxoLookup + ?Sized>(
         &self,
         block: &Block,
         height: u32,
-        utxos: &HashMap<OutPoint, UtxoEntry>,
+        utxos: &U,
         block_median_time_past: u32,
     ) -> Result<BlockApplication> {
         self.validate_block_transactions_with_options(
@@ -4750,24 +4780,21 @@ impl ChainState {
         )
     }
 
-    fn validate_block_transactions_with_options(
+    fn validate_block_transactions_with_options<U: UtxoLookup + ?Sized>(
         &self,
         block: &Block,
         height: u32,
-        utxos: &HashMap<OutPoint, UtxoEntry>,
+        utxos: &U,
         block_median_time_past: u32,
         skip_script_checks: bool,
     ) -> Result<BlockApplication> {
         if self.enforce_bip30(height, block.block_hash(), block.header.prev_blockhash) {
             for transaction in &block.txdata {
                 let txid = transaction.compute_txid();
-                if transaction
-                    .output
-                    .iter()
-                    .enumerate()
-                    .any(|(vout, _)| utxos.contains_key(&OutPoint::new(txid, vout as u32)))
-                {
-                    return Err(ValidationError::Bip30(txid).into());
+                for (vout, _) in transaction.output.iter().enumerate() {
+                    if utxos.contains(&OutPoint::new(txid, vout as u32))? {
+                        return Err(ValidationError::Bip30(txid).into());
+                    }
                 }
             }
         }
@@ -4813,11 +4840,11 @@ impl ChainState {
                 if !spent.insert(outpoint) {
                     return Err(ValidationError::DuplicateInput(txid).into());
                 }
-                let Some(entry) = created
-                    .get(&outpoint)
-                    .or_else(|| utxos.get(&outpoint))
-                    .cloned()
-                else {
+                let entry = if let Some(entry) = created.get(&outpoint).cloned() {
+                    entry
+                } else if let Some(entry) = utxos.get(&outpoint)? {
+                    entry
+                } else {
                     return Err(ValidationError::MissingInput { outpoint }.into());
                 };
                 if entry.coinbase && height < entry.height.saturating_add(COINBASE_MATURITY) {
@@ -5140,8 +5167,16 @@ impl ChainState {
         )?;
         self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
         let block_median_time_past = self.median_time_past();
-        let application =
-            self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?;
+        let application = if persist {
+            self.validate_block_transactions(
+                block,
+                height,
+                &self.utxo_store,
+                block_median_time_past,
+            )?
+        } else {
+            self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?
+        };
         self.cache_block_undo(block, &application.spent_entries)?;
         let previous_filter_header = self
             .basic_filter_for_block(&previous)?

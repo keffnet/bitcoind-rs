@@ -10,6 +10,11 @@ use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
+
 use anyhow::{Context, Result, bail};
 use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
@@ -1103,11 +1108,11 @@ impl UtxoStore {
             .context("UTXO store disk usage overflowed")
     }
 
-    pub fn get(&mut self, outpoint: &OutPoint) -> Result<Option<StoredUtxo>> {
+    pub fn get(&self, outpoint: &OutPoint) -> Result<Option<StoredUtxo>> {
         let Some(location) = self.index.get(outpoint).copied() else {
             return Ok(None);
         };
-        let body = read_utxo_data_record(&mut self.file, location)?;
+        let body = read_utxo_data_record(&self.file, location)?;
         if body.first().copied() != Some(UTXO_PUT) || body.len() < 1 + 8 + 36 {
             bail!("UTXO location points to a non-value record");
         }
@@ -1121,7 +1126,7 @@ impl UtxoStore {
     /// Read all live entries.  This is intentionally explicit: normal block
     /// validation uses point lookups, while snapshot/export code can opt into
     /// the full materialization cost.
-    pub fn entries(&mut self) -> Result<Vec<(OutPoint, StoredUtxo)>> {
+    pub fn entries(&self) -> Result<Vec<(OutPoint, StoredUtxo)>> {
         let outpoints = self.index.keys().copied().collect::<Vec<_>>();
         outpoints
             .iter()
@@ -1376,19 +1381,54 @@ fn append_utxo_data_record(file: &mut File, body: &[u8]) -> Result<UtxoLocation>
     Ok(UtxoLocation { offset, length })
 }
 
-fn read_utxo_data_record(file: &mut File, location: UtxoLocation) -> Result<Vec<u8>> {
+fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        file.read_at(bytes, offset)
+    }
+    #[cfg(windows)]
+    {
+        file.seek_read(bytes, offset)
+    }
+}
+
+fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> Result<()> {
+    let mut consumed = 0usize;
+    while consumed < bytes.len() {
+        let read = read_file_at(
+            file,
+            &mut bytes[consumed..],
+            offset
+                .checked_add(consumed as u64)
+                .context("UTXO read offset overflowed")?,
+        )?;
+        if read == 0 {
+            bail!("unexpected end of UTXO value log");
+        }
+        consumed += read;
+    }
+    Ok(())
+}
+
+fn read_utxo_data_record(file: &File, location: UtxoLocation) -> Result<Vec<u8>> {
     if location.length as usize > MAX_STORED_UTXO_SIZE + 64 {
         bail!("stored UTXO log record is too large");
     }
-    file.seek(SeekFrom::Start(location.offset))?;
     let mut length = [0u8; 4];
-    file.read_exact(&mut length)?;
+    read_exact_at(file, &mut length, location.offset)?;
     let actual = u32::from_le_bytes(length);
     if actual != location.length {
         bail!("UTXO index disagrees with value record length");
     }
     let mut body = vec![0u8; location.length as usize];
-    file.read_exact(&mut body)?;
+    read_exact_at(
+        file,
+        &mut body,
+        location
+            .offset
+            .checked_add(4)
+            .context("UTXO value offset overflowed")?,
+    )?;
     Ok(body)
 }
 
@@ -2553,7 +2593,7 @@ mod tests {
         let data_path = directory.path().join("utxos.dat");
         let committed_len = std::fs::metadata(&data_path).unwrap().len();
         {
-            let mut reopened = UtxoStore::open(directory.path()).unwrap();
+            let reopened = UtxoStore::open(directory.path()).unwrap();
             assert_eq!(reopened.len(), 1);
             assert_eq!(reopened.get(&second).unwrap(), Some(second_entry.clone()));
         }
@@ -2579,7 +2619,7 @@ mod tests {
         file.sync_data().unwrap();
         drop(file);
 
-        let mut recovered = UtxoStore::open(directory.path()).unwrap();
+        let recovered = UtxoStore::open(directory.path()).unwrap();
         assert_eq!(recovered.get(&first).unwrap(), None);
         assert_eq!(recovered.get(&second).unwrap(), Some(second_entry));
         assert_eq!(std::fs::metadata(data_path).unwrap().len(), committed_len);

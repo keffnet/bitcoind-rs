@@ -39,6 +39,7 @@ const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
 const MAX_TX_LEGACY_SIGOPS: usize = 2_500;
 const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
+const MAX_SCRIPT_SIZE: usize = 10_000;
 /// BIP 431/TRUC transaction version and topology limits.
 const TRUC_VERSION: i32 = 3;
 const TRUC_ANCESTOR_LIMIT: usize = 2;
@@ -889,6 +890,17 @@ impl Mempool {
 
     pub fn transactions(&self) -> impl Iterator<Item = &Transaction> {
         self.entries.values().map(|entry| &entry.transaction)
+    }
+
+    /// Core refuses to change the priority of an in-mempool transaction with
+    /// dust outputs while standard policy is enabled.
+    pub fn has_dust_outputs(&self, txid: &Txid) -> bool {
+        self.policy.require_standard
+            && self.entries.get(txid).is_some_and(|entry| {
+                entry.transaction.output.iter().any(|output| {
+                    is_dust_output_with_fee(output, self.policy.dust_relay_fee_sat_per_kvb)
+                })
+            })
     }
 
     pub fn prioritise(&mut self, txid: Txid, fee_delta: i64) {
@@ -3333,7 +3345,7 @@ fn is_dust_output(output: &TxOut) -> bool {
 }
 
 fn is_dust_output_with_fee(output: &TxOut, dust_relay_fee_sat_per_kvb: u64) -> bool {
-    if output.script_pubkey.is_op_return() {
+    if output.script_pubkey.is_op_return() || output.script_pubkey.len() > MAX_SCRIPT_SIZE {
         return false;
     }
     let output_size = bitcoin::consensus::encode::serialize(output).len() as u64;
@@ -4704,6 +4716,14 @@ mod tests {
 
         nonstandard.output[0].value = Amount::from_sat(1);
         assert!(is_dust_output(&nonstandard.output[0]));
+
+        let mut strict_pool = Mempool::new(Network::Bitcoin);
+        let dust_id = insert_policy_entry(&mut strict_pool, nonstandard.clone());
+        assert!(strict_pool.has_dust_outputs(&dust_id));
+        nonstandard.output[0].script_pubkey =
+            ScriptBuf::from_bytes(vec![0x6a; MAX_SCRIPT_SIZE + 1]);
+        let unspendable_id = insert_policy_entry(&mut strict_pool, nonstandard.clone());
+        assert!(!strict_pool.has_dust_outputs(&unspendable_id));
 
         nonstandard.output[0].value = Amount::from_sat(100_000);
         nonstandard.output[0].script_pubkey = ScriptBuf::from_bytes({

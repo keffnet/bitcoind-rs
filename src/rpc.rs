@@ -11293,7 +11293,11 @@ fn prioritise_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }
     }
     let fee_delta = param::<i64>(params, 2)?;
-    node.mempool.write().prioritise(txid, fee_delta);
+    let mut mempool = node.mempool.write();
+    if mempool.has_dust_outputs(&txid) {
+        bail!("Priority is not supported for transactions with dust outputs.")
+    }
+    mempool.prioritise(txid, fee_delta);
     Ok(Value::Bool(true))
 }
 

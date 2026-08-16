@@ -3140,6 +3140,11 @@ fn validate_standard_inputs(
                     "bad-txns-nonstandard-inputs".to_owned(),
                 ));
             }
+            if contains_opcode(redeem_script_view, 0xab) {
+                return Err(standard_script_policy_failure(
+                    "Using OP_CODESEPARATOR in non-witness script",
+                ));
+            }
             Some(redeem_script)
         } else {
             None
@@ -3468,6 +3473,12 @@ fn is_p2a_script(script: &Script) -> bool {
 fn is_core_nulldata(script: &Script) -> bool {
     script.as_bytes().first() == Some(&0x6a)
         && Script::from_bytes(&script.as_bytes()[1..]).is_push_only()
+}
+
+fn contains_opcode(script: &Script, opcode: u8) -> bool {
+    script
+        .instructions()
+        .any(|instruction| matches!(instruction, Ok(Instruction::Op(op)) if op.to_u8() == opcode))
 }
 
 fn push_only_stack_items(script: &Script) -> Option<Vec<Vec<u8>>> {
@@ -5171,6 +5182,41 @@ mod tests {
             validate_standard_policy(&transaction, std::slice::from_ref(&previous), 1),
             Err(MempoolError::NonStandard(reason))
                 if reason.contains("neither compressed or uncompressed")
+        ));
+    }
+
+    #[test]
+    fn standard_policy_rejects_legacy_code_separator() {
+        let redeem_script = ScriptBuf::from_bytes(vec![0x51, 0xab, 0x51]);
+        let redeem_hash = bitcoin::hashes::hash160::Hash::hash(redeem_script.as_bytes());
+        let p2sh_previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: {
+                let mut bytes = vec![0xa9, 0x14];
+                bytes.extend_from_slice(&redeem_hash.to_byte_array());
+                bytes.push(0x87);
+                ScriptBuf::from_bytes(bytes)
+            },
+        };
+        let mut transaction = graph_transaction(Txid::from_byte_array([14; 32]), 14);
+        transaction.input[0].script_sig = ScriptBuf::from_bytes({
+            let mut bytes = vec![redeem_script.len() as u8];
+            bytes.extend_from_slice(redeem_script.as_bytes());
+            bytes
+        });
+        transaction.output[0] = TxOut {
+            value: Amount::from_sat(99_999),
+            script_pubkey: ScriptBuf::from_bytes({
+                let mut bytes = vec![0x00, 0x14];
+                bytes.extend([0u8; 20]);
+                bytes
+            }),
+        };
+
+        assert!(matches!(
+            validate_standard_policy(&transaction, std::slice::from_ref(&p2sh_previous), 1),
+            Err(MempoolError::NonStandard(reason))
+                if reason.contains("Using OP_CODESEPARATOR in non-witness script")
         ));
     }
 

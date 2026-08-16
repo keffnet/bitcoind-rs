@@ -13674,6 +13674,11 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "amount out of range" || lower == "missing amount" {
         return -3;
     }
+    if lower.starts_with("failed to parse hex digit:")
+        || lower.starts_with("failed to parse hex: invilad hex string length")
+    {
+        return -8;
+    }
     if lower == "unknown filtertype"
         || lower == "block not found"
         || lower == "block hash not found"
@@ -14119,6 +14124,14 @@ mod tests {
         );
         assert_eq!(rpc_error_code("unknown mode foobar"), -8);
         assert_eq!(rpc_error_code("mode must be a string"), -3);
+        assert_eq!(
+            rpc_error_code("failed to parse hex digit: invalid character 'z' at position 0"),
+            -8
+        );
+        assert_eq!(
+            rpc_error_code("failed to parse hex: invilad hex string length 2 (expected 64)"),
+            -8
+        );
         assert_eq!(rpc_error_code("TX decode failed"), -22);
         assert_eq!(rpc_error_code("TX decode failed: invalid hex"), -22);
         assert_eq!(rpc_error_code("Input not found or already spent"), -25);

@@ -33,6 +33,8 @@ const MAX_STORED_ELECTRUM_HISTORY_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_UTXO_SIZE: usize = 100 * 1024;
 const MIN_UTXO_COMPACTION_DATA_SIZE: u64 = 16 * 1024 * 1024;
 const MIN_UTXO_COMPACTION_STALE_SIZE: u64 = 8 * 1024 * 1024;
+const MIN_ELECTRUM_HISTORY_COMPACTION_DATA_SIZE: u64 = 16 * 1024 * 1024;
+const MIN_ELECTRUM_HISTORY_COMPACTION_STALE_SIZE: u64 = 8 * 1024 * 1024;
 const XOR_KEY_SIZE: usize = 8;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
@@ -1760,6 +1762,151 @@ impl ElectrumHistoryStore {
             self.apply_batch(&batch)?;
         }
         Ok(())
+    }
+
+    /// Rewrite the latest history value for every script into a compact data
+    /// log and atomically replace the location index.  Both replacement files
+    /// are synced before installation; an interrupted two-file replacement is
+    /// detected by the index/data consistency checks during the next open.
+    pub fn compact(&mut self) -> Result<()> {
+        self.flush()?;
+        let entries = self.entries()?;
+        let compact_data_path = self.path.with_extension("dat.compact");
+        let compact_index_path = self.index_path.with_extension("index.compact");
+        for path in [&compact_data_path, &compact_index_path] {
+            match remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let result = (|| -> Result<()> {
+            let mut compact_data = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&compact_data_path)
+                .with_context(|| {
+                    format!(
+                        "creating compacted Electrum history store {}",
+                        compact_data_path.display()
+                    )
+                })?;
+            compact_data.write_all(ELECTRUM_HISTORY_DATA_MAGIC)?;
+            let batch_id = self.next_batch_id;
+            let next_batch_id = batch_id
+                .checked_add(1)
+                .context("Electrum history batch identifier exhausted during compaction")?;
+            let entries_empty = entries.is_empty();
+            let mut compact_index = HashMap::with_capacity(entries.len());
+            if !entries_empty {
+                for (script_hash, history) in entries {
+                    let script_hash_bytes = encode_history_script_hash(&script_hash)?;
+                    let body = encode_history_value(batch_id, script_hash_bytes, &history)?;
+                    let location = append_history_data_record(&mut compact_data, &body)?;
+                    compact_index.insert(script_hash_bytes, location);
+                }
+                let commit = encode_history_commit(batch_id);
+                append_history_data_record(&mut compact_data, &commit)?;
+            }
+            compact_data.sync_data()?;
+            let data_end = data_len_after(&compact_data)?;
+
+            let mut compact_index_file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&compact_index_path)
+                .with_context(|| {
+                    format!(
+                        "creating compacted Electrum history index {}",
+                        compact_index_path.display()
+                    )
+                })?;
+            rewrite_history_index(
+                &mut compact_index_file,
+                data_end,
+                if entries_empty {
+                    self.next_batch_id
+                } else {
+                    next_batch_id
+                },
+                &compact_index,
+            )?;
+            drop(compact_index_file);
+            drop(compact_data);
+
+            rename(&compact_data_path, &self.path).with_context(|| {
+                format!(
+                    "installing compacted Electrum history store {}",
+                    self.path.display()
+                )
+            })?;
+            rename(&compact_index_path, &self.index_path).with_context(|| {
+                format!(
+                    "installing compacted Electrum history index {}",
+                    self.index_path.display()
+                )
+            })?;
+
+            self.file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.path)
+                .with_context(|| {
+                    format!(
+                        "reopening compacted Electrum history store {}",
+                        self.path.display()
+                    )
+                })?;
+            self.index_file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.index_path)
+                .with_context(|| {
+                    format!(
+                        "reopening compacted Electrum history index {}",
+                        self.index_path.display()
+                    )
+                })?;
+            self.index = compact_index;
+            self.next_batch_id = if entries_empty {
+                self.next_batch_id
+            } else {
+                next_batch_id
+            };
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = remove_file(&compact_data_path);
+            let _ = remove_file(&compact_index_path);
+        }
+        result
+    }
+
+    /// Compact only when enough historical replacement data is dead to make a
+    /// full rewrite worthwhile.  Chainstate snapshots invoke this hook so
+    /// long-running Electrum nodes reclaim old script-history versions.
+    pub fn compact_if_needed(&mut self) -> Result<bool> {
+        let data_len = data_len_after(&self.file)?;
+        if data_len < MIN_ELECTRUM_HISTORY_COMPACTION_DATA_SIZE {
+            return Ok(false);
+        }
+        let live_bytes = ELECTRUM_HISTORY_DATA_MAGIC.len() as u64
+            + self
+                .index
+                .values()
+                .map(|location| 4u64.saturating_add(u64::from(location.length)))
+                .sum::<u64>()
+            + if self.index.is_empty() { 0 } else { 13 };
+        let stale_bytes = data_len.saturating_sub(live_bytes);
+        if stale_bytes < MIN_ELECTRUM_HISTORY_COMPACTION_STALE_SIZE || stale_bytes < live_bytes / 4
+        {
+            return Ok(false);
+        }
+        self.compact()?;
+        Ok(true)
     }
 
     pub fn clear(&mut self) -> Result<()> {
@@ -3817,6 +3964,42 @@ mod tests {
             reopened.get(&first_script).unwrap(),
             vec![(second_txid, 12)]
         );
+    }
+
+    #[test]
+    fn electrum_history_compaction_rewrites_live_values_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let script_hash = hex::encode([11u8; 32]);
+        let mut history = (0..32u32)
+            .map(|height| (Txid::from_byte_array([height as u8; 32]), height))
+            .collect::<Vec<_>>();
+        let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
+        store
+            .apply_batch(&[(script_hash.clone(), history.clone())])
+            .unwrap();
+        for round in 1..=7u32 {
+            history = history
+                .into_iter()
+                .map(|(txid, height)| (txid, height.saturating_add(round)))
+                .collect();
+            store
+                .apply_batch(&[(script_hash.clone(), history.clone())])
+                .unwrap();
+        }
+        let before = std::fs::metadata(directory.path().join("history.dat"))
+            .unwrap()
+            .len();
+        store.compact().unwrap();
+        let after = std::fs::metadata(directory.path().join("history.dat"))
+            .unwrap()
+            .len();
+        assert!(after < before);
+        assert_eq!(store.get(&script_hash).unwrap(), history);
+        drop(store);
+
+        let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&script_hash).unwrap(), history);
+        assert_eq!(reopened.generation(), 10);
     }
 
     #[test]

@@ -11234,6 +11234,21 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
             None => bail!("getblocktemplate mode must be a string"),
         }
     }
+    if request
+        .and_then(|request| request.get("mode"))
+        .and_then(Value::as_str)
+        != Some("proposal")
+        && let Some(rules) = request
+            .and_then(|request| request.get("rules"))
+            .filter(|value| !value.is_null())
+    {
+        let rules = rules
+            .as_array()
+            .ok_or_else(|| anyhow!("getblocktemplate rules must be an array"))?;
+        if rules.iter().any(|rule| rule.as_str().is_none()) {
+            bail!("getblocktemplate rules must contain strings");
+        }
+    }
     let longpoll_value = request
         .filter(|request| request.get("mode").and_then(Value::as_str) != Some("proposal"))
         .and_then(|request| request.get("longpollid"))
@@ -19074,6 +19089,13 @@ mod tests {
         .await
         .expect("invalid mode is rejected before long-polling");
         assert!(invalid_mode.is_err());
+        let invalid_rules = tokio::time::timeout(
+            Duration::from_millis(50),
+            get_block_template_async(&node, &json!([{"longpollid": 1, "rules": [1]}])),
+        )
+        .await
+        .expect("invalid rules are rejected before long-polling");
+        assert!(invalid_rules.is_err());
 
         let node_for_poll = Arc::clone(&node);
         let poll_params = json!([{"longpollid": 1, "rules": ["segwit"]}]);

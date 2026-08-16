@@ -1824,11 +1824,7 @@ fn spawn_outbound_loop(
             if persistent && !node.is_node_added_endpoint(&endpoint) {
                 return;
             }
-            if !node.network_active()
-                || endpoint
-                    .socket_addr()
-                    .is_some_and(|address| node.is_banned_for_peer(address, false))
-            {
+            if !node.network_active() || node.is_banned_for_endpoint(&endpoint) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -1945,7 +1941,7 @@ fn spawn_private_broadcast_loop(
         };
         if !node.config.allows_address(address)
             || !node.network_active()
-            || node.is_banned_for_peer(address, false)
+            || node.is_banned_for_endpoint(&endpoint)
         {
             return;
         }
@@ -2017,9 +2013,11 @@ fn select_discovery_endpoints(
         .filter(|entry| {
             endpoint_can_be_discovered(node, &entry.endpoint)
                 && !connected.contains(&entry.endpoint)
-                && !entry.endpoint.legacy_socket_addr().is_some_and(|address| {
-                    address.ip().is_unspecified() || node.is_banned_for_peer(address, false)
-                })
+                && !entry
+                    .endpoint
+                    .socket_addr()
+                    .is_some_and(|address| address.ip().is_unspecified())
+                && !node.is_banned_for_endpoint(&entry.endpoint)
                 && !added.contains(&entry.endpoint)
                 && !attempts.contains(&entry.endpoint)
         })

@@ -788,11 +788,21 @@ impl BannedAddress {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct BannedNetworkAddress {
+    pub endpoint: NetworkEndpoint,
+    pub ban_created: u64,
+    pub ban_until: u64,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedBannedAddress {
-    address: IpAddr,
+    address: String,
     #[serde(default)]
     prefix: Option<u8>,
+    #[serde(default)]
+    network: Option<String>,
     ban_created: u64,
     ban_until: u64,
     reason: String,
@@ -816,6 +826,11 @@ type LoadedAddressState = (
     HashSet<SocketAddr>,
     HashMap<NetworkEndpoint, KnownNetworkAddress>,
     HashSet<NetworkEndpoint>,
+);
+
+type LoadedBanState = (
+    HashMap<IpSubnet, BannedAddress>,
+    HashMap<NetworkEndpoint, BannedNetworkAddress>,
 );
 
 /// Per-node state shared by the long-running descriptor scans.
@@ -885,6 +900,7 @@ pub struct Node {
     added_nodes: parking_lot::RwLock<HashMap<NetworkEndpoint, Option<bool>>>,
     added_node_names: parking_lot::RwLock<HashMap<NetworkEndpoint, String>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
+    banned_network_addresses: parking_lot::RwLock<HashMap<NetworkEndpoint, BannedNetworkAddress>>,
     listen_address: parking_lot::RwLock<Option<SocketAddr>>,
     listen_addresses: parking_lot::RwLock<Vec<SocketAddr>>,
     mapped_addresses: parking_lot::RwLock<Vec<SocketAddr>>,
@@ -1115,11 +1131,11 @@ impl Node {
                 .context("startup block-index consistency check failed")?;
         }
         let banlist_path = config.datadir.join("banlist.json");
-        let banned_addresses = match load_banlist(&config.datadir) {
+        let (banned_addresses, banned_network_addresses) = match load_banlist(&config.datadir) {
             Ok(entries) => entries,
             Err(error) => {
                 quarantine_persistent_file(&banlist_path, &error);
-                HashMap::new()
+                (HashMap::new(), HashMap::new())
             }
         };
         let peers_path = config.datadir.join("peers.json");
@@ -1200,6 +1216,7 @@ impl Node {
             added_nodes: parking_lot::RwLock::new(added_nodes),
             added_node_names: parking_lot::RwLock::new(added_node_names),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
+            banned_network_addresses: parking_lot::RwLock::new(banned_network_addresses),
             listen_address: parking_lot::RwLock::new(None),
             listen_addresses: parking_lot::RwLock::new(Vec::new()),
             mapped_addresses: parking_lot::RwLock::new(Vec::new()),
@@ -3789,6 +3806,22 @@ impl Node {
         self.is_banned_for_permissions(address, permissions)
     }
 
+    pub(crate) fn is_banned_for_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
+        if endpoint
+            .socket_addr()
+            .is_some_and(|address| self.is_banned(address.ip()))
+        {
+            return true;
+        }
+        let Some(key) = endpoint.without_port() else {
+            return false;
+        };
+        let now = time::unix_time();
+        let mut banned = self.banned_network_addresses.write();
+        remove_expired_network_bans(&mut banned, now);
+        banned.get(&key).is_some_and(|entry| entry.ban_until > now)
+    }
+
     pub(crate) fn is_banned_for_permissions(
         &self,
         address: SocketAddr,
@@ -3803,6 +3836,15 @@ impl Node {
         remove_expired_bans(&mut banned, now);
         let mut addresses = banned.values().cloned().collect::<Vec<_>>();
         addresses.sort_by_key(|entry| entry.subnet().display());
+        addresses
+    }
+
+    pub fn banned_network_addresses(&self) -> Vec<BannedNetworkAddress> {
+        let now = time::unix_time();
+        let mut banned = self.banned_network_addresses.write();
+        remove_expired_network_bans(&mut banned, now);
+        let mut addresses = banned.values().cloned().collect::<Vec<_>>();
+        addresses.sort_by_key(|entry| entry.endpoint.host_string());
         addresses
     }
 
@@ -3845,12 +3887,60 @@ impl Node {
         self.persist_banlist()
     }
 
+    pub(crate) fn ban_network_address(
+        &self,
+        endpoint: NetworkEndpoint,
+        ban_until: u64,
+        reason: String,
+    ) -> Result<()> {
+        let key = endpoint
+            .without_port()
+            .ok_or_else(|| anyhow::anyhow!("invalid network address"))?;
+        let ban_created = time::unix_time();
+        let mut banned = self.banned_network_addresses.write();
+        remove_expired_network_bans(&mut banned, ban_created);
+        if banned.contains_key(&key) {
+            bail!("IP/Subnet already banned")
+        }
+        banned.insert(
+            key.clone(),
+            BannedNetworkAddress {
+                endpoint: key.clone(),
+                ban_created,
+                ban_until,
+                reason,
+            },
+        );
+        drop(banned);
+        let peers: Vec<_> = self
+            .peer_infos()
+            .into_iter()
+            .filter(|peer| peer.endpoint.without_port().as_ref() == Some(&key))
+            .map(|peer| peer.id)
+            .collect();
+        for peer_id in peers {
+            self.disconnect_peer(peer_id);
+        }
+        self.persist_banlist()
+    }
+
     pub fn unban_address(&self, address: IpAddr) -> Result<bool> {
         self.unban_subnet(IpSubnet::from_address(address))
     }
 
     pub(crate) fn unban_subnet(&self, subnet: IpSubnet) -> Result<bool> {
         let removed = self.banned_addresses.write().remove(&subnet).is_some();
+        if removed {
+            self.persist_banlist()?;
+        }
+        Ok(removed)
+    }
+
+    pub(crate) fn unban_network_address(&self, endpoint: &NetworkEndpoint) -> Result<bool> {
+        let Some(key) = endpoint.without_port() else {
+            return Ok(false);
+        };
+        let removed = self.banned_network_addresses.write().remove(&key).is_some();
         if removed {
             self.persist_banlist()?;
         }
@@ -4077,18 +4167,29 @@ impl Node {
     fn persist_banlist(&self) -> Result<()> {
         let path = self.config.datadir.join("banlist.json");
         let temp = self.config.datadir.join("banlist.json.tmp");
-        let entries = self
+        let mut entries = self
             .banned_addresses
             .read()
             .values()
             .map(|entry| PersistedBannedAddress {
-                address: entry.address,
+                address: entry.address.to_string(),
                 prefix: Some(entry.prefix),
+                network: None,
                 ban_created: entry.ban_created,
                 ban_until: entry.ban_until,
                 reason: entry.reason.clone(),
             })
             .collect::<Vec<_>>();
+        entries.extend(self.banned_network_addresses.read().values().map(|entry| {
+            PersistedBannedAddress {
+                address: entry.endpoint.host_string(),
+                prefix: None,
+                network: Some(entry.endpoint.network_name().to_owned()),
+                ban_created: entry.ban_created,
+                ban_until: entry.ban_until,
+                reason: entry.reason.clone(),
+            }
+        }));
         std::fs::write(&temp, serde_json::to_vec_pretty(&entries)?)?;
         std::fs::rename(temp, path)?;
         Ok(())
@@ -4136,6 +4237,13 @@ impl Node {
 }
 
 fn remove_expired_bans(banned: &mut HashMap<IpSubnet, BannedAddress>, now: u64) {
+    banned.retain(|_, entry| entry.ban_until > now);
+}
+
+fn remove_expired_network_bans(
+    banned: &mut HashMap<NetworkEndpoint, BannedNetworkAddress>,
+    now: u64,
+) {
     banned.retain(|_, entry| entry.ban_until > now);
 }
 
@@ -4228,18 +4336,19 @@ fn initialize_settings_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load_banlist(data_dir: &Path) -> Result<HashMap<IpSubnet, BannedAddress>> {
+fn load_banlist(data_dir: &Path) -> Result<LoadedBanState> {
     let path = data_dir.join("banlist.json");
     if !path.exists() {
-        return Ok(HashMap::new());
+        return Ok((HashMap::new(), HashMap::new()));
     }
     let bytes = std::fs::read(path)?;
     let entries: Vec<PersistedBannedAddress> = serde_json::from_slice(&bytes)?;
-    entries
-        .into_iter()
-        .map(|entry| {
-            let prefix = entry.prefix.unwrap_or_else(|| address_bits(entry.address));
-            let subnet = IpSubnet::new(entry.address, prefix)?;
+    let mut ip_addresses = HashMap::new();
+    let mut network_addresses = HashMap::new();
+    for entry in entries {
+        if let Ok(address) = entry.address.parse::<IpAddr>() {
+            let prefix = entry.prefix.unwrap_or_else(|| address_bits(address));
+            let subnet = IpSubnet::new(address, prefix)?;
             let banned = BannedAddress {
                 address: subnet.address(),
                 prefix: subnet.prefix(),
@@ -4247,9 +4356,26 @@ fn load_banlist(data_dir: &Path) -> Result<HashMap<IpSubnet, BannedAddress>> {
                 ban_until: entry.ban_until,
                 reason: entry.reason,
             };
-            Ok((subnet, banned))
-        })
-        .collect()
+            ip_addresses.insert(subnet, banned);
+        } else {
+            let endpoint = match entry.network.as_deref() {
+                Some(network) => NetworkEndpoint::parse(Some(network), &entry.address, Some(1))?
+                    .without_port()
+                    .ok_or_else(|| anyhow::anyhow!("invalid banned network address"))?,
+                None => NetworkEndpoint::parse_ban_address(&entry.address)?,
+            };
+            network_addresses.insert(
+                endpoint.clone(),
+                BannedNetworkAddress {
+                    endpoint,
+                    ban_created: entry.ban_created,
+                    ban_until: entry.ban_until,
+                    reason: entry.reason,
+                },
+            );
+        }
+    }
+    Ok((ip_addresses, network_addresses))
 }
 
 fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
@@ -4792,18 +4918,33 @@ mod tests {
             "ban_created": 1,
             "ban_until": 2,
             "reason": "manual"
+        }, {
+            "address": "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion",
+            "ban_created": 1,
+            "ban_until": 2,
+            "reason": "manual"
         }]);
         fs::write(
             directory.path().join("banlist.json"),
             serde_json::to_vec(&legacy).unwrap(),
         )
         .unwrap();
-        let loaded = load_banlist(directory.path()).unwrap();
+        let (loaded, loaded_network) = load_banlist(directory.path()).unwrap();
         let legacy_subnet = IpSubnet::parse("192.0.2.7").unwrap();
         assert_eq!(loaded[&legacy_subnet].prefix, 32);
         assert_eq!(
             loaded[&legacy_subnet].address,
             "192.0.2.7".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(loaded_network.len(), 1);
+        assert_eq!(
+            loaded_network
+                .values()
+                .next()
+                .unwrap()
+                .endpoint
+                .host_string(),
+            "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"
         );
     }
 

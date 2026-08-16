@@ -3636,7 +3636,10 @@ fn get_added_node_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let address = param::<String>(params, 0)?;
     let command = param::<String>(params, 1)?;
-    let subnet = crate::IpSubnet::parse(&address)?;
+    let (subnet, network_address) = match crate::IpSubnet::parse(&address) {
+        Ok(subnet) => (Some(subnet), None),
+        Err(_) => (None, Some(NetworkEndpoint::parse_ban_address(&address)?)),
+    };
     match command.as_str() {
         "add" => {
             let bantime = optional_i64(params, 2, 0, "bantime")?;
@@ -3652,11 +3655,26 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
             } else {
                 now.saturating_add(u64::try_from(bantime).unwrap_or(u64::MAX))
             };
-            node.ban_subnet(subnet, ban_until, "manually banned".to_owned())?;
+            if let Some(subnet) = subnet {
+                node.ban_subnet(subnet, ban_until, "manually banned".to_owned())?;
+            } else {
+                node.ban_network_address(
+                    network_address.expect("non-IP ban has a network address"),
+                    ban_until,
+                    "manually banned".to_owned(),
+                )?;
+            }
             Ok(Value::Null)
         }
         "remove" => {
-            if node.unban_subnet(subnet)? {
+            let removed = if let Some(subnet) = subnet {
+                node.unban_subnet(subnet)?
+            } else {
+                node.unban_network_address(
+                    &network_address.expect("non-IP ban has a network address"),
+                )?
+            };
+            if removed {
                 Ok(Value::Null)
             } else {
                 bail!("unban failed: address is not banned")
@@ -3668,23 +3686,38 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn list_banned(node: &Arc<Node>) -> Result<Value> {
     let now = unix_time();
-    Ok(json!(
-        node.banned_addresses()
-            .into_iter()
-            .map(|entry| json!({
+    let mut entries = node
+        .banned_addresses()
+        .into_iter()
+        .map(|entry| {
+            json!({
                 "address": entry.subnet().display(),
                 "ban_created": entry.ban_created,
                 "banned_until": entry.ban_until,
                 "ban_duration": entry.ban_until.saturating_sub(entry.ban_created),
                 "time_remaining": entry.ban_until.saturating_sub(now),
-            }))
-            .collect::<Vec<_>>()
-    ))
+            })
+        })
+        .chain(node.banned_network_addresses().into_iter().map(|entry| {
+            json!({
+                "address": entry.endpoint.host_string(),
+                "ban_created": entry.ban_created,
+                "banned_until": entry.ban_until,
+                "ban_duration": entry.ban_until.saturating_sub(entry.ban_created),
+                "time_remaining": entry.ban_until.saturating_sub(now),
+            })
+        }))
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left["address"].as_str().cmp(&right["address"].as_str()));
+    Ok(Value::Array(entries))
 }
 
 fn clear_banned(node: &Arc<Node>) -> Result<Value> {
     for entry in node.banned_addresses() {
         node.unban_subnet(entry.subnet())?;
+    }
+    for entry in node.banned_network_addresses() {
+        node.unban_network_address(&entry.endpoint)?;
     }
     Ok(Value::Null)
 }
@@ -20554,6 +20587,20 @@ mod tests {
         set_ban(&node, &json!(["192.0.2.2", "remove"])).unwrap();
         set_ban(&node, &json!(["192.0.2.0/24", "remove"])).unwrap();
         assert!(!node.is_banned("192.0.2.99".parse().unwrap()));
+        let tor_address = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";
+        set_ban(&node, &json!([tor_address, "add", 60])).unwrap();
+        let tor_endpoint = NetworkEndpoint::parse(Some("onion"), tor_address, Some(18444)).unwrap();
+        assert!(node.is_banned_for_endpoint(&tor_endpoint));
+        assert!(
+            list_banned(&node)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["address"] == tor_address)
+        );
+        set_ban(&node, &json!([tor_address, "remove"])).unwrap();
+        assert!(!node.is_banned_for_endpoint(&tor_endpoint));
         let normalized = normalize_rpc_params(
             "setban",
             &json!({"subnet": "192.0.2.4", "command": "add", "bantime": 60}),

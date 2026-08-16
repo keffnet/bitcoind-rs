@@ -106,6 +106,27 @@ impl NetworkEndpoint {
         }
     }
 
+    /// Return the endpoint identity used by Core's address-only ban entries.
+    /// Ports are deliberately excluded because `setban` bans a network address
+    /// across all transport ports.
+    pub fn without_port(&self) -> Option<Self> {
+        match self {
+            Self::OnionV2 { address, .. } => Some(Self::OnionV2 {
+                address: *address,
+                port: 0,
+            }),
+            Self::OnionV3 { address, .. } => Some(Self::OnionV3 {
+                address: *address,
+                port: 0,
+            }),
+            Self::I2p { address, .. } => Some(Self::I2p {
+                address: *address,
+                port: 0,
+            }),
+            Self::Ip(_) | Self::Dns { .. } | Self::Cjdns { .. } => None,
+        }
+    }
+
     /// The RPC/`onlynet` network name used for this endpoint.
     pub fn network_name(&self) -> &'static str {
         match self {
@@ -292,6 +313,26 @@ impl NetworkEndpoint {
             }),
             _ => bail!("unknown network endpoint type '{network}'"),
         }
+    }
+
+    /// Parse an address accepted by setban when it is not an IP literal.
+    /// Onion and I2P bans are address-only entries, so the temporary port used
+    /// for decoding is discarded from the returned identity.
+    pub fn parse_ban_address(value: &str) -> Result<Self> {
+        if value.contains('/') {
+            bail!("invalid IP/Subnet")
+        }
+        let lower = value.to_ascii_lowercase();
+        let network = if lower.ends_with(".onion") {
+            "onion"
+        } else if lower.ends_with(".b32.i2p") {
+            "i2p"
+        } else {
+            bail!("invalid IP/Subnet")
+        };
+        Self::parse(Some(network), &lower, Some(1))?
+            .without_port()
+            .ok_or_else(|| anyhow!("invalid IP/Subnet"))
     }
 }
 

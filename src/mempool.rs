@@ -2007,7 +2007,11 @@ impl Mempool {
             &transaction,
             chain.height() + 1,
             chain.median_time_past_value(),
-            chain.height() + 1 >= validation::buried_deployment_heights(chain.network).csv,
+            // Core's mempool policy always enforces BIP68 sequence locks. The
+            // consensus CSV deployment height only controls block connection;
+            // it must not let a pre-activation mempool accept a transaction
+            // that cannot be included in the next block under Core policy.
+            true,
             &previous_entries,
         )
         .map_err(|error| MempoolError::Script(error.to_string()))?;
@@ -3770,6 +3774,62 @@ mod tests {
 
         assert!(loaded.get(&txid).is_some());
         assert_eq!(loaded.fee_delta(&txid), 10_000_000);
+    }
+
+    #[test]
+    fn mempool_enforces_bip68_before_csv_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut deployment_parameters =
+            validation::DeploymentParameters::for_network(Network::Regtest);
+        deployment_parameters.buried.csv = 10_000;
+        let blocks_dir = directory.path().join("blocks");
+        let mut chain = ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters(
+            Network::Regtest,
+            directory.path(),
+            &blocks_dir,
+            None,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            deployment_parameters,
+        )
+        .unwrap();
+        let mut previous = *chain.header(0).unwrap();
+        let mut funding_txid = None;
+        for height in 1..=101 {
+            let block = mine_regtest_block(&previous, height);
+            if height == 1 {
+                funding_txid = Some(block.txdata[0].compute_txid());
+            }
+            previous = block.header;
+            chain.connect_block(block).unwrap();
+        }
+
+        let previous_output = OutPoint::new(funding_txid.unwrap(), 0);
+        let value = chain.utxo(&previous_output).unwrap().output.value.to_sat();
+        let transaction = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output,
+                script_sig: ScriptBuf::from_bytes(vec![0; 65]),
+                sequence: bitcoin::Sequence::from_consensus(500),
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value - 1_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+
+        let result = Mempool::new(Network::Regtest).accept(transaction, &chain);
+        assert!(
+            matches!(result, Err(MempoolError::Script(message)) if message.contains("locktime"))
+        );
     }
 
     #[test]

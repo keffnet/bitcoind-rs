@@ -5814,11 +5814,25 @@ async fn flush_peer_transaction_inventory(
         return Ok(());
     }
 
+    let transaction_order = node
+        .mempool
+        .read()
+        .main_order()
+        .into_iter()
+        .enumerate()
+        .map(|(position, txid)| (txid, position))
+        .collect::<HashMap<_, _>>();
     let pending = {
         let mut pending = state.pending_tx_inventory.lock();
         if pending.is_empty() {
             return Ok(());
         }
+        let mempool = node.mempool.read();
+        pending.sort_by_key(|item| {
+            transaction_id_for_inventory(&mempool, item)
+                .and_then(|txid| transaction_order.get(&txid).copied())
+                .unwrap_or(usize::MAX)
+        });
         let limit = inventory_broadcast_limit(pending.len());
         let count = pending.len().min(limit);
         pending.drain(..count).collect::<Vec<_>>()
@@ -6008,6 +6022,19 @@ fn transaction_fee_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<(
         InventoryType::Transaction => mempool
             .get(&Txid::from_byte_array(item.hash.to_byte_array()))
             .map(|entry| (entry.fee_sat, entry.vsize)),
+        _ => None,
+    }
+}
+
+fn transaction_id_for_inventory(
+    mempool: &crate::mempool::Mempool,
+    item: &Inventory,
+) -> Option<Txid> {
+    match item.kind {
+        kind if kind.is_witness_transaction() => mempool
+            .get_by_wtxid(&Wtxid::from_byte_array(item.hash.to_byte_array()))
+            .map(|entry| entry.transaction.compute_txid()),
+        InventoryType::Transaction => Some(Txid::from_byte_array(item.hash.to_byte_array())),
         _ => None,
     }
 }

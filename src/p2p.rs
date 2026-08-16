@@ -43,6 +43,7 @@ use crate::chain::BasicFilterRange;
 use crate::config::DEFAULT_CONNECT_TIMEOUT_MS;
 use crate::config::{PeerPermissions, default_p2p_port};
 use crate::mempool::MempoolError;
+use crate::script::{core_multisig_solution, is_core_p2pk};
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
 };
@@ -1170,7 +1171,8 @@ impl BloomFilter {
             let should_update = match self.flags {
                 BloomFlags::All => true,
                 BloomFlags::PubkeyOnly => {
-                    output.script_pubkey.is_p2pk() || output.script_pubkey.is_multisig()
+                    is_core_p2pk(&output.script_pubkey)
+                        || core_multisig_solution(&output.script_pubkey).is_some()
                 }
                 BloomFlags::None => false,
             };

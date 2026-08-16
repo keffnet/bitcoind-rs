@@ -14,6 +14,7 @@ pub mod muhash;
 pub mod p2p;
 pub mod portmap;
 pub mod rpc;
+pub(crate) mod script;
 pub mod storage;
 pub mod time;
 pub mod tor;

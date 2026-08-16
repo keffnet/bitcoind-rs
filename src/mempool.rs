@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 use bitcoin::blockdata::script::Instruction;
 use bitcoin::consensus::encode::{VarInt, deserialize_partial, serialize};
 use bitcoin::{
-    Amount, Network, OutPoint, PublicKey, Script, ScriptBuf, Transaction, TxIn, TxOut, Txid, Wtxid,
+    Amount, Network, OutPoint, Script, ScriptBuf, Transaction, TxIn, TxOut, Txid, Wtxid,
 };
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,7 @@ use crate::config::{
     DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB, DEFAULT_MAX_DATACARRIER_BYTES,
     DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB, DEFAULT_PERMIT_BARE_MULTISIG, MAX_CLUSTER_COUNT_LIMIT,
 };
+use crate::script::core_multisig_solution;
 use crate::time;
 use crate::validation::{self, ValidationError};
 
@@ -3508,7 +3509,7 @@ fn p2pk_checksig_not_pubkey_bytes(script: &Script) -> Option<Vec<u8>> {
 fn is_standard_output_script(script: &Script, permit_bare_multisig: bool) -> bool {
     script.is_p2pkh()
         || script.is_p2sh()
-        || script.p2pk_public_key().is_some()
+        || crate::script::is_core_p2pk(script)
         || script.is_p2wpkh()
         || script.is_p2wsh()
         || script.is_p2tr()
@@ -3658,23 +3659,11 @@ fn is_standard_spend_script(script: &Script) -> bool {
 }
 
 fn is_standard_bare_multisig(script: &Script) -> bool {
-    if !script.is_multisig() {
-        return false;
-    }
-    let Some(Ok(Instruction::Op(required))) = script.instructions().next() else {
+    let Some((required, public_keys)) = core_multisig_solution(script) else {
         return false;
     };
-    if required.to_u8() == 0x00 {
-        return false;
-    }
-    let keys = script
-        .instructions()
-        .filter_map(|instruction| match instruction {
-            Ok(Instruction::PushBytes(bytes)) => Some(bytes.as_bytes()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    !keys.is_empty() && keys.len() <= 3 && keys.iter().all(|key| PublicKey::from_slice(key).is_ok())
+    let key_count = u8::try_from(public_keys.len()).ok();
+    key_count.is_some_and(|key_count| public_keys.len() <= 3 && required <= key_count)
 }
 
 #[cfg(test)]

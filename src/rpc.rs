@@ -53,6 +53,7 @@ use crate::mempool::{
     MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool, MempoolError, MempoolLoadOptions,
     package_is_child_with_parents_tree, package_is_topologically_sorted, package_weight,
 };
+use crate::script::{core_multisig_solution, is_core_multisig, is_core_p2pk};
 use crate::validation;
 use crate::wire;
 use crate::{Node, ScanState, StartupLatch};
@@ -6678,52 +6679,17 @@ fn expand_decimal_exponent(value: &str) -> Result<String> {
     })
 }
 
-fn script_push_num(opcode: u8) -> Option<u8> {
-    match opcode {
-        0x00 => Some(0),
-        0x51..=0x60 => Some(opcode - 0x50),
-        _ => None,
-    }
-}
-
 fn multisig_descriptor_body(script: &bitcoin::Script) -> Option<String> {
-    if !script.is_multisig() {
-        return None;
-    }
-    let mut instructions = script.instructions();
-    let required = match instructions.next()? {
-        Ok(Instruction::Op(op)) => script_push_num(op.to_u8())?,
-        _ => return None,
-    };
-    if required == 0 {
-        return None;
-    }
-    let mut keys = Vec::new();
-    loop {
-        match instructions.next()? {
-            Ok(Instruction::PushBytes(bytes)) => {
-                let public_key = bitcoin::PublicKey::from_slice(bytes.as_bytes()).ok()?;
-                keys.push(public_key.to_string());
-            }
-            Ok(Instruction::Op(op)) => {
-                let key_count = script_push_num(op.to_u8())?;
-                let parsed_key_count = u8::try_from(keys.len()).ok()?;
-                if key_count != parsed_key_count || required > key_count {
-                    return None;
-                }
-                match instructions.next()? {
-                    Ok(Instruction::Op(check))
-                        if check == bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG => {}
-                    _ => return None,
-                }
-                if instructions.next().is_some() {
-                    return None;
-                }
-                return Some(format!("multi({required},{})", keys.join(",")));
-            }
-            Err(_) => return None,
-        }
-    }
+    let (required, public_key_bytes) = core_multisig_solution(script)?;
+    let keys = public_key_bytes
+        .into_iter()
+        .map(|bytes| {
+            bitcoin::PublicKey::from_slice(&bytes)
+                .ok()
+                .map(|key| key.to_string())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("multi({required},{})", keys.join(",")))
 }
 
 fn is_core_nulldata(script: &bitcoin::Script) -> bool {
@@ -6776,9 +6742,9 @@ fn script_type_for_decode(script: &bitcoin::Script) -> &'static str {
         "witness_unknown"
     } else if is_core_nulldata(script) {
         "nulldata"
-    } else if script.is_p2pk() {
+    } else if is_core_p2pk(script) {
         "pubkey"
-    } else if script.is_multisig() {
+    } else if is_core_multisig(script) {
         "multisig"
     } else {
         "nonstandard"

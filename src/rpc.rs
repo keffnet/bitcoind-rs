@@ -5832,13 +5832,6 @@ fn combine_transaction_variants(transactions: &[Transaction]) -> Result<Transact
         .first()
         .cloned()
         .ok_or_else(|| anyhow!("Missing transactions"))?;
-    if transactions
-        .iter()
-        .skip(1)
-        .any(|transaction| !raw_transactions_match(&first, transaction))
-    {
-        bail!("TXs are not compatible")
-    }
     let mut combined = first;
     for transaction in transactions.iter().skip(1) {
         for (combined_input, input) in combined.input.iter_mut().zip(&transaction.input) {
@@ -5848,16 +5841,6 @@ fn combine_transaction_variants(transactions: &[Transaction]) -> Result<Transact
         }
     }
     Ok(combined)
-}
-
-fn raw_transactions_match(left: &Transaction, right: &Transaction) -> bool {
-    left.version == right.version
-        && left.lock_time == right.lock_time
-        && left.output == right.output
-        && left.input.len() == right.input.len()
-        && left.input.iter().zip(&right.input).all(|(left, right)| {
-            left.previous_output == right.previous_output && left.sequence == right.sequence
-        })
 }
 
 #[derive(Clone)]
@@ -21703,7 +21686,8 @@ mod tests {
         assert_eq!(combined.output, vec![output]);
 
         first.output[0].value = bitcoin::Amount::from_sat(999);
-        assert!(combine_transaction_variants(&[first, second]).is_err());
+        let combined = combine_transaction_variants(&[first, second]).unwrap();
+        assert_eq!(combined.output[0].value, bitcoin::Amount::from_sat(999));
     }
 
     #[test]

@@ -3299,6 +3299,9 @@ fn parse_descriptor_range(value: &Value) -> Result<(u32, u32)> {
 }
 
 fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    const ADDRMAN_HORIZON_SECS: u64 = 30 * 24 * 60 * 60;
+    const ADDRMAN_MAX_FUTURE_SECS: u64 = 10 * 60;
+
     let count = match params.get(0) {
         None | Some(Value::Null) => Some(1usize),
         Some(value) => {
@@ -3330,6 +3333,7 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
     {
         bail!("Network not recognized: {network}")
     }
+    let now = crate::time::unix_time();
     let mut peers = node
         .known_network_addresses()
         .into_iter()
@@ -3338,9 +3342,8 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
             Some(network) => peer.endpoint.network_name() == network,
         })
         .filter(|peer| {
-            peer.endpoint
-                .socket_addr()
-                .is_none_or(|address| !node.is_banned_for_peer(address, false))
+            peer.time <= now.saturating_add(ADDRMAN_MAX_FUTURE_SECS)
+                && now.saturating_sub(peer.time) <= ADDRMAN_HORIZON_SECS
         })
         .collect::<Vec<_>>();
     peers.shuffle(&mut rand::rng());
@@ -20247,6 +20250,26 @@ mod tests {
         let raw = dispatch_method(&node, "getrawaddrman", &json!([])).unwrap();
         assert_eq!(raw["new"].as_object().unwrap().len(), 1);
         assert_eq!(raw["tried"].as_object().unwrap().len(), 2);
+        let now = crate::time::unix_time();
+        assert!(node.remember_network_address(
+            crate::address::NetworkEndpoint::Ip("192.0.2.11:18444".parse().unwrap()),
+            crate::wire::NODE_NETWORK,
+            now.saturating_sub(30 * 24 * 60 * 60 + 1),
+        ));
+        assert!(node.remember_network_address(
+            crate::address::NetworkEndpoint::Ip("192.0.2.12:18444".parse().unwrap()),
+            crate::wire::NODE_NETWORK,
+            now.saturating_add(10 * 60 + 1),
+        ));
+        let node_addresses = dispatch_method(&node, "getnodeaddresses", &json!([0])).unwrap();
+        assert_eq!(node_addresses.as_array().unwrap().len(), 3);
+        assert!(
+            node_addresses
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["address"] != "192.0.2.11" && entry["address"] != "192.0.2.12")
+        );
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         node.register_peer_with_endpoint(
@@ -20767,14 +20790,21 @@ mod tests {
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
-        node.remember_address("192.0.2.20:18444".parse().unwrap(), 1, 10);
-        node.remember_address("[2001:db8::20]:18444".parse().unwrap(), 8, 20);
+        let now = crate::time::unix_time();
+        node.remember_address("192.0.2.20:18444".parse().unwrap(), 1, now);
+        node.remember_address("[2001:db8::20]:18444".parse().unwrap(), 8, now);
         set_ban(&node, &json!(["192.0.2.20", "add", 3600, false])).unwrap();
 
         let default = get_node_addresses(&node, &json!([])).unwrap();
         assert_eq!(default.as_array().unwrap().len(), 1);
         let all = get_node_addresses(&node, &json!([0])).unwrap();
-        assert_eq!(all.as_array().unwrap().len(), 1);
+        assert_eq!(all.as_array().unwrap().len(), 2);
+        assert!(
+            all.as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["address"] == "192.0.2.20")
+        );
         let ipv6 = get_node_addresses(&node, &json!([10, "ipv6"])).unwrap();
         assert_eq!(ipv6[0]["address"], "2001:db8::20");
         assert_eq!(ipv6[0]["services"], 8);

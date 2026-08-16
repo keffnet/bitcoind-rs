@@ -232,6 +232,8 @@ const MAX_ADDR_TO_SEND: usize = 1_000;
 const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 const MAX_BLOCKTXN_DEPTH: u32 = 10;
 const STALE_RELAY_AGE_LIMIT_SECS: u64 = 30 * 24 * 60 * 60;
+pub(crate) const MIN_PEER_PROTO_VERSION: i32 = 31_800;
+pub(crate) const BIP31_VERSION: i32 = 60_000;
 const SENDHEADERS_VERSION: i32 = 70_012;
 const FEEFILTER_VERSION: i32 = 70_013;
 const SHORT_IDS_BLOCKS_VERSION: i32 = 70_014;
@@ -2956,7 +2958,7 @@ async fn serve_peer_loop(
                         }
                         continue;
                     }
-                    Some(PeerCommand::Ping(nonce)) => {
+                    Some(PeerCommand::Ping(nonce)) if peer_version > BIP31_VERSION => {
                         send_message(
                             node,
                             peer_id,
@@ -2966,6 +2968,7 @@ async fn serve_peer_loop(
                         ).await?;
                         continue;
                     }
+                    Some(PeerCommand::Ping(_)) => continue,
                     Some(PeerCommand::SendMessage { command, payload }) => {
                         send_message(
                             node,
@@ -2997,7 +3000,7 @@ async fn serve_peer_loop(
                 node.capture_message(peer_id, true, &message)?;
                 message
             },
-            _ = ping_interval.tick(), if version_received && verack_received && !*peer_state.private_broadcast_peer.lock() => {
+            _ = ping_interval.tick(), if version_received && verack_received && peer_version > BIP31_VERSION && !*peer_state.private_broadcast_peer.lock() => {
                 if node.ping_timed_out(peer_id, peer_timeout) {
                     anyhow::bail!("peer ping timed out");
                 }
@@ -3106,7 +3109,7 @@ async fn serve_peer_loop(
                     anyhow::bail!("duplicate version message");
                 }
                 version_received = true;
-                if version.version < 70001 {
+                if version.version < MIN_PEER_PROTO_VERSION {
                     anyhow::bail!("peer protocol version is too old");
                 }
                 if version.nonce == local_nonce {
@@ -3258,17 +3261,20 @@ async fn serve_peer_loop(
                 *registered = true;
             }
             Message::Ping(nonce) => {
-                send_message(
-                    node,
-                    peer_id,
-                    writer,
-                    node.config.network,
-                    &Message::Pong(nonce),
-                )
-                .await?;
+                if peer_version > BIP31_VERSION {
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Pong(nonce),
+                    )
+                    .await?;
+                }
             }
             Message::Pong(nonce) => {
-                if node.record_pong(peer_id, nonce)
+                if peer_version > BIP31_VERSION
+                    && node.record_pong(peer_id, nonce)
                     && peer_state.connection_type == "private-broadcast"
                     && let Some(transaction) = peer_state.private_broadcast_transaction.as_ref()
                     && let Some(address) = node

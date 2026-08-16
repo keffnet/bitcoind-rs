@@ -697,8 +697,16 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
         "mempool" => Message::Mempool,
         "addr" => Message::Addr(decode_addr(&mut reader)?),
         "addrv2" => Message::AddrV2(decode_addr_v2(&mut reader)?),
-        "ping" => Message::Ping(reader.u64_le()?),
-        "pong" => Message::Pong(reader.u64_le()?),
+        "ping" => Message::Ping(if reader.remaining() == 0 {
+            0
+        } else {
+            reader.u64_le()?
+        }),
+        "pong" => Message::Pong(if reader.remaining() == 0 {
+            0
+        } else {
+            reader.u64_le()?
+        }),
         "getheaders" => Message::GetHeaders(decode_getheaders(&mut reader)?),
         "getblocks" => Message::GetBlocks(decode_getheaders(&mut reader)?),
         "headers" => Message::Headers(decode_headers(&mut reader)?),
@@ -1084,6 +1092,21 @@ mod tests {
             decode_message(Network::Regtest, &frame).unwrap(),
             Message::Ping(42)
         );
+    }
+
+    #[test]
+    fn legacy_ping_and_pong_payloads_are_empty() {
+        for (command, expected) in [("ping", Message::Ping(0)), ("pong", Message::Pong(0))] {
+            let frame = encode_message(
+                Network::Regtest,
+                &Message::Unknown {
+                    command: command.to_owned(),
+                    payload: Vec::new(),
+                },
+            )
+            .unwrap();
+            assert_eq!(decode_message(Network::Regtest, &frame).unwrap(), expected);
+        }
     }
 
     #[test]

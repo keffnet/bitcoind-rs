@@ -3938,6 +3938,12 @@ impl Node {
         let Some(peer) = peers.get_mut(&peer_id) else {
             return false;
         };
+        if peer
+            .version
+            .is_none_or(|version| version <= p2p::BIP31_VERSION)
+        {
+            return false;
+        }
         if peer.ping_nonce.is_some() {
             return false;
         }

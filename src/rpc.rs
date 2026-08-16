@@ -727,7 +727,7 @@ fn rest_query_bool(query: &str, name: &str, default: bool) -> Result<bool> {
     match value {
         "true" => Ok(true),
         "false" => Ok(false),
-        _ => bail!("REST query parameter {name} must be true or false"),
+        _ => bail!("The \"{name}\" query parameter must be either \"true\" or \"false\"."),
     }
 }
 
@@ -17556,6 +17556,18 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Verbose results cannot contain mempool sequence values. (hint: set \"verbose=false\")"
+        );
+        assert_eq!(
+            dispatch_rest(&node, "/rest/mempool/contents.json?verbose=maybe")
+                .unwrap_err()
+                .to_string(),
+            "The \"verbose\" query parameter must be either \"true\" or \"false\"."
+        );
+        assert_eq!(
+            dispatch_rest(&node, "/rest/mempool/contents.json?mempool_sequence=maybe")
+                .unwrap_err()
+                .to_string(),
+            "The \"mempool_sequence\" query parameter must be either \"true\" or \"false\"."
         );
     }
 

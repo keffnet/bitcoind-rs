@@ -13611,7 +13611,10 @@ fn add_transaction_fee(
     Ok(())
 }
 
-fn script_json_with_network(script: &bitcoin::Script, network: Option<Network>) -> Value {
+pub(crate) fn script_json_with_network(
+    script: &bitcoin::Script,
+    network: Option<Network>,
+) -> Value {
     let script_type = script_type_for_decode(script);
     let mut result = json!({
         "asm": script.to_asm_string(),

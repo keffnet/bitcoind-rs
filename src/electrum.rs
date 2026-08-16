@@ -1395,6 +1395,7 @@ fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 Some(&location),
                 confirmations,
                 time,
+                node.config.network,
             ));
         }
         return Ok(json!(chain::transaction_hex(&transaction)));
@@ -1406,6 +1407,7 @@ fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 None,
                 None,
                 None,
+                node.config.network,
             ));
         }
         return Ok(json!(chain::transaction_hex(&entry.transaction)));
@@ -1434,12 +1436,13 @@ fn electrum_transaction_json(
     location: Option<&chain::TxLocation>,
     confirmations: Option<u32>,
     time: Option<u32>,
+    network: bitcoin::Network,
 ) -> Value {
     let vin = transaction
         .input
         .iter()
         .map(|input| {
-            if input.previous_output.is_null() {
+            let mut result = if input.previous_output.is_null() {
                 json!({
                     "coinbase": hex::encode(input.script_sig.as_bytes()),
                     "sequence": input.sequence.to_consensus_u32(),
@@ -1452,10 +1455,20 @@ fn electrum_transaction_json(
                         "hex": hex::encode(input.script_sig.as_bytes()),
                         "asm": input.script_sig.to_asm_string(),
                     },
-                    "txinwitness": input.witness.to_vec().into_iter().map(hex::encode).collect::<Vec<_>>(),
                     "sequence": input.sequence.to_consensus_u32(),
                 })
+            };
+            if !input.witness.is_empty() {
+                result["txinwitness"] = json!(
+                    input
+                        .witness
+                        .to_vec()
+                        .into_iter()
+                        .map(hex::encode)
+                        .collect::<Vec<_>>()
+                );
             }
+            result
         })
         .collect::<Vec<_>>();
     let vout = transaction
@@ -1466,10 +1479,10 @@ fn electrum_transaction_json(
             json!({
                 "value": output.value.to_btc(),
                 "n": index,
-                "scriptPubKey": {
-                    "hex": hex::encode(output.script_pubkey.as_bytes()),
-                    "asm": output.script_pubkey.to_asm_string(),
-                },
+                "scriptPubKey": crate::rpc::script_json_with_network(
+                    &output.script_pubkey,
+                    Some(network),
+                ),
             })
         })
         .collect::<Vec<_>>();
@@ -3157,13 +3170,21 @@ mod tests {
         assert_eq!(verbose["confirmations"], json!(1));
         assert_eq!(verbose["time"], json!(block.header.time));
         assert_eq!(verbose["blocktime"], json!(block.header.time));
+        assert!(verbose["vin"][0].get("txinwitness").is_none());
+        assert!(verbose["vout"][0]["scriptPubKey"]["desc"].is_string());
+        assert!(verbose["vout"][0]["scriptPubKey"]["type"].is_string());
         let side_location = chain::TxLocation {
             block_hash: BlockHash::from_byte_array([1; 32]),
             height: 0,
             transaction_index: 0,
         };
-        let side_verbose =
-            electrum_transaction_json(&block.txdata[0], Some(&side_location), Some(0), None);
+        let side_verbose = electrum_transaction_json(
+            &block.txdata[0],
+            Some(&side_location),
+            Some(0),
+            None,
+            Network::Regtest,
+        );
         assert_eq!(side_verbose["confirmations"], json!(0));
         assert!(side_verbose.get("time").is_none());
         assert!(side_verbose.get("blocktime").is_none());

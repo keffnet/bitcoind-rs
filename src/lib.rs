@@ -1347,7 +1347,11 @@ impl Node {
         };
         self.reduce_block_stalling_timeout();
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
-            self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
+            self.reconcile_mempool_after_chain_change(
+                &activated_blocks,
+                &disconnected_blocks,
+                false,
+            );
             let _ = self.events.send(tip.clone());
 
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
@@ -1601,6 +1605,7 @@ impl Node {
         &self,
         activated_blocks: &[Block],
         disconnected_blocks: &[Block],
+        manual_invalidation: bool,
     ) {
         let mempool_before = self
             .mempool
@@ -1632,7 +1637,22 @@ impl Node {
         }
         let added_at = time::unix_time();
         let mut fee_estimator_exclusions = HashSet::new();
-        for block in disconnected_blocks {
+        // Core's invalidateblock disconnects one block at a time.  It
+        // attempts to resurrect transactions from the ten most recently
+        // disconnected blocks, newest first; deeper invalidations skip
+        // resurrection entirely.  Ordinary reorgs use one aggregate
+        // disconnect pool and restore the oldest block first so parents are
+        // available before their descendants.
+        let blocks_to_restore = if manual_invalidation {
+            disconnected_blocks
+                .iter()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+        } else {
+            disconnected_blocks.iter().collect::<Vec<_>>()
+        };
+        for block in blocks_to_restore {
             for transaction in block.txdata.iter().skip(1) {
                 if let Ok(txid) = mempool.accept_reorg(transaction.clone(), &chain, added_at) {
                     fee_estimator_exclusions.insert(txid);
@@ -2246,7 +2266,11 @@ impl Node {
             (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
-            self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
+            self.reconcile_mempool_after_chain_change(
+                &activated_blocks,
+                &disconnected_blocks,
+                true,
+            );
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
@@ -2275,7 +2299,11 @@ impl Node {
             (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
-            self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
+            self.reconcile_mempool_after_chain_change(
+                &activated_blocks,
+                &disconnected_blocks,
+                false,
+            );
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
@@ -2304,7 +2332,11 @@ impl Node {
             (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
-            self.reconcile_mempool_after_chain_change(&activated_blocks, &disconnected_blocks);
+            self.reconcile_mempool_after_chain_change(
+                &activated_blocks,
+                &disconnected_blocks,
+                false,
+            );
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
@@ -5987,6 +6019,89 @@ mod tests {
 
         node.reconsider_block(block_hash).unwrap();
         assert_eq!(node.chain.read().height(), 102);
+        assert!(node.mempool.read().get(&txid).is_none());
+    }
+
+    #[test]
+    fn invalidation_resurrects_transactions_in_core_disconnect_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let parent = private_broadcast_test_transaction(&node);
+        let parent_txid = parent.compute_txid();
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                script_sig: ScriptBuf::from_bytes(vec![0; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_998_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let child_txid = child.compute_txid();
+
+        let previous = *node.chain.read().header(101).unwrap();
+        let mut parent_block = mine_test_block(&previous, 102, 102);
+        parent_block.txdata.push(parent);
+        parent_block.header.merkle_root = parent_block.compute_merkle_root().unwrap();
+        while !parent_block
+            .header
+            .target()
+            .is_met_by(parent_block.block_hash())
+        {
+            parent_block.header.nonce = parent_block.header.nonce.wrapping_add(1);
+        }
+        let parent_block_hash = parent_block.block_hash();
+        let parent_block_header = parent_block.header;
+        node.connect_block(parent_block).unwrap();
+
+        let mut child_block = mine_test_block(&parent_block_header, 103, 103);
+        child_block.txdata.push(child);
+        child_block.header.merkle_root = child_block.compute_merkle_root().unwrap();
+        while !child_block
+            .header
+            .target()
+            .is_met_by(child_block.block_hash())
+        {
+            child_block.header.nonce = child_block.header.nonce.wrapping_add(1);
+        }
+        node.connect_block(child_block).unwrap();
+
+        node.invalidate_block(parent_block_hash).unwrap();
+        let mempool = node.mempool.read();
+        assert!(mempool.get(&parent_txid).is_some());
+        assert!(mempool.get(&child_txid).is_none());
+    }
+
+    #[test]
+    fn deep_invalidation_skips_transactions_older_than_core_limit() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let transaction = private_broadcast_test_transaction(&node);
+        let txid = transaction.compute_txid();
+
+        let previous = *node.chain.read().header(101).unwrap();
+        let mut first = mine_test_block(&previous, 102, 102);
+        first.txdata.push(transaction);
+        first.header.merkle_root = first.compute_merkle_root().unwrap();
+        while !first.header.target().is_met_by(first.block_hash()) {
+            first.header.nonce = first.header.nonce.wrapping_add(1);
+        }
+        let first_hash = first.block_hash();
+        let mut previous = first.header;
+        node.connect_block(first).unwrap();
+        for height in 103..=113 {
+            let block = mine_test_block(&previous, height, height as u8);
+            previous = block.header;
+            node.connect_block(block).unwrap();
+        }
+
+        node.invalidate_block(first_hash).unwrap();
+        assert_eq!(node.chain.read().height(), 101);
         assert!(node.mempool.read().get(&txid).is_none());
     }
 

@@ -868,12 +868,13 @@ fn rest_block(
     };
     drop(chain);
     match format {
-        "json" => rest_json(get_block(
+        "json" if details => rest_json(get_block(
             node,
             // Core's /rest/block endpoint uses SHOW_DETAILS_AND_PREVOUT for
             // the extended JSON form, which is RPC verbosity 3 here.
-            &json!([hash.to_string(), if details { 3 } else { 1 }]),
+            &json!([hash.to_string(), 3]),
         )?),
+        "json" => bail!("JSON output is not supported for this request type"),
         "bin" => Ok(("application/octet-stream", serialize(&block))),
         "hex" => rest_format_bytes(serialize(&block), format),
         _ => bail!("unsupported REST output format"),
@@ -17330,6 +17331,15 @@ mod tests {
             1
         );
         let genesis_hash = node.chain.read().best_hash();
+        assert_eq!(
+            dispatch_rest(
+                &node,
+                &format!("/rest/block/notxdetails/{genesis_hash}.json")
+            )
+            .unwrap_err()
+            .to_string(),
+            "JSON output is not supported for this request type"
+        );
         let (_, block_part) = dispatch_rest(
             &node,
             &format!("/rest/blockpart/{genesis_hash}.hex?offset=0&size=4"),

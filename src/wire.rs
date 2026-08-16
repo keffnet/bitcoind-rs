@@ -804,20 +804,34 @@ fn decode_version(reader: &mut Reader<'_>) -> Result<VersionMessage, WireError> 
     let receiver_services = reader.u64_le()?;
     let receiver_address = reader.array::<16>()?;
     let receiver_port = reader.u16_be()?;
-    let sender_services = reader.u64_le()?;
-    let sender_address = reader.array::<16>()?;
-    let sender_port = reader.u16_be()?;
-    let nonce = reader.u64_le()?;
-    let user_agent_len = usize::try_from(reader.compact_size()?)
-        .map_err(|_| WireError::Payload("user agent length is out of range".to_owned()))?;
-    if user_agent_len > MAX_USER_AGENT_LENGTH {
-        return Err(WireError::Payload(
-            "user agent exceeds Core's 256-byte limit".to_owned(),
-        ));
-    }
-    let user_agent = String::from_utf8(reader.bytes(user_agent_len)?.to_vec())
-        .map_err(|_| WireError::Payload("user agent is not UTF-8".to_owned()))?;
-    let start_height = reader.i32_le()?;
+    let (sender_services, sender_address, sender_port, nonce) = if reader.remaining() != 0 {
+        (
+            reader.u64_le()?,
+            reader.array::<16>()?,
+            reader.u16_be()?,
+            reader.u64_le()?,
+        )
+    } else {
+        (0, [0; 16], 0, 1)
+    };
+    let user_agent = if reader.remaining() != 0 {
+        let user_agent_len = usize::try_from(reader.compact_size()?)
+            .map_err(|_| WireError::Payload("user agent length is out of range".to_owned()))?;
+        if user_agent_len > MAX_USER_AGENT_LENGTH {
+            return Err(WireError::Payload(
+                "user agent exceeds Core's 256-byte limit".to_owned(),
+            ));
+        }
+        String::from_utf8(reader.bytes(user_agent_len)?.to_vec())
+            .map_err(|_| WireError::Payload("user agent is not UTF-8".to_owned()))?
+    } else {
+        String::new()
+    };
+    let start_height = if reader.remaining() != 0 {
+        reader.i32_le()?
+    } else {
+        -1
+    };
     let relay = if reader.remaining() == 0 {
         true
     } else {
@@ -1137,6 +1151,30 @@ mod tests {
         let message = Message::Version(VersionMessage::new(12, 99));
         let frame = encode_message(Network::Bitcoin, &message).unwrap();
         assert_eq!(decode_message(Network::Bitcoin, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn version_accepts_core_legacy_trailing_field_omissions() {
+        let message = VersionMessage::new(12, 99);
+        let mut expected = message.clone();
+        expected.sender_services = 0;
+        expected.sender_address = [0; 16];
+        expected.sender_port = 0;
+        expected.nonce = 1;
+        expected.user_agent.clear();
+        expected.start_height = -1;
+        expected.relay = true;
+
+        let mut frame = encode_message(Network::Bitcoin, &Message::Version(message)).unwrap();
+        frame.truncate(24 + 46);
+        frame[16..20].copy_from_slice(&46u32.to_le_bytes());
+        let frame_checksum = checksum(&frame[24..]);
+        frame[20..24].copy_from_slice(&frame_checksum);
+
+        assert_eq!(
+            decode_message(Network::Bitcoin, &frame).unwrap(),
+            Message::Version(expected)
+        );
     }
 
     #[test]

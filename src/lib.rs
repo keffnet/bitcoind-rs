@@ -1512,19 +1512,8 @@ impl Node {
         self.asmap.as_ref()?.mapped_as(endpoint)
     }
 
-    pub(crate) fn addrman_siphash_keys(&self) -> (u64, u64) {
-        (
-            u64::from_le_bytes(
-                self.addrman_key[..8]
-                    .try_into()
-                    .expect("addrman key length"),
-            ),
-            u64::from_le_bytes(
-                self.addrman_key[8..16]
-                    .try_into()
-                    .expect("addrman key length"),
-            ),
-        )
+    pub(crate) fn addrman_hash_key(&self) -> &[u8; 32] {
+        &self.addrman_key
     }
 
     fn log_asmap_health(&self) {
@@ -5950,12 +5939,12 @@ mod tests {
     fn address_manager_secret_survives_a_restart() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(test_config(directory.path())).unwrap();
-        let keys = node.addrman_siphash_keys();
+        let key = *node.addrman_hash_key();
         assert!(directory.path().join(ADDRMAN_SECRET_FILE).is_file());
         drop(node);
 
         let reopened = Node::open(test_config(directory.path())).unwrap();
-        assert_eq!(reopened.addrman_siphash_keys(), keys);
+        assert_eq!(*reopened.addrman_hash_key(), key);
     }
 
     #[test]

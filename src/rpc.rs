@@ -19,7 +19,7 @@ use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{Decodable, VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::ecdsa::Signature as EcdsaSignature;
-use bitcoin::hashes::{Hash, siphash24};
+use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::key::TapTweak;
 use bitcoin::psbt::{GetKey, Input as PsbtInput, KeyRequest, Psbt};
 use bitcoin::secp256k1::{Message, Secp256k1};
@@ -3439,14 +3439,25 @@ const ADDRMAN_TRIED_BUCKET_COUNT: usize = 256;
 const ADDRMAN_BUCKET_SIZE: usize = 64;
 
 fn addrman_endpoint_key(endpoint: &NetworkEndpoint) -> Vec<u8> {
-    let mut key = Vec::new();
-    if let Some((network, address)) = endpoint.to_addr_v2() {
-        key.push(network);
-        key.extend_from_slice(&address);
-    } else {
-        key.push(0);
-        key.extend_from_slice(endpoint.host_string().as_bytes());
-    }
+    // CService::GetKey() is the address bytes followed by the port in
+    // network byte order. The BIP155 network discriminator is deliberately
+    // not part of the key.
+    let mut key = match endpoint {
+        NetworkEndpoint::Ip(address) => match address.ip() {
+            IpAddr::V4(address) => {
+                let mut key = vec![0; 12];
+                key.extend_from_slice(&[0xff, 0xff]);
+                key.extend_from_slice(&address.octets());
+                key
+            }
+            IpAddr::V6(address) => address.octets().to_vec(),
+        },
+        NetworkEndpoint::Dns { host, .. } => host.as_bytes().to_vec(),
+        NetworkEndpoint::OnionV2 { address, .. } => address.to_vec(),
+        NetworkEndpoint::OnionV3 { address, .. } => address.to_vec(),
+        NetworkEndpoint::I2p { address, .. } => address.to_vec(),
+        NetworkEndpoint::Cjdns { address, .. } => address.octets().to_vec(),
+    };
     key.extend_from_slice(&endpoint.port().to_be_bytes());
     key
 }
@@ -3462,7 +3473,7 @@ fn addrman_group(endpoint: &NetworkEndpoint) -> Vec<u8> {
         },
         NetworkEndpoint::Cjdns { address, .. } => {
             let octets = address.octets();
-            vec![6, octets[0], octets[1], octets[2], octets[3]]
+            vec![5, octets[0], octets[1] | 0x0f]
         }
         NetworkEndpoint::Dns { host, .. } => {
             let digest = Sha256::digest(host.to_ascii_lowercase().as_bytes());
@@ -3470,23 +3481,41 @@ fn addrman_group(endpoint: &NetworkEndpoint) -> Vec<u8> {
             group.extend_from_slice(&digest[..4]);
             group
         }
-        NetworkEndpoint::OnionV2 { .. } => vec![3],
-        NetworkEndpoint::OnionV3 { .. } => vec![4],
-        NetworkEndpoint::I2p { .. } => vec![5],
+        NetworkEndpoint::OnionV2 { address, .. } => vec![3, address[0] | 0x0f],
+        NetworkEndpoint::OnionV3 { address, .. } => vec![3, address[0] | 0x0f],
+        NetworkEndpoint::I2p { address, .. } => vec![4, address[0] | 0x0f],
     }
 }
 
-fn addrman_hash(keys: (u64, u64), domain: u8, parts: &[&[u8]]) -> u64 {
-    let mut input = vec![domain];
-    for part in parts {
-        input.extend_from_slice(
-            &u32::try_from(part.len())
-                .expect("address-manager hash component length fits u32")
-                .to_le_bytes(),
-        );
-        input.extend_from_slice(part);
+fn append_compact_size(input: &mut Vec<u8>, value: usize) {
+    let value = u64::try_from(value).expect("address-manager vector length fits u64");
+    if value <= 252 {
+        input.push(value as u8);
+    } else if value <= u64::from(u16::MAX) {
+        input.push(253);
+        input.extend_from_slice(&(value as u16).to_le_bytes());
+    } else if value <= u64::from(u32::MAX) {
+        input.push(254);
+        input.extend_from_slice(&(value as u32).to_le_bytes());
+    } else {
+        input.push(255);
+        input.extend_from_slice(&value.to_le_bytes());
     }
-    siphash24::Hash::hash_to_u64_with_keys(keys.0, keys.1, &input)
+}
+
+fn append_serialized_bytes(input: &mut Vec<u8>, bytes: &[u8]) {
+    append_compact_size(input, bytes.len());
+    input.extend_from_slice(bytes);
+}
+
+fn addrman_hash<F>(key: &[u8; 32], append: F) -> u64
+where
+    F: FnOnce(&mut Vec<u8>),
+{
+    let mut input = key.to_vec();
+    append(&mut input);
+    let digest = sha256d::Hash::hash(&input).to_byte_array();
+    u64::from_le_bytes(digest[..8].try_into().expect("hash has eight-byte prefix"))
 }
 
 fn addrman_location(
@@ -3499,25 +3528,37 @@ fn addrman_location(
     let endpoint_key = addrman_endpoint_key(endpoint);
     let endpoint_group = addrman_group(endpoint);
     let source_group = addrman_group(source);
-    let bucket_count = if tried {
-        ADDRMAN_TRIED_BUCKET_COUNT
+    let (bucket_count, bucket) = if tried {
+        let hash1 = addrman_hash(node.addrman_hash_key(), |input| {
+            append_serialized_bytes(input, &endpoint_key);
+        });
+        let hash2 = addrman_hash(node.addrman_hash_key(), |input| {
+            append_serialized_bytes(input, &endpoint_group);
+            input.extend_from_slice(&(hash1 % 8).to_le_bytes());
+        });
+        (
+            ADDRMAN_TRIED_BUCKET_COUNT,
+            (hash2 as usize) % ADDRMAN_TRIED_BUCKET_COUNT,
+        )
     } else {
-        ADDRMAN_NEW_BUCKET_COUNT
+        let hash1 = addrman_hash(node.addrman_hash_key(), |input| {
+            append_serialized_bytes(input, &endpoint_group);
+            append_serialized_bytes(input, &source_group);
+        });
+        let hash2 = addrman_hash(node.addrman_hash_key(), |input| {
+            append_serialized_bytes(input, &source_group);
+            input.extend_from_slice(&(hash1 % 64).to_le_bytes());
+        });
+        (
+            ADDRMAN_NEW_BUCKET_COUNT,
+            (hash2 as usize) % ADDRMAN_NEW_BUCKET_COUNT,
+        )
     };
-    let domain = if tried { b'T' } else { b'N' };
-    let bucket_parts: [&[u8]; 2] = if tried {
-        [endpoint_group.as_slice(), endpoint_key.as_slice()]
-    } else {
-        [endpoint_group.as_slice(), source_group.as_slice()]
-    };
-    let bucket =
-        (addrman_hash(node.addrman_siphash_keys(), domain, &bucket_parts) as usize) % bucket_count;
-    let bucket_bytes = bucket.to_le_bytes();
-    let preferred_position = (addrman_hash(
-        node.addrman_siphash_keys(),
-        domain.wrapping_add(1),
-        &[bucket_bytes.as_slice(), endpoint_key.as_slice()],
-    ) as usize)
+    let preferred_position = (addrman_hash(node.addrman_hash_key(), |input| {
+        input.push(if tried { b'K' } else { b'N' });
+        input.extend_from_slice(&(bucket as i32).to_le_bytes());
+        append_serialized_bytes(input, &endpoint_key);
+    }) as usize)
         % ADDRMAN_BUCKET_SIZE;
 
     for bucket_offset in 0..bucket_count {

@@ -505,6 +505,8 @@ pub enum MempoolError {
     NegativeFee,
     #[error("transaction fee rate is below the relay minimum")]
     FeeRate,
+    #[error("min relay fee not met")]
+    MinRelayFee,
     #[error("transaction script validation failed: {0}")]
     Script(String),
     #[error("transaction is non-standard: {0}")]
@@ -1613,13 +1615,16 @@ impl Mempool {
                 .last()
                 .ok_or(MempoolError::Empty)?
                 .compute_txid();
-            let child = candidate.get(&child_txid).ok_or(MempoolError::BadOutput)?;
-            if !fee_rate_meets(
-                candidate.modified_fee_sat(&child_txid, child.fee_sat),
-                child.vsize,
-                candidate.mempool_min_fee_sat_per_kvb(),
-            ) {
-                return Err(MempoolError::FeeRate);
+            let (child_fee, child_vsize) = {
+                let child = candidate.get(&child_txid).ok_or(MempoolError::BadOutput)?;
+                (
+                    candidate.modified_fee_sat(&child_txid, child.fee_sat),
+                    child.vsize,
+                )
+            };
+            let minimum_fee = candidate.mempool_min_fee_sat_per_kvb();
+            if !fee_rate_meets(child_fee, child_vsize, minimum_fee) {
+                return Err(candidate.fee_rate_error(child_fee, child_vsize));
             }
         }
         if new_count > 0
@@ -1629,7 +1634,7 @@ impl Mempool {
                 candidate.mempool_min_fee_sat_per_kvb(),
             )
         {
-            return Err(MempoolError::FeeRate);
+            return Err(candidate.fee_rate_error(package_fee, package_vsize));
         }
         if package_rbf && conflicting_fee > 0 {
             let required_fee = conflicting_fee.saturating_add(fee_for_rate(
@@ -2170,7 +2175,7 @@ impl Mempool {
                 self.mempool_min_fee_sat_per_kvb(),
             )
         {
-            return Err(MempoolError::FeeRate);
+            return Err(self.fee_rate_error(i128::from(modified_fee_sat), vsize));
         }
         if enforce_mempool_policy {
             match self.policy.truc_policy {
@@ -2239,6 +2244,15 @@ impl Mempool {
             Some(MempoolError::AlreadyPresent)
         } else {
             Some(MempoolError::SameNonWitnessData(wtxid))
+        }
+    }
+
+    fn fee_rate_error(&mut self, fee_sat: i128, vsize: u64) -> MempoolError {
+        let rolling_min_fee = self.mempool_get_min_fee_sat_per_kvb();
+        if rolling_min_fee != 0 && !fee_rate_meets(fee_sat, vsize, rolling_min_fee) {
+            MempoolError::FeeRate
+        } else {
+            MempoolError::MinRelayFee
         }
     }
 
@@ -4923,6 +4937,30 @@ mod tests {
 
         assert_eq!(pool.mempool_get_min_fee_sat_per_kvb(), 1_000);
         assert_eq!(pool.mempool_min_fee_sat_per_kvb(), 1_000);
+    }
+
+    #[test]
+    fn fee_rate_errors_distinguish_rolling_and_static_relay_floors() {
+        let mut pool = Mempool::new(Network::Regtest);
+        assert!(matches!(
+            pool.fee_rate_error(0, 100),
+            MempoolError::MinRelayFee
+        ));
+
+        pool.rolling_min_fee_sat_per_kvb = 10_000.0;
+        assert!(matches!(pool.fee_rate_error(0, 100), MempoolError::FeeRate));
+
+        let policy = MempoolPolicy {
+            min_relay_fee_sat_per_kvb: 1_000,
+            ..MempoolPolicy::default()
+        };
+        let mut static_floor_pool =
+            Mempool::with_max_bytes_and_policy(Network::Regtest, 1_000_000, policy);
+        static_floor_pool.rolling_min_fee_sat_per_kvb = 100.0;
+        assert!(matches!(
+            static_floor_pool.fee_rate_error(15, 100),
+            MempoolError::MinRelayFee
+        ));
     }
 
     fn insert_policy_entry(pool: &mut Mempool, transaction: Transaction) -> Txid {

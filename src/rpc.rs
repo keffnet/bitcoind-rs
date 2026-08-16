@@ -11712,6 +11712,7 @@ fn mempool_reject_reason(error: &MempoolError) -> String {
         }
         MempoolError::MissingInput(_) => "missing-inputs".to_owned(),
         MempoolError::FeeRate => "mempool min fee not met".to_owned(),
+        MempoolError::MinRelayFee => "min relay fee not met".to_owned(),
         MempoolError::NonStandard(reason) => reason.clone(),
         MempoolError::ClusterLimit => "too-long-mempool-chain".to_owned(),
         MempoolError::Truc(reason) => format!("TRUC-violation, {reason}"),
@@ -14617,6 +14618,8 @@ mod tests {
             rejected["reject-details"],
             "transaction fee rate is below the relay minimum"
         );
+        let relay_rejected = rejected_transaction_json(&transaction, &MempoolError::MinRelayFee);
+        assert_eq!(relay_rejected["reject-reason"], "min relay fee not met");
         let missing =
             rejected_transaction_json(&transaction, &MempoolError::MissingInput(OutPoint::null()));
         assert!(missing.get("reject-details").is_none());

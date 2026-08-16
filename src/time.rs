@@ -40,7 +40,34 @@ pub fn unix_time_millis() -> u128 {
         .as_millis()
 }
 
+/// Return the system Unix time in milliseconds without applying regtest
+/// mocktime. Core's network-traffic RPCs use the system clock for this field,
+/// even while consensus and peer timestamps use mocktime.
+pub fn system_unix_time_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// Return Unix time as a signed value for wire timestamps.
 pub fn unix_time_i64() -> i64 {
     i64::try_from(unix_time()).unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_millis_ignores_mocktime() {
+        let previous = mock_time();
+        set_mock_time(1);
+        let system = system_unix_time_millis();
+        let mock = unix_time_millis();
+        set_mock_time(previous);
+
+        assert_eq!(mock, 1_000);
+        assert!(system > mock);
+    }
 }

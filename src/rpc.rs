@@ -2593,7 +2593,7 @@ fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
     Ok(json!({
         "totalbytesrecv": total_bytes_recv,
         "totalbytessent": total_bytes_sent,
-        "timemillis": crate::time::unix_time_millis(),
+        "timemillis": crate::time::system_unix_time_millis(),
         "uploadtarget": {
             "timeframe": node.max_upload_timeframe(),
             "target": node.max_upload_target(),

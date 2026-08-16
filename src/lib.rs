@@ -640,6 +640,10 @@ pub struct PeerInfo {
     pub last_transaction: u64,
     pub last_block: u64,
     pub(crate) best_known_block: Option<BlockHash>,
+    // Core keeps the latest block announcement that is not in the global
+    // index yet.  Once another peer supplies the missing headers, the
+    // announcement can be promoted to best_known_block.
+    pub(crate) last_unknown_block: Option<BlockHash>,
     pub(crate) last_common_block: Option<BlockHash>,
     pub(crate) presynced_headers: i64,
     pub(crate) bip152_highbandwidth_to: bool,
@@ -2560,20 +2564,38 @@ impl Node {
 
     pub(crate) fn update_peer_best_known_block(&self, peer_id: usize, hash: BlockHash) {
         let chain = self.chain.read();
-        let Some(candidate_work) = chain.chain_work_by_hash(&hash) else {
-            return;
-        };
         let mut peers = self.peers.write();
         let Some(peer) = peers.get_mut(&peer_id) else {
             return;
         };
-        let should_update = peer.best_known_block.is_none_or(|current| {
-            chain
-                .chain_work_by_hash(&current)
-                .is_none_or(|current_work| candidate_work >= current_work)
-        });
-        if should_update {
-            peer.best_known_block = Some(hash);
+
+        let mut update_known = |candidate_hash: BlockHash, candidate_work| {
+            let should_update = peer.best_known_block.is_none_or(|current| {
+                chain
+                    .chain_work_by_hash(&current)
+                    .is_none_or(|current_work| candidate_work >= current_work)
+            });
+            if should_update {
+                peer.best_known_block = Some(candidate_hash);
+            }
+        };
+
+        // Match Core's ProcessBlockAvailability: resolve the previously
+        // unknown announcement before handling the new one.
+        if let Some(unknown_hash) = peer.last_unknown_block.take() {
+            if let Some(unknown_work) = chain.chain_work_by_hash(&unknown_hash) {
+                update_known(unknown_hash, unknown_work);
+            } else {
+                peer.last_unknown_block = Some(unknown_hash);
+            }
+        }
+
+        if let Some(candidate_work) = chain.chain_work_by_hash(&hash) {
+            update_known(hash, candidate_work);
+        } else {
+            // An unindexed announcement is retained until a later header or
+            // block update gives us enough information to compare its work.
+            peer.last_unknown_block = Some(hash);
         }
     }
 
@@ -3011,6 +3033,7 @@ impl Node {
             last_transaction: 0,
             last_block: 0,
             best_known_block: None,
+            last_unknown_block: None,
             last_common_block: None,
             presynced_headers: -1,
             bip152_highbandwidth_to: false,
@@ -3561,6 +3584,7 @@ impl Node {
                 last_transaction: 0,
                 last_block: 0,
                 best_known_block: None,
+                last_unknown_block: None,
                 last_common_block: None,
                 presynced_headers: -1,
                 bip152_highbandwidth_to: false,
@@ -3627,6 +3651,7 @@ impl Node {
             last_transaction: 0,
             last_block: 0,
             best_known_block: None,
+            last_unknown_block: None,
             last_common_block: None,
             presynced_headers: -1,
             bip152_highbandwidth_to: false,
@@ -4664,6 +4689,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                         last_transaction: 0,
                         last_block: 0,
                         best_known_block: None,
+                        last_unknown_block: None,
                         last_common_block: None,
                         presynced_headers: -1,
                         bip152_highbandwidth_to: false,
@@ -5463,6 +5489,40 @@ mod tests {
             core_block_download_timeout(interval, 10),
             Duration::from_secs(3_600)
         );
+    }
+
+    #[test]
+    fn peer_unknown_block_availability_is_resolved_after_header_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+
+        let genesis = *node.chain.read().header(0).unwrap();
+        let block = mine_test_block(&genesis, 1, 99);
+        let hash = block.block_hash();
+        node.update_peer_best_known_block(1, hash);
+        let before = node
+            .peer_infos()
+            .into_iter()
+            .find(|peer| peer.id == 1)
+            .unwrap();
+        assert_eq!(before.best_known_block, None);
+        assert_eq!(before.last_unknown_block, Some(hash));
+
+        node.chain
+            .write()
+            .accept_headers(std::slice::from_ref(&block.header))
+            .unwrap();
+        node.update_peer_best_known_block(1, genesis.block_hash());
+
+        let after = node
+            .peer_infos()
+            .into_iter()
+            .find(|peer| peer.id == 1)
+            .unwrap();
+        assert_eq!(after.best_known_block, Some(hash));
+        assert_eq!(after.last_unknown_block, None);
     }
 
     #[test]

@@ -3730,6 +3730,13 @@ async fn serve_peer_loop(
                     // missing chain instead of disconnecting merely because
                     // this peer announced a header before another peer did.
                     debug!(%parent_hash, "received unconnecting headers");
+                    node.update_peer_best_known_block(
+                        peer_id,
+                        headers_to_accept
+                            .last()
+                            .expect("non-empty headers batch")
+                            .block_hash(),
+                    );
                     request_headers(node, peer_id, writer, peer_state).await?;
                     continue;
                 }

@@ -3982,7 +3982,7 @@ async fn serve_peer_loop(
                         }
                         kind if kind.is_transaction() => {
                             if !peer_can_serve_transaction_getdata(
-                                peer_state.local_relay_transactions,
+                                peer_state.connection_type,
                                 *relay_transactions.lock(),
                                 node.config.peer_bloom_filters,
                                 peer_state.permissions,
@@ -5754,15 +5754,17 @@ fn mempool_request_exceeds_upload_limit(
 }
 
 fn peer_can_serve_transaction_getdata(
-    local_relay_transactions: bool,
+    connection_type: &str,
     peer_relay_transactions: bool,
-    peer_bloom_filters: bool,
+    local_bloom_filters: bool,
     permissions: PeerPermissions,
 ) -> bool {
-    local_relay_transactions
-        && (peer_relay_transactions
-            || peer_bloom_filters
-            || permissions.contains(PeerPermissions::BLOOM_FILTER))
+    !matches!(
+        connection_type,
+        "block-relay-only" | "feeler" | "private-broadcast"
+    ) && (peer_relay_transactions
+        || local_bloom_filters
+        || permissions.contains(PeerPermissions::BLOOM_FILTER))
 }
 
 fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
@@ -7623,31 +7625,31 @@ mod tests {
     #[test]
     fn transaction_getdata_serving_is_separate_from_relay_announcements() {
         assert!(peer_can_serve_transaction_getdata(
-            true,
+            "outbound-full",
             true,
             false,
             PeerPermissions::empty()
         ));
         assert!(!peer_can_serve_transaction_getdata(
-            true,
+            "outbound-full",
             false,
             false,
             PeerPermissions::empty()
         ));
         assert!(peer_can_serve_transaction_getdata(
-            true,
+            "outbound-full",
             false,
             true,
             PeerPermissions::empty()
         ));
         assert!(peer_can_serve_transaction_getdata(
-            true,
+            "outbound-full",
             false,
             false,
             PeerPermissions::BLOOM_FILTER
         ));
         assert!(!peer_can_serve_transaction_getdata(
-            false,
+            "block-relay-only",
             true,
             true,
             PeerPermissions::BLOOM_FILTER

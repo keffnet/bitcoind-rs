@@ -2760,11 +2760,11 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .transpose()?
         .unwrap_or(true);
     let target = params.get(1).filter(|value| !value.is_null());
-    if target.is_some() && hash_type == "hash_serialized_3" {
-        bail!("hash_serialized_3 hash type cannot be queried for a specific block")
-    }
     if target.is_some() && !node.config.coinstatsindex {
         bail!("Querying specific block heights requires coinstatsindex")
+    }
+    if target.is_some() && hash_type == "hash_serialized_3" {
+        bail!("hash_serialized_3 hash type cannot be queried for a specific block")
     }
     if target.is_some() && !use_index {
         bail!("Cannot set use_index to false when querying for a specific block")
@@ -2776,25 +2776,28 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let include_serialized_hash = hash_type == "hash_serialized_3";
     let include_muhash = hash_type == "muhash";
     let (height, bestblock, stats, disk_size) = if let Some(value) = target {
-        let target_hash = if let Some(height) = value.as_u64() {
+        let target_hash = if let Some(height) = value.as_i64() {
+            if height < 0 {
+                bail!("Target block height {height} is negative")
+            }
             let height = u32::try_from(height).context("hash_or_height is too large")?;
+            if height > chain.height() {
+                bail!(
+                    "Target block height {height} after current tip {}",
+                    chain.height()
+                )
+            }
             chain
                 .block_hash(height)
                 .ok_or_else(|| anyhow!("block height out of range"))?
         } else if let Some(text) = value.as_str() {
-            if let Ok(hash) = text.parse::<BlockHash>() {
-                hash
-            } else {
-                let height = text
-                    .parse::<u32>()
-                    .context("hash_or_height must be a block hash or height")?;
-                chain
-                    .block_hash(height)
-                    .ok_or_else(|| anyhow!("block height out of range"))?
-            }
+            text.parse::<BlockHash>()?
         } else {
             bail!("hash_or_height must be a block hash or height")
         };
+        if chain.block_height_by_hash(&target_hash).is_none() {
+            bail!("Block not found")
+        }
         let (height, stats) = chain
             .coinstats_at(&target_hash, include_muhash)?
             .ok_or_else(|| anyhow!("block is not available"))?;

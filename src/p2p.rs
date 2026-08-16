@@ -4800,12 +4800,6 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::FeeFilter(rate) => {
-                if peer_state
-                    .permissions
-                    .contains(PeerPermissions::FORCE_RELAY)
-                {
-                    continue;
-                }
                 if !fee_filter_in_money_range(rate) {
                     continue;
                 }

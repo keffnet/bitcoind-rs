@@ -2286,7 +2286,14 @@ impl ChainState {
             .invalid_blocks
             .iter()
             .copied()
-            .filter(|candidate| self.is_descendant_or_self(candidate, hash))
+            // Core clears BLOCK_FAILED_VALID on the requested block, all of
+            // its descendants, and all of its ancestors.  The ancestor
+            // portion matters when a descendant is supplied to
+            // reconsiderblock after its invalid parent was marked failed.
+            .filter(|candidate| {
+                self.is_descendant_or_self(candidate, hash)
+                    || self.is_descendant_or_self(hash, candidate)
+            })
             .collect();
         for candidate in reconsidered {
             self.invalid_blocks.remove(&candidate);

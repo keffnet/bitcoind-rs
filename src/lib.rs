@@ -6015,6 +6015,35 @@ mod tests {
     }
 
     #[test]
+    fn reconsider_block_clears_invalid_ancestors() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let main_one = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 1);
+        node.connect_block(main_one).unwrap();
+        let main_two = mine_test_block(&node.chain.read().header(1).unwrap().to_owned(), 2, 2);
+        node.connect_block(main_two).unwrap();
+
+        let genesis = node.chain.read().header(0).unwrap().to_owned();
+        let side_one = mine_test_block(&genesis, 1, 3);
+        let side_one_hash = side_one.block_hash();
+        let side_one_header = side_one.header;
+        node.connect_block(side_one).unwrap();
+        let side_two = mine_test_block(&side_one_header, 2, 4);
+        let side_two_header = side_two.header;
+        node.connect_block(side_two).unwrap();
+        let side_three = mine_test_block(&side_two_header, 3, 5);
+        let side_three_hash = side_three.block_hash();
+        node.connect_block(side_three).unwrap();
+        assert_eq!(node.chain.read().best_hash(), side_three_hash);
+
+        node.invalidate_block(side_one_hash).unwrap();
+        assert_eq!(node.chain.read().height(), 2);
+
+        node.reconsider_block(side_three_hash).unwrap();
+        assert_eq!(node.chain.read().best_hash(), side_three_hash);
+    }
+
+    #[test]
     fn discovered_addresses_survive_a_restart() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(test_config(directory.path())).unwrap();

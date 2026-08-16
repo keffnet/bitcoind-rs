@@ -4265,10 +4265,11 @@ async fn serve_peer_loop(
                         && node.allow_peer_address(peer_id)
                     {
                         let endpoint = NetworkEndpoint::from_socket(address);
-                        if node.remember_network_address(
+                        if node.remember_network_address_from(
                             endpoint.clone(),
                             entry.services,
                             u64::from(entry.time),
+                            peer_state.endpoint.clone(),
                         ) {
                             relay_addresses.push((endpoint, entry.services, u64::from(entry.time)));
                         }
@@ -4291,10 +4292,11 @@ async fn serve_peer_loop(
                         &address.address,
                         address.port,
                     ) && node.allow_peer_address(peer_id)
-                        && node.remember_network_address(
+                        && node.remember_network_address_from(
                             endpoint.clone(),
                             address.services,
                             u64::from(address.time),
+                            peer_state.endpoint.clone(),
                         )
                     {
                         relay_addresses.push((endpoint, address.services, u64::from(address.time)));

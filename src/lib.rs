@@ -827,6 +827,12 @@ struct PersistedAddress {
     network: Option<String>,
     #[serde(default)]
     port: Option<u16>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_network: Option<String>,
+    #[serde(default)]
+    source_port: Option<u16>,
 }
 
 type LoadedAddressState = (
@@ -834,6 +840,7 @@ type LoadedAddressState = (
     HashSet<SocketAddr>,
     HashMap<NetworkEndpoint, KnownNetworkAddress>,
     HashSet<NetworkEndpoint>,
+    HashMap<NetworkEndpoint, NetworkEndpoint>,
 );
 
 type LoadedBanState = (
@@ -906,6 +913,7 @@ pub struct Node {
     tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
     network_addresses: parking_lot::RwLock<HashMap<NetworkEndpoint, KnownNetworkAddress>>,
     network_tried_addresses: parking_lot::RwLock<HashSet<NetworkEndpoint>>,
+    network_address_sources: parking_lot::RwLock<HashMap<NetworkEndpoint, NetworkEndpoint>>,
     added_nodes: parking_lot::RwLock<HashMap<NetworkEndpoint, Option<bool>>>,
     added_node_names: parking_lot::RwLock<HashMap<NetworkEndpoint, String>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
@@ -1148,19 +1156,25 @@ impl Node {
             }
         };
         let peers_path = config.datadir.join("peers.json");
-        let (known_addresses, tried_addresses, network_addresses, network_tried_addresses) =
-            match load_known_addresses(&config.datadir) {
-                Ok(state) => state,
-                Err(error) => {
-                    quarantine_persistent_file(&peers_path, &error);
-                    (
-                        HashMap::new(),
-                        HashSet::new(),
-                        HashMap::new(),
-                        HashSet::new(),
-                    )
-                }
-            };
+        let (
+            known_addresses,
+            tried_addresses,
+            network_addresses,
+            network_tried_addresses,
+            network_address_sources,
+        ) = match load_known_addresses(&config.datadir) {
+            Ok(state) => state,
+            Err(error) => {
+                quarantine_persistent_file(&peers_path, &error);
+                (
+                    HashMap::new(),
+                    HashSet::new(),
+                    HashMap::new(),
+                    HashSet::new(),
+                    HashMap::new(),
+                )
+            }
+        };
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
@@ -1223,6 +1237,7 @@ impl Node {
             tried_addresses: parking_lot::RwLock::new(tried_addresses),
             network_addresses: parking_lot::RwLock::new(network_addresses),
             network_tried_addresses: parking_lot::RwLock::new(network_tried_addresses),
+            network_address_sources: parking_lot::RwLock::new(network_address_sources),
             added_nodes: parking_lot::RwLock::new(added_nodes),
             added_node_names: parking_lot::RwLock::new(added_node_names),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
@@ -2960,6 +2975,10 @@ impl Node {
                 if self.reserve_known_address(&mut known, address) {
                     known.insert(address, peer);
                     self.tried_addresses.write().insert(address);
+                    self.network_address_sources
+                        .write()
+                        .entry(endpoint.clone())
+                        .or_insert(endpoint.clone());
                 }
             } else {
                 let mut known = self.network_addresses.write();
@@ -2974,6 +2993,10 @@ impl Node {
                             });
                     entry.time = entry.time.max(connected_at);
                     self.network_tried_addresses.write().insert(endpoint);
+                    self.network_address_sources
+                        .write()
+                        .entry(peer.endpoint.clone())
+                        .or_insert(peer.endpoint.clone());
                 }
             }
         }
@@ -3313,6 +3336,28 @@ impl Node {
         addresses
     }
 
+    /// Return the peer or discovery endpoint that introduced an address to
+    /// the address manager. Older persisted entries have no source metadata,
+    /// so the address itself is the Core-compatible fallback.
+    pub(crate) fn network_address_source(&self, endpoint: &NetworkEndpoint) -> NetworkEndpoint {
+        self.network_address_sources
+            .read()
+            .get(endpoint)
+            .cloned()
+            .unwrap_or_else(|| endpoint.clone())
+    }
+
+    fn remember_network_address_source(
+        &self,
+        endpoint: &NetworkEndpoint,
+        source: &NetworkEndpoint,
+    ) {
+        self.network_address_sources
+            .write()
+            .entry(endpoint.clone())
+            .or_insert_with(|| source.clone());
+    }
+
     pub(crate) fn is_address_tried(&self, address: SocketAddr) -> bool {
         self.tried_addresses.read().contains(&address)
     }
@@ -3358,8 +3403,11 @@ impl Node {
         );
         drop(known);
         if tried {
-            self.network_tried_addresses.write().insert(endpoint);
+            self.network_tried_addresses
+                .write()
+                .insert(endpoint.clone());
         }
+        self.remember_network_address_source(&endpoint, &endpoint);
         self.maybe_check_addrman();
         true
     }
@@ -3370,11 +3418,26 @@ impl Node {
         services: u64,
         time: u64,
     ) -> bool {
+        let source = endpoint.clone();
+        self.remember_network_address_from(endpoint, services, time, source)
+    }
+
+    pub(crate) fn remember_network_address_from(
+        &self,
+        endpoint: NetworkEndpoint,
+        services: u64,
+        time: u64,
+        source: NetworkEndpoint,
+    ) -> bool {
         if !self.config.allows_network_endpoint(&endpoint) {
             return false;
         }
         if let Some(address) = endpoint.legacy_socket_addr() {
-            return self.remember_address(address, services, time);
+            let is_new = self.remember_address(address, services, time);
+            if is_new || self.known_addresses.read().contains_key(&address) {
+                self.remember_network_address_source(&endpoint, &source);
+            }
+            return is_new;
         }
         let mut known = self.network_addresses.write();
         if !self.reserve_network_address(&mut known, &endpoint) {
@@ -3384,13 +3447,14 @@ impl Node {
         let entry = known
             .entry(endpoint.clone())
             .or_insert_with(|| KnownNetworkAddress {
-                endpoint,
+                endpoint: endpoint.clone(),
                 services,
                 time,
             });
         entry.services |= services;
         entry.time = entry.time.max(time);
         drop(known);
+        self.remember_network_address_source(&endpoint, &source);
         self.maybe_check_addrman();
         is_new
     }
@@ -3453,9 +3517,10 @@ impl Node {
             },
         );
         drop(known);
+        let endpoint = NetworkEndpoint::from_socket(address);
+        self.remember_network_address_source(&endpoint, &endpoint);
         if tried {
             self.tried_addresses.write().insert(address);
-            let endpoint = NetworkEndpoint::from_socket(address);
             if matches!(endpoint, NetworkEndpoint::Cjdns { .. }) {
                 self.network_tried_addresses.write().insert(endpoint);
             }
@@ -3546,6 +3611,9 @@ impl Node {
         drop(tried);
         if let Some(eviction) = eviction {
             known.remove(&eviction);
+            self.network_address_sources
+                .write()
+                .remove(&NetworkEndpoint::from_socket(eviction));
             true
         } else {
             false
@@ -3569,6 +3637,7 @@ impl Node {
         drop(tried);
         if let Some(eviction) = eviction {
             known.remove(&eviction);
+            self.network_address_sources.write().remove(&eviction);
             true
         } else {
             false
@@ -4260,28 +4329,35 @@ impl Node {
             .known_addresses
             .read()
             .values()
-            .map(|peer| PersistedAddress {
-                address: peer.address.to_string(),
-                services: peer.services,
-                time: peer.connected_at,
-                tried: self.is_address_tried(peer.address),
-                network: None,
-                port: None,
+            .map(|peer| {
+                let source = self.network_address_source(&peer.endpoint);
+                PersistedAddress {
+                    address: peer.address.to_string(),
+                    services: peer.services,
+                    time: peer.connected_at,
+                    tried: self.is_address_tried(peer.address),
+                    network: None,
+                    port: None,
+                    source: Some(source.host_string()),
+                    source_network: Some(source.network_name().to_owned()),
+                    source_port: Some(source.port()),
+                }
             })
             .collect::<Vec<_>>();
-        entries.extend(
-            self.network_addresses
-                .read()
-                .values()
-                .map(|entry| PersistedAddress {
-                    address: entry.endpoint.host_string(),
-                    services: entry.services,
-                    time: entry.time,
-                    tried: self.is_network_address_tried(&entry.endpoint),
-                    network: Some(entry.endpoint.network_name().to_owned()),
-                    port: Some(entry.endpoint.port()),
-                }),
-        );
+        entries.extend(self.network_addresses.read().values().map(|entry| {
+            let source = self.network_address_source(&entry.endpoint);
+            PersistedAddress {
+                address: entry.endpoint.host_string(),
+                services: entry.services,
+                time: entry.time,
+                tried: self.is_network_address_tried(&entry.endpoint),
+                network: Some(entry.endpoint.network_name().to_owned()),
+                port: Some(entry.endpoint.port()),
+                source: Some(source.host_string()),
+                source_network: Some(source.network_name().to_owned()),
+                source_port: Some(source.port()),
+            }
+        }));
         entries.sort_by(|left, right| {
             left.network
                 .cmp(&right.network)
@@ -4447,6 +4523,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
             HashSet::new(),
             HashMap::new(),
             HashSet::new(),
+            HashMap::new(),
         ));
     }
     let bytes = std::fs::read(path)?;
@@ -4455,9 +4532,11 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
     let mut tried = HashSet::new();
     let mut network_addresses = HashMap::new();
     let mut network_tried_addresses = HashSet::new();
+    let mut network_address_sources = HashMap::new();
     for entry in entries {
         let endpoint =
             NetworkEndpoint::parse(entry.network.as_deref(), &entry.address, entry.port)?;
+        let source = parse_persisted_address_source(&entry, &endpoint)?;
         match endpoint {
             NetworkEndpoint::Ip(address) => {
                 if entry.tried {
@@ -4511,6 +4590,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                         addr_token_timestamp: Instant::now(),
                     },
                 );
+                network_address_sources.insert(NetworkEndpoint::from_socket(address), source);
             }
             endpoint => {
                 if entry.tried {
@@ -4519,15 +4599,35 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                 network_addresses.insert(
                     endpoint.clone(),
                     KnownNetworkAddress {
-                        endpoint,
+                        endpoint: endpoint.clone(),
                         services: entry.services,
                         time: entry.time,
                     },
                 );
+                network_address_sources.insert(endpoint, source);
             }
         }
     }
-    Ok((known, tried, network_addresses, network_tried_addresses))
+    Ok((
+        known,
+        tried,
+        network_addresses,
+        network_tried_addresses,
+        network_address_sources,
+    ))
+}
+
+fn parse_persisted_address_source(
+    entry: &PersistedAddress,
+    endpoint: &NetworkEndpoint,
+) -> Result<NetworkEndpoint> {
+    let Some(source) = entry.source.as_deref() else {
+        return Ok(endpoint.clone());
+    };
+    match entry.source_network.as_deref() {
+        Some(network) => NetworkEndpoint::parse(Some(network), source, entry.source_port),
+        None => NetworkEndpoint::parse(None, source, None),
+    }
 }
 
 fn unix_time_seconds() -> u64 {
@@ -5781,6 +5881,27 @@ mod tests {
         assert_eq!(peer.id, 0);
         assert_eq!(peer.services, crate::wire::NODE_NETWORK);
         assert_eq!(peer.connected_at, 123);
+    }
+
+    #[test]
+    fn address_manager_sources_survive_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let endpoint = NetworkEndpoint::Ip("192.0.2.42:18444".parse().unwrap());
+        let source = NetworkEndpoint::Ip("198.51.100.7:18444".parse().unwrap());
+
+        assert!(node.remember_network_address_from(
+            endpoint.clone(),
+            crate::wire::NODE_NETWORK,
+            123,
+            source.clone(),
+        ));
+        assert_eq!(node.network_address_source(&endpoint), source);
+        node.persist_known_addresses().unwrap();
+        drop(node);
+
+        let reopened = Node::open(test_config(directory.path())).unwrap();
+        assert_eq!(reopened.network_address_source(&endpoint), source);
     }
 
     #[test]

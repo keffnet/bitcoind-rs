@@ -3443,21 +3443,21 @@ fn get_raw_addrman(node: &Arc<Node>) -> Result<Value> {
     for peer in peers {
         let network = peer.endpoint.network_name();
         let host = peer.endpoint.host_string();
+        let source = node.network_address_source(&peer.endpoint);
         let mut entry = json!({
             "address": host,
             "port": peer.endpoint.port(),
             "services": peer.services,
             "time": peer.time,
             "network": network,
-            "source": host,
-            "source_network": network,
+            "source": source.host_string(),
+            "source_network": source.network_name(),
         });
         if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
             entry["mapped_as"] = json!(mapped_as);
-            // The simplified address manager uses the address itself as the
-            // source when no relaying peer is retained. Keep both Core fields
-            // coherent until a source-aware entry is available.
-            entry["source_mapped_as"] = json!(mapped_as);
+        }
+        if let Some(source_mapped_as) = node.mapped_as(&source) {
+            entry["source_mapped_as"] = json!(source_mapped_as);
         }
         let (table, position) = if node.is_network_address_tried(&peer.endpoint) {
             let position = tried_position;
@@ -20264,6 +20264,23 @@ mod tests {
         assert!(raw["tried"].get("0/0").is_some());
         assert!(raw["tried"].get("0/1").is_some());
         assert!(raw["new"]["0/0"].get("source_mapped_as").is_none());
+        let announced = crate::address::NetworkEndpoint::Ip("192.0.2.13:18444".parse().unwrap());
+        let source = crate::address::NetworkEndpoint::Ip("198.51.100.7:18444".parse().unwrap());
+        assert!(node.remember_network_address_from(
+            announced.clone(),
+            crate::wire::NODE_NETWORK,
+            crate::time::unix_time(),
+            source.clone(),
+        ));
+        let raw = dispatch_method(&node, "getrawaddrman", &json!([])).unwrap();
+        let announced_entry = raw["new"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|entry| entry["address"] == "192.0.2.13")
+            .expect("announced address in raw addrman");
+        assert_eq!(announced_entry["source"], "198.51.100.7");
+        assert_eq!(announced_entry["source_network"], "ipv4");
         let now = crate::time::unix_time();
         assert!(node.remember_network_address(
             crate::address::NetworkEndpoint::Ip("192.0.2.11:18444".parse().unwrap()),
@@ -20276,7 +20293,7 @@ mod tests {
             now.saturating_add(10 * 60 + 1),
         ));
         let node_addresses = dispatch_method(&node, "getnodeaddresses", &json!([0])).unwrap();
-        assert_eq!(node_addresses.as_array().unwrap().len(), 3);
+        assert_eq!(node_addresses.as_array().unwrap().len(), 4);
         assert!(
             node_addresses
                 .as_array()

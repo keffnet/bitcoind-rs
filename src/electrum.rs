@@ -462,6 +462,21 @@ fn invalid_request_response() -> Value {
     })
 }
 
+#[derive(Debug)]
+struct ElectrumInvalidParams;
+
+impl std::fmt::Display for ElectrumInvalidParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("invalid Electrum parameters")
+    }
+}
+
+impl std::error::Error for ElectrumInvalidParams {}
+
+fn electrum_invalid_params() -> anyhow::Error {
+    anyhow::Error::new(ElectrumInvalidParams)
+}
+
 fn process_electrum_request(
     node: &Arc<Node>,
     request: &Value,
@@ -512,6 +527,13 @@ fn process_electrum_request(
 }
 
 fn electrum_error_response(id: Value, method: &str, error: anyhow::Error) -> Value {
+    if error.downcast_ref::<ElectrumInvalidParams>().is_some() {
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32602, "message": "invalid params"},
+        });
+    }
     let message = error.to_string();
     if message == format!("unsupported Electrum method {method}") {
         return json!({
@@ -563,7 +585,9 @@ fn dispatch_with_session(
     }
     match method {
         "server.version" => negotiate_version(params, session),
-        "server.ping" => server_ping(params, session.protocol_version),
+        "server.ping" => {
+            server_ping(params, session.protocol_version).map_err(|_| electrum_invalid_params())
+        }
         "server.banner" => Ok(json!("bitcoind-rs wallet-free Bitcoin node")),
         "server.add_peer" => server_add_peer(node, params, session.peer_address),
         "server.donation_address" => Ok(json!("")),
@@ -771,9 +795,7 @@ fn normalize_electrum_params(method: &str, params: &Value) -> Result<Value> {
     if params.is_array() {
         return Ok(params.clone());
     }
-    let object = params
-        .as_object()
-        .ok_or_else(|| anyhow!("Electrum parameters must be an array or object"))?;
+    let object = params.as_object().ok_or_else(electrum_invalid_params)?;
     let names = electrum_parameter_names(method)
         .ok_or_else(|| anyhow!("unsupported Electrum method {method}"))?;
     let mut normalized = vec![Value::Null; names.len()];
@@ -785,7 +807,7 @@ fn normalize_electrum_params(method: &str, params: &Value) -> Result<Value> {
             if method == "server.version" {
                 continue;
             }
-            bail!("unknown named parameter {name} for {method}");
+            return Err(electrum_invalid_params());
         };
         normalized[index] = value.clone();
     }
@@ -966,7 +988,8 @@ fn negotiate_version(params: &Value, session: &mut ElectrumSession) -> Result<Va
     if session.version_negotiated {
         bail!("server.version may only be called once")
     }
-    let (client_min, client_max) = client_protocol_range(params)?;
+    let (client_min, client_max) =
+        client_protocol_range(params).map_err(|_| electrum_invalid_params())?;
     if client_min > client_max {
         bail!("client protocol minimum exceeds maximum")
     }
@@ -1892,8 +1915,8 @@ fn param<T: serde::de::DeserializeOwned>(params: &Value, index: usize) -> Result
     let value = params
         .as_array()
         .and_then(|values| values.get(index))
-        .ok_or_else(|| anyhow!("missing parameter {index}"))?;
-    Ok(serde_json::from_value(value.clone())?)
+        .ok_or_else(electrum_invalid_params)?;
+    serde_json::from_value(value.clone()).map_err(|_| electrum_invalid_params())
 }
 
 #[cfg(test)]
@@ -3419,6 +3442,19 @@ mod tests {
         let response: Value = serde_json::from_slice(&line)?;
         assert_eq!(response["error"]["code"], json!(-32601));
         assert_eq!(response["error"]["message"], json!("method not found"));
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":5,"method":"blockchain.block.header","params":[]}
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["error"]["code"], json!(-32602));
+        assert_eq!(response["error"]["message"], json!("invalid params"));
         drop(reader);
         server.await??;
         Ok(())

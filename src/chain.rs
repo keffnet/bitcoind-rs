@@ -723,6 +723,11 @@ pub struct ChainState {
     snapshot_validation_error: Option<String>,
     background_validation: Option<BackgroundValidation>,
     block_index: HashMap<BlockHash, BlockNode>,
+    // Core's candidate ordering uses a memory-only sequence ID after
+    // chainwork.  Keep the same ordering for equal-work forks; this is not
+    // persisted because Core resets the active chain to zero on restart.
+    block_sequence_ids: HashMap<BlockHash, u64>,
+    next_block_sequence_id: u64,
     orphans: HashMap<BlockHash, Vec<Block>>,
     invalid_blocks: HashSet<BlockHash>,
     prune_height: Option<u32>,
@@ -1113,6 +1118,8 @@ impl ChainState {
                 .and_then(|provenance| provenance.failure.clone()),
             background_validation: None,
             block_index: HashMap::new(),
+            block_sequence_ids: HashMap::new(),
+            next_block_sequence_id: 1,
             orphans: HashMap::new(),
             invalid_blocks,
             prune_height,
@@ -1244,6 +1251,7 @@ impl ChainState {
         }
         state.index_persisted_headers(&persisted_headers)?;
         state.rebuild_block_index()?;
+        state.initialize_block_sequence_ids_after_load();
         if state
             .active_chain
             .iter()
@@ -1253,6 +1261,7 @@ impl ChainState {
                 .best_valid_tip_hash()
                 .context("invalidated chain has no valid alternative")?;
             state.activate_chain(best_valid)?;
+            state.initialize_block_sequence_ids_after_load();
         }
         if loaded_snapshot {
             let snapshot_utxos = state.utxos.clone();
@@ -4119,6 +4128,7 @@ impl ChainState {
                 chain_work,
             },
         );
+        self.assign_block_sequence_id(hash);
         if chain_work > self.tip().work {
             self.activate_chain(hash)?;
         }
@@ -4979,6 +4989,7 @@ impl ChainState {
                 chain_work: parent_work + block.header.work(),
             },
         );
+        self.assign_block_sequence_id(hash);
         if let Some(stats) = self.coin_stats.as_mut() {
             stats.apply_block_metrics(application.metrics);
         }
@@ -5472,9 +5483,53 @@ impl ChainState {
                         self.precious_priority(left_hash)
                             .cmp(&self.precious_priority(right_hash))
                     })
+                    // Core's CBlockIndexWorkComparator prefers the block
+                    // that became fully available first when chainwork is
+                    // equal.  Loaded non-active blocks share one sequence
+                    // ID, so retain a deterministic fallback for that case.
+                    .then_with(|| {
+                        self.block_sequence_id(right_hash)
+                            .cmp(&self.block_sequence_id(left_hash))
+                    })
                     .then_with(|| right_hash.to_string().cmp(&left_hash.to_string()))
             })
             .map(|(hash, _)| *hash)
+    }
+
+    fn assign_block_sequence_id(&mut self, hash: BlockHash) {
+        if self.block_sequence_ids.contains_key(&hash) {
+            return;
+        }
+        let sequence_id = self.next_block_sequence_id;
+        self.block_sequence_ids.insert(hash, sequence_id);
+        self.next_block_sequence_id = self.next_block_sequence_id.saturating_add(1);
+    }
+
+    fn block_sequence_id(&self, hash: &BlockHash) -> u64 {
+        self.block_sequence_ids
+            .get(hash)
+            .copied()
+            .unwrap_or(u64::MAX)
+    }
+
+    /// Recreate Core's restart behavior for its memory-only candidate order:
+    /// active-chain entries are loaded with sequence zero, while full blocks
+    /// already present on non-active forks are loaded with the same neutral
+    /// sequence. Newly received blocks then get increasing IDs.
+    fn initialize_block_sequence_ids_after_load(&mut self) {
+        self.block_sequence_ids.clear();
+        for hash in &self.active_chain {
+            self.block_sequence_ids.insert(*hash, 0);
+        }
+        let active: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
+        let mut has_loaded_fork = false;
+        for hash in self.block_index.keys().copied().collect::<Vec<_>>() {
+            if !active.contains(&hash) && self.store.contains(&hash) {
+                self.block_sequence_ids.insert(hash, 1);
+                has_loaded_fork = true;
+            }
+        }
+        self.next_block_sequence_id = if has_loaded_fork { 2 } else { 1 };
     }
 
     fn has_full_block_data_to_active_fork(&self, hash: BlockHash) -> bool {
@@ -6518,6 +6573,8 @@ fn open_background_replay_state(
         snapshot_validation_error: None,
         background_validation: None,
         block_index: block_index.clone(),
+        block_sequence_ids: HashMap::new(),
+        next_block_sequence_id: 1,
         orphans: HashMap::new(),
         invalid_blocks: HashSet::new(),
         prune_height: None,
@@ -8864,6 +8921,48 @@ mod tests {
         assert_eq!(state.best_hash(), main_two_hash);
         state.reconsider_block(&side_one_hash).unwrap();
         assert_eq!(state.best_hash(), side_two_hash);
+    }
+
+    #[test]
+    fn equal_work_reconsideration_prefers_the_earlier_received_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+
+        let main_one = mine_block(&state, 1);
+        let main_one_hash = main_one.block_hash();
+        state.connect_block(main_one).unwrap();
+        let main_two = mine_block(&state, 2);
+        let main_two_hash = main_two.block_hash();
+        state.connect_block(main_two).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 1);
+        let side_one_hash = side_one.block_hash();
+        state.connect_block(side_one).unwrap();
+        let side_one_header = *state.block_index.get(&side_one_hash).unwrap();
+        let main_two_display_hash = main_two_hash.to_string();
+        let side_two = (2u8..=u8::MAX)
+            .map(|tag| mine_block_from_header(&side_one_header.header, 2, tag))
+            .find(|block| block.block_hash().to_string() > main_two_display_hash)
+            .expect("a side block with a higher display hash");
+        let side_two_hash = side_two.block_hash();
+        state.connect_block(side_two).unwrap();
+
+        assert_eq!(state.best_hash(), main_two_hash);
+        state.invalidate_block(&main_one_hash).unwrap();
+        assert_eq!(state.best_hash(), side_two_hash);
+        state.reconsider_block(&main_one_hash).unwrap();
+
+        // Core's sequence-ID tie-break restores the chain that arrived first,
+        // even though the side-chain hash is larger in display order.
+        assert_eq!(state.best_hash(), main_two_hash);
+
+        drop(state);
+        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        reopened.invalidate_block(&main_one_hash).unwrap();
+        assert_eq!(reopened.best_hash(), side_two_hash);
+        reopened.reconsider_block(&main_one_hash).unwrap();
+        assert_eq!(reopened.best_hash(), main_two_hash);
     }
 
     #[test]

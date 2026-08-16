@@ -507,10 +507,24 @@ fn process_electrum_request(
     }
     Ok(Some(match result {
         Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-        Err(error) => {
-            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -1, "message": error.to_string()}})
-        }
+        Err(error) => electrum_error_response(id, method, error),
     }))
+}
+
+fn electrum_error_response(id: Value, method: &str, error: anyhow::Error) -> Value {
+    let message = error.to_string();
+    if message == format!("unsupported Electrum method {method}") {
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32601, "message": "method not found"},
+        });
+    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": -1, "message": message},
+    })
 }
 
 #[cfg(test)]
@@ -761,7 +775,7 @@ fn normalize_electrum_params(method: &str, params: &Value) -> Result<Value> {
         .as_object()
         .ok_or_else(|| anyhow!("Electrum parameters must be an array or object"))?;
     let names = electrum_parameter_names(method)
-        .ok_or_else(|| anyhow!("named parameters are not supported for {method}"))?;
+        .ok_or_else(|| anyhow!("unsupported Electrum method {method}"))?;
     let mut normalized = vec![Value::Null; names.len()];
     for (name, value) in object {
         let Some(index) = names.iter().position(|candidate| *candidate == name) else {
@@ -3392,6 +3406,19 @@ mod tests {
         assert_eq!(response.as_array().map(Vec::len), Some(1));
         assert_eq!(response[0]["id"], json!(3));
         assert_eq!(response[0]["result"]["protocol_min"], json!("1.4"));
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":4,"method":"server.not-a-method","params":{"future":true}}
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["error"]["code"], json!(-32601));
+        assert_eq!(response["error"]["message"], json!("method not found"));
         drop(reader);
         server.await??;
         Ok(())

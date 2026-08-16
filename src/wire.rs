@@ -22,6 +22,7 @@ pub const MAX_MESSAGE_SIZE: usize = 4_000_000;
 const HEADER_SIZE: usize = 24;
 const MAX_INVENTORY_ITEMS: usize = 50_000;
 const MAX_LOCATOR_HASHES: usize = 101;
+const MAX_USER_AGENT_LENGTH: usize = 256;
 
 pub const NODE_NETWORK: u64 = 1;
 pub const NODE_BLOOM: u64 = 1 << 2;
@@ -768,6 +769,9 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
 }
 
 fn encode_version(version: &VersionMessage, out: &mut Vec<u8>) -> Result<()> {
+    if version.user_agent.len() > MAX_USER_AGENT_LENGTH {
+        bail!("user agent exceeds Core's 256-byte limit");
+    }
     put_i32(version.version, out);
     put_u64(version.services, out);
     put_i64(version.timestamp, out);
@@ -796,7 +800,13 @@ fn decode_version(reader: &mut Reader<'_>) -> Result<VersionMessage, WireError> 
     let sender_address = reader.array::<16>()?;
     let sender_port = reader.u16_be()?;
     let nonce = reader.u64_le()?;
-    let user_agent_len = reader.compact_size()? as usize;
+    let user_agent_len = usize::try_from(reader.compact_size()?)
+        .map_err(|_| WireError::Payload("user agent length is out of range".to_owned()))?;
+    if user_agent_len > MAX_USER_AGENT_LENGTH {
+        return Err(WireError::Payload(
+            "user agent exceeds Core's 256-byte limit".to_owned(),
+        ));
+    }
     let user_agent = String::from_utf8(reader.bytes(user_agent_len)?.to_vec())
         .map_err(|_| WireError::Payload("user agent is not UTF-8".to_owned()))?;
     let start_height = reader.i32_le()?;
@@ -1105,6 +1115,21 @@ mod tests {
         let message = Message::Version(VersionMessage::new(12, 99));
         let frame = encode_message(Network::Bitcoin, &message).unwrap();
         assert_eq!(decode_message(Network::Bitcoin, &frame).unwrap(), message);
+    }
+
+    #[test]
+    fn version_user_agent_uses_core_length_limit() {
+        let mut accepted = VersionMessage::new(12, 99);
+        accepted.user_agent = "x".repeat(256);
+        let frame = encode_message(Network::Bitcoin, &Message::Version(accepted.clone())).unwrap();
+        assert_eq!(
+            decode_message(Network::Bitcoin, &frame).unwrap(),
+            Message::Version(accepted)
+        );
+
+        let mut rejected = VersionMessage::new(12, 99);
+        rejected.user_agent = "x".repeat(257);
+        assert!(encode_message(Network::Bitcoin, &Message::Version(rejected)).is_err());
     }
 
     #[tokio::test]

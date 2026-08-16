@@ -3171,6 +3171,24 @@ async fn serve_peer_loop(
             // complete the handshake state prematurely.
             continue;
         }
+        if version_received
+            && !verack_received
+            && !matches!(
+                &message,
+                Message::Version(_)
+                    | Message::Verack
+                    | Message::SendHeaders
+                    | Message::SendCmpct { .. }
+                    | Message::WtxidRelay
+                    | Message::SendAddrV2
+                    | Message::SendTxRcncl(_)
+            )
+        {
+            // Core processes only handshake extensions before VERACK; all
+            // other application messages are ignored until the connection is
+            // fully established.
+            continue;
+        }
         match message {
             Message::Version(version) => {
                 if version_received {
@@ -6221,6 +6239,17 @@ mod tests {
                 break;
             }
         }
+        wire::write_message_with_size(&mut writer, Network::Regtest, &Message::Ping(7))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                wire::read_message(&mut reader, Network::Regtest),
+            )
+            .await
+            .is_err()
+        );
         wire::write_message_with_size(&mut writer, Network::Regtest, &Message::Verack)
             .await
             .unwrap();

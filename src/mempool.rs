@@ -3099,7 +3099,7 @@ fn contains_tapscript_op_success(script: &[u8]) -> bool {
                 .ok()
                 .unwrap_or(usize::MAX)
             }
-            _ => continue,
+            _ => return false,
         };
         let Some(end) = offset.checked_add(length) else {
             return false;
@@ -3148,6 +3148,13 @@ fn validate_standard_inputs(
             if contains_unconditional_upgradable_nop(redeem_script_view) {
                 return Err(standard_script_policy_failure(
                     "NOPx reserved for soft-fork upgrades",
+                ));
+            }
+            if !contains_conditional_opcode(redeem_script_view)
+                && contains_nonminimal_script_push(redeem_script_view)
+            {
+                return Err(standard_script_policy_failure(
+                    "Data push larger than necessary",
                 ));
             }
             Some(redeem_script)
@@ -3509,6 +3516,65 @@ fn contains_unconditional_upgradable_nop(script: &Script) -> bool {
         }
     }
     has_upgradable_nop && !has_conditional
+}
+
+fn contains_conditional_opcode(script: &Script) -> bool {
+    script.instructions().any(|instruction| {
+        matches!(instruction, Ok(Instruction::Op(op)) if (0x63..=0x68).contains(&op.to_u8()))
+    })
+}
+
+fn contains_nonminimal_script_push(script: &Script) -> bool {
+    let bytes = script.as_bytes();
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let opcode = bytes[offset];
+        offset += 1;
+        let length = match opcode {
+            0x00 | 0x4f | 0x50 | 0x51..=0x60 | 0x61..=0xff => continue,
+            0x01..=0x4b => usize::from(opcode),
+            0x4c => {
+                let Some(&length) = bytes.get(offset) else {
+                    return false;
+                };
+                offset += 1;
+                usize::from(length)
+            }
+            0x4d => {
+                let Some(length) = bytes.get(offset..offset.saturating_add(2)) else {
+                    return false;
+                };
+                offset += 2;
+                usize::from(u16::from_le_bytes([length[0], length[1]]))
+            }
+            0x4e => {
+                let Some(length) = bytes.get(offset..offset.saturating_add(4)) else {
+                    return false;
+                };
+                offset += 4;
+                usize::try_from(u32::from_le_bytes([
+                    length[0], length[1], length[2], length[3],
+                ]))
+                .ok()
+                .unwrap_or(usize::MAX)
+            }
+        };
+        let Some(end) = offset.checked_add(length) else {
+            return false;
+        };
+        let Some(data) = bytes.get(offset..end) else {
+            return false;
+        };
+        if (length == 1 && ((1..=16).contains(&data[0]) || data[0] == 0x81))
+            || (opcode == 0x4c && length <= 75)
+            || (opcode == 0x4d && length <= 255)
+            || (opcode == 0x4e && length <= 65_535)
+        {
+            return true;
+        }
+        offset = end;
+    }
+    false
 }
 
 fn witness_v0_script_starts_with_nonminimal_if(
@@ -5286,6 +5352,33 @@ mod tests {
             validate_standard_policy(&transaction, std::slice::from_ref(&nop_previous), 1),
             Err(MempoolError::NonStandard(reason))
                 if reason.contains("NOPx reserved for soft-fork upgrades")
+        ));
+
+        let nonminimal_redeem_script = ScriptBuf::from_bytes(vec![0x4c, 0x01, 0x51]);
+        let nonminimal_redeem_hash =
+            bitcoin::hashes::hash160::Hash::hash(nonminimal_redeem_script.as_bytes());
+        let nonminimal_previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: {
+                let mut bytes = vec![0xa9, 0x14];
+                bytes.extend_from_slice(&nonminimal_redeem_hash.to_byte_array());
+                bytes.push(0x87);
+                ScriptBuf::from_bytes(bytes)
+            },
+        };
+        transaction.input[0].script_sig = ScriptBuf::from_bytes({
+            let mut bytes = vec![nonminimal_redeem_script.len() as u8];
+            bytes.extend_from_slice(nonminimal_redeem_script.as_bytes());
+            bytes
+        });
+        assert!(matches!(
+            validate_standard_policy(
+                &transaction,
+                std::slice::from_ref(&nonminimal_previous),
+                1,
+            ),
+            Err(MempoolError::NonStandard(reason))
+                if reason.contains("Data push larger than necessary")
         ));
     }
 

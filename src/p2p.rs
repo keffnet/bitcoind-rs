@@ -4110,7 +4110,48 @@ async fn serve_peer_loop(
             Message::CompactBlock(compact) => {
                 let hash = compact.header.block_hash();
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
+                let compact_work = {
+                    let chain = node.chain.read();
+                    compact_block_work_state(&compact, &chain)
+                };
                 node.clear_peer_block_request(peer_id, hash);
+                let Some((height, recent_work)) = compact_work else {
+                    continue;
+                };
+                let (work_allowed, should_reconstruct) = {
+                    let chain = node.chain.read();
+                    let active_height = chain.height();
+                    let direct_fetch_allowed = chain.header(active_height).is_some_and(|header| {
+                        can_direct_fetch(
+                            header.time,
+                            crate::time::unix_time_i64(),
+                            chain.network.params().pow_target_spacing,
+                        )
+                    });
+                    let threshold = headers_sync_work_threshold(&chain);
+                    let work_allowed = recent_work >= threshold;
+                    (
+                        work_allowed,
+                        compact_block_should_reconstruct(
+                            requested,
+                            height,
+                            recent_work,
+                            active_height,
+                            threshold,
+                            direct_fetch_allowed,
+                        ),
+                    )
+                };
+                if !work_allowed {
+                    continue;
+                }
+                if !should_reconstruct {
+                    if requested {
+                        request_full_block(node, peer_id, writer, node.config.network, hash)
+                            .await?;
+                    }
+                    continue;
+                }
                 flush_pending_block_requests(
                     node,
                     peer_id,
@@ -4967,6 +5008,29 @@ fn unrequested_block_work_is_allowed(
     work >= active_work
         && height <= active_height.saturating_add(MIN_BLOCKS_TO_KEEP)
         && work >= minimum_chain_work
+}
+
+fn compact_block_work_state(
+    compact: &HeaderAndShortIds,
+    chain: &crate::chain::ChainState,
+) -> Option<(u32, Work)> {
+    let parent = compact.header.prev_blockhash;
+    let height = chain.block_height_by_hash(&parent)?.saturating_add(1);
+    let parent_work = chain.chain_work_by_hash(&parent)?;
+    Some((height, parent_work + compact.header.work()))
+}
+
+fn compact_block_should_reconstruct(
+    requested: bool,
+    height: u32,
+    work: Work,
+    active_height: u32,
+    threshold: Work,
+    direct_fetch_allowed: bool,
+) -> bool {
+    work >= threshold
+        && height <= active_height.saturating_add(2)
+        && (requested || direct_fetch_allowed)
 }
 
 async fn request_full_block(
@@ -7827,6 +7891,29 @@ mod tests {
         ));
         assert!(!unrequested_block_work_is_allowed(10, zero, 10, one, zero));
         assert!(!unrequested_block_work_is_allowed(10, one, 10, zero, two));
+    }
+
+    #[test]
+    fn compact_block_reconstruction_matches_core_near_tip_gate() {
+        let zero = Work::from_be_bytes([0; 32]);
+        let mut one_bytes = [0; 32];
+        one_bytes[31] = 1;
+        let one = Work::from_be_bytes(one_bytes);
+        assert!(compact_block_should_reconstruct(
+            false, 100, one, 100, one, true
+        ));
+        assert!(compact_block_should_reconstruct(
+            true, 102, one, 100, one, false
+        ));
+        assert!(!compact_block_should_reconstruct(
+            false, 103, one, 100, one, true
+        ));
+        assert!(!compact_block_should_reconstruct(
+            false, 100, zero, 100, one, true
+        ));
+        assert!(!compact_block_should_reconstruct(
+            false, 100, one, 100, one, false
+        ));
     }
 
     #[test]

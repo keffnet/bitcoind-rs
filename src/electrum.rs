@@ -870,21 +870,31 @@ fn server_ping(params: &Value, protocol_version: ProtocolVersion) -> Result<Valu
     if protocol_version < PROTOCOL_1_7 {
         return Ok(Value::Null);
     }
-    let length = params
-        .get(0)
-        .filter(|value| !value.is_null())
-        .map(|value| {
-            value
-                .as_u64()
-                .ok_or_else(|| anyhow!("pong_len must be a non-negative integer"))
-        })
-        .transpose()?
-        .unwrap_or_default();
+    let data_only = params.get(0).is_some_and(Value::is_string);
+    let length = if data_only {
+        0
+    } else {
+        params
+            .get(0)
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("pong_len must be a non-negative integer"))
+            })
+            .transpose()?
+            .unwrap_or_default()
+    };
     let length = usize::try_from(length).map_err(|_| anyhow!("pong_len is too large"))?;
     if length > MAX_LINE_SIZE {
         bail!("pong_len exceeds the server limit")
     }
-    if let Some(data) = params.get(1).filter(|value| !value.is_null()) {
+    let data = if data_only {
+        params.get(0)
+    } else {
+        params.get(1)
+    };
+    if let Some(data) = data.filter(|value| !value.is_null()) {
         let data = data
             .as_str()
             .ok_or_else(|| anyhow!("data must be a hexadecimal string"))?;
@@ -2633,6 +2643,17 @@ mod tests {
                 &node,
                 "server.ping",
                 &json!([0, "deadbeef"]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!({"data": ""})
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "server.ping",
+                &json!(["deadbeef"]),
                 &mut subscriptions,
                 &mut session,
             )

@@ -1457,7 +1457,7 @@ impl ElectrumHistoryStore {
             .open(&index_path)
             .with_context(|| format!("opening Electrum history index {}", index_path.display()))?;
         let data_len = file.metadata()?.len();
-        let loaded_index = load_history_index(&mut index_file, data_len)?;
+        let loaded_index = load_history_index(&mut index_file, &file, data_len)?;
         let (index, next_batch_id) = if let Some(index) = loaded_index {
             index
         } else {
@@ -1881,7 +1881,11 @@ fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocati
     ))
 }
 
-fn load_history_index(file: &mut File, data_len: u64) -> Result<Option<HistoryIndexState>> {
+fn load_history_index(
+    file: &mut File,
+    data_file: &File,
+    data_len: u64,
+) -> Result<Option<HistoryIndexState>> {
     let index_len = file.metadata()?.len();
     if index_len < ELECTRUM_HISTORY_INDEX_MAGIC.len() as u64 {
         return Ok(None);
@@ -1979,6 +1983,11 @@ fn load_history_index(file: &mut File, data_len: u64) -> Result<Option<HistoryIn
     if pending_batch.is_some() || last_data_end != Some(data_len) {
         return Ok(None);
     }
+    for (script_hash, location) in &index {
+        if validate_history_data_header(data_file, *location, *script_hash).is_err() {
+            return Ok(None);
+        }
+    }
     Ok(Some((
         index,
         stored_next_batch_id.unwrap_or(
@@ -1987,6 +1996,55 @@ fn load_history_index(file: &mut File, data_len: u64) -> Result<Option<HistoryIn
                 .context("Electrum history batch identifier exhausted")?,
         ),
     )))
+}
+
+fn validate_history_data_header(
+    file: &File,
+    location: HistoryLocation,
+    expected_script_hash: [u8; 32],
+) -> Result<()> {
+    if (location.length as usize) < 1 + 8 + 32 + 4
+        || (location.length as usize) > MAX_STORED_ELECTRUM_HISTORY_SIZE
+    {
+        bail!("stored Electrum history value is too large or truncated");
+    }
+    let mut length = [0u8; 4];
+    read_exact_at(file, &mut length, location.offset)?;
+    if u32::from_le_bytes(length) != location.length {
+        bail!("Electrum history index disagrees with value record length");
+    }
+    let mut header = [0u8; 45];
+    read_exact_at(
+        file,
+        &mut header,
+        location
+            .offset
+            .checked_add(4)
+            .context("Electrum history value offset overflowed")?,
+    )?;
+    if header[0] != HISTORY_PUT {
+        bail!("Electrum history index points to a non-value record");
+    }
+    if header[9..41] != expected_script_hash {
+        bail!("Electrum history value key does not match its index");
+    }
+    let count = usize::try_from(u32::from_le_bytes(
+        header[41..45]
+            .try_into()
+            .expect("Electrum history count has fixed width"),
+    ))
+    .context("Electrum history count does not fit usize")?;
+    let expected_length = 45usize
+        .checked_add(
+            count
+                .checked_mul(36)
+                .context("Electrum history count overflowed")?,
+        )
+        .context("Electrum history value length overflowed")?;
+    if expected_length != location.length as usize {
+        bail!("Electrum history count does not match value length");
+    }
+    Ok(())
 }
 
 fn append_history_index_batch(
@@ -3471,7 +3529,13 @@ mod tests {
             let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
             store.replace_all(entries.clone()).unwrap();
         }
-        std::fs::write(directory.path().join("history.index"), b"corrupt").unwrap();
+        let index_path = directory.path().join("history.index");
+        let mut index_bytes = std::fs::read(&index_path).unwrap();
+        let first_put_body = ELECTRUM_HISTORY_INDEX_MAGIC.len() + 4;
+        let offset_start = first_put_body + 1 + 8;
+        index_bytes[offset_start..offset_start + 8]
+            .copy_from_slice(&(ELECTRUM_HISTORY_DATA_MAGIC.len() as u64).to_le_bytes());
+        std::fs::write(&index_path, index_bytes).unwrap();
 
         let mut reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
         assert_eq!(reopened.entries().unwrap().len(), 2);

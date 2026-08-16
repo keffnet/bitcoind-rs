@@ -1,6 +1,7 @@
 //! Wallet-free Bitcoin Core-style JSON-RPC over HTTP/1.1.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock, atomic::Ordering};
@@ -16,7 +17,7 @@ use bitcoin::blockdata::opcodes::all::OP_RETURN;
 use bitcoin::blockdata::script::{Builder, Instruction, PushBytesBuf};
 use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
-use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
+use bitcoin::consensus::encode::{Decodable, VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::ecdsa::Signature as EcdsaSignature;
 use bitcoin::hashes::Hash;
 use bitcoin::key::TapTweak;
@@ -5746,17 +5747,13 @@ fn decoded_transaction_json(transaction: &Transaction, network: Network) -> Valu
     result
 }
 
-fn transaction_has_witness_serialization(bytes: &[u8]) -> bool {
-    bytes.get(4).copied() == Some(0) && bytes.get(5).is_some_and(|flag| *flag != 0)
-}
-
 fn decode_transaction_from_params(
     params: &Value,
     hex_index: usize,
     witness_index: usize,
 ) -> Result<Transaction> {
     let bytes = hex::decode(param::<String>(params, hex_index)?).context("TX decode failed")?;
-    if let Some(iswitness) = params
+    let (try_no_witness, try_witness) = match params
         .get(witness_index)
         .filter(|value| !value.is_null())
         .map(|value| {
@@ -5765,12 +5762,80 @@ fn decode_transaction_from_params(
                 .ok_or_else(|| anyhow!("iswitness must be a boolean"))
         })
         .transpose()?
-        && iswitness != transaction_has_witness_serialization(&bytes)
     {
-        bail!("TX decode failed")
+        Some(true) => (false, true),
+        Some(false) => (true, false),
+        None => (true, true),
+    };
+    decode_transaction_bytes(&bytes, try_no_witness, try_witness)
+}
+
+fn decode_transaction_bytes(
+    bytes: &[u8],
+    try_no_witness: bool,
+    try_witness: bool,
+) -> Result<Transaction> {
+    let extended = try_witness
+        .then(|| deserialize_partial::<Transaction>(bytes).ok())
+        .flatten()
+        .filter(|(_, consumed)| *consumed == bytes.len())
+        .map(|(transaction, _)| transaction);
+
+    if extended.as_ref().is_some_and(transaction_scripts_are_sane) {
+        return Ok(extended.expect("checked extended transaction"));
     }
-    let transaction: Transaction = deserialize(&bytes).context("TX decode failed")?;
-    Ok(transaction)
+
+    let legacy = try_no_witness
+        .then(|| decode_legacy_transaction(bytes).ok())
+        .flatten()
+        .filter(|(_, consumed)| *consumed == bytes.len())
+        .map(|(transaction, _)| transaction);
+
+    if legacy.as_ref().is_some_and(transaction_scripts_are_sane) {
+        return Ok(legacy.expect("checked legacy transaction"));
+    }
+    if let Some(transaction) = extended {
+        return Ok(transaction);
+    }
+    if let Some(transaction) = legacy {
+        return Ok(transaction);
+    }
+    bail!("TX decode failed")
+}
+
+fn decode_legacy_transaction(bytes: &[u8]) -> Result<(Transaction, usize)> {
+    let mut cursor = Cursor::new(bytes);
+    let version = Version::consensus_decode_from_finite_reader(&mut cursor)?;
+    let input = Vec::<TxIn>::consensus_decode_from_finite_reader(&mut cursor)?;
+    let output = Vec::<TxOut>::consensus_decode_from_finite_reader(&mut cursor)?;
+    let lock_time = LockTime::consensus_decode_from_finite_reader(&mut cursor)?;
+    Ok((
+        Transaction {
+            version,
+            lock_time,
+            input,
+            output,
+        },
+        cursor.position() as usize,
+    ))
+}
+
+fn transaction_scripts_are_sane(transaction: &Transaction) -> bool {
+    (transaction.is_coinbase()
+        || transaction.input.iter().all(|input| {
+            input.script_sig.len() <= MAX_SCRIPT_SIZE
+                && input
+                    .script_sig
+                    .instructions()
+                    .all(|instruction| instruction.is_ok())
+        }))
+        && transaction.output.iter().all(|output| {
+            output.script_pubkey.len() <= MAX_SCRIPT_SIZE
+                && output
+                    .script_pubkey
+                    .instructions()
+                    .all(|instruction| instruction.is_ok())
+        })
 }
 
 fn decode_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -5818,7 +5883,7 @@ fn decode_raw_transaction_variants(params: &Value) -> Result<Vec<Transaction>> {
                 .ok_or_else(|| anyhow!("transaction {index} must be hexadecimal"))?;
             let bytes = hex::decode(raw)
                 .with_context(|| format!("TX decode failed for transaction {index}"))?;
-            deserialize::<Transaction>(&bytes)
+            decode_transaction_bytes(&bytes, true, true)
                 .with_context(|| format!("TX decode failed for transaction {index}"))
         })
         .collect()
@@ -21262,14 +21327,11 @@ mod tests {
             "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"
         );
         assert!(decode_raw_transaction(&node, &json!([raw, false])).is_ok());
-        assert!(decode_raw_transaction(&node, &json!([raw, true])).is_err());
+        assert!(decode_raw_transaction(&node, &json!([raw, true])).is_ok());
 
         let mut witness_transaction = transaction.clone();
         witness_transaction.input[0].witness = Witness::from_slice(&[vec![0x01]]);
         let witness_raw = hex::encode(serialize(&witness_transaction));
-        assert!(transaction_has_witness_serialization(
-            &hex::decode(&witness_raw).unwrap()
-        ));
         assert!(decode_raw_transaction(&node, &json!([witness_raw])).is_ok());
         let decoded_witness = decode_raw_transaction(&node, &json!([witness_raw, true])).unwrap();
         assert!(decoded_witness["vin"][0]["txinwitness"].is_array());
@@ -21325,6 +21387,20 @@ mod tests {
         )
         .unwrap();
         assert!(null_input_transaction.input.is_empty());
+        assert!(decode_raw_transaction(&node, &json!([null_inputs])).is_ok());
+        assert!(decode_raw_transaction(&node, &json!([null_inputs, false])).is_err());
+
+        let mut null_input_legacy_bytes = hex::decode(null_inputs.as_str().unwrap()).unwrap();
+        null_input_legacy_bytes.drain(4..6);
+        let null_input_legacy = hex::encode(null_input_legacy_bytes);
+        assert!(decode_raw_transaction(&node, &json!([null_input_legacy])).is_ok());
+        let null_input_legacy_decoded =
+            decode_raw_transaction(&node, &json!([null_input_legacy, false]));
+        assert!(
+            null_input_legacy_decoded.is_ok(),
+            "raw={null_input_legacy}, result={null_input_legacy_decoded:?}"
+        );
+        assert!(decode_raw_transaction(&node, &json!([null_input_legacy, true])).is_err());
         assert!(create_raw_transaction(&node, &json!([[], {"data": "00"}, null, "yes"])).is_err());
         assert!(
             create_raw_transaction(&node, &json!([[], {"data": "00"}, null, true, 4])).is_err()

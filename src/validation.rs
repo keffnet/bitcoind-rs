@@ -1312,6 +1312,7 @@ pub(crate) fn transaction_sigop_cost(
     if flags & bitcoinconsensus::VERIFY_P2SH != 0 {
         for (input, previous_output) in transaction.input.iter().zip(previous_outputs) {
             if previous_output.script_pubkey.is_p2sh()
+                && input.script_sig.is_push_only()
                 && let Some(redeem_script) = last_push_bytes(&input.script_sig)
             {
                 cost = cost.saturating_add(
@@ -1399,6 +1400,40 @@ mod tests {
             }],
         };
         validate_transaction_scripts(Network::Regtest, 1, &transaction, &[previous]).unwrap();
+    }
+
+    #[test]
+    fn p2sh_sigops_ignore_non_push_only_script_sigs() {
+        let redeem_script = ScriptBuf::from_bytes(vec![bitcoin::opcodes::all::OP_CHECKSIG.to_u8()]);
+        let previous = TxOut {
+            value: Amount::ZERO,
+            script_pubkey: Builder::new()
+                .push_opcode(bitcoin::opcodes::all::OP_HASH160)
+                .push_slice([0u8; 20])
+                .push_opcode(bitcoin::opcodes::all::OP_EQUAL)
+                .into_script(),
+        };
+        let mut script_sig = ScriptBuf::new();
+        script_sig.push_opcode(bitcoin::opcodes::all::OP_CHECKSIG);
+        script_sig.push_slice(PushBytesBuf::try_from(redeem_script.as_bytes().to_vec()).unwrap());
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([1; 32]), 0),
+                script_sig,
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        assert_eq!(
+            transaction_sigop_cost(&transaction, &[previous], bitcoinconsensus::VERIFY_P2SH,),
+            4
+        );
     }
 
     #[test]

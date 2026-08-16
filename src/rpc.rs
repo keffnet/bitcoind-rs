@@ -13603,7 +13603,9 @@ fn rpc_error(error: &anyhow::Error) -> Value {
 
 fn rpc_error_code(message: &str) -> i32 {
     let lower = message.to_ascii_lowercase();
-    if message == "Method not found" {
+    if message == "Method not found"
+        || lower.starts_with("generate\n\nhas been replaced by the -generate cli option.")
+    {
         return -32601;
     }
     if lower == "can only import the mempool after the block download and sync is done." {
@@ -15401,6 +15403,7 @@ mod tests {
                 .to_string()
                 .contains("replaced by the -generate cli option")
         );
+        assert_eq!(rpc_error_code(&generate_error.to_string()), -32601);
     }
 
     #[test]

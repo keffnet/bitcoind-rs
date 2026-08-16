@@ -3310,7 +3310,9 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
             if count < 0 {
                 bail!("Address count out of range")
             }
-            (count != 0).then(|| usize::try_from(count).unwrap_or(usize::MAX))
+            let count = i32::try_from(count)
+                .map_err(|_| anyhow!("address count is outside the supported integer range"))?;
+            (count != 0).then_some(count as usize)
         }
     };
     let network = match params.get(1) {
@@ -3349,17 +3351,13 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .into_iter()
             .take(count.unwrap_or(usize::MAX))
             .map(|peer| {
-                let mut result = json!({
+                json!({
                     "address": peer.endpoint.host_string(),
                     "port": peer.endpoint.port(),
                     "services": peer.services,
                     "time": peer.time,
                     "network": peer.endpoint.network_name(),
-                });
-                if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
-                    result["mapped_as"] = json!(mapped_as);
-                }
-                result
+                })
             })
             .collect::<Vec<_>>()
     ))
@@ -20633,6 +20631,7 @@ mod tests {
             json!([])
         );
         assert!(get_node_addresses(&node, &json!([1, "unknown"])).is_err());
+        assert!(get_node_addresses(&node, &json!([i64::from(i32::MAX) + 1])).is_err());
 
         add_node(&node, &json!(["127.0.0.1:18444", "add"])).unwrap();
         let selected = get_added_node_info(&node, &json!(["127.0.0.1:18444"])).unwrap();

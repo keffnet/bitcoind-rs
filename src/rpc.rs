@@ -11700,6 +11700,7 @@ fn package_policy_error(transactions: &[Transaction]) -> Option<&'static str> {
 fn mempool_reject_reason(error: &MempoolError) -> String {
     match error {
         MempoolError::AlreadyPresent => "txn-already-in-mempool".to_owned(),
+        MempoolError::SameNonWitnessData(_) => "txn-same-nonwitness-data-in-mempool".to_owned(),
         MempoolError::AlreadyInChain => "txn-already-known".to_owned(),
         MempoolError::Conflict(_) => "txn-mempool-conflict".to_owned(),
         MempoolError::TooManyReplacementCandidates { .. } => {
@@ -11811,6 +11812,32 @@ fn accepted_transaction_json(
     }
     result.insert("fees".to_owned(), fees);
     Ok(Value::Object(result))
+}
+
+fn package_transaction_json(
+    transaction: &Transaction,
+    package: &[Transaction],
+    mempool: &Mempool,
+    include_effective_fee: bool,
+) -> Result<Value> {
+    let txid = transaction.compute_txid();
+    let entry = mempool
+        .get(&txid)
+        .ok_or_else(|| anyhow!("accepted package transaction disappeared"))?;
+    if entry.transaction.compute_wtxid() != transaction.compute_wtxid() {
+        return Ok(json!({
+            "txid": txid.to_string(),
+            "other-wtxid": entry.transaction.compute_wtxid().to_string(),
+        }));
+    }
+    accepted_transaction_json(
+        transaction,
+        package,
+        mempool,
+        false,
+        false,
+        include_effective_fee,
+    )
 }
 
 fn rejected_transaction_json(transaction: &Transaction, error: &MempoolError) -> Value {
@@ -12072,12 +12099,10 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 if index < failure_index {
                     results.insert(
                         transaction.compute_wtxid().to_string(),
-                        accepted_transaction_json(
+                        package_transaction_json(
                             transaction,
                             &transactions,
                             &candidate,
-                            false,
-                            false,
                             !preexisting.contains(&txid),
                         )?,
                     );
@@ -12144,12 +12169,10 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 if index < failure_index {
                     results.insert(
                         transaction.compute_wtxid().to_string(),
-                        accepted_transaction_json(
+                        package_transaction_json(
                             transaction,
                             &transactions,
                             &candidate,
-                            false,
-                            false,
                             !preexisting.contains(&transaction.compute_txid()),
                         )?,
                     );
@@ -12208,12 +12231,10 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         } else {
             results.insert(
                 transaction.compute_wtxid().to_string(),
-                accepted_transaction_json(
+                package_transaction_json(
                     transaction,
                     &transactions,
                     &candidate,
-                    false,
-                    false,
                     !preexisting.contains(&transaction.compute_txid()),
                 )?,
             );
@@ -14554,6 +14575,42 @@ mod tests {
         let missing =
             rejected_transaction_json(&transaction, &MempoolError::MissingInput(OutPoint::null()));
         assert!(missing.get("reject-details").is_none());
+    }
+
+    #[test]
+    fn rpc_reports_same_txid_different_witness_like_core() {
+        let existing = proof_transaction(42);
+        let existing_wtxid = existing.compute_wtxid();
+        let mut submitted = existing.clone();
+        submitted.input[0].witness = Witness::from_slice(&[vec![1u8]]);
+        let mut mempool = Mempool::new(Network::Regtest);
+        mempool.insert_test_entry(crate::mempool::MempoolEntry {
+            transaction: existing,
+            fee_sat: 1,
+            vsize: 1,
+            added_at: 1,
+            height: 0,
+        });
+
+        let error = MempoolError::SameNonWitnessData(existing_wtxid);
+        assert_eq!(
+            mempool_reject_reason(&error),
+            "txn-same-nonwitness-data-in-mempool"
+        );
+        let rejected = rejected_transaction_json(&submitted, &error);
+        assert_eq!(
+            rejected["reject-reason"],
+            "txn-same-nonwitness-data-in-mempool"
+        );
+        let package =
+            package_transaction_json(&submitted, &[submitted.clone()], &mempool, false).unwrap();
+        assert_eq!(
+            package,
+            json!({
+                "txid": submitted.compute_txid().to_string(),
+                "other-wtxid": existing_wtxid.to_string(),
+            })
+        );
     }
 
     #[test]

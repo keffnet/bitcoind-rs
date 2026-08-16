@@ -467,6 +467,8 @@ pub enum MempoolError {
     Coinbase,
     #[error("transaction already exists in the mempool")]
     AlreadyPresent,
+    #[error("txn-same-nonwitness-data-in-mempool")]
+    SameNonWitnessData(Wtxid),
     #[error("Transaction outputs already in utxo set")]
     AlreadyInChain,
     #[error("transaction input is already spent by mempool transaction {0}")]
@@ -1410,6 +1412,9 @@ impl Mempool {
         transaction: Transaction,
         chain: &ChainState,
     ) -> Result<Txid, MempoolError> {
+        if let Some(error) = self.duplicate_error(&transaction) {
+            return Err(error);
+        }
         let conflicts = self.conflicts_for(&transaction);
         self.check_replacement_cluster_limit(transaction.compute_txid(), &conflicts)?;
         if !conflicts.is_empty() {
@@ -1560,10 +1565,11 @@ impl Mempool {
         let mut new_count = 0usize;
         for transaction in transactions {
             let txid = transaction.compute_txid();
-            if let Some(existing) = candidate.get(&txid) {
-                if existing.transaction.compute_wtxid() != transaction.compute_wtxid() {
-                    return Err(MempoolError::AlreadyPresent);
-                }
+            if candidate.get(&txid).is_some() {
+                // Core's package path de-duplicates both exact entries and
+                // same-txid/different-witness entries. The latter is reported
+                // by submitpackage as `other-wtxid`, rather than rejecting the
+                // whole package.
                 accepted.push(txid);
                 continue;
             }
@@ -1650,9 +1656,12 @@ impl Mempool {
         let mut accepted = Vec::with_capacity(transactions.len());
         for transaction in transactions {
             let txid = transaction.compute_txid();
+            if let Some(error) = candidate.duplicate_error(transaction) {
+                return Err(error);
+            }
             let conflicts = candidate.conflicts_for(transaction);
             candidate.check_replacement_cluster_limit(txid, &conflicts)?;
-            if candidate.entries.contains_key(&txid) || !conflicts.is_empty() {
+            if !conflicts.is_empty() {
                 return Err(MempoolError::ReplacementDisallowed);
             }
             accepted.push(candidate.accept_at(transaction.clone(), chain, added_at)?);
@@ -1950,8 +1959,8 @@ impl Mempool {
         record_sequence: bool,
     ) -> Result<Txid, MempoolError> {
         let txid = transaction.compute_txid();
-        if self.entries.contains_key(&txid) {
-            return Err(MempoolError::AlreadyPresent);
+        if let Some(error) = self.duplicate_error(&transaction) {
+            return Err(error);
         }
         if transaction.output.iter().enumerate().any(|(vout, _)| {
             u32::try_from(vout)
@@ -2148,6 +2157,17 @@ impl Mempool {
             });
         }
         Ok(txid)
+    }
+
+    fn duplicate_error(&self, transaction: &Transaction) -> Option<MempoolError> {
+        let txid = transaction.compute_txid();
+        let existing = self.entries.get(&txid)?;
+        let wtxid = existing.transaction.compute_wtxid();
+        if wtxid == transaction.compute_wtxid() {
+            Some(MempoolError::AlreadyPresent)
+        } else {
+            Some(MempoolError::SameNonWitnessData(wtxid))
+        }
     }
 
     fn record_removal(&mut self, transaction: Transaction, notify_zmq: bool) {
@@ -4230,6 +4250,38 @@ mod tests {
         assert!(pool.get_for_relay(&txid, 4).is_none());
         assert!(pool.get_for_relay(&txid, 5).is_some());
         assert!(pool.get_by_wtxid_for_relay(&wtxid, 5).is_some());
+    }
+
+    #[test]
+    fn distinguishes_same_txid_different_witness_from_exact_duplicate() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let transaction = graph_transaction(Txid::from_byte_array([10; 32]), 10);
+        let txid = transaction.compute_txid();
+        let existing_wtxid = transaction.compute_wtxid();
+        let mut pool = Mempool::new(Network::Regtest);
+        insert_policy_entry(&mut pool, transaction.clone());
+
+        let mut different_witness = transaction.clone();
+        different_witness.input[0].witness = Witness::from_slice(&[vec![1u8]]);
+        assert_eq!(different_witness.compute_txid(), txid);
+        assert_ne!(different_witness.compute_wtxid(), existing_wtxid);
+        assert!(matches!(
+            pool.accept(different_witness.clone(), &chain),
+            Err(MempoolError::SameNonWitnessData(wtxid)) if wtxid == existing_wtxid
+        ));
+        assert!(matches!(
+            pool.accept_for_test(different_witness, &chain),
+            Err(MempoolError::SameNonWitnessData(wtxid)) if wtxid == existing_wtxid
+        ));
+        assert!(matches!(
+            pool.accept_for_test(transaction.clone(), &chain),
+            Err(MempoolError::AlreadyPresent)
+        ));
+        assert_eq!(
+            pool.accept_package(&[transaction], &chain).unwrap(),
+            vec![txid]
+        );
     }
 
     #[test]

@@ -1199,14 +1199,15 @@ fn block_headers_for_protocol(
     protocol_version: ProtocolVersion,
 ) -> Result<Value> {
     let start = param::<u32>(params, 0)?;
-    let count = param::<u32>(params, 1)?.min(2_016);
+    let requested_count = param::<u32>(params, 1)?;
     let checkpoint = optional_checkpoint(params, 2)?;
     if checkpoint.is_some()
-        && count != 0
-        && start.saturating_add(count.saturating_sub(1)) > checkpoint.unwrap_or_default()
+        && requested_count != 0
+        && start.saturating_add(requested_count.saturating_sub(1)) > checkpoint.unwrap_or_default()
     {
         bail!("checkpoint height is below the requested header range")
     }
+    let count = requested_count.min(2_016);
     let chain = node.chain.read();
     let mut bytes = Vec::with_capacity(count as usize * 80);
     let mut headers = Vec::with_capacity(count as usize);
@@ -1530,7 +1531,6 @@ fn transaction_id_from_pos(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!({
         "tx_hash": txid.to_string(),
         "merkle": branch.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "pos": position,
     }))
 }
 
@@ -2860,6 +2860,10 @@ mod tests {
         assert_eq!(genesis_headers["headers"].as_array().unwrap().len(), 1);
         assert!(genesis_headers.get("branch").is_none());
         assert!(genesis_headers.get("root").is_none());
+        assert!(
+            block_headers_for_protocol(&node, &json!([0, 2_017, 2_016]), MAX_PROTOCOL_VERSION,)
+                .is_err()
+        );
         assert_eq!(
             dispatch_with_session(
                 &node,
@@ -3165,7 +3169,7 @@ mod tests {
         assert!(transaction_merkle(&node, &json!([txid.to_string(), 1])).is_err());
         let id_from_pos = transaction_id_from_pos(&node, &json!([0, 0, true])).unwrap();
         assert_eq!(id_from_pos["tx_hash"], json!(txid.to_string()));
-        assert_eq!(id_from_pos["pos"], json!(0));
+        assert!(id_from_pos.get("pos").is_none());
         assert_eq!(id_from_pos["merkle"], merkle["merkle"]);
 
         let script_hash = "00".repeat(32);

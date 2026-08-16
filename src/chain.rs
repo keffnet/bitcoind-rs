@@ -30,8 +30,8 @@ use sha2::{Digest, Sha256};
 use crate::config::{DEFAULT_SCRIPT_CHECK_THREADS, MAX_SCRIPT_CHECK_THREADS};
 use crate::muhash::MuHash3072;
 use crate::storage::{
-    BlockStore, ChainstateStore, CoinStatsRecord, CoinStatsStore, ElectrumBlockStore, FilterStore,
-    StoredUtxo, UtxoStore,
+    BlockStore, ChainstateStore, CoinStatsRecord, CoinStatsStore, ElectrumBlockStore,
+    ElectrumHistoryStore, FilterStore, StoredUtxo, UtxoStore,
 };
 use crate::validation::{self, ValidationError};
 
@@ -782,6 +782,7 @@ pub struct ChainState {
     filter_store: FilterStore,
     chainstate_store: ChainstateStore,
     utxo_store: UtxoStore,
+    electrum_history_store: ElectrumHistoryStore,
     blockfilter_index_enabled: bool,
     tx_index_all_enabled: bool,
     coinstats_store: CoinStatsStore,
@@ -824,6 +825,7 @@ pub struct ChainState {
     tx_index_duplicates: HashMap<Txid, Vec<TxLocation>>,
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
+    history_materialized: bool,
     spent_by: HashMap<OutPoint, SpentTransaction>,
     // Core stores preciousblock preferences as negative reverse sequence IDs.
     // They are runtime-only and are intentionally not persisted.
@@ -1078,6 +1080,8 @@ impl ChainState {
         }
         let chainstate_store = ChainstateStore::open(&chainstate_path)?;
         let utxo_store = UtxoStore::open(chainstate_path.join("utxos"))?;
+        let electrum_history_store =
+            ElectrumHistoryStore::open(data_dir.join("indexes/electrum-history"))?;
         if rebuild_chainstate {
             for path in [
                 metadata_path.clone(),
@@ -1183,6 +1187,7 @@ impl ChainState {
             filter_store,
             chainstate_store,
             utxo_store,
+            electrum_history_store,
             blockfilter_index_enabled,
             tx_index_all_enabled,
             coinstats_store,
@@ -1226,6 +1231,7 @@ impl ChainState {
             tx_index_duplicates: HashMap::new(),
             tx_index_all: HashMap::new(),
             history: HashMap::new(),
+            history_materialized: true,
             spent_by: HashMap::new(),
             precious_blocks: HashMap::new(),
             precious_sequence: -1,
@@ -1267,6 +1273,7 @@ impl ChainState {
                 HashMap::new()
             };
             state.history = snapshot.history;
+            state.history_materialized = true;
             state.prune_height = snapshot.prune_height.or(state.prune_height);
             let persisted_spent_by = snapshot.spent_by;
             state.active_tx_counts.truncate(snapshot_chain_len);
@@ -1379,6 +1386,7 @@ impl ChainState {
             }
         }
         state.reconcile_utxo_store()?;
+        state.reconcile_electrum_history_store()?;
         state.update_ibd_status();
         state.persist_metadata()?;
         if state.snapshot_base.is_some()
@@ -1388,6 +1396,7 @@ impl ChainState {
             state.start_background_validation()?;
         }
         state.release_materialized_utxos();
+        state.release_materialized_history();
         Ok(state)
     }
 
@@ -3407,11 +3416,27 @@ impl ChainState {
     }
 
     pub fn get_history(&self, script_hash: &str) -> Vec<HistoryEntry> {
-        self.history.get(script_hash).cloned().unwrap_or_default()
+        self.get_history_checked(script_hash).unwrap_or_default()
+    }
+
+    pub fn get_history_checked(&self, script_hash: &str) -> Result<Vec<HistoryEntry>> {
+        if self.history_materialized {
+            return Ok(self.history.get(script_hash).cloned().unwrap_or_default());
+        }
+        Ok(self
+            .electrum_history_store
+            .get(script_hash)?
+            .into_iter()
+            .map(|(txid, height)| HistoryEntry { txid, height })
+            .collect())
     }
 
     pub fn script_hashes(&self) -> Vec<String> {
-        self.history.keys().cloned().collect()
+        if self.history_materialized {
+            self.history.keys().cloned().collect()
+        } else {
+            self.electrum_history_store.keys()
+        }
     }
 
     pub fn get_utxos(&self, script_hash: &str) -> Vec<(OutPoint, UtxoEntry)> {
@@ -3445,7 +3470,7 @@ impl ChainState {
         script_hash: &str,
     ) -> Result<Vec<(OutPoint, i64, usize, u64)>> {
         let mut outputs = HashMap::new();
-        for history in self.get_history(script_hash) {
+        for history in self.get_history_checked(script_hash)? {
             let Some(location) =
                 self.active_transaction_location_at_height(&history.txid, history.height)
             else {
@@ -3708,8 +3733,8 @@ impl ChainState {
             })
             .map(|(txid, location)| (*txid, location.clone()))
             .collect();
-        let history = self
-            .history
+        let active_history = self.active_history_map_for_read()?;
+        let history = active_history
             .iter()
             .filter_map(|(script_hash, entries)| {
                 let entries = entries
@@ -4299,7 +4324,10 @@ impl ChainState {
     }
 
     pub fn history_status(&self, script_hash: &str) -> Option<String> {
-        let history = self.history.get(script_hash)?;
+        let history = self.get_history_checked(script_hash).ok()?;
+        if history.is_empty() {
+            return None;
+        }
         let mut input = String::new();
         for entry in history {
             input.push_str(&entry.txid.to_string());
@@ -5282,6 +5310,7 @@ impl ChainState {
             self.remove_utxo_entry(outpoint, entry);
         }
         let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
+        let mut history_updates = HashMap::new();
         for (transaction_index, transaction) in block.txdata.iter().enumerate() {
             let txid = transaction.compute_txid();
             let mut affected_scripts = HashSet::new();
@@ -5307,7 +5336,12 @@ impl ChainState {
                 affected_scripts.insert(electrum_script_hash(&output.script_pubkey));
             }
             for script_hash in affected_scripts {
-                self.add_history(&script_hash, HistoryEntry { txid, height });
+                let entry = HistoryEntry { txid, height };
+                if persist {
+                    self.append_history_update(&mut history_updates, &script_hash, entry)?;
+                } else {
+                    self.add_history(&script_hash, entry);
+                }
             }
             let location = TxLocation {
                 block_hash: hash,
@@ -5331,6 +5365,7 @@ impl ChainState {
                 .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
                 .collect::<Vec<_>>();
             self.utxo_store.apply_batch(&removals, &additions)?;
+            self.persist_history_updates(history_updates)?;
         }
         if self.txospender_index_enabled {
             self.index_block_spends(block, height);
@@ -5364,6 +5399,7 @@ impl ChainState {
         self.assign_block_sequence_id(hash);
         if persist {
             self.persist_utxo_store_tip()?;
+            self.persist_electrum_history_store_tip()?;
         }
         if let Some(stats) = self.coin_stats.as_mut() {
             stats.apply_block_metrics(application.metrics);
@@ -5622,6 +5658,7 @@ impl ChainState {
         let old_tx_index_duplicates = std::mem::take(&mut self.tx_index_duplicates);
         let mut tx_index_all_changes = HashMap::new();
         let old_history = std::mem::take(&mut self.history);
+        let old_history_materialized = self.history_materialized;
         let old_spent_by = std::mem::take(&mut self.spent_by);
         let old_basic_filter_cache = std::mem::take(&mut self.basic_filter_cache);
         let old_block_undo_cache = std::mem::take(&mut self.block_undo_cache);
@@ -5639,6 +5676,7 @@ impl ChainState {
         self.tx_index.clear();
         self.tx_index_duplicates.clear();
         self.history.clear();
+        self.history_materialized = true;
         self.spent_by.clear();
         self.coin_stats = self.coinstats_index_enabled.then(CoinStatsState::default);
         let replay = (|| -> Result<()> {
@@ -5720,6 +5758,7 @@ impl ChainState {
                 }
             }
             self.history = old_history;
+            self.history_materialized = old_history_materialized;
             self.spent_by = old_spent_by;
             self.basic_filter_cache = old_basic_filter_cache;
             self.block_undo_cache = old_block_undo_cache;
@@ -5741,6 +5780,7 @@ impl ChainState {
             self.background_validation = old_background_validation;
         }
         self.release_materialized_utxos();
+        self.release_materialized_history();
         self.update_ibd_status();
         Ok(())
     }
@@ -6142,6 +6182,92 @@ impl ChainState {
             .collect())
     }
 
+    fn load_history_map_from_store(&self) -> Result<HashMap<String, Vec<HistoryEntry>>> {
+        Ok(self
+            .electrum_history_store
+            .entries()?
+            .into_iter()
+            .map(|(script_hash, entries)| {
+                (
+                    script_hash,
+                    entries
+                        .into_iter()
+                        .map(|(txid, height)| HistoryEntry { txid, height })
+                        .collect(),
+                )
+            })
+            .collect())
+    }
+
+    fn active_history_map_for_read(&self) -> Result<HashMap<String, Vec<HistoryEntry>>> {
+        if self.history_materialized {
+            Ok(self.history.clone())
+        } else {
+            self.load_history_map_from_store()
+        }
+    }
+
+    fn history_entries_for_update(&self, script_hash: &str) -> Result<Vec<HistoryEntry>> {
+        if self.history_materialized {
+            return Ok(self.history.get(script_hash).cloned().unwrap_or_default());
+        }
+        Ok(self
+            .electrum_history_store
+            .get(script_hash)?
+            .into_iter()
+            .map(|(txid, height)| HistoryEntry { txid, height })
+            .collect())
+    }
+
+    fn append_history_update(
+        &self,
+        updates: &mut HashMap<String, Vec<HistoryEntry>>,
+        script_hash: &str,
+        entry: HistoryEntry,
+    ) -> Result<()> {
+        if !updates.contains_key(script_hash) {
+            updates.insert(
+                script_hash.to_owned(),
+                self.history_entries_for_update(script_hash)?,
+            );
+        }
+        let history = updates
+            .get_mut(script_hash)
+            .expect("history update was inserted above");
+        if history.last() != Some(&entry) {
+            history.push(entry);
+        }
+        Ok(())
+    }
+
+    fn persist_history_updates(
+        &mut self,
+        updates: HashMap<String, Vec<HistoryEntry>>,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let store_updates = updates
+            .iter()
+            .map(|(script_hash, entries)| {
+                (
+                    script_hash.clone(),
+                    entries
+                        .iter()
+                        .map(|entry| (entry.txid, entry.height))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.electrum_history_store.apply_batch(&store_updates)?;
+        if self.history_materialized {
+            for (script_hash, entries) in updates {
+                self.history.insert(script_hash, entries);
+            }
+        }
+        Ok(())
+    }
+
     fn active_utxo_entries_for_read(&self) -> Vec<(OutPoint, UtxoEntry)> {
         if self.utxos_materialized {
             self.utxos
@@ -6178,6 +6304,11 @@ impl ChainState {
     fn release_materialized_utxos(&mut self) {
         self.utxos.clear();
         self.utxos_materialized = false;
+    }
+
+    fn release_materialized_history(&mut self) {
+        self.history.clear();
+        self.history_materialized = false;
     }
 
     fn utxo_store_tip_path(&self) -> PathBuf {
@@ -6225,6 +6356,69 @@ impl ChainState {
             return Ok(());
         }
         self.sync_utxo_store()
+    }
+
+    fn electrum_history_store_tip_path(&self) -> PathBuf {
+        self.data_dir.join("indexes/electrum-history.tip")
+    }
+
+    fn persist_electrum_history_store_tip(&self) -> Result<()> {
+        let path = self.electrum_history_store_tip_path();
+        let temp = path.with_extension("tip.tmp");
+        let contents = format!(
+            "{}\n{}\n{}\n",
+            self.best_hash(),
+            self.electrum_history_store.generation(),
+            self.electrum_history_store.len()
+        );
+        fs::write(&temp, contents)?;
+        fs::rename(temp, path)?;
+        Ok(())
+    }
+
+    fn sync_electrum_history_store(&mut self) -> Result<()> {
+        if !self.history_materialized {
+            // Normal active-chain connects append exact replacement values to
+            // the durable store. There is no resident map to copy back.
+            return self.persist_electrum_history_store_tip();
+        }
+        let entries = self
+            .history
+            .iter()
+            .map(|(script_hash, history)| {
+                (
+                    script_hash.clone(),
+                    history
+                        .iter()
+                        .map(|entry| (entry.txid, entry.height))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.electrum_history_store.replace_all(entries)?;
+        self.persist_electrum_history_store_tip()
+    }
+
+    fn reconcile_electrum_history_store(&mut self) -> Result<()> {
+        let tip = fs::read_to_string(self.electrum_history_store_tip_path()).ok();
+        let expected_tip = self.best_hash().to_string();
+        let marker_matches = tip.as_deref().is_some_and(|tip| {
+            let mut lines = tip.lines();
+            lines.next().map(str::trim) == Some(expected_tip.as_str())
+                && lines
+                    .next()
+                    .and_then(|generation| generation.trim().parse::<u64>().ok())
+                    == Some(self.electrum_history_store.generation())
+                && lines
+                    .next()
+                    .and_then(|length| length.trim().parse::<usize>().ok())
+                    == Some(self.electrum_history_store.len())
+                && lines.next().is_none()
+        });
+        if marker_matches && self.electrum_history_store.len() == self.history.len() {
+            return Ok(());
+        }
+        self.sync_electrum_history_store()
     }
 
     fn insert_utxo(&mut self, outpoint: OutPoint, entry: UtxoEntry) {
@@ -6643,6 +6837,7 @@ impl ChainState {
 
     fn persist_snapshot(&mut self) -> Result<()> {
         self.sync_utxo_store()?;
+        self.sync_electrum_history_store()?;
         let snapshot = self.current_snapshot()?;
         let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
@@ -6837,7 +7032,11 @@ impl ChainState {
             } else {
                 HashMap::new()
             },
-            history: self.history.clone(),
+            history: if self.history_materialized {
+                self.history.clone()
+            } else {
+                self.load_history_map_from_store()?
+            },
             spent_by: self.txospender_index_enabled.then(|| self.spent_by.clone()),
             prune_height: self.prune_height,
         })
@@ -7060,6 +7259,8 @@ fn open_background_replay_state(
     let filter_store = FilterStore::open(data_dir.join("filters"))?;
     let chainstate_store = ChainstateStore::open(data_dir.join("chainstate"))?;
     let utxo_store = UtxoStore::open(data_dir.join("chainstate/utxos"))?;
+    let electrum_history_store =
+        ElectrumHistoryStore::open(data_dir.join("indexes/electrum-history"))?;
     let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
     let headers = active_chain
         .iter()
@@ -7087,6 +7288,7 @@ fn open_background_replay_state(
         filter_store,
         chainstate_store,
         utxo_store,
+        electrum_history_store,
         blockfilter_index_enabled: false,
         tx_index_all_enabled: false,
         coinstats_store,
@@ -7120,6 +7322,7 @@ fn open_background_replay_state(
         tx_index_duplicates: HashMap::new(),
         tx_index_all: HashMap::new(),
         history: HashMap::new(),
+        history_materialized: true,
         spent_by: HashMap::new(),
         precious_blocks: HashMap::new(),
         precious_sequence: -1,
@@ -9168,12 +9371,31 @@ mod tests {
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
         state.connect_block(mine_block(&state, 1)).unwrap();
         state.connect_block(mine_block(&state, 2)).unwrap();
+        let script_hash = electrum_script_hash(&Builder::new().push_int(1).into_script());
+        let expected_history = state.get_history(&script_hash);
 
         assert!(!state.utxos_materialized);
         assert!(state.utxos.is_empty());
+        assert!(!state.history_materialized);
+        assert!(state.history.is_empty());
         assert_eq!(state.all_utxos().count(), 2);
         assert_eq!(state.utxo_stats(), (2, 2, 10_000_000_000));
         assert_eq!(state.utxo_store.len(), 2);
+        assert_eq!(
+            state
+                .electrum_history_store
+                .get(&script_hash)
+                .unwrap()
+                .into_iter()
+                .map(|(txid, height)| HistoryEntry { txid, height })
+                .collect::<Vec<_>>(),
+            expected_history
+        );
+
+        drop(state);
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert!(!reopened.history_materialized);
+        assert_eq!(reopened.get_history(&script_hash), expected_history);
     }
 
     #[test]

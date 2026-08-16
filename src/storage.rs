@@ -28,15 +28,20 @@ const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_FILTER_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_CHAINSTATE_DELTA_SIZE: usize = 64 * 1024 * 1024;
 const MAX_STORED_ELECTRUM_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+const MAX_STORED_ELECTRUM_HISTORY_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_UTXO_SIZE: usize = 100 * 1024;
 const XOR_KEY_SIZE: usize = 8;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
 const UTXO_DATA_MAGIC: &[u8] = b"bitcoind-rs-utxo-v1\0";
 const UTXO_INDEX_MAGIC: &[u8] = b"bitcoind-rs-utxo-index-v1\0";
+const ELECTRUM_HISTORY_DATA_MAGIC: &[u8] = b"bitcoind-rs-electrum-history-v1\0";
+const ELECTRUM_HISTORY_INDEX_MAGIC: &[u8] = b"bitcoind-rs-electrum-history-index-v1\0";
 const UTXO_PUT: u8 = 1;
 const UTXO_DELETE: u8 = 2;
 const UTXO_COMMIT: u8 = 3;
+const HISTORY_PUT: u8 = 1;
+const HISTORY_COMMIT: u8 = 2;
 
 #[derive(Clone, Copy, Debug)]
 struct Record {
@@ -57,6 +62,8 @@ pub struct StoredUtxo {
     pub coinbase: bool,
 }
 
+pub type StoredElectrumHistory = Vec<(Txid, u32)>;
+
 #[derive(Clone, Copy, Debug)]
 struct UtxoLocation {
     offset: u64,
@@ -64,6 +71,20 @@ struct UtxoLocation {
 }
 
 type UtxoIndexState = (HashMap<OutPoint, UtxoLocation>, u64, u64);
+
+#[derive(Clone, Copy, Debug)]
+struct HistoryLocation {
+    offset: u64,
+    length: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingHistoryOperation {
+    script_hash: [u8; 32],
+    location: HistoryLocation,
+}
+
+type HistoryIndexState = (HashMap<[u8; 32], HistoryLocation>, u64);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct XorKey([u8; XOR_KEY_SIZE]);
@@ -1292,8 +1313,634 @@ impl Drop for UtxoStore {
     }
 }
 
+/// Durable Electrum script history.
+///
+/// Each value-log record contains the complete history for one script hash;
+/// the in-memory index keeps only the latest record location.  Updating a
+/// script therefore appends a new value and atomically advances its pointer,
+/// while ordinary restarts avoid loading every history vector into memory.
+pub struct ElectrumHistoryStore {
+    path: PathBuf,
+    index_path: PathBuf,
+    file: File,
+    index_file: File,
+    index: HashMap<[u8; 32], HistoryLocation>,
+    next_batch_id: u64,
+}
+
+impl ElectrumHistoryStore {
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref();
+        create_dir_all(directory)
+            .with_context(|| format!("creating Electrum history store {}", directory.display()))?;
+        let path = directory.join("history.dat");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening Electrum history store {}", path.display()))?;
+        if file.metadata()?.len() == 0 {
+            file.write_all(ELECTRUM_HISTORY_DATA_MAGIC)?;
+            file.sync_data()?;
+        } else {
+            let mut magic = vec![0u8; ELECTRUM_HISTORY_DATA_MAGIC.len()];
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut magic)?;
+            if magic != ELECTRUM_HISTORY_DATA_MAGIC {
+                bail!("Electrum history store has an unknown format");
+            }
+        }
+
+        let index_path = directory.join("history.index");
+        let mut index_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&index_path)
+            .with_context(|| format!("opening Electrum history index {}", index_path.display()))?;
+        let data_len = file.metadata()?.len();
+        let loaded_index = load_history_index(&mut index_file, data_len)?;
+        let (index, next_batch_id) = if let Some(index) = loaded_index {
+            index
+        } else {
+            let (index, next_batch_id) = scan_history_data(&mut file)?;
+            rewrite_history_index(
+                &mut index_file,
+                data_len_after(&file)?,
+                next_batch_id,
+                &index,
+            )?;
+            (index, next_batch_id)
+        };
+        Ok(Self {
+            path,
+            index_path,
+            file,
+            index_file,
+            index,
+            next_batch_id,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn index_path(&self) -> &Path {
+        &self.index_path
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    /// Monotonically increasing checkpoint used by chainstate to detect a
+    /// history store write that was not followed by metadata publication.
+    pub fn generation(&self) -> u64 {
+        self.next_batch_id
+    }
+
+    pub fn contains(&self, script_hash: &str) -> bool {
+        encode_history_script_hash(script_hash)
+            .ok()
+            .is_some_and(|script_hash| self.index.contains_key(&script_hash))
+    }
+
+    pub fn disk_usage(&self) -> Result<u64> {
+        self.file
+            .metadata()?
+            .len()
+            .checked_add(self.index_file.metadata()?.len())
+            .context("Electrum history store size overflowed")
+    }
+
+    pub fn get(&self, script_hash: &str) -> Result<Vec<(Txid, u32)>> {
+        let script_hash = encode_history_script_hash(script_hash)?;
+        let Some(location) = self.index.get(&script_hash).copied() else {
+            return Ok(Vec::new());
+        };
+        let body = read_history_data_record(&self.file, location)?;
+        decode_history_value(&body, script_hash)
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.index.keys().map(hex::encode).collect()
+    }
+
+    pub fn entries(&self) -> Result<Vec<(String, StoredElectrumHistory)>> {
+        let mut locations = self
+            .index
+            .iter()
+            .map(|(script_hash, location)| (*script_hash, *location))
+            .collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|(_, location)| location.offset);
+        locations
+            .into_iter()
+            .map(|(script_hash, location)| {
+                let body = read_history_data_record(&self.file, location)?;
+                Ok((
+                    hex::encode(script_hash),
+                    decode_history_value(&body, script_hash)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// Apply complete replacement values for the scripts touched by a block.
+    /// The caller supplies each script's new chronological history.
+    pub fn apply_batch(&mut self, updates: &[(String, Vec<(Txid, u32)>)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let batch_id = self.next_batch_id;
+        let next_batch_id = batch_id
+            .checked_add(1)
+            .context("Electrum history batch identifier exhausted")?;
+        let batch_start = data_len_after(&self.file)?;
+        let mut operations = Vec::with_capacity(updates.len());
+        let mut data_committed = false;
+        let write_result = (|| -> Result<()> {
+            for (script_hash, entries) in updates {
+                let script_hash_bytes = encode_history_script_hash(script_hash)?;
+                let body = encode_history_value(batch_id, script_hash_bytes, entries)?;
+                let location = append_history_data_record(&mut self.file, &body)?;
+                operations.push(PendingHistoryOperation {
+                    script_hash: script_hash_bytes,
+                    location,
+                });
+            }
+            let commit = encode_history_commit(batch_id);
+            append_history_data_record(&mut self.file, &commit)?;
+            self.file.sync_data()?;
+            data_committed = true;
+            append_history_index_batch(
+                &mut self.index_file,
+                batch_id,
+                data_len_after(&self.file)?,
+                next_batch_id,
+                &operations,
+            )?;
+            self.index_file.sync_data()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            if !data_committed {
+                let current_len = data_len_after(&self.file)?;
+                if current_len > batch_start {
+                    let _ = self.file.set_len(batch_start);
+                    let _ = self.file.seek(SeekFrom::End(0));
+                }
+            }
+            return Err(error);
+        }
+        for operation in operations {
+            self.index.insert(operation.script_hash, operation.location);
+        }
+        self.next_batch_id = next_batch_id;
+        Ok(())
+    }
+
+    pub fn replace_all<I>(&mut self, entries: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (String, Vec<(Txid, u32)>)>,
+    {
+        self.clear()?;
+        let mut batch = Vec::with_capacity(1_000);
+        for entry in entries {
+            batch.push(entry);
+            if batch.len() == 1_000 {
+                self.apply_batch(&batch)?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.apply_batch(&batch)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(ELECTRUM_HISTORY_DATA_MAGIC)?;
+        self.file.sync_data()?;
+        self.index.clear();
+        self.next_batch_id = 1;
+        self.index_file.set_len(0)?;
+        self.index_file.seek(SeekFrom::End(0))?;
+        self.index_file.write_all(ELECTRUM_HISTORY_INDEX_MAGIC)?;
+        self.index_file.sync_data()?;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        self.index_file.sync_data()?;
+        Ok(())
+    }
+}
+
+impl Drop for ElectrumHistoryStore {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 fn data_len_after(file: &File) -> Result<u64> {
     Ok(file.metadata()?.len())
+}
+
+fn encode_history_script_hash(script_hash: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(script_hash).context("decoding Electrum script hash")?;
+    bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Electrum script hash must be exactly 32 bytes"))
+}
+
+fn encode_history_value(
+    batch_id: u64,
+    script_hash: [u8; 32],
+    entries: &[(Txid, u32)],
+) -> Result<Vec<u8>> {
+    let entry_bytes = entries
+        .len()
+        .checked_mul(36)
+        .context("Electrum history entry count overflowed")?;
+    let body_len = 1usize
+        .checked_add(8)
+        .and_then(|length| length.checked_add(32))
+        .and_then(|length| length.checked_add(4))
+        .and_then(|length| length.checked_add(entry_bytes))
+        .context("Electrum history record length overflowed")?;
+    if body_len > MAX_STORED_ELECTRUM_HISTORY_SIZE {
+        bail!("Electrum history record is too large: {body_len} bytes");
+    }
+    let count =
+        u32::try_from(entries.len()).context("Electrum history entry count is too large")?;
+    let mut body = Vec::with_capacity(body_len);
+    body.push(HISTORY_PUT);
+    body.extend_from_slice(&batch_id.to_le_bytes());
+    body.extend_from_slice(&script_hash);
+    body.extend_from_slice(&count.to_le_bytes());
+    for (txid, height) in entries {
+        body.extend_from_slice(&txid.to_byte_array());
+        body.extend_from_slice(&height.to_le_bytes());
+    }
+    Ok(body)
+}
+
+fn encode_history_commit(batch_id: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(1 + 8);
+    body.push(HISTORY_COMMIT);
+    body.extend_from_slice(&batch_id.to_le_bytes());
+    body
+}
+
+fn append_history_data_record(file: &mut File, body: &[u8]) -> Result<HistoryLocation> {
+    if body.is_empty() || body.len() > MAX_STORED_ELECTRUM_HISTORY_SIZE {
+        bail!("Electrum history log record is too large");
+    }
+    let offset = data_len_after(file)?;
+    let length = u32::try_from(body.len()).context("Electrum history record is too large")?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(body)?;
+    Ok(HistoryLocation { offset, length })
+}
+
+fn read_history_data_record(file: &File, location: HistoryLocation) -> Result<Vec<u8>> {
+    if location.length as usize > MAX_STORED_ELECTRUM_HISTORY_SIZE {
+        bail!("stored Electrum history record is too large");
+    }
+    let mut length = [0u8; 4];
+    read_exact_at(file, &mut length, location.offset)?;
+    let actual = u32::from_le_bytes(length);
+    if actual != location.length {
+        bail!("Electrum history index disagrees with record length");
+    }
+    let mut body = vec![0u8; location.length as usize];
+    read_exact_at(
+        file,
+        &mut body,
+        location
+            .offset
+            .checked_add(4)
+            .context("Electrum history value offset overflowed")?,
+    )?;
+    Ok(body)
+}
+
+fn decode_history_value(body: &[u8], expected_script_hash: [u8; 32]) -> Result<Vec<(Txid, u32)>> {
+    if body.len() < 1 + 8 + 32 + 4 || body[0] != HISTORY_PUT {
+        bail!("Electrum history value is truncated or has an invalid operation");
+    }
+    let script_hash: [u8; 32] = body[9..41]
+        .try_into()
+        .expect("Electrum history script hash has fixed width");
+    if script_hash != expected_script_hash {
+        bail!("Electrum history value key does not match its index");
+    }
+    let count = usize::try_from(u32::from_le_bytes(
+        body[41..45]
+            .try_into()
+            .expect("Electrum history count has fixed width"),
+    ))
+    .context("Electrum history count does not fit usize")?;
+    let expected_len = 45usize
+        .checked_add(
+            count
+                .checked_mul(36)
+                .context("Electrum history count overflowed")?,
+        )
+        .context("Electrum history value length overflowed")?;
+    if expected_len != body.len() {
+        bail!("Electrum history count does not match value length");
+    }
+    let mut entries = Vec::with_capacity(count);
+    let mut offset = 45usize;
+    for _ in 0..count {
+        let txid = Txid::from_byte_array(
+            body[offset..offset + 32]
+                .try_into()
+                .expect("Electrum history txid has fixed width"),
+        );
+        let height = u32::from_le_bytes(
+            body[offset + 32..offset + 36]
+                .try_into()
+                .expect("Electrum history height has fixed width"),
+        );
+        entries.push((txid, height));
+        offset += 36;
+    }
+    Ok(entries)
+}
+
+fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocation>, u64)> {
+    let data_len = data_len_after(file)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut magic = vec![0u8; ELECTRUM_HISTORY_DATA_MAGIC.len()];
+    file.read_exact(&mut magic)?;
+    if magic != ELECTRUM_HISTORY_DATA_MAGIC {
+        bail!("Electrum history store has an unknown format");
+    }
+    let mut position = ELECTRUM_HISTORY_DATA_MAGIC.len() as u64;
+    let mut committed_end = position;
+    let mut pending_batch = None;
+    let mut pending = Vec::new();
+    let mut index = HashMap::new();
+    let mut max_batch = 0u64;
+    while position < data_len {
+        let record_start = position;
+        let mut length_bytes = [0u8; 4];
+        if let Err(error) = file.read_exact(&mut length_bytes) {
+            if error.kind() == ErrorKind::UnexpectedEof {
+                break;
+            }
+            return Err(error.into());
+        }
+        let length = u32::from_le_bytes(length_bytes);
+        let next = position
+            .checked_add(4)
+            .and_then(|value| value.checked_add(u64::from(length)))
+            .context("Electrum history log position overflowed")?;
+        if length == 0
+            || usize::try_from(length).unwrap_or(usize::MAX) > MAX_STORED_ELECTRUM_HISTORY_SIZE
+        {
+            if next > data_len {
+                break;
+            }
+            bail!("Electrum history log record has an invalid length");
+        }
+        if next > data_len {
+            break;
+        }
+        let mut body = vec![0u8; length as usize];
+        file.read_exact(&mut body)?;
+        match body.first().copied() {
+            Some(HISTORY_PUT) => {
+                if body.len() < 1 + 8 + 32 + 4 {
+                    bail!("Electrum history value is truncated");
+                }
+                let batch_id = u64::from_le_bytes(
+                    body[1..9]
+                        .try_into()
+                        .context("Electrum history batch identifier is truncated")?,
+                );
+                let script_hash: [u8; 32] = body[9..41]
+                    .try_into()
+                    .context("Electrum history script hash is truncated")?;
+                decode_history_value(&body, script_hash)?;
+                if pending_batch != Some(batch_id) {
+                    if pending_batch.is_some() {
+                        bail!("Electrum history log contains interleaved batches");
+                    }
+                    pending_batch = Some(batch_id);
+                }
+                pending.push(PendingHistoryOperation {
+                    script_hash,
+                    location: HistoryLocation {
+                        offset: record_start,
+                        length,
+                    },
+                });
+                max_batch = max_batch.max(batch_id);
+            }
+            Some(HISTORY_COMMIT) => {
+                if body.len() != 1 + 8 {
+                    bail!("Electrum history commit record has an invalid length");
+                }
+                let batch_id = u64::from_le_bytes(
+                    body[1..9]
+                        .try_into()
+                        .expect("Electrum history batch identifier has fixed width"),
+                );
+                if pending_batch != Some(batch_id) || pending.is_empty() {
+                    bail!("Electrum history commit does not match a pending batch");
+                }
+                for operation in pending.drain(..) {
+                    index.insert(operation.script_hash, operation.location);
+                }
+                pending_batch = None;
+                committed_end = next;
+                max_batch = max_batch.max(batch_id);
+            }
+            _ => bail!("Electrum history log contains an unknown operation"),
+        }
+        position = next;
+    }
+    if pending_batch.is_some() || position != committed_end {
+        file.set_len(committed_end)?;
+        file.seek(SeekFrom::End(0))?;
+    }
+    Ok((
+        index,
+        max_batch
+            .checked_add(1)
+            .context("Electrum history batch identifier exhausted")?,
+    ))
+}
+
+fn load_history_index(file: &mut File, data_len: u64) -> Result<Option<HistoryIndexState>> {
+    let index_len = file.metadata()?.len();
+    if index_len < ELECTRUM_HISTORY_INDEX_MAGIC.len() as u64 {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut magic = vec![0u8; ELECTRUM_HISTORY_INDEX_MAGIC.len()];
+    file.read_exact(&mut magic)?;
+    if magic != ELECTRUM_HISTORY_INDEX_MAGIC {
+        return Ok(None);
+    }
+    let mut position = ELECTRUM_HISTORY_INDEX_MAGIC.len() as u64;
+    let mut pending_batch = None;
+    let mut pending = Vec::new();
+    let mut index = HashMap::new();
+    let mut last_data_end = None;
+    let mut stored_next_batch_id = None;
+    let mut max_batch = 0u64;
+    while position < index_len {
+        let mut length_bytes = [0u8; 4];
+        if file.read_exact(&mut length_bytes).is_err() {
+            return Ok(None);
+        }
+        let length = u32::from_le_bytes(length_bytes);
+        let next = position
+            .checked_add(4)
+            .and_then(|value| value.checked_add(u64::from(length)))
+            .context("Electrum history index position overflowed")?;
+        if next > index_len || length == 0 || length > 128 {
+            return Ok(None);
+        }
+        let mut body = vec![0u8; length as usize];
+        file.read_exact(&mut body)?;
+        match body.first().copied() {
+            Some(HISTORY_PUT) => {
+                if body.len() != 1 + 8 + 8 + 4 + 32 {
+                    return Ok(None);
+                }
+                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
+                let offset = u64::from_le_bytes(body[9..17].try_into().unwrap());
+                let value_length = u32::from_le_bytes(body[17..21].try_into().unwrap());
+                if value_length == 0
+                    || value_length as usize > MAX_STORED_ELECTRUM_HISTORY_SIZE
+                    || offset < ELECTRUM_HISTORY_DATA_MAGIC.len() as u64
+                    || offset
+                        .checked_add(4)
+                        .and_then(|end| end.checked_add(u64::from(value_length)))
+                        .is_none_or(|end| end > data_len)
+                {
+                    return Ok(None);
+                }
+                let script_hash: [u8; 32] = body[21..53].try_into().unwrap();
+                if pending_batch != Some(batch_id) {
+                    if pending_batch.is_some() {
+                        return Ok(None);
+                    }
+                    pending_batch = Some(batch_id);
+                }
+                pending.push(PendingHistoryOperation {
+                    script_hash,
+                    location: HistoryLocation {
+                        offset,
+                        length: value_length,
+                    },
+                });
+                max_batch = max_batch.max(batch_id);
+            }
+            Some(HISTORY_COMMIT) => {
+                if body.len() != 1 + 8 + 8 + 8 {
+                    return Ok(None);
+                }
+                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
+                let data_end = u64::from_le_bytes(body[9..17].try_into().unwrap());
+                let next_batch_id = u64::from_le_bytes(body[17..25].try_into().unwrap());
+                if next_batch_id == 0
+                    || data_end < ELECTRUM_HISTORY_DATA_MAGIC.len() as u64
+                    || data_end > data_len
+                    || last_data_end.is_some_and(|previous| data_end < previous)
+                    || pending_batch != Some(batch_id)
+                    || (pending.is_empty() && batch_id != 0)
+                {
+                    return Ok(None);
+                }
+                for operation in pending.drain(..) {
+                    index.insert(operation.script_hash, operation.location);
+                }
+                pending_batch = None;
+                last_data_end = Some(data_end);
+                stored_next_batch_id = Some(next_batch_id);
+                max_batch = max_batch.max(batch_id);
+            }
+            _ => return Ok(None),
+        }
+        position = next;
+    }
+    if pending_batch.is_some() || last_data_end != Some(data_len) {
+        return Ok(None);
+    }
+    Ok(Some((
+        index,
+        stored_next_batch_id.unwrap_or(
+            max_batch
+                .checked_add(1)
+                .context("Electrum history batch identifier exhausted")?,
+        ),
+    )))
+}
+
+fn append_history_index_batch(
+    file: &mut File,
+    batch_id: u64,
+    data_end: u64,
+    next_batch_id: u64,
+    operations: &[PendingHistoryOperation],
+) -> Result<()> {
+    file.seek(SeekFrom::End(0))?;
+    for operation in operations {
+        let mut body = Vec::with_capacity(64);
+        body.push(HISTORY_PUT);
+        body.extend_from_slice(&batch_id.to_le_bytes());
+        body.extend_from_slice(&operation.location.offset.to_le_bytes());
+        body.extend_from_slice(&operation.location.length.to_le_bytes());
+        body.extend_from_slice(&operation.script_hash);
+        let length =
+            u32::try_from(body.len()).context("Electrum history index record too large")?;
+        file.write_all(&length.to_le_bytes())?;
+        file.write_all(&body)?;
+    }
+    let mut commit = Vec::with_capacity(25);
+    commit.push(HISTORY_COMMIT);
+    commit.extend_from_slice(&batch_id.to_le_bytes());
+    commit.extend_from_slice(&data_end.to_le_bytes());
+    commit.extend_from_slice(&next_batch_id.to_le_bytes());
+    file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
+    file.write_all(&commit)?;
+    Ok(())
+}
+
+fn rewrite_history_index(
+    file: &mut File,
+    data_end: u64,
+    next_batch_id: u64,
+    index: &HashMap<[u8; 32], HistoryLocation>,
+) -> Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(ELECTRUM_HISTORY_INDEX_MAGIC)?;
+    let operations = index
+        .iter()
+        .map(|(script_hash, location)| PendingHistoryOperation {
+            script_hash: *script_hash,
+            location: *location,
+        })
+        .collect::<Vec<_>>();
+    append_history_index_batch(file, 0, data_end, next_batch_id, &operations)?;
+    file.sync_data()?;
+    Ok(())
 }
 
 fn encode_stored_utxo(entry: &StoredUtxo) -> Result<Vec<u8>> {
@@ -2632,6 +3279,82 @@ mod tests {
         assert_eq!(recovered.get(&first).unwrap(), None);
         assert_eq!(recovered.get(&second).unwrap(), Some(second_entry));
         assert_eq!(std::fs::metadata(data_path).unwrap().len(), committed_len);
+    }
+
+    #[test]
+    fn electrum_history_batches_reopen_and_recover_an_uncommitted_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let script_hash = hex::encode([1u8; 32]);
+        let first_txid = Txid::from_byte_array([2u8; 32]);
+        let second_txid = Txid::from_byte_array([3u8; 32]);
+        let first_history = vec![(first_txid, 7)];
+        let second_history = vec![(first_txid, 7), (second_txid, 8)];
+        {
+            let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
+            store
+                .apply_batch(&[(script_hash.clone(), first_history.clone())])
+                .unwrap();
+            assert_eq!(store.get(&script_hash).unwrap(), first_history);
+            store
+                .apply_batch(&[(script_hash.clone(), second_history.clone())])
+                .unwrap();
+            assert_eq!(store.get(&script_hash).unwrap(), second_history);
+            assert_eq!(store.keys(), vec![script_hash.clone()]);
+        }
+
+        let data_path = directory.path().join("history.dat");
+        let committed_len = std::fs::metadata(&data_path).unwrap().len();
+        let uncommitted =
+            encode_history_value(99, [1u8; 32], &[(Txid::from_byte_array([4u8; 32]), 9)]).unwrap();
+        let mut file = OpenOptions::new().append(true).open(&data_path).unwrap();
+        file.write_all(&(u32::try_from(uncommitted.len()).unwrap()).to_le_bytes())
+            .unwrap();
+        file.write_all(&uncommitted).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+
+        let recovered = ElectrumHistoryStore::open(directory.path()).unwrap();
+        assert_eq!(recovered.get(&script_hash).unwrap(), second_history);
+        assert_eq!(std::fs::metadata(data_path).unwrap().len(), committed_len);
+    }
+
+    #[test]
+    fn electrum_history_rebuilds_a_corrupt_index_and_replaces_all_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_script = hex::encode([5u8; 32]);
+        let second_script = hex::encode([6u8; 32]);
+        let first_txid = Txid::from_byte_array([7u8; 32]);
+        let second_txid = Txid::from_byte_array([8u8; 32]);
+        let entries = vec![
+            (first_script.clone(), vec![(first_txid, 10)]),
+            (second_script.clone(), vec![(second_txid, 11)]),
+        ];
+        {
+            let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
+            store.replace_all(entries.clone()).unwrap();
+        }
+        std::fs::write(directory.path().join("history.index"), b"corrupt").unwrap();
+
+        let mut reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.entries().unwrap().len(), 2);
+        assert_eq!(reopened.get(&first_script).unwrap(), entries[0].1);
+        assert_eq!(reopened.get(&second_script).unwrap(), entries[1].1);
+        reopened
+            .replace_all([(first_script.clone(), vec![(second_txid, 12)])])
+            .unwrap();
+        assert_eq!(
+            reopened.get(&first_script).unwrap(),
+            vec![(second_txid, 12)]
+        );
+        assert!(reopened.get(&second_script).unwrap().is_empty());
+        drop(reopened);
+
+        let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(
+            reopened.get(&first_script).unwrap(),
+            vec![(second_txid, 12)]
+        );
     }
 
     #[test]

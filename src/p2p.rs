@@ -648,6 +648,10 @@ impl LowWorkHeadersSync {
         }
     }
 
+    fn presync_height(&self) -> i64 {
+        i64::from(self.current_height)
+    }
+
     fn next_locator(&self, chain: &crate::chain::ChainState) -> Vec<BlockHash> {
         let last_hash = match self.phase {
             LowWorkHeadersPhase::Presync => self.last_header.block_hash(),
@@ -3322,6 +3326,7 @@ async fn serve_peer_loop(
                 *peer_state.last_headers_request.lock() = None;
                 if headers.is_empty() {
                     headers_sync = None;
+                    node.update_peer_presynced_headers(peer_id, None);
                     continue;
                 }
 
@@ -3342,6 +3347,7 @@ async fn serve_peer_loop(
                     let result = sync.process(&headers_to_accept, request_more_headers);
                     if !result.success {
                         headers_sync = None;
+                        node.update_peer_presynced_headers(peer_id, None);
                         continue;
                     }
                     headers_to_accept = result.ready;
@@ -3399,6 +3405,7 @@ async fn serve_peer_loop(
                             );
                             let result = sync.process(&headers_to_accept, request_more_headers);
                             if !result.success {
+                                node.update_peer_presynced_headers(peer_id, None);
                                 continue;
                             }
                             headers_to_accept = result.ready;
@@ -3411,6 +3418,10 @@ async fn serve_peer_loop(
                             }
                             sync_finished = result.finished;
                             if !sync_finished {
+                                node.update_peer_presynced_headers(
+                                    peer_id,
+                                    Some(sync.presync_height()),
+                                );
                                 headers_sync = Some(sync);
                             }
                         }
@@ -3419,6 +3430,9 @@ async fn serve_peer_loop(
 
                 if sync_finished {
                     headers_sync = None;
+                    node.update_peer_presynced_headers(peer_id, None);
+                } else if let Some(sync) = headers_sync.as_ref() {
+                    node.update_peer_presynced_headers(peer_id, Some(sync.presync_height()));
                 }
 
                 let hashes = node.chain.write().accept_headers(&headers_to_accept)?;
@@ -6640,6 +6654,7 @@ mod tests {
         assert!(presync.success);
         assert!(presync.request_more);
         assert!(!presync.finished);
+        assert_eq!(sync.presync_height(), 300);
         assert_eq!(sync.phase(), LowWorkHeadersPhase::Redownload);
         assert_eq!(sync.commitment_count(), 2);
 
@@ -6648,6 +6663,7 @@ mod tests {
         assert!(redownload.finished);
         assert!(!redownload.request_more);
         assert_eq!(redownload.ready, headers);
+        assert_eq!(sync.presync_height(), 300);
     }
 
     #[test]

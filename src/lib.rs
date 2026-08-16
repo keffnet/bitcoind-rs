@@ -590,6 +590,7 @@ pub struct PeerInfo {
     pub last_block: u64,
     pub(crate) best_known_block: Option<BlockHash>,
     pub(crate) last_common_block: Option<BlockHash>,
+    pub(crate) presynced_headers: i64,
     pub(crate) bip152_highbandwidth_to: bool,
     pub(crate) bip152_highbandwidth_from: bool,
     inflight_blocks: Vec<InflightBlock>,
@@ -2499,6 +2500,12 @@ impl Node {
         }
     }
 
+    pub(crate) fn update_peer_presynced_headers(&self, peer_id: usize, height: Option<i64>) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.presynced_headers = height.unwrap_or(-1);
+        }
+    }
+
     pub(crate) fn update_peer_bip152_highbandwidth_from(&self, peer_id: usize, enabled: bool) {
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
             peer.bip152_highbandwidth_from = enabled;
@@ -2928,6 +2935,7 @@ impl Node {
             last_block: 0,
             best_known_block: None,
             last_common_block: None,
+            presynced_headers: -1,
             bip152_highbandwidth_to: false,
             bip152_highbandwidth_from: false,
             inflight_blocks: Vec::new(),
@@ -3428,6 +3436,7 @@ impl Node {
                 last_block: 0,
                 best_known_block: None,
                 last_common_block: None,
+                presynced_headers: -1,
                 bip152_highbandwidth_to: false,
                 bip152_highbandwidth_from: false,
                 inflight_blocks: Vec::new(),
@@ -3492,6 +3501,7 @@ impl Node {
             last_block: 0,
             best_known_block: None,
             last_common_block: None,
+            presynced_headers: -1,
             bip152_highbandwidth_to: false,
             bip152_highbandwidth_from: false,
             inflight_blocks: Vec::new(),
@@ -4485,6 +4495,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                         last_block: 0,
                         best_known_block: None,
                         last_common_block: None,
+                        presynced_headers: -1,
                         bip152_highbandwidth_to: false,
                         bip152_highbandwidth_from: false,
                         inflight_blocks: Vec::new(),

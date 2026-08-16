@@ -2156,7 +2156,7 @@ fn dispatch_method_for_user(
                         "inbound": peer.inbound,
                         "bip152_hb_to": peer.bip152_highbandwidth_to,
                         "bip152_hb_from": peer.bip152_highbandwidth_from,
-                        "presynced_headers": -1,
+                        "presynced_headers": peer.presynced_headers,
                         "synced_headers": synced_headers,
                         "synced_blocks": synced_blocks,
                         "inflight": peer.inflight_heights(),
@@ -20305,6 +20305,10 @@ mod tests {
         );
         assert_eq!(peer_info[0]["subver"], json!("/test-peerunsafe/"));
         assert_eq!(peer_info[0]["presynced_headers"], json!(-1));
+        node.update_peer_presynced_headers(7, Some(12));
+        let presyncing = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
+        assert_eq!(presyncing[0]["presynced_headers"], json!(12));
+        node.update_peer_presynced_headers(7, None);
         assert_eq!(peer_info[0]["bip152_hb_to"], json!(false));
         assert_eq!(peer_info[0]["bip152_hb_from"], json!(true));
         assert_eq!(peer_info[0]["inflight"], json!([]));

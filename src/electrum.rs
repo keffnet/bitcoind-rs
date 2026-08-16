@@ -795,6 +795,11 @@ fn normalize_electrum_params(method: &str, params: &Value) -> Result<Value> {
     if params.is_array() {
         let values = params.as_array().expect("checked array above");
         if electrum_parameter_names(method).is_some_and(|names| values.len() > names.len()) {
+            if method == "server.version" {
+                return Ok(Value::Array(
+                    values.iter().take(2).cloned().collect::<Vec<_>>(),
+                ));
+            }
             return Err(electrum_invalid_params());
         }
         return Ok(params.clone());
@@ -964,7 +969,7 @@ fn client_protocol_range(params: &Value) -> Result<(ProtocolVersion, ProtocolVer
             let version = parse_protocol_version(version)?;
             Ok((version, version))
         }
-        Value::Array(versions) if versions.len() >= 2 => Ok((
+        Value::Array(versions) if versions.len() == 2 => Ok((
             parse_protocol_version(
                 versions[0]
                     .as_str()
@@ -991,6 +996,13 @@ fn client_protocol_range(params: &Value) -> Result<(ProtocolVersion, ProtocolVer
 fn negotiate_version(params: &Value, session: &mut ElectrumSession) -> Result<Value> {
     if session.version_negotiated {
         bail!("server.version may only be called once")
+    }
+    if params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .is_some_and(|value| !value.is_string())
+    {
+        return Err(electrum_invalid_params());
     }
     let (client_min, client_max) =
         client_protocol_range(params).map_err(|_| electrum_invalid_params())?;
@@ -2080,6 +2092,14 @@ mod tests {
             .unwrap(),
             json!(["test"])
         );
+        assert_eq!(
+            normalize_electrum_params(
+                "server.version",
+                &json!(["test", ["1.4", "1.7"], "future-hint"]),
+            )
+            .unwrap(),
+            json!(["test", ["1.4", "1.7"]])
+        );
         let default_range = client_protocol_range(
             &normalize_electrum_params("server.version", &json!({"client_name": "test"})).unwrap(),
         )
@@ -2092,6 +2112,9 @@ mod tests {
             )
             .is_err()
         );
+        assert!(client_protocol_range(&json!(["test", ["1.4", "1.7", "1.8"]])).is_err());
+        let mut session = ElectrumSession::default();
+        assert!(negotiate_version(&json!([42, "1.4"]), &mut session).is_err());
     }
 
     #[test]

@@ -2937,6 +2937,40 @@ impl ChainState {
             .collect()
     }
 
+    /// Return the block inventory Core would produce for `getblocks`.
+    ///
+    /// Unlike `getheaders`, the stop hash is not included. Core also stops
+    /// at the first block whose body is unavailable, rather than skipping it
+    /// and advertising later blocks. In prune mode it applies the same
+    /// recent-block safety window even when an older body happens to remain
+    /// on disk.
+    pub fn block_hashes_after_locator_for_getblocks(
+        &self,
+        locator: &[BlockHash],
+        stop_hash: BlockHash,
+        max_blocks: usize,
+    ) -> Vec<BlockHash> {
+        let recent_blocks = MIN_BLOCKS_TO_KEEP.saturating_sub(
+            u32::try_from(3600 / self.network.params().pow_target_spacing).unwrap_or(u32::MAX),
+        );
+        let oldest_allowed_height = self.height().saturating_sub(recent_blocks);
+        self.headers_after_locator(locator, stop_hash)
+            .into_iter()
+            .take_while(|header| {
+                let hash = header.block_hash();
+                if hash == stop_hash || !self.store.contains(&hash) {
+                    return false;
+                }
+                !self.is_pruned()
+                    || self
+                        .block_height_by_hash(&hash)
+                        .is_some_and(|height| height > oldest_allowed_height)
+            })
+            .take(max_blocks)
+            .map(|header| header.block_hash())
+            .collect()
+    }
+
     /// Match Core's special `getheaders` behavior for a null locator.
     ///
     /// A null locator is not a request for the active chain from genesis. Core
@@ -7763,6 +7797,36 @@ mod tests {
                     30 * 24 * 60 * 60
                 )
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn getblocks_excludes_stop_and_stops_at_missing_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=4 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+
+        let locator = [state.block_hash(0).unwrap()];
+        let stop = state.block_hash(3).unwrap();
+        assert_eq!(
+            state.block_hashes_after_locator_for_getblocks(&locator, stop, 500),
+            vec![state.block_hash(1).unwrap(), state.block_hash(2).unwrap(),]
+        );
+
+        let retained = [
+            state.block_hash(0).unwrap(),
+            state.block_hash(1).unwrap(),
+            state.block_hash(3).unwrap(),
+            state.block_hash(4).unwrap(),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        state.store.prune(&retained, &retained).unwrap();
+        assert_eq!(
+            state.block_hashes_after_locator_for_getblocks(&locator, BlockHash::all_zeros(), 500),
+            vec![state.block_hash(1).unwrap()]
         );
     }
 

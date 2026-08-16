@@ -3319,15 +3319,17 @@ async fn serve_peer_loop(
             }
             Message::GetBlocks(request) => {
                 let hashes = {
-                    let chain = node.chain.read();
-                    chain
-                        .headers_after_locator(&request.locator_hashes, request.stop_hash)
+                    node.chain
+                        .read()
+                        .block_hashes_after_locator_for_getblocks(
+                            &request.locator_hashes,
+                            request.stop_hash,
+                            500,
+                        )
                         .into_iter()
-                        .filter(|header| chain.store.contains(&header.block_hash()))
-                        .take(500)
                         .map(|header| Inventory {
                             kind: InventoryType::Block,
-                            hash: header.block_hash(),
+                            hash: header,
                         })
                         .collect::<Vec<_>>()
                 };

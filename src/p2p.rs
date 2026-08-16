@@ -248,6 +248,8 @@ const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(2 * 60);
 const HEADERS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const AVG_FEEFILTER_BROADCAST_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const MAX_FEEFILTER_CHANGE_DELAY: Duration = Duration::from_secs(5 * 60);
 const MAX_FUTURE_BLOCK_TIME_SECS: u64 = 2 * 60 * 60;
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
 const MAX_PEER_TX_ANNOUNCEMENTS: usize = 5_000;
@@ -846,6 +848,8 @@ struct PeerState {
     pending_tx_inventory: parking_lot::Mutex<Vec<Inventory>>,
     tx_requests: parking_lot::Mutex<TxRequestState>,
     fee_filter: parking_lot::Mutex<i64>,
+    sent_fee_filter: parking_lot::Mutex<Option<i64>>,
+    next_fee_filter: parking_lot::Mutex<Option<Instant>>,
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
@@ -2858,6 +2862,8 @@ async fn serve_peer(
         pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
         tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
         fee_filter: parking_lot::Mutex::new(0),
+        sent_fee_filter: parking_lot::Mutex::new(None),
+        next_fee_filter: parking_lot::Mutex::new(None),
         relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
@@ -3143,6 +3149,15 @@ async fn serve_peer_loop(
                     continue;
                 }
                 maybe_send_send_headers(
+                    node,
+                    peer_id,
+                    writer,
+                    peer_state,
+                    node.config.network,
+                    peer_version,
+                )
+                .await?;
+                maybe_send_fee_filter(
                     node,
                     peer_id,
                     writer,
@@ -5371,37 +5386,101 @@ async fn send_post_verack_extensions(
         )
         .await?;
     }
-    if peer_version >= FEEFILTER_VERSION {
-        let initial_block_download = node.chain.read().is_initial_block_download();
-        let (mempool_min_fee, min_relay_fee) = {
-            let mut mempool = node.mempool.write();
-            (
-                mempool.mempool_min_fee_sat_per_kvb(),
-                mempool.min_relay_fee_sat_per_kvb(),
-            )
-        };
-        if let Some(relay_fee) = outbound_fee_filter(
-            node.config.blocksonly,
-            initial_block_download,
-            peer_state
-                .permissions
-                .contains(PeerPermissions::FORCE_RELAY),
-            peer_state.connection_type,
-            mempool_min_fee,
-            min_relay_fee,
-        ) {
-            send_message(
-                node,
-                peer_id,
-                writer,
-                network,
-                &Message::FeeFilter(relay_fee),
-            )
-            .await?;
-        }
-    }
+    maybe_send_fee_filter(node, peer_id, writer, peer_state, network, peer_version).await?;
     *sent = true;
     Ok(())
+}
+
+async fn maybe_send_fee_filter(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    peer_state: &PeerState,
+    network: Network,
+    peer_version: i32,
+) -> Result<()> {
+    if peer_version < FEEFILTER_VERSION || *peer_state.private_broadcast_peer.lock() {
+        return Ok(());
+    }
+    let initial_block_download = node.chain.read().is_initial_block_download();
+    let (mempool_min_fee, min_relay_fee) = {
+        let mut mempool = node.mempool.write();
+        (
+            mempool.mempool_min_fee_sat_per_kvb(),
+            mempool.min_relay_fee_sat_per_kvb(),
+        )
+    };
+    let Some(relay_fee) = outbound_fee_filter(
+        node.config.blocksonly,
+        initial_block_download,
+        peer_state
+            .permissions
+            .contains(PeerPermissions::FORCE_RELAY),
+        peer_state.connection_type,
+        mempool_min_fee,
+        min_relay_fee,
+    ) else {
+        return Ok(());
+    };
+
+    let now = Instant::now();
+    let sent_fee = *peer_state.sent_fee_filter.lock();
+    let max_money = i64::try_from(Amount::MAX_MONEY.to_sat()).expect("MAX_MONEY fits in i64");
+    let should_send = {
+        let mut next_fee_filter = peer_state.next_fee_filter.lock();
+        if !initial_block_download && sent_fee == Some(max_money) {
+            // Core immediately re-advertises the normal relay floor after leaving
+            // IBD instead of waiting for the old randomized timer.
+            *next_fee_filter = None;
+        }
+        let scheduled = *next_fee_filter;
+        if scheduled.is_none_or(|deadline| now >= deadline) {
+            true
+        } else {
+            if fee_filter_changed_substantially(relay_fee, sent_fee)
+                && scheduled.is_some_and(|deadline| now + MAX_FEEFILTER_CHANGE_DELAY < deadline)
+            {
+                *next_fee_filter =
+                    Some(now + random_fee_filter_delay_at_most(MAX_FEEFILTER_CHANGE_DELAY));
+            }
+            false
+        }
+    };
+    if !should_send {
+        return Ok(());
+    }
+
+    if sent_fee != Some(relay_fee) {
+        send_message(
+            node,
+            peer_id,
+            writer,
+            network,
+            &Message::FeeFilter(relay_fee),
+        )
+        .await?;
+        *peer_state.sent_fee_filter.lock() = Some(relay_fee);
+    }
+    *peer_state.next_fee_filter.lock() =
+        Some(now + random_fee_filter_delay(AVG_FEEFILTER_BROADCAST_INTERVAL));
+    Ok(())
+}
+
+fn random_fee_filter_delay(maximum: Duration) -> Duration {
+    let mean_seconds = maximum.as_secs_f64();
+    if mean_seconds == 0.0 {
+        return Duration::ZERO;
+    }
+    let unit = (1.0 - random::<f64>()).max(f64::MIN_POSITIVE);
+    Duration::from_secs_f64(-unit.ln() * mean_seconds)
+}
+
+fn random_fee_filter_delay_at_most(maximum: Duration) -> Duration {
+    let maximum_seconds = maximum.as_secs();
+    if maximum_seconds == 0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs(random::<u64>() % (maximum_seconds + 1))
 }
 
 async fn maybe_send_send_headers(
@@ -5957,6 +6036,13 @@ fn notfound_transaction_items(items: &[Inventory]) -> Option<Vec<Inventory>> {
 
 fn fee_filter_in_money_range(rate: i64) -> bool {
     rate >= 0 && u64::try_from(rate).is_ok_and(|rate| rate <= Amount::MAX_MONEY.to_sat())
+}
+
+fn fee_filter_changed_substantially(current: i64, sent: Option<i64>) -> bool {
+    let Some(sent) = sent else {
+        return true;
+    };
+    sent <= 0 || current < sent.saturating_mul(3) / 4 || current > sent.saturating_mul(4) / 3
 }
 
 fn send_headers_work_gate(peer_work: Option<Work>, minimum_chain_work: Work) -> bool {
@@ -7370,6 +7456,8 @@ mod tests {
             pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
             tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
             fee_filter: parking_lot::Mutex::new(0),
+            sent_fee_filter: parking_lot::Mutex::new(None),
+            next_fee_filter: parking_lot::Mutex::new(None),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(true),
             send_headers: parking_lot::Mutex::new(false),
@@ -7851,6 +7939,16 @@ mod tests {
         assert!(fee_filter_in_money_range(max_money));
         assert!(!fee_filter_in_money_range(-1));
         assert!(!fee_filter_in_money_range(max_money + 1));
+    }
+
+    #[test]
+    fn fee_filter_refresh_uses_core_substantial_change_threshold() {
+        assert!(fee_filter_changed_substantially(74, Some(100)));
+        assert!(!fee_filter_changed_substantially(75, Some(100)));
+        assert!(!fee_filter_changed_substantially(133, Some(100)));
+        assert!(fee_filter_changed_substantially(134, Some(100)));
+        assert!(fee_filter_changed_substantially(1, Some(0)));
+        assert!(fee_filter_changed_substantially(100, None));
     }
 
     #[test]
@@ -9758,6 +9856,8 @@ mod tests {
             pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
             tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
             fee_filter: parking_lot::Mutex::new(0),
+            sent_fee_filter: parking_lot::Mutex::new(None),
+            next_fee_filter: parking_lot::Mutex::new(None),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(false),
             send_headers: parking_lot::Mutex::new(false),

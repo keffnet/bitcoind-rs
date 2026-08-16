@@ -10833,7 +10833,10 @@ fn mining_block_with_deployment_parameters(
                 }
                 builder.into_script()
             },
-            sequence: bitcoin::Sequence::MAX,
+            // Match Core's CTxIn::MAX_SEQUENCE_NONFINAL.  Although the
+            // coinbase input cannot be spent in the block, miners and RPC
+            // clients observe this transaction field directly.
+            sequence: bitcoin::Sequence::from_consensus(0xffff_fffe),
             witness: Witness::default(),
         }],
         output: vec![TxOut {
@@ -18643,6 +18646,12 @@ mod tests {
         })
         .unwrap();
         assert!(pre_segwit_block.txdata[0].input[0].witness.is_empty());
+        assert_eq!(
+            pre_segwit_block.txdata[0].input[0]
+                .sequence
+                .to_consensus_u32(),
+            0xffff_fffe
+        );
         assert_eq!(pre_segwit_block.txdata[0].output.len(), 1);
         assert!(get_block_template(&node, &json!([{}])).is_err());
 

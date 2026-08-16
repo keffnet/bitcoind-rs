@@ -3731,13 +3731,6 @@ async fn serve_peer_loop(
                             }
                         }
                         InventoryType::CompactBlock => {
-                            if node.historical_block_serving_limit_reached(
-                                &item.hash,
-                                false,
-                                peer_state.permissions,
-                            ) {
-                                anyhow::bail!("historical block serving limit reached");
-                            }
                             let (block, recent, direct_fetch_allowed) = {
                                 let mut chain = node.chain.write();
                                 if !chain
@@ -3762,6 +3755,13 @@ async fn serve_peer_loop(
                                 };
                                 (block, recent, direct_fetch_allowed)
                             };
+                            if node.historical_block_serving_limit_reached(
+                                &item.hash,
+                                false,
+                                peer_state.permissions,
+                            ) {
+                                anyhow::bail!("historical block serving limit reached");
+                            }
                             if peer_requests_too_old_network_limited_block(
                                 node,
                                 &item.hash,

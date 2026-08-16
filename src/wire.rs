@@ -934,11 +934,10 @@ fn decode_headers(reader: &mut Reader<'_>) -> Result<Vec<bitcoin::block::Header>
     for _ in 0..count {
         let bytes = reader.bytes(80)?;
         headers.push(deserialize(bytes).map_err(payload_error)?);
-        if reader.compact_size()? != 0 {
-            return Err(WireError::Payload(
-                "headers message contains transactions".to_owned(),
-            ));
-        }
+        // Core consumes the transaction-count field but intentionally ignores
+        // its value. Keep the same wire compatibility: a nonzero count does
+        // not turn an otherwise decodable header message into a disconnect.
+        reader.compact_size()?;
     }
     Ok(headers)
 }
@@ -1130,6 +1129,19 @@ mod tests {
         let mut rejected = VersionMessage::new(12, 99);
         rejected.user_agent = "x".repeat(257);
         assert!(encode_message(Network::Bitcoin, &Message::Version(rejected)).is_err());
+    }
+
+    #[test]
+    fn headers_ignore_transaction_counts_like_core() {
+        let header = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let mut frame = encode_message(Network::Regtest, &Message::Headers(vec![header])).unwrap();
+        frame[24 + 1 + 80] = 1;
+        let frame_checksum = checksum(&frame[24..]);
+        frame[20..24].copy_from_slice(&frame_checksum);
+        assert_eq!(
+            decode_message(Network::Regtest, &frame).unwrap(),
+            Message::Headers(vec![header])
+        );
     }
 
     #[tokio::test]

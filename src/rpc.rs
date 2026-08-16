@@ -5346,26 +5346,30 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .as_array()
         .and_then(|values| values.first())
         .ok_or_else(|| anyhow!("missing block selector"))?;
+    let mut chain = node.chain.write();
     let hash = if let Some(hash) = selector.as_str() {
         hash.parse::<BlockHash>()?
-    } else {
-        let height = selector
-            .as_u64()
-            .ok_or_else(|| anyhow!("block selector must be a hash or height"))?;
-        let height =
-            u32::try_from(height).map_err(|_| anyhow!("block selector height is out of range"))?;
-        node.chain
-            .read()
+    } else if let Some(height) = selector.as_i64() {
+        if height < 0 {
+            bail!("Target block height {height} is negative")
+        }
+        let current_tip = chain.height();
+        if height > i64::from(current_tip) {
+            bail!("Target block height {height} after current tip {current_tip}")
+        }
+        let height = u32::try_from(height).expect("height is within the active chain");
+        chain
             .block_hash(height)
             .ok_or_else(|| anyhow!("block height out of range"))?
+    } else {
+        bail!("block selector must be a hash or height")
     };
-    let mut chain = node.chain.write();
     let height = chain
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
     let block = chain
         .block(&hash)?
-        .ok_or_else(|| anyhow!("Block not available"))?;
+        .ok_or_else(|| anyhow!("Block not available (not fully downloaded)"))?;
     let fee_stats = chain
         .block_fee_stats(&hash)?
         .ok_or_else(|| anyhow!("Undo data not available"))?;
@@ -13381,6 +13385,7 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.starts_with("invalid blockhash:")
         || lower.starts_with("invalid nblocks.")
         || lower.starts_with("invalid selected statistic ")
+        || lower.starts_with("target block height ")
         || lower.contains("specified more than once")
         || lower.contains("must be between ")
         || lower.contains("must not be negative")
@@ -14560,6 +14565,18 @@ mod tests {
         .unwrap();
         let hash = node.chain.read().best_hash();
         let stats = get_block_stats(&node, &json!([hash.to_string()])).unwrap();
+        let negative_height = get_block_stats(&node, &json!([-1])).unwrap_err();
+        assert_eq!(
+            negative_height.to_string(),
+            "Target block height -1 is negative"
+        );
+        assert_eq!(rpc_error(&negative_height)["code"], json!(-8));
+        let after_tip = get_block_stats(&node, &json!([1])).unwrap_err();
+        assert_eq!(
+            after_tip.to_string(),
+            "Target block height 1 after current tip 0"
+        );
+        assert_eq!(rpc_error(&after_tip)["code"], json!(-8));
         assert!(stats.get("size").is_none());
         assert_eq!(stats["total_out"], json!(0));
         assert_eq!(stats["subsidy"], json!(5_000_000_000u64));

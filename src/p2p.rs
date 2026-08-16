@@ -3981,8 +3981,12 @@ async fn serve_peer_loop(
                             .await?;
                         }
                         kind if kind.is_transaction() => {
-                            if !peer_state.local_relay_transactions || !*relay_transactions.lock() {
-                                missing.push(item);
+                            if !peer_can_serve_transaction_getdata(
+                                peer_state.local_relay_transactions,
+                                *relay_transactions.lock(),
+                                node.config.peer_bloom_filters,
+                                peer_state.permissions,
+                            ) {
                                 continue;
                             }
                             let last_inv_sequence = node
@@ -5747,6 +5751,18 @@ fn mempool_request_exceeds_upload_limit(
     permissions: PeerPermissions,
 ) -> bool {
     upload_target_reached && !permissions.contains(PeerPermissions::MEMPOOL)
+}
+
+fn peer_can_serve_transaction_getdata(
+    local_relay_transactions: bool,
+    peer_relay_transactions: bool,
+    peer_bloom_filters: bool,
+    permissions: PeerPermissions,
+) -> bool {
+    local_relay_transactions
+        && (peer_relay_transactions
+            || peer_bloom_filters
+            || permissions.contains(PeerPermissions::BLOOM_FILTER))
 }
 
 fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
@@ -7601,6 +7617,40 @@ mod tests {
         assert!(!mempool_request_exceeds_upload_limit(
             true,
             PeerPermissions::MEMPOOL
+        ));
+    }
+
+    #[test]
+    fn transaction_getdata_serving_is_separate_from_relay_announcements() {
+        assert!(peer_can_serve_transaction_getdata(
+            true,
+            true,
+            false,
+            PeerPermissions::empty()
+        ));
+        assert!(!peer_can_serve_transaction_getdata(
+            true,
+            false,
+            false,
+            PeerPermissions::empty()
+        ));
+        assert!(peer_can_serve_transaction_getdata(
+            true,
+            false,
+            true,
+            PeerPermissions::empty()
+        ));
+        assert!(peer_can_serve_transaction_getdata(
+            true,
+            false,
+            false,
+            PeerPermissions::BLOOM_FILTER
+        ));
+        assert!(!peer_can_serve_transaction_getdata(
+            false,
+            true,
+            true,
+            PeerPermissions::BLOOM_FILTER
         ));
     }
 

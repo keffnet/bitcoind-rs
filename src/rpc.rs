@@ -12834,15 +12834,10 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
 
     if let Some((progress_height, progress_hash, snapshot_base, _)) = chain.background_chainstate()
     {
-        let progress = if tip.height == 0 {
-            0.0
-        } else {
-            f64::from(progress_height) / f64::from(tip.height)
-        };
         chainstates.push(make_chainstate(
             progress_height,
             progress_hash,
-            progress.min(1.0),
+            chain.verification_progress_for_height(progress_height, crate::time::unix_time_i64()),
             0,
             false,
             None,
@@ -12850,7 +12845,7 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
         chainstates.push(make_chainstate(
             tip.height,
             tip.hash,
-            1.0,
+            chain.verification_progress(),
             chain.utxo_bogo_size(),
             false,
             Some(snapshot_base),
@@ -12862,7 +12857,7 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
         chainstates.push(make_chainstate(
             tip.height,
             tip.hash,
-            1.0,
+            chain.verification_progress(),
             chain.utxo_bogo_size(),
             validated,
             snapshot_base,
@@ -25745,12 +25740,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(duplicate_activity["activity"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            get_chain_states(&node).unwrap()["chainstates"][0]["blocks"],
-            1
-        );
-        let chainstate = &get_chain_states(&node).unwrap()["chainstates"][0];
+        let previous_mock_time = crate::time::mock_time();
+        let tip_time = i64::from(node.chain.read().header(1).unwrap().time);
+        crate::time::set_mock_time(tip_time.saturating_add(2 * 24 * 60 * 60));
+        let chainstates = get_chain_states(&node).unwrap();
+        assert_eq!(chainstates["chainstates"][0]["blocks"], 1);
+        let chainstate = &chainstates["chainstates"][0];
         assert_eq!(chainstate["validated"], true);
         assert!(chainstate.get("snapshot_blockhash").is_none());
+        let blockchain_info = get_blockchain_info(&node).unwrap();
+        let chainstate_progress = chainstate["verificationprogress"].as_f64().unwrap();
+        let blockchain_progress = blockchain_info["verificationprogress"].as_f64().unwrap();
+        assert!((chainstate_progress - blockchain_progress).abs() < f64::EPSILON);
+        assert!(chainstate_progress < 1.0);
+        crate::time::set_mock_time(previous_mock_time);
     }
 }

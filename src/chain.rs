@@ -1836,8 +1836,17 @@ impl ChainState {
     }
 
     fn verification_progress_at(&self, now: i64) -> f64 {
-        let tip = self.tip();
-        let Some(chain_tx_count) = self.chain_transaction_count(tip.height) else {
+        self.verification_progress_for_height(self.height(), now)
+    }
+
+    /// Estimate verification progress for the chainstate tip at `height`.
+    ///
+    /// Core's `getchainstates` calls `GuessVerificationProgress` separately
+    /// for the active and historical chainstate tips. The transaction-count
+    /// model is shared with `getblockchaininfo`, but the height must remain
+    /// explicit for the background AssumeUTXO chainstate.
+    pub fn verification_progress_for_height(&self, height: u32, now: i64) -> f64 {
+        let Some(chain_tx_count) = self.chain_transaction_count(height) else {
             return 0.0;
         };
         if chain_tx_count == 0 {
@@ -1845,15 +1854,15 @@ impl ChainState {
         }
 
         let tip_header = self
-            .header(tip.height)
+            .header(height)
             .expect("active tip header is always indexed");
         let best_header = self.best_header_tip();
         let spacing = i64::try_from(self.network.params().pow_target_spacing).unwrap_or(i64::MAX);
-        let block_time = if best_header.height >= tip.height
+        let block_time = if best_header.height >= height
             && now.abs_diff(i64::from(tip_header.time)) <= 2 * 60 * 60
         {
             now.saturating_sub(
-                i64::from(best_header.height.saturating_sub(tip.height)).saturating_mul(spacing),
+                i64::from(best_header.height.saturating_sub(height)).saturating_mul(spacing),
             )
         } else {
             i64::from(tip_header.time)

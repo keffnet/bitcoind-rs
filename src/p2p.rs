@@ -797,6 +797,18 @@ impl LowWorkHeadersSync {
     }
 }
 
+fn missing_headers_parent(
+    chain: &crate::chain::ChainState,
+    headers: &[BlockHeader],
+) -> Option<BlockHash> {
+    headers.first().and_then(|header| {
+        chain
+            .header_by_hash(&header.prev_blockhash)
+            .is_none()
+            .then_some(header.prev_blockhash)
+    })
+}
+
 fn valid_header_pow(network: Network, header: &BlockHeader) -> bool {
     let compact = header.bits.to_consensus();
     let target = header.target();
@@ -3595,8 +3607,8 @@ async fn serve_peer_loop(
             }
             Message::Headers(headers) => {
                 let request_more_headers = headers.len() == 2_000;
-                *peer_state.last_headers_request.lock() = None;
                 if headers.is_empty() {
+                    *peer_state.last_headers_request.lock() = None;
                     headers_sync = None;
                     node.update_peer_presynced_headers(peer_id, None);
                     continue;
@@ -3708,6 +3720,21 @@ async fn serve_peer_loop(
                     }
                 }
 
+                let missing_parent = {
+                    let chain = node.chain.read();
+                    missing_headers_parent(&chain, &headers_to_accept)
+                };
+                if let Some(parent_hash) = missing_parent {
+                    // Core treats a continuous batch whose first parent is
+                    // unknown as a BIP130-style announcement. Ask for the
+                    // missing chain instead of disconnecting merely because
+                    // this peer announced a header before another peer did.
+                    debug!(%parent_hash, "received unconnecting headers");
+                    request_headers(node, peer_id, writer, peer_state).await?;
+                    continue;
+                }
+
+                *peer_state.last_headers_request.lock() = None;
                 if sync_finished {
                     headers_sync = None;
                     node.update_peer_presynced_headers(peer_id, None);
@@ -7766,6 +7793,21 @@ mod tests {
         let mut non_continuous = headers.clone();
         non_continuous[1].prev_blockhash = BlockHash::from_byte_array([0x42; 32]);
         assert!(!headers_are_continuous(&non_continuous));
+    }
+
+    #[test]
+    fn unconnecting_header_batches_report_their_missing_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = crate::chain::ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let (_, mut headers) = mined_regtest_headers(1);
+
+        assert_eq!(missing_headers_parent(&chain, &headers), None);
+
+        headers[0].prev_blockhash = BlockHash::from_byte_array([0x42; 32]);
+        assert_eq!(
+            missing_headers_parent(&chain, &headers),
+            Some(BlockHash::from_byte_array([0x42; 32]))
+        );
     }
 
     fn mined_regtest_headers(count: usize) -> (Header, Vec<Header>) {

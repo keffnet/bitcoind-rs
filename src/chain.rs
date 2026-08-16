@@ -3156,15 +3156,11 @@ impl ChainState {
             .collect()
     }
 
-    pub fn transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
-        let Some(location) = self
-            .tx_index
-            .get(txid)
-            .or_else(|| self.tx_index_all.get(txid))
-            .cloned()
-        else {
-            return Ok(None);
-        };
+    fn transaction_at_location(
+        &mut self,
+        txid: &Txid,
+        location: TxLocation,
+    ) -> Result<Option<(Transaction, TxLocation)>> {
         if let Some(block) = self.store.get(&location.block_hash)? {
             let Some(transaction) = block.txdata.get(location.transaction_index).cloned() else {
                 bail!("transaction index is inconsistent with stored block");
@@ -3183,6 +3179,30 @@ impl ChainState {
             bail!("Electrum transaction sidecar does not match transaction index");
         }
         Ok(Some((transaction, location)))
+    }
+
+    /// Return a transaction from the active chain only.
+    ///
+    /// Electrum indexes the best chain, whereas [`Self::transaction`] also
+    /// serves side-chain transactions when the optional Core-style `-txindex`
+    /// is enabled.
+    pub fn active_transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
+        let Some(location) = self.tx_index.get(txid).cloned() else {
+            return Ok(None);
+        };
+        self.transaction_at_location(txid, location)
+    }
+
+    pub fn transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
+        let Some(location) = self
+            .tx_index
+            .get(txid)
+            .or_else(|| self.tx_index_all.get(txid))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        self.transaction_at_location(txid, location)
     }
 
     pub fn transaction_location(&self, txid: &Txid) -> Option<TxLocation> {
@@ -8615,6 +8635,46 @@ mod tests {
         assert!(reopened.tx_index_all.is_empty());
         assert!(reopened.transaction(&main_txid).unwrap().is_some());
         assert!(reopened.transaction(&side_txid).unwrap().is_none());
+    }
+
+    #[test]
+    fn active_transaction_lookup_omits_side_chain_with_optional_txindex() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open_with_options_and_tx_index(
+            Network::Regtest,
+            directory.path(),
+            None,
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        let main = mine_block(&state, 1);
+        let main_txid = main.txdata[0].compute_txid();
+        state.connect_block(main).unwrap();
+        assert!(state.active_transaction(&main_txid).unwrap().is_some());
+
+        let genesis = *state.header(0).unwrap();
+        let side = mine_block_from_header(&genesis, 1, 77);
+        let side_txid = side.txdata[0].compute_txid();
+        state.connect_block(side).unwrap();
+        assert!(state.transaction(&side_txid).unwrap().is_some());
+        assert!(state.active_transaction(&side_txid).unwrap().is_none());
+
+        drop(state);
+        let mut reopened = ChainState::open_with_options_and_tx_index(
+            Network::Regtest,
+            directory.path(),
+            None,
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(reopened.transaction(&side_txid).unwrap().is_some());
+        assert!(reopened.active_transaction(&side_txid).unwrap().is_none());
     }
 
     fn mine_block(state: &ChainState, height: u32) -> Block {

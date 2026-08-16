@@ -1373,7 +1373,7 @@ fn block_chunk(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid = txid_param(params, 0)?;
     let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
-    let chain_transaction = { node.chain.write().transaction(&txid)? };
+    let chain_transaction = { node.chain.write().active_transaction(&txid)? };
     if let Some((transaction, location)) = chain_transaction {
         if verbose {
             let chain = node.chain.read();

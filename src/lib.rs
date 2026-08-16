@@ -101,6 +101,47 @@ const MAX_UPLOAD_BLOCK_RESERVE_BYTES: u64 = 4_000_000;
 const HISTORICAL_BLOCK_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 const MAX_TIME_OFFSET_SAMPLES: usize = 50;
 const CLOCK_OUT_OF_SYNC_THRESHOLD_SECS: u64 = 10 * 60;
+const P2P_MESSAGE_TYPE_OTHER: &str = "*other*";
+// Keep this list aligned with Core's ALL_NET_MESSAGE_TYPES. Unknown received
+// commands are aggregated under P2P_MESSAGE_TYPE_OTHER to avoid an unbounded
+// per-peer map in getpeerinfo.
+const KNOWN_P2P_MESSAGE_TYPES: &[&str] = &[
+    "version",
+    "verack",
+    "addr",
+    "addrv2",
+    "sendaddrv2",
+    "inv",
+    "getdata",
+    "merkleblock",
+    "getblocks",
+    "getheaders",
+    "tx",
+    "headers",
+    "block",
+    "getaddr",
+    "mempool",
+    "ping",
+    "pong",
+    "notfound",
+    "filterload",
+    "filteradd",
+    "filterclear",
+    "sendheaders",
+    "feefilter",
+    "sendcmpct",
+    "cmpctblock",
+    "getblocktxn",
+    "blocktxn",
+    "getcfilters",
+    "cfilter",
+    "getcfheaders",
+    "cfheaders",
+    "getcfcheckpt",
+    "cfcheckpt",
+    "wtxidrelay",
+    "sendtxrcncl",
+];
 pub(crate) const PRIVATE_BROADCAST_PEERS_PER_TRANSACTION: usize = 3;
 pub(crate) const PRIVATE_BROADCAST_RETRY_SECS: u64 = 60;
 pub(crate) const MAX_INITIAL_BROADCAST_DELAY_SECS: u64 = 15 * 60;
@@ -121,6 +162,14 @@ fn sanitize_peer_user_agent(user_agent: &str) -> String {
                 )
         })
         .collect()
+}
+
+fn received_p2p_message_type(command: &str) -> &str {
+    if KNOWN_P2P_MESSAGE_TYPES.contains(&command) {
+        command
+    } else {
+        P2P_MESSAGE_TYPE_OTHER
+    }
 }
 
 fn expand_notify_command(command: &str, argument: Option<&str>) -> String {
@@ -2453,6 +2502,7 @@ impl Node {
             let now = unix_time_seconds();
             peer.bytes_received = peer.bytes_received.saturating_add(bytes);
             peer.last_recv = now;
+            let command = received_p2p_message_type(command);
             let total = peer
                 .bytes_received_per_msg
                 .entry(command.to_owned())

@@ -3145,6 +3145,11 @@ fn validate_standard_inputs(
                     "Using OP_CODESEPARATOR in non-witness script",
                 ));
             }
+            if contains_unconditional_upgradable_nop(redeem_script_view) {
+                return Err(standard_script_policy_failure(
+                    "NOPx reserved for soft-fork upgrades",
+                ));
+            }
             Some(redeem_script)
         } else {
             None
@@ -3232,6 +3237,14 @@ fn validate_standard_witnesses(
             {
                 return Err(MempoolError::NonStandard(
                     "bad-witness-nonstandard".to_owned(),
+                ));
+            }
+            if witness_v0_script_starts_with_nonminimal_if(
+                witness_script,
+                input.witness.iter().take(stack_len).last(),
+            ) {
+                return Err(standard_script_policy_failure(
+                    "OP_IF/NOTIF argument must be minimal",
                 ));
             }
         } else if spending_script.is_p2tr() && !previous.script_pubkey.is_p2sh() {
@@ -3479,6 +3492,40 @@ fn contains_opcode(script: &Script, opcode: u8) -> bool {
     script
         .instructions()
         .any(|instruction| matches!(instruction, Ok(Instruction::Op(op)) if op.to_u8() == opcode))
+}
+
+fn contains_unconditional_upgradable_nop(script: &Script) -> bool {
+    let mut has_conditional = false;
+    let mut has_upgradable_nop = false;
+    for instruction in script.instructions() {
+        let Ok(Instruction::Op(op)) = instruction else {
+            continue;
+        };
+        if matches!(op.to_u8(), 0x63..=0x68) {
+            has_conditional = true;
+        }
+        if op.to_u8() == 0xb0 || (0xb3..=0xb9).contains(&op.to_u8()) {
+            has_upgradable_nop = true;
+        }
+    }
+    has_upgradable_nop && !has_conditional
+}
+
+fn witness_v0_script_starts_with_nonminimal_if(
+    witness_script: &[u8],
+    top_stack_item: Option<&[u8]>,
+) -> bool {
+    let Some(Ok(Instruction::Op(op))) = Script::from_bytes(witness_script).instructions().next()
+    else {
+        return false;
+    };
+    if !matches!(op.to_u8(), 0x63 | 0x64) {
+        return false;
+    }
+    let Some(item) = top_stack_item else {
+        return false;
+    };
+    item.len() > 1 || (item.len() == 1 && item[0] != 1)
 }
 
 fn push_only_stack_items(script: &Script) -> Option<Vec<Vec<u8>>> {
@@ -5217,6 +5264,60 @@ mod tests {
             validate_standard_policy(&transaction, std::slice::from_ref(&p2sh_previous), 1),
             Err(MempoolError::NonStandard(reason))
                 if reason.contains("Using OP_CODESEPARATOR in non-witness script")
+        ));
+
+        let nop_redeem_script = ScriptBuf::from_bytes(vec![0xb3]);
+        let nop_redeem_hash = bitcoin::hashes::hash160::Hash::hash(nop_redeem_script.as_bytes());
+        let nop_previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: {
+                let mut bytes = vec![0xa9, 0x14];
+                bytes.extend_from_slice(&nop_redeem_hash.to_byte_array());
+                bytes.push(0x87);
+                ScriptBuf::from_bytes(bytes)
+            },
+        };
+        transaction.input[0].script_sig = ScriptBuf::from_bytes({
+            let mut bytes = vec![nop_redeem_script.len() as u8];
+            bytes.extend_from_slice(nop_redeem_script.as_bytes());
+            bytes
+        });
+        assert!(matches!(
+            validate_standard_policy(&transaction, std::slice::from_ref(&nop_previous), 1),
+            Err(MempoolError::NonStandard(reason))
+                if reason.contains("NOPx reserved for soft-fork upgrades")
+        ));
+    }
+
+    #[test]
+    fn standard_policy_enforces_minimal_if_for_simple_witness_scripts() {
+        let witness_script = ScriptBuf::from_bytes(vec![0x63, 0x51, 0x68]);
+        let witness_hash = bitcoin::hashes::sha256::Hash::hash(witness_script.as_bytes());
+        let previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: {
+                let mut bytes = vec![0x00, 0x20];
+                bytes.extend_from_slice(&witness_hash.to_byte_array());
+                ScriptBuf::from_bytes(bytes)
+            },
+        };
+        let mut transaction = graph_transaction(Txid::from_byte_array([15; 32]), 15);
+        transaction.input[0].script_sig = ScriptBuf::new();
+        transaction.input[0].witness =
+            Witness::from_slice(&[vec![0x00, 0x01], witness_script.as_bytes().to_vec()]);
+        transaction.output[0] = TxOut {
+            value: Amount::from_sat(99_999),
+            script_pubkey: ScriptBuf::from_bytes({
+                let mut bytes = vec![0x00, 0x14];
+                bytes.extend([0u8; 20]);
+                bytes
+            }),
+        };
+
+        assert!(matches!(
+            validate_standard_policy(&transaction, std::slice::from_ref(&previous), 1),
+            Err(MempoolError::NonStandard(reason))
+                if reason.contains("OP_IF/NOTIF argument must be minimal")
         ));
     }
 

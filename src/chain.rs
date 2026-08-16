@@ -1605,34 +1605,11 @@ impl ChainState {
         self.coinstats_index_enabled
     }
 
-    /// Return the durable footprint of this implementation's chainstate,
-    /// including the crash-recoverable UTXO value and location logs.
+    /// Return the estimated on-disk footprint of the active UTXO database,
+    /// matching Core's `gettxoutsetinfo` `disk_size` field. Other durable
+    /// metadata and historical mutation logs are not part of that estimate.
     pub fn utxo_disk_size(&self) -> Result<u64> {
-        let mut total = self
-            .chainstate_store
-            .disk_usage()?
-            .checked_add(self.utxo_store.disk_usage()?)
-            .context("chainstate disk usage overflowed")?;
-        for name in [
-            "chainstate.bin",
-            "chainstate.json",
-            "chainstate.snapshot",
-            "chainstate.snapshot.sha256",
-            "chainstate.txcounters",
-        ] {
-            let path = self.data_dir.join(name);
-            match fs::metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    total = total
-                        .checked_add(metadata.len())
-                        .context("chainstate disk usage overflowed")?;
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(total)
+        self.utxo_store.disk_usage()
     }
 
     pub fn txospender_index_enabled(&self) -> bool {
@@ -3027,9 +3004,13 @@ impl ChainState {
             self.remember_block_undo(*hash, undo.clone());
             return Ok(Some(undo));
         }
-        let mut outputs = self
-            .replay_utxos_for_block(block.header.prev_blockhash, true)?
-            .context("block undo parent UTXO state is unavailable")?;
+        let Some(mut outputs) = self.replay_utxos_for_block(block.header.prev_blockhash, true)?
+        else {
+            // A body can be accepted before its parent's body arrives. Core
+            // still serves that block, but has no undo information from which
+            // to derive fees or prevouts yet.
+            return Ok(None);
+        };
         for transaction in block.txdata.iter().skip(1) {
             let mut spent = Vec::with_capacity(transaction.input.len());
             for input in &transaction.input {
@@ -4233,12 +4214,19 @@ impl ChainState {
                 bail!("stored block header does not match active index at height {height}")
             }
             if check_level >= 1 {
-                self.validate_block_structure(
+                validation::validate_block_structure_for_verification(
                     &block,
-                    self.network,
+                    &self.deployment_parameters,
                     height,
                     Amount::MAX_MONEY.to_sat(),
-                )?;
+                    self.signet_challenge.as_deref(),
+                )
+                .with_context(|| {
+                    format!(
+                        "block structure verification failed at height {height} (segwit activation {})",
+                        self.deployment_parameters.buried.segwit
+                    )
+                })?;
             }
             let undo = if check_level >= 2 {
                 let undo = self
@@ -4513,6 +4501,14 @@ impl ChainState {
     }
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {
+        self.connect_block_with_existing_body(block, false)
+    }
+
+    fn connect_block_with_existing_body(
+        &mut self,
+        block: Block,
+        allow_existing_body: bool,
+    ) -> Result<ChainTip> {
         self.poll_background_validation()?;
         let hash = block.block_hash();
         if self.has_invalid_ancestor(hash) {
@@ -4524,7 +4520,7 @@ impl ChainState {
         // Core's AcceptBlock returns immediately for a block body that is
         // already present, including a side-chain body. Avoid repeating
         // validation and appending a duplicate record to the block store.
-        if self.store.contains(&hash) {
+        if self.store.contains(&hash) && !allow_existing_body {
             return Ok(self.tip());
         }
         let parent_hash = block.header.prev_blockhash;
@@ -4535,19 +4531,57 @@ impl ChainState {
         if self.has_invalid_ancestor(parent_hash) {
             bail!("block {hash} is on an invalidated branch")
         }
-        // Headers can arrive before full block bodies. Keep a child pending
-        // until its parent UTXO state is available so an unvalidated body
-        // cannot influence chain selection.
-        if !self.store.contains(&parent_hash) {
-            self.queue_orphan_block(parent_hash, block)?;
-            bail!("block {} has a parent whose full body is unavailable", hash)
-        }
         if parent_hash == self.best_hash() {
             self.connect_block_internal(&block, true)?;
             self.process_orphans(hash);
             self.process_known_children(hash);
             self.update_ibd_status();
             return Ok(self.tip());
+        }
+
+        // Core writes a block body once its parent header is known, even when
+        // the parent body (and therefore its UTXO state) is not available.
+        // Keep the body indexed as an unconnected candidate so getblock can
+        // serve it without fabricating undo data. A later arrival of the
+        // parent body will revisit it through process_known_children().
+        if !self.store.contains(&parent_hash) {
+            let height = parent.height.saturating_add(1);
+            validation::validate_bip94_timewarp_with_params(
+                &self.deployment_parameters,
+                height,
+                block.header.time,
+                parent.header.time,
+            )?;
+            validation::validate_header(
+                self.network,
+                &block.header,
+                parent_hash,
+                self.expected_target_for_parent(parent_hash, block.header.time),
+                self.median_time_past_for_parent(parent_hash),
+            )?;
+            self.validate_block_structure(
+                &block,
+                self.network,
+                height,
+                Amount::MAX_MONEY.to_sat(),
+            )?;
+            self.store.insert(&block)?;
+            if let Some(store) = self.electrum_store.as_mut() {
+                store.insert(&block)?;
+            }
+            self.index_all_transactions(&block, height);
+            self.block_index.insert(
+                hash,
+                BlockNode {
+                    header: block.header,
+                    height,
+                    chain_work: parent.chain_work + block.header.work(),
+                },
+            );
+            self.assign_header_sequence_id(hash);
+            self.assign_block_sequence_id(hash);
+            self.persist_metadata()?;
+            bail!("block {} has a parent whose full body is unavailable", hash)
         }
 
         let height = parent.height.saturating_add(1);
@@ -4604,7 +4638,7 @@ impl ChainState {
             return;
         };
         for child in children {
-            let _ = self.connect_block(child);
+            let _ = self.connect_block_with_existing_body(child, true);
         }
     }
 
@@ -4638,7 +4672,7 @@ impl ChainState {
             let Ok(Some(child)) = self.store.get(&child_hash) else {
                 continue;
             };
-            let _ = self.connect_block(child);
+            let _ = self.connect_block_with_existing_body(child, true);
         }
     }
 
@@ -10337,6 +10371,23 @@ mod tests {
         state.connect_block(child).unwrap();
         assert_eq!(state.height(), 2);
         assert_eq!(state.blocks_ahead_of_tip(), None);
+    }
+
+    #[test]
+    fn stores_a_block_body_when_only_its_parent_header_is_known() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let child = mine_block_from_header(&parent.header, 2, 13);
+        let child_hash = child.block_hash();
+
+        state.accept_headers(&[parent.header]).unwrap();
+        assert!(state.connect_block(child).is_err());
+        assert!(state.store.contains(&child_hash));
+        assert_eq!(state.block_height_by_hash(&child_hash), Some(2));
+
+        state.connect_block(parent).unwrap();
+        assert_eq!(state.best_hash(), child_hash);
     }
 
     #[test]

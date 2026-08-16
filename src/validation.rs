@@ -623,7 +623,7 @@ fn validate_header_internal(
     if header.time <= median_time_past {
         return Err(ValidationError::TimeTooOld);
     }
-    if header.time > time::unix_time().saturating_add(2 * 60 * 60) as u32 {
+    if u64::from(header.time) > time::unix_time().saturating_add(2 * 60 * 60) {
         return Err(ValidationError::TimeTooNew);
     }
     let compact = header.bits.to_consensus();
@@ -797,6 +797,52 @@ pub(crate) fn validate_block_structure_with_signet_options_with_params_and_merkl
     check_signet_solution: bool,
     check_merkle_root: bool,
 ) -> Result<BlockValidationStats, ValidationError> {
+    validate_block_structure_with_options_internal(
+        block,
+        params,
+        height,
+        expected_coinbase_value,
+        signet_challenge,
+        check_signet_solution,
+        check_merkle_root,
+        true,
+    )
+}
+
+/// Validate a block for `verifychain` without reapplying contextual witness
+/// activation. Core's VerifyDB checks block structure and ConnectBlock, but
+/// deliberately does not rerun ContextualCheckBlock; this matters when a
+/// regtest node is restarted with a different test activation height.
+pub(crate) fn validate_block_structure_for_verification(
+    block: &Block,
+    params: &DeploymentParameters,
+    height: u32,
+    expected_coinbase_value: u64,
+    signet_challenge: Option<&[u8]>,
+) -> Result<BlockValidationStats, ValidationError> {
+    validate_block_structure_with_options_internal(
+        block,
+        params,
+        height,
+        expected_coinbase_value,
+        signet_challenge,
+        true,
+        true,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_block_structure_with_options_internal(
+    block: &Block,
+    params: &DeploymentParameters,
+    height: u32,
+    expected_coinbase_value: u64,
+    signet_challenge: Option<&[u8]>,
+    check_signet_solution: bool,
+    check_merkle_root: bool,
+    check_witness_commitment: bool,
+) -> Result<BlockValidationStats, ValidationError> {
     if block.txdata.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }
@@ -804,7 +850,9 @@ pub(crate) fn validate_block_structure_with_signet_options_with_params_and_merkl
     if check_merkle_root && !block.check_merkle_root() {
         return Err(ValidationError::BadMerkleRoot);
     }
-    validate_witness_commitment(block, height >= params.buried.segwit)?;
+    if check_witness_commitment {
+        validate_witness_commitment(block, height >= params.buried.segwit)?;
+    }
     if block.weight().to_wu() > MAX_BLOCK_WEIGHT as u64 {
         return Err(ValidationError::OversizedBlock);
     }

@@ -858,6 +858,17 @@ pub struct Args {
     )]
     pub log_rate_limit: bool,
 
+    /// Core's negated spelling for disabling file-log rate limiting.
+    #[arg(
+        long = "nologratelimit",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub no_log_rate_limit: bool,
+
     /// Enable Core-compatible debug logging categories.  Supplying the
     /// option without a value enables all categories; it can be repeated.
     #[arg(
@@ -937,7 +948,11 @@ pub struct Args {
     #[arg(long = "assumevalid", value_name = "HEX")]
     pub assume_valid: Option<String>,
 
-    #[arg(long = "checkblocks", value_name = "N")]
+    #[arg(
+        long = "checkblocks",
+        value_name = "N",
+        value_parser = parse_check_blocks
+    )]
     pub check_blocks: Option<u32>,
 
     #[arg(long = "checklevel", value_name = "N")]
@@ -1084,8 +1099,8 @@ pub struct Args {
     #[arg(long, value_name = "PORT")]
     pub port: Option<u16>,
 
-    #[arg(long = "bind", value_name = "IP:PORT", value_delimiter = ',')]
-    pub bind: Vec<SocketAddr>,
+    #[arg(long = "bind", value_name = "IP[:PORT][=onion]", value_delimiter = ',')]
+    pub bind: Vec<String>,
 
     #[arg(
         long,
@@ -1169,6 +1184,27 @@ pub struct Args {
     /// intentionally ignored because this build does not implement wallets.
     #[arg(long = "wallet", value_name = "NAME")]
     pub wallets: Vec<String>,
+
+    /// Accept Core's wallet fallback fee setting without retaining wallet
+    /// state. Raw transaction and node fee policy use their own explicit
+    /// fee-rate options in this wallet-free build.
+    #[arg(long = "fallbackfee", value_name = "BTC/KVB", hide = true)]
+    pub fallback_fee: Option<String>,
+
+    /// Accept Core's wallet key-pool setting for configuration compatibility.
+    #[arg(long = "keypool", value_name = "N", hide = true)]
+    pub keypool: Option<u64>,
+
+    /// Accept Core's wallet SQLite durability toggle without enabling a
+    /// wallet database.
+    #[arg(
+        long = "unsafesqlitesync",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub unsafe_sqlite_sync: Option<bool>,
 
     #[arg(long = "rpcservertimeout", default_value_t = DEFAULT_RPC_SERVER_TIMEOUT_SECS)]
     pub rpc_server_timeout: u64,
@@ -2514,7 +2550,7 @@ impl Config {
         let p2p_binds = if args.bind.is_empty() {
             vec![p2p]
         } else {
-            args.bind.clone()
+            parse_p2p_binds(&args.bind, p2p.port())?
         };
         let rpc = args.rpc.unwrap_or_else(|| {
             SocketAddr::from((
@@ -2862,7 +2898,7 @@ impl Config {
                 source_locations: args.log_source_locations,
                 level_always: args.log_level_always,
                 log_ips: args.log_ips,
-                log_rate_limit: args.log_rate_limit,
+                log_rate_limit: args.log_rate_limit && !args.no_log_rate_limit,
                 debug_all: logging.debug_all,
                 debug_categories: logging.debug_categories,
                 category_levels: logging.category_levels,
@@ -3042,6 +3078,17 @@ fn default_rpc_port(network: Network) -> u16 {
     }
 }
 
+fn parse_check_blocks(value: &str) -> std::result::Result<u32, String> {
+    let value = value
+        .parse::<i64>()
+        .map_err(|error| format!("invalid checkblocks value '{value}': {error}"))?;
+    if value <= 0 {
+        Ok(0)
+    } else {
+        u32::try_from(value).map_err(|_| format!("checkblocks value '{value}' is too large"))
+    }
+}
+
 fn parse_tor_control(value: &str) -> Result<SocketAddr> {
     if let Ok(address) = value.parse::<SocketAddr>() {
         if address.port() == 0 {
@@ -3118,14 +3165,14 @@ fn parse_deployment_parameters(
     }
 
     for value in activation_heights {
-        let (name, height) = value
-            .split_once('@')
-            .with_context(|| format!("invalid --testactivationheight value '{value}'"))?;
-        let height = height
-            .parse::<i64>()
-            .with_context(|| format!("invalid activation height in '{value}'"))?;
+        let (name, height) = value.split_once('@').ok_or_else(|| {
+            anyhow::anyhow!("Invalid format ({value}) for -testactivationheight=name@height.")
+        })?;
+        let height = height.parse::<i64>().map_err(|_| {
+            anyhow::anyhow!("Invalid height value ({value}) for -testactivationheight=name@height.")
+        })?;
         if !(0..i64::from(i32::MAX)).contains(&height) {
-            bail!("invalid activation height in '{value}'");
+            bail!("Invalid height value ({value}) for -testactivationheight=name@height.");
         }
         let height = height as u32;
         match name {
@@ -3134,7 +3181,7 @@ fn parse_deployment_parameters(
             "bip66" | "dersig" => parameters.buried.bip66 = height,
             "csv" => parameters.buried.csv = height,
             "segwit" => parameters.buried.segwit = height,
-            _ => bail!("invalid buried deployment '{name}' in '{value}'"),
+            _ => bail!("Invalid name ({value}) for -testactivationheight=name@height."),
         }
     }
 
@@ -3204,6 +3251,22 @@ pub(crate) fn default_network_endpoint_port(value: &str, network: Network) -> u1
     }
 }
 
+/// Return the directory name Core uses for network-specific data.
+pub(crate) fn network_data_dir_name(network: Network) -> &'static str {
+    match network {
+        Network::Bitcoin => "",
+        Network::Testnet => "testnet3",
+        Network::Testnet4 => "testnet4",
+        Network::Signet => "signet",
+        Network::Regtest => "regtest",
+    }
+}
+
+pub(crate) fn core_network_blocks_dir(datadir: &Path, network: Network) -> Option<PathBuf> {
+    let name = network_data_dir_name(network);
+    (!name.is_empty()).then(|| datadir.join(name).join("blocks"))
+}
+
 fn parse_external_addresses(values: &[String], default_port: u16) -> Result<Vec<SocketAddr>> {
     values
         .iter()
@@ -3236,6 +3299,35 @@ fn parse_rpc_binds(values: &[String], default_port: u16) -> Result<Vec<SocketAdd
             }
             Err(anyhow::anyhow!(
                 "invalid --rpcbind address '{value}'; expected IP[:PORT]"
+            ))
+        })
+        .collect()
+}
+
+fn parse_p2p_binds(values: &[String], default_port: u16) -> Result<Vec<SocketAddr>> {
+    values
+        .iter()
+        .map(|raw| {
+            // Core permits an optional =onion suffix to classify a listener
+            // for Tor address advertisement. The compact listener model used
+            // here has a separate onion transport, so retain the endpoint
+            // while accepting the spelling for configuration compatibility.
+            let value = raw.strip_suffix("=onion").unwrap_or(raw);
+            if let Ok(address) = value.parse::<SocketAddr>() {
+                return Ok(address);
+            }
+            if let Ok(ip) = value.parse::<IpAddr>() {
+                return Ok(SocketAddr::new(ip, default_port));
+            }
+            if let Some(host) = value
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                && let Ok(ip) = host.parse::<IpAddr>()
+            {
+                return Ok(SocketAddr::new(ip, default_port));
+            }
+            Err(anyhow::anyhow!(
+                "invalid --bind address '{raw}'; expected IP[:PORT][=onion]"
             ))
         })
         .collect()
@@ -3838,6 +3930,9 @@ mod tests {
         assert!(logging.log_ips);
         assert!(!logging.log_rate_limit);
 
+        let args = Args::try_parse_from(["bitcoind-rs", "--nologratelimit"]).unwrap();
+        assert!(!Config::from_args(args).unwrap().logging.log_rate_limit);
+
         assert!(Args::try_parse_from(["bitcoind-rs", "--pid="]).is_err());
 
         let args = Args::try_parse_from([
@@ -3956,6 +4051,15 @@ mod tests {
         assert_eq!(config.check_level, Some(4));
         assert_eq!(config.max_tip_age_secs, 42);
         assert_eq!(config.script_check_threads, -2);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--checkblocks=-1",
+        ])
+        .unwrap();
+        assert_eq!(Config::from_args(args).unwrap().check_blocks, Some(0));
 
         let args = Args::try_parse_from([
             "bitcoind-rs",
@@ -4472,6 +4576,23 @@ mod tests {
             "--datadir",
             directory.path().to_str().unwrap(),
             "--network=regtest",
+            "--bind=127.0.0.1:18446=onion,127.0.0.1",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.p2p_binds,
+            vec![
+                "127.0.0.1:18446".parse().unwrap(),
+                "127.0.0.1:18444".parse().unwrap(),
+            ]
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--network=regtest",
             "--seednode=seed.example",
         ])
         .unwrap();
@@ -4727,10 +4848,16 @@ mod tests {
             directory.path().to_str().unwrap(),
             "--disablewallet",
             "--wallet=default",
+            "--fallbackfee=0.0002",
+            "--keypool=1",
+            "--unsafesqlitesync=1",
         ])
         .unwrap();
         assert!(args.disable_wallet);
         assert_eq!(args.wallets, vec!["default"]);
+        assert_eq!(args.fallback_fee.as_deref(), Some("0.0002"));
+        assert_eq!(args.keypool, Some(1));
+        assert_eq!(args.unsafe_sqlite_sync, Some(true));
         Config::from_args(args).unwrap();
 
         let args = Args::try_parse_from([

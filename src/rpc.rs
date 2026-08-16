@@ -47,7 +47,7 @@ use tracing::{debug, info, warn};
 
 use crate::address::NetworkEndpoint;
 use crate::chain;
-use crate::config::{OnlyNet, RpcAuth, default_network_endpoint_port};
+use crate::config::{OnlyNet, RpcAuth, core_network_blocks_dir, default_network_endpoint_port};
 use crate::fee_estimator::{EstimatorBucket, RawFeeEstimate};
 use crate::mempool::{
     MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool, MempoolError, MempoolLoadOptions,
@@ -1899,11 +1899,17 @@ fn dispatch_method_for_user(
                 bail!("nblocks must not be negative")
             }
             let depth = u32::try_from(checkblocks).map_err(|_| anyhow!("nblocks is too large"))?;
-            let verified = node
+            let verified = match node
                 .chain
                 .write()
                 .verify_active_chain_with_level(checklevel as u8, depth)
-                .is_ok();
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    debug!(%error, "verifychain failed");
+                    false
+                }
+            };
             Ok(Value::Bool(verified))
         }
         "getmemoryinfo" => get_memory_info(params),
@@ -4210,8 +4216,8 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let mut deployments = serde_json::Map::new();
     for (name, activation_height) in [
         ("bip34", heights.bip34),
-        ("dersig", heights.bip66),
-        ("cltv", heights.bip65),
+        ("bip66", heights.bip66),
+        ("bip65", heights.bip65),
         ("csv", heights.csv),
         ("segwit", heights.segwit),
     ] {
@@ -4248,7 +4254,7 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    let hash = parse_core_hash(&param::<String>(params, 0)?, "hash")?;
     let verbose = optional_bool(params, 1, true, "verbose")?;
     let mut chain = node.chain.write();
     let height = chain
@@ -4301,16 +4307,15 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         let spacing = node.config.network.params().pow_target_spacing;
         i64::try_from((30 * 24 * 60 * 60) / spacing).unwrap_or(i64::MAX)
     };
-    let requested_window = optional_i64(params, 0, default_window, "nblocks")?;
+    let requested_window = optional_i64_core(params, 0, default_window)?;
     let requested_hash = params
         .get(1)
         .filter(|value| !value.is_null())
         .map(|value| {
-            value
+            let value = value
                 .as_str()
-                .ok_or_else(|| anyhow!("blockhash must be a string"))?
-                .parse::<BlockHash>()
-                .map_err(|error| anyhow!("invalid blockhash: {error}"))
+                .ok_or_else(|| json_type_error(value, "string"))?;
+            parse_core_block_hash(value)
         })
         .transpose()?;
     let chain = node.chain.write();
@@ -4391,11 +4396,34 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_network_hash_ps(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let nblocks = optional_i64(params, 0, 120, "nblocks")?;
+    let mut wrong_types = Vec::new();
+    for (index, name) in [(0, "nblocks"), (1, "height")] {
+        if let Some(value) = params.get(index).filter(|value| !value.is_null())
+            && value.as_i64().is_none()
+        {
+            wrong_types.push(format!(
+                "    \"Position {} ({name})\": \"{}\"",
+                index + 1,
+                json_type_error(value, "number")
+            ));
+        }
+    }
+    if !wrong_types.is_empty() {
+        bail!("Wrong type passed:\n{{\n{}\n}}", wrong_types.join(",\n"));
+    }
+    let nblocks = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_i64)
+        .unwrap_or(120);
     if nblocks < -1 || nblocks == 0 {
         bail!("Invalid nblocks. Must be a positive number or -1.");
     }
-    let requested_height = optional_i64(params, 1, -1, "height")?;
+    let requested_height = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_i64)
+        .unwrap_or(-1);
     if requested_height < -1 {
         bail!("Block does not exist at specified height");
     }
@@ -4412,11 +4440,16 @@ fn get_network_hash_ps(node: &Arc<Node>, params: &Value) -> Result<Value> {
         return Ok(json!(0.0));
     }
     let mut lookup = if nblocks == -1 {
-        let interval = node
-            .config
-            .network
-            .params()
-            .difficulty_adjustment_interval();
+        // Core v31.1 uses a one-day (144-block) retarget interval on regtest;
+        // the upstream bitcoin crate retains the older two-week parameter.
+        let interval = if node.config.network == Network::Regtest {
+            144
+        } else {
+            node.config
+                .network
+                .params()
+                .difficulty_adjustment_interval()
+        };
         u64::from(end_height) % interval + 1
     } else {
         u64::try_from(nblocks).map_err(|_| anyhow!("nblocks is out of range"))?
@@ -4533,6 +4566,12 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = chain
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
+    if chain.is_active_block(&hash)
+        && core_network_blocks_dir(&node.config.datadir, node.config.network)
+            .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
+    {
+        bail!("Block not found on disk");
+    }
     let block = chain
         .block(&hash)?
         .ok_or_else(|| missing_block_data_error(&chain, &hash))?;
@@ -4545,6 +4584,14 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         -1
     };
     let undo = if verbosity >= 2 {
+        if chain.is_active_block(&hash)
+            && core_network_blocks_dir(&node.config.datadir, node.config.network)
+                .is_some_and(|directory| !directory.join("rev00000.dat").is_file())
+        {
+            bail!(
+                "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event."
+            );
+        }
         chain.spent_outputs_by_transaction(&hash)?
     } else {
         None
@@ -4650,8 +4697,8 @@ fn get_block_filter(node: &Arc<Node>, params: &Value) -> Result<Value> {
 fn submit_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hex_data = param::<String>(params, 0)?;
     let bytes = hex::decode(hex_data).map_err(|_| anyhow!("Block header decode failed"))?;
-    let header: bitcoin::block::Header =
-        deserialize(&bytes).map_err(|_| anyhow!("Block header decode failed"))?;
+    let (header, _) = deserialize_partial::<bitcoin::block::Header>(&bytes)
+        .map_err(|_| anyhow!("Block header decode failed"))?;
     let hash = header.block_hash();
     {
         let chain = node.chain.read();
@@ -5166,9 +5213,12 @@ fn rpc_timeout(params: &Value, index: usize) -> Result<Option<tokio::time::Insta
         .get(index)
         .filter(|value| !value.is_null())
         .map(|value| {
+            if value.as_i64().is_some_and(|timeout| timeout < 0) {
+                return Err(anyhow!("Negative timeout"));
+            }
             value
                 .as_u64()
-                .ok_or_else(|| anyhow!("timeout must be a non-negative integer"))
+                .ok_or_else(|| json_type_error(value, "number"))
         })
         .transpose()?;
     Ok(timeout
@@ -5983,7 +6033,7 @@ fn parse_verbosity(value: Option<&Value>, default: i64) -> Result<i64> {
         Some(Value::Number(number)) => number
             .as_i64()
             .ok_or_else(|| anyhow!("verbosity must be an integer")),
-        Some(_) => bail!("verbosity must be an integer or boolean"),
+        Some(value) => Err(json_type_error(value, "number")),
     }
 }
 
@@ -13853,6 +13903,46 @@ fn optional_i64(params: &Value, index: usize, default: i64, name: &str) -> Resul
         .ok_or_else(|| anyhow!("{name} must be an integer"))
 }
 
+fn optional_i64_core(params: &Value, index: usize, default: i64) -> Result<i64> {
+    let Some(value) = params.get(index).filter(|value| !value.is_null()) else {
+        return Ok(default);
+    };
+    value
+        .as_i64()
+        .ok_or_else(|| json_type_error(value, "number"))
+}
+
+fn json_type_error(value: &Value, expected: &str) -> anyhow::Error {
+    let actual = match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    anyhow!("JSON value of type {actual} is not of expected type {expected}")
+}
+
+fn parse_core_block_hash(value: &str) -> Result<BlockHash> {
+    parse_core_hash(value, "blockhash")
+}
+
+fn parse_core_hash(value: &str, name: &str) -> Result<BlockHash> {
+    if value.len() != 64 {
+        bail!(
+            "{name} must be of length 64 (not {}, for '{value}')",
+            value.len()
+        );
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{name} must be hexadecimal string (not '{value}')");
+    }
+    value
+        .parse::<BlockHash>()
+        .map_err(|error| anyhow!("invalid blockhash: {error}"))
+}
+
 pub(crate) fn optional_u64(params: &Value, index: usize, default: u64, name: &str) -> Result<u64> {
     let Some(value) = params.get(index).filter(|value| !value.is_null()) else {
         return Ok(default);
@@ -13935,6 +14025,7 @@ fn rpc_error_code(message: &str) -> i32 {
     }
     if lower == "filter not found. this error is unexpected and indicates index corruption."
         || lower == "fee estimation disabled"
+        || lower.starts_with("undo data expected but can't be read.")
     {
         return -32603;
     }
@@ -13948,10 +14039,13 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "block does not exist at specified height"
         || lower.starts_with("invalid block count:")
         || lower.starts_with("invalid blockhash:")
+        || lower.starts_with("blockhash must be")
+        || lower.starts_with("hash must be")
         || lower.starts_with("invalid nblocks.")
         || lower.starts_with("invalid selected statistic ")
         || lower.starts_with("target block height ")
         || lower.contains("specified more than once")
+        || lower.contains("is not a valid hash_type")
         || lower.contains("must be between ")
         || lower.contains("must not be negative")
         || lower.contains("cannot be negative")
@@ -13985,6 +14079,8 @@ fn rpc_error_code(message: &str) -> i32 {
         return -25;
     }
     if lower.starts_with("invalid type:")
+        || lower.starts_with("json value of type ")
+        || lower.starts_with("wrong type passed:")
         || lower.contains(" must be a ")
         || lower.contains(" must be an ")
         || lower.starts_with("params must be ")

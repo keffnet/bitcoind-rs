@@ -4207,7 +4207,7 @@ async fn serve_peer_loop(
                     forget_transaction_requests(peers, transaction);
                 }
                 node.clear_peer_block_request(peer_id, hash);
-                if handle_received_block(node, peers, peer_id, block, requested).await {
+                if handle_received_block(node, peers, peer_id, block, requested, false).await {
                     node.record_peer_block(peer_id, hash);
                 }
                 flush_pending_block_requests(
@@ -4292,8 +4292,10 @@ async fn serve_peer_loop(
                                 for transaction in &block.txdata {
                                     forget_transaction_requests(peers, transaction);
                                 }
-                                if handle_received_block(node, peers, peer_id, block, requested)
-                                    .await
+                                if handle_received_block(
+                                    node, peers, peer_id, block, requested, true,
+                                )
+                                .await
                                 {
                                     node.record_peer_block(peer_id, block_hash);
                                 }
@@ -4476,8 +4478,15 @@ async fn serve_peer_loop(
                         for transaction in &block.txdata {
                             forget_transaction_requests(peers, transaction);
                         }
-                        if handle_received_block(node, peers, peer_id, block, pending.requested)
-                            .await
+                        if handle_received_block(
+                            node,
+                            peers,
+                            peer_id,
+                            block,
+                            pending.requested,
+                            true,
+                        )
+                        .await
                         {
                             node.record_peer_block(peer_id, block_hash);
                         }
@@ -4996,9 +5005,10 @@ async fn handle_received_block(
     peer_id: usize,
     block: Block,
     requested: bool,
+    enforce_unrequested_gate: bool,
 ) -> bool {
     let hash = block.block_hash();
-    if !requested {
+    if enforce_unrequested_gate && !requested {
         let allowed = {
             let chain = node.chain.read();
             unrequested_block_is_allowed(&block, &chain)

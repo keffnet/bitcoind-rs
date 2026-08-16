@@ -79,7 +79,9 @@ use tracing::{info, warn};
 use crate::address::NetworkEndpoint;
 use crate::asmap::AsMap;
 use crate::chain::ChainState;
-use crate::config::{Config, PeerPermissions, RpcCookiePermissions};
+use crate::config::{
+    Config, PeerPermissions, RpcCookiePermissions, core_network_blocks_dir, network_data_dir_name,
+};
 use crate::fee_estimator::{FeeEstimator, RawFeeEstimate};
 use crate::mempool::{
     Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
@@ -1123,6 +1125,20 @@ impl Node {
             fs::create_dir_all(&blocks_dir)
                 .with_context(|| format!("creating blocks directory {}", blocks_dir.display()))?;
         }
+        if let Some(core_blocks_dir) = core_network_blocks_dir(&config.datadir, config.network) {
+            fs::create_dir_all(&core_blocks_dir).with_context(|| {
+                format!(
+                    "creating Core-compatible blocks directory {}",
+                    core_blocks_dir.display()
+                )
+            })?;
+            for file_name in ["blk00000.dat", "rev00000.dat"] {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(core_blocks_dir.join(file_name))?;
+            }
+        }
         let blocks_dir_lock = if blocks_dir == config.datadir {
             None
         } else {
@@ -1219,7 +1235,8 @@ impl Node {
                 config.assume_valid,
                 config.blocks_xor,
                 deployment_parameters,
-            )?;
+            )
+            .map_err(core_startup_chain_error)?;
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
         chain.configure_script_cache_size_mib(config.max_sig_cache_mib);
@@ -1350,7 +1367,13 @@ impl Node {
                     .iter()
                     .any(|auth| auth.uses_plaintext_password())
             })
-            .map(|path| load_rpc_cookie(&path, config.rpc_cookie_permissions))
+            .map(|path| {
+                let cookie = load_rpc_cookie(&path, config.rpc_cookie_permissions)?;
+                if let Some(compat_path) = rpc_cookie_compat_path(&config, &path) {
+                    write_rpc_cookie(&compat_path, &cookie, config.rpc_cookie_permissions)?;
+                }
+                Ok::<String, anyhow::Error>(cookie)
+            })
             .transpose()?;
         let compact_extra_limit = config.block_reconstruction_extra_txn;
         let node = Arc::new(Self {
@@ -4469,16 +4492,21 @@ impl Node {
     }
 
     fn remove_rpc_cookie(&self) {
-        if self.rpc_cookie.is_none() {
-            return;
-        }
         let Some(path) = self.config.rpc_cookie_path.as_deref() else {
             return;
         };
-        if let Err(error) = fs::remove_file(path)
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(path = %path.display(), %error, "unable to remove RPC authentication cookie");
+        if self.rpc_cookie.is_some() {
+            let mut paths = vec![path.to_owned()];
+            if let Some(compat_path) = rpc_cookie_compat_path(&self.config, path) {
+                paths.push(compat_path);
+            }
+            for path in paths {
+                if let Err(error) = fs::remove_file(&path)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(path = %path.display(), %error, "unable to remove RPC authentication cookie");
+                }
+            }
         }
     }
 
@@ -4918,14 +4946,19 @@ fn unix_time_seconds() -> u64 {
 }
 
 fn load_rpc_cookie(path: &Path, permissions: RpcCookiePermissions) -> Result<String> {
+    let cookie = format!("__cookie__:{}", hex::encode(random::<[u8; 32]>()));
+    write_rpc_cookie(path, &cookie, permissions)?;
+    Ok(cookie)
+}
+
+fn write_rpc_cookie(path: &Path, cookie: &str, permissions: RpcCookiePermissions) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)?;
     }
-    let cookie = format!("__cookie__:{}", hex::encode(random::<[u8; 32]>()));
     let temp = std::path::PathBuf::from(format!("{}.tmp", path.display()));
-    std::fs::write(&temp, &cookie)?;
+    std::fs::write(&temp, cookie)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -4939,7 +4972,47 @@ fn load_rpc_cookie(path: &Path, permissions: RpcCookiePermissions) -> Result<Str
     #[cfg(not(unix))]
     let _ = permissions;
     std::fs::rename(temp, path)?;
-    Ok(cookie)
+    Ok(())
+}
+
+fn rpc_cookie_compat_path(config: &Config, primary_path: &Path) -> Option<std::path::PathBuf> {
+    if config.network == Network::Bitcoin || primary_path != config.datadir.join(".cookie") {
+        return None;
+    }
+    Some(
+        config
+            .datadir
+            .join(network_data_dir_name(config.network))
+            .join(".cookie"),
+    )
+}
+
+#[derive(Debug)]
+pub struct CoreStartupError;
+
+impl std::fmt::Display for CoreStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(concat!(
+            "The block database contains a block which appears to be from the future. ",
+            "This may be due to your computer's date and time being set incorrectly. ",
+            "Only rebuild the block database if you are sure that your computer's date ",
+            "and time are correct.\nPlease restart with -reindex or ",
+            "-reindex-chainstate to recover.",
+        ))
+    }
+}
+
+impl std::error::Error for CoreStartupError {}
+
+fn core_startup_chain_error(error: anyhow::Error) -> anyhow::Error {
+    if error
+        .downcast_ref::<validation::ValidationError>()
+        .is_some_and(|error| matches!(error, validation::ValidationError::TimeTooNew))
+    {
+        CoreStartupError.into()
+    } else {
+        error
+    }
 }
 
 #[cfg(test)]

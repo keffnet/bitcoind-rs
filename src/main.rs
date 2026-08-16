@@ -24,7 +24,21 @@ use bitcoind_rs::{
     config::{Args, Config},
 };
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        if error
+            .downcast_ref::<bitcoind_rs::CoreStartupError>()
+            .is_some()
+        {
+            eprintln!("{error}");
+        } else {
+            eprintln!("Error: {error}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<()> {
     let args = Args::parse_with_config()?;
     let daemon = args.daemon || args.daemon_wait;
     let daemon_wait = args.daemon_wait;

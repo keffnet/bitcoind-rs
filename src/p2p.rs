@@ -5170,12 +5170,13 @@ async fn send_peer_extensions(
         // peers still exchange the extension before VERACK.
         send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
         send_message(node, peer_id, writer, network, &Message::SendAddrV2).await?;
-        if node.config.zmq.tx_reconciliation
-            && *peer_state.relay_transactions.lock()
-            && peer_state.local_relay_transactions
-            && peer_state.connection_type != "addr-fetch"
-            && peer_state.connection_type != "feeler"
-        {
+        if tx_reconciliation_allowed(
+            node.config.zmq.tx_reconciliation,
+            node.config.blocksonly,
+            *peer_state.relay_transactions.lock(),
+            peer_state.local_relay_transactions,
+            peer_state.connection_type,
+        ) {
             let salt = random::<u64>();
             send_message(
                 node,
@@ -5766,6 +5767,21 @@ fn peer_can_serve_transaction_getdata(
     ) && (peer_relay_transactions
         || local_bloom_filters
         || permissions.contains(PeerPermissions::BLOOM_FILTER))
+}
+
+fn tx_reconciliation_allowed(
+    enabled: bool,
+    blocksonly: bool,
+    peer_relay_transactions: bool,
+    local_relay_transactions: bool,
+    connection_type: &str,
+) -> bool {
+    enabled
+        && !blocksonly
+        && peer_relay_transactions
+        && local_relay_transactions
+        && connection_type != "addr-fetch"
+        && connection_type != "feeler"
 }
 
 fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
@@ -7654,6 +7670,38 @@ mod tests {
             true,
             true,
             PeerPermissions::BLOOM_FILTER
+        ));
+    }
+
+    #[test]
+    fn tx_reconciliation_respects_core_blocksonly_and_connection_gates() {
+        assert!(tx_reconciliation_allowed(
+            true,
+            false,
+            true,
+            true,
+            "outbound-full"
+        ));
+        assert!(!tx_reconciliation_allowed(
+            true,
+            true,
+            true,
+            true,
+            "outbound-full"
+        ));
+        assert!(!tx_reconciliation_allowed(
+            true,
+            false,
+            false,
+            true,
+            "outbound-full"
+        ));
+        assert!(!tx_reconciliation_allowed(
+            true,
+            false,
+            true,
+            true,
+            "addr-fetch"
         ));
     }
 

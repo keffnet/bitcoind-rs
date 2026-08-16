@@ -3267,9 +3267,10 @@ async fn serve_peer_loop(
                 if verack_received {
                     anyhow::bail!("sendaddrv2 received after verack");
                 }
-                if peer_version >= WTXID_RELAY_VERSION {
-                    addrv2_received = true;
-                }
+                // BIP155 permits the signal for every protocol version. Core
+                // only suppresses sending it to old peers as a compatibility
+                // courtesy; an explicit signal from such a peer is honored.
+                addrv2_received = true;
             }
             Message::WtxidRelay => {
                 if verack_received {

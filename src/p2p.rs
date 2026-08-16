@@ -5206,16 +5206,33 @@ async fn send_peer_extensions(
         .await?;
     }
     if peer_version >= FEEFILTER_VERSION {
-        let relay_fee =
-            i64::try_from(node.mempool.write().mempool_min_fee_sat_per_kvb()).unwrap_or(i64::MAX);
-        send_message(
-            node,
-            peer_id,
-            writer,
-            network,
-            &Message::FeeFilter(relay_fee),
-        )
-        .await?;
+        let initial_block_download = node.chain.read().is_initial_block_download();
+        let (mempool_min_fee, min_relay_fee) = {
+            let mut mempool = node.mempool.write();
+            (
+                mempool.mempool_min_fee_sat_per_kvb(),
+                mempool.min_relay_fee_sat_per_kvb(),
+            )
+        };
+        if let Some(relay_fee) = outbound_fee_filter(
+            node.config.blocksonly,
+            initial_block_download,
+            peer_state
+                .permissions
+                .contains(PeerPermissions::FORCE_RELAY),
+            peer_state.connection_type,
+            mempool_min_fee,
+            min_relay_fee,
+        ) {
+            send_message(
+                node,
+                peer_id,
+                writer,
+                network,
+                &Message::FeeFilter(relay_fee),
+            )
+            .await?;
+        }
     }
     *sent = true;
     Ok(())
@@ -5740,6 +5757,29 @@ fn notfound_transaction_items(items: &[Inventory]) -> Option<Vec<Inventory>> {
 
 fn fee_filter_in_money_range(rate: i64) -> bool {
     rate >= 0 && u64::try_from(rate).is_ok_and(|rate| rate <= Amount::MAX_MONEY.to_sat())
+}
+
+/// Select the initial BIP133 filter using Core's relay policy. Core does not
+/// send this message when it cannot accept unsolicited transactions, and uses
+/// MAX_MONEY during IBD so peers stop announcing transactions that will be
+/// discarded by the active chainstate.
+fn outbound_fee_filter(
+    blocksonly: bool,
+    initial_block_download: bool,
+    force_relay: bool,
+    connection_type: &str,
+    mempool_min_fee: u64,
+    min_relay_fee: u64,
+) -> Option<i64> {
+    if blocksonly || force_relay || connection_type == "block-relay-only" {
+        return None;
+    }
+    let fee = if initial_block_download {
+        Amount::MAX_MONEY.to_sat()
+    } else {
+        mempool_min_fee.max(min_relay_fee)
+    };
+    i64::try_from(fee).ok()
 }
 
 fn peer_can_request_mempool(peer_bloom_filters: bool, permissions: PeerPermissions) -> bool {
@@ -7606,6 +7646,32 @@ mod tests {
         assert!(fee_filter_in_money_range(max_money));
         assert!(!fee_filter_in_money_range(-1));
         assert!(!fee_filter_in_money_range(max_money + 1));
+    }
+
+    #[test]
+    fn outbound_fee_filter_matches_core_relay_policy() {
+        assert_eq!(
+            outbound_fee_filter(false, false, false, "outbound-full", 100, 100),
+            Some(100)
+        );
+        assert_eq!(
+            outbound_fee_filter(false, false, false, "outbound-full", 75, 100),
+            Some(100)
+        );
+        assert_eq!(
+            outbound_fee_filter(false, true, false, "outbound-full", 100, 100),
+            Some(i64::try_from(Amount::MAX_MONEY.to_sat()).unwrap())
+        );
+        for (blocksonly, force_relay, connection_type) in [
+            (true, false, "outbound-full"),
+            (false, true, "outbound-full"),
+            (false, false, "block-relay-only"),
+        ] {
+            assert_eq!(
+                outbound_fee_filter(blocksonly, false, force_relay, connection_type, 100, 100,),
+                None
+            );
+        }
     }
 
     #[test]
@@ -9490,7 +9556,7 @@ mod tests {
             wire::read_message(&mut server_reader, Network::Regtest)
                 .await
                 .unwrap(),
-            Message::FeeFilter(100)
+            Message::FeeFilter(i64::try_from(Amount::MAX_MONEY.to_sat()).unwrap())
         );
         send_message(&node, 1, &writer, Network::Regtest, &Message::Verack)
             .await

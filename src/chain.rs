@@ -1435,6 +1435,36 @@ impl ChainState {
         self.coinstats_index_enabled
     }
 
+    /// Return the durable footprint of this implementation's chainstate.
+    ///
+    /// Core obtains this value from the coins database. The Rust node keeps
+    /// its UTXO state in memory and persists metadata, snapshots, and an
+    /// append-only chainstate delta log instead, so report those files rather
+    /// than the unrelated block body store.
+    pub fn utxo_disk_size(&self) -> Result<u64> {
+        let mut total = self.chainstate_store.disk_usage()?;
+        for name in [
+            "chainstate.bin",
+            "chainstate.json",
+            "chainstate.snapshot",
+            "chainstate.snapshot.sha256",
+            "chainstate.txcounters",
+        ] {
+            let path = self.data_dir.join(name);
+            match fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    total = total
+                        .checked_add(metadata.len())
+                        .context("chainstate disk usage overflowed")?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(total)
+    }
+
     pub fn txospender_index_enabled(&self) -> bool {
         self.txospender_index_enabled
     }

@@ -860,6 +860,15 @@ impl ChainstateStore {
         &self.path
     }
 
+    /// Return the durable size of the chainstate delta data and its index.
+    pub fn disk_usage(&self) -> Result<u64> {
+        self.file
+            .metadata()?
+            .len()
+            .checked_add(self.index_file.metadata()?.len())
+            .context("chainstate store disk usage overflowed")
+    }
+
     pub fn contains(&self, hash: &BlockHash) -> bool {
         self.index.contains_key(hash)
     }

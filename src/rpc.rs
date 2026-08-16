@@ -2816,9 +2816,7 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         } else {
             chain.utxo_statistics_without_index(include_serialized_hash, include_muhash)
         };
-        let disk_size = std::fs::metadata(chain.store.path())
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let disk_size = chain.utxo_disk_size()?;
         (chain.height(), chain.best_hash(), stats, disk_size)
     };
     let mut result = json!({
@@ -15185,6 +15183,13 @@ mod tests {
 
         let default = dispatch_method(&node, "gettxoutsetinfo", &json!([])).unwrap();
         assert!(default["hash_serialized_3"].is_string());
+        let chain = node.chain.read();
+        assert_eq!(default["disk_size"], json!(chain.utxo_disk_size().unwrap()));
+        assert_ne!(
+            default["disk_size"],
+            json!(chain.store.data_size().unwrap())
+        );
+        drop(chain);
         let without_hash =
             dispatch_method(&node, "gettxoutsetinfo", &json!(["none", null, false])).unwrap();
         assert!(without_hash.get("hash_serialized_3").is_none());

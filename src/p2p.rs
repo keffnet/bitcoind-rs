@@ -859,6 +859,7 @@ struct PeerState {
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
     pending_tx_inventory: parking_lot::Mutex<Vec<Inventory>>,
+    send_mempool: parking_lot::Mutex<bool>,
     tx_requests: parking_lot::Mutex<TxRequestState>,
     fee_filter: parking_lot::Mutex<i64>,
     sent_fee_filter: parking_lot::Mutex<Option<i64>>,
@@ -2874,6 +2875,7 @@ async fn serve_peer(
         bloom_filter: parking_lot::Mutex::new(None),
         known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
         pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
+        send_mempool: parking_lot::Mutex::new(false),
         tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
         fee_filter: parking_lot::Mutex::new(0),
         sent_fee_filter: parking_lot::Mutex::new(None),
@@ -3216,12 +3218,23 @@ async fn serve_peer_loop(
                         node.note_block_staller(staller);
                     }
                 }
-                if transaction_inventory_send_due(
+                let inventory_send_due = transaction_inventory_send_due(
                     peer_state,
                     Instant::now(),
                     tx_inventory_average,
-                )
-                {
+                );
+                let force_inventory_send = peer_state
+                    .permissions
+                    .contains(PeerPermissions::NO_BAN);
+                if inventory_send_due || force_inventory_send {
+                    flush_peer_mempool_request(
+                        node,
+                        peer_id,
+                        peer_state,
+                        writer,
+                        node.config.network,
+                    )
+                    .await?;
                     flush_peer_transaction_inventory(
                         node,
                         peer_id,
@@ -4859,60 +4872,7 @@ async fn serve_peer_loop(
                     );
                     continue;
                 }
-                let transactions = {
-                    let mempool = node.mempool.read();
-                    let minimum_fee = if peer_state
-                        .permissions
-                        .contains(PeerPermissions::FORCE_RELAY)
-                    {
-                        0
-                    } else {
-                        *fee_filter.lock()
-                    };
-                    mempool
-                        .main_order()
-                        .into_iter()
-                        .filter_map(|txid| {
-                            mempool.get(&txid).and_then(|entry| {
-                                let fee_rate = fee_rate_sat_per_kvb(entry.fee_sat, entry.vsize);
-                                (fee_rate >= minimum_fee).then(|| entry.transaction.clone())
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let inventory = {
-                    let mut filter = bloom_filter.lock();
-                    let wtxid_relay = *peer_state.wtxid_relay.lock();
-                    let mut known = peer_state.known_tx_inventory.lock();
-                    transactions
-                        .into_iter()
-                        .filter_map(|transaction| {
-                            if let Some(filter) = filter.as_mut()
-                                && !filter.is_relevant_and_update(&transaction)
-                            {
-                                return None;
-                            }
-                            let item = transaction_inventory(&transaction, wtxid_relay);
-                            if known.contains(&item.hash) {
-                                return None;
-                            }
-                            known.insert(&item.hash);
-                            Some(item)
-                        })
-                        .collect::<Vec<_>>()
-                };
-                let mempool_sequence = node.mempool.read().sequence();
-                for chunk in inventory.chunks(MAX_TX_INVENTORY_BATCH) {
-                    send_message(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &Message::Inv(chunk.to_vec()),
-                    )
-                    .await?;
-                }
-                node.record_peer_inv_sequence(peer_id, mempool_sequence);
+                *peer_state.send_mempool.lock() = true;
             }
         }
         if version_received && verack_received && !verack_sent {
@@ -5861,11 +5821,7 @@ async fn flush_peer_transaction_inventory(
     node.set_peer_inv_to_send(peer_id, state.pending_tx_inventory.lock().len());
 
     let wtxid_relay = *state.wtxid_relay.lock();
-    let minimum_fee = if state.permissions.contains(PeerPermissions::FORCE_RELAY) {
-        0
-    } else {
-        *state.fee_filter.lock()
-    };
+    let minimum_fee = *state.fee_filter.lock();
     let mut inventory = Vec::with_capacity(pending.len());
     for queued in pending {
         let Some(transaction) = transaction_for_inventory(node, &queued) else {
@@ -5908,6 +5864,92 @@ async fn flush_peer_transaction_inventory(
     node.record_peer_inv_sequence(peer_id, node.mempool.read().sequence());
     let remaining = state.pending_tx_inventory.lock().len();
     node.set_peer_inv_to_send(peer_id, remaining);
+    Ok(())
+}
+
+async fn flush_peer_mempool_request(
+    node: &Arc<Node>,
+    peer_id: usize,
+    state: &PeerState,
+    writer: &PeerWriter,
+    network: Network,
+) -> Result<()> {
+    {
+        let mut send_mempool = state.send_mempool.lock();
+        if !*send_mempool {
+            return Ok(());
+        }
+        // Core consumes the request before building the response. A failed
+        // write closes this peer, so retaining the flag cannot produce a
+        // useful retry and would only make the state surprising in tests.
+        *send_mempool = false;
+    }
+
+    let minimum_fee = *state.fee_filter.lock();
+    let (transactions, mempool_txids) = {
+        let mempool = node.mempool.read();
+        let mut txids = HashSet::new();
+        let transactions = mempool
+            .main_order()
+            .into_iter()
+            .filter_map(|txid| {
+                let entry = mempool.get(&txid)?;
+                txids.insert(txid);
+                let fee_rate = fee_rate_sat_per_kvb(entry.fee_sat, entry.vsize);
+                (fee_rate >= minimum_fee).then(|| entry.transaction.clone())
+            })
+            .collect::<Vec<_>>();
+        (transactions, txids)
+    };
+
+    // A mempool response supersedes queued announcements for every current
+    // transaction, including entries filtered by fee or bloom relevance.
+    // This matches Core's removal from m_tx_inventory_to_send while it walks
+    // the mempool response.
+    let remaining = {
+        let mempool = node.mempool.read();
+        let mut pending = state.pending_tx_inventory.lock();
+        pending.retain(|item| {
+            transaction_id_for_inventory(&mempool, item)
+                .is_none_or(|txid| !mempool_txids.contains(&txid))
+        });
+        pending.len()
+    };
+    node.set_peer_inv_to_send(peer_id, remaining);
+
+    let wtxid_relay = *state.wtxid_relay.lock();
+    let inventory = {
+        let mut filter = state.bloom_filter.lock();
+        let mut known = state.known_tx_inventory.lock();
+        transactions
+            .into_iter()
+            .filter_map(|transaction| {
+                if let Some(filter) = filter.as_mut()
+                    && !filter.is_relevant_and_update(&transaction)
+                {
+                    return None;
+                }
+                let item = transaction_inventory(&transaction, wtxid_relay);
+                if known.contains(&item.hash) {
+                    return None;
+                }
+                known.insert(&item.hash);
+                Some(item)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for chunk in inventory.chunks(MAX_TX_INVENTORY_BATCH) {
+        send_message(
+            node,
+            peer_id,
+            writer,
+            network,
+            &Message::Inv(chunk.to_vec()),
+        )
+        .await?;
+    }
+    node.record_peer_inv_sequence(peer_id, node.mempool.read().sequence());
     Ok(())
 }
 
@@ -7541,6 +7583,7 @@ mod tests {
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
             pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
+            send_mempool: parking_lot::Mutex::new(false),
             tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
             fee_filter: parking_lot::Mutex::new(0),
             sent_fee_filter: parking_lot::Mutex::new(None),
@@ -9954,6 +9997,7 @@ mod tests {
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
             pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
+            send_mempool: parking_lot::Mutex::new(false),
             tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
             fee_filter: parking_lot::Mutex::new(0),
             sent_fee_filter: parking_lot::Mutex::new(None),

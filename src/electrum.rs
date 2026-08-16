@@ -1275,7 +1275,7 @@ fn transaction_id_from_pos(node: &Arc<Node>, params: &Value) -> Result<Value> {
         return Ok(json!(txid.to_string()));
     }
     let (branch, _, _) = chain
-        .merkle_branch(&txid)?
+        .merkle_branch_at_height(&txid, height)?
         .ok_or_else(|| anyhow!("transaction not found"))?;
     Ok(json!({
         "tx_hash": txid.to_string(),
@@ -2762,6 +2762,10 @@ mod tests {
         let merkle = transaction_merkle(&node, &json!([txid.to_string(), 0])).unwrap();
         assert_eq!(merkle["block_height"], 0);
         assert!(transaction_merkle(&node, &json!([txid.to_string(), 1])).is_err());
+        let id_from_pos = transaction_id_from_pos(&node, &json!([0, 0, true])).unwrap();
+        assert_eq!(id_from_pos["tx_hash"], json!(txid.to_string()));
+        assert_eq!(id_from_pos["pos"], json!(0));
+        assert_eq!(id_from_pos["merkle"], merkle["merkle"]);
 
         let script_hash = "00".repeat(32);
         let mut subscriptions = HashMap::new();

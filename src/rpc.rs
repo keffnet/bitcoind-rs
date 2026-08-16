@@ -10500,9 +10500,12 @@ fn build_mining_block_with_transactions(
         .ok_or_else(|| anyhow!("active tip header is unavailable"))?;
     let height = tip.height.saturating_add(1);
     let now = u32::try_from(crate::time::unix_time()).unwrap_or(u32::MAX);
-    let time = now
-        .max(parent.time.saturating_add(1))
-        .max(chain.median_time_past_value().saturating_add(1));
+    let time = now.max(minimum_block_time(
+        chain.network,
+        &parent,
+        height,
+        chain.median_time_past_value(),
+    ));
     let bits = chain.next_bits(time);
     let network = chain.network;
     let deployment_parameters = chain.deployment_parameters();

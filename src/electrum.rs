@@ -1500,7 +1500,6 @@ fn electrum_transaction_json(
     });
     if let Some(location) = location {
         result["blockhash"] = json!(location.block_hash.to_string());
-        result["height"] = json!(location.height);
     }
     if let Some(confirmations) = confirmations {
         result["confirmations"] = json!(confirmations);
@@ -3217,7 +3216,7 @@ mod tests {
         );
         let verbose = transaction_get(&node, &json!([txid.to_string(), true])).unwrap();
         assert_eq!(verbose["blockhash"], json!(hash.to_string()));
-        assert_eq!(verbose["height"], json!(0));
+        assert!(verbose.get("height").is_none());
         assert_eq!(verbose["confirmations"], json!(1));
         assert_eq!(verbose["time"], json!(block.header.time));
         assert_eq!(verbose["blocktime"], json!(block.header.time));

@@ -1348,7 +1348,7 @@ fn block_chunk(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let txid: Txid = param::<String>(params, 0)?.parse()?;
+    let txid = txid_param(params, 0)?;
     let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
     let chain_transaction = { node.chain.write().transaction(&txid)? };
     if let Some((transaction, location)) = chain_transaction {
@@ -1479,7 +1479,7 @@ fn electrum_transaction_json(
 }
 
 fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let txid: Txid = param::<String>(params, 0)?.parse()?;
+    let txid = txid_param(params, 0)?;
     let requested_height = param::<u32>(params, 1)?;
     let Some((branch, position, height)) = node
         .chain
@@ -1877,9 +1877,15 @@ fn output_for_outpoint(
 fn script_hash_param(params: &Value, index: usize) -> Result<String> {
     let value = param::<String>(params, index)?;
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        bail!("invalid Electrum scripthash");
+        return Err(electrum_invalid_params());
     }
     Ok(value.to_ascii_lowercase())
+}
+
+fn txid_param(params: &Value, index: usize) -> Result<Txid> {
+    param::<String>(params, index)?
+        .parse()
+        .map_err(|_| electrum_invalid_params())
 }
 
 fn scriptpubkey_param(params: &Value, index: usize) -> Result<ScriptBuf> {
@@ -1899,14 +1905,16 @@ fn scriptpubkey_hash_param(params: &Value, index: usize) -> Result<String> {
 fn address_param(node: &Arc<Node>, params: &Value, index: usize) -> Result<(String, String)> {
     let value = param::<String>(params, index)?;
     let address = value
-        .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
-        .require_network(node.config.network)?;
+        .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+        .map_err(|_| electrum_invalid_params())?
+        .require_network(node.config.network)
+        .map_err(|_| electrum_invalid_params())?;
     let script_hash = chain::electrum_script_hash(&address.script_pubkey());
     Ok((address.to_string(), script_hash))
 }
 
 fn outpoint_param(params: &Value) -> Result<OutPoint> {
-    let txid: Txid = param::<String>(params, 0)?.parse()?;
+    let txid = txid_param(params, 0)?;
     let vout = param::<u32>(params, 1)?;
     Ok(OutPoint::new(txid, vout))
 }
@@ -3495,6 +3503,45 @@ mod tests {
             .get_mut()
             .write_all(
                 br#"{"jsonrpc":"2.0","id":7,"method":"blockchain.block.header","params":[0,0,true]}
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["error"]["code"], json!(-32602));
+        assert_eq!(response["error"]["message"], json!("invalid params"));
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":8,"method":"blockchain.scripthash.get_balance","params":["00"]}
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["error"]["code"], json!(-32602));
+        assert_eq!(response["error"]["message"], json!("invalid params"));
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":9,"method":"blockchain.transaction.get","params":["not-a-txid"]}
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["error"]["code"], json!(-32602));
+        assert_eq!(response["error"]["message"], json!("invalid params"));
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":10,"method":"blockchain.address.get_balance","params":["not-an-address"]}
 "#,
             )
             .await?;

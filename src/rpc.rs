@@ -20178,7 +20178,7 @@ mod tests {
             7,
             70016,
             crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
-            "/test-peer/",
+            "/test\u{1}-peer<unsafe>/",
             0,
             true,
         );
@@ -20194,6 +20194,7 @@ mod tests {
             peer_info[0]["connection_type"],
             json!("outbound-full-relay")
         );
+        assert_eq!(peer_info[0]["subver"], json!("/test-peerunsafe/"));
         assert_eq!(peer_info[0]["presynced_headers"], json!(-1));
         assert_eq!(peer_info[0]["bip152_hb_to"], json!(false));
         assert_eq!(peer_info[0]["bip152_hb_from"], json!(true));

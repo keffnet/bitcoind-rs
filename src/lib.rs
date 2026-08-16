@@ -103,6 +103,24 @@ const CLOCK_OUT_OF_SYNC_THRESHOLD_SECS: u64 = 10 * 60;
 pub(crate) const PRIVATE_BROADCAST_PEERS_PER_TRANSACTION: usize = 3;
 pub(crate) const PRIVATE_BROADCAST_RETRY_SECS: u64 = 60;
 
+/// Match Core's default `SanitizeString` rule for peer user-agent strings.
+///
+/// Peer subversions are untrusted handshake data. Core removes every byte
+/// outside this conservative printable set before retaining the value for
+/// diagnostics and RPC output.
+fn sanitize_peer_user_agent(user_agent: &str) -> String {
+    user_agent
+        .chars()
+        .filter(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    ' ' | '.' | ',' | ';' | '-' | '_' | '/' | ':' | '?' | '@' | '(' | ')'
+                )
+        })
+        .collect()
+}
+
 fn expand_notify_command(command: &str, argument: Option<&str>) -> String {
     command.replace("%s", argument.unwrap_or_default())
 }
@@ -2919,9 +2937,10 @@ impl Node {
         relay_transactions: bool,
     ) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
+            let user_agent = sanitize_peer_user_agent(user_agent);
             peer.version = Some(version);
             peer.services = services;
-            peer.user_agent = user_agent.to_owned();
+            peer.user_agent.clone_from(&user_agent);
             peer.start_height = start_height;
             peer.relay_transactions = relay_transactions;
             if peer.connection_type != "private-broadcast" {
@@ -2929,7 +2948,7 @@ impl Node {
                     if let Some(known) = self.known_addresses.write().get_mut(&address) {
                         known.version = Some(version);
                         known.services = services;
-                        known.user_agent = user_agent.to_owned();
+                        known.user_agent = user_agent;
                         known.start_height = start_height;
                         known.relay_transactions = relay_transactions;
                     }

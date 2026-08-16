@@ -10,7 +10,7 @@ use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::{Address, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::debug;
 
@@ -369,10 +369,9 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
                 }
             }
-            read = reader.read_until(b'\n', &mut line) => {
+            read = read_line_limited(&mut reader, &mut line, MAX_LINE_SIZE) => {
                 let bytes = read?;
                 if bytes == 0 { return Ok(()); }
-                if line.len() > MAX_LINE_SIZE { bail!("Electrum request exceeds limit"); }
                 let requests: Value = match serde_json::from_slice(&line) {
                     Ok(requests) => requests,
                     Err(_) => {
@@ -422,6 +421,35 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                 encoded.push(b'\n');
                 write_half.write_all(&encoded).await?;
             }
+        }
+    }
+}
+
+async fn read_line_limited<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut Vec<u8>,
+    limit: usize,
+) -> Result<usize> {
+    line.clear();
+    loop {
+        let (chunk_len, terminated) = {
+            let buffer = reader.fill_buf().await?;
+            if buffer.is_empty() {
+                return Ok(line.len());
+            }
+            let chunk_len = buffer
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(buffer.len(), |position| position + 1);
+            if line.len().saturating_add(chunk_len) > limit {
+                bail!("Electrum request exceeds limit");
+            }
+            line.extend_from_slice(&buffer[..chunk_len]);
+            (chunk_len, buffer[..chunk_len].contains(&b'\n'))
+        };
+        reader.consume(chunk_len);
+        if terminated {
+            return Ok(line.len());
         }
     }
 }
@@ -3173,6 +3201,20 @@ mod tests {
             .unwrap(),
             Value::Bool(true)
         );
+    }
+
+    #[tokio::test]
+    async fn electrum_line_reader_bounds_unterminated_requests() {
+        let mut reader = BufReader::new(std::io::Cursor::new(b"abcdef".to_vec()));
+        let mut line = Vec::new();
+        assert!(read_line_limited(&mut reader, &mut line, 4).await.is_err());
+
+        let mut reader = BufReader::new(std::io::Cursor::new(b"abc\n".to_vec()));
+        assert_eq!(
+            read_line_limited(&mut reader, &mut line, 4).await.unwrap(),
+            4
+        );
+        assert_eq!(line, b"abc\n");
     }
 
     #[tokio::test]

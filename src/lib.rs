@@ -2067,7 +2067,7 @@ impl Node {
         self.notify_mempool_transaction_with_exclusions(transaction, Vec::new());
     }
 
-    pub(crate) fn mock_scheduler_forward(&self, delta_secs: u64) {
+    pub(crate) fn mock_scheduler_forward(&self, delta_secs: u64) -> Result<()> {
         let previous = self
             .mock_scheduler_elapsed_secs
             .fetch_add(delta_secs, Ordering::Relaxed);
@@ -2075,6 +2075,12 @@ impl Node {
         if next / MAX_INITIAL_BROADCAST_DELAY_SECS > previous / MAX_INITIAL_BROADCAST_DELAY_SECS {
             self.reannounce_unbroadcast_transactions();
         }
+        if next / FEE_ESTIMATOR_FLUSH_INTERVAL.as_secs()
+            > previous / FEE_ESTIMATOR_FLUSH_INTERVAL.as_secs()
+        {
+            self.flush_fee_estimates(false)?;
+        }
+        Ok(())
     }
 
     fn reannounce_unbroadcast_transactions(&self) {
@@ -4891,14 +4897,19 @@ mod tests {
         assert_eq!(node.accept_transaction(transaction).unwrap(), txid);
         assert_eq!(events.try_recv().unwrap().txid, txid);
 
-        node.mock_scheduler_forward(MAX_INITIAL_BROADCAST_DELAY_SECS - 1);
+        node.mock_scheduler_forward(MAX_INITIAL_BROADCAST_DELAY_SECS - 1)
+            .unwrap();
         assert!(events.try_recv().is_err());
-        node.mock_scheduler_forward(1);
+        node.mock_scheduler_forward(1).unwrap();
         assert_eq!(events.try_recv().unwrap().txid, txid);
 
         node.mempool.write().remove_unbroadcast(&txid);
-        node.mock_scheduler_forward(MAX_INITIAL_BROADCAST_DELAY_SECS);
+        node.mock_scheduler_forward(MAX_INITIAL_BROADCAST_DELAY_SECS)
+            .unwrap();
         assert!(events.try_recv().is_err());
+        node.mock_scheduler_forward(FEE_ESTIMATOR_FLUSH_INTERVAL.as_secs())
+            .unwrap();
+        assert!(directory.path().join("fee_estimates.dat").exists());
     }
 
     #[test]

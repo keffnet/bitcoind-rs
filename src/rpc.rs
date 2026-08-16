@@ -2294,7 +2294,7 @@ fn mock_scheduler(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if !(1..=3_600).contains(&delta) {
         bail!("delta_time must be between 1 and 3600 seconds (1 hr)")
     }
-    node.mock_scheduler_forward(delta as u64);
+    node.mock_scheduler_forward(delta as u64)?;
     Ok(Value::Null)
 }
 

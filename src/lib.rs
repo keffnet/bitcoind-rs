@@ -707,10 +707,6 @@ impl IpSubnet {
         Self::new(address, self.prefix).is_ok_and(|candidate| candidate.address == self.address)
     }
 
-    pub(crate) fn contains_subnet(self, subnet: Self) -> bool {
-        self.prefix <= subnet.prefix && self.contains(subnet.address)
-    }
-
     pub(crate) fn display(self) -> String {
         format!("{}/{}", self.address, self.prefix)
     }
@@ -3823,10 +3819,7 @@ impl Node {
         let ban_created = time::unix_time();
         let mut banned = self.banned_addresses.write();
         remove_expired_bans(&mut banned, ban_created);
-        if banned
-            .keys()
-            .any(|existing| existing.contains_subnet(subnet))
-        {
+        if banned.contains_key(&subnet) {
             bail!("IP/Subnet already banned")
         }
         banned.insert(

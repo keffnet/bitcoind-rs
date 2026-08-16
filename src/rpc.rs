@@ -3638,22 +3638,19 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let subnet = crate::IpSubnet::parse(&address)?;
     match command.as_str() {
         "add" => {
-            let requested_duration = optional_u64(params, 2, 0, "bantime")?;
+            let bantime = optional_i64(params, 2, 0, "bantime")?;
             let absolute = optional_bool(params, 3, false, "absolute")?;
-            let (requested_duration, absolute) = if requested_duration == 0 {
-                (node.config.ban_time_secs, false)
-            } else {
-                (requested_duration, absolute)
-            };
             let now = unix_time();
-            let ban_until = if absolute {
-                requested_duration
-            } else {
-                now.saturating_add(requested_duration)
-            };
-            if ban_until <= now {
-                bail!("ban time must be in the future")
+            if absolute && bantime < i64::try_from(now).unwrap_or(i64::MAX) {
+                bail!("Error: Absolute timestamp is in the past")
             }
+            let ban_until = if bantime <= 0 {
+                now.saturating_add(node.config.ban_time_secs)
+            } else if absolute {
+                u64::try_from(bantime).map_err(|_| anyhow!("bantime is out of range"))?
+            } else {
+                now.saturating_add(u64::try_from(bantime).unwrap_or(u64::MAX))
+            };
             node.ban_subnet(subnet, ban_until, "manually banned".to_owned())?;
             Ok(Value::Null)
         }
@@ -20460,8 +20457,25 @@ mod tests {
             .find(|entry| entry["address"] == "192.0.2.3/32")
             .and_then(|entry| entry["ban_duration"].as_u64());
         assert_eq!(default_duration, Some(123));
+        set_ban(&node, &json!(["192.0.2.4", "add", -1])).unwrap();
+        let negative_default_duration = list_banned(&node)
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["address"] == "192.0.2.4/32")
+            .and_then(|entry| entry["ban_duration"].as_u64());
+        assert_eq!(negative_default_duration, Some(123));
+        set_ban(&node, &json!(["192.0.2.4", "remove"])).unwrap();
+        assert_eq!(
+            set_ban(&node, &json!(["192.0.2.5", "add", 1, true]))
+                .unwrap_err()
+                .to_string(),
+            "Error: Absolute timestamp is in the past"
+        );
         set_ban(&node, &json!(["192.0.2.0/24", "add", 60])).unwrap();
         assert!(node.is_banned("192.0.2.99".parse().unwrap()));
+        set_ban(&node, &json!(["192.0.2.2", "add", 60])).unwrap();
         assert!(set_ban(&node, &json!(["192.0.2.2", "add", 60])).is_err());
         let subnet_entry = list_banned(&node)
             .unwrap()
@@ -20472,6 +20486,7 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(subnet_entry["ban_duration"], json!(60));
+        set_ban(&node, &json!(["192.0.2.2", "remove"])).unwrap();
         set_ban(&node, &json!(["192.0.2.0/24", "remove"])).unwrap();
         assert!(!node.is_banned("192.0.2.99".parse().unwrap()));
         let normalized = normalize_rpc_params(

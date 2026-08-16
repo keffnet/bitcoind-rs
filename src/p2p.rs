@@ -235,6 +235,7 @@ const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 const STALE_RELAY_AGE_LIMIT_SECS: u64 = 30 * 24 * 60 * 60;
 pub(crate) const MIN_PEER_PROTO_VERSION: i32 = 31_800;
 pub(crate) const BIP31_VERSION: i32 = 60_000;
+const NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS: i64 = 144;
 const SENDHEADERS_VERSION: i32 = 70_012;
 const FEEFILTER_VERSION: i32 = 70_013;
 const SHORT_IDS_BLOCKS_VERSION: i32 = 70_014;
@@ -342,6 +343,28 @@ fn block_request_inventory_type(peer_services: u64) -> InventoryType {
     } else {
         InventoryType::Block
     }
+}
+
+fn peer_services_are_desirable(peer_services: u64, approximate_best_block_depth: i64) -> bool {
+    let desirable = if peer_services & wire::NODE_NETWORK_LIMITED != 0
+        && approximate_best_block_depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
+    {
+        wire::NODE_NETWORK_LIMITED | wire::NODE_WITNESS
+    } else {
+        wire::NODE_NETWORK | wire::NODE_WITNESS
+    };
+    peer_services & desirable == desirable
+}
+
+fn approximate_best_block_depth(node: &Arc<Node>) -> i64 {
+    let chain = node.chain.read();
+    let tip = chain.tip();
+    let tip_time = i64::from(chain.header(tip.height).map_or(0, |header| header.time));
+    let now = i64::try_from(crate::time::unix_time()).unwrap_or(i64::MAX);
+    let spacing = i64::try_from(chain.network.params().pow_target_spacing)
+        .unwrap_or(1)
+        .max(1);
+    now.saturating_sub(tip_time) / spacing
 }
 
 fn addr_fetch_timed_out(connected_at: u64, now: u64) -> bool {
@@ -3168,6 +3191,17 @@ async fn serve_peer_loop(
                     && version.start_height == 0
                     && !version.relay
                     && version.user_agent == "/pynode:0.0.1/";
+                if matches!(
+                    peer_state.connection_type,
+                    "outbound-full" | "block-relay-only" | "addr-fetch"
+                ) && !private_broadcast_version
+                    && !peer_services_are_desirable(
+                        version.services,
+                        approximate_best_block_depth(node),
+                    )
+                {
+                    anyhow::bail!("peer does not advertise the required services");
+                }
                 if private_broadcast_version {
                     *peer_state.private_broadcast_peer.lock() = true;
                 }
@@ -6173,6 +6207,17 @@ mod tests {
             true,
             PeerPermissions::FORCE_RELAY
         ));
+    }
+
+    #[test]
+    fn peer_service_requirements_match_core_limited_peer_window() {
+        let full = wire::NODE_NETWORK | wire::NODE_WITNESS;
+        let limited = wire::NODE_NETWORK_LIMITED | wire::NODE_WITNESS;
+        assert!(peer_services_are_desirable(full, 0));
+        assert!(!peer_services_are_desirable(wire::NODE_NETWORK, 0));
+        assert!(peer_services_are_desirable(limited, 143));
+        assert!(!peer_services_are_desirable(limited, 144));
+        assert!(peer_services_are_desirable(full, 144));
     }
 
     #[test]

@@ -6947,6 +6947,7 @@ impl ChainState {
 
     fn persist_snapshot(&mut self) -> Result<()> {
         self.sync_utxo_store()?;
+        self.utxo_store.compact_if_needed()?;
         self.sync_electrum_history_store()?;
         let snapshot = self.current_snapshot()?;
         let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;

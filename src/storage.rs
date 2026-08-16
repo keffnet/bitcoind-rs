@@ -6,7 +6,7 @@
 //! corrupt index files fall back to a complete record scan.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions, create_dir_all};
+use std::fs::{File, OpenOptions, create_dir_all, remove_file, rename};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -31,6 +31,8 @@ const MAX_STORED_CHAINSTATE_DELTA_SIZE: usize = 64 * 1024 * 1024;
 const MAX_STORED_ELECTRUM_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_ELECTRUM_HISTORY_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_UTXO_SIZE: usize = 100 * 1024;
+const MIN_UTXO_COMPACTION_DATA_SIZE: u64 = 16 * 1024 * 1024;
+const MIN_UTXO_COMPACTION_STALE_SIZE: u64 = 8 * 1024 * 1024;
 const XOR_KEY_SIZE: usize = 8;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
@@ -1143,7 +1145,7 @@ impl UtxoStore {
             .open(&index_path)
             .with_context(|| format!("opening UTXO index {}", index_path.display()))?;
         let data_len = file.metadata()?.len();
-        let loaded_index = load_utxo_index(&mut index_file, data_len)?;
+        let loaded_index = load_utxo_index(&mut index_file, &file, data_len)?;
         let (index, next_batch_id, generation) = if let Some(index) = loaded_index {
             index
         } else {
@@ -1371,6 +1373,145 @@ impl UtxoStore {
             self.apply_batch(&[], &batch)?;
         }
         Ok(())
+    }
+
+    /// Rewrite the live UTXO set into a compact value log and atomically
+    /// replace the location index.  The data and index are written and synced
+    /// before either rename, so an interrupted compaction is recovered by the
+    /// normal index rebuild path on the next open.
+    pub fn compact(&mut self) -> Result<()> {
+        self.flush()?;
+        let entries = self.entries()?;
+        let compact_data_path = self.path.with_extension("dat.compact");
+        let compact_index_path = self.index_path.with_extension("index.compact");
+        for path in [&compact_data_path, &compact_index_path] {
+            match remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let result = (|| -> Result<()> {
+            let mut compact_data = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&compact_data_path)
+                .with_context(|| {
+                    format!(
+                        "creating compacted UTXO store {}",
+                        compact_data_path.display()
+                    )
+                })?;
+            compact_data.write_all(UTXO_DATA_MAGIC)?;
+            let batch_id = self.next_batch_id;
+            let next_batch_id = batch_id
+                .checked_add(1)
+                .context("UTXO batch identifier exhausted during compaction")?;
+            let entries_empty = entries.is_empty();
+            let mut compact_index = HashMap::with_capacity(entries.len());
+            if !entries_empty {
+                for (outpoint, entry) in entries {
+                    let body = encode_utxo_put(batch_id, &outpoint, &entry)?;
+                    let location = append_utxo_data_record(&mut compact_data, &body)?;
+                    compact_index.insert(outpoint, location);
+                }
+                let commit = encode_utxo_commit(batch_id);
+                append_utxo_data_record(&mut compact_data, &commit)?;
+            }
+            compact_data.sync_data()?;
+            let data_end = data_len_after(&compact_data)?;
+
+            let mut compact_index_file = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&compact_index_path)
+                .with_context(|| {
+                    format!(
+                        "creating compacted UTXO index {}",
+                        compact_index_path.display()
+                    )
+                })?;
+            rewrite_utxo_index(
+                &mut compact_index_file,
+                data_end,
+                if entries_empty {
+                    self.next_batch_id
+                } else {
+                    next_batch_id
+                },
+                self.generation,
+                &compact_index,
+            )?;
+            drop(compact_index_file);
+            drop(compact_data);
+
+            rename(&compact_data_path, &self.path).with_context(|| {
+                format!("installing compacted UTXO store {}", self.path.display())
+            })?;
+            rename(&compact_index_path, &self.index_path).with_context(|| {
+                format!(
+                    "installing compacted UTXO index {}",
+                    self.index_path.display()
+                )
+            })?;
+
+            self.file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.path)
+                .with_context(|| {
+                    format!("reopening compacted UTXO store {}", self.path.display())
+                })?;
+            self.index_file = OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&self.index_path)
+                .with_context(|| {
+                    format!(
+                        "reopening compacted UTXO index {}",
+                        self.index_path.display()
+                    )
+                })?;
+            self.index = compact_index;
+            self.next_batch_id = if entries_empty {
+                self.next_batch_id
+            } else {
+                next_batch_id
+            };
+            self.pending_write_bytes = 0;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = remove_file(&compact_data_path);
+            let _ = remove_file(&compact_index_path);
+        }
+        result
+    }
+
+    /// Compact only when stale mutation records are large enough to justify a
+    /// full live-set rewrite.  Snapshot boundaries call this method so normal
+    /// operation gets LevelDB-like reclamation without a rewrite per block.
+    pub fn compact_if_needed(&mut self) -> Result<bool> {
+        let data_len = data_len_after(&self.file)?;
+        if data_len < MIN_UTXO_COMPACTION_DATA_SIZE {
+            return Ok(false);
+        }
+        let live_bytes = UTXO_DATA_MAGIC.len() as u64
+            + self
+                .index
+                .values()
+                .map(|location| 4u64.saturating_add(u64::from(location.length)))
+                .sum::<u64>()
+            + if self.index.is_empty() { 0 } else { 13 };
+        let stale_bytes = data_len.saturating_sub(live_bytes);
+        if stale_bytes < MIN_UTXO_COMPACTION_STALE_SIZE || stale_bytes < live_bytes / 4 {
+            return Ok(false);
+        }
+        self.compact()?;
+        Ok(true)
     }
 
     pub fn clear(&mut self) -> Result<()> {
@@ -2363,7 +2504,11 @@ fn scan_utxo_data(file: &mut File) -> Result<(HashMap<OutPoint, UtxoLocation>, u
     ))
 }
 
-fn load_utxo_index(file: &mut File, data_len: u64) -> Result<Option<UtxoIndexState>> {
+fn load_utxo_index(
+    file: &mut File,
+    data_file: &File,
+    data_len: u64,
+) -> Result<Option<UtxoIndexState>> {
     let index_len = file.metadata()?.len();
     if index_len < UTXO_INDEX_MAGIC.len() as u64 {
         return Ok(None);
@@ -2433,6 +2578,18 @@ fn load_utxo_index(file: &mut File, data_len: u64) -> Result<Option<UtxoIndexSta
                         length: value_length,
                     },
                 });
+                if validate_utxo_data_header(
+                    data_file,
+                    UtxoLocation {
+                        offset,
+                        length: value_length,
+                    },
+                    outpoint,
+                )
+                .is_err()
+                {
+                    return Ok(None);
+                }
                 max_batch = max_batch.max(batch_id);
             }
             UTXO_DELETE => {
@@ -2504,6 +2661,42 @@ fn load_utxo_index(file: &mut File, data_len: u64) -> Result<Option<UtxoIndexSta
         ),
         stored_generation.context("UTXO index has no generation checkpoint")?,
     )))
+}
+
+fn validate_utxo_data_header(
+    file: &File,
+    location: UtxoLocation,
+    expected_outpoint: OutPoint,
+) -> Result<()> {
+    if (location.length as usize) < 1 + 8 + 36 + 13
+        || (location.length as usize) > MAX_STORED_UTXO_SIZE + 64
+    {
+        bail!("stored UTXO value is too large or truncated");
+    }
+    let mut length = [0u8; 4];
+    read_exact_at(file, &mut length, location.offset)?;
+    if u32::from_le_bytes(length) != location.length {
+        bail!("UTXO index disagrees with value record length");
+    }
+    let mut header = [0u8; 45];
+    read_exact_at(
+        file,
+        &mut header,
+        location
+            .offset
+            .checked_add(4)
+            .context("UTXO value offset overflowed")?,
+    )?;
+    if header[0] != UTXO_PUT {
+        bail!("UTXO index points to a non-value record");
+    }
+    if u64::from_le_bytes(header[1..9].try_into().expect("UTXO batch has fixed width")) == 0 {
+        bail!("UTXO value batch identifier is invalid");
+    }
+    if decode_outpoint(&header[9..45])? != expected_outpoint {
+        bail!("UTXO value key does not match its index");
+    }
+    Ok(())
 }
 
 fn append_utxo_index_batch(
@@ -3475,6 +3668,73 @@ mod tests {
         store.clear().unwrap();
         assert_eq!(store.get(&outpoint).unwrap(), None);
         assert!(store.read_cache.lock().entries.is_empty());
+    }
+
+    #[test]
+    fn utxo_compaction_rewrites_live_values_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = UtxoStore::open(directory.path()).unwrap();
+        let mut entries = (0..32u32)
+            .map(|index| {
+                (
+                    OutPoint::new(Txid::from_byte_array([index as u8; 32]), index),
+                    StoredUtxo {
+                        output: TxOut {
+                            value: bitcoin::Amount::from_sat(1_000 + u64::from(index)),
+                            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                        },
+                        height: 1,
+                        median_time_past: 1,
+                        coinbase: false,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        store.apply_batch(&[], &entries).unwrap();
+        for height in 2..=7u32 {
+            let removals = entries
+                .iter()
+                .map(|(outpoint, _)| *outpoint)
+                .collect::<Vec<_>>();
+            let additions = entries
+                .iter()
+                .map(|(outpoint, entry)| {
+                    (
+                        *outpoint,
+                        StoredUtxo {
+                            height,
+                            median_time_past: height,
+                            ..entry.clone()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            store.apply_batch(&removals, &additions).unwrap();
+            entries = additions;
+        }
+        let before = std::fs::metadata(directory.path().join("utxos.dat"))
+            .unwrap()
+            .len();
+        store.compact().unwrap();
+        let after = std::fs::metadata(directory.path().join("utxos.dat"))
+            .unwrap()
+            .len();
+        assert!(after < before);
+        assert_eq!(store.entries().unwrap(), entries);
+        drop(store);
+
+        let reopened = UtxoStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.entries().unwrap(), entries);
+        assert_eq!(reopened.next_batch_id, 9);
+
+        let index_path = directory.path().join("utxos.index");
+        let mut index_bytes = std::fs::read(&index_path).unwrap();
+        let offset_start = UTXO_INDEX_MAGIC.len() + 4 + 1 + 8;
+        index_bytes[offset_start..offset_start + 8]
+            .copy_from_slice(&(UTXO_DATA_MAGIC.len() as u64).to_le_bytes());
+        std::fs::write(&index_path, index_bytes).unwrap();
+        let repaired = UtxoStore::open(directory.path()).unwrap();
+        assert_eq!(repaired.entries().unwrap(), entries);
     }
 
     #[test]

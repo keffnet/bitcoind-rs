@@ -1532,6 +1532,16 @@ impl Mempool {
         let package_has_preexisting = transactions
             .iter()
             .any(|transaction| candidate.get(&transaction.compute_txid()).is_some());
+        // Core evaluates only the transactions that are not already in the
+        // mempool.  A child-with-parents package still gets aggregate
+        // feerate treatment when at least two new transactions remain (for
+        // example, a package with one pre-existing parent and two new
+        // transactions).  If only one new transaction remains, it follows
+        // the ordinary single-transaction fee policy.
+        let new_transaction_count = transactions
+            .iter()
+            .filter(|transaction| candidate.get(&transaction.compute_txid()).is_none())
+            .count();
         let package_rbf = transactions.len() == 2
             && allow_low_fee_parent
             && !package_has_preexisting
@@ -1600,7 +1610,7 @@ impl Mempool {
                     transaction.clone(),
                     chain,
                     added_at,
-                    !allow_low_fee_parent,
+                    !(allow_low_fee_parent && new_transaction_count > 1),
                 )?
             };
             let entry = candidate.get(&txid).ok_or(MempoolError::BadOutput)?;
@@ -1609,23 +1619,6 @@ impl Mempool {
             package_vsize = package_vsize.saturating_add(entry.vsize);
             accepted.push(txid);
             new_count += 1;
-        }
-        if allow_low_fee_parent && new_count > 0 {
-            let child_txid = transactions
-                .last()
-                .ok_or(MempoolError::Empty)?
-                .compute_txid();
-            let (child_fee, child_vsize) = {
-                let child = candidate.get(&child_txid).ok_or(MempoolError::BadOutput)?;
-                (
-                    candidate.modified_fee_sat(&child_txid, child.fee_sat),
-                    child.vsize,
-                )
-            };
-            let minimum_fee = candidate.mempool_min_fee_sat_per_kvb();
-            if !fee_rate_meets(child_fee, child_vsize, minimum_fee) {
-                return Err(candidate.fee_rate_error(child_fee, child_vsize));
-            }
         }
         if new_count > 0
             && !fee_rate_meets(
@@ -4045,6 +4038,70 @@ mod tests {
 
         pool.bytes = 1;
         assert!(pool.check_consistency().is_err());
+    }
+
+    #[test]
+    fn package_feerate_can_sponsor_a_low_fee_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=101 {
+            let previous = *chain.header(height - 1).expect("previous header");
+            chain
+                .connect_block(mine_regtest_block(&previous, height))
+                .unwrap();
+        }
+        let (funding_outpoint, funding) = chain
+            .all_utxos()
+            .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
+            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+            .expect("matured coinbase output");
+
+        let parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding_outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0; 65]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(funding.output.value.to_sat() - 100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent.compute_txid(), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0; 65]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(parent.output[0].value.to_sat().saturating_sub(1)),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let policy = MempoolPolicy {
+            require_standard: false,
+            ..MempoolPolicy::default()
+        };
+        let mut pool =
+            Mempool::with_max_bytes_and_policy(Network::Regtest, DEFAULT_MAX_MEMPOOL_BYTES, policy);
+
+        assert!(!fee_rate_meets(
+            1,
+            child.vsize() as u64,
+            policy.min_relay_fee_sat_per_kvb
+        ));
+        let accepted = pool
+            .accept_package(&[parent.clone(), child.clone()], &chain)
+            .expect("parent fee should sponsor the package child");
+        assert_eq!(accepted, vec![parent.compute_txid(), child.compute_txid()]);
+        assert!(pool.get(&parent.compute_txid()).is_some());
+        assert!(pool.get(&child.compute_txid()).is_some());
     }
 
     #[test]

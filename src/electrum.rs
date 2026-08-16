@@ -1725,16 +1725,27 @@ fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<(Txid,
     let mut records = Vec::new();
     let mut seen = HashSet::new();
     for entry in chain.get_history(script_hash) {
-        if seen.insert(entry.txid) {
-            records.push((entry.txid, i64::from(entry.height)));
-        }
+        append_history_record(&mut records, &mut seen, entry.txid, i64::from(entry.height));
     }
     for (txid, height) in mempool_records_for_script(&chain, &mempool, script_hash) {
-        if seen.insert(txid) {
-            records.push((txid, height));
-        }
+        append_history_record(&mut records, &mut seen, txid, height);
     }
     records
+}
+
+fn append_history_record(
+    records: &mut Vec<(Txid, i64)>,
+    seen: &mut HashSet<(Txid, i64)>,
+    txid: Txid,
+    height: i64,
+) {
+    // Electrum/electrs represents each confirmed block occurrence.  This
+    // matters for the two historical BIP30 duplicate-coinbase transactions:
+    // the same txid has two distinct confirmed heights and both belong in the
+    // history and status digest.
+    if seen.insert((txid, height)) {
+        records.push((txid, height));
+    }
 }
 
 fn mempool_records_for_script(
@@ -2144,6 +2155,19 @@ mod tests {
             history_status(&[(txid, 1)]),
             "549540a6810df8dc5008757fa694172b0f7a3e32facfd9f39eab228286543cde"
         );
+    }
+
+    #[test]
+    fn history_records_keep_duplicate_txids_at_distinct_heights() {
+        let txid = Txid::from_byte_array([1; 32]);
+        let mut records = Vec::new();
+        let mut seen = HashSet::new();
+
+        append_history_record(&mut records, &mut seen, txid, 91_842);
+        append_history_record(&mut records, &mut seen, txid, 91_880);
+        append_history_record(&mut records, &mut seen, txid, 91_880);
+
+        assert_eq!(records, vec![(txid, 91_842), (txid, 91_880)]);
     }
 
     #[test]

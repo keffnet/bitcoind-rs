@@ -2330,6 +2330,13 @@ impl ChainState {
         {
             return true;
         }
+        // Core's BlockRequestAllowed requires BLOCK_VALID_SCRIPTS for
+        // non-active blocks. Header-only branches have no script-validation
+        // state; in this storage model a retained side-chain body is the
+        // corresponding validation marker.
+        if !self.store.contains(hash) {
+            return false;
+        }
         let best_header = self.best_header_tip();
         let Some(best_node) = self.block_index.get(&best_header.hash) else {
             return false;
@@ -8606,6 +8613,12 @@ mod tests {
             .expect("header-only fork is reported");
         assert_eq!(header_only.status, "headers-only");
         assert_eq!(header_only.branch_len, 1);
+        assert!(!state.block_request_allowed(&side_hash, 30 * 24 * 60 * 60));
+        assert!(
+            state
+                .headers_for_getheaders(&[], side_hash, 30 * 24 * 60 * 60)
+                .is_none()
+        );
     }
 
     #[test]

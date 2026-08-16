@@ -923,25 +923,29 @@ fn server_add_peer(
 }
 
 fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
-    let mut entries = mempool
-        .transaction_order()
-        .into_iter()
-        .filter_map(|txid| mempool.get(&txid))
-        .filter_map(|entry| (entry.vsize > 0).then_some((entry.fee_sat / entry.vsize, entry.vsize)))
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
-    let mut histogram: Vec<(u64, u64)> = Vec::new();
-    let mut cumulative_vsize = 0u64;
-    for (fee_rate, vsize) in entries {
-        cumulative_vsize = cumulative_vsize.saturating_add(vsize);
-        if let Some((last_fee_rate, total_vsize)) = histogram.last_mut()
-            && *last_fee_rate == fee_rate
-        {
-            *total_vsize = cumulative_vsize;
-        } else {
-            histogram.push((fee_rate, cumulative_vsize));
+    // Electrum servers conventionally expose logarithmic fee bands.  The
+    // label is the upper bound of a band, expressed as 2^n - 1 sat/vbyte;
+    // the second value is the vsize in that band, not a cumulative total.
+    const BINS: usize = 65;
+    let mut vsizes = [0u64; BINS];
+    for txid in mempool.transaction_order() {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        if entry.vsize == 0 {
+            continue;
         }
+        let fee_rate = entry.fee_sat / entry.vsize;
+        let bin = fee_rate.leading_zeros() as usize;
+        vsizes[bin] = vsizes[bin].saturating_add(entry.vsize);
     }
+
+    let Some(first_bin) = vsizes.iter().position(|vsize| *vsize != 0) else {
+        return json!([]);
+    };
+    let histogram = (first_bin..BINS)
+        .map(|bin| json!([u64::MAX.checked_shr(bin as u32).unwrap_or(0), vsizes[bin]]))
+        .collect::<Vec<_>>();
     json!(histogram)
 }
 
@@ -1833,6 +1837,36 @@ mod tests {
     fn empty_fee_histogram_is_a_valid_electrum_result() {
         let mempool = crate::mempool::Mempool::new(Network::Regtest);
         assert_eq!(fee_histogram(&mempool), json!([]));
+    }
+
+    #[test]
+    fn fee_histogram_uses_electrs_fee_bands() {
+        let mut mempool = crate::mempool::Mempool::new(Network::Regtest);
+        for (tag, fee_sat, vsize) in [(1u8, 50, 10), (2, 1, 1), (3, 0, 2)] {
+            let transaction = Transaction {
+                version: Version::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::null(),
+                    script_sig: Builder::new().push_int(i64::from(tag)).into_script(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                }],
+                output: Vec::new(),
+            };
+            mempool.insert_test_entry(crate::mempool::MempoolEntry {
+                transaction,
+                fee_sat,
+                vsize,
+                added_at: u64::from(tag),
+                height: 0,
+            });
+        }
+
+        assert_eq!(
+            fee_histogram(&mempool),
+            json!([[7, 10], [3, 0], [1, 1], [0, 2]])
+        );
     }
 
     #[test]

@@ -252,6 +252,7 @@ const MAX_FUTURE_BLOCK_TIME_SECS: u64 = 2 * 60 * 60;
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
 const MAX_PEER_TX_ANNOUNCEMENTS: usize = 5_000;
 const MAX_PEER_TX_REQUEST_IN_FLIGHT: usize = 100;
+const MIN_BLOCKS_TO_KEEP: u32 = 288;
 const TXID_RELAY_DELAY: Duration = Duration::from_secs(2);
 const NONPREF_PEER_TX_DELAY: Duration = Duration::from_secs(2);
 const OVERLOADED_PEER_TX_DELAY: Duration = Duration::from_secs(2);
@@ -1238,6 +1239,7 @@ struct PendingCompactBlock {
     compact: HeaderAndShortIds,
     transactions: Vec<Option<Transaction>>,
     requested_indexes: Vec<u64>,
+    requested: bool,
 }
 
 pub struct PeerManager {
@@ -4088,11 +4090,12 @@ async fn serve_peer_loop(
             }
             Message::Block(block) => {
                 let hash = block.header.block_hash();
+                let requested = node.peer_has_inflight_block_request(peer_id, hash);
                 for transaction in &block.txdata {
                     forget_transaction_requests(peers, transaction);
                 }
                 node.clear_peer_block_request(peer_id, hash);
-                if handle_received_block(node, peers, peer_id, block).await {
+                if handle_received_block(node, peers, peer_id, block, requested).await {
                     node.record_peer_block(peer_id, hash);
                 }
                 flush_pending_block_requests(
@@ -4106,6 +4109,7 @@ async fn serve_peer_loop(
             }
             Message::CompactBlock(compact) => {
                 let hash = compact.header.block_hash();
+                let requested = node.peer_has_inflight_block_request(peer_id, hash);
                 node.clear_peer_block_request(peer_id, hash);
                 flush_pending_block_requests(
                     node,
@@ -4123,7 +4127,9 @@ async fn serve_peer_loop(
                                 for transaction in &block.txdata {
                                     forget_transaction_requests(peers, transaction);
                                 }
-                                if handle_received_block(node, peers, peer_id, block).await {
+                                if handle_received_block(node, peers, peer_id, block, requested)
+                                    .await
+                                {
                                     node.record_peer_block(peer_id, block_hash);
                                 }
                             }
@@ -4149,6 +4155,7 @@ async fn serve_peer_loop(
                             compact,
                             transactions,
                             requested_indexes: missing,
+                            requested,
                         });
                         send_message(
                             node,
@@ -4304,7 +4311,9 @@ async fn serve_peer_loop(
                         for transaction in &block.txdata {
                             forget_transaction_requests(peers, transaction);
                         }
-                        if handle_received_block(node, peers, peer_id, block).await {
+                        if handle_received_block(node, peers, peer_id, block, pending.requested)
+                            .await
+                        {
                             node.record_peer_block(peer_id, block_hash);
                         }
                     }
@@ -4880,8 +4889,19 @@ async fn handle_received_block(
     peers: &PeerRegistry,
     peer_id: usize,
     block: Block,
+    requested: bool,
 ) -> bool {
     let hash = block.block_hash();
+    if !requested {
+        let allowed = {
+            let chain = node.chain.read();
+            unrequested_block_is_allowed(&block, &chain)
+        };
+        if !allowed {
+            debug!(%hash, "ignored unrequested low-work or distant peer block");
+            return false;
+        }
+    }
     let (was_stored, previous_tip) = {
         let chain = node.chain.read();
         (chain.store.contains(&hash), chain.best_hash())
@@ -4917,6 +4937,36 @@ async fn handle_received_block(
             false
         }
     }
+}
+
+fn unrequested_block_is_allowed(block: &Block, chain: &crate::chain::ChainState) -> bool {
+    let Some(parent_height) = chain.block_height_by_hash(&block.header.prev_blockhash) else {
+        return false;
+    };
+    let Some(parent_work) = chain.chain_work_by_hash(&block.header.prev_blockhash) else {
+        return false;
+    };
+    let height = parent_height.saturating_add(1);
+    let work = parent_work + block.header.work();
+    unrequested_block_work_is_allowed(
+        height,
+        work,
+        chain.height(),
+        chain.tip().work,
+        chain.minimum_chain_work(),
+    )
+}
+
+fn unrequested_block_work_is_allowed(
+    height: u32,
+    work: Work,
+    active_height: u32,
+    active_work: Work,
+    minimum_chain_work: Work,
+) -> bool {
+    work >= active_work
+        && height <= active_height.saturating_add(MIN_BLOCKS_TO_KEEP)
+        && work >= minimum_chain_work
 }
 
 async fn request_full_block(
@@ -7749,6 +7799,34 @@ mod tests {
         assert!(!send_headers_work_gate(Some(zero), zero));
         assert!(send_headers_work_gate(Some(one), zero));
         assert!(!send_headers_work_gate(Some(one), one));
+    }
+
+    #[test]
+    fn unrequested_block_work_gate_matches_core_antidos_policy() {
+        let zero = Work::from_be_bytes([0; 32]);
+        let mut one_bytes = [0; 32];
+        one_bytes[31] = 1;
+        let one = Work::from_be_bytes(one_bytes);
+        let mut two_bytes = [0; 32];
+        two_bytes[31] = 2;
+        let two = Work::from_be_bytes(two_bytes);
+        assert!(unrequested_block_work_is_allowed(10, one, 10, one, zero));
+        assert!(unrequested_block_work_is_allowed(
+            10 + MIN_BLOCKS_TO_KEEP,
+            one,
+            10,
+            one,
+            zero,
+        ));
+        assert!(!unrequested_block_work_is_allowed(
+            10 + MIN_BLOCKS_TO_KEEP + 1,
+            one,
+            10,
+            one,
+            zero,
+        ));
+        assert!(!unrequested_block_work_is_allowed(10, zero, 10, one, zero));
+        assert!(!unrequested_block_work_is_allowed(10, one, 10, zero, two));
     }
 
     #[test]

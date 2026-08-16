@@ -1458,31 +1458,62 @@ impl ChainState {
         hash: &BlockHash,
         include_muhash: bool,
     ) -> Result<Option<(u32, UtxoSetStats)>> {
-        let Some(record) = self.coinstats_store.get(hash)? else {
+        if let Some(record) = self.coinstats_store.get(hash)?
+            && self.block_height_by_hash(hash) == Some(record.height)
+        {
+            return Ok(Some((
+                record.height,
+                UtxoSetStats {
+                    transactions: record.transactions as usize,
+                    outputs: record.outputs as usize,
+                    total_amount_sat: record.total_amount_sat,
+                    bogo_size: record.bogo_size,
+                    serialized_hash: None,
+                    muhash: include_muhash.then_some(record.muhash),
+                    total_prevout_spent_sat: record.total_prevout_spent_sat,
+                    total_new_outputs_ex_coinbase_sat: record.total_new_outputs_ex_coinbase_sat,
+                    total_coinbase_sat: record.total_coinbase_sat,
+                    total_unspendable_genesis_sat: record.total_unspendable_genesis_sat,
+                    total_unspendable_bip30_sat: record.total_unspendable_bip30_sat,
+                    total_unspendable_scripts_sat: record.total_unspendable_scripts_sat,
+                    total_unspendable_unclaimed_rewards_sat: record
+                        .total_unspendable_unclaimed_rewards_sat,
+                },
+            )));
+        }
+
+        let Some(height) = self.block_height_by_hash(hash) else {
             return Ok(None);
         };
-        if self.block_height_by_hash(hash) != Some(record.height) {
-            return Ok(None);
+        let mut path = Vec::with_capacity(height as usize + 1);
+        let mut cursor = *hash;
+        loop {
+            path.push(cursor);
+            if cursor == self.network_genesis_hash() {
+                break;
+            }
+            let Some(header) = self.header_by_hash(&cursor) else {
+                return Ok(None);
+            };
+            cursor = header.prev_blockhash;
         }
-        Ok(Some((
-            record.height,
-            UtxoSetStats {
-                transactions: record.transactions as usize,
-                outputs: record.outputs as usize,
-                total_amount_sat: record.total_amount_sat,
-                bogo_size: record.bogo_size,
-                serialized_hash: None,
-                muhash: include_muhash.then_some(record.muhash),
-                total_prevout_spent_sat: record.total_prevout_spent_sat,
-                total_new_outputs_ex_coinbase_sat: record.total_new_outputs_ex_coinbase_sat,
-                total_coinbase_sat: record.total_coinbase_sat,
-                total_unspendable_genesis_sat: record.total_unspendable_genesis_sat,
-                total_unspendable_bip30_sat: record.total_unspendable_bip30_sat,
-                total_unspendable_scripts_sat: record.total_unspendable_scripts_sat,
-                total_unspendable_unclaimed_rewards_sat: record
-                    .total_unspendable_unclaimed_rewards_sat,
-            },
-        )))
+        path.reverse();
+
+        let mut stats = CoinStatsState::default();
+        let mut utxos = HashMap::new();
+        for (height, block_hash) in path.into_iter().enumerate() {
+            let Some(block) = self.store.get(&block_hash)? else {
+                return Ok(None);
+            };
+            apply_block_to_coin_stats(
+                self.network,
+                &mut utxos,
+                &mut stats,
+                &block,
+                u32::try_from(height).context("coinstats height does not fit u32")?,
+            );
+        }
+        Ok(Some((height, stats.statistics(include_muhash))))
     }
 
     /// Apply the startup pruning mode from the node configuration.
@@ -7979,6 +8010,37 @@ mod tests {
                 .muhash,
             live.muhash
         );
+    }
+
+    #[test]
+    fn coinstats_index_replays_side_chain_block_by_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let main_one = mine_block(&state, 1);
+        state.connect_block(main_one).unwrap();
+        let main_two = mine_block(&state, 2);
+        let main_two_hash = main_two.block_hash();
+        state.connect_block(main_two).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 1);
+        let side_one_hash = side_one.block_hash();
+        state.connect_block(side_one).unwrap();
+        let side_one_header = state.block_index[&side_one_hash].header;
+        let side_two = mine_block_from_header(&side_one_header, 2, 2);
+        let side_two_hash = side_two.block_hash();
+        state.connect_block(side_two).unwrap();
+
+        assert_eq!(state.best_hash(), main_two_hash);
+        state.configure_coinstats_index(true).unwrap();
+        let (height, stats) = state
+            .coinstats_at(&side_two_hash, true)
+            .unwrap()
+            .expect("side-chain coinstats");
+        assert_eq!(height, 2);
+        assert_eq!(stats.outputs, 2);
+        assert_eq!(stats.total_amount_sat, 10_000_000_000);
+        assert!(stats.muhash.is_some());
     }
 
     #[test]

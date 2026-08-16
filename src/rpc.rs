@@ -2747,7 +2747,7 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .ok_or_else(|| anyhow!("hash_type must be a string"))?,
     };
     if !matches!(hash_type, "hash_serialized_3" | "muhash" | "none") {
-        bail!("unknown hash_type: {hash_type}")
+        bail!("'{hash_type}' is not a valid hash_type")
     }
     let use_index = params
         .get(2)
@@ -2795,9 +2795,6 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         } else {
             bail!("hash_or_height must be a block hash or height")
         };
-        if !chain.is_active_block(&target_hash) {
-            bail!("hash_or_height is not on the active chain")
-        }
         let (height, stats) = chain
             .coinstats_at(&target_hash, include_muhash)?
             .ok_or_else(|| anyhow!("block is not available"))?;
@@ -2843,8 +2840,9 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             crate::chain::UtxoSetStats::default()
         } else {
             let previous_hash = chain
-                .block_hash(height.saturating_sub(1))
-                .context("previous block is unavailable")?;
+                .header_by_hash(&bestblock)
+                .context("target block is unavailable")?
+                .prev_blockhash;
             chain
                 .coinstats_at(&previous_hash, false)?
                 .map(|(_, stats)| stats)

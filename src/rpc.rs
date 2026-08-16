@@ -13456,6 +13456,12 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "input not found or already spent" {
         return -25;
     }
+    if lower == "invalid ip/subnet" || lower == "unban failed: address is not banned" {
+        return -30;
+    }
+    if lower == "ip/subnet already banned" {
+        return -23;
+    }
     if lower == "previous output scriptpubkey mismatch" {
         return -22;
     }
@@ -20574,7 +20580,10 @@ mod tests {
         set_ban(&node, &json!(["192.0.2.0/24", "add", 60])).unwrap();
         assert!(node.is_banned("192.0.2.99".parse().unwrap()));
         set_ban(&node, &json!(["192.0.2.2", "add", 60])).unwrap();
-        assert!(set_ban(&node, &json!(["192.0.2.2", "add", 60])).is_err());
+        let duplicate_ban = set_ban(&node, &json!(["192.0.2.2", "add", 60])).unwrap_err();
+        assert_eq!(rpc_error(&duplicate_ban)["code"], json!(-23));
+        let invalid_subnet = set_ban(&node, &json!(["192.0.2.0/33", "add", 60])).unwrap_err();
+        assert_eq!(rpc_error(&invalid_subnet)["code"], json!(-30));
         let subnet_entry = list_banned(&node)
             .unwrap()
             .as_array()
@@ -20601,6 +20610,8 @@ mod tests {
         );
         set_ban(&node, &json!([tor_address, "remove"])).unwrap();
         assert!(!node.is_banned_for_endpoint(&tor_endpoint));
+        let missing_ban = set_ban(&node, &json!([tor_address, "remove"])).unwrap_err();
+        assert_eq!(rpc_error(&missing_ban)["code"], json!(-30));
         let normalized = normalize_rpc_params(
             "setban",
             &json!({"subnet": "192.0.2.4", "command": "add", "bantime": 60}),

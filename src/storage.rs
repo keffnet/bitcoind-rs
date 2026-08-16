@@ -3054,11 +3054,7 @@ impl ElectrumBlockStore {
                 )
             })?;
         let data_len = file.metadata()?.len();
-        let index = match load_index_with_limit(
-            &mut index_file,
-            data_len,
-            MAX_STORED_ELECTRUM_BLOCK_SIZE + 32,
-        )? {
+        let index = match load_electrum_index(&mut index_file, &file, data_len)? {
             Some(index) => index,
             None => {
                 let index = scan_electrum_index(&mut file)?;
@@ -3174,6 +3170,52 @@ impl ElectrumBlockStore {
             deserialize(&bytes[32..]).context("decoding stored Electrum transactions")?;
         Ok(Some(transactions))
     }
+}
+
+fn load_electrum_index(
+    index_file: &mut File,
+    data_file: &File,
+    data_len: u64,
+) -> Result<Option<HashMap<BlockHash, Record>>> {
+    let Some(index) =
+        load_index_with_limit(index_file, data_len, MAX_STORED_ELECTRUM_BLOCK_SIZE + 32)?
+    else {
+        return Ok(None);
+    };
+    for (hash, record) in &index {
+        if validate_electrum_data_header(data_file, *record, *hash).is_err() {
+            return Ok(None);
+        }
+    }
+    Ok(Some(index))
+}
+
+fn validate_electrum_data_header(
+    file: &File,
+    record: Record,
+    expected_hash: BlockHash,
+) -> Result<()> {
+    if record.length < 32 || record.length as usize > MAX_STORED_ELECTRUM_BLOCK_SIZE + 32 {
+        bail!("stored Electrum transaction record is too large or truncated");
+    }
+    let mut length = [0u8; 4];
+    read_exact_at(file, &mut length, record.offset)?;
+    if u32::from_le_bytes(length) != record.length {
+        bail!("Electrum transaction index disagrees with record length");
+    }
+    let mut hash = [0u8; 32];
+    read_exact_at(
+        file,
+        &mut hash,
+        record
+            .offset
+            .checked_add(4)
+            .context("Electrum transaction value offset overflowed")?,
+    )?;
+    if BlockHash::from_byte_array(hash) != expected_hash {
+        bail!("Electrum transaction value key does not match its index");
+    }
+    Ok(())
 }
 
 fn merkle_branch_for_transactions(
@@ -4031,6 +4073,45 @@ mod tests {
             txid
         );
         assert_eq!(reopened.merkle_branch(&hash, 0).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn recovers_a_stale_electrum_transaction_pointer() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = genesis_block(Network::Regtest);
+        let first_hash = first.block_hash();
+        let mut second = first.clone();
+        second.header.nonce = 1;
+        let second_hash = second.block_hash();
+        {
+            let mut store = ElectrumBlockStore::open(directory.path()).unwrap();
+            store.insert(&first).unwrap();
+            store.insert(&second).unwrap();
+        }
+
+        let index_path = directory.path().join("txblocks.index");
+        let mut index = std::fs::read(&index_path).unwrap();
+        let second_offset = (INDEX_HEADER_SIZE + INDEX_RECORD_SIZE + 32) as usize;
+        index[second_offset..second_offset + 8].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(index_path, index).unwrap();
+
+        let mut reopened = ElectrumBlockStore::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .transaction(&first_hash, 0)
+                .unwrap()
+                .unwrap()
+                .compute_txid(),
+            first.txdata[0].compute_txid()
+        );
+        assert_eq!(
+            reopened
+                .transaction(&second_hash, 0)
+                .unwrap()
+                .unwrap()
+                .compute_txid(),
+            second.txdata[0].compute_txid()
+        );
     }
 
     #[test]

@@ -2987,6 +2987,7 @@ async fn serve_peer_loop(
     let mut verack_received = false;
     let mut verack_sent = false;
     let mut extensions_sent = false;
+    let mut post_verack_extensions_sent = false;
     let mut addrv2_received = false;
     let mut getaddr_received = false;
     let mut peer_version = 0i32;
@@ -3303,6 +3304,18 @@ async fn serve_peer_loop(
                     send_message(node, peer_id, writer, node.config.network, &Message::Verack)
                         .await?;
                     verack_sent = true;
+                    if verack_received {
+                        send_post_verack_extensions(
+                            node,
+                            peer_id,
+                            writer,
+                            peer_state,
+                            node.config.network,
+                            &mut post_verack_extensions_sent,
+                            peer_version,
+                        )
+                        .await?;
+                    }
                 }
                 if outbound {
                     debug!(user_agent = %version.user_agent, height = version.start_height, "completed outbound version exchange");
@@ -3320,6 +3333,16 @@ async fn serve_peer_loop(
                     peer_state,
                     node.config.network,
                     &mut extensions_sent,
+                    peer_version,
+                )
+                .await?;
+                send_post_verack_extensions(
+                    node,
+                    peer_id,
+                    writer,
+                    peer_state,
+                    node.config.network,
+                    &mut post_verack_extensions_sent,
                     peer_version,
                 )
                 .await?;
@@ -5172,7 +5195,6 @@ async fn send_peer_extensions(
         *sent = true;
         return Ok(());
     }
-    maybe_send_send_headers(node, peer_id, writer, peer_state, network, peer_version).await?;
     if peer_version >= WTXID_RELAY_VERSION {
         // Core negotiates BIP339 independently of whether this connection
         // accepts unsolicited transactions. Block-relay-only and blocksonly
@@ -5201,6 +5223,27 @@ async fn send_peer_extensions(
             *peer_state.tx_reconciliation_salt.lock() = Some(salt);
         }
     }
+    *sent = true;
+    Ok(())
+}
+
+async fn send_post_verack_extensions(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    peer_state: &PeerState,
+    network: Network,
+    sent: &mut bool,
+    peer_version: i32,
+) -> Result<()> {
+    if *sent {
+        return Ok(());
+    }
+    if *peer_state.private_broadcast_peer.lock() {
+        *sent = true;
+        return Ok(());
+    }
+    maybe_send_send_headers(node, peer_id, writer, peer_state, network, peer_version).await?;
     if peer_version >= SHORT_IDS_BLOCKS_VERSION {
         send_message(
             node,
@@ -9562,6 +9605,7 @@ mod tests {
             tx_reconciliation_registered: parking_lot::Mutex::new(false),
         };
         let mut sent = false;
+        let mut post_verack_extensions_sent = false;
         send_peer_extensions(
             &node,
             1,
@@ -9598,6 +9642,26 @@ mod tests {
             *peer_state.tx_reconciliation_salt.lock(),
             Some(reconciliation.salt)
         );
+        send_message(&node, 1, &writer, Network::Regtest, &Message::Verack)
+            .await
+            .unwrap();
+        assert_eq!(
+            wire::read_message(&mut server_reader, Network::Regtest)
+                .await
+                .unwrap(),
+            Message::Verack
+        );
+        send_post_verack_extensions(
+            &node,
+            1,
+            &writer,
+            &peer_state,
+            Network::Regtest,
+            &mut post_verack_extensions_sent,
+            WTXID_RELAY_VERSION,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             wire::read_message(&mut server_reader, Network::Regtest)
                 .await
@@ -9613,15 +9677,7 @@ mod tests {
                 .unwrap(),
             Message::FeeFilter(i64::try_from(Amount::MAX_MONEY.to_sat()).unwrap())
         );
-        send_message(&node, 1, &writer, Network::Regtest, &Message::Verack)
-            .await
-            .unwrap();
-        assert_eq!(
-            wire::read_message(&mut server_reader, Network::Regtest)
-                .await
-                .unwrap(),
-            Message::Verack
-        );
         assert!(sent);
+        assert!(post_verack_extensions_sent);
     }
 }

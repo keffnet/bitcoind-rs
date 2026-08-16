@@ -3174,7 +3174,7 @@ async fn serve_peer_loop(
         match message {
             Message::Version(version) => {
                 if version_received {
-                    anyhow::bail!("duplicate version message");
+                    continue;
                 }
                 version_received = true;
                 if version.version < MIN_PEER_PROTO_VERSION {
@@ -6161,6 +6161,92 @@ mod tests {
         .await
         .unwrap();
 
+        let result = tokio::time::timeout(Duration::from_secs(5), server_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn redundant_version_message_is_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(private_broadcast_test_config(
+            directory.path(),
+            false,
+            Vec::new(),
+        ))
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address);
+        let server = listener.accept();
+        let (client, server) = tokio::join!(client, server);
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+        let client_address = client.local_addr().unwrap();
+        let server_task = tokio::spawn(serve_peer(
+            node.clone(),
+            server,
+            NetworkEndpoint::Ip(client_address),
+            PeerConnectionOptions {
+                outbound: false,
+                transport_v2: Some(false),
+                connection_type: "inbound",
+                permissions: None,
+                private_broadcast_transaction: None,
+            },
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            1,
+        ));
+
+        let (mut reader, mut writer) = client.into_split();
+        let version = VersionMessage::with_bloom(0, random(), false);
+        wire::write_message_with_size(
+            &mut writer,
+            Network::Regtest,
+            &Message::Version(version.clone()),
+        )
+        .await
+        .unwrap();
+        loop {
+            let message = tokio::time::timeout(
+                Duration::from_secs(5),
+                wire::read_message(&mut reader, Network::Regtest),
+            )
+            .await
+            .expect("server did not complete version handshake")
+            .unwrap();
+            if matches!(message, Message::Verack) {
+                break;
+            }
+        }
+        wire::write_message_with_size(&mut writer, Network::Regtest, &Message::Verack)
+            .await
+            .unwrap();
+        wire::write_message_with_size(&mut writer, Network::Regtest, &Message::Version(version))
+            .await
+            .unwrap();
+        wire::write_message_with_size(&mut writer, Network::Regtest, &Message::Ping(42))
+            .await
+            .unwrap();
+
+        let mut pong_received = false;
+        for _ in 0..4 {
+            let message = tokio::time::timeout(
+                Duration::from_secs(5),
+                wire::read_message(&mut reader, Network::Regtest),
+            )
+            .await
+            .expect("server did not answer after redundant version")
+            .unwrap();
+            if message == Message::Pong(42) {
+                pong_received = true;
+                break;
+            }
+        }
+        assert!(pong_received);
+        node.disconnect_all_peers();
         let result = tokio::time::timeout(Duration::from_secs(5), server_task)
             .await
             .unwrap()

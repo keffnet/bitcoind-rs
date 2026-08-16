@@ -11224,6 +11224,16 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
         .get(0)
         .filter(|value| !value.is_null())
         .and_then(Value::as_object);
+    if let Some(mode) = request
+        .and_then(|request| request.get("mode"))
+        .filter(|value| !value.is_null())
+    {
+        match mode.as_str() {
+            Some("template" | "proposal") => {}
+            Some(_) => bail!("invalid getblocktemplate mode"),
+            None => bail!("getblocktemplate mode must be a string"),
+        }
+    }
     let longpoll_value = request
         .filter(|request| request.get("mode").and_then(Value::as_str) != Some("proposal"))
         .and_then(|request| request.get("longpollid"))
@@ -19053,6 +19063,17 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(template["height"], 1);
+
+        let invalid_mode = tokio::time::timeout(
+            Duration::from_millis(50),
+            get_block_template_async(
+                &node,
+                &json!([{"mode": "invalid", "longpollid": 1, "rules": ["segwit"]}]),
+            ),
+        )
+        .await
+        .expect("invalid mode is rejected before long-polling");
+        assert!(invalid_mode.is_err());
 
         let node_for_poll = Arc::clone(&node);
         let poll_params = json!([{"longpollid": 1, "rules": ["segwit"]}]);

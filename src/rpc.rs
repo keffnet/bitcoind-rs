@@ -12639,7 +12639,16 @@ fn block_matches_scripts(
     let block = chain
         .block(hash)?
         .ok_or_else(|| missing_block_data_error(chain, hash))?;
-    for transaction in &block.txdata {
+    // Core's exact scan path checks the block's undo data for spent inputs.
+    // Looking up each previous transaction is both slower and incorrect for
+    // pruned history, where the undo record is the authoritative input data.
+    let undo = chain
+        .spent_outputs_by_transaction(hash)?
+        .ok_or_else(|| anyhow!("block undo data is missing"))?;
+    if undo.len() != block.txdata.len() {
+        bail!("block undo transaction count does not match block");
+    }
+    for (transaction, spent_outputs) in block.txdata.iter().zip(undo.iter()) {
         if transaction
             .output
             .iter()
@@ -12647,19 +12656,11 @@ fn block_matches_scripts(
         {
             return Ok(true);
         }
-        for input in &transaction.input {
-            if input.previous_output.is_null() {
-                continue;
-            }
-            let Some((previous, _)) = chain.transaction(&input.previous_output.txid)? else {
-                continue;
-            };
-            let Some(output) = previous.output.get(input.previous_output.vout as usize) else {
-                continue;
-            };
-            if scripts.iter().any(|script| script == &output.script_pubkey) {
-                return Ok(true);
-            }
+        if spent_outputs
+            .iter()
+            .any(|output| scripts.iter().any(|script| script == &output.script_pubkey))
+        {
+            return Ok(true);
         }
     }
     Ok(false)

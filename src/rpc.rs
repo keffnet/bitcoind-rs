@@ -656,6 +656,11 @@ fn dispatch_rest_with_body(
         "mempool/contents" if format == "json" => {
             let verbose = rest_query_bool(query, "verbose", true)?;
             let sequence = rest_query_bool(query, "mempool_sequence", false)?;
+            if verbose && sequence {
+                bail!(
+                    "Verbose results cannot contain mempool sequence values. (hint: set \"verbose=false\")"
+                );
+            }
             rest_json(dispatch_method(
                 node,
                 "getrawmempool",
@@ -17543,12 +17548,14 @@ mod tests {
         let result = serde_json::from_slice::<Value>(&body).unwrap();
         assert_eq!(result["txids"], json!([]));
         assert_eq!(result["mempool_sequence"], json!(1));
-        assert!(
-            dispatch_rest(
-                &node,
-                "/rest/mempool/contents.json?verbose=true&mempool_sequence=true"
-            )
-            .is_err()
+        let error = dispatch_rest(
+            &node,
+            "/rest/mempool/contents.json?verbose=true&mempool_sequence=true",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Verbose results cannot contain mempool sequence values. (hint: set \"verbose=false\")"
         );
     }
 

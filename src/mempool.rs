@@ -2482,6 +2482,17 @@ impl Mempool {
         self.remove_with_notification(txid, true)
     }
 
+    /// Remove a transaction and every in-mempool descendant, matching Core's
+    /// recursive removal used when a reorg disconnect pool evicts an entry.
+    pub(crate) fn remove_recursive(&mut self, txid: &Txid) {
+        let mut descendants = self.descendants(txid);
+        descendants.reverse();
+        for descendant in descendants {
+            self.remove(&descendant);
+        }
+        self.remove(txid);
+    }
+
     fn remove_with_notification(&mut self, txid: &Txid, notify_zmq: bool) -> Option<MempoolEntry> {
         let entry = self.entries.remove(txid)?;
         self.adjusted_weights.remove(txid);

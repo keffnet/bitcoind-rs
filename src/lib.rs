@@ -54,6 +54,7 @@ pub(crate) mod mining_capnp {
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::process::Command;
@@ -97,6 +98,8 @@ const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 const FEE_ESTIMATOR_FLUSH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const MAX_EXTERNAL_BLOCK_RECORD_SIZE: usize = 4 * 1024 * 1024;
+// Core's DisconnectedBlockTransactions cap used while processing a reorg.
+const MAX_DISCONNECTED_TX_POOL_BYTES: usize = 20_000_000;
 const MAX_UPLOAD_TIMEFRAME_SECS: u64 = 24 * 60 * 60;
 const MAX_UPLOAD_BLOCK_RESERVE_BYTES: u64 = 4_000_000;
 const HISTORICAL_BLOCK_AGE_SECS: u64 = 7 * 24 * 60 * 60;
@@ -258,6 +261,105 @@ fn run_alert_notify_command(command: Option<&str>, message: &str) {
 struct CompactExtraTransactions {
     limit: usize,
     transactions: VecDeque<Transaction>,
+}
+
+/// Transactions disconnected during a normal reorg are queued in Core's
+/// order and bounded independently of the mempool size.  The front is the
+/// newest transaction; draining from the back restores the oldest first so
+/// parent transactions are available before descendants.
+#[derive(Default)]
+struct DisconnectedTransactionPool {
+    transactions: VecDeque<Transaction>,
+    txids: HashSet<Txid>,
+    memory_usage: usize,
+}
+
+impl DisconnectedTransactionPool {
+    fn add_block(&mut self, block: &Block) -> Vec<Transaction> {
+        self.add_transactions(&block.txdata)
+    }
+
+    fn add_transactions(&mut self, transactions: &[Transaction]) -> Vec<Transaction> {
+        let mut evicted = Vec::new();
+        for transaction in transactions.iter().rev() {
+            let txid = transaction.compute_txid();
+            if !self.txids.insert(txid) {
+                continue;
+            }
+            self.memory_usage = self
+                .memory_usage
+                .saturating_add(disconnected_transaction_memory_usage(transaction));
+            self.transactions.push_back(transaction.clone());
+        }
+        while self.memory_usage > MAX_DISCONNECTED_TX_POOL_BYTES {
+            let Some(transaction) = self.transactions.pop_front() else {
+                break;
+            };
+            self.txids.remove(&transaction.compute_txid());
+            self.memory_usage = self
+                .memory_usage
+                .saturating_sub(disconnected_transaction_memory_usage(&transaction));
+            evicted.push(transaction);
+        }
+        evicted
+    }
+
+    fn remove_for_block(&mut self, block: &Block) {
+        for transaction in &block.txdata {
+            let txid = transaction.compute_txid();
+            if !self.txids.remove(&txid) {
+                continue;
+            }
+            if let Some(position) = self
+                .transactions
+                .iter()
+                .position(|queued| queued.compute_txid() == txid)
+            {
+                if let Some(removed) = self.transactions.remove(position) {
+                    self.memory_usage = self
+                        .memory_usage
+                        .saturating_sub(disconnected_transaction_memory_usage(&removed));
+                }
+            }
+        }
+    }
+
+    fn take_oldest_first(self) -> impl Iterator<Item = Transaction> {
+        self.transactions.into_iter().rev()
+    }
+}
+
+fn disconnected_transaction_memory_usage(transaction: &Transaction) -> usize {
+    // Core's RecursiveDynamicUsage counts transaction-owned allocations plus
+    // its list/hash-map nodes. Rust's transaction fields use different
+    // containers, so use a deterministic conservative estimate covering the
+    // same categories and the serialized script/witness payloads.
+    let mut usage = size_of::<Transaction>()
+        .saturating_add(
+            transaction
+                .input
+                .len()
+                .saturating_mul(size_of::<bitcoin::TxIn>()),
+        )
+        .saturating_add(
+            transaction
+                .output
+                .len()
+                .saturating_mul(size_of::<bitcoin::TxOut>()),
+        )
+        .saturating_add(size_of::<Txid>() + size_of::<usize>() * 4);
+    for input in &transaction.input {
+        usage = usage.saturating_add(input.script_sig.as_bytes().len());
+        let witness = input.witness.to_vec();
+        usage = usage.saturating_add(witness.capacity().saturating_mul(size_of::<Vec<u8>>()));
+        for item in witness {
+            usage = usage.saturating_add(item.capacity());
+        }
+    }
+    for output in &transaction.output {
+        usage = usage.saturating_add(output.script_pubkey.as_bytes().len());
+    }
+    usage
 }
 
 impl CompactExtraTransactions {
@@ -1617,8 +1719,23 @@ impl Node {
         let mut mempool = self.mempool.write();
         let mut fee_block_changes = Vec::with_capacity(activated_blocks.len());
         let mut mempool_changes = Vec::new();
+        let mut disconnected_pool =
+            (!manual_invalidation).then(DisconnectedTransactionPool::default);
+        if let Some(pool) = disconnected_pool.as_mut() {
+            // Core receives disconnected blocks from newest to oldest and
+            // queues each block's transactions in reverse order. Evicted
+            // entries are removed immediately, including their descendants.
+            for block in disconnected_blocks.iter().rev() {
+                for evicted in pool.add_block(block) {
+                    mempool.remove_recursive(&evicted.compute_txid());
+                }
+            }
+        }
         for block in activated_blocks {
             mempool.remove_confirmed(block);
+            if let Some(pool) = disconnected_pool.as_mut() {
+                pool.remove_for_block(block);
+            }
             let block_changes = mempool.take_changes();
             let confirmed = block_changes
                 .iter()
@@ -1637,25 +1754,42 @@ impl Node {
         }
         let added_at = time::unix_time();
         let mut fee_estimator_exclusions = HashSet::new();
-        // Core's invalidateblock disconnects one block at a time.  It
+        // Core's invalidateblock disconnects one block at a time. It
         // attempts to resurrect transactions from the ten most recently
         // disconnected blocks, newest first; deeper invalidations skip
-        // resurrection entirely.  Ordinary reorgs use one aggregate
-        // disconnect pool and restore the oldest block first so parents are
-        // available before their descendants.
-        let blocks_to_restore = if manual_invalidation {
-            disconnected_blocks
-                .iter()
-                .rev()
-                .take(10)
-                .collect::<Vec<_>>()
-        } else {
-            disconnected_blocks.iter().collect::<Vec<_>>()
-        };
-        for block in blocks_to_restore {
-            for transaction in block.txdata.iter().skip(1) {
-                if let Ok(txid) = mempool.accept_reorg(transaction.clone(), &chain, added_at) {
+        // resurrection entirely. Ordinary reorgs drain one aggregate
+        // disconnect pool oldest first so parents are available before their
+        // descendants.
+        if let Some(pool) = disconnected_pool {
+            for transaction in pool.take_oldest_first() {
+                if transaction.is_coinbase() {
+                    continue;
+                }
+                if let Ok(txid) = mempool.accept_reorg(transaction, &chain, added_at) {
                     fee_estimator_exclusions.insert(txid);
+                }
+            }
+        } else {
+            for (index, block) in disconnected_blocks.iter().rev().enumerate() {
+                let mut pool = DisconnectedTransactionPool::default();
+                for evicted in pool.add_block(block) {
+                    mempool.remove_recursive(&evicted.compute_txid());
+                }
+                for activated in activated_blocks {
+                    pool.remove_for_block(activated);
+                }
+                let restore = index < 10;
+                for transaction in pool.take_oldest_first() {
+                    if transaction.is_coinbase() {
+                        continue;
+                    }
+                    if !restore {
+                        mempool.remove_recursive(&transaction.compute_txid());
+                        continue;
+                    }
+                    if let Ok(txid) = mempool.accept_reorg(transaction, &chain, added_at) {
+                        fee_estimator_exclusions.insert(txid);
+                    }
                 }
             }
         }
@@ -4848,6 +4982,37 @@ mod tests {
         cache.insert(second.clone());
         cache.insert(third.clone());
         assert_eq!(cache.snapshot(), vec![second, third]);
+    }
+
+    #[test]
+    fn disconnected_transaction_pool_evicts_newest_entries_at_core_limit() {
+        let transactions = (0u8..25)
+            .map(|tag| Transaction {
+                version: Version::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![TxIn {
+                    previous_output: OutPoint::new(Txid::from_byte_array([tag; 32]), 0),
+                    script_sig: ScriptBuf::from_bytes(vec![tag; 1_000_000]),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: Witness::default(),
+                }],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            })
+            .collect::<Vec<_>>();
+        let mut pool = DisconnectedTransactionPool::default();
+        let evicted = pool.add_transactions(&transactions);
+        let restored = pool
+            .take_oldest_first()
+            .map(|transaction| transaction.compute_txid())
+            .collect::<Vec<_>>();
+
+        assert!(!evicted.is_empty());
+        assert!(restored.len() < transactions.len());
+        assert_eq!(restored.first(), Some(&transactions[0].compute_txid()));
+        assert!(!restored.contains(&transactions[24].compute_txid()));
     }
 
     fn test_config(datadir: &Path) -> Config {

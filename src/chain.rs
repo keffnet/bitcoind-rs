@@ -4105,6 +4105,12 @@ impl ChainState {
         if self.active_chain.contains(&hash) {
             return Ok(self.tip());
         }
+        // Core's AcceptBlock returns immediately for a block body that is
+        // already present, including a side-chain body. Avoid repeating
+        // validation and appending a duplicate record to the block store.
+        if self.store.contains(&hash) {
+            return Ok(self.tip());
+        }
         let parent_hash = block.header.prev_blockhash;
         let Some(parent) = self.block_index.get(&parent_hash).copied() else {
             self.queue_orphan_block(parent_hash, block)?;
@@ -9339,6 +9345,25 @@ mod tests {
         assert!(state.accept_headers(&[parent.header]).is_err());
         assert!(state.accept_headers(&[child.header]).is_err());
         assert!(state.block_height_by_hash(&child.block_hash()).is_none());
+    }
+
+    #[test]
+    fn duplicate_side_block_bodies_are_not_reprocessed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        state.connect_block(mine_block(&state, 2)).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side = mine_block_from_header(&genesis, 1, 77);
+        state.connect_block(side.clone()).unwrap();
+        let stored_bytes = state.store.data_size().unwrap();
+        let tip = state.best_hash();
+
+        state.connect_block(side).unwrap();
+
+        assert_eq!(state.best_hash(), tip);
+        assert_eq!(state.store.data_size().unwrap(), stored_bytes);
     }
 
     #[test]

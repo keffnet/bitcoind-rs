@@ -13679,6 +13679,11 @@ fn rpc_error_code(message: &str) -> i32 {
     {
         return -8;
     }
+    if lower.starts_with("missing parameter ")
+        || lower.starts_with("too many positional arguments ")
+    {
+        return -1;
+    }
     if lower == "unknown filtertype"
         || lower == "block not found"
         || lower == "block hash not found"
@@ -13703,8 +13708,6 @@ fn rpc_error_code(message: &str) -> i32 {
     }
     if lower == "mallocinfo mode not available"
         || lower.starts_with("unknown mode ")
-        || lower.starts_with("missing parameter ")
-        || lower.starts_with("too many positional arguments ")
         || lower.starts_with("unknown named parameter ")
         || lower.starts_with("range ")
         || lower.starts_with("end of range ")
@@ -13749,7 +13752,8 @@ fn rpc_error_code(message: &str) -> i32 {
     {
         return -25;
     }
-    if lower.contains(" must be a ")
+    if lower.starts_with("invalid type:")
+        || lower.contains(" must be a ")
         || lower.contains(" must be an ")
         || lower.starts_with("params must be ")
         || lower.contains(" expects an array")
@@ -14131,6 +14135,15 @@ mod tests {
         assert_eq!(
             rpc_error_code("failed to parse hex: invilad hex string length 2 (expected 64)"),
             -8
+        );
+        assert_eq!(rpc_error_code("missing parameter 0"), -1);
+        assert_eq!(
+            rpc_error_code("too many positional arguments for getblock"),
+            -1
+        );
+        assert_eq!(
+            rpc_error_code("invalid type: integer `1`, expected a string"),
+            -3
         );
         assert_eq!(rpc_error_code("TX decode failed"), -22);
         assert_eq!(rpc_error_code("TX decode failed: invalid hex"), -22);

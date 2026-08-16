@@ -76,7 +76,10 @@ macro_rules! rpc_address_log {
     };
 }
 
-const MAX_HTTP_REQUEST: usize = 8 * 1024 * 1024;
+// Match Core's `MAX_SIZE` HTTP body limit (0x02000000 bytes). In
+// particular, Core's functional suite exercises `echo` with two 8 MiB
+// arguments, whose JSON envelope is larger than the old 8 MiB cap.
+const MAX_HTTP_REQUEST: usize = 32 * 1024 * 1024;
 const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 const MAX_SCRIPT_SIZE: usize = 10_000;
 const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
@@ -1903,7 +1906,18 @@ fn dispatch_method_for_user(
         "testmempoolaccept" => test_mempool_accept(node, params),
         "setmocktime" => set_mock_time(node, params),
         "mockscheduler" => mock_scheduler(node, params),
-        "echo" | "echojson" => Ok(params.clone()),
+        "echo" | "echojson" => {
+            // Core keeps this deliberate CHECK_NONFATAL hook in the test-only
+            // echo RPC. Returning the same diagnostic as a JSON-RPC error
+            // preserves the functional-test contract without aborting the
+            // wallet-free daemon process.
+            if params.get(9).and_then(Value::as_str) == Some("trigger_internal_bug") {
+                bail!(
+                    "Internal bug detected: request.params[9].get_str() != \"trigger_internal_bug\""
+                )
+            }
+            Ok(params.clone())
+        }
         "echoipc" => Ok(json!(param::<String>(params, 0)?)),
         "verifychain" => {
             let checklevel = params
@@ -2324,7 +2338,7 @@ fn dispatch_method_for_user(
                 })
                 .collect::<Vec<_>>()
         )),
-        "logging" => configure_logging(params),
+        "logging" => configure_logging(node, params),
         "syncwithvalidationinterfacequeue" => Ok(Value::Null),
         "validateaddress" => validate_address(node, params),
         "deriveaddresses" => derive_addresses(node, params),
@@ -2632,13 +2646,8 @@ const LOG_CATEGORIES: &[&str] = &[
     "zmq",
 ];
 
-fn logging_state() -> &'static parking_lot::RwLock<HashSet<String>> {
-    static STATE: OnceLock<parking_lot::RwLock<HashSet<String>>> = OnceLock::new();
-    STATE.get_or_init(|| parking_lot::RwLock::new(HashSet::new()))
-}
-
-fn configure_logging(params: &Value) -> Result<Value> {
-    let mut enabled = logging_state().write();
+fn configure_logging(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let mut enabled = node.rpc_logging.write();
     for (index, should_enable) in [(0usize, true), (1usize, false)] {
         let Some(value) = params.get(index).filter(|value| !value.is_null()) else {
             continue;

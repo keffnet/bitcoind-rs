@@ -88,6 +88,10 @@ use crate::mempool::{
 };
 
 const MAX_ORPHAN_TRANSACTIONS: usize = 100;
+// Core assigns live peer IDs from zero. Address-manager entries use a
+// separate sentinel so peer 0 remains distinguishable from an unconnected
+// address.
+const UNCONNECTED_PEER_ID: usize = usize::MAX;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_KNOWN_ADDRESSES: usize = 256_000;
@@ -1048,9 +1052,14 @@ pub struct Node {
     mempool_check_operations: AtomicUsize,
     block_index_check_operations: AtomicUsize,
     addrman_check_operations: AtomicUsize,
+    pub(crate) rpc_logging: parking_lot::RwLock<HashSet<String>>,
     zmq_mempool_sequence: AtomicU64,
     rpc_command_sequence: AtomicUsize,
     rpc_commands: parking_lot::RwLock<HashMap<usize, (String, Instant)>>,
+    headers_sync_peers: AtomicUsize,
+    headers_sync_started: parking_lot::Mutex<HashSet<usize>>,
+    inv_triggered_headers_sync: parking_lot::Mutex<HashSet<usize>>,
+    last_block_inv_triggering_headers_sync: parking_lot::Mutex<Option<BlockHash>>,
     total_bytes_sent: AtomicU64,
     total_bytes_received: AtomicU64,
     outbound_usage: parking_lot::Mutex<OutboundUsage>,
@@ -1376,6 +1385,14 @@ impl Node {
             })
             .transpose()?;
         let compact_extra_limit = config.block_reconstruction_extra_txn;
+        let rpc_logging = if config.logging.debug_all {
+            crate::config::CORE_LOG_CATEGORIES
+                .iter()
+                .map(|category| (*category).to_owned())
+                .collect()
+        } else {
+            config.logging.debug_categories.iter().cloned().collect()
+        };
         let node = Arc::new(Self {
             config,
             _data_dir_lock: data_dir_lock,
@@ -1397,9 +1414,14 @@ impl Node {
             mempool_check_operations: AtomicUsize::new(0),
             block_index_check_operations: AtomicUsize::new(0),
             addrman_check_operations: AtomicUsize::new(0),
+            rpc_logging: parking_lot::RwLock::new(rpc_logging),
             zmq_mempool_sequence: AtomicU64::new(zmq_mempool_sequence),
             rpc_command_sequence: AtomicUsize::new(0),
             rpc_commands: parking_lot::RwLock::new(HashMap::new()),
+            headers_sync_peers: AtomicUsize::new(0),
+            headers_sync_started: parking_lot::Mutex::new(HashSet::new()),
+            inv_triggered_headers_sync: parking_lot::Mutex::new(HashSet::new()),
+            last_block_inv_triggering_headers_sync: parking_lot::Mutex::new(None),
             total_bytes_sent: AtomicU64::new(0),
             total_bytes_received: AtomicU64::new(0),
             outbound_usage: parking_lot::Mutex::new(OutboundUsage::default()),
@@ -1665,7 +1687,7 @@ impl Node {
             if *endpoint != NetworkEndpoint::Ip(*address) {
                 bail!("known IPv4/IPv6 address has a mismatched endpoint key: {address}");
             }
-            if *peer_id != 0 && peer_ids.get(peer_id) != Some(endpoint) {
+            if *peer_id != UNCONNECTED_PEER_ID && peer_ids.get(peer_id) != Some(endpoint) {
                 bail!("known address {address} points to a missing or different peer");
             }
         }
@@ -2788,6 +2810,117 @@ impl Node {
         }
     }
 
+    fn headers_sync_peer_is_eligible(peer: &PeerInfo) -> bool {
+        peer.version.is_some()
+            && !matches!(
+                peer.connection_type,
+                "addr-fetch" | "feeler" | "private-broadcast"
+            )
+            && peer.services & (wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED) != 0
+    }
+
+    fn best_header_is_recent(&self) -> bool {
+        let chain = self.chain.read();
+        let best_header = chain.best_header_tip();
+        let Some(header) = chain.header(best_header.height) else {
+            return false;
+        };
+        u64::from(header.time).saturating_add(24 * 60 * 60) >= time::unix_time()
+    }
+
+    /// Claim Core's single initial headers-sync slot for a connected peer.
+    /// Once the node is within a day of the current time Core allows all
+    /// suitable peers to start their own headers requests.
+    pub(crate) fn start_initial_headers_sync(&self, peer_id: usize) -> bool {
+        let allow_parallel = self.best_header_is_recent();
+        let mut started = self.headers_sync_started.lock();
+        if started.contains(&peer_id) {
+            return false;
+        }
+        if !allow_parallel && self.headers_sync_peers.load(Ordering::Relaxed) != 0 {
+            return false;
+        }
+        if !self
+            .peers
+            .read()
+            .get(&peer_id)
+            .is_some_and(Self::headers_sync_peer_is_eligible)
+        {
+            return false;
+        }
+        started.insert(peer_id);
+        self.headers_sync_peers.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Apply Core's one-new-peer-per-announced-block headers-sync policy.
+    pub(crate) fn headers_sync_for_block_inventory(
+        &self,
+        peer_id: usize,
+        block_hash: BlockHash,
+    ) -> bool {
+        if self.headers_sync_started.lock().contains(&peer_id) {
+            return true;
+        }
+        let mut triggered = self.inv_triggered_headers_sync.lock();
+        if triggered.contains(&peer_id) {
+            return false;
+        }
+        let mut last_block = self.last_block_inv_triggering_headers_sync.lock();
+        if *last_block == Some(block_hash) {
+            return false;
+        }
+        triggered.insert(peer_id);
+        *last_block = Some(block_hash);
+        true
+    }
+
+    fn assign_headers_sync_replacement(
+        &self,
+        excluded_peer_id: Option<usize>,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>> {
+        if self.headers_sync_peers.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        let mut started = self.headers_sync_started.lock();
+        let candidate = self
+            .peers
+            .read()
+            .values()
+            .filter(|peer| Some(peer.id) != excluded_peer_id)
+            .filter(|peer| Self::headers_sync_peer_is_eligible(peer))
+            .min_by_key(|peer| (!peer.inbound, peer.id))
+            .map(|peer| peer.id)?;
+        let sender = self.peer_commands.read().get(&candidate).cloned()?;
+        started.insert(candidate);
+        self.headers_sync_peers.fetch_add(1, Ordering::Relaxed);
+        Some(sender)
+    }
+
+    /// Drop a peer's initial headers-sync claim and, if possible, immediately
+    /// hand the slot to another connected peer.
+    pub(crate) fn release_headers_sync_peer(
+        &self,
+        peer_id: usize,
+    ) -> Option<tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>> {
+        if !self.clear_headers_sync_peer(peer_id) {
+            return None;
+        }
+        self.assign_headers_sync_replacement(Some(peer_id))
+    }
+
+    /// Clear a headers-sync claim without immediately assigning a replacement.
+    /// Core uses this path when a `noban` peer times out: the peer remains
+    /// connected while its existing sync claim is cleared, allowing the
+    /// message loop to retry without disconnecting it.
+    pub(crate) fn clear_headers_sync_peer(&self, peer_id: usize) -> bool {
+        let removed = self.headers_sync_started.lock().remove(&peer_id);
+        if removed {
+            self.headers_sync_peers.fetch_sub(1, Ordering::Relaxed);
+        }
+        removed
+    }
+
     pub(crate) fn update_peer_presynced_headers(&self, peer_id: usize, height: Option<i64>) {
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
             peer.presynced_headers = height.unwrap_or(-1);
@@ -3551,18 +3684,23 @@ impl Node {
     pub fn unregister_peer(&self, id: usize) {
         let endpoint = self.peers.write().remove(&id).map(|peer| peer.endpoint);
         self.peer_commands.write().remove(&id);
+        let replacement = self.release_headers_sync_peer(id);
+        self.inv_triggered_headers_sync.lock().remove(&id);
         self.block_stalling_since.write().remove(&id);
         if let Some(endpoint) = endpoint {
             if let Some(address) = endpoint.legacy_socket_addr()
                 && let Some(known) = self.known_addresses.write().get_mut(&address)
                 && known.id == id
             {
-                known.id = 0;
+                known.id = UNCONNECTED_PEER_ID;
                 known.inbound = false;
                 known.local_address = None;
                 known.ping_nonce = None;
                 known.ping_sent_at = None;
             }
+        }
+        if let Some(sender) = replacement {
+            let _ = sender.send(p2p::PeerCommand::RequestHeaders);
         }
         self.orphans.lock().erase_for_peer(id);
         self.maybe_check_addrman();
@@ -3751,7 +3889,7 @@ impl Node {
         known.insert(
             address,
             PeerInfo {
-                id: 0,
+                id: UNCONNECTED_PEER_ID,
                 address,
                 endpoint: NetworkEndpoint::from_socket(address),
                 local_address: None,
@@ -3818,7 +3956,7 @@ impl Node {
         let is_new = !known.contains_key(&address);
         let endpoint = NetworkEndpoint::from_socket(address);
         let entry = known.entry(address).or_insert_with(|| PeerInfo {
-            id: 0,
+            id: UNCONNECTED_PEER_ID,
             address,
             endpoint,
             local_address: None,
@@ -3863,7 +4001,7 @@ impl Node {
             addr_token_bucket: 1.0,
             addr_token_timestamp: Instant::now(),
         });
-        if entry.id == 0 {
+        if entry.id == UNCONNECTED_PEER_ID {
             entry.services |= services;
             entry.connected_at = entry.connected_at.max(time);
             entry.last_send = entry.last_send.max(time);
@@ -3886,7 +4024,9 @@ impl Node {
         let eviction = known
             .iter()
             .filter(|(candidate, peer)| {
-                peer.id == 0 && !tried.contains(*candidate) && **candidate != address
+                peer.id == UNCONNECTED_PEER_ID
+                    && !tried.contains(*candidate)
+                    && **candidate != address
             })
             .min_by_key(|(_, peer)| peer.connected_at)
             .map(|(candidate, _)| *candidate);
@@ -4861,7 +5001,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                 known.insert(
                     address,
                     PeerInfo {
-                        id: 0,
+                        id: UNCONNECTED_PEER_ID,
                         address,
                         endpoint: NetworkEndpoint::Ip(address),
                         local_address: None,
@@ -6417,7 +6557,7 @@ mod tests {
             .into_iter()
             .find(|peer| peer.address == address)
             .expect("persisted address");
-        assert_eq!(peer.id, 0);
+        assert_eq!(peer.id, UNCONNECTED_PEER_ID);
         assert_eq!(peer.services, crate::wire::NODE_NETWORK);
         assert_eq!(peer.connected_at, 123);
     }

@@ -453,6 +453,51 @@ fn headers_download_timed_out(last_request: Option<Instant>) -> bool {
     last_request.is_some_and(|sent| sent.elapsed() > HEADERS_DOWNLOAD_TIMEOUT)
 }
 
+fn headers_download_timed_out_with_mocktime(
+    last_request: Option<Instant>,
+    last_request_time: Option<u64>,
+) -> bool {
+    headers_download_timed_out(last_request)
+        || last_request_time.is_some_and(|sent| {
+            unix_time_seconds().saturating_sub(sent) > HEADERS_DOWNLOAD_TIMEOUT.as_secs()
+        })
+}
+
+/// Apply Core's initial-header timeout policy. The boolean result tells the
+/// caller that a `noban` peer was retained but its sync claim was cleared;
+/// message-driven callers still need to finish replying to the triggering
+/// message, while periodic callers can continue their loop immediately.
+fn handle_headers_download_timeout(
+    node: &Arc<Node>,
+    peer_id: usize,
+    peer_state: &PeerState,
+) -> Result<bool> {
+    if !headers_download_timed_out_with_mocktime(
+        *peer_state.last_headers_request.lock(),
+        *peer_state.last_headers_request_time.lock(),
+    ) {
+        return Ok(false);
+    }
+    let replacement_available = node.peer_infos().into_iter().any(|peer| {
+        peer.id != peer_id
+            && !peer.inbound
+            && peer.version.is_some()
+            && peer.services & (wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED) != 0
+    });
+    if replacement_available && peer_state.permissions.contains(PeerPermissions::NO_BAN) {
+        info!("Timeout downloading headers from noban peer, not disconnecting peer={peer_id}");
+        *peer_state.last_headers_request.lock() = None;
+        *peer_state.last_headers_request_time.lock() = None;
+        node.clear_headers_sync_peer(peer_id);
+        return Ok(true);
+    }
+    if replacement_available {
+        info!("Timeout downloading headers, disconnecting peer={peer_id}");
+        anyhow::bail!("peer timed out responding to getheaders");
+    }
+    Ok(false)
+}
+
 fn block_relay_is_suppressed(peer_state: &PeerState) -> bool {
     peer_state
         .last_block_request
@@ -925,6 +970,7 @@ struct PeerState {
     send_headers: parking_lot::Mutex<bool>,
     send_headers_sent: parking_lot::Mutex<bool>,
     last_headers_request: parking_lot::Mutex<Option<Instant>>,
+    last_headers_request_time: parking_lot::Mutex<Option<u64>>,
     continuation_block: parking_lot::Mutex<Option<BlockHash>>,
     last_block_request: parking_lot::Mutex<Option<Instant>>,
     compact_block_version: parking_lot::Mutex<Option<u64>>,
@@ -1290,6 +1336,7 @@ impl PeerReader {
 #[derive(Debug)]
 pub(crate) enum PeerCommand {
     Disconnect,
+    RequestHeaders,
     RequestBlock(BlockHash),
     Ping(u64),
     SendMessage {
@@ -1386,7 +1433,7 @@ impl PeerManager {
         let manual_slots = Arc::new(Semaphore::new(MAX_ADDNODE_CONNECTIONS));
         let private_slots = Arc::new(Semaphore::new(MAX_PRIVATE_BROADCAST_CONNECTIONS));
         let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let next_peer_id = Arc::new(AtomicUsize::new(1));
+        let next_peer_id = Arc::new(AtomicUsize::new(0));
         let outbound = OutboundContext {
             slots: slots.clone(),
             manual_slots,
@@ -2943,6 +2990,7 @@ async fn serve_peer(
         send_headers: parking_lot::Mutex::new(false),
         send_headers_sent: parking_lot::Mutex::new(false),
         last_headers_request: parking_lot::Mutex::new(None),
+        last_headers_request_time: parking_lot::Mutex::new(None),
         continuation_block: parking_lot::Mutex::new(None),
         last_block_request: parking_lot::Mutex::new(None),
         compact_block_version: parking_lot::Mutex::new(None),
@@ -3107,6 +3155,10 @@ async fn serve_peer_loop(
             command = commands.recv() => {
                 match command {
                     Some(PeerCommand::Disconnect) | None => anyhow::bail!("peer disconnected by node"),
+                    Some(PeerCommand::RequestHeaders) => {
+                        request_headers(node, peer_id, writer, peer_state).await?;
+                        continue;
+                    }
                     Some(PeerCommand::RequestBlock(hash)) => {
                         let request = Inventory {
                             kind: InventoryType::WitnessBlock,
@@ -3257,8 +3309,9 @@ async fn serve_peer_loop(
                 if let Some(staller) = node.take_stalled_block_peer() {
                     node.disconnect_peer(staller);
                 }
-                if headers_download_timed_out(*peer_state.last_headers_request.lock()) {
-                    anyhow::bail!("peer timed out responding to getheaders");
+                if handle_headers_download_timeout(node, peer_id, peer_state)? {
+                    request_headers(node, peer_id, writer, peer_state).await?;
+                    continue;
                 }
                 if node.peer_block_download_timed_out(peer_id) {
                     anyhow::bail!("peer timed out downloading blocks");
@@ -3490,7 +3543,18 @@ async fn serve_peer_loop(
                     }
                     continue;
                 }
-                if connection_requests_headers(peer_state.connection_type) {
+                if connection_requests_headers(peer_state.connection_type)
+                    && node.start_initial_headers_sync(peer_id)
+                {
+                    let start_height = node.chain.read().best_header_tip().height.saturating_sub(1);
+                    let peer_start_height = node
+                        .peer_infos()
+                        .into_iter()
+                        .find(|peer| peer.id == peer_id)
+                        .map_or(-1, |peer| peer.start_height);
+                    info!(
+                        "initial getheaders ({start_height}) to peer={peer_id} (startheight:{peer_start_height})"
+                    );
                     request_headers(node, peer_id, writer, peer_state).await?;
                 }
                 if connection_fetches_addresses(outbound, peer_state.connection_type) {
@@ -3549,6 +3613,7 @@ async fn serve_peer_loop(
                 *registered = true;
             }
             Message::Ping(nonce) => {
+                let retry_headers = handle_headers_download_timeout(node, peer_id, peer_state)?;
                 if peer_version > BIP31_VERSION {
                     send_message(
                         node,
@@ -3558,6 +3623,9 @@ async fn serve_peer_loop(
                         &Message::Pong(nonce),
                     )
                     .await?;
+                }
+                if retry_headers {
+                    request_headers(node, peer_id, writer, peer_state).await?;
                 }
             }
             Message::Pong(nonce) => {
@@ -3643,6 +3711,7 @@ async fn serve_peer_loop(
                 let request_more_headers = headers.len() == 2_000;
                 if headers.is_empty() {
                     *peer_state.last_headers_request.lock() = None;
+                    *peer_state.last_headers_request_time.lock() = None;
                     headers_sync = None;
                     node.update_peer_presynced_headers(peer_id, None);
                     continue;
@@ -3776,6 +3845,7 @@ async fn serve_peer_loop(
                 }
 
                 *peer_state.last_headers_request.lock() = None;
+                *peer_state.last_headers_request_time.lock() = None;
                 if sync_finished {
                     headers_sync = None;
                     node.update_peer_presynced_headers(peer_id, None);
@@ -3876,7 +3946,7 @@ async fn serve_peer_loop(
                         node.update_peer_best_known_block(peer_id, item.hash);
                     }
                 }
-                let mut needs_headers = false;
+                let mut best_block = None;
                 let transaction_requests = {
                     let chain = node.chain.read();
                     let mempool = node.mempool.read();
@@ -3896,7 +3966,7 @@ async fn serve_peer_loop(
                                 if chain.block_height_by_hash(&item.hash).is_none()
                                     && !node.peer_has_inflight_block_request(peer_id, item.hash)
                                 {
-                                    needs_headers = true;
+                                    best_block = Some(item.hash);
                                 }
                                 None
                             }
@@ -3955,7 +4025,9 @@ async fn serve_peer_loop(
                     node.config.network,
                 )
                 .await?;
-                if needs_headers {
+                if best_block
+                    .is_some_and(|hash| node.headers_sync_for_block_inventory(peer_id, hash))
+                {
                     request_headers(node, peer_id, writer, peer_state).await?;
                 }
             }
@@ -5709,6 +5781,7 @@ async fn request_headers_with_locator(
             return Ok(());
         }
         *last_request = Some(Instant::now());
+        *peer_state.last_headers_request_time.lock() = Some(unix_time_seconds());
     }
     send_message(
         node,
@@ -7755,6 +7828,7 @@ mod tests {
             send_headers: parking_lot::Mutex::new(false),
             send_headers_sent: parking_lot::Mutex::new(false),
             last_headers_request: parking_lot::Mutex::new(None),
+            last_headers_request_time: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),
             last_block_request: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),
@@ -9356,7 +9430,7 @@ mod tests {
                 .find(|known| known.address == "127.0.0.1:18444".parse().unwrap())
                 .expect("disconnected peer remains in address table")
                 .id,
-            0
+            crate::UNCONNECTED_PEER_ID
         );
     }
 
@@ -9514,7 +9588,13 @@ mod tests {
                 .iter()
                 .any(|peer| peer.address == v2_endpoint.socket_addr().unwrap())
         );
-        assert_eq!(addresses.iter().filter(|peer| peer.id == 0).count(), 2);
+        assert_eq!(
+            addresses
+                .iter()
+                .filter(|peer| peer.id == crate::UNCONNECTED_PEER_ID)
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -10185,6 +10265,7 @@ mod tests {
             send_headers: parking_lot::Mutex::new(false),
             send_headers_sent: parking_lot::Mutex::new(false),
             last_headers_request: parking_lot::Mutex::new(None),
+            last_headers_request_time: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),
             last_block_request: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),

@@ -2470,6 +2470,13 @@ impl Config {
         let debug_log_path = PathBuf::from(&args.debug_log_file);
         let debug_log_path = if debug_log_path.is_absolute() {
             debug_log_path
+        } else if args.debug_log_file == "debug.log" {
+            let network_dir = network_data_dir_name(network);
+            if network_dir.is_empty() {
+                args.datadir.join(debug_log_path)
+            } else {
+                args.datadir.join(network_dir).join(debug_log_path)
+            }
         } else {
             args.datadir.join(debug_log_path)
         };

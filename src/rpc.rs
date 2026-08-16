@@ -12702,18 +12702,28 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
     let mut activity = Vec::new();
     for (height, hash, block) in blocks {
-        for transaction in &block.txdata {
+        // Core reads spent inputs from the block undo record. This remains
+        // available when the previous transaction body has been pruned and
+        // avoids an independent transaction lookup for every input.
+        let undo = chain
+            .spent_outputs_by_transaction(&hash)?
+            .ok_or_else(|| anyhow!("block undo data is missing"))?;
+        if undo.len() != block.txdata.len() {
+            bail!("block undo transaction count does not match block");
+        }
+        for (transaction_index, (transaction, spent_outputs)) in
+            block.txdata.iter().zip(undo.iter()).enumerate()
+        {
             let txid = transaction.compute_txid();
-            for (vin, input) in transaction.input.iter().enumerate() {
-                if input.previous_output.is_null() {
-                    continue;
-                }
-                let Some((previous, _)) = chain.transaction(&input.previous_output.txid)? else {
-                    continue;
-                };
-                let Some(output) = previous.output.get(input.previous_output.vout as usize) else {
-                    continue;
-                };
+            if transaction_index != 0 && spent_outputs.len() != transaction.input.len() {
+                bail!("block undo input count does not match transaction");
+            }
+            for (vin, (input, output)) in transaction
+                .input
+                .iter()
+                .zip(spent_outputs.iter())
+                .enumerate()
+            {
                 if scripts.iter().any(|script| script == &output.script_pubkey) {
                     activity.push(json!({
                         "type": "spend",
@@ -15022,6 +15032,16 @@ mod tests {
             &json!(["raw(51)", [hex::encode(serialize(&spend))], true]),
         )
         .unwrap();
+        let activity =
+            get_descriptor_activity(&node, &json!([[block["hash"].clone()], ["raw(51)"], false]))
+                .unwrap();
+        assert!(
+            activity["activity"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["type"] == "spend")
+        );
         let stats = get_block_stats(&node, &json!([block["hash"].clone()])).unwrap();
         assert_eq!(stats["totalfee"], json!(1_000));
         assert_eq!(stats["utxo_increase_actual"], json!(1));

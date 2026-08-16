@@ -4708,6 +4708,21 @@ async fn serve_peer_loop(
                     );
                     continue;
                 }
+                if mempool_request_exceeds_upload_limit(
+                    node.outbound_target_reached(false),
+                    peer_state.permissions,
+                ) {
+                    if !peer_state.permissions.contains(PeerPermissions::NO_BAN) {
+                        anyhow::bail!("mempool request with bandwidth limit reached");
+                    }
+                    // Core ignores this request for a noban peer instead of
+                    // disconnecting it. There is no mempool response to send.
+                    debug!(
+                        peer_id,
+                        "ignoring mempool request after upload target was reached"
+                    );
+                    continue;
+                }
                 let transactions = {
                     let mempool = node.mempool.read();
                     let minimum_fee = if peer_state
@@ -4727,7 +4742,6 @@ async fn serve_peer_loop(
                                 (fee_rate >= minimum_fee).then(|| entry.transaction.clone())
                             })
                         })
-                        .take(50_000)
                         .collect::<Vec<_>>()
                 };
                 let inventory = {
@@ -4752,14 +4766,16 @@ async fn serve_peer_loop(
                         .collect::<Vec<_>>()
                 };
                 let mempool_sequence = node.mempool.read().sequence();
-                send_message(
-                    node,
-                    peer_id,
-                    writer,
-                    node.config.network,
-                    &Message::Inv(inventory),
-                )
-                .await?;
+                for chunk in inventory.chunks(MAX_TX_INVENTORY_BATCH) {
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Inv(chunk.to_vec()),
+                    )
+                    .await?;
+                }
                 node.record_peer_inv_sequence(peer_id, mempool_sequence);
             }
         }
@@ -5724,6 +5740,13 @@ fn peer_can_request_mempool(peer_bloom_filters: bool, permissions: PeerPermissio
     peer_bloom_filters
         || permissions.contains(PeerPermissions::MEMPOOL)
         || permissions.contains(PeerPermissions::BLOOM_FILTER)
+}
+
+fn mempool_request_exceeds_upload_limit(
+    upload_target_reached: bool,
+    permissions: PeerPermissions,
+) -> bool {
+    upload_target_reached && !permissions.contains(PeerPermissions::MEMPOOL)
 }
 
 fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
@@ -7558,6 +7581,26 @@ mod tests {
         assert!(peer_can_request_mempool(
             false,
             PeerPermissions::BLOOM_FILTER
+        ));
+    }
+
+    #[test]
+    fn mempool_requests_honor_core_upload_target_permissions() {
+        assert!(!mempool_request_exceeds_upload_limit(
+            false,
+            PeerPermissions::empty()
+        ));
+        assert!(mempool_request_exceeds_upload_limit(
+            true,
+            PeerPermissions::empty()
+        ));
+        assert!(mempool_request_exceeds_upload_limit(
+            true,
+            PeerPermissions::BLOOM_FILTER
+        ));
+        assert!(!mempool_request_exceeds_upload_limit(
+            true,
+            PeerPermissions::MEMPOOL
         ));
     }
 

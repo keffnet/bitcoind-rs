@@ -816,7 +816,6 @@ pub struct ChainState {
     prune_target_size: Option<u64>,
     prune_after_height: u32,
     utxos: HashMap<OutPoint, UtxoEntry>,
-    utxos_by_script: HashMap<String, HashSet<OutPoint>>,
     tx_index: HashMap<Txid, TxLocation>,
     // Most txids have one active-chain location. Keep duplicate locations
     // separately so the Core-style txindex remains a latest-location map
@@ -1221,7 +1220,6 @@ impl ChainState {
             // the owning Node applies the network-specific Core parameter.
             prune_after_height: MIN_BLOCKS_TO_KEEP,
             utxos: HashMap::new(),
-            utxos_by_script: HashMap::new(),
             tx_index: HashMap::new(),
             tx_index_duplicates: HashMap::new(),
             tx_index_all: HashMap::new(),
@@ -1255,7 +1253,6 @@ impl ChainState {
             state.active_chain = active_chain[..snapshot_chain_len].to_vec();
             state.headers = snapshot.headers;
             state.utxos = snapshot.utxos;
-            state.rebuild_utxo_index();
             state.tx_index = snapshot.tx_index;
             state.tx_index_duplicates = snapshot.tx_index_duplicates;
             state.tx_index_all = if state.tx_index_all_enabled {
@@ -2127,7 +2124,6 @@ impl ChainState {
                 ..
             } => {
                 self.utxos = utxos;
-                self.rebuild_utxo_index();
                 self.snapshot_base = None;
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
@@ -2138,7 +2134,6 @@ impl ChainState {
             BackgroundValidationOutcome::Failed { error, utxos, .. } => {
                 if let Some(utxos) = utxos {
                     self.utxos = utxos;
-                    self.rebuild_utxo_index();
                     self.snapshot_base = None;
                     self.snapshot_validated = true;
                     self.snapshot_validation_error = None;
@@ -3410,14 +3405,21 @@ impl ChainState {
     }
 
     pub fn get_utxos(&self, script_hash: &str) -> Vec<(OutPoint, UtxoEntry)> {
-        self.utxos_by_script
-            .get(script_hash)
+        self.utxo_store
+            .entries()
+            .unwrap_or_default()
             .into_iter()
-            .flat_map(|outpoints| outpoints.iter())
-            .filter_map(|outpoint| {
-                self.utxos
-                    .get(outpoint)
-                    .map(|entry| (*outpoint, entry.clone()))
+            .filter(|(_, entry)| electrum_script_hash(&entry.output.script_pubkey) == script_hash)
+            .map(|(outpoint, entry)| {
+                (
+                    outpoint,
+                    UtxoEntry {
+                        output: entry.output,
+                        height: entry.height,
+                        median_time_past: entry.median_time_past,
+                        coinbase: entry.coinbase,
+                    },
+                )
             })
             .collect()
     }
@@ -3449,7 +3451,7 @@ impl ChainState {
                     continue;
                 }
                 let outpoint = OutPoint::new(history.txid, vout as u32);
-                let unspent = if self.utxos.contains_key(&outpoint) {
+                let unspent = if self.utxo_store.contains(&outpoint) {
                     true
                 } else {
                     // The Electrum integration enables this index before it
@@ -3779,7 +3781,6 @@ impl ChainState {
             }
         }
         self.utxos = snapshot.utxos;
-        self.rebuild_utxo_index();
         self.block_undo_cache.clear();
         self.persist_snapshot()?;
         self.clear_snapshot_provenance()?;
@@ -3920,7 +3921,6 @@ impl ChainState {
         let coins_count = snapshot.coins_count;
         let base_hash = snapshot.base_hash;
         self.utxos = snapshot.utxos;
-        self.rebuild_utxo_index();
         self.block_undo_cache.clear();
         self.persist_snapshot()?;
         Ok(((coins_count, base_hash, base_height), fully_validated))
@@ -5552,7 +5552,6 @@ impl ChainState {
         let old_active_tx_counts = std::mem::take(&mut self.active_tx_counts);
         let old_active_tx_totals = std::mem::take(&mut self.active_tx_totals);
         let old_utxos = std::mem::take(&mut self.utxos);
-        let old_utxos_by_script = std::mem::take(&mut self.utxos_by_script);
         let old_tx_index = std::mem::take(&mut self.tx_index);
         let old_tx_index_duplicates = std::mem::take(&mut self.tx_index_duplicates);
         let mut tx_index_all_changes = HashMap::new();
@@ -5570,7 +5569,6 @@ impl ChainState {
         self.active_tx_counts.clear();
         self.active_tx_totals.clear();
         self.utxos.clear();
-        self.utxos_by_script.clear();
         self.tx_index.clear();
         self.tx_index_duplicates.clear();
         self.history.clear();
@@ -5587,7 +5585,6 @@ impl ChainState {
                 self.active_chain = path[..snapshot_chain_len].to_vec();
                 self.headers = snapshot.headers;
                 self.utxos = snapshot.utxos;
-                self.rebuild_utxo_index();
                 self.tx_index = snapshot.tx_index;
                 self.tx_index_duplicates = snapshot.tx_index_duplicates;
                 self.history = snapshot.history;
@@ -5642,7 +5639,6 @@ impl ChainState {
             self.active_tx_counts = old_active_tx_counts;
             self.active_tx_totals = old_active_tx_totals;
             self.utxos = old_utxos;
-            self.utxos_by_script = old_utxos_by_script;
             self.tx_index = old_tx_index;
             self.tx_index_duplicates = old_tx_index_duplicates;
             for (txid, previous) in tx_index_all_changes {
@@ -6100,15 +6096,10 @@ impl ChainState {
         if self.utxos.contains_key(&outpoint) {
             self.remove_utxo(&outpoint);
         }
-        let script_hash = electrum_script_hash(&entry.output.script_pubkey);
         self.utxos.insert(outpoint, entry.clone());
         if let Some(stats) = self.coin_stats.as_mut() {
             stats.add(&outpoint, &entry);
         }
-        self.utxos_by_script
-            .entry(script_hash)
-            .or_default()
-            .insert(outpoint);
     }
 
     fn remove_utxo(&mut self, outpoint: &OutPoint) -> Option<UtxoEntry> {
@@ -6116,24 +6107,7 @@ impl ChainState {
         if let Some(stats) = self.coin_stats.as_mut() {
             stats.remove(outpoint, &entry);
         }
-        let script_hash = electrum_script_hash(&entry.output.script_pubkey);
-        if let Some(outpoints) = self.utxos_by_script.get_mut(&script_hash) {
-            outpoints.remove(outpoint);
-            if outpoints.is_empty() {
-                self.utxos_by_script.remove(&script_hash);
-            }
-        }
         Some(entry)
-    }
-
-    fn rebuild_utxo_index(&mut self) {
-        self.utxos_by_script.clear();
-        for (outpoint, entry) in &self.utxos {
-            self.utxos_by_script
-                .entry(electrum_script_hash(&entry.output.script_pubkey))
-                .or_default()
-                .insert(*outpoint);
-        }
     }
 
     fn add_history(&mut self, script_hash: &str, entry: HistoryEntry) {
@@ -6989,7 +6963,6 @@ fn open_background_replay_state(
         prune_target_size: None,
         prune_after_height: MIN_BLOCKS_TO_KEEP,
         utxos: HashMap::new(),
-        utxos_by_script: HashMap::new(),
         tx_index: HashMap::new(),
         tx_index_duplicates: HashMap::new(),
         tx_index_all: HashMap::new(),

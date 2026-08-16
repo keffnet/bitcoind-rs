@@ -848,6 +848,7 @@ struct PeerState {
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
+    send_headers_sent: parking_lot::Mutex<bool>,
     last_headers_request: parking_lot::Mutex<Option<Instant>>,
     continuation_block: parking_lot::Mutex<Option<BlockHash>>,
     compact_block_version: parking_lot::Mutex<Option<u64>>,
@@ -2858,6 +2859,7 @@ async fn serve_peer(
         relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
+        send_headers_sent: parking_lot::Mutex::new(false),
         last_headers_request: parking_lot::Mutex::new(None),
         continuation_block: parking_lot::Mutex::new(None),
         compact_block_version: parking_lot::Mutex::new(None),
@@ -2985,7 +2987,6 @@ async fn serve_peer_loop(
     let mut verack_received = false;
     let mut verack_sent = false;
     let mut extensions_sent = false;
-    let mut send_headers_sent = false;
     let mut addrv2_received = false;
     let mut getaddr_received = false;
     let mut peer_version = 0i32;
@@ -3144,7 +3145,6 @@ async fn serve_peer_loop(
                     writer,
                     peer_state,
                     node.config.network,
-                    &mut send_headers_sent,
                     peer_version,
                 )
                 .await?;
@@ -3297,7 +3297,6 @@ async fn serve_peer_loop(
                         peer_state,
                         node.config.network,
                         &mut extensions_sent,
-                        &mut send_headers_sent,
                         peer_version,
                     )
                     .await?;
@@ -3321,7 +3320,6 @@ async fn serve_peer_loop(
                     peer_state,
                     node.config.network,
                     &mut extensions_sent,
-                    &mut send_headers_sent,
                     peer_version,
                 )
                 .await?;
@@ -5165,7 +5163,6 @@ async fn send_peer_extensions(
     peer_state: &PeerState,
     network: Network,
     sent: &mut bool,
-    send_headers_sent: &mut bool,
     peer_version: i32,
 ) -> Result<()> {
     if *sent {
@@ -5175,16 +5172,7 @@ async fn send_peer_extensions(
         *sent = true;
         return Ok(());
     }
-    maybe_send_send_headers(
-        node,
-        peer_id,
-        writer,
-        peer_state,
-        network,
-        send_headers_sent,
-        peer_version,
-    )
-    .await?;
+    maybe_send_send_headers(node, peer_id, writer, peer_state, network, peer_version).await?;
     if peer_version >= WTXID_RELAY_VERSION {
         // Core negotiates BIP339 independently of whether this connection
         // accepts unsolicited transactions. Block-relay-only and blocksonly
@@ -5265,10 +5253,12 @@ async fn maybe_send_send_headers(
     writer: &PeerWriter,
     peer_state: &PeerState,
     network: Network,
-    sent: &mut bool,
     peer_version: i32,
 ) -> Result<()> {
-    if *sent || peer_version < SENDHEADERS_VERSION || *peer_state.private_broadcast_peer.lock() {
+    if *peer_state.send_headers_sent.lock()
+        || peer_version < SENDHEADERS_VERSION
+        || *peer_state.private_broadcast_peer.lock()
+    {
         return Ok(());
     }
     let peer_best_known_block = node
@@ -5287,7 +5277,7 @@ async fn maybe_send_send_headers(
         return Ok(());
     }
     send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
-    *sent = true;
+    *peer_state.send_headers_sent.lock() = true;
     Ok(())
 }
 
@@ -7226,6 +7216,7 @@ mod tests {
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(true),
             send_headers: parking_lot::Mutex::new(false),
+            send_headers_sent: parking_lot::Mutex::new(false),
             last_headers_request: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),
@@ -9562,6 +9553,7 @@ mod tests {
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(false),
             send_headers: parking_lot::Mutex::new(false),
+            send_headers_sent: parking_lot::Mutex::new(false),
             last_headers_request: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),
@@ -9570,7 +9562,6 @@ mod tests {
             tx_reconciliation_registered: parking_lot::Mutex::new(false),
         };
         let mut sent = false;
-        let mut send_headers_sent = false;
         send_peer_extensions(
             &node,
             1,
@@ -9578,7 +9569,6 @@ mod tests {
             &peer_state,
             Network::Regtest,
             &mut sent,
-            &mut send_headers_sent,
             WTXID_RELAY_VERSION,
         )
         .await

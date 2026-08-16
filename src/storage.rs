@@ -1127,15 +1127,24 @@ impl UtxoStore {
     /// validation uses point lookups, while snapshot/export code can opt into
     /// the full materialization cost.
     pub fn entries(&self) -> Result<Vec<(OutPoint, StoredUtxo)>> {
-        let outpoints = self.index.keys().copied().collect::<Vec<_>>();
-        outpoints
+        let mut locations = self
+            .index
             .iter()
-            .map(|outpoint| {
-                self.get(outpoint).and_then(|entry| {
-                    entry
-                        .map(|entry| (*outpoint, entry))
-                        .context("UTXO index entry disappeared")
-                })
+            .map(|(outpoint, location)| (*outpoint, *location))
+            .collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|(_, location)| location.offset);
+        locations
+            .into_iter()
+            .map(|(outpoint, location)| {
+                let body = read_utxo_data_record(&self.file, location)?;
+                if body.first().copied() != Some(UTXO_PUT) || body.len() < 1 + 8 + 36 {
+                    bail!("UTXO location points to a non-value record");
+                }
+                let stored_outpoint = decode_outpoint(&body[9..45])?;
+                if stored_outpoint != outpoint {
+                    bail!("UTXO value key does not match its index");
+                }
+                Ok((outpoint, decode_stored_utxo(&body[45..])?))
             })
             .collect()
     }

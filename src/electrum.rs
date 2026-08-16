@@ -793,6 +793,10 @@ fn dispatch_with_session(
 
 fn normalize_electrum_params(method: &str, params: &Value) -> Result<Value> {
     if params.is_array() {
+        let values = params.as_array().expect("checked array above");
+        if electrum_parameter_names(method).is_some_and(|names| values.len() > names.len()) {
+            return Err(electrum_invalid_params());
+        }
         return Ok(params.clone());
     }
     let object = params.as_object().ok_or_else(electrum_invalid_params)?;
@@ -3485,6 +3489,19 @@ mod tests {
             response["error"]["message"],
             json!("block height out of range")
         );
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":7,"method":"blockchain.block.header","params":[0,0,true]}
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["error"]["code"], json!(-32602));
+        assert_eq!(response["error"]["message"], json!("invalid params"));
         drop(reader);
         server.await??;
         Ok(())

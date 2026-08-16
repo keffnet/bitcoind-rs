@@ -255,6 +255,21 @@ pub struct TxLocation {
     pub transaction_index: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveTxLocation {
+    height: u32,
+    transaction_index: usize,
+}
+
+impl From<&TxLocation> for ActiveTxLocation {
+    fn from(location: &TxLocation) -> Self {
+        Self {
+            height: location.height,
+            transaction_index: location.transaction_index,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub txid: Txid,
@@ -818,11 +833,11 @@ pub struct ChainState {
     prune_after_height: u32,
     utxos: HashMap<OutPoint, UtxoEntry>,
     utxos_materialized: bool,
-    tx_index: HashMap<Txid, TxLocation>,
+    tx_index: HashMap<Txid, ActiveTxLocation>,
     // Most txids have one active-chain location. Keep duplicate locations
     // separately so the Core-style txindex remains a latest-location map
     // while Electrum can return the earliest occurrence.
-    tx_index_duplicates: HashMap<Txid, Vec<TxLocation>>,
+    tx_index_duplicates: HashMap<Txid, Vec<ActiveTxLocation>>,
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
     history_materialized: bool,
@@ -1261,11 +1276,21 @@ impl ChainState {
             state.active_chain = active_chain[..snapshot_chain_len].to_vec();
             state.headers = snapshot.headers;
             state.utxos = snapshot.utxos;
-            state.tx_index = snapshot.tx_index;
-            state.tx_index_duplicates = snapshot.tx_index_duplicates;
+            let snapshot_tx_index = snapshot.tx_index;
+            state.tx_index = snapshot_tx_index
+                .iter()
+                .map(|(txid, location)| (*txid, ActiveTxLocation::from(location)))
+                .collect();
+            state.tx_index_duplicates = snapshot
+                .tx_index_duplicates
+                .into_iter()
+                .map(|(txid, locations)| {
+                    (txid, locations.iter().map(ActiveTxLocation::from).collect())
+                })
+                .collect();
             state.tx_index_all = if state.tx_index_all_enabled {
                 if snapshot.tx_index_all.is_empty() {
-                    state.tx_index.clone()
+                    snapshot_tx_index.into_iter().collect()
                 } else {
                     snapshot.tx_index_all
                 }
@@ -3365,18 +3390,71 @@ impl ChainState {
     /// Ordinary txids take the fast single-map path; only duplicate txids use
     /// the side index.
     pub(crate) fn active_transaction_locations(&self, txid: &Txid) -> Vec<TxLocation> {
-        let mut locations = self
+        let mut compact_locations = self
             .tx_index_duplicates
             .get(txid)
             .cloned()
             .unwrap_or_default();
         if let Some(location) = self.tx_index.get(txid)
-            && !locations.iter().any(|candidate| candidate == location)
+            && !compact_locations
+                .iter()
+                .any(|candidate| candidate == location)
         {
-            locations.push(location.clone());
+            compact_locations.push(*location);
         }
-        locations.sort_by_key(|location| (location.height, location.transaction_index));
-        locations
+        compact_locations.sort_by_key(|location| (location.height, location.transaction_index));
+        compact_locations
+            .into_iter()
+            .filter_map(|location| self.expand_active_tx_location(location))
+            .collect()
+    }
+
+    fn expand_active_tx_location(&self, location: ActiveTxLocation) -> Option<TxLocation> {
+        self.active_chain
+            .get(usize::try_from(location.height).ok()?)
+            .copied()
+            .map(|block_hash| TxLocation {
+                block_hash,
+                height: location.height,
+                transaction_index: location.transaction_index,
+            })
+    }
+
+    fn active_tx_index_for_snapshot(&self) -> Result<HashMap<Txid, TxLocation>> {
+        self.tx_index
+            .iter()
+            .map(|(txid, location)| {
+                Ok((
+                    *txid,
+                    self.expand_active_tx_location(*location).with_context(|| {
+                        format!(
+                            "active transaction {} points outside the active chain",
+                            txid
+                        )
+                    })?,
+                ))
+            })
+            .collect()
+    }
+
+    fn active_tx_duplicates_for_snapshot(&self) -> Result<HashMap<Txid, Vec<TxLocation>>> {
+        self.tx_index_duplicates
+            .iter()
+            .map(|(txid, locations)| {
+                let locations = locations
+                    .iter()
+                    .map(|location| {
+                        self.expand_active_tx_location(*location).with_context(|| {
+                            format!(
+                                "duplicate transaction {} points outside the active chain",
+                                txid
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((*txid, locations))
+            })
+            .collect()
     }
 
     /// Find an active occurrence at an exact height, including a duplicate
@@ -3392,19 +3470,21 @@ impl ChainState {
     }
 
     pub fn transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
-        let Some(location) = self
+        let location = self
             .tx_index
             .get(txid)
-            .or_else(|| self.tx_index_all.get(txid))
-            .cloned()
-        else {
+            .and_then(|location| self.expand_active_tx_location(*location))
+            .or_else(|| self.tx_index_all.get(txid).cloned());
+        let Some(location) = location else {
             return Ok(None);
         };
         self.transaction_at_location(txid, location)
     }
 
     pub fn transaction_location(&self, txid: &Txid) -> Option<TxLocation> {
-        self.tx_index.get(txid).cloned()
+        self.tx_index
+            .get(txid)
+            .and_then(|location| self.expand_active_tx_location(*location))
     }
 
     pub fn spending_transaction(
@@ -3706,10 +3786,11 @@ impl ChainState {
         let tx_index = self
             .tx_index
             .iter()
-            .filter(|(_, location)| {
-                location.height <= target_height && active_hashes.contains(&location.block_hash)
+            .filter_map(|(txid, location)| {
+                let location = self.expand_active_tx_location(*location)?;
+                (location.height <= target_height && active_hashes.contains(&location.block_hash))
+                    .then_some((*txid, location))
             })
-            .map(|(txid, location)| (*txid, location.clone()))
             .collect();
         let tx_index_duplicates = self
             .tx_index_duplicates
@@ -3717,11 +3798,12 @@ impl ChainState {
             .filter_map(|(txid, locations)| {
                 let locations = locations
                     .iter()
-                    .filter(|location| {
-                        location.height <= target_height
-                            && active_hashes.contains(&location.block_hash)
+                    .filter_map(|location| {
+                        let location = self.expand_active_tx_location(*location)?;
+                        (location.height <= target_height
+                            && active_hashes.contains(&location.block_hash))
+                        .then_some(location)
                     })
-                    .cloned()
                     .collect::<Vec<_>>();
                 (!locations.is_empty()).then_some((*txid, locations))
             })
@@ -4042,11 +4124,15 @@ impl ChainState {
                 bail!("UTXO snapshot contains an output above the money range")
             }
             let location = if self.tx_index_all_enabled {
-                self.tx_index_all
-                    .get(&outpoint.txid)
-                    .or_else(|| self.tx_index.get(&outpoint.txid))
+                self.tx_index_all.get(&outpoint.txid).cloned().or_else(|| {
+                    self.tx_index
+                        .get(&outpoint.txid)
+                        .and_then(|location| self.expand_active_tx_location(*location))
+                })
             } else {
-                self.tx_index.get(&outpoint.txid)
+                self.tx_index
+                    .get(&outpoint.txid)
+                    .and_then(|location| self.expand_active_tx_location(*location))
             }
             .with_context(|| {
                 format!(
@@ -4340,7 +4426,11 @@ impl ChainState {
     }
 
     pub fn merkle_branch(&mut self, txid: &Txid) -> Result<Option<(Vec<Txid>, usize, u32)>> {
-        let Some(location) = self.tx_index.get(txid).cloned() else {
+        let Some(location) = self
+            .tx_index
+            .get(txid)
+            .and_then(|location| self.expand_active_tx_location(*location))
+        else {
             return Ok(None);
         };
         let branch = if let Some(block) = self.store.get(&location.block_hash)? {
@@ -4756,7 +4846,8 @@ impl ChainState {
                 let location = self
                     .tx_index
                     .get(&outpoint.txid)
-                    .or_else(|| self.tx_index_all.get(&outpoint.txid))?;
+                    .and_then(|location| self.expand_active_tx_location(*location))
+                    .or_else(|| self.tx_index_all.get(&outpoint.txid).cloned())?;
                 (
                     location.height,
                     location.block_hash,
@@ -5691,8 +5782,18 @@ impl ChainState {
                 self.active_chain = path[..snapshot_chain_len].to_vec();
                 self.headers = snapshot.headers;
                 self.utxos = snapshot.utxos;
-                self.tx_index = snapshot.tx_index;
-                self.tx_index_duplicates = snapshot.tx_index_duplicates;
+                self.tx_index = snapshot
+                    .tx_index
+                    .into_iter()
+                    .map(|(txid, location)| (txid, ActiveTxLocation::from(&location)))
+                    .collect();
+                self.tx_index_duplicates = snapshot
+                    .tx_index_duplicates
+                    .into_iter()
+                    .map(|(txid, locations)| {
+                        (txid, locations.iter().map(ActiveTxLocation::from).collect())
+                    })
+                    .collect();
                 self.history = snapshot.history;
                 self.active_tx_counts = old_active_tx_counts
                     .get(..snapshot_chain_len)
@@ -6096,11 +6197,15 @@ impl ChainState {
                 bail!("spent index references an inactive or mismatched block");
             }
             let location = if self.tx_index_all_enabled {
-                self.tx_index_all
-                    .get(txid)
-                    .or_else(|| self.tx_index.get(txid))
+                self.tx_index_all.get(txid).cloned().or_else(|| {
+                    self.tx_index
+                        .get(txid)
+                        .and_then(|location| self.expand_active_tx_location(*location))
+                })
             } else {
-                self.tx_index.get(txid)
+                self.tx_index
+                    .get(txid)
+                    .and_then(|location| self.expand_active_tx_location(*location))
             }
             .with_context(|| format!("spent index references unknown transaction {txid}"))?;
             if location.block_hash != *block_hash || location.height != *height {
@@ -6134,9 +6239,10 @@ impl ChainState {
     }
 
     fn index_active_transaction(&mut self, txid: Txid, location: TxLocation) {
-        let previous = self.tx_index.insert(txid, location.clone());
+        let compact_location = ActiveTxLocation::from(&location);
+        let previous = self.tx_index.insert(txid, compact_location);
         if let Some(previous) = previous {
-            if previous == location {
+            if previous == compact_location {
                 return;
             }
             let locations = self.tx_index_duplicates.entry(txid).or_default();
@@ -6145,8 +6251,11 @@ impl ChainState {
             }
         }
         if let Some(locations) = self.tx_index_duplicates.get_mut(&txid) {
-            if !locations.iter().any(|candidate| candidate == &location) {
-                locations.push(location);
+            if !locations
+                .iter()
+                .any(|candidate| candidate == &compact_location)
+            {
+                locations.push(compact_location);
             }
             locations.sort_by_key(|candidate| (candidate.height, candidate.transaction_index));
         }
@@ -7022,12 +7131,14 @@ impl ChainState {
         } else {
             self.load_utxo_map_from_store()?
         };
+        let tx_index = self.active_tx_index_for_snapshot()?;
+        let tx_index_duplicates = self.active_tx_duplicates_for_snapshot()?;
         Ok(ChainSnapshot {
             tip: self.best_hash().to_string(),
             headers: self.headers.clone(),
             utxos,
-            tx_index: self.tx_index.clone(),
-            tx_index_duplicates: self.tx_index_duplicates.clone(),
+            tx_index,
+            tx_index_duplicates,
             tx_index_all: if self.tx_index_all_enabled {
                 self.tx_index_all.clone()
             } else {
@@ -7108,20 +7219,28 @@ impl ChainState {
 
     fn tx_counts_from_index(&self) -> Option<Vec<u32>> {
         let mut counts = vec![0u32; self.active_chain.len()];
-        let index = if self.tx_index_all_enabled {
-            &self.tx_index_all
-        } else {
-            &self.tx_index
-        };
-        for location in index.values() {
-            let height = usize::try_from(location.height).ok()?;
-            if self.active_chain.get(height) != Some(&location.block_hash) {
-                continue;
+        if self.tx_index_all_enabled {
+            for location in self.tx_index_all.values() {
+                let height = usize::try_from(location.height).ok()?;
+                if self.active_chain.get(height) != Some(&location.block_hash) {
+                    continue;
+                }
+                let count = u32::try_from(location.transaction_index)
+                    .ok()?
+                    .checked_add(1)?;
+                counts[height] = counts[height].max(count);
             }
-            let count = u32::try_from(location.transaction_index)
-                .ok()?
-                .checked_add(1)?;
-            counts[height] = counts[height].max(count);
+        } else {
+            for location in self.tx_index.values() {
+                let height = usize::try_from(location.height).ok()?;
+                if height >= self.active_chain.len() {
+                    continue;
+                }
+                let count = u32::try_from(location.transaction_index)
+                    .ok()?
+                    .checked_add(1)?;
+                counts[height] = counts[height].max(count);
+            }
         }
         counts.iter().all(|count| *count > 0).then_some(counts)
     }
@@ -9397,6 +9516,28 @@ mod tests {
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert!(!reopened.history_materialized);
         assert_eq!(reopened.get_history(&script_hash), expected_history);
+    }
+
+    #[test]
+    fn active_transaction_locations_omit_redundant_block_hash() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let block = mine_block(&state, 1);
+        let txid = block.txdata[0].compute_txid();
+        state.connect_block(block).unwrap();
+
+        assert!(std::mem::size_of::<ActiveTxLocation>() < std::mem::size_of::<TxLocation>());
+        let compact = state.tx_index.get(&txid).copied().unwrap();
+        assert_eq!(compact.height, 1);
+        assert_eq!(compact.transaction_index, 0);
+        let location = state.transaction_location(&txid).unwrap();
+        assert_eq!(location.block_hash, state.block_hash(1).unwrap());
+        assert_eq!(location.height, compact.height);
+        assert_eq!(location.transaction_index, compact.transaction_index);
+
+        drop(state);
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.transaction_location(&txid), Some(location));
     }
 
     #[test]

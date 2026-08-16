@@ -4407,7 +4407,12 @@ fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
     let tip = chain.tip();
     let header = chain.header(tip.height).expect("tip header exists");
     let now = u32::try_from(crate::time::unix_time()).unwrap_or(u32::MAX);
-    let next_time = now.max(header.time.saturating_add(1));
+    let next_time = now.max(minimum_block_time(
+        chain.network,
+        header,
+        tip.height.saturating_add(1),
+        chain.median_time_past_value(),
+    ));
     let next_bits = chain.next_bits(next_time);
     let mempool = node.mempool.read();
     let mut result = json!({
@@ -16525,6 +16530,13 @@ mod tests {
         let info = get_mining_info(&node).unwrap();
         assert_eq!(info["currentblockweight"], json!(8_000));
         assert_eq!(info["currentblocktx"], json!(0));
+    }
+
+    #[test]
+    fn mining_minimum_time_uses_median_time_past() {
+        let mut parent = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        parent.time = 10_000;
+        assert_eq!(minimum_block_time(Network::Regtest, &parent, 1, 100), 101);
     }
 
     #[test]

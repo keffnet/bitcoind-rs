@@ -5422,7 +5422,7 @@ async fn maybe_send_fee_filter(
     let (mempool_min_fee, min_relay_fee, incremental_relay_fee) = {
         let mut mempool = node.mempool.write();
         (
-            mempool.mempool_min_fee_sat_per_kvb(),
+            mempool.mempool_get_min_fee_sat_per_kvb(),
             mempool.min_relay_fee_sat_per_kvb(),
             mempool.incremental_relay_fee_sat_per_kvb(),
         )

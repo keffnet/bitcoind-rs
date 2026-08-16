@@ -625,13 +625,28 @@ impl Mempool {
         self.policy.min_relay_fee_sat_per_kvb
     }
 
-    pub fn mempool_min_fee_sat_per_kvb(&mut self) -> u64 {
+    /// Return Core's rolling mempool minimum fee before the static relay
+    /// floor is applied.  Once the pool has bumped its rolling fee, Core
+    /// keeps that value at least at the incremental relay fee until decay
+    /// resets it to zero.
+    pub fn mempool_get_min_fee_sat_per_kvb(&mut self) -> u64 {
         self.decay_rolling_min_fee();
-        self.policy.min_relay_fee_sat_per_kvb.max(
-            self.rolling_min_fee_sat_per_kvb
-                .round()
-                .clamp(0.0, u64::MAX as f64) as u64,
-        )
+        let rolling = self
+            .rolling_min_fee_sat_per_kvb
+            .round()
+            .clamp(0.0, u64::MAX as f64) as u64;
+        if self.block_since_last_rolling_fee_bump && rolling != 0 {
+            rolling.max(self.policy.incremental_relay_fee_sat_per_kvb)
+        } else {
+            rolling
+        }
+    }
+
+    /// Return the effective admission/RPC floor, including minrelaytxfee.
+    pub fn mempool_min_fee_sat_per_kvb(&mut self) -> u64 {
+        self.policy
+            .min_relay_fee_sat_per_kvb
+            .max(self.mempool_get_min_fee_sat_per_kvb())
     }
 
     pub fn incremental_relay_fee_sat_per_kvb(&self) -> u64 {
@@ -4757,6 +4772,22 @@ mod tests {
         let decayed = pool.mempool_min_fee_sat_per_kvb();
         assert!(decayed < 10_000);
         assert!(decayed >= pool.min_relay_fee_sat_per_kvb());
+    }
+
+    #[test]
+    fn rolling_minimum_fee_keeps_core_incremental_floor_after_eviction() {
+        let policy = MempoolPolicy {
+            min_relay_fee_sat_per_kvb: 100,
+            incremental_relay_fee_sat_per_kvb: 1_000,
+            ..MempoolPolicy::default()
+        };
+        let mut pool = Mempool::with_max_bytes_and_policy(Network::Regtest, 300_000_000, policy);
+        pool.rolling_min_fee_sat_per_kvb = 500.0;
+        pool.block_since_last_rolling_fee_bump = true;
+        pool.rolling_fee_last_updated = time::unix_time();
+
+        assert_eq!(pool.mempool_get_min_fee_sat_per_kvb(), 1_000);
+        assert_eq!(pool.mempool_min_fee_sat_per_kvb(), 1_000);
     }
 
     fn insert_policy_entry(pool: &mut Mempool, transaction: Transaction) -> Txid {

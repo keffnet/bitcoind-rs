@@ -4496,27 +4496,11 @@ async fn serve_peer_loop(
             | Message::CFCheckpt(_)
             | Message::Unknown { .. } => {}
             Message::NotFound(items) => {
-                for item in items {
-                    if item.kind.is_transaction() {
+                if let Some(transaction_items) = notfound_transaction_items(&items) {
+                    for item in transaction_items {
                         peer_state.tx_requests.lock().remove_inventory(&item);
                     }
-                    if matches!(
-                        item.kind,
-                        InventoryType::Block
-                            | InventoryType::WitnessBlock
-                            | InventoryType::CompactBlock
-                    ) {
-                        node.clear_peer_block_request(peer_id, item.hash);
-                    }
                 }
-                flush_pending_block_requests(
-                    node,
-                    peer_id,
-                    writer,
-                    node.config.network,
-                    &mut pending_block_requests,
-                )
-                .await?;
                 flush_peer_transaction_requests(
                     node,
                     peer_id,
@@ -5592,6 +5576,18 @@ fn requested_block_transactions(block: &Block, indexes: &[u64]) -> Option<Vec<Tr
 
 fn compact_filter_checkpoint_heights(stop_height: u32) -> impl Iterator<Item = u32> {
     (1_000..=stop_height).step_by(1_000)
+}
+
+fn notfound_transaction_items(items: &[Inventory]) -> Option<Vec<Inventory>> {
+    (items.len() <= MAX_PEER_TX_ANNOUNCEMENTS.saturating_add(MAX_BLOCKS_IN_TRANSIT_PER_PEER)).then(
+        || {
+            items
+                .iter()
+                .filter(|item| item.kind.is_transaction())
+                .cloned()
+                .collect()
+        },
+    )
 }
 
 fn peer_can_request_mempool(peer_bloom_filters: bool, permissions: PeerPermissions) -> bool {
@@ -7234,6 +7230,26 @@ mod tests {
             compact_filter_checkpoint_heights(2_000).collect::<Vec<_>>(),
             vec![1_000, 2_000]
         );
+    }
+
+    #[test]
+    fn notfound_processing_matches_core_transaction_limits() {
+        let transaction = Inventory {
+            kind: InventoryType::WitnessTransaction,
+            hash: BlockHash::from_byte_array([1; 32]),
+        };
+        let block = Inventory {
+            kind: InventoryType::WitnessBlock,
+            hash: BlockHash::from_byte_array([2; 32]),
+        };
+        assert_eq!(
+            notfound_transaction_items(&[transaction.clone(), block]),
+            Some(vec![transaction.clone()])
+        );
+
+        let oversized =
+            vec![transaction; MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER + 1];
+        assert!(notfound_transaction_items(&oversized).is_none());
     }
 
     #[test]

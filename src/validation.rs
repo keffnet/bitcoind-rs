@@ -1195,6 +1195,24 @@ pub fn validate_transaction_scripts_at_time_with_block_hash_with_params(
     transaction: &Transaction,
     previous_outputs: &[bitcoin::TxOut],
 ) -> Result<(), ValidationError> {
+    let _ = block_time;
+    let flags = script_flags_for_block_with_params(params, height, block_hash);
+    validate_transaction_scripts_with_flags(transaction, previous_outputs, flags)
+}
+
+/// Core's mempool verifier uses all mandatory script rules regardless of the
+/// active chain height. This is stricter than the height-dependent flags used
+/// when validating a block and prevents policy-validity from changing merely
+/// because a node is on regtest or an early testnet block.
+pub(crate) fn mempool_script_flags() -> u32 {
+    bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT
+}
+
+pub(crate) fn validate_transaction_scripts_with_flags(
+    transaction: &Transaction,
+    previous_outputs: &[bitcoin::TxOut],
+    flags: u32,
+) -> Result<(), ValidationError> {
     if previous_outputs.len() != transaction.input.len() {
         return Err(ValidationError::Script {
             txid: transaction.compute_txid(),
@@ -1211,8 +1229,6 @@ pub fn validate_transaction_scripts_at_time_with_block_hash_with_params(
             value: output.value.to_sat() as i64,
         })
         .collect();
-    let _ = block_time;
-    let flags = script_flags_for_block_with_params(params, height, block_hash);
     for (input, previous_output) in previous_outputs.iter().enumerate() {
         if let Err(error) = bitcoinconsensus::verify_with_flags(
             previous_output.script_pubkey.as_bytes(),
@@ -1600,6 +1616,19 @@ mod tests {
             script_flags_for_block_with_hash(Network::Bitcoin, 1, None)
                 & bitcoinconsensus::VERIFY_TAPROOT,
             bitcoinconsensus::VERIFY_NONE
+        );
+    }
+
+    #[test]
+    fn mempool_script_flags_are_independent_of_block_height() {
+        let flags = mempool_script_flags();
+        assert_eq!(
+            flags,
+            bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT
+        );
+        assert_ne!(
+            script_flags_for_block(Network::Regtest, 0, 0) & bitcoinconsensus::VERIFY_DERSIG,
+            flags & bitcoinconsensus::VERIFY_DERSIG
         );
     }
 

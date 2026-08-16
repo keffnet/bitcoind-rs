@@ -4561,15 +4561,16 @@ impl ChainState {
             return Ok(());
         }
         let block_hash = block.block_hash();
+        let script_flags = validation::script_flags_for_block_with_params(
+            &self.deployment_parameters,
+            height,
+            Some(block_hash),
+        );
         let pending = jobs
             .iter()
             .filter(|job| {
-                let key = self.script_cache_key(
-                    height,
-                    Some(block_hash),
-                    job.transaction,
-                    &job.previous_outputs,
-                );
+                let key =
+                    self.script_cache_key(script_flags, job.transaction, &job.previous_outputs);
                 !self.script_cache.lock().entries.contains(&key)
             })
             .collect::<Vec<_>>();
@@ -4627,12 +4628,7 @@ impl ChainState {
 
         let mut cache = self.script_cache.lock();
         for job in pending {
-            let key = self.script_cache_key(
-                height,
-                Some(block_hash),
-                job.transaction,
-                &job.previous_outputs,
-            );
+            let key = self.script_cache_key(script_flags, job.transaction, &job.previous_outputs);
             if cache.entries.contains(&key) {
                 continue;
             }
@@ -4657,18 +4653,15 @@ impl ChainState {
         transaction: &Transaction,
         previous_outputs: &[TxOut],
     ) -> std::result::Result<(), ValidationError> {
-        let height = self.height().saturating_add(1);
-        let key = self.script_cache_key(height, None, transaction, previous_outputs);
+        let script_flags = validation::mempool_script_flags();
+        let key = self.script_cache_key(script_flags, transaction, previous_outputs);
         if self.script_cache.lock().entries.contains(&key) {
             return Ok(());
         }
-        validation::validate_transaction_scripts_at_time_with_block_hash_with_params(
-            &self.deployment_parameters,
-            height,
-            u32::MAX,
-            None,
+        validation::validate_transaction_scripts_with_flags(
             transaction,
             previous_outputs,
+            script_flags,
         )?;
         self.cache_script_validation(key);
         Ok(())
@@ -4690,8 +4683,7 @@ impl ChainState {
 
     fn script_cache_key(
         &self,
-        height: u32,
-        block_hash: Option<BlockHash>,
+        script_flags: u32,
         transaction: &Transaction,
         previous_outputs: &[TxOut],
     ) -> [u8; 32] {
@@ -4703,14 +4695,7 @@ impl ChainState {
             Network::Signet => b"signet".as_slice(),
             Network::Regtest => b"regtest".as_slice(),
         });
-        hasher.update(
-            validation::script_flags_for_block_with_params(
-                &self.deployment_parameters,
-                height,
-                block_hash,
-            )
-            .to_le_bytes(),
-        );
+        hasher.update(script_flags.to_le_bytes());
         hasher.update(transaction.compute_wtxid().to_byte_array());
         for output in previous_outputs {
             hasher.update(serialize(output));

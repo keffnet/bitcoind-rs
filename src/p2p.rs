@@ -325,10 +325,34 @@ fn inventory_broadcast_limit(pending: usize) -> usize {
 }
 
 fn transaction_inventory_send_due(
+    node: &Node,
     peer_state: &PeerState,
     now: Instant,
     average_interval: Duration,
 ) -> bool {
+    if peer_state.connection_type == "inbound" {
+        if peer_state
+            .next_tx_inventory_send
+            .lock()
+            .is_some_and(|deadline| now < deadline)
+        {
+            return false;
+        }
+        let deadline = {
+            let mut next_inbound = node.next_inbound_tx_inventory_send.lock();
+            match *next_inbound {
+                Some(deadline) if now < deadline => deadline,
+                _ => {
+                    let deadline = now + random_fee_filter_delay(average_interval);
+                    *next_inbound = Some(deadline);
+                    deadline
+                }
+            }
+        };
+        *peer_state.next_tx_inventory_send.lock() = Some(deadline);
+        return true;
+    }
+
     let mut next_send = peer_state.next_tx_inventory_send.lock();
     if next_send.is_some_and(|deadline| now < deadline) {
         return false;
@@ -3219,6 +3243,7 @@ async fn serve_peer_loop(
                     }
                 }
                 let inventory_send_due = transaction_inventory_send_due(
+                    node,
                     peer_state,
                     Instant::now(),
                     tx_inventory_average,

@@ -2985,6 +2985,7 @@ async fn serve_peer_loop(
     let mut verack_received = false;
     let mut verack_sent = false;
     let mut extensions_sent = false;
+    let mut send_headers_sent = false;
     let mut addrv2_received = false;
     let mut getaddr_received = false;
     let mut peer_version = 0i32;
@@ -3137,6 +3138,16 @@ async fn serve_peer_loop(
                     }
                     continue;
                 }
+                maybe_send_send_headers(
+                    node,
+                    peer_id,
+                    writer,
+                    peer_state,
+                    node.config.network,
+                    &mut send_headers_sent,
+                    peer_version,
+                )
+                .await?;
                 if let Some(staller) = node.take_stalled_block_peer() {
                     node.disconnect_peer(staller);
                 }
@@ -3286,6 +3297,7 @@ async fn serve_peer_loop(
                         peer_state,
                         node.config.network,
                         &mut extensions_sent,
+                        &mut send_headers_sent,
                         peer_version,
                     )
                     .await?;
@@ -3309,6 +3321,7 @@ async fn serve_peer_loop(
                     peer_state,
                     node.config.network,
                     &mut extensions_sent,
+                    &mut send_headers_sent,
                     peer_version,
                 )
                 .await?;
@@ -5152,6 +5165,7 @@ async fn send_peer_extensions(
     peer_state: &PeerState,
     network: Network,
     sent: &mut bool,
+    send_headers_sent: &mut bool,
     peer_version: i32,
 ) -> Result<()> {
     if *sent {
@@ -5161,9 +5175,16 @@ async fn send_peer_extensions(
         *sent = true;
         return Ok(());
     }
-    if peer_version >= SENDHEADERS_VERSION {
-        send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
-    }
+    maybe_send_send_headers(
+        node,
+        peer_id,
+        writer,
+        peer_state,
+        network,
+        send_headers_sent,
+        peer_version,
+    )
+    .await?;
     if peer_version >= WTXID_RELAY_VERSION {
         // Core negotiates BIP339 independently of whether this connection
         // accepts unsolicited transactions. Block-relay-only and blocksonly
@@ -5234,6 +5255,38 @@ async fn send_peer_extensions(
             .await?;
         }
     }
+    *sent = true;
+    Ok(())
+}
+
+async fn maybe_send_send_headers(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    peer_state: &PeerState,
+    network: Network,
+    sent: &mut bool,
+    peer_version: i32,
+) -> Result<()> {
+    if *sent || peer_version < SENDHEADERS_VERSION || *peer_state.private_broadcast_peer.lock() {
+        return Ok(());
+    }
+    let peer_best_known_block = node
+        .peer_infos()
+        .into_iter()
+        .find(|peer| peer.id == peer_id)
+        .and_then(|peer| peer.best_known_block);
+    let ready = {
+        let chain = node.chain.read();
+        send_headers_work_gate(
+            peer_best_known_block.and_then(|hash| chain.chain_work_by_hash(&hash)),
+            chain.minimum_chain_work(),
+        )
+    };
+    if !ready {
+        return Ok(());
+    }
+    send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
     *sent = true;
     Ok(())
 }
@@ -5757,6 +5810,10 @@ fn notfound_transaction_items(items: &[Inventory]) -> Option<Vec<Inventory>> {
 
 fn fee_filter_in_money_range(rate: i64) -> bool {
     rate >= 0 && u64::try_from(rate).is_ok_and(|rate| rate <= Amount::MAX_MONEY.to_sat())
+}
+
+fn send_headers_work_gate(peer_work: Option<Work>, minimum_chain_work: Work) -> bool {
+    peer_work.is_some_and(|work| work > minimum_chain_work)
 }
 
 /// Select the initial BIP133 filter using Core's relay policy. Core does not
@@ -7649,6 +7706,18 @@ mod tests {
     }
 
     #[test]
+    fn send_headers_waits_for_core_peer_work_threshold() {
+        let zero = Work::from_be_bytes([0; 32]);
+        let mut one_bytes = [0; 32];
+        one_bytes[31] = 1;
+        let one = Work::from_be_bytes(one_bytes);
+        assert!(!send_headers_work_gate(None, zero));
+        assert!(!send_headers_work_gate(Some(zero), zero));
+        assert!(send_headers_work_gate(Some(one), zero));
+        assert!(!send_headers_work_gate(Some(one), one));
+    }
+
+    #[test]
     fn outbound_fee_filter_matches_core_relay_policy() {
         assert_eq!(
             outbound_fee_filter(false, false, false, "outbound-full", 100, 100),
@@ -9501,6 +9570,7 @@ mod tests {
             tx_reconciliation_registered: parking_lot::Mutex::new(false),
         };
         let mut sent = false;
+        let mut send_headers_sent = false;
         send_peer_extensions(
             &node,
             1,
@@ -9508,17 +9578,12 @@ mod tests {
             &peer_state,
             Network::Regtest,
             &mut sent,
+            &mut send_headers_sent,
             WTXID_RELAY_VERSION,
         )
         .await
         .unwrap();
 
-        assert_eq!(
-            wire::read_message(&mut server_reader, Network::Regtest)
-                .await
-                .unwrap(),
-            Message::SendHeaders
-        );
         assert_eq!(
             wire::read_message(&mut server_reader, Network::Regtest)
                 .await

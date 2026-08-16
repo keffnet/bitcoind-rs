@@ -4089,9 +4089,13 @@ fn bip9_deployment_json(
     selected_height: u32,
     deployment: validation::Bip9Deployment,
 ) -> Value {
-    let next_height = selected_height.saturating_add(1);
-    let (state, since) = bip9_state_at_height(headers, deployment, next_height);
-    let (next_state, _) = bip9_state_at_height(headers, deployment, next_height.saturating_add(1));
+    // Core's VersionBitsCache::Info reports the state for the queried block
+    // and the state for the following block separately.  In particular, the
+    // first block of a signalling period must not make the preceding block
+    // appear to have already changed state.
+    let (state, since) = bip9_state_at_height(headers, deployment, selected_height);
+    let (next_state, _) =
+        bip9_state_at_height(headers, deployment, selected_height.saturating_add(1));
     let mut bip9 = json!({
         "start_time": deployment.start_time,
         "timeout": deployment.timeout,
@@ -4144,13 +4148,22 @@ fn bip9_deployment_json(
         bip9["statistics"] = statistics;
         bip9["signalling"] = json!(signalling);
     }
+    let active_since = if state == Bip9State::Active {
+        Some(since)
+    } else if next_state == Bip9State::Active {
+        // VersionBitsCache::Info uses the queried block's height plus one
+        // when activation starts in the next block.
+        Some(selected_height.saturating_add(1))
+    } else {
+        None
+    };
     let mut result = json!({
         "type": "bip9",
-        "active": state == Bip9State::Active,
+        "active": active_since.is_some(),
         "bip9": bip9,
     });
-    if state == Bip9State::Active {
-        result["height"] = json!(since);
+    if let Some(height) = active_since {
+        result["height"] = json!(height);
     }
     result
 }
@@ -18635,16 +18648,41 @@ mod tests {
 
         let locked_in_info =
             bip9_deployment_json(&headers, u32::try_from(period * 2 - 1).unwrap(), deployment);
-        assert_eq!(locked_in_info["bip9"]["status"], json!("locked_in"));
-        assert!(
-            locked_in_info["bip9"]["statistics"]
-                .get("threshold")
-                .is_none()
+        assert_eq!(locked_in_info["bip9"]["status"], json!("started"));
+        assert_eq!(locked_in_info["bip9"]["status_next"], json!("locked_in"));
+        assert_eq!(locked_in_info["bip9"]["since"], json!(period as u32));
+        assert_eq!(
+            locked_in_info["bip9"]["statistics"]["threshold"],
+            json!(deployment.threshold)
         );
-        assert!(
-            locked_in_info["bip9"]["statistics"]
-                .get("possible")
-                .is_none()
+        assert_eq!(
+            locked_in_info["bip9"]["statistics"]["possible"],
+            json!(true)
+        );
+
+        let period_boundary_info =
+            bip9_deployment_json(&headers, u32::try_from(period - 1).unwrap(), deployment);
+        assert_eq!(period_boundary_info["bip9"]["status"], json!("defined"));
+        assert_eq!(
+            period_boundary_info["bip9"]["status_next"],
+            json!("started")
+        );
+        assert!(period_boundary_info["bip9"].get("statistics").is_none());
+
+        let activation_boundary_info =
+            bip9_deployment_json(&headers, u32::try_from(period * 3 - 1).unwrap(), deployment);
+        assert_eq!(
+            activation_boundary_info["bip9"]["status"],
+            json!("locked_in")
+        );
+        assert_eq!(
+            activation_boundary_info["bip9"]["status_next"],
+            json!("active")
+        );
+        assert_eq!(activation_boundary_info["active"], json!(true));
+        assert_eq!(
+            activation_boundary_info["height"],
+            json!(u32::try_from(period * 3).unwrap())
         );
     }
 

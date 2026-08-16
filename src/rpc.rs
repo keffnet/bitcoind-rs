@@ -13396,7 +13396,9 @@ fn rpc_error_code(message: &str) -> i32 {
     {
         return -5;
     }
-    if lower == "filter not found. this error is unexpected and indicates index corruption." {
+    if lower == "filter not found. this error is unexpected and indicates index corruption."
+        || lower == "fee estimation disabled"
+    {
         return -32603;
     }
     if lower == "mallocinfo mode not available"
@@ -13855,6 +13857,7 @@ mod tests {
             ),
             -32603
         );
+        assert_eq!(rpc_error_code("Fee estimation disabled"), -32603);
     }
 
     #[test]

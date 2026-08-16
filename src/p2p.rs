@@ -1095,9 +1095,9 @@ fn murmur_hash3(seed: u32, data: &[u8]) -> u32 {
 }
 
 impl PeerReader {
-    async fn read_message(&mut self, network: Network) -> Result<(Message, usize)> {
+    async fn read_message(&mut self, network: Network) -> Result<(Option<Message>, usize)> {
         match self {
-            Self::V1(reader) => wire::read_message_with_size(reader, network).await,
+            Self::V1(reader) => wire::read_message_with_size_allow_reject(reader, network).await,
             Self::V2(reader) => loop {
                 let payload = reader.read().await?;
                 if payload.packet_type() == PacketType::Decoy {
@@ -1105,8 +1105,11 @@ impl PeerReader {
                 }
                 let contents = payload.contents();
                 let bytes = contents.len().saturating_add(20);
+                if !wire::v2_message_type_is_valid(contents) {
+                    break Ok((None, bytes));
+                }
                 let message = wire::decode_v2_message(contents)?;
-                break Ok((message, bytes));
+                break Ok((Some(message), bytes));
             },
         }
     }
@@ -2980,6 +2983,10 @@ async fn serve_peer_loop(
             }
             message = reader.read_message(node.config.network) => {
                 let (message, bytes) = message?;
+                let Some(message) = message else {
+                    node.record_bytes_received(peer_id, bytes, crate::P2P_MESSAGE_TYPE_OTHER);
+                    continue;
+                };
                 node.record_bytes_received(peer_id, bytes, message.command());
                 node.capture_message(peer_id, true, &message)?;
                 message

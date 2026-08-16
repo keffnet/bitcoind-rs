@@ -347,6 +347,27 @@ pub async fn read_message_with_size<R: AsyncRead + Unpin>(
     reader: &mut R,
     network: Network,
 ) -> Result<(Message, usize)> {
+    let (frame, size) = read_frame_with_size(reader).await?;
+    Ok((decode_message(network, &frame)?, size))
+}
+
+/// Read a v1 frame while preserving Core's distinction between a recoverable
+/// message rejection and a fatal transport/framing error. Core discards a
+/// complete frame with a bad checksum or invalid command header, accounts its
+/// bytes as `*other*`, and continues reading the connection.
+pub(crate) async fn read_message_with_size_allow_reject<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    network: Network,
+) -> Result<(Option<Message>, usize)> {
+    let (frame, size) = read_frame_with_size(reader).await?;
+    match decode_message(network, &frame) {
+        Ok(message) => Ok((Some(message), size)),
+        Err(_error) if frame_has_recoverable_error(network, &frame) => Ok((None, size)),
+        Err(error) => Err(error),
+    }
+}
+
+async fn read_frame_with_size<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(Vec<u8>, usize)> {
     let mut header = [0u8; HEADER_SIZE];
     reader.read_exact(&mut header).await?;
     let length = u32::from_le_bytes(header[16..20].try_into().expect("slice length")) as usize;
@@ -358,7 +379,16 @@ pub async fn read_message_with_size<R: AsyncRead + Unpin>(
     frame.resize(HEADER_SIZE + length, 0);
     reader.read_exact(&mut frame[HEADER_SIZE..]).await?;
     let size = frame.len();
-    Ok((decode_message(network, &frame)?, size))
+    Ok((frame, size))
+}
+
+fn frame_has_recoverable_error(network: Network, frame: &[u8]) -> bool {
+    if frame.len() < HEADER_SIZE || frame[..4] != network_magic(network) {
+        return false;
+    }
+    let command_valid = decode_command(&frame[4..16]).is_ok();
+    let checksum_valid = frame[20..24] == checksum(&frame[24..]);
+    !command_valid || !checksum_valid
 }
 
 pub async fn write_message<W: AsyncWrite + Unpin>(
@@ -531,6 +561,18 @@ pub fn decode_v2_message(payload: &[u8]) -> Result<Message> {
         )
     };
     decode_payload(&command, payload.get(payload_start..).unwrap_or_default()).map_err(Into::into)
+}
+
+pub(crate) fn v2_message_type_is_valid(payload: &[u8]) -> bool {
+    let Some(&message_type) = payload.first() else {
+        return false;
+    };
+    if message_type == 0 {
+        return payload
+            .get(1..13)
+            .is_some_and(|command| decode_command(command).is_ok());
+    }
+    v2_message_command(message_type).is_some()
 }
 
 fn validate_payload_size(size: usize) -> Result<()> {
@@ -1063,6 +1105,47 @@ mod tests {
         let message = Message::Version(VersionMessage::new(12, 99));
         let frame = encode_message(Network::Bitcoin, &message).unwrap();
         assert_eq!(decode_message(Network::Bitcoin, &frame).unwrap(), message);
+    }
+
+    #[tokio::test]
+    async fn recoverable_v1_frames_are_accounted_and_skipped() {
+        let mut bad_checksum = encode_message(Network::Regtest, &Message::Ping(1)).unwrap();
+        bad_checksum[20] ^= 1;
+        let mut bad_command = encode_message(Network::Regtest, &Message::Verack).unwrap();
+        bad_command[11] = b'x';
+        let valid = encode_message(Network::Regtest, &Message::Pong(2)).unwrap();
+        let total = bad_checksum.len() + bad_command.len() + valid.len();
+        let (mut writer, mut reader) = tokio::io::duplex(total);
+        writer.write_all(&bad_checksum).await.unwrap();
+        writer.write_all(&bad_command).await.unwrap();
+        writer.write_all(&valid).await.unwrap();
+        drop(writer);
+
+        let (message, size) = read_message_with_size_allow_reject(&mut reader, Network::Regtest)
+            .await
+            .unwrap();
+        assert!(message.is_none());
+        assert_eq!(size, bad_checksum.len());
+        let (message, size) = read_message_with_size_allow_reject(&mut reader, Network::Regtest)
+            .await
+            .unwrap();
+        assert!(message.is_none());
+        assert_eq!(size, bad_command.len());
+        let (message, size) = read_message_with_size_allow_reject(&mut reader, Network::Regtest)
+            .await
+            .unwrap();
+        assert_eq!(message, Some(Message::Pong(2)));
+        assert_eq!(size, valid.len());
+    }
+
+    #[test]
+    fn invalid_v2_message_types_are_recoverable() {
+        assert!(!v2_message_type_is_valid(&[]));
+        assert!(!v2_message_type_is_valid(&[0xff]));
+        assert!(!v2_message_type_is_valid(&[0]));
+        assert!(v2_message_type_is_valid(
+            &encode_v2_message(&Message::Ping(42)).unwrap()
+        ));
     }
 
     #[test]

@@ -367,6 +367,10 @@ fn approximate_best_block_depth(node: &Arc<Node>) -> i64 {
     now.saturating_sub(tip_time) / spacing
 }
 
+fn peer_nonce_is_self_connection(outbound: bool, peer_nonce: u64, local_nonce: u64) -> bool {
+    !outbound && peer_nonce == local_nonce
+}
+
 fn addr_fetch_timed_out(connected_at: u64, now: u64) -> bool {
     now.saturating_sub(connected_at) > ADDR_FETCH_TIMEOUT_SECS
 }
@@ -3198,7 +3202,7 @@ async fn serve_peer_loop(
                 if version.version < MIN_PEER_PROTO_VERSION {
                     anyhow::bail!("peer protocol version is too old");
                 }
-                if version.nonce == local_nonce {
+                if peer_nonce_is_self_connection(outbound, version.nonce, local_nonce) {
                     anyhow::bail!("peer connected to itself");
                 }
                 if peer_state.connection_type == "feeler" {
@@ -6333,6 +6337,13 @@ mod tests {
         assert!(peer_services_are_desirable(limited, 143));
         assert!(!peer_services_are_desirable(limited, 144));
         assert!(peer_services_are_desirable(full, 144));
+    }
+
+    #[test]
+    fn self_connection_nonce_is_checked_only_for_inbound_peers() {
+        assert!(peer_nonce_is_self_connection(false, 42, 42));
+        assert!(!peer_nonce_is_self_connection(true, 42, 42));
+        assert!(!peer_nonce_is_self_connection(false, 43, 42));
     }
 
     #[test]

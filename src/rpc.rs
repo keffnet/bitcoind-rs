@@ -11991,9 +11991,32 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
         if let Err(failure) = package_result {
             return package_test_failure_json(&transactions, &candidate, failure);
         }
+        let no_preexisting = HashSet::new();
+        let max_fee_failure =
+            first_max_fee_failure_index(&transactions, &candidate, &no_preexisting, max_fee_rate);
         let mut result = Vec::with_capacity(transactions.len());
         let mut exit_early = false;
-        for transaction in &transactions {
+        for (index, transaction) in transactions.iter().enumerate() {
+            if let Some(max_fee_failure) = max_fee_failure {
+                if index == max_fee_failure {
+                    let entry = candidate
+                        .get(&transaction.compute_txid())
+                        .ok_or_else(|| anyhow!("accepted package transaction disappeared"))?;
+                    result.push(json!({
+                        "txid": transaction.compute_txid().to_string(),
+                        "wtxid": transaction.compute_wtxid().to_string(),
+                        "allowed": false,
+                        "reject-reason": "max-fee-exceeded",
+                    }));
+                    debug_assert!(exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate));
+                } else {
+                    result.push(json!({
+                        "txid": transaction.compute_txid().to_string(),
+                        "wtxid": transaction.compute_wtxid().to_string(),
+                    }));
+                }
+                continue;
+            }
             if exit_early {
                 result.push(json!({
                     "txid": transaction.compute_txid().to_string(),

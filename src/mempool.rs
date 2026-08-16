@@ -2079,7 +2079,7 @@ impl Mempool {
                     median_time_past: chain.median_time_past_value(),
                     coinbase: false,
                 });
-                output
+                output.clone()
             } else {
                 let entry = chain
                     .utxo(&input.previous_output)
@@ -2088,7 +2088,7 @@ impl Mempool {
                     return Err(MempoolError::MissingInput(input.previous_output));
                 }
                 previous_entries.push(entry.clone());
-                &entry.output
+                entry.output.clone()
             };
             input_total = input_total
                 .checked_add(previous.value.to_sat())
@@ -4053,7 +4053,6 @@ mod tests {
         let (funding_outpoint, funding) = chain
             .all_utxos()
             .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
-            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
             .expect("matured coinbase output");
 
         let parent = Transaction {
@@ -4117,7 +4116,6 @@ mod tests {
         let (outpoint, utxo) = chain
             .all_utxos()
             .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
-            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
             .expect("matured coinbase output");
         let transaction = Transaction {
             version: Version::ONE,
@@ -4464,7 +4462,6 @@ mod tests {
         let (outpoint, entry) = chain
             .all_utxos()
             .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
-            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
             .expect("matured coinbase output");
         let transaction = Transaction {
             version: Version::ONE,
@@ -4512,7 +4509,6 @@ mod tests {
         let (outpoint, entry) = chain
             .all_utxos()
             .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
-            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
             .expect("matured coinbase output");
         let transaction = Transaction {
             version: Version::ONE,
@@ -4611,7 +4607,6 @@ mod tests {
         let (outpoint, entry) = chain
             .all_utxos()
             .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
-            .map(|(outpoint, entry)| (*outpoint, entry.clone()))
             .expect("matured coinbase output");
 
         let sigop_count = 100usize;

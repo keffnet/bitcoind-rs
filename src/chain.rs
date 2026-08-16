@@ -816,6 +816,7 @@ pub struct ChainState {
     prune_target_size: Option<u64>,
     prune_after_height: u32,
     utxos: HashMap<OutPoint, UtxoEntry>,
+    utxos_materialized: bool,
     tx_index: HashMap<Txid, TxLocation>,
     // Most txids have one active-chain location. Keep duplicate locations
     // separately so the Core-style txindex remains a latest-location map
@@ -1220,6 +1221,7 @@ impl ChainState {
             // the owning Node applies the network-specific Core parameter.
             prune_after_height: MIN_BLOCKS_TO_KEEP,
             utxos: HashMap::new(),
+            utxos_materialized: true,
             tx_index: HashMap::new(),
             tx_index_duplicates: HashMap::new(),
             tx_index_all: HashMap::new(),
@@ -1385,6 +1387,7 @@ impl ChainState {
         {
             state.start_background_validation()?;
         }
+        state.release_materialized_utxos();
         Ok(state)
     }
 
@@ -1646,7 +1649,12 @@ impl ChainState {
             self.coin_stats = None;
             return Ok(());
         }
-        self.coin_stats = Some(CoinStatsState::from_utxos(&self.utxos));
+        let utxos = if self.utxos_materialized {
+            self.utxos.clone()
+        } else {
+            self.load_utxo_map_from_store()?
+        };
+        self.coin_stats = Some(CoinStatsState::from_utxos(&utxos));
         self.rebuild_coinstats_index()
     }
 
@@ -2124,6 +2132,7 @@ impl ChainState {
                 ..
             } => {
                 self.utxos = utxos;
+                self.utxos_materialized = true;
                 self.snapshot_base = None;
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
@@ -2134,6 +2143,7 @@ impl ChainState {
             BackgroundValidationOutcome::Failed { error, utxos, .. } => {
                 if let Some(utxos) = utxos {
                     self.utxos = utxos;
+                    self.utxos_materialized = true;
                     self.snapshot_base = None;
                     self.snapshot_validated = true;
                     self.snapshot_validation_error = None;
@@ -3488,12 +3498,21 @@ impl ChainState {
         Ok(outputs)
     }
 
-    pub fn utxo(&self, outpoint: &OutPoint) -> Option<&UtxoEntry> {
-        self.utxos.get(outpoint)
+    pub fn utxo(&self, outpoint: &OutPoint) -> Option<UtxoEntry> {
+        self.utxo_store
+            .get(outpoint)
+            .ok()
+            .flatten()
+            .map(Self::decoded_utxo)
+            .or_else(|| self.utxos.get(outpoint).cloned())
     }
 
-    pub fn all_utxos(&self) -> impl Iterator<Item = (&OutPoint, &UtxoEntry)> {
-        self.utxos.iter()
+    pub fn all_utxos(&self) -> impl Iterator<Item = (OutPoint, UtxoEntry)> {
+        self.utxo_store
+            .entries()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(outpoint, entry)| (outpoint, Self::decoded_utxo(entry)))
     }
 
     pub fn utxo_stats(&self) -> (usize, usize, u64) {
@@ -3522,13 +3541,15 @@ impl ChainState {
             if !include_serialized_hash {
                 return coin_stats.statistics(include_muhash);
             }
-            let mut statistics = calculate_utxo_statistics(&self.utxos, true, false);
+            let utxos = self.active_utxo_map_for_read();
+            let mut statistics = calculate_utxo_statistics(&utxos, true, false);
             if include_muhash {
                 statistics.muhash = Some(coin_stats.muhash.finalize());
             }
             return statistics;
         }
-        calculate_utxo_statistics(&self.utxos, include_serialized_hash, include_muhash)
+        let utxos = self.active_utxo_map_for_read();
+        calculate_utxo_statistics(&utxos, include_serialized_hash, include_muhash)
     }
 
     pub fn utxo_statistics_without_index(
@@ -3536,7 +3557,8 @@ impl ChainState {
         include_serialized_hash: bool,
         include_muhash: bool,
     ) -> UtxoSetStats {
-        calculate_utxo_statistics(&self.utxos, include_serialized_hash, include_muhash)
+        let utxos = self.active_utxo_map_for_read();
+        calculate_utxo_statistics(&utxos, include_serialized_hash, include_muhash)
     }
 
     /// Calculate UTXO statistics at a stored block. A historical state is
@@ -3553,7 +3575,7 @@ impl ChainState {
             return Ok(None);
         };
         let utxos = if hash == self.best_hash() {
-            self.utxos.clone()
+            self.active_utxo_map_for_read()
         } else {
             let Some(utxos) = self.replay_utxos_for_block(hash, false)? else {
                 return Ok(None);
@@ -3597,8 +3619,9 @@ impl ChainState {
     }
 
     pub fn dump_utxo_set(&self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {
-        write_core_utxo_snapshot(path.as_ref(), self.network, self.best_hash(), &self.utxos)?;
-        Ok((self.utxos.len() as u64, self.best_hash(), self.height()))
+        let utxos = self.load_utxo_map_from_store()?;
+        write_core_utxo_snapshot(path.as_ref(), self.network, self.best_hash(), &utxos)?;
+        Ok((utxos.len() as u64, self.best_hash(), self.height()))
     }
 
     /// Write a snapshot for an active historical block without changing the
@@ -3620,7 +3643,7 @@ impl ChainState {
         }
 
         let utxos = if target_hash == self.best_hash() {
-            self.utxos.clone()
+            self.load_utxo_map_from_store()?
         } else {
             self.replay_utxos_for_block(target_hash, false)?
                 .context("could not reconstruct the historical UTXO set")?
@@ -3781,6 +3804,7 @@ impl ChainState {
             }
         }
         self.utxos = snapshot.utxos;
+        self.utxos_materialized = true;
         self.block_undo_cache.clear();
         self.persist_snapshot()?;
         self.clear_snapshot_provenance()?;
@@ -3921,6 +3945,7 @@ impl ChainState {
         let coins_count = snapshot.coins_count;
         let base_hash = snapshot.base_hash;
         self.utxos = snapshot.utxos;
+        self.utxos_materialized = true;
         self.block_undo_cache.clear();
         self.persist_snapshot()?;
         Ok(((coins_count, base_hash, base_height), fully_validated))
@@ -4097,7 +4122,11 @@ impl ChainState {
             return Ok(());
         }
 
-        let original_utxos = self.utxos.clone();
+        let original_utxos = if self.utxos_materialized {
+            self.utxos.clone()
+        } else {
+            self.load_utxo_map_from_store()?
+        };
         let mut working_utxos = original_utxos.clone();
         for (height, block, undo) in blocks.iter().rev() {
             self.disconnect_block_for_verification(
@@ -4492,7 +4521,11 @@ impl ChainState {
             .context("active block height is unavailable")?;
         let tip_height = self.height();
         if target_height >= tip_height {
-            return Ok(Some(self.utxos.clone()));
+            return Ok(Some(if self.utxos_materialized {
+                self.utxos.clone()
+            } else {
+                self.load_utxo_map_from_store()?
+            }));
         }
 
         // The two historical duplicate-coinbase branches require Core's
@@ -4507,7 +4540,11 @@ impl ChainState {
             return Ok(None);
         }
 
-        let mut utxos = self.utxos.clone();
+        let mut utxos = if self.utxos_materialized {
+            self.utxos.clone()
+        } else {
+            self.load_utxo_map_from_store()?
+        };
         for height in (target_height + 1..=tip_height).rev() {
             let block_hash = self.active_chain[height as usize];
             let Some(block) = self.store.get(&block_hash)? else {
@@ -4694,7 +4731,11 @@ impl ChainState {
         use_active_cache: bool,
     ) -> Result<Option<HashMap<OutPoint, UtxoEntry>>> {
         if use_active_cache && hash == self.best_hash() {
-            return Ok(Some(self.utxos.clone()));
+            return Ok(Some(if self.utxos_materialized {
+                self.utxos.clone()
+            } else {
+                self.load_utxo_map_from_store()?
+            }));
         }
         if let Some(utxos) = self.replay_active_utxos_backwards(hash)? {
             return Ok(Some(utxos));
@@ -5214,8 +5255,8 @@ impl ChainState {
             .iter()
             .map(|(outpoint, _)| *outpoint)
             .collect::<Vec<_>>();
-        for (outpoint, _) in &application.spent_entries {
-            self.remove_utxo(outpoint);
+        for (outpoint, entry) in &application.spent_entries {
+            self.remove_utxo_entry(outpoint, entry);
         }
         let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
         for (transaction_index, transaction) in block.txdata.iter().enumerate() {
@@ -5506,6 +5547,7 @@ impl ChainState {
         if self.has_invalid_ancestor(tip_hash) {
             bail!("cannot activate an invalidated chain")
         }
+        self.materialize_utxos()?;
         let mut path = Vec::new();
         let mut cursor = tip_hash;
         loop {
@@ -5552,6 +5594,7 @@ impl ChainState {
         let old_active_tx_counts = std::mem::take(&mut self.active_tx_counts);
         let old_active_tx_totals = std::mem::take(&mut self.active_tx_totals);
         let old_utxos = std::mem::take(&mut self.utxos);
+        let old_utxos_materialized = self.utxos_materialized;
         let old_tx_index = std::mem::take(&mut self.tx_index);
         let old_tx_index_duplicates = std::mem::take(&mut self.tx_index_duplicates);
         let mut tx_index_all_changes = HashMap::new();
@@ -5569,6 +5612,7 @@ impl ChainState {
         self.active_tx_counts.clear();
         self.active_tx_totals.clear();
         self.utxos.clear();
+        self.utxos_materialized = true;
         self.tx_index.clear();
         self.tx_index_duplicates.clear();
         self.history.clear();
@@ -5639,6 +5683,7 @@ impl ChainState {
             self.active_tx_counts = old_active_tx_counts;
             self.active_tx_totals = old_active_tx_totals;
             self.utxos = old_utxos;
+            self.utxos_materialized = old_utxos_materialized;
             self.tx_index = old_tx_index;
             self.tx_index_duplicates = old_tx_index_duplicates;
             for (txid, previous) in tx_index_all_changes {
@@ -5672,6 +5717,7 @@ impl ChainState {
         } else {
             self.background_validation = old_background_validation;
         }
+        self.release_materialized_utxos();
         self.update_ibd_status();
         Ok(())
     }
@@ -6051,6 +6097,46 @@ impl ChainState {
         }
     }
 
+    fn decoded_utxo(entry: StoredUtxo) -> UtxoEntry {
+        UtxoEntry {
+            output: entry.output,
+            height: entry.height,
+            median_time_past: entry.median_time_past,
+            coinbase: entry.coinbase,
+        }
+    }
+
+    fn load_utxo_map_from_store(&self) -> Result<HashMap<OutPoint, UtxoEntry>> {
+        Ok(self
+            .utxo_store
+            .entries()?
+            .into_iter()
+            .map(|(outpoint, entry)| (outpoint, Self::decoded_utxo(entry)))
+            .collect())
+    }
+
+    fn active_utxo_map_for_read(&self) -> HashMap<OutPoint, UtxoEntry> {
+        if self.utxos_materialized {
+            self.utxos.clone()
+        } else {
+            self.load_utxo_map_from_store()
+                .unwrap_or_else(|_| self.utxos.clone())
+        }
+    }
+
+    fn materialize_utxos(&mut self) -> Result<()> {
+        if !self.utxos_materialized {
+            self.utxos = self.load_utxo_map_from_store()?;
+            self.utxos_materialized = true;
+        }
+        Ok(())
+    }
+
+    fn release_materialized_utxos(&mut self) {
+        self.utxos.clear();
+        self.utxos_materialized = false;
+    }
+
     fn utxo_store_tip_path(&self) -> PathBuf {
         self.data_dir.join("chainstate/utxos.tip")
     }
@@ -6065,6 +6151,12 @@ impl ChainState {
     }
 
     fn sync_utxo_store(&mut self) -> Result<()> {
+        if !self.utxos_materialized {
+            // Normal active-chain connects already commit the exact mutation
+            // batch to the durable store. There is no resident map to copy
+            // back, and rewriting the store here would destroy that state.
+            return self.persist_utxo_store_tip();
+        }
         let entries = self
             .utxos
             .iter()
@@ -6093,21 +6185,33 @@ impl ChainState {
     }
 
     fn insert_utxo(&mut self, outpoint: OutPoint, entry: UtxoEntry) {
-        if self.utxos.contains_key(&outpoint) {
-            self.remove_utxo(&outpoint);
+        if self.utxos_materialized {
+            if self.utxos.contains_key(&outpoint) {
+                self.remove_utxo(&outpoint);
+            }
+            self.utxos.insert(outpoint, entry.clone());
+        } else if let Ok(Some(previous)) = self.utxo_store.get(&outpoint) {
+            if let Some(stats) = self.coin_stats.as_mut() {
+                stats.remove(&outpoint, &Self::decoded_utxo(previous));
+            }
         }
-        self.utxos.insert(outpoint, entry.clone());
         if let Some(stats) = self.coin_stats.as_mut() {
             stats.add(&outpoint, &entry);
         }
     }
 
     fn remove_utxo(&mut self, outpoint: &OutPoint) -> Option<UtxoEntry> {
-        let entry = self.utxos.remove(outpoint)?;
-        if let Some(stats) = self.coin_stats.as_mut() {
-            stats.remove(outpoint, &entry);
-        }
+        let entry = self
+            .utxos_materialized
+            .then(|| self.utxos.remove(outpoint))??;
+        self.remove_utxo_entry(outpoint, &entry);
         Some(entry)
+    }
+
+    fn remove_utxo_entry(&mut self, outpoint: &OutPoint, entry: &UtxoEntry) {
+        if let Some(stats) = self.coin_stats.as_mut() {
+            stats.remove(outpoint, entry);
+        }
     }
 
     fn add_history(&mut self, script_hash: &str, entry: HistoryEntry) {
@@ -6496,7 +6600,7 @@ impl ChainState {
 
     fn persist_snapshot(&mut self) -> Result<()> {
         self.sync_utxo_store()?;
-        let snapshot = self.current_snapshot();
+        let snapshot = self.current_snapshot()?;
         let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
         let temp = self.data_dir.join("chainstate.snapshot.tmp");
@@ -6673,11 +6777,16 @@ impl ChainState {
         self.remove_snapshot_provenance_file()
     }
 
-    fn current_snapshot(&self) -> ChainSnapshot {
-        ChainSnapshot {
+    fn current_snapshot(&self) -> Result<ChainSnapshot> {
+        let utxos = if self.utxos_materialized {
+            self.utxos.clone()
+        } else {
+            self.load_utxo_map_from_store()?
+        };
+        Ok(ChainSnapshot {
             tip: self.best_hash().to_string(),
             headers: self.headers.clone(),
-            utxos: self.utxos.clone(),
+            utxos,
             tx_index: self.tx_index.clone(),
             tx_index_duplicates: self.tx_index_duplicates.clone(),
             tx_index_all: if self.tx_index_all_enabled {
@@ -6688,7 +6797,7 @@ impl ChainState {
             history: self.history.clone(),
             spent_by: self.txospender_index_enabled.then(|| self.spent_by.clone()),
             prune_height: self.prune_height,
-        }
+        })
     }
 
     fn index_active_headers(&mut self, headers: &[bitcoin::block::Header]) -> Result<()> {
@@ -6963,6 +7072,7 @@ fn open_background_replay_state(
         prune_target_size: None,
         prune_after_height: MIN_BLOCKS_TO_KEEP,
         utxos: HashMap::new(),
+        utxos_materialized: true,
         tx_index: HashMap::new(),
         tx_index_duplicates: HashMap::new(),
         tx_index_all: HashMap::new(),
@@ -7980,7 +8090,7 @@ mod tests {
             state.connect_block(block).unwrap();
         }
         let base = state.best_hash();
-        let expected = state.utxos.clone();
+        let expected = state.load_utxo_map_from_store().unwrap();
         state.persist_snapshot().unwrap();
         state
             .persist_assumeutxo_base_snapshot(base, &expected)
@@ -7999,7 +8109,7 @@ mod tests {
         }
         assert!(state.snapshot_provenance().is_none());
         assert!(state.background_chainstate().is_none());
-        assert_eq!(state.utxos, expected);
+        assert_eq!(state.load_utxo_map_from_store().unwrap(), expected);
         assert!(!directory.path().join("assumeutxo.bin").exists());
         assert!(!directory.path().join("assumeutxo-base.bin").exists());
     }
@@ -8013,7 +8123,7 @@ mod tests {
             state.connect_block(block).unwrap();
         }
         let base = state.best_hash();
-        let expected = state.utxos.clone();
+        let expected = state.load_utxo_map_from_store().unwrap();
         state.persist_snapshot().unwrap();
         state
             .persist_assumeutxo_base_snapshot(base, &HashMap::new())
@@ -8031,7 +8141,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(state.snapshot_provenance().is_none());
-        assert_eq!(state.utxos, expected);
+        assert_eq!(state.load_utxo_map_from_store().unwrap(), expected);
         assert!(state.snapshot_validation_error().is_none());
     }
 
@@ -8143,7 +8253,7 @@ mod tests {
             prune_height: state.prune_height,
             prune_locks: HashMap::new(),
         };
-        let snapshot = state.current_snapshot();
+        let snapshot = state.current_snapshot().unwrap();
         let metadata_json = serde_json::to_vec_pretty(&metadata).unwrap();
         let snapshot_json = serde_json::to_vec(&snapshot).unwrap();
         let tip = state.best_hash();
@@ -8933,6 +9043,7 @@ mod tests {
                 .unwrap();
         }
         state.verify_active_chain_with_level(4, 0).unwrap();
+        state.materialize_utxos().unwrap();
         let original_utxos = state.utxos.clone();
         let corrupted_outpoint = *state.utxos.keys().next().unwrap();
         state
@@ -8956,7 +9067,7 @@ mod tests {
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.height(), 2);
         assert_eq!(reopened.block_hash(1), Some(first_hash));
-        assert_eq!(reopened.utxos.len(), 2);
+        assert_eq!(reopened.all_utxos().count(), 2);
         assert_eq!(reopened.get_utxos(&script_hash).len(), 2);
         drop(reopened);
         let snapshot_path = directory.path().join("chainstate.snapshot");
@@ -8975,6 +9086,20 @@ mod tests {
         fs::write(directory.path().join("chainstate.snapshot"), b"corrupt").unwrap();
         let replayed = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(replayed.height(), 2);
+    }
+
+    #[test]
+    fn active_utxo_values_are_served_from_the_durable_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        state.connect_block(mine_block(&state, 2)).unwrap();
+
+        assert!(!state.utxos_materialized);
+        assert!(state.utxos.is_empty());
+        assert_eq!(state.all_utxos().count(), 2);
+        assert_eq!(state.utxo_stats(), (2, 2, 10_000_000_000));
+        assert_eq!(state.utxo_store.len(), 2);
     }
 
     #[test]
@@ -9924,7 +10049,7 @@ mod tests {
         };
         let second_txid = second.compute_txid();
         state.persist_snapshot().unwrap();
-        let expected_before_spend = state.utxos.clone();
+        let expected_before_spend = state.load_utxo_map_from_store().unwrap();
         let previous = *state.header(100).expect("height 100 header");
         let mut block = Block {
             header: Header {

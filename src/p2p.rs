@@ -371,6 +371,10 @@ fn peer_nonce_is_self_connection(outbound: bool, peer_nonce: u64, local_nonce: u
     !outbound && peer_nonce == local_nonce
 }
 
+fn peer_time_offset(peer_timestamp: i64, now: i64) -> i64 {
+    peer_timestamp.max(0).saturating_sub(now)
+}
+
 fn addr_fetch_timed_out(connected_at: u64, now: u64) -> bool {
     now.saturating_sub(connected_at) > ADDR_FETCH_TIMEOUT_SECS
 }
@@ -3248,7 +3252,7 @@ async fn serve_peer_loop(
                     node.record_peer_inv_sequence(peer_id, 1);
                 }
                 let now = i64::try_from(crate::time::unix_time()).unwrap_or(i64::MAX);
-                node.update_peer_time_offset(peer_id, version.timestamp.saturating_sub(now));
+                node.update_peer_time_offset(peer_id, peer_time_offset(version.timestamp, now));
                 *relay_transactions.lock() = version.relay;
                 if !verack_sent {
                     send_peer_extensions(
@@ -6344,6 +6348,13 @@ mod tests {
         assert!(peer_nonce_is_self_connection(false, 42, 42));
         assert!(!peer_nonce_is_self_connection(true, 42, 42));
         assert!(!peer_nonce_is_self_connection(false, 43, 42));
+    }
+
+    #[test]
+    fn peer_time_offset_clamps_negative_version_timestamps() {
+        assert_eq!(peer_time_offset(-1, 100), -100);
+        assert_eq!(peer_time_offset(50, 100), -50);
+        assert_eq!(peer_time_offset(150, 100), 50);
     }
 
     #[test]

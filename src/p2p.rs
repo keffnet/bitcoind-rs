@@ -3360,7 +3360,7 @@ async fn serve_peer_loop(
                 if verack_received {
                     anyhow::bail!("wtxidrelay received after verack");
                 }
-                if peer_version >= WTXID_RELAY_VERSION && peer_state.local_relay_transactions {
+                if peer_version >= WTXID_RELAY_VERSION {
                     *peer_state.wtxid_relay.lock() = true;
                 }
             }
@@ -5165,9 +5165,10 @@ async fn send_peer_extensions(
         send_message(node, peer_id, writer, network, &Message::SendHeaders).await?;
     }
     if peer_version >= WTXID_RELAY_VERSION {
-        if peer_state.local_relay_transactions {
-            send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
-        }
+        // Core negotiates BIP339 independently of whether this connection
+        // accepts unsolicited transactions. Block-relay-only and blocksonly
+        // peers still exchange the extension before VERACK.
+        send_message(node, peer_id, writer, network, &Message::WtxidRelay).await?;
         send_message(node, peer_id, writer, network, &Message::SendAddrV2).await?;
         if node.config.zmq.tx_reconciliation
             && *peer_state.relay_transactions.lock()

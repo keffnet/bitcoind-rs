@@ -14,7 +14,7 @@ use anyhow::{Context, Result, bail};
 use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
-use bitcoin::{Block, BlockHash, Transaction, TxOut, Txid};
+use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
 use rand::random;
 use serde::{Deserialize, Serialize};
 
@@ -23,15 +23,42 @@ const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_FILTER_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_CHAINSTATE_DELTA_SIZE: usize = 64 * 1024 * 1024;
 const MAX_STORED_ELECTRUM_BLOCK_SIZE: usize = 4 * 1024 * 1024;
+const MAX_STORED_UTXO_SIZE: usize = 100 * 1024;
 const XOR_KEY_SIZE: usize = 8;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
+const UTXO_DATA_MAGIC: &[u8] = b"bitcoind-rs-utxo-v1\0";
+const UTXO_INDEX_MAGIC: &[u8] = b"bitcoind-rs-utxo-index-v1\0";
+const UTXO_PUT: u8 = 1;
+const UTXO_DELETE: u8 = 2;
+const UTXO_COMMIT: u8 = 3;
 
 #[derive(Clone, Copy, Debug)]
 struct Record {
     offset: u64,
     length: u32,
 }
+
+/// The serialized value kept by the durable UTXO store.
+///
+/// This type deliberately lives in the storage layer so the store does not
+/// depend on ChainState.  ChainState converts it to and from its public
+/// `UtxoEntry` type at the integration boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredUtxo {
+    pub output: TxOut,
+    pub height: u32,
+    pub median_time_past: u32,
+    pub coinbase: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UtxoLocation {
+    offset: u64,
+    length: u32,
+}
+
+type UtxoIndexState = (HashMap<OutPoint, UtxoLocation>, u64, u64);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct XorKey([u8; XOR_KEY_SIZE]);
@@ -953,6 +980,751 @@ impl Drop for ChainstateStore {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PendingUtxoOperation {
+    Put {
+        outpoint: OutPoint,
+        location: UtxoLocation,
+    },
+    Delete {
+        outpoint: OutPoint,
+    },
+}
+
+/// Crash-recoverable, batched UTXO storage.
+///
+/// The value log is append-only and each mutation batch ends with a commit
+/// marker.  A torn final record or an uncommitted batch is discarded on the
+/// next open.  A separate append-only location index avoids decoding the
+/// value log during ordinary restarts; if the index is stale or damaged, the
+/// value log is replayed and the index is rebuilt.
+pub struct UtxoStore {
+    path: PathBuf,
+    index_path: PathBuf,
+    file: File,
+    index_file: File,
+    index: HashMap<OutPoint, UtxoLocation>,
+    next_batch_id: u64,
+    generation: u64,
+    pending_write_bytes: usize,
+}
+
+impl UtxoStore {
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref();
+        create_dir_all(directory)
+            .with_context(|| format!("creating UTXO store {}", directory.display()))?;
+        let path = directory.join("utxos.dat");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening UTXO store {}", path.display()))?;
+        if file.metadata()?.len() == 0 {
+            file.write_all(UTXO_DATA_MAGIC)?;
+            file.sync_data()?;
+        } else {
+            let mut magic = vec![0u8; UTXO_DATA_MAGIC.len()];
+            file.seek(SeekFrom::Start(0))?;
+            file.read_exact(&mut magic)?;
+            if magic != UTXO_DATA_MAGIC {
+                bail!("UTXO store has an unknown format");
+            }
+        }
+
+        let index_path = directory.join("utxos.index");
+        let mut index_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&index_path)
+            .with_context(|| format!("opening UTXO index {}", index_path.display()))?;
+        let data_len = file.metadata()?.len();
+        let loaded_index = load_utxo_index(&mut index_file, data_len)?;
+        let (index, next_batch_id, generation) = if let Some(index) = loaded_index {
+            index
+        } else {
+            let (index, next_batch_id) = scan_utxo_data(&mut file)?;
+            // A rebuilt index must not reuse a tip marker from an interrupted
+            // replacement, even if the resulting data happens to have the
+            // same length as the old value log.
+            let generation = random::<u64>().max(1);
+            rewrite_utxo_index(
+                &mut index_file,
+                data_len_after(&file)?,
+                next_batch_id,
+                generation,
+                &index,
+            )?;
+            (index, next_batch_id, generation)
+        };
+        Ok(Self {
+            path,
+            index_path,
+            file,
+            index_file,
+            index,
+            next_batch_id,
+            generation,
+            pending_write_bytes: 0,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn index_path(&self) -> &Path {
+        &self.index_path
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn contains(&self, outpoint: &OutPoint) -> bool {
+        self.index.contains_key(outpoint)
+    }
+
+    pub fn disk_usage(&self) -> Result<u64> {
+        self.file
+            .metadata()?
+            .len()
+            .checked_add(self.index_file.metadata()?.len())
+            .context("UTXO store disk usage overflowed")
+    }
+
+    pub fn get(&mut self, outpoint: &OutPoint) -> Result<Option<StoredUtxo>> {
+        let Some(location) = self.index.get(outpoint).copied() else {
+            return Ok(None);
+        };
+        let body = read_utxo_data_record(&mut self.file, location)?;
+        if body.first().copied() != Some(UTXO_PUT) || body.len() < 1 + 8 + 36 {
+            bail!("UTXO location points to a non-value record");
+        }
+        let stored_outpoint = decode_outpoint(&body[9..45])?;
+        if stored_outpoint != *outpoint {
+            bail!("UTXO value key does not match its index");
+        }
+        decode_stored_utxo(&body[45..]).map(Some)
+    }
+
+    /// Read all live entries.  This is intentionally explicit: normal block
+    /// validation uses point lookups, while snapshot/export code can opt into
+    /// the full materialization cost.
+    pub fn entries(&mut self) -> Result<Vec<(OutPoint, StoredUtxo)>> {
+        let outpoints = self.index.keys().copied().collect::<Vec<_>>();
+        outpoints
+            .iter()
+            .map(|outpoint| {
+                self.get(outpoint).and_then(|entry| {
+                    entry
+                        .map(|entry| (*outpoint, entry))
+                        .context("UTXO index entry disappeared")
+                })
+            })
+            .collect()
+    }
+
+    /// Apply removals and additions as one durable mutation batch.  A caller
+    /// may remove and then recreate the same outpoint in one batch, which is
+    /// required for historical duplicate-coinbase (BIP30) handling.
+    pub fn apply_batch(
+        &mut self,
+        removals: &[OutPoint],
+        additions: &[(OutPoint, StoredUtxo)],
+    ) -> Result<()> {
+        if removals.is_empty() && additions.is_empty() {
+            return Ok(());
+        }
+        let batch_id = self.next_batch_id;
+        let next_batch_id = batch_id
+            .checked_add(1)
+            .context("UTXO batch identifier exhausted")?;
+        let batch_start = data_len_after(&self.file)?;
+        let mut data_committed = false;
+        let mut operations = Vec::with_capacity(removals.len() + additions.len());
+        let write_result = (|| -> Result<()> {
+            for outpoint in removals {
+                let body = encode_utxo_delete(batch_id, outpoint);
+                let location = append_utxo_data_record(&mut self.file, &body)?;
+                operations.push(PendingUtxoOperation::Delete {
+                    outpoint: *outpoint,
+                });
+                self.pending_write_bytes = self
+                    .pending_write_bytes
+                    .saturating_add(4usize.saturating_add(location.length as usize));
+            }
+            for (outpoint, entry) in additions {
+                let body = encode_utxo_put(batch_id, outpoint, entry)?;
+                let location = append_utxo_data_record(&mut self.file, &body)?;
+                operations.push(PendingUtxoOperation::Put {
+                    outpoint: *outpoint,
+                    location,
+                });
+                self.pending_write_bytes = self
+                    .pending_write_bytes
+                    .saturating_add(4usize.saturating_add(location.length as usize));
+            }
+            let commit = encode_utxo_commit(batch_id);
+            let commit_location = append_utxo_data_record(&mut self.file, &commit)?;
+            self.pending_write_bytes = self
+                .pending_write_bytes
+                .saturating_add(4usize.saturating_add(commit_location.length as usize));
+            self.file.sync_data()?;
+            data_committed = true;
+            append_utxo_index_batch(
+                &mut self.index_file,
+                batch_id,
+                data_len_after(&self.file)?,
+                next_batch_id,
+                self.generation,
+                &operations,
+            )?;
+            self.index_file.sync_data()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            // If the data commit itself was not durable, remove the partial
+            // tail so the live store can continue to accept writes. Once the
+            // commit marker has been synced, leave the committed value log
+            // intact; a later open can rebuild an index whose append failed.
+            if !data_committed {
+                let current_len = data_len_after(&self.file)?;
+                if current_len > batch_start {
+                    let _ = self.file.set_len(batch_start);
+                    let _ = self.file.seek(SeekFrom::End(0));
+                }
+            }
+            return Err(error);
+        }
+        for operation in operations {
+            match operation {
+                PendingUtxoOperation::Put { outpoint, location } => {
+                    self.index.insert(outpoint, location);
+                }
+                PendingUtxoOperation::Delete { outpoint } => {
+                    self.index.remove(&outpoint);
+                }
+            }
+        }
+        self.next_batch_id = next_batch_id;
+        Ok(())
+    }
+
+    /// Replace the live set in bounded batches.  This is used when importing
+    /// a snapshot or migrating the legacy in-memory chainstate format.
+    pub fn replace_all<I>(&mut self, entries: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (OutPoint, StoredUtxo)>,
+    {
+        self.clear()?;
+        let mut batch = Vec::with_capacity(10_000);
+        for entry in entries {
+            batch.push(entry);
+            if batch.len() == 10_000 {
+                self.apply_batch(&[], &batch)?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.apply_batch(&[], &batch)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.write_all(UTXO_DATA_MAGIC)?;
+        self.file.sync_data()?;
+        self.index.clear();
+        self.next_batch_id = 1;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .context("UTXO store generation exhausted")?;
+        rewrite_utxo_index(
+            &mut self.index_file,
+            UTXO_DATA_MAGIC.len() as u64,
+            self.next_batch_id,
+            self.generation,
+            &self.index,
+        )?;
+        self.pending_write_bytes = 0;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        self.index_file.sync_data()?;
+        self.pending_write_bytes = 0;
+        Ok(())
+    }
+}
+
+impl Drop for UtxoStore {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+fn data_len_after(file: &File) -> Result<u64> {
+    Ok(file.metadata()?.len())
+}
+
+fn encode_stored_utxo(entry: &StoredUtxo) -> Result<Vec<u8>> {
+    let output = serialize(&entry.output);
+    let output_len = u32::try_from(output.len()).context("UTXO output is too large")?;
+    let mut bytes = Vec::with_capacity(4 + 4 + 1 + 4 + output.len());
+    bytes.extend_from_slice(&entry.height.to_le_bytes());
+    bytes.extend_from_slice(&entry.median_time_past.to_le_bytes());
+    bytes.push(u8::from(entry.coinbase));
+    bytes.extend_from_slice(&output_len.to_le_bytes());
+    bytes.extend_from_slice(&output);
+    if bytes.len() > MAX_STORED_UTXO_SIZE {
+        bail!("UTXO value is too large: {} bytes", bytes.len());
+    }
+    Ok(bytes)
+}
+
+fn decode_stored_utxo(bytes: &[u8]) -> Result<StoredUtxo> {
+    if bytes.len() < 13 {
+        bail!("stored UTXO value is truncated");
+    }
+    let height = u32::from_le_bytes(bytes[0..4].try_into().expect("fixed UTXO height"));
+    let median_time_past =
+        u32::from_le_bytes(bytes[4..8].try_into().expect("fixed UTXO median time"));
+    let coinbase = match bytes[8] {
+        0 => false,
+        1 => true,
+        _ => bail!("stored UTXO coinbase flag is invalid"),
+    };
+    let output_len = usize::try_from(u32::from_le_bytes(
+        bytes[9..13].try_into().expect("fixed UTXO output length"),
+    ))
+    .context("stored UTXO output length does not fit usize")?;
+    let output_end = 13usize
+        .checked_add(output_len)
+        .context("stored UTXO output length overflowed")?;
+    if output_end != bytes.len() {
+        bail!("stored UTXO output length does not match record length");
+    }
+    let output = deserialize(&bytes[13..output_end]).context("decoding stored UTXO output")?;
+    Ok(StoredUtxo {
+        output,
+        height,
+        median_time_past,
+        coinbase,
+    })
+}
+
+fn encode_outpoint(outpoint: &OutPoint) -> [u8; 36] {
+    serialize(outpoint)
+        .try_into()
+        .expect("Bitcoin outpoints have a fixed 36-byte encoding")
+}
+
+fn decode_outpoint(bytes: &[u8]) -> Result<OutPoint> {
+    if bytes.len() != 36 {
+        bail!("stored UTXO outpoint is not 36 bytes");
+    }
+    deserialize(bytes).context("decoding stored UTXO outpoint")
+}
+
+fn encode_utxo_put(batch_id: u64, outpoint: &OutPoint, entry: &StoredUtxo) -> Result<Vec<u8>> {
+    let mut body = Vec::with_capacity(1 + 8 + 36 + MAX_STORED_UTXO_SIZE.min(128));
+    body.push(UTXO_PUT);
+    body.extend_from_slice(&batch_id.to_le_bytes());
+    body.extend_from_slice(&encode_outpoint(outpoint));
+    body.extend_from_slice(&encode_stored_utxo(entry)?);
+    Ok(body)
+}
+
+fn encode_utxo_delete(batch_id: u64, outpoint: &OutPoint) -> Vec<u8> {
+    let mut body = Vec::with_capacity(1 + 8 + 36);
+    body.push(UTXO_DELETE);
+    body.extend_from_slice(&batch_id.to_le_bytes());
+    body.extend_from_slice(&encode_outpoint(outpoint));
+    body
+}
+
+fn encode_utxo_commit(batch_id: u64) -> Vec<u8> {
+    let mut body = Vec::with_capacity(1 + 8);
+    body.push(UTXO_COMMIT);
+    body.extend_from_slice(&batch_id.to_le_bytes());
+    body
+}
+
+fn append_utxo_data_record(file: &mut File, body: &[u8]) -> Result<UtxoLocation> {
+    if body.is_empty() || body.len() > MAX_STORED_UTXO_SIZE + 64 {
+        bail!("UTXO log record is too large");
+    }
+    let offset = data_len_after(file)?;
+    let length = u32::try_from(body.len()).context("UTXO log record length does not fit u32")?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(body)?;
+    Ok(UtxoLocation { offset, length })
+}
+
+fn read_utxo_data_record(file: &mut File, location: UtxoLocation) -> Result<Vec<u8>> {
+    if location.length as usize > MAX_STORED_UTXO_SIZE + 64 {
+        bail!("stored UTXO log record is too large");
+    }
+    file.seek(SeekFrom::Start(location.offset))?;
+    let mut length = [0u8; 4];
+    file.read_exact(&mut length)?;
+    let actual = u32::from_le_bytes(length);
+    if actual != location.length {
+        bail!("UTXO index disagrees with value record length");
+    }
+    let mut body = vec![0u8; location.length as usize];
+    file.read_exact(&mut body)?;
+    Ok(body)
+}
+
+fn scan_utxo_data(file: &mut File) -> Result<(HashMap<OutPoint, UtxoLocation>, u64)> {
+    let data_len = data_len_after(file)?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut magic = vec![0u8; UTXO_DATA_MAGIC.len()];
+    file.read_exact(&mut magic)?;
+    if magic != UTXO_DATA_MAGIC {
+        bail!("UTXO store has an unknown format");
+    }
+    let mut position = UTXO_DATA_MAGIC.len() as u64;
+    let mut committed_end = position;
+    let mut pending_batch = None;
+    let mut pending = Vec::new();
+    let mut index = HashMap::new();
+    let mut max_batch = 0u64;
+    while position < data_len {
+        let record_start = position;
+        let mut length_bytes = [0u8; 4];
+        if let Err(error) = file.read_exact(&mut length_bytes) {
+            if error.kind() == ErrorKind::UnexpectedEof {
+                break;
+            }
+            return Err(error.into());
+        }
+        let length = u32::from_le_bytes(length_bytes);
+        let next = position
+            .checked_add(4)
+            .and_then(|value| value.checked_add(u64::from(length)))
+            .context("UTXO log position overflowed")?;
+        if length == 0 || usize::try_from(length).unwrap_or(usize::MAX) > MAX_STORED_UTXO_SIZE + 64
+        {
+            if next > data_len {
+                break;
+            }
+            bail!("UTXO log record has an invalid length");
+        }
+        if next > data_len {
+            break;
+        }
+        let mut body = vec![0u8; length as usize];
+        file.read_exact(&mut body)?;
+        let operation = body.first().copied().context("UTXO log record is empty")?;
+        match operation {
+            UTXO_PUT => {
+                if body.len() < 1 + 8 + 36 + 13 {
+                    bail!("UTXO put record is truncated");
+                }
+                let batch_id =
+                    u64::from_le_bytes(body[1..9].try_into().expect("fixed UTXO batch identifier"));
+                let outpoint = decode_outpoint(&body[9..45])?;
+                decode_stored_utxo(&body[45..])?;
+                if pending_batch != Some(batch_id) {
+                    if pending_batch.is_some() {
+                        bail!("UTXO log contains interleaved mutation batches");
+                    }
+                    pending_batch = Some(batch_id);
+                }
+                pending.push(PendingUtxoOperation::Put {
+                    outpoint,
+                    location: UtxoLocation {
+                        offset: record_start,
+                        length,
+                    },
+                });
+                max_batch = max_batch.max(batch_id);
+            }
+            UTXO_DELETE => {
+                if body.len() != 1 + 8 + 36 {
+                    bail!("UTXO delete record has an invalid length");
+                }
+                let batch_id =
+                    u64::from_le_bytes(body[1..9].try_into().expect("fixed UTXO batch identifier"));
+                let outpoint = decode_outpoint(&body[9..45])?;
+                if pending_batch != Some(batch_id) {
+                    if pending_batch.is_some() {
+                        bail!("UTXO log contains interleaved mutation batches");
+                    }
+                    pending_batch = Some(batch_id);
+                }
+                pending.push(PendingUtxoOperation::Delete { outpoint });
+                max_batch = max_batch.max(batch_id);
+            }
+            UTXO_COMMIT => {
+                if body.len() != 1 + 8 {
+                    bail!("UTXO commit record has an invalid length");
+                }
+                let batch_id =
+                    u64::from_le_bytes(body[1..9].try_into().expect("fixed UTXO batch identifier"));
+                if pending_batch != Some(batch_id) || pending.is_empty() {
+                    bail!("UTXO commit does not match a pending batch");
+                }
+                for operation in pending.drain(..) {
+                    match operation {
+                        PendingUtxoOperation::Put { outpoint, location } => {
+                            index.insert(outpoint, location);
+                        }
+                        PendingUtxoOperation::Delete { outpoint } => {
+                            index.remove(&outpoint);
+                        }
+                    }
+                }
+                pending_batch = None;
+                committed_end = next;
+                max_batch = max_batch.max(batch_id);
+            }
+            _ => bail!("UTXO log contains an unknown operation"),
+        }
+        position = next;
+    }
+    if pending_batch.is_some() || position != committed_end {
+        file.set_len(committed_end)?;
+        file.seek(SeekFrom::End(0))?;
+    }
+    Ok((
+        index,
+        max_batch
+            .checked_add(1)
+            .context("UTXO batch identifier exhausted")?,
+    ))
+}
+
+fn load_utxo_index(file: &mut File, data_len: u64) -> Result<Option<UtxoIndexState>> {
+    let index_len = file.metadata()?.len();
+    if index_len < UTXO_INDEX_MAGIC.len() as u64 {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut magic = vec![0u8; UTXO_INDEX_MAGIC.len()];
+    file.read_exact(&mut magic)?;
+    if magic != UTXO_INDEX_MAGIC {
+        return Ok(None);
+    }
+    let mut position = UTXO_INDEX_MAGIC.len() as u64;
+    let mut pending_batch = None;
+    let mut pending = Vec::new();
+    let mut index = HashMap::new();
+    let mut last_data_end = None;
+    let mut max_batch = 0u64;
+    let mut stored_next_batch_id = None;
+    let mut stored_generation = None;
+    while position < index_len {
+        let mut length_bytes = [0u8; 4];
+        if file.read_exact(&mut length_bytes).is_err() {
+            return Ok(None);
+        }
+        let length = u32::from_le_bytes(length_bytes);
+        let next = position
+            .checked_add(4)
+            .and_then(|value| value.checked_add(u64::from(length)))
+            .context("UTXO index position overflowed")?;
+        if next > index_len || length == 0 || length > 128 {
+            return Ok(None);
+        }
+        let mut body = vec![0u8; length as usize];
+        file.read_exact(&mut body)?;
+        let operation = body
+            .first()
+            .copied()
+            .context("UTXO index record is empty")?;
+        match operation {
+            UTXO_PUT => {
+                if body.len() != 1 + 8 + 8 + 4 + 36 {
+                    return Ok(None);
+                }
+                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
+                let offset = u64::from_le_bytes(body[9..17].try_into().unwrap());
+                let value_length = u32::from_le_bytes(body[17..21].try_into().unwrap());
+                let outpoint = decode_outpoint(&body[21..57])?;
+                if value_length == 0
+                    || value_length as usize > MAX_STORED_UTXO_SIZE + 64
+                    || offset < UTXO_DATA_MAGIC.len() as u64
+                    || offset
+                        .checked_add(4)
+                        .and_then(|end| end.checked_add(u64::from(value_length)))
+                        .is_none_or(|end| end > data_len)
+                {
+                    return Ok(None);
+                }
+                if pending_batch != Some(batch_id) {
+                    if pending_batch.is_some() {
+                        return Ok(None);
+                    }
+                    pending_batch = Some(batch_id);
+                }
+                pending.push(PendingUtxoOperation::Put {
+                    outpoint,
+                    location: UtxoLocation {
+                        offset,
+                        length: value_length,
+                    },
+                });
+                max_batch = max_batch.max(batch_id);
+            }
+            UTXO_DELETE => {
+                if body.len() != 1 + 8 + 36 {
+                    return Ok(None);
+                }
+                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
+                let outpoint = decode_outpoint(&body[9..45])?;
+                if pending_batch != Some(batch_id) {
+                    if pending_batch.is_some() {
+                        return Ok(None);
+                    }
+                    pending_batch = Some(batch_id);
+                }
+                pending.push(PendingUtxoOperation::Delete { outpoint });
+                max_batch = max_batch.max(batch_id);
+            }
+            UTXO_COMMIT => {
+                if body.len() != 1 + 8 + 8 + 8 + 8 {
+                    return Ok(None);
+                }
+                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
+                let data_end = u64::from_le_bytes(body[9..17].try_into().unwrap());
+                let next_batch_id = u64::from_le_bytes(body[17..25].try_into().unwrap());
+                let generation = u64::from_le_bytes(body[25..33].try_into().unwrap());
+                if next_batch_id == 0 {
+                    return Ok(None);
+                }
+                if generation == 0
+                    || data_end < UTXO_DATA_MAGIC.len() as u64
+                    || data_end > data_len
+                    || last_data_end.is_some_and(|previous| data_end < previous)
+                    || stored_generation.is_some_and(|previous| previous != generation)
+                {
+                    return Ok(None);
+                }
+                if pending_batch != Some(batch_id) || (pending.is_empty() && batch_id != 0) {
+                    return Ok(None);
+                }
+                for operation in pending.drain(..) {
+                    match operation {
+                        PendingUtxoOperation::Put { outpoint, location } => {
+                            index.insert(outpoint, location);
+                        }
+                        PendingUtxoOperation::Delete { outpoint } => {
+                            index.remove(&outpoint);
+                        }
+                    }
+                }
+                pending_batch = None;
+                last_data_end = Some(data_end);
+                stored_next_batch_id = Some(next_batch_id);
+                stored_generation = Some(generation);
+                max_batch = max_batch.max(batch_id);
+            }
+            _ => return Ok(None),
+        }
+        position = next;
+    }
+    if pending_batch.is_some() || last_data_end != Some(data_len) {
+        return Ok(None);
+    }
+    Ok(Some((
+        index,
+        stored_next_batch_id.unwrap_or(
+            max_batch
+                .checked_add(1)
+                .context("UTXO batch identifier exhausted")?,
+        ),
+        stored_generation.context("UTXO index has no generation checkpoint")?,
+    )))
+}
+
+fn append_utxo_index_batch(
+    file: &mut File,
+    batch_id: u64,
+    data_end: u64,
+    next_batch_id: u64,
+    generation: u64,
+    operations: &[PendingUtxoOperation],
+) -> Result<()> {
+    file.seek(SeekFrom::End(0))?;
+    for operation in operations {
+        let mut body = Vec::with_capacity(64);
+        match operation {
+            PendingUtxoOperation::Put { outpoint, location } => {
+                body.push(UTXO_PUT);
+                body.extend_from_slice(&batch_id.to_le_bytes());
+                body.extend_from_slice(&location.offset.to_le_bytes());
+                body.extend_from_slice(&location.length.to_le_bytes());
+                body.extend_from_slice(&encode_outpoint(outpoint));
+            }
+            PendingUtxoOperation::Delete { outpoint } => {
+                body.push(UTXO_DELETE);
+                body.extend_from_slice(&batch_id.to_le_bytes());
+                body.extend_from_slice(&encode_outpoint(outpoint));
+            }
+        }
+        let length = u32::try_from(body.len()).context("UTXO index record is too large")?;
+        file.write_all(&length.to_le_bytes())?;
+        file.write_all(&body)?;
+    }
+    let mut commit = Vec::with_capacity(33);
+    commit.push(UTXO_COMMIT);
+    commit.extend_from_slice(&batch_id.to_le_bytes());
+    commit.extend_from_slice(&data_end.to_le_bytes());
+    commit.extend_from_slice(&next_batch_id.to_le_bytes());
+    commit.extend_from_slice(&generation.to_le_bytes());
+    file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
+    file.write_all(&commit)?;
+    Ok(())
+}
+
+fn rewrite_utxo_index(
+    file: &mut File,
+    data_end: u64,
+    next_batch_id: u64,
+    generation: u64,
+    index: &HashMap<OutPoint, UtxoLocation>,
+) -> Result<()> {
+    file.set_len(0)?;
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(UTXO_INDEX_MAGIC)?;
+    let checkpoint_batch = 0u64;
+    let operations = index
+        .iter()
+        .map(|(outpoint, location)| PendingUtxoOperation::Put {
+            outpoint: *outpoint,
+            location: *location,
+        })
+        .collect::<Vec<_>>();
+    append_utxo_index_batch(
+        file,
+        checkpoint_batch,
+        data_end,
+        next_batch_id,
+        generation,
+        &operations,
+    )?;
+    file.sync_data()?;
+    Ok(())
+}
+
 impl CoinStatsStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
@@ -1721,6 +2493,7 @@ mod tests {
     use super::*;
     use bitcoin::Network;
     use bitcoin::blockdata::constants::genesis_block;
+    use bitcoin::hashes::Hash;
     use std::collections::HashSet;
 
     #[test]
@@ -1739,6 +2512,77 @@ mod tests {
         let mut reopened = BlockStore::open(directory.path()).unwrap();
         assert!(reopened.contains(&hash));
         assert_eq!(reopened.get(&hash).unwrap().unwrap(), block);
+    }
+
+    #[test]
+    fn utxo_batches_reopen_and_recover_an_uncommitted_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let second = OutPoint::new(Txid::from_byte_array([2; 32]), 1);
+        let first_entry = StoredUtxo {
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(50_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            },
+            height: 12,
+            median_time_past: 11,
+            coinbase: true,
+        };
+        let second_entry = StoredUtxo {
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(40_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x52]),
+            },
+            height: 13,
+            median_time_past: 12,
+            coinbase: false,
+        };
+        {
+            let mut store = UtxoStore::open(directory.path()).unwrap();
+            store
+                .apply_batch(&[], &[(first, first_entry.clone())])
+                .unwrap();
+            assert_eq!(store.get(&first).unwrap(), Some(first_entry.clone()));
+            store
+                .apply_batch(&[first], &[(second, second_entry.clone())])
+                .unwrap();
+            assert!(!store.contains(&first));
+            assert_eq!(store.get(&second).unwrap(), Some(second_entry.clone()));
+        }
+
+        let data_path = directory.path().join("utxos.dat");
+        let committed_len = std::fs::metadata(&data_path).unwrap().len();
+        {
+            let mut reopened = UtxoStore::open(directory.path()).unwrap();
+            assert_eq!(reopened.len(), 1);
+            assert_eq!(reopened.get(&second).unwrap(), Some(second_entry.clone()));
+        }
+
+        let mut file = OpenOptions::new().append(true).open(&data_path).unwrap();
+        let uncommitted = encode_utxo_put(
+            99,
+            &first,
+            &StoredUtxo {
+                output: TxOut {
+                    value: bitcoin::Amount::from_sat(1),
+                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x53]),
+                },
+                height: 14,
+                median_time_past: 13,
+                coinbase: false,
+            },
+        )
+        .unwrap();
+        file.write_all(&(u32::try_from(uncommitted.len()).unwrap()).to_le_bytes())
+            .unwrap();
+        file.write_all(&uncommitted).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+
+        let mut recovered = UtxoStore::open(directory.path()).unwrap();
+        assert_eq!(recovered.get(&first).unwrap(), None);
+        assert_eq!(recovered.get(&second).unwrap(), Some(second_entry));
+        assert_eq!(std::fs::metadata(data_path).unwrap().len(), committed_len);
     }
 
     #[test]

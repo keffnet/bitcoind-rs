@@ -31,6 +31,7 @@ use crate::config::{DEFAULT_SCRIPT_CHECK_THREADS, MAX_SCRIPT_CHECK_THREADS};
 use crate::muhash::MuHash3072;
 use crate::storage::{
     BlockStore, ChainstateStore, CoinStatsRecord, CoinStatsStore, ElectrumBlockStore, FilterStore,
+    StoredUtxo, UtxoStore,
 };
 use crate::validation::{self, ValidationError};
 
@@ -750,6 +751,7 @@ pub struct ChainState {
     electrum_store: Option<ElectrumBlockStore>,
     filter_store: FilterStore,
     chainstate_store: ChainstateStore,
+    utxo_store: UtxoStore,
     blockfilter_index_enabled: bool,
     tx_index_all_enabled: bool,
     coinstats_store: CoinStatsStore,
@@ -1045,6 +1047,7 @@ impl ChainState {
             }
         }
         let chainstate_store = ChainstateStore::open(&chainstate_path)?;
+        let utxo_store = UtxoStore::open(chainstate_path.join("utxos"))?;
         if rebuild_chainstate {
             for path in [
                 metadata_path.clone(),
@@ -1149,6 +1152,7 @@ impl ChainState {
             electrum_store: None,
             filter_store,
             chainstate_store,
+            utxo_store,
             blockfilter_index_enabled,
             tx_index_all_enabled,
             coinstats_store,
@@ -1345,6 +1349,7 @@ impl ChainState {
                 state.persist_snapshot_checksum()?;
             }
         }
+        state.reconcile_utxo_store()?;
         state.update_ibd_status();
         state.persist_metadata()?;
         if state.snapshot_base.is_some()
@@ -1536,14 +1541,14 @@ impl ChainState {
         self.coinstats_index_enabled
     }
 
-    /// Return the durable footprint of this implementation's chainstate.
-    ///
-    /// Core obtains this value from the coins database. The Rust node keeps
-    /// its UTXO state in memory and persists metadata, snapshots, and an
-    /// append-only chainstate delta log instead, so report those files rather
-    /// than the unrelated block body store.
+    /// Return the durable footprint of this implementation's chainstate,
+    /// including the crash-recoverable UTXO value and location logs.
     pub fn utxo_disk_size(&self) -> Result<u64> {
-        let mut total = self.chainstate_store.disk_usage()?;
+        let mut total = self
+            .chainstate_store
+            .disk_usage()?
+            .checked_add(self.utxo_store.disk_usage()?)
+            .context("chainstate disk usage overflowed")?;
         for name in [
             "chainstate.bin",
             "chainstate.json",
@@ -5168,6 +5173,12 @@ impl ChainState {
             let bytes = serialize_chainstate_delta(&delta)?;
             self.chainstate_store.insert(hash, &bytes)?;
         }
+        let mut created_utxos = Vec::new();
+        let removals = application
+            .spent_entries
+            .iter()
+            .map(|(outpoint, _)| *outpoint)
+            .collect::<Vec<_>>();
         for (outpoint, _) in &application.spent_entries {
             self.remove_utxo(outpoint);
         }
@@ -5185,15 +5196,14 @@ impl ChainState {
                 if !spent_outpoints.contains(&outpoint)
                     && !is_unspendable_script(&output.script_pubkey)
                 {
-                    self.insert_utxo(
-                        outpoint,
-                        UtxoEntry {
-                            output: output.clone(),
-                            height,
-                            median_time_past: block_median_time_past,
-                            coinbase: transaction_index == 0,
-                        },
-                    );
+                    let entry = UtxoEntry {
+                        output: output.clone(),
+                        height,
+                        median_time_past: block_median_time_past,
+                        coinbase: transaction_index == 0,
+                    };
+                    created_utxos.push((outpoint, entry.clone()));
+                    self.insert_utxo(outpoint, entry);
                 }
                 affected_scripts.insert(electrum_script_hash(&output.script_pubkey));
             }
@@ -5215,6 +5225,13 @@ impl ChainState {
                 }
                 self.tx_index_all.insert(txid, location);
             }
+        }
+        if persist {
+            let additions = created_utxos
+                .iter()
+                .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
+                .collect::<Vec<_>>();
+            self.utxo_store.apply_batch(&removals, &additions)?;
         }
         if self.txospender_index_enabled {
             self.index_block_spends(block, height);
@@ -5246,6 +5263,9 @@ impl ChainState {
         );
         self.assign_header_sequence_id(hash);
         self.assign_block_sequence_id(hash);
+        if persist {
+            self.persist_utxo_store_tip()?;
+        }
         if let Some(stats) = self.coin_stats.as_mut() {
             stats.apply_block_metrics(application.metrics);
         }
@@ -5991,6 +6011,56 @@ impl ChainState {
         }
     }
 
+    fn stored_utxo(entry: &UtxoEntry) -> StoredUtxo {
+        StoredUtxo {
+            output: entry.output.clone(),
+            height: entry.height,
+            median_time_past: entry.median_time_past,
+            coinbase: entry.coinbase,
+        }
+    }
+
+    fn utxo_store_tip_path(&self) -> PathBuf {
+        self.data_dir.join("chainstate/utxos.tip")
+    }
+
+    fn persist_utxo_store_tip(&self) -> Result<()> {
+        let path = self.utxo_store_tip_path();
+        let temp = path.with_extension("tip.tmp");
+        let contents = format!("{}\n{}\n", self.best_hash(), self.utxo_store.generation());
+        fs::write(&temp, contents)?;
+        fs::rename(temp, path)?;
+        Ok(())
+    }
+
+    fn sync_utxo_store(&mut self) -> Result<()> {
+        let entries = self
+            .utxos
+            .iter()
+            .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
+            .collect::<Vec<_>>();
+        self.utxo_store.replace_all(entries)?;
+        self.persist_utxo_store_tip()
+    }
+
+    fn reconcile_utxo_store(&mut self) -> Result<()> {
+        let tip = fs::read_to_string(self.utxo_store_tip_path()).ok();
+        let expected_tip = self.best_hash().to_string();
+        let marker_matches = tip.as_deref().is_some_and(|tip| {
+            let mut lines = tip.lines();
+            lines.next().map(str::trim) == Some(expected_tip.as_str())
+                && lines
+                    .next()
+                    .and_then(|generation| generation.trim().parse::<u64>().ok())
+                    == Some(self.utxo_store.generation())
+                && lines.next().is_none()
+        });
+        if marker_matches && self.utxo_store.len() == self.utxos.len() {
+            return Ok(());
+        }
+        self.sync_utxo_store()
+    }
+
     fn insert_utxo(&mut self, outpoint: OutPoint, entry: UtxoEntry) {
         if self.utxos.contains_key(&outpoint) {
             self.remove_utxo(&outpoint);
@@ -6416,6 +6486,7 @@ impl ChainState {
     }
 
     fn persist_snapshot(&mut self) -> Result<()> {
+        self.sync_utxo_store()?;
         let snapshot = self.current_snapshot();
         let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
@@ -6827,6 +6898,7 @@ fn open_background_replay_state(
     let store = BlockStore::open_read_only_with_xor(blocks_dir, blocks_xor)?;
     let filter_store = FilterStore::open(data_dir.join("filters"))?;
     let chainstate_store = ChainstateStore::open(data_dir.join("chainstate"))?;
+    let utxo_store = UtxoStore::open(data_dir.join("chainstate/utxos"))?;
     let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
     let headers = active_chain
         .iter()
@@ -6853,6 +6925,7 @@ fn open_background_replay_state(
         electrum_store: None,
         filter_store,
         chainstate_store,
+        utxo_store,
         blockfilter_index_enabled: false,
         tx_index_all_enabled: false,
         coinstats_store,
@@ -8863,6 +8936,14 @@ mod tests {
         assert!(state.verify_active_chain_with_level(4, 0).is_err());
         state.utxos = original_utxos;
         state.persist_snapshot().unwrap();
+        assert!(directory.path().join("chainstate/utxos/utxos.dat").exists());
+        assert!(
+            directory
+                .path()
+                .join("chainstate/utxos/utxos.index")
+                .exists()
+        );
+        assert!(directory.path().join("chainstate/utxos.tip").exists());
         drop(state);
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.height(), 2);

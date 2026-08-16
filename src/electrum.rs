@@ -1240,11 +1240,12 @@ fn electrum_transaction_json(
 
 fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid: Txid = param::<String>(params, 0)?.parse()?;
-    // The height is a hint.  A client can have a stale height after a reorg,
-    // while the transaction may still be available in the active chain at a
-    // different height.
-    let _requested_height = param::<u32>(params, 1)?;
-    let Some((branch, position, height)) = node.chain.write().merkle_branch(&txid)? else {
+    let requested_height = param::<u32>(params, 1)?;
+    let Some((branch, position, height)) = node
+        .chain
+        .write()
+        .merkle_branch_at_height(&txid, requested_height)?
+    else {
         bail!("transaction not found")
     };
     Ok(json!({
@@ -2760,10 +2761,7 @@ mod tests {
         assert!(side_verbose.get("blocktime").is_none());
         let merkle = transaction_merkle(&node, &json!([txid.to_string(), 0])).unwrap();
         assert_eq!(merkle["block_height"], 0);
-        assert_eq!(
-            transaction_merkle(&node, &json!([txid.to_string(), 1])).unwrap()["block_height"],
-            json!(0)
-        );
+        assert!(transaction_merkle(&node, &json!([txid.to_string(), 1])).is_err());
 
         let script_hash = "00".repeat(32);
         let mut subscriptions = HashMap::new();

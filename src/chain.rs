@@ -56,6 +56,34 @@ const ASSUMEUTXO_BASE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-base-v1\0";
 const ASSUMEUTXO_CHECKPOINT_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-checkpoint-v1\0";
 const ASSUMEUTXO_CHECKPOINT_INTERVAL: u32 = 256;
 
+fn merkle_branch_for_block(block: &Block, transaction_index: usize) -> Vec<Txid> {
+    let mut layer: Vec<Txid> = block.txdata.iter().map(Transaction::compute_txid).collect();
+    let mut index = transaction_index;
+    let mut branch = Vec::new();
+    while layer.len() > 1 {
+        let sibling = if index ^ 1 < layer.len() {
+            index ^ 1
+        } else {
+            index
+        };
+        branch.push(layer[sibling]);
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
+        for pair in layer.chunks(2) {
+            let left = pair[0];
+            let right = *pair.get(1).unwrap_or(&left);
+            let mut engine = bitcoin::hashes::sha256d::Hash::engine();
+            engine.input(&left.to_raw_hash().to_byte_array());
+            engine.input(&right.to_raw_hash().to_byte_array());
+            next.push(Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_engine(engine),
+            ));
+        }
+        layer = next;
+        index /= 2;
+    }
+    branch
+}
+
 #[derive(Clone, Copy)]
 struct ChainTxData {
     time: i64,
@@ -3854,31 +3882,35 @@ impl ChainState {
         let Some(block) = self.store.get(&location.block_hash)? else {
             return Ok(None);
         };
-        let mut layer: Vec<Txid> = block.txdata.iter().map(Transaction::compute_txid).collect();
-        let mut index = location.transaction_index;
-        let mut branch = Vec::new();
-        while layer.len() > 1 {
-            let sibling = if index ^ 1 < layer.len() {
-                index ^ 1
-            } else {
-                index
-            };
-            branch.push(layer[sibling]);
-            let mut next = Vec::with_capacity(layer.len().div_ceil(2));
-            for pair in layer.chunks(2) {
-                let left = pair[0];
-                let right = *pair.get(1).unwrap_or(&left);
-                let mut engine = bitcoin::hashes::sha256d::Hash::engine();
-                engine.input(&left.to_raw_hash().to_byte_array());
-                engine.input(&right.to_raw_hash().to_byte_array());
-                next.push(Txid::from_raw_hash(
-                    bitcoin::hashes::sha256d::Hash::from_engine(engine),
-                ));
-            }
-            layer = next;
-            index /= 2;
-        }
+        let branch = merkle_branch_for_block(&block, location.transaction_index);
         Ok(Some((branch, location.transaction_index, location.height)))
+    }
+
+    /// Return a transaction merkle branch only when the transaction is in the
+    /// active-chain block at `height`. Electrum supplies the confirmation
+    /// height as part of `blockchain.transaction.get_merkle`; using the
+    /// height here prevents a stale or incorrect height from silently
+    /// producing a proof for another block.
+    pub fn merkle_branch_at_height(
+        &mut self,
+        txid: &Txid,
+        height: u32,
+    ) -> Result<Option<(Vec<Txid>, usize, u32)>> {
+        let Some(block_hash) = self.block_hash(height) else {
+            return Ok(None);
+        };
+        let Some(block) = self.store.get(&block_hash)? else {
+            return Ok(None);
+        };
+        let Some(transaction_index) = block
+            .txdata
+            .iter()
+            .position(|transaction| transaction.compute_txid() == *txid)
+        else {
+            return Ok(None);
+        };
+        let branch = merkle_branch_for_block(&block, transaction_index);
+        Ok(Some((branch, transaction_index, height)))
     }
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {

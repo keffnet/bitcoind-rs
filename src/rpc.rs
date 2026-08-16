@@ -11603,11 +11603,7 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
         .iter()
         .find(|chunk| chunk.txids.contains(txid))
         .expect("mempool entry must have a chunk");
-    let parents = mempool
-        .parents(txid)
-        .into_iter()
-        .map(|parent| parent.to_string())
-        .collect::<Vec<_>>();
+    let parents = mempool_dependency_ids(mempool, txid);
     let mut children = mempool.children(txid).into_iter().collect::<Vec<_>>();
     // Core's GetChildren sorts by the raw transaction hash. The public
     // `children` helper keeps display ordering for graph traversal, so sort
@@ -11640,6 +11636,22 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
         "bip125-replaceable": mempool.is_replaceable(txid),
         "unbroadcast": mempool.is_unbroadcast(txid),
     }))
+}
+
+fn mempool_dependency_ids(mempool: &Mempool, txid: &Txid) -> Vec<String> {
+    display_sorted_txids(mempool.parents(txid))
+}
+
+fn display_sorted_txids(txids: impl IntoIterator<Item = Txid>) -> Vec<String> {
+    let mut parents = txids
+        .into_iter()
+        .map(|parent| parent.to_string())
+        .collect::<Vec<_>>();
+    // Core's entryToJSON stores dependencies in std::set<std::string>, so
+    // this public field is ordered by displayed txid rather than the native
+    // hash-byte ordering used by the mempool graph.
+    parents.sort_unstable();
+    parents
 }
 
 fn package_policy_error(transactions: &[Transaction]) -> Option<&'static str> {
@@ -17759,6 +17771,22 @@ mod tests {
         assert_eq!(chunks[1].txids, vec![second, third]);
         assert_eq!(chunks[1].fee, 100);
         assert_eq!(chunks[1].weight, 200);
+    }
+
+    #[test]
+    fn mempool_dependency_ids_use_core_display_order() {
+        let mut native_low_bytes = [0; 32];
+        native_low_bytes[31] = 1;
+        let mut native_high_bytes = [0; 32];
+        native_high_bytes[0] = 1;
+        let native_low = Txid::from_byte_array(native_low_bytes);
+        let native_high = Txid::from_byte_array(native_high_bytes);
+
+        assert!(native_low < native_high);
+        assert_eq!(
+            display_sorted_txids([native_low, native_high]),
+            vec![native_high.to_string(), native_low.to_string()]
+        );
     }
 
     #[test]

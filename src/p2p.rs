@@ -3983,10 +3983,6 @@ async fn serve_peer_loop(
                 }
                 let (block, recent) = {
                     let mut chain = node.chain.write();
-                    if !chain.block_request_allowed(&request.block_hash, STALE_RELAY_AGE_LIMIT_SECS)
-                    {
-                        continue;
-                    }
                     let Some(height) = chain.block_height_by_hash(&request.block_hash) else {
                         continue;
                     };
@@ -3994,15 +3990,41 @@ async fn serve_peer_loop(
                     let Some(block) = chain.block(&request.block_hash)? else {
                         continue;
                     };
+                    // Core answers recent getblocktxn requests whenever the
+                    // block body is available. Its stale-relay policy is
+                    // applied only to the full-block fallback for older
+                    // requests, through ProcessGetBlockData.
+                    if !recent
+                        && !chain
+                            .block_request_allowed(&request.block_hash, STALE_RELAY_AGE_LIMIT_SECS)
+                    {
+                        continue;
+                    }
                     (block, recent)
                 };
                 if !recent {
+                    if node.historical_block_serving_limit_reached(
+                        &request.block_hash,
+                        false,
+                        peer_state.permissions,
+                    ) {
+                        anyhow::bail!("historical block serving limit reached");
+                    }
                     send_message(
                         node,
                         peer_id,
                         writer,
                         node.config.network,
                         &Message::Block(block),
+                    )
+                    .await?;
+                    maybe_send_getblocks_continuation(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        peer_state,
+                        request.block_hash,
                     )
                     .await?;
                     continue;

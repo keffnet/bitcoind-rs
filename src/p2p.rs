@@ -23,7 +23,7 @@ use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_bloom::{BloomFlags, FilterAdd, FilterLoad};
 use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
 use bitcoin::pow::{CompactTarget, Target, Work};
-use bitcoin::{Block, BlockHash, MerkleBlock, Network, Transaction, Txid, Witness, Wtxid};
+use bitcoin::{Amount, Block, BlockHash, MerkleBlock, Network, Transaction, Txid, Witness, Wtxid};
 use rand::random;
 use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
@@ -4518,7 +4518,9 @@ async fn serve_peer_loop(
                 {
                     continue;
                 }
-                let rate = rate.max(0);
+                if !fee_filter_in_money_range(rate) {
+                    continue;
+                }
                 *fee_filter.lock() = rate;
                 node.update_peer_fee_filter(peer_id, rate);
             }
@@ -5588,6 +5590,10 @@ fn notfound_transaction_items(items: &[Inventory]) -> Option<Vec<Inventory>> {
                 .collect()
         },
     )
+}
+
+fn fee_filter_in_money_range(rate: i64) -> bool {
+    rate >= 0 && u64::try_from(rate).is_ok_and(|rate| rate <= Amount::MAX_MONEY.to_sat())
 }
 
 fn peer_can_request_mempool(peer_bloom_filters: bool, permissions: PeerPermissions) -> bool {
@@ -7250,6 +7256,15 @@ mod tests {
         let oversized =
             vec![transaction; MAX_PEER_TX_ANNOUNCEMENTS + MAX_BLOCKS_IN_TRANSIT_PER_PEER + 1];
         assert!(notfound_transaction_items(&oversized).is_none());
+    }
+
+    #[test]
+    fn fee_filter_accepts_only_core_money_range() {
+        let max_money = i64::try_from(Amount::MAX_MONEY.to_sat()).unwrap();
+        assert!(fee_filter_in_money_range(0));
+        assert!(fee_filter_in_money_range(max_money));
+        assert!(!fee_filter_in_money_range(-1));
+        assert!(!fee_filter_in_money_range(max_money + 1));
     }
 
     #[test]

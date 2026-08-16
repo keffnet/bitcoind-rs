@@ -3438,7 +3438,9 @@ fn get_raw_addrman(node: &Arc<Node>) -> Result<Value> {
     peers.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     let mut new_table = serde_json::Map::new();
     let mut tried_table = serde_json::Map::new();
-    for (position, peer) in peers.into_iter().enumerate() {
+    let mut new_position = 0usize;
+    let mut tried_position = 0usize;
+    for peer in peers {
         let network = peer.endpoint.network_name();
         let host = peer.endpoint.host_string();
         let mut entry = json!({
@@ -3452,11 +3454,19 @@ fn get_raw_addrman(node: &Arc<Node>) -> Result<Value> {
         });
         if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
             entry["mapped_as"] = json!(mapped_as);
+            // The simplified address manager uses the address itself as the
+            // source when no relaying peer is retained. Keep both Core fields
+            // coherent until a source-aware entry is available.
+            entry["source_mapped_as"] = json!(mapped_as);
         }
-        let table = if node.is_network_address_tried(&peer.endpoint) {
-            &mut tried_table
+        let (table, position) = if node.is_network_address_tried(&peer.endpoint) {
+            let position = tried_position;
+            tried_position = tried_position.saturating_add(1);
+            (&mut tried_table, position)
         } else {
-            &mut new_table
+            let position = new_position;
+            new_position = new_position.saturating_add(1);
+            (&mut new_table, position)
         };
         table.insert(format!("0/{position}"), entry);
     }
@@ -20250,6 +20260,10 @@ mod tests {
         let raw = dispatch_method(&node, "getrawaddrman", &json!([])).unwrap();
         assert_eq!(raw["new"].as_object().unwrap().len(), 1);
         assert_eq!(raw["tried"].as_object().unwrap().len(), 2);
+        assert!(raw["new"].get("0/0").is_some());
+        assert!(raw["tried"].get("0/0").is_some());
+        assert!(raw["tried"].get("0/1").is_some());
+        assert!(raw["new"]["0/0"].get("source_mapped_as").is_none());
         let now = crate::time::unix_time();
         assert!(node.remember_network_address(
             crate::address::NetworkEndpoint::Ip("192.0.2.11:18444".parse().unwrap()),

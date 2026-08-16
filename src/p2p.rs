@@ -356,6 +356,29 @@ fn peer_services_are_desirable(peer_services: u64, approximate_best_block_depth:
     peer_services & desirable == desirable
 }
 
+fn peer_address_may_have_useful_database(peer_services: u64) -> bool {
+    peer_services & (wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED) != 0
+}
+
+fn peer_address_should_be_stored(peer_services: u64, approximate_best_block_depth: i64) -> bool {
+    peer_address_may_have_useful_database(peer_services)
+        || peer_services_are_desirable(peer_services, approximate_best_block_depth)
+}
+
+fn normalize_peer_address_time(timestamp: u64, now: u64) -> u64 {
+    const MIN_VALID_ADDRESS_TIME: u64 = 100_000_000;
+    const MAX_FUTURE_ADDRESS_TIME: u64 = 10 * 60;
+    const ADDRESS_TIME_PENALTY: u64 = 5 * 24 * 60 * 60;
+
+    if timestamp <= MIN_VALID_ADDRESS_TIME
+        || timestamp > now.saturating_add(MAX_FUTURE_ADDRESS_TIME)
+    {
+        now.saturating_sub(ADDRESS_TIME_PENALTY)
+    } else {
+        timestamp
+    }
+}
+
 fn approximate_best_block_depth(node: &Arc<Node>) -> i64 {
     let chain = node.chain.read();
     let tip = chain.tip();
@@ -4509,19 +4532,27 @@ async fn serve_peer_loop(
                     bail!("addr-fetch connection received too many addresses");
                 }
                 node.enable_peer_address_relay(peer_id);
+                let address_time = crate::time::unix_time();
+                let approximate_depth = approximate_best_block_depth(node);
+                let mut addresses = addresses;
+                addresses.shuffle(&mut rand::rng());
                 let mut relay_addresses = Vec::new();
                 for entry in addresses {
-                    if let Some(address) = socket_address_from_legacy(&entry)
-                        && node.allow_peer_address(peer_id)
+                    if !node.allow_peer_address(peer_id)
+                        || !peer_address_should_be_stored(entry.services, approximate_depth)
                     {
+                        continue;
+                    }
+                    if let Some(address) = socket_address_from_legacy(&entry) {
+                        let time = normalize_peer_address_time(u64::from(entry.time), address_time);
                         let endpoint = NetworkEndpoint::from_socket(address);
                         if node.remember_network_address_from(
                             endpoint.clone(),
                             entry.services,
-                            u64::from(entry.time),
+                            time,
                             peer_state.endpoint.clone(),
                         ) {
-                            relay_addresses.push((endpoint, entry.services, u64::from(entry.time)));
+                            relay_addresses.push((endpoint, entry.services, time));
                         }
                     }
                 }
@@ -4540,21 +4571,32 @@ async fn serve_peer_loop(
                     bail!("addr-fetch connection received too many addresses");
                 }
                 node.enable_peer_address_relay(peer_id);
+                let address_time = crate::time::unix_time();
+                let approximate_depth = approximate_best_block_depth(node);
+                let mut addresses = addresses;
+                addresses.shuffle(&mut rand::rng());
                 let mut relay_addresses = Vec::new();
                 for address in addresses {
+                    if !node.allow_peer_address(peer_id)
+                        || !peer_address_should_be_stored(address.services, approximate_depth)
+                    {
+                        continue;
+                    }
                     if let Some(endpoint) = NetworkEndpoint::from_addr_v2(
                         address.network,
                         &address.address,
                         address.port,
-                    ) && node.allow_peer_address(peer_id)
-                        && node.remember_network_address_from(
+                    ) {
+                        let time =
+                            normalize_peer_address_time(u64::from(address.time), address_time);
+                        if node.remember_network_address_from(
                             endpoint.clone(),
                             address.services,
-                            u64::from(address.time),
+                            time,
                             peer_state.endpoint.clone(),
-                        )
-                    {
-                        relay_addresses.push((endpoint, address.services, u64::from(address.time)));
+                        ) {
+                            relay_addresses.push((endpoint, address.services, time));
+                        }
                     }
                 }
                 node.relay_peer_addresses(peer_id, relay_addresses);
@@ -6341,6 +6383,32 @@ mod tests {
         assert!(peer_services_are_desirable(limited, 143));
         assert!(!peer_services_are_desirable(limited, 144));
         assert!(peer_services_are_desirable(full, 144));
+    }
+
+    #[test]
+    fn address_service_filter_matches_core() {
+        let full = wire::NODE_NETWORK | wire::NODE_WITNESS;
+        let limited = wire::NODE_NETWORK_LIMITED | wire::NODE_WITNESS;
+        assert!(peer_address_should_be_stored(full, 144));
+        assert!(peer_address_should_be_stored(limited, 143));
+        assert!(peer_address_should_be_stored(wire::NODE_NETWORK, 0));
+        assert!(peer_address_should_be_stored(wire::NODE_NETWORK_LIMITED, 0));
+        assert!(!peer_address_should_be_stored(wire::NODE_WITNESS, 0));
+        assert!(!peer_address_may_have_useful_database(wire::NODE_WITNESS));
+    }
+
+    #[test]
+    fn address_timestamps_match_core_normalization() {
+        let now = 1_700_000_000;
+        assert_eq!(
+            normalize_peer_address_time(100_000_000, now),
+            now - 5 * 24 * 60 * 60
+        );
+        assert_eq!(
+            normalize_peer_address_time(now + 10 * 60 + 1, now),
+            now - 5 * 24 * 60 * 60
+        );
+        assert_eq!(normalize_peer_address_time(now - 1, now), now - 1);
     }
 
     #[test]

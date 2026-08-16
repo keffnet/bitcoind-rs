@@ -1525,6 +1525,9 @@ impl ChainState {
         }
         let mut store = ElectrumBlockStore::open(self.data_dir.join("indexes/electrum"))?;
         for hash in self.active_chain.clone() {
+            if store.contains(&hash) {
+                continue;
+            }
             if let Some(block) = self.store.get(&hash)? {
                 store.insert(&block)?;
             }

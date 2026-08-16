@@ -1126,6 +1126,7 @@ impl Node {
         // user-facing getindexinfo reporting for that optional index.
         chain
             .configure_txospender_index(config.txospenderindex || config.electrum_bind.is_some())?;
+        chain.configure_electrum_index(config.electrum_bind.is_some())?;
         chain.configure_coinstats_index(config.coinstatsindex)?;
         for path in &config.load_blocks {
             import_external_block_file(&mut chain, path, config.network)?;

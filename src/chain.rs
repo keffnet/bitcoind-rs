@@ -29,7 +29,9 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{DEFAULT_SCRIPT_CHECK_THREADS, MAX_SCRIPT_CHECK_THREADS};
 use crate::muhash::MuHash3072;
-use crate::storage::{BlockStore, ChainstateStore, CoinStatsRecord, CoinStatsStore, FilterStore};
+use crate::storage::{
+    BlockStore, ChainstateStore, CoinStatsRecord, CoinStatsStore, ElectrumBlockStore, FilterStore,
+};
 use crate::validation::{self, ValidationError};
 
 const COINBASE_MATURITY: u32 = 100;
@@ -702,6 +704,7 @@ pub struct ChainState {
     signet_challenge: Option<Vec<u8>>,
     deployment_parameters: validation::DeploymentParameters,
     pub store: BlockStore,
+    electrum_store: Option<ElectrumBlockStore>,
     filter_store: FilterStore,
     chainstate_store: ChainstateStore,
     blockfilter_index_enabled: bool,
@@ -1083,6 +1086,7 @@ impl ChainState {
             }),
             deployment_parameters,
             store,
+            electrum_store: None,
             filter_store,
             chainstate_store,
             blockfilter_index_enabled,
@@ -1507,6 +1511,25 @@ impl ChainState {
         } else {
             self.spent_by.clear();
         }
+        Ok(())
+    }
+
+    /// Enable the durable transaction-body sidecar required by the in-process
+    /// Electrum service. It is intentionally separate from Core's txindex:
+    /// only block-hash keyed bodies are retained, and normal block serving
+    /// continues to respect pruning.
+    pub fn configure_electrum_index(&mut self, enabled: bool) -> Result<()> {
+        if !enabled {
+            self.electrum_store = None;
+            return Ok(());
+        }
+        let mut store = ElectrumBlockStore::open(self.data_dir.join("indexes/electrum"))?;
+        for hash in self.active_chain.clone() {
+            if let Some(block) = self.store.get(&hash)? {
+                store.insert(&block)?;
+            }
+        }
+        self.electrum_store = Some(store);
         Ok(())
     }
 
@@ -3130,12 +3153,23 @@ impl ChainState {
         else {
             return Ok(None);
         };
-        let Some(block) = self.store.get(&location.block_hash)? else {
+        if let Some(block) = self.store.get(&location.block_hash)? {
+            let Some(transaction) = block.txdata.get(location.transaction_index).cloned() else {
+                bail!("transaction index is inconsistent with stored block");
+            };
+            return Ok(Some((transaction, location)));
+        }
+        let Some(store) = self.electrum_store.as_mut() else {
             return Ok(None);
         };
-        let Some(transaction) = block.txdata.get(location.transaction_index).cloned() else {
-            bail!("transaction index is inconsistent with stored block");
+        let Some(transaction) =
+            store.transaction(&location.block_hash, location.transaction_index)?
+        else {
+            return Ok(None);
         };
+        if transaction.compute_txid() != *txid {
+            bail!("Electrum transaction sidecar does not match transaction index");
+        }
         Ok(Some((transaction, location)))
     }
 
@@ -3933,10 +3967,19 @@ impl ChainState {
         let Some(location) = self.tx_index.get(txid).cloned() else {
             return Ok(None);
         };
-        let Some(block) = self.store.get(&location.block_hash)? else {
-            return Ok(None);
+        let branch = if let Some(block) = self.store.get(&location.block_hash)? {
+            merkle_branch_for_block(&block, location.transaction_index)
+        } else {
+            let Some(store) = self.electrum_store.as_mut() else {
+                return Ok(None);
+            };
+            let Some(branch) =
+                store.merkle_branch(&location.block_hash, location.transaction_index)?
+            else {
+                return Ok(None);
+            };
+            branch
         };
-        let branch = merkle_branch_for_block(&block, location.transaction_index);
         Ok(Some((branch, location.transaction_index, location.height)))
     }
 
@@ -3953,18 +3996,54 @@ impl ChainState {
         let Some(block_hash) = self.block_hash(height) else {
             return Ok(None);
         };
-        let Some(block) = self.store.get(&block_hash)? else {
-            return Ok(None);
+        let (transaction_index, branch) = if let Some(block) = self.store.get(&block_hash)? {
+            let Some(transaction_index) = block
+                .txdata
+                .iter()
+                .position(|transaction| transaction.compute_txid() == *txid)
+            else {
+                return Ok(None);
+            };
+            (
+                transaction_index,
+                merkle_branch_for_block(&block, transaction_index),
+            )
+        } else {
+            let Some(location) = self.tx_index.get(txid).cloned() else {
+                return Ok(None);
+            };
+            if location.block_hash != block_hash || location.height != height {
+                return Ok(None);
+            }
+            let Some(store) = self.electrum_store.as_mut() else {
+                return Ok(None);
+            };
+            let Some(branch) = store.merkle_branch(&block_hash, location.transaction_index)? else {
+                return Ok(None);
+            };
+            (location.transaction_index, branch)
         };
-        let Some(transaction_index) = block
-            .txdata
-            .iter()
-            .position(|transaction| transaction.compute_txid() == *txid)
-        else {
-            return Ok(None);
-        };
-        let branch = merkle_branch_for_block(&block, transaction_index);
         Ok(Some((branch, transaction_index, height)))
+    }
+
+    /// Return an Electrum-indexed transaction by active-chain height and
+    /// position when the ordinary block body has been pruned.
+    pub(crate) fn electrum_transaction_at_height(
+        &mut self,
+        height: u32,
+        transaction_index: usize,
+    ) -> Result<Option<Transaction>> {
+        let Some(block_hash) = self.block_hash(height) else {
+            return Ok(None);
+        };
+        if let Some(block) = self.store.get(&block_hash)? {
+            return Ok(block.txdata.get(transaction_index).cloned());
+        }
+        self.electrum_store
+            .as_mut()
+            .map(|store| store.transaction(&block_hash, transaction_index))
+            .transpose()
+            .map(|value| value.flatten())
     }
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {
@@ -4024,6 +4103,9 @@ impl ChainState {
             self.median_time_past_for_parent(parent_hash),
         )?;
         self.store.insert(&block)?;
+        if let Some(store) = self.electrum_store.as_mut() {
+            store.insert(&block)?;
+        }
         self.index_all_transactions(&block, height);
         let chain_work = parent.chain_work + block.header.work();
         self.block_index.insert(
@@ -4803,6 +4885,11 @@ impl ChainState {
             application.spent_entries.iter().cloned().collect();
         if persist {
             self.store.insert(block)?;
+        }
+        if let Some(store) = self.electrum_store.as_mut() {
+            store.insert(block)?;
+        }
+        if persist {
             let delta = self.chainstate_delta_for_block(
                 block,
                 height,
@@ -6409,6 +6496,7 @@ fn open_background_replay_state(
         signet_challenge,
         deployment_parameters,
         store,
+        electrum_store: None,
         filter_store,
         chainstate_store,
         blockfilter_index_enabled: false,
@@ -8066,6 +8154,53 @@ mod tests {
             Some(1)
         );
         assert!(path.join("chainstate.txcounters").exists());
+    }
+
+    #[test]
+    fn electrum_transaction_sidecar_survives_pruning_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_electrum_index(true).unwrap();
+        let mut old_block_hash = None;
+        let mut old_txid = None;
+        for height in 1..=300 {
+            let block = mine_block(&state, height);
+            if height == 5 {
+                old_block_hash = Some(block.block_hash());
+                old_txid = Some(block.txdata[0].compute_txid());
+            }
+            state.connect_block(block).unwrap();
+        }
+        let old_block_hash = old_block_hash.expect("sidecar test block");
+        let old_txid = old_txid.expect("sidecar test transaction");
+        assert!(state.transaction(&old_txid).unwrap().is_some());
+        state.prune(50).unwrap();
+        assert!(!state.store.contains(&old_block_hash));
+        let (transaction, location) = state
+            .transaction(&old_txid)
+            .unwrap()
+            .expect("pruned transaction remains indexed");
+        assert_eq!(transaction.compute_txid(), old_txid);
+        assert_eq!(location.block_hash, old_block_hash);
+        assert_eq!(
+            state.merkle_branch(&old_txid).unwrap(),
+            Some((Vec::new(), 0, 5))
+        );
+
+        let path = directory.path().to_owned();
+        drop(state);
+        let mut reopened = ChainState::open(Network::Regtest, &path).unwrap();
+        reopened.configure_electrum_index(true).unwrap();
+        let (transaction, location) = reopened
+            .transaction(&old_txid)
+            .unwrap()
+            .expect("pruned transaction survives restart");
+        assert_eq!(transaction.compute_txid(), old_txid);
+        assert_eq!(location.block_hash, old_block_hash);
+        assert_eq!(
+            reopened.merkle_branch(&old_txid).unwrap(),
+            Some((Vec::new(), 0, 5))
+        );
     }
 
     #[test]

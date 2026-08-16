@@ -1521,15 +1521,8 @@ fn transaction_id_from_pos(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let position = param::<u32>(params, 1)?;
     let include_merkle = crate::rpc::optional_bool(params, 2, false, "include_merkle")?;
     let mut chain = node.chain.write();
-    let hash = chain
-        .block_hash(height)
-        .ok_or_else(|| anyhow!("block height out of range"))?;
-    let block = chain
-        .block(&hash)?
-        .ok_or_else(|| anyhow!("block not found"))?;
-    let transaction = block
-        .txdata
-        .get(position as usize)
+    let transaction = chain
+        .electrum_transaction_at_height(height, position as usize)?
         .ok_or_else(|| anyhow!("transaction position out of range"))?;
     let txid = transaction.compute_txid();
     if !include_merkle {

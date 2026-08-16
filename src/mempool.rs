@@ -465,7 +465,7 @@ impl PartialOrd for MiningCandidate {
 pub enum MempoolError {
     #[error("coinbase transactions cannot enter the mempool")]
     Coinbase,
-    #[error("transaction already exists in the mempool")]
+    #[error("txn-already-in-mempool")]
     AlreadyPresent,
     #[error("txn-same-nonwitness-data-in-mempool")]
     SameNonWitnessData(Wtxid),
@@ -515,6 +515,21 @@ pub enum MempoolError {
     ClusterLimit,
     #[error("TRUC-violation, {0}")]
     Truc(String),
+}
+
+/// The package test-accept path needs to preserve the first transaction that
+/// failed. Core returns no per-transaction result for package members that it
+/// did not reach, unlike a package-wide policy failure which is reported on
+/// every member.
+pub(crate) enum PackageTestAcceptFailure {
+    Transaction {
+        index: usize,
+        error: MempoolError,
+        prior_results_validated: bool,
+    },
+    Package {
+        error: String,
+    },
 }
 
 impl Mempool {
@@ -1644,31 +1659,88 @@ impl Mempool {
     /// replacement are intentionally disabled for this dry-run path, just as
     /// in Core's PackageTestAccept arguments.
     pub(crate) fn accept_package_for_test(
-        &mut self,
+        &self,
         transactions: &[Transaction],
         chain: &ChainState,
-    ) -> Result<Vec<Txid>, MempoolError> {
+    ) -> (Self, Result<Vec<Txid>, PackageTestAcceptFailure>) {
         if transactions.is_empty() {
-            return Err(MempoolError::Empty);
+            return (
+                self.clone(),
+                Err(PackageTestAcceptFailure::Package {
+                    error: "package-too-large".to_owned(),
+                }),
+            );
         }
         let added_at = time::unix_time();
         let mut candidate = self.clone();
         let mut accepted = Vec::with_capacity(transactions.len());
-        for transaction in transactions {
+        for (index, transaction) in transactions.iter().enumerate() {
             let txid = transaction.compute_txid();
             if let Some(error) = candidate.duplicate_error(transaction) {
-                return Err(error);
+                return (
+                    candidate,
+                    Err(PackageTestAcceptFailure::Transaction {
+                        index,
+                        error,
+                        prior_results_validated: false,
+                    }),
+                );
             }
             let conflicts = candidate.conflicts_for(transaction);
-            candidate.check_replacement_cluster_limit(txid, &conflicts)?;
             if !conflicts.is_empty() {
-                return Err(MempoolError::ReplacementDisallowed);
+                return (
+                    candidate,
+                    Err(PackageTestAcceptFailure::Transaction {
+                        index,
+                        error: MempoolError::ReplacementDisallowed,
+                        prior_results_validated: false,
+                    }),
+                );
             }
-            accepted.push(candidate.accept_at(transaction.clone(), chain, added_at)?);
+            if let Err(error) = candidate.check_replacement_cluster_limit(txid, &conflicts) {
+                return (
+                    candidate,
+                    Err(PackageTestAcceptFailure::Transaction {
+                        index,
+                        error,
+                        prior_results_validated: false,
+                    }),
+                );
+            }
+            let txid = match candidate.accept_at(transaction.clone(), chain, added_at) {
+                Ok(txid) => txid,
+                Err(error) => {
+                    let package_error = match &error {
+                        MempoolError::ClusterLimit => Some("too-large-cluster".to_owned()),
+                        MempoolError::Truc(_) => Some(error.to_string()),
+                        _ => None,
+                    };
+                    return (
+                        candidate,
+                        Err(match package_error {
+                            Some(error) => PackageTestAcceptFailure::Package { error },
+                            None => PackageTestAcceptFailure::Transaction {
+                                index,
+                                prior_results_validated: matches!(error, MempoolError::Script(_)),
+                                error,
+                            },
+                        }),
+                    );
+                }
+            };
+            accepted.push(txid);
         }
-        validate_ephemeral_spends(transactions, &candidate)?;
-        *self = candidate;
-        Ok(accepted)
+        if let Err(error) = validate_ephemeral_spends(transactions, &candidate) {
+            return (
+                candidate,
+                Err(PackageTestAcceptFailure::Transaction {
+                    index: transactions.len().saturating_sub(1),
+                    error,
+                    prior_results_validated: false,
+                }),
+            );
+        }
+        (candidate, Ok(accepted))
     }
 
     fn replace(

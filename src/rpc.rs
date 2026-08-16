@@ -51,7 +51,8 @@ use crate::config::{OnlyNet, RpcAuth, default_network_endpoint_port};
 use crate::fee_estimator::{EstimatorBucket, RawFeeEstimate};
 use crate::mempool::{
     MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool, MempoolError, MempoolLoadOptions,
-    package_is_child_with_parents_tree, package_is_topologically_sorted, package_weight,
+    PackageTestAcceptFailure, package_is_child_with_parents_tree, package_is_topologically_sorted,
+    package_weight,
 };
 use crate::script::{core_multisig_solution, is_core_multisig, is_core_p2pk};
 use crate::validation;
@@ -11901,6 +11902,52 @@ fn discard_unaccepted_package_transactions(
     }
 }
 
+fn package_test_failure_json(
+    transactions: &[Transaction],
+    candidate: &Mempool,
+    failure: PackageTestAcceptFailure,
+) -> Result<Value> {
+    match failure {
+        PackageTestAcceptFailure::Package { error } => Ok(json!(
+            transactions
+                .iter()
+                .map(|transaction| json!({
+                    "txid": transaction.compute_txid().to_string(),
+                    "wtxid": transaction.compute_wtxid().to_string(),
+                    "package-error": error.clone(),
+                }))
+                .collect::<Vec<_>>()
+        )),
+        PackageTestAcceptFailure::Transaction {
+            index,
+            error,
+            prior_results_validated,
+        } => {
+            let mut result = Vec::with_capacity(transactions.len());
+            for (transaction_index, transaction) in transactions.iter().enumerate() {
+                if transaction_index == index {
+                    result.push(rejected_transaction_json(transaction, &error));
+                } else if transaction_index > index || !prior_results_validated {
+                    result.push(json!({
+                        "txid": transaction.compute_txid().to_string(),
+                        "wtxid": transaction.compute_wtxid().to_string(),
+                    }));
+                } else {
+                    result.push(accepted_transaction_json(
+                        transaction,
+                        transactions,
+                        candidate,
+                        true,
+                        true,
+                        true,
+                    )?);
+                }
+            }
+            Ok(Value::Array(result))
+        }
+    }
+}
+
 pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let raw_transactions = params
         .as_array()
@@ -11937,13 +11984,11 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
     let chain = node.chain.read();
     let mut candidate = node.mempool.read().clone();
     if transactions.len() > 1 {
-        if let Err(error) = candidate.accept_package_for_test(&transactions, &chain) {
-            return Ok(json!(
-                transactions
-                    .iter()
-                    .map(|transaction| rejected_transaction_json(transaction, &error))
-                    .collect::<Vec<_>>()
-            ));
+        let (package_candidate, package_result) =
+            candidate.accept_package_for_test(&transactions, &chain);
+        candidate = package_candidate;
+        if let Err(failure) = package_result {
+            return package_test_failure_json(&transactions, &candidate, failure);
         }
         let mut result = Vec::with_capacity(transactions.len());
         let mut exit_early = false;
@@ -14585,7 +14630,7 @@ mod tests {
         submitted.input[0].witness = Witness::from_slice(&[vec![1u8]]);
         let mut mempool = Mempool::new(Network::Regtest);
         mempool.insert_test_entry(crate::mempool::MempoolEntry {
-            transaction: existing,
+            transaction: existing.clone(),
             fee_sat: 1,
             vsize: 1,
             added_at: 1,
@@ -14602,6 +14647,9 @@ mod tests {
             rejected["reject-reason"],
             "txn-same-nonwitness-data-in-mempool"
         );
+        let exact_rejected = rejected_transaction_json(&existing, &MempoolError::AlreadyPresent);
+        assert_eq!(exact_rejected["reject-reason"], "txn-already-in-mempool");
+        assert_eq!(exact_rejected["reject-details"], "txn-already-in-mempool");
         let package =
             package_transaction_json(&submitted, &[submitted.clone()], &mempool, false).unwrap();
         assert_eq!(
@@ -14610,6 +14658,36 @@ mod tests {
                 "txid": submitted.compute_txid().to_string(),
                 "other-wtxid": existing_wtxid.to_string(),
             })
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let chain = chain::ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let unprocessed = proof_transaction(43);
+        let (candidate, result) =
+            mempool.accept_package_for_test(&[existing.clone(), unprocessed.clone()], &chain);
+        let Err(failure) = result else {
+            panic!("expected the exact duplicate to fail package test acceptance");
+        };
+        assert_eq!(
+            package_test_failure_json(
+                &[existing.clone(), unprocessed.clone()],
+                &candidate,
+                failure,
+            )
+            .unwrap(),
+            json!([
+                {
+                    "txid": existing.compute_txid().to_string(),
+                    "wtxid": existing.compute_wtxid().to_string(),
+                    "allowed": false,
+                    "reject-reason": "txn-already-in-mempool",
+                    "reject-details": "txn-already-in-mempool",
+                },
+                {
+                    "txid": unprocessed.compute_txid().to_string(),
+                    "wtxid": unprocessed.compute_wtxid().to_string(),
+                },
+            ])
         );
     }
 

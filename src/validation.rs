@@ -157,6 +157,8 @@ pub enum ValidationError {
     BadCoinbaseHeight,
     #[error("transaction locktime is not yet satisfied")]
     NonFinalTransaction,
+    #[error("transaction locktime/sequence locks are not yet satisfied")]
+    NonFinalSequence,
     #[error("script validation failed for transaction {txid} input {input}: {reason}")]
     Script {
         txid: Txid,
@@ -209,6 +211,7 @@ impl ValidationError {
             Self::Bip30(_) => "bad-txns-BIP30".to_owned(),
             Self::BadCoinbaseHeight => "bad-cb-height".to_owned(),
             Self::NonFinalTransaction => "bad-txns-nonfinal".to_owned(),
+            Self::NonFinalSequence => "bad-txns-nonfinal".to_owned(),
             Self::Script { reason, .. } => {
                 format!("block-script-verify-flag-failed ({reason})")
             }
@@ -1174,13 +1177,13 @@ pub fn validate_transaction_finality(
         let relative = u32::from((sequence & 0x0000_ffff) as u16);
         if input.sequence.is_height_locked() {
             if height < entry.height.saturating_add(relative) {
-                return Err(ValidationError::NonFinalTransaction);
+                return Err(ValidationError::NonFinalSequence);
             }
         } else {
             let relative_seconds = relative.saturating_mul(512);
             let required_time = i64::from(entry.median_time_past) + i64::from(relative_seconds) - 1;
             if i64::from(lock_time_cutoff) <= required_time {
-                return Err(ValidationError::NonFinalTransaction);
+                return Err(ValidationError::NonFinalSequence);
             }
         }
     }

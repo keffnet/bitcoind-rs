@@ -463,6 +463,8 @@ impl PartialOrd for MiningCandidate {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MempoolError {
+    #[error("package is empty")]
+    EmptyPackage,
     #[error("coinbase transactions cannot enter the mempool")]
     Coinbase,
     #[error("txn-already-in-mempool")]
@@ -495,10 +497,20 @@ pub enum MempoolError {
     DuplicateInput,
     #[error("transaction contains a null prevout")]
     NullPrevout,
-    #[error("transaction has no inputs or outputs")]
-    Empty,
+    #[error("transaction has no inputs")]
+    EmptyInputs,
+    #[error("transaction has no outputs")]
+    EmptyOutputs,
     #[error("bad-txns-oversize")]
     Oversized,
+    #[error("bad-txns-vout-negative")]
+    NegativeOutput,
+    #[error("bad-txns-vout-toolarge")]
+    OutputTooLarge,
+    #[error("bad-txns-txouttotal-toolarge")]
+    OutputTotalTooLarge,
+    #[error("bad-txns-inputvalues-outofrange")]
+    InputValuesOutOfRange,
     #[error("transaction output value is invalid")]
     BadOutput,
     #[error("transaction spends more than its inputs")]
@@ -1420,24 +1432,15 @@ impl Mempool {
         self.accept_with_sibling(transaction, chain, false)
     }
 
-    /// Validate a transaction for testmempoolaccept without allowing it to
-    /// replace an existing mempool transaction. Core deliberately keeps
-    /// replacement disabled for this dry-run RPC even though normal local
-    /// admission uses full-RBF.
+    /// Validate a transaction for testmempoolaccept on a cloned mempool.
+    /// Replacements are evaluated normally; the caller keeps the clone
+    /// private so the dry-run RPC remains non-mutating.
     pub(crate) fn accept_for_test(
         &mut self,
         transaction: Transaction,
         chain: &ChainState,
     ) -> Result<Txid, MempoolError> {
-        if let Some(error) = self.duplicate_error(&transaction) {
-            return Err(error);
-        }
-        let conflicts = self.conflicts_for(&transaction);
-        self.check_replacement_cluster_limit(transaction.compute_txid(), &conflicts)?;
-        if !conflicts.is_empty() {
-            return Err(MempoolError::ReplacementDisallowed);
-        }
-        self.accept_without_sibling(transaction, chain)
+        self.accept(transaction, chain)
     }
 
     fn accept_with_sibling(
@@ -1522,7 +1525,7 @@ impl Mempool {
         chain: &ChainState,
     ) -> Result<Vec<Txid>, MempoolError> {
         if transactions.is_empty() {
-            return Err(MempoolError::Empty);
+            return Err(MempoolError::EmptyPackage);
         }
         let added_at = time::unix_time();
         let mut accepted = Vec::with_capacity(transactions.len());
@@ -2050,8 +2053,11 @@ impl Mempool {
         {
             return Err(MempoolError::NullPrevout);
         }
-        if transaction.input.is_empty() || transaction.output.is_empty() {
-            return Err(MempoolError::Empty);
+        if transaction.input.is_empty() {
+            return Err(MempoolError::EmptyInputs);
+        }
+        if transaction.output.is_empty() {
+            return Err(MempoolError::EmptyOutputs);
         }
         if transaction.base_size().saturating_mul(4) > validation::MAX_BLOCK_WEIGHT {
             return Err(MempoolError::Oversized);
@@ -2110,27 +2116,24 @@ impl Mempool {
             &previous_entries,
         )
         .map_err(|error| MempoolError::Script(error.to_string()))?;
-        chain
-            .validate_mempool_transaction_scripts(&transaction, &previous_outputs)
-            .map_err(|error| MempoolError::Script(error.to_string()))?;
-        let output_total = transaction
-            .output
-            .iter()
-            .map(|output| output.value.to_sat())
-            .try_fold(0u64, u64::checked_add)
-            .ok_or(MempoolError::BadOutput)?;
-        if output_total > Amount::MAX_MONEY.to_sat() {
-            return Err(MempoolError::BadOutput);
+        let mut output_total = 0u64;
+        for output in &transaction.output {
+            let value = output.value.to_sat();
+            if value > i64::MAX as u64 {
+                return Err(MempoolError::NegativeOutput);
+            }
+            if value > Amount::MAX_MONEY.to_sat() {
+                return Err(MempoolError::OutputTooLarge);
+            }
+            output_total = output_total
+                .checked_add(value)
+                .ok_or(MempoolError::OutputTotalTooLarge)?;
+            if output_total > Amount::MAX_MONEY.to_sat() {
+                return Err(MempoolError::OutputTotalTooLarge);
+            }
         }
         if output_total > input_total {
             return Err(MempoolError::NegativeFee);
-        }
-        if transaction
-            .output
-            .iter()
-            .any(|output| output.value > Amount::MAX_MONEY)
-        {
-            return Err(MempoolError::BadOutput);
         }
         let fee_sat = input_total - output_total;
         let script_flags =
@@ -2143,9 +2146,6 @@ impl Mempool {
             .to_wu()
             .max(sigop_cost.saturating_mul(self.policy.bytes_per_sigop));
         let vsize = adjusted_weight.saturating_add(3) / 4;
-        if transaction.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
-            return Err(MempoolError::NonStandard("tx-size-small".to_owned()));
-        }
         let modified_fee_sat = i64::try_from(fee_sat)
             .unwrap_or(i64::MAX)
             .saturating_add(self.fee_delta(&txid));
@@ -2158,6 +2158,15 @@ impl Mempool {
                 &self.policy,
             )?;
         }
+        // Core checks this after ordinary standardness so a short
+        // transaction with a non-standard script reports that script
+        // policy reason rather than the generic anti-CVE size reason.
+        if transaction.base_size() < MIN_STANDARD_TX_NONWITNESS_SIZE {
+            return Err(MempoolError::NonStandard("tx-size-small".to_owned()));
+        }
+        chain
+            .validate_mempool_transaction_scripts(&transaction, &previous_outputs)
+            .map_err(|error| MempoolError::Script(error.to_string()))?;
         let truc_min_fee_exempt =
             self.policy.truc_policy == TrucPolicy::Enforce && transaction.version.0 == TRUC_VERSION;
         if enforce_fee_rate
@@ -3288,6 +3297,21 @@ fn validate_standard_inputs(
             None
         };
         let spending_script = redeem_script.as_deref().unwrap_or(&previous.script_pubkey);
+        // Core rejects a witness program hidden in P2SH when the serialized
+        // transaction has no witness data. This is a stripped-witness
+        // policy failure, including the v1 anchor-shaped program used by
+        // Core's mempool acceptance tests.
+        if previous.script_pubkey.is_p2sh()
+            && spending_script.is_witness_program()
+            && transaction
+                .input
+                .iter()
+                .all(|input| input.witness.is_empty())
+        {
+            return Err(standard_script_policy_failure(
+                "Witness version reserved for soft-fork upgrades",
+            ));
+        }
         if spending_script.is_witness_program()
             && !(spending_script.is_p2wpkh()
                 || spending_script.is_p2wsh()

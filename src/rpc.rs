@@ -1737,7 +1737,7 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
                 bail!("unknown named parameter {name} for {method}")
             };
             if specified.get(index).copied().unwrap_or(false) {
-                bail!("parameter {name} specified more than once")
+                bail!("Parameter {name} specified twice both as positional and named argument")
             }
             values.resize(index.saturating_add(1), Value::Null);
             specified.resize(index.saturating_add(1), false);
@@ -1769,10 +1769,10 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
         }
         let lookup_name = rpc_parameter_alias(method, name).unwrap_or(name);
         let Some(index) = names.iter().position(|candidate| *candidate == lookup_name) else {
-            bail!("unknown named parameter {name} for {method}")
+            bail!("Unknown named parameter {name}")
         };
         if specified[index] {
-            bail!("parameter {name} specified more than once")
+            bail!("Parameter {name} specified twice both as positional and named argument")
         }
         values[index] = if method == "dumptxoutset" && name == "rollback" {
             json!({"rollback": value})
@@ -11991,6 +11991,8 @@ fn package_policy_error(transactions: &[Transaction]) -> Option<&'static str> {
 
 fn mempool_reject_reason(error: &MempoolError) -> String {
     match error {
+        MempoolError::EmptyPackage => "package-too-large".to_owned(),
+        MempoolError::Coinbase => "coinbase".to_owned(),
         MempoolError::AlreadyPresent => "txn-already-in-mempool".to_owned(),
         MempoolError::SameNonWitnessData(_) => "txn-same-nonwitness-data-in-mempool".to_owned(),
         MempoolError::AlreadyInChain => "txn-already-known".to_owned(),
@@ -12002,11 +12004,23 @@ fn mempool_reject_reason(error: &MempoolError) -> String {
             "insufficient feerate: does not improve feerate diagram".to_owned()
         }
         MempoolError::MissingInput(_) => "missing-inputs".to_owned(),
+        MempoolError::EmptyInputs => "bad-txns-vin-empty".to_owned(),
+        MempoolError::EmptyOutputs => "bad-txns-vout-empty".to_owned(),
+        MempoolError::Oversized => "bad-txns-oversize".to_owned(),
+        MempoolError::NegativeOutput => "bad-txns-vout-negative".to_owned(),
+        MempoolError::OutputTooLarge => "bad-txns-vout-toolarge".to_owned(),
+        MempoolError::OutputTotalTooLarge => "bad-txns-txouttotal-toolarge".to_owned(),
+        MempoolError::InputValuesOutOfRange => "bad-txns-inputvalues-outofrange".to_owned(),
+        MempoolError::DuplicateInput => "bad-txns-inputs-duplicate".to_owned(),
+        MempoolError::NullPrevout => "bad-txns-prevout-null".to_owned(),
+        MempoolError::NegativeFee => "bad-txns-in-belowout".to_owned(),
         MempoolError::FeeRate => "mempool min fee not met".to_owned(),
         MempoolError::MinRelayFee => "min relay fee not met".to_owned(),
         MempoolError::NonStandard(reason) => reason.clone(),
         MempoolError::ClusterLimit => "too-long-mempool-chain".to_owned(),
         MempoolError::Truc(reason) => format!("TRUC-violation, {reason}"),
+        MempoolError::Script(reason) if reason.contains("sequence") => "non-BIP68-final".to_owned(),
+        MempoolError::Script(reason) if reason.contains("locktime") => "non-final".to_owned(),
         MempoolError::Script(reason) => reason.clone(),
         _ => error.to_string(),
     }
@@ -12241,11 +12255,10 @@ fn package_test_failure_json(
 }
 
 pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let raw_transactions = params
+    let raw_transactions_value = params.get(0).unwrap_or(&Value::Null);
+    let raw_transactions = raw_transactions_value
         .as_array()
-        .and_then(|values| values.first())
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("testmempoolaccept expects an array of hex transactions"))?;
+        .ok_or_else(|| json_type_error(raw_transactions_value, "array"))?;
     if raw_transactions.is_empty() || raw_transactions.len() > MAX_PACKAGE_COUNT {
         bail!("Array must contain between 1 and {MAX_PACKAGE_COUNT} transactions.");
     }
@@ -14318,6 +14331,8 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.starts_with("invalid block count:")
         || lower.starts_with("invalid blockhash:")
         || lower.starts_with("invalid parameter")
+        || lower.starts_with("array must contain between ")
+        || lower.starts_with("fee rates larger than or equal to ")
         || lower.starts_with("blockhash must be")
         || lower.starts_with("hash must be")
         || lower.starts_with("txid must be")
@@ -14327,6 +14342,7 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.starts_with("invalid selected statistic ")
         || lower.starts_with("target block height ")
         || lower.contains("specified more than once")
+        || lower.contains("specified twice both as positional and named argument")
         || lower.contains("is not a valid hash_type")
         || lower.contains("must be between ")
         || lower.contains("must not be negative")
@@ -14545,7 +14561,7 @@ fn rpc_help(method: &str) -> String {
             LOG_CATEGORIES.join(", ")
         )
     } else if METHODS.contains(&method) {
-        format!("{method}: wallet-free Bitcoin Core-compatible RPC")
+        format!("{method}\n\n{method}: wallet-free Bitcoin Core-compatible RPC")
     } else {
         format!("unknown command: {method}")
     }
@@ -25472,8 +25488,8 @@ mod tests {
             &json!([[hex::encode(serialize(&replacement))]]),
         )
         .unwrap();
-        assert_eq!(dry_run[0]["allowed"], false);
-        assert_eq!(dry_run[0]["reject-reason"], "bip125-replacement-disallowed");
+        assert_eq!(dry_run[0]["allowed"], true);
+        assert!(dry_run[0]["fees"]["base"].is_number());
         assert!(node.mempool.read().get(&old_txid).is_some());
         let replacement_txid = replacement.compute_txid();
         let package_result =

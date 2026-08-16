@@ -231,6 +231,7 @@ const MAX_BLOOM_ELEMENT_SIZE: usize = 520;
 const MAX_ADDR_TO_SEND: usize = 1_000;
 const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 const MAX_BLOCKTXN_DEPTH: u32 = 10;
+const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 const STALE_RELAY_AGE_LIMIT_SECS: u64 = 30 * 24 * 60 * 60;
 pub(crate) const MIN_PEER_PROTO_VERSION: i32 = 31_800;
 pub(crate) const BIP31_VERSION: i32 = 60_000;
@@ -3689,6 +3690,13 @@ async fn serve_peer_loop(
                             {
                                 continue;
                             }
+                            if peer_requests_too_old_network_limited_block(
+                                node,
+                                &item.hash,
+                                peer_state.permissions,
+                            ) {
+                                anyhow::bail!("block is below the network-limited serving window");
+                            }
                             if node.historical_block_serving_limit_reached(
                                 &item.hash,
                                 false,
@@ -3754,6 +3762,13 @@ async fn serve_peer_loop(
                                 };
                                 (block, recent, direct_fetch_allowed)
                             };
+                            if peer_requests_too_old_network_limited_block(
+                                node,
+                                &item.hash,
+                                peer_state.permissions,
+                            ) {
+                                anyhow::bail!("block is below the network-limited serving window");
+                            }
                             if !recent || !direct_fetch_allowed {
                                 send_message(
                                     node,
@@ -3805,6 +3820,13 @@ async fn serve_peer_loop(
                                 .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
                             {
                                 continue;
+                            }
+                            if peer_requests_too_old_network_limited_block(
+                                node,
+                                &item.hash,
+                                peer_state.permissions,
+                            ) {
+                                anyhow::bail!("block is below the network-limited serving window");
                             }
                             if node.historical_block_serving_limit_reached(
                                 &item.hash,
@@ -4037,6 +4059,13 @@ async fn serve_peer_loop(
                     (block, recent)
                 };
                 if !recent {
+                    if peer_requests_too_old_network_limited_block(
+                        node,
+                        &request.block_hash,
+                        peer_state.permissions,
+                    ) {
+                        anyhow::bail!("block is below the network-limited serving window");
+                    }
                     if node.historical_block_serving_limit_reached(
                         &request.block_hash,
                         false,
@@ -5559,6 +5588,34 @@ fn peer_can_request_mempool(peer_bloom_filters: bool, permissions: PeerPermissio
 
 fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
     height >= tip_height.saturating_sub(MAX_BLOCKTXN_DEPTH)
+}
+
+fn network_limited_block_request_is_too_old(
+    limited: bool,
+    tip_height: u32,
+    block_height: u32,
+    permissions: PeerPermissions,
+) -> bool {
+    limited
+        && !permissions.contains(PeerPermissions::NO_BAN)
+        && tip_height.saturating_sub(block_height)
+            > NODE_NETWORK_LIMITED_MIN_BLOCKS.saturating_add(2)
+}
+
+fn peer_requests_too_old_network_limited_block(
+    node: &Arc<Node>,
+    hash: &BlockHash,
+    permissions: PeerPermissions,
+) -> bool {
+    let chain = node.chain.read();
+    chain.block_height_by_hash(hash).is_some_and(|height| {
+        network_limited_block_request_is_too_old(
+            chain.is_network_limited(),
+            chain.height(),
+            height,
+            permissions,
+        )
+    })
 }
 
 fn compact_block_is_recent(height: u32, tip_height: u32) -> bool {
@@ -7094,6 +7151,31 @@ mod tests {
         assert!(compact_block_is_recent(100, 100));
         assert!(!compact_block_is_recent(94, 100));
         assert!(compact_block_is_recent(0, 5));
+
+        assert!(!network_limited_block_request_is_too_old(
+            false,
+            1_000,
+            0,
+            PeerPermissions::empty()
+        ));
+        assert!(!network_limited_block_request_is_too_old(
+            true,
+            1_000,
+            710,
+            PeerPermissions::empty()
+        ));
+        assert!(network_limited_block_request_is_too_old(
+            true,
+            1_000,
+            709,
+            PeerPermissions::empty()
+        ));
+        assert!(!network_limited_block_request_is_too_old(
+            true,
+            1_000,
+            0,
+            PeerPermissions::NO_BAN
+        ));
 
         assert!(can_direct_fetch(1_000, 1_000 + 20 * 600 - 1, 600));
         assert!(!can_direct_fetch(1_000, 1_000 + 20 * 600, 600));

@@ -3378,6 +3378,70 @@ impl ChainState {
             .collect()
     }
 
+    /// Return the active-chain outputs that electrs would consider unspent
+    /// for a script hash.  Unlike Core's UTXO set, electrs keeps matching
+    /// outputs whose scripts are provably unspendable (for example
+    /// `OP_RETURN`) in its scripthash status index.  The Electrum node path
+    /// enables the durable spender index, which lets this projection retain
+    /// those outputs without polluting consensus UTXO accounting.
+    pub(crate) fn electrum_unspent_for_script(
+        &mut self,
+        script_hash: &str,
+    ) -> Result<Vec<(OutPoint, i64, usize, u64)>> {
+        let mut outputs = HashMap::new();
+        for history in self.get_history(script_hash) {
+            let Some(location) =
+                self.active_transaction_location_at_height(&history.txid, history.height)
+            else {
+                continue;
+            };
+            let Some((transaction, location)) =
+                self.transaction_at_location(&history.txid, location)?
+            else {
+                continue;
+            };
+            for (vout, output) in transaction.output.iter().enumerate() {
+                if electrum_script_hash(&output.script_pubkey) != script_hash {
+                    continue;
+                }
+                let outpoint = OutPoint::new(history.txid, vout as u32);
+                let unspent = if self.utxos.contains_key(&outpoint) {
+                    true
+                } else {
+                    // The Electrum integration enables this index before it
+                    // serves requests.  Without it, an output absent from
+                    // the consensus UTXO set cannot be distinguished from a
+                    // spendable output that was already spent.
+                    self.txospender_index_enabled && self.spending_transaction(&outpoint).is_none()
+                };
+                if unspent {
+                    outputs.insert(
+                        outpoint,
+                        (
+                            i64::from(location.height),
+                            location.transaction_index,
+                            output.value.to_sat(),
+                        ),
+                    );
+                }
+            }
+        }
+        let mut outputs = outputs
+            .into_iter()
+            .map(|(outpoint, (height, transaction_index, value))| {
+                (outpoint, height, transaction_index, value)
+            })
+            .collect::<Vec<_>>();
+        outputs.sort_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| left.0.txid.cmp(&right.0.txid))
+                .then_with(|| left.0.vout.cmp(&right.0.vout))
+        });
+        Ok(outputs)
+    }
+
     pub fn utxo(&self, outpoint: &OutPoint) -> Option<&UtxoEntry> {
         self.utxos.get(outpoint)
     }
@@ -8695,6 +8759,7 @@ mod tests {
         while !block.header.target().is_met_by(block.block_hash()) {
             block.header.nonce = block.header.nonce.wrapping_add(1);
         }
+        let coinbase_txid = block.txdata[0].compute_txid();
         let block_hash = block.block_hash();
         state.connect_block(block).unwrap();
         state.configure_coinstats_index(true).unwrap();
@@ -8706,6 +8771,13 @@ mod tests {
         assert_eq!(stats.total_unspendable_genesis_sat, 5_000_000_000);
         assert_eq!(stats.total_unspendable_scripts_sat, 500_000_000);
         assert_eq!(stats.total_unspendable_unclaimed_rewards_sat, 500_000_000);
+
+        state.configure_txospender_index(true).unwrap();
+        let script_hash = electrum_script_hash(&bitcoin::ScriptBuf::from_bytes(vec![0x6a]));
+        assert_eq!(
+            state.electrum_unspent_for_script(&script_hash).unwrap(),
+            vec![(OutPoint::new(coinbase_txid, 1), 1, 0, 500_000_000,)]
+        );
     }
 
     #[test]

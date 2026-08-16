@@ -1782,12 +1782,13 @@ fn sort_mempool_records(records: &mut [(Txid, i64)]) {
 }
 
 fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> (u64, i64) {
-    let chain = node.chain.read();
+    let mut chain = node.chain.write();
     let mempool = node.mempool.read();
     let confirmed = chain
-        .get_utxos(script_hash)
+        .electrum_unspent_for_script(script_hash)
+        .unwrap_or_default()
         .into_iter()
-        .map(|(_, entry)| entry.output.value.to_sat())
+        .map(|(_, _, _, value)| value)
         .sum();
     let mut unconfirmed = 0i64;
     for txid in mempool.transaction_order() {
@@ -1811,7 +1812,7 @@ fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> (u64, i64) {
 }
 
 fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
-    let chain = node.chain.read();
+    let mut chain = node.chain.write();
     let mempool = node.mempool.read();
     let mut spent = HashSet::new();
     for txid in mempool.transaction_order() {
@@ -1825,22 +1826,12 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
             );
         }
     }
-    let mut confirmed: Vec<(OutPoint, i64, usize, u64)> = chain
-        .get_utxos(script_hash)
+    let mut confirmed = chain
+        .electrum_unspent_for_script(script_hash)
+        .unwrap_or_default()
         .into_iter()
-        .filter(|(outpoint, _)| !spent.contains(outpoint))
-        .map(|(outpoint, entry)| {
-            let transaction_index = chain
-                .transaction_location(&outpoint.txid)
-                .map_or(usize::MAX, |location| location.transaction_index);
-            (
-                outpoint,
-                i64::from(entry.height),
-                transaction_index,
-                entry.output.value.to_sat(),
-            )
-        })
-        .collect();
+        .filter(|(outpoint, _, _, _)| !spent.contains(outpoint))
+        .collect::<Vec<_>>();
     confirmed.sort_by(|left, right| {
         left.1
             .cmp(&right.1)

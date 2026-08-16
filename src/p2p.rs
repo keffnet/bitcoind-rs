@@ -4160,6 +4160,15 @@ async fn serve_peer_loop(
                 if !work_allowed {
                     continue;
                 }
+                if let Err(error) = node
+                    .chain
+                    .write()
+                    .accept_headers(std::slice::from_ref(&compact.header))
+                {
+                    debug!(%hash, %error, "invalid compact block header");
+                    continue;
+                }
+                node.update_peer_best_known_block(peer_id, hash);
                 if !should_reconstruct {
                     if requested {
                         request_full_block(node, peer_id, writer, node.config.network, hash)

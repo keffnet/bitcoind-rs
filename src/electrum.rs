@@ -1437,7 +1437,7 @@ async fn send_status_notifications(
     node: &Arc<Node>,
     subscriptions: &mut HashMap<String, Subscription>,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
-    force_scriptpubkey_notification: bool,
+    force_reorg_notification: bool,
 ) -> Result<()> {
     for subscription in subscriptions.values_mut() {
         let notification = match subscription {
@@ -1485,7 +1485,7 @@ async fn send_status_notifications(
                 let current = history_status_for_script(node, script_hash)
                     .map(Value::String)
                     .unwrap_or(Value::Null);
-                if status_notification_needed(status, &current, force_scriptpubkey_notification) {
+                if status_notification_needed(status, &current, force_reorg_notification) {
                     *status = current.clone();
                     json!({
                         "jsonrpc": "2.0",
@@ -1498,7 +1498,7 @@ async fn send_status_notifications(
             }
             Subscription::Outpoint { outpoint, status } => {
                 let current = outpoint_status(node, outpoint)?;
-                if *status == current {
+                if !status_notification_needed(status, &current, force_reorg_notification) {
                     continue;
                 }
                 *status = current.clone();
@@ -1898,7 +1898,7 @@ mod tests {
     }
 
     #[test]
-    fn scriptpubkey_reorg_notifications_can_repeat_an_unchanged_status() {
+    fn reorg_notifications_can_repeat_an_unchanged_status() {
         let status = json!("same-status");
         assert!(!status_notification_needed(&status, &status, false));
         assert!(status_notification_needed(&status, &status, true));

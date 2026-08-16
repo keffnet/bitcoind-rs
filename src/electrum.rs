@@ -1761,7 +1761,11 @@ fn sort_mempool_records(records: &mut [(Txid, i64)]) {
     records.sort_by(|(left_txid, left_height), (right_txid, right_height)| {
         right_height
             .cmp(left_height)
-            .then_with(|| left_txid.to_string().cmp(&right_txid.to_string()))
+            // electrs uses Txid's native ordering here.  Comparing the
+            // displayed string is not equivalent because Bitcoin renders
+            // hashes in reverse byte order; it can invert the order and
+            // consequently change both history responses and status hashes.
+            .then_with(|| left_txid.cmp(right_txid))
     });
 }
 
@@ -2155,6 +2159,27 @@ mod tests {
         assert_eq!(records[1].1, 0);
         assert_eq!(records[2], (child_txid, -1));
         assert!(records[0].0.to_string() < records[1].0.to_string());
+    }
+
+    #[test]
+    fn mempool_records_sort_by_raw_txid_order_not_display_order() {
+        let raw_low = Txid::from_byte_array({
+            let mut bytes = [0; 32];
+            bytes[31] = 1;
+            bytes
+        });
+        let raw_high = Txid::from_byte_array({
+            let mut bytes = [0; 32];
+            bytes[0] = 1;
+            bytes
+        });
+        assert!(raw_low < raw_high);
+        assert!(raw_low.to_string() > raw_high.to_string());
+
+        let mut records = vec![(raw_high, 0), (raw_low, 0)];
+        sort_mempool_records(&mut records);
+
+        assert_eq!(records, vec![(raw_low, 0), (raw_high, 0)]);
     }
 
     #[test]

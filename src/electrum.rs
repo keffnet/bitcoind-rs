@@ -1394,14 +1394,12 @@ fn transaction_get_batch(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txids = params
         .get(0)
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("transaction.get_batch expects an array of txids"))?;
+        .ok_or_else(electrum_invalid_params)?;
     let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
     txids
         .iter()
         .map(|txid| {
-            let txid = txid
-                .as_str()
-                .ok_or_else(|| anyhow!("transaction ids must be strings"))?;
+            let txid = txid.as_str().ok_or_else(electrum_invalid_params)?;
             transaction_get(node, &json!([txid, verbose]))
         })
         .collect::<Result<Vec<_>>>()
@@ -1532,10 +1530,7 @@ fn transaction_broadcast(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn transaction_broadcast_package(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let raw_transactions = params
-        .get(0)
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("broadcast_package expects an array of transactions"))?;
+    let raw_transactions = raw_transaction_params(params)?;
     if raw_transactions.is_empty() {
         bail!("broadcast_package requires at least one transaction")
     }
@@ -1568,10 +1563,7 @@ fn transaction_broadcast_package(node: &Arc<Node>, params: &Value) -> Result<Val
 }
 
 fn transaction_test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let raw_transactions = params
-        .get(0)
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("testmempoolaccept expects an array of transactions"))?;
+    let raw_transactions = raw_transaction_params(params)?;
     if raw_transactions.is_empty() {
         bail!("testmempoolaccept requires at least one transaction")
     }
@@ -1888,11 +1880,22 @@ fn txid_param(params: &Value, index: usize) -> Result<Txid> {
         .map_err(|_| electrum_invalid_params())
 }
 
+fn raw_transaction_params(params: &Value) -> Result<&[Value]> {
+    let raw_transactions = params
+        .get(0)
+        .and_then(Value::as_array)
+        .ok_or_else(electrum_invalid_params)?;
+    if raw_transactions.iter().any(|raw| !raw.is_string()) {
+        return Err(electrum_invalid_params());
+    }
+    Ok(raw_transactions)
+}
+
 fn scriptpubkey_param(params: &Value, index: usize) -> Result<ScriptBuf> {
     let value = param::<String>(params, index)?;
-    let bytes = hex::decode(value)?;
+    let bytes = hex::decode(value).map_err(|_| electrum_invalid_params())?;
     if bytes.len() > MAX_SCRIPTPUBKEY_SIZE {
-        bail!("scriptPubKey exceeds the 10,000-byte limit")
+        return Err(electrum_invalid_params());
     }
     Ok(ScriptBuf::from_bytes(bytes))
 }
@@ -2033,6 +2036,26 @@ mod tests {
             scriptpubkey_param(&json!([hex::encode(vec![0; MAX_SCRIPTPUBKEY_SIZE + 1])]), 0,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn transaction_package_parameter_shapes_are_invalid_params() {
+        for params in [json!([]), json!([["00", false]])] {
+            let response = electrum_error_response(
+                json!(1),
+                "blockchain.transaction.broadcast_package",
+                raw_transaction_params(&params).unwrap_err(),
+            );
+            assert_eq!(response["error"]["code"], json!(-32602));
+            assert_eq!(response["error"]["message"], json!("invalid params"));
+        }
+        let response = electrum_error_response(
+            json!(2),
+            "blockchain.scriptpubkey.get_balance",
+            scriptpubkey_param(&json!(["not-hex"]), 0).unwrap_err(),
+        );
+        assert_eq!(response["error"]["code"], json!(-32602));
+        assert_eq!(response["error"]["message"], json!("invalid params"));
     }
 
     #[test]

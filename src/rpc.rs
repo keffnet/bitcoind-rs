@@ -13566,12 +13566,18 @@ fn add_prevout_details(
         let output = spent_outputs
             .get(input_index)
             .ok_or_else(|| anyhow!("transaction undo is missing input {input_index}"))?;
-        let (previous_transaction, location) = chain
-            .transaction(&input.previous_output.txid)?
-            .ok_or_else(|| anyhow!("previous transaction is unavailable"))?;
+        let (height, generated) =
+            if let Some(location) = chain.transaction_location(&input.previous_output.txid) {
+                (location.height, location.transaction_index == 0)
+            } else {
+                let (previous_transaction, location) = chain
+                    .transaction(&input.previous_output.txid)?
+                    .ok_or_else(|| anyhow!("previous transaction is unavailable"))?;
+                (location.height, previous_transaction.is_coinbase())
+            };
         let prevout = json!({
-            "generated": previous_transaction.is_coinbase(),
-            "height": location.height,
+            "generated": generated,
+            "height": height,
             "value": sat_to_btc(output.value.to_sat()),
             "scriptPubKey": script_json_with_network(&output.script_pubkey, Some(network)),
         });
@@ -18522,7 +18528,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(raw_high["fee"], 0.00001);
-        assert!(raw_high["vin"][0].get("prevout").is_some());
+        assert_eq!(raw_high["vin"][0]["prevout"]["generated"], true);
+        assert_eq!(raw_high["vin"][0]["prevout"]["height"], 1);
         assert!(
             get_raw_transaction(
                 &node,

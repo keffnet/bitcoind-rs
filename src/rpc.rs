@@ -11221,10 +11221,10 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
         .get(0)
         .filter(|value| !value.is_null())
         .and_then(Value::as_object);
-    let longpoll_id = request
+    let longpoll_value = request
         .filter(|request| request.get("mode").and_then(Value::as_str) != Some("proposal"))
         .and_then(|request| request.get("longpollid"))
-        .and_then(Value::as_str);
+        .filter(|value| !value.is_null());
     if request
         .and_then(|request| request.get("mode"))
         .and_then(Value::as_str)
@@ -11232,7 +11232,14 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
     {
         ensure_get_block_template_ready(node)?;
     }
-    if let Some(longpoll_id) = longpoll_id {
+    if let Some(longpoll_value) = longpoll_value {
+        // Core treats every non-null longpollid as a long-poll request. Its
+        // documented type is a string, but non-string values use the current
+        // tip/transaction counter as the baseline for compatibility tests.
+        let longpoll_id = longpoll_value
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| current_block_template_longpoll_id(node));
         let mut chain_events = node.subscribe_chain();
         // Core wakes immediately for a new best tip, but polls the mempool
         // transaction counter after one minute and then every ten seconds.
@@ -19043,6 +19050,29 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(template["height"], 1);
+
+        let node_for_poll = Arc::clone(&node);
+        let poll_params = json!([{"longpollid": 1, "rules": ["segwit"]}]);
+        let mut poll =
+            tokio::spawn(
+                async move { get_block_template_async(&node_for_poll, &poll_params).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut poll)
+                .await
+                .is_err()
+        );
+        generate_to_address(
+            &node,
+            &json!([1, "bcrt1q2nfxmhd4n3c8834pj72xagvyr9gl57n5r94fsl"]),
+        )
+        .unwrap();
+        let template = tokio::time::timeout(Duration::from_secs(2), poll)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(template["height"], 2);
     }
 
     #[tokio::test]

@@ -291,6 +291,27 @@ fn getdata_batches(requests: &[Inventory]) -> impl Iterator<Item = &[Inventory]>
     requests.chunks(MAX_GETDATA_BATCH)
 }
 
+/// Match Core's getdata scheduler: drain a transaction prefix, then process
+/// at most one block (or other non-transaction item) before returning to the
+/// peer loop. This keeps expensive block responses from overtaking later
+/// requests and provides the same queue backpressure as net_processing.
+fn take_getdata_batch(pending: &mut VecDeque<Inventory>) -> Option<Vec<Inventory>> {
+    if pending.is_empty() {
+        return None;
+    }
+    let mut batch = Vec::new();
+    while pending
+        .front()
+        .is_some_and(|item| item.kind.is_transaction())
+    {
+        batch.push(pending.pop_front().expect("getdata queue front exists"));
+    }
+    if let Some(item) = pending.pop_front() {
+        batch.push(item);
+    }
+    Some(batch)
+}
+
 fn inventory_broadcast_limit(pending: usize) -> usize {
     INVENTORY_BROADCAST_TARGET
         .saturating_add((pending / 1_000).saturating_mul(5))
@@ -2922,6 +2943,7 @@ async fn serve_peer_loop(
     tx_inventory_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tx_inventory_interval.tick().await;
     let mut pending_block_requests = Vec::new();
+    let mut pending_getdata = VecDeque::new();
     let mut headers_sync: Option<LowWorkHeadersSync> = None;
     let private_broadcast_timeout = tokio::time::sleep(Duration::from_secs(3 * 60));
     tokio::pin!(private_broadcast_timeout);
@@ -2929,7 +2951,10 @@ async fn serve_peer_loop(
         if !node.network_active() {
             anyhow::bail!("networking is disabled");
         }
-        let message = tokio::select! {
+        let message = if let Some(items) = take_getdata_batch(&mut pending_getdata) {
+            Message::GetData(items)
+        } else {
+            tokio::select! {
             command = commands.recv() => {
                 match command {
                     Some(PeerCommand::Disconnect) | None => anyhow::bail!("peer disconnected by node"),
@@ -3000,7 +3025,15 @@ async fn serve_peer_loop(
                 };
                 node.record_bytes_received(peer_id, bytes, message.command());
                 node.capture_message(peer_id, true, &message)?;
-                message
+                if let Message::GetData(items) = message {
+                    pending_getdata.extend(items);
+                    let Some(items) = take_getdata_batch(&mut pending_getdata) else {
+                        continue;
+                    };
+                    Message::GetData(items)
+                } else {
+                    message
+                }
             },
             _ = ping_interval.tick(), if version_received && verack_received && peer_version > BIP31_VERSION && !*peer_state.private_broadcast_peer.lock() => {
                 if node.ping_timed_out(peer_id, peer_timeout) {
@@ -3097,6 +3130,7 @@ async fn serve_peer_loop(
             }
             _ = &mut private_broadcast_timeout, if peer_state.connection_type == "private-broadcast" => {
                 anyhow::bail!("private broadcast connection timed out")
+            }
             }
         };
         if !version_received && !matches!(&message, Message::Version(_)) {
@@ -6747,6 +6781,44 @@ mod tests {
             .map(<[Inventory]>::len)
             .collect::<Vec<_>>();
         assert_eq!(lengths, [1_000, 1_000, 1]);
+    }
+
+    #[test]
+    fn inbound_getdata_batches_match_core_block_backpressure() {
+        let mut pending = VecDeque::from(vec![
+            Inventory {
+                kind: InventoryType::Transaction,
+                hash: BlockHash::from_byte_array([1; 32]),
+            },
+            Inventory {
+                kind: InventoryType::WitnessTransaction,
+                hash: BlockHash::from_byte_array([2; 32]),
+            },
+            Inventory {
+                kind: InventoryType::WitnessBlock,
+                hash: BlockHash::from_byte_array([3; 32]),
+            },
+            Inventory {
+                kind: InventoryType::Transaction,
+                hash: BlockHash::from_byte_array([4; 32]),
+            },
+            Inventory {
+                kind: InventoryType::Block,
+                hash: BlockHash::from_byte_array([5; 32]),
+            },
+        ]);
+
+        let first = take_getdata_batch(&mut pending).unwrap();
+        assert_eq!(first.len(), 3);
+        assert!(first[..2].iter().all(|item| item.kind.is_transaction()));
+        assert_eq!(first[2].kind, InventoryType::WitnessBlock);
+        assert_eq!(pending.len(), 2);
+
+        let second = take_getdata_batch(&mut pending).unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].kind, InventoryType::Transaction);
+        assert_eq!(second[1].kind, InventoryType::Block);
+        assert!(take_getdata_batch(&mut pending).is_none());
     }
 
     #[test]

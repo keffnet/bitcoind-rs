@@ -123,6 +123,12 @@ impl NetworkEndpoint {
                 address: *address,
                 port: 0,
             }),
+            Self::Dns { host, .. }
+                if host.to_ascii_lowercase().ends_with(".onion")
+                    || host.to_ascii_lowercase().ends_with(".b32.i2p") =>
+            {
+                Self::parse_ban_address(host).ok()
+            }
             Self::Ip(_) | Self::Dns { .. } | Self::Cjdns { .. } => None,
         }
     }

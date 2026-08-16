@@ -545,7 +545,7 @@ fn electrum_error_response(id: Value, method: &str, error: anyhow::Error) -> Val
     json!({
         "jsonrpc": "2.0",
         "id": id,
-        "error": {"code": -1, "message": message},
+        "error": {"code": 1, "message": message},
     })
 }
 
@@ -3455,6 +3455,22 @@ mod tests {
         let response: Value = serde_json::from_slice(&line)?;
         assert_eq!(response["error"]["code"], json!(-32602));
         assert_eq!(response["error"]["message"], json!("invalid params"));
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":6,"method":"blockchain.block.header","params":[999]}
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["error"]["code"], json!(1));
+        assert_eq!(
+            response["error"]["message"],
+            json!("block height out of range")
+        );
         drop(reader);
         server.await??;
         Ok(())

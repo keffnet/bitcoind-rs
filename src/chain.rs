@@ -746,8 +746,11 @@ pub struct ChainState {
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
     spent_by: HashMap<OutPoint, SpentTransaction>,
-    precious_blocks: HashMap<BlockHash, u64>,
-    precious_sequence: u64,
+    // Core stores preciousblock preferences as negative reverse sequence IDs.
+    // They are runtime-only and are intentionally not persisted.
+    precious_blocks: HashMap<BlockHash, i32>,
+    precious_sequence: i32,
+    precious_last_chainwork: Option<Work>,
     basic_filter_cache: HashMap<BlockHash, (Vec<u8>, FilterHeader)>,
     block_undo_cache: HashMap<BlockHash, Vec<Vec<TxOut>>>,
     script_cache: Mutex<ScriptValidationCache>,
@@ -1143,7 +1146,8 @@ impl ChainState {
             history: HashMap::new(),
             spent_by: HashMap::new(),
             precious_blocks: HashMap::new(),
-            precious_sequence: 0,
+            precious_sequence: -1,
+            precious_last_chainwork: None,
             basic_filter_cache: HashMap::new(),
             block_undo_cache: HashMap::new(),
             script_cache: Mutex::new(ScriptValidationCache::default()),
@@ -2308,15 +2312,25 @@ impl ChainState {
     }
 
     pub fn precious_block(&mut self, hash: &BlockHash) -> Result<ChainTip> {
-        self.block_index
+        let node = self
+            .block_index
             .get(hash)
             .copied()
             .with_context(|| format!("block {hash} not found"))?;
-        if self.has_invalid_ancestor(*hash) {
-            bail!("cannot prefer an invalidated chain")
+        // Core treats a preciousblock request below the current tip's
+        // chainwork as a no-op and does not attach a preference to it.
+        if node.chain_work < self.tip().work {
+            return Ok(self.tip());
         }
-        self.precious_sequence = self.precious_sequence.saturating_add(1);
+        if self
+            .precious_last_chainwork
+            .is_none_or(|last| self.tip().work > last)
+        {
+            self.precious_sequence = -1;
+        }
+        self.precious_last_chainwork = Some(self.tip().work);
         self.precious_blocks.insert(*hash, self.precious_sequence);
+        self.precious_sequence = self.precious_sequence.saturating_sub(1);
         let best = self
             .best_valid_tip_hash()
             .context("chain has no valid tip")?;
@@ -5535,8 +5549,8 @@ impl ChainState {
                 left.chain_work
                     .cmp(&right.chain_work)
                     .then_with(|| {
-                        self.precious_priority(left_hash)
-                            .cmp(&self.precious_priority(right_hash))
+                        self.precious_priority(right_hash)
+                            .cmp(&self.precious_priority(left_hash))
                     })
                     // Core's CBlockIndexWorkComparator prefers the block
                     // that became fully available first when chainwork is
@@ -5623,20 +5637,11 @@ impl ChainState {
         true
     }
 
-    fn precious_priority(&self, hash: &BlockHash) -> u64 {
-        let mut priority = 0;
-        let mut cursor = *hash;
-        loop {
-            priority = priority.max(self.precious_blocks.get(&cursor).copied().unwrap_or(0));
-            let Some(node) = self.block_index.get(&cursor) else {
-                break;
-            };
-            if node.height == 0 {
-                break;
-            }
-            cursor = node.header.prev_blockhash;
-        }
-        priority
+    fn precious_priority(&self, hash: &BlockHash) -> i32 {
+        // Core's PreciousBlock assigns a reverse sequence ID to exactly the
+        // requested block index.  Descendants receive their own normal
+        // arrival sequence IDs and must not inherit the preference.
+        self.precious_blocks.get(hash).copied().unwrap_or(0)
     }
 
     fn index_transactions(&mut self, block: &Block, height: u32) {
@@ -6669,7 +6674,8 @@ fn open_background_replay_state(
         history: HashMap::new(),
         spent_by: HashMap::new(),
         precious_blocks: HashMap::new(),
-        precious_sequence: 0,
+        precious_sequence: -1,
+        precious_last_chainwork: None,
         basic_filter_cache: HashMap::new(),
         block_undo_cache: HashMap::new(),
         script_cache: Mutex::new(ScriptValidationCache::with_max_entries(
@@ -9039,8 +9045,54 @@ mod tests {
         assert_eq!(state.best_hash(), side_two_hash);
         state.invalidate_block(&side_one_hash).unwrap();
         assert_eq!(state.best_hash(), main_two_hash);
+        // Core accepts preciousblock for a failed branch as a preference
+        // update, but activation continues to ignore the invalid candidate.
+        state.precious_block(&side_two_hash).unwrap();
+        assert_eq!(state.best_hash(), main_two_hash);
         state.reconsider_block(&side_one_hash).unwrap();
         assert_eq!(state.best_hash(), side_two_hash);
+    }
+
+    #[test]
+    fn precious_block_does_not_prefer_later_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let main_one = mine_block(&state, 1);
+        state.connect_block(main_one).unwrap();
+        let main_two = mine_block(&state, 2);
+        let main_two_header = main_two.header;
+        state.connect_block(main_two).unwrap();
+        let main_two_hash = state.best_hash();
+
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 51);
+        let side_one_hash = side_one.block_hash();
+        state.connect_block(side_one).unwrap();
+        let side_one_header = *state.block_index.get(&side_one_hash).unwrap();
+        state.precious_block(&side_one_hash).unwrap();
+        assert_eq!(state.best_hash(), main_two_hash);
+        assert!(!state.precious_blocks.contains_key(&side_one_hash));
+        let side_two = mine_block_from_header(&side_one_header.header, 2, 52);
+        let side_two_hash = side_two.block_hash();
+        state.connect_block(side_two).unwrap();
+
+        state.precious_block(&side_two_hash).unwrap();
+        assert_eq!(state.best_hash(), side_two_hash);
+
+        let main_three = mine_block_from_header(&main_two_header, 3, 53);
+        let main_three_hash = main_three.block_hash();
+        state.connect_block(main_three).unwrap();
+        let side_two_header = *state.block_index.get(&side_two_hash).unwrap();
+        let side_three = mine_block_from_header(&side_two_header.header, 3, 54);
+        state.connect_block(side_three).unwrap();
+        assert_eq!(state.best_hash(), main_three_hash);
+
+        // Re-running activation must not inherit side_two's precious
+        // preference onto side_three. Core compares the block's own
+        // sequence ID, so main_three arrived first and remains preferred.
+        state.reconsider_block(&side_two_hash).unwrap();
+        assert_eq!(state.best_hash(), main_three_hash);
+        assert_ne!(main_two_hash, main_three_hash);
     }
 
     #[test]

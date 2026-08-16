@@ -1449,6 +1449,11 @@ pub struct Args {
     #[arg(long)]
     pub minrelaytxfee: Option<String>,
 
+    /// Wallet-only Core compatibility option. Wallet support is disabled,
+    /// but Core still accepts this setting in wallet-free daemon tests.
+    #[arg(long = "mintxfee", hide = true)]
+    pub mintxfee: Option<String>,
+
     #[arg(long)]
     pub incrementalrelayfee: Option<String>,
 

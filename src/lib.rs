@@ -1272,8 +1272,19 @@ impl Node {
                 .verify_active_chain_with_level(check_level, check_blocks)
                 .context("startup block verification failed")?;
         }
-        let mempool_path = config.datadir.join("mempool.dat");
-        let fee_estimator_path = config.datadir.join("fee_estimates.dat");
+        let network_datadir = if network_data_dir_name(config.network).is_empty() {
+            config.datadir.clone()
+        } else {
+            config.datadir.join(network_data_dir_name(config.network))
+        };
+        fs::create_dir_all(&network_datadir).with_context(|| {
+            format!(
+                "creating network data directory {}",
+                network_datadir.display()
+            )
+        })?;
+        let mempool_path = network_datadir.join("mempool.dat");
+        let fee_estimator_path = network_datadir.join("fee_estimates.dat");
         let mempool_policy = MempoolPolicy {
             min_relay_fee_sat_per_kvb: config.min_relay_tx_fee_sat_per_kvb,
             incremental_relay_fee_sat_per_kvb: config.incremental_relay_fee_sat_per_kvb,
@@ -4660,6 +4671,11 @@ impl Node {
         self.mempool
             .read()
             .save_to_file_with_format(&self.mempool_path, self.config.persist_mempool_v1)
+            .with_context(|| "Unable to dump mempool to disk")
+    }
+
+    pub(crate) fn mempool_path(&self) -> &Path {
+        &self.mempool_path
     }
 
     pub fn import_mempool(&self, path: impl AsRef<Path>) -> Result<()> {
@@ -5499,7 +5515,9 @@ mod tests {
     #[test]
     fn corrupt_startup_mempool_does_not_abort_node_open() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("mempool.dat"), b"not a mempool dump").unwrap();
+        let network_directory = directory.path().join("regtest");
+        fs::create_dir_all(&network_directory).unwrap();
+        fs::write(network_directory.join("mempool.dat"), b"not a mempool dump").unwrap();
 
         let node = Node::open(test_config(directory.path())).unwrap();
 
@@ -5553,7 +5571,13 @@ mod tests {
         assert!(events.try_recv().is_err());
         node.mock_scheduler_forward(FEE_ESTIMATOR_FLUSH_INTERVAL.as_secs())
             .unwrap();
-        assert!(directory.path().join("fee_estimates.dat").exists());
+        assert!(
+            directory
+                .path()
+                .join("regtest")
+                .join("fee_estimates.dat")
+                .exists()
+        );
     }
 
     #[test]

@@ -2166,7 +2166,7 @@ fn dispatch_method_for_user(
         "savemempool" => {
             node.persist_mempool()?;
             Ok(json!({
-                "filename": node.config.datadir.join("mempool.dat").to_string_lossy(),
+                "filename": node.mempool_path().to_string_lossy(),
             }))
         }
         "importmempool" => {
@@ -15859,7 +15859,13 @@ mod tests {
             dispatch_method(&node, "savefeeestimates", &json!([])).unwrap(),
             Value::Null
         );
-        assert!(directory.path().join("fee_estimates.dat").exists());
+        assert!(
+            directory
+                .path()
+                .join("regtest")
+                .join("fee_estimates.dat")
+                .exists()
+        );
         let one_block = dispatch_method(&node, "estimatesmartfee", &json!([1])).unwrap();
         assert_eq!(one_block["blocks"], json!(2));
         assert!(dispatch_method(&node, "estimatesmartfee", &json!([0])).is_err());

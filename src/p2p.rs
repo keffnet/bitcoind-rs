@@ -6052,10 +6052,10 @@ async fn flush_peer_transaction_inventory(
             continue;
         };
         let item = transaction_inventory(&transaction, wtxid_relay);
-        if let Some((fee_sat, vsize)) = transaction_fee_for_inventory(node, &item)
-            && fee_rate_sat_per_kvb(fee_sat, vsize) < minimum_fee
-        {
-            continue;
+        if let Some((fee_sat, vsize)) = transaction_fee_for_inventory(node, &item) {
+            if !fee_meets_filter(fee_sat, vsize, minimum_fee) {
+                continue;
+            }
         }
         {
             let mut filter = state.bloom_filter.lock();
@@ -6119,8 +6119,8 @@ async fn flush_peer_mempool_request(
             .filter_map(|txid| {
                 let entry = mempool.get(&txid)?;
                 txids.insert(txid);
-                let fee_rate = fee_rate_sat_per_kvb(entry.fee_sat, entry.vsize);
-                (fee_rate >= minimum_fee).then(|| entry.transaction.clone())
+                fee_meets_filter(entry.fee_sat, entry.vsize, minimum_fee)
+                    .then(|| entry.transaction.clone())
             })
             .collect::<Vec<_>>();
         (transactions, txids)
@@ -6524,11 +6524,24 @@ fn can_direct_fetch(tip_time: u32, now: i64, target_spacing: u64) -> bool {
     i64::from(tip_time) > now.saturating_sub(freshness_window)
 }
 
+#[cfg(test)]
 fn fee_rate_sat_per_kvb(fee_sat: u64, vsize: u64) -> i64 {
     if vsize == 0 {
         return i64::MAX;
     }
     i64::try_from(fee_sat.saturating_mul(1_000).saturating_div(vsize)).unwrap_or(i64::MAX)
+}
+
+/// Core compares each transaction's fee with `CFeeRate::GetFee(vsize)`,
+/// which rounds the required fee up to a whole satoshi. Comparing the
+/// cross-multiplied values preserves that boundary without first flooring
+/// the transaction's effective sat/kvB rate.
+fn fee_meets_filter(fee_sat: u64, vsize: u64, minimum_fee_sat_per_kvb: i64) -> bool {
+    minimum_fee_sat_per_kvb <= 0
+        || u128::from(fee_sat).saturating_mul(1_000)
+            >= u128::try_from(minimum_fee_sat_per_kvb)
+                .unwrap_or_default()
+                .saturating_mul(u128::from(vsize))
 }
 
 fn install_bloom_filter(

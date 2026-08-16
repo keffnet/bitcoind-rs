@@ -1404,7 +1404,7 @@ impl Mempool {
         }
         bytes.extend_from_slice(&payload);
         let temp = path.with_file_name(format!(
-            "{}.tmp",
+            "{}.new",
             path.file_name().unwrap_or_default().to_string_lossy()
         ));
         fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
@@ -1990,7 +1990,9 @@ impl Mempool {
         chain: &ChainState,
         added_at: u64,
     ) -> Result<Txid, MempoolError> {
-        let txid = self.accept_at_with_options(transaction, chain, added_at, false, false)?;
+        // Core's reorg path bypasses fee-rate and rolling-size limits, but it
+        // still applies structural mempool policy such as cluster limits.
+        let txid = self.accept_at_with_options(transaction, chain, added_at, false, true)?;
         self.relay_sequences.insert(txid, 0);
         Ok(txid)
     }
@@ -2632,6 +2634,10 @@ impl Mempool {
         for transaction in &block.txdata {
             let txid = transaction.compute_txid();
             self.remove_with_notification(&txid, false);
+            // Core discards transaction-specific prioritisation once the
+            // transaction is confirmed. If the block is later invalidated,
+            // the resurrected transaction returns without the old delta.
+            self.priorities.remove(&txid);
         }
         self.rolling_fee_last_updated = time::unix_time();
         self.block_since_last_rolling_fee_bump = true;

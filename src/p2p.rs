@@ -4131,6 +4131,9 @@ async fn serve_peer_loop(
                 };
                 node.clear_peer_block_request(peer_id, hash);
                 let Some((height, recent_work)) = compact_work else {
+                    if !node.chain.read().is_initial_block_download() {
+                        request_headers(node, peer_id, writer, peer_state).await?;
+                    }
                     continue;
                 };
                 let (work_allowed, should_reconstruct) = {

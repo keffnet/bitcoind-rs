@@ -3790,7 +3790,9 @@ async fn serve_peer_loop(
                                 // for headers first lets the normal headers-first
                                 // path validate the chain and schedule bounded
                                 // block downloads.
-                                if chain.block_height_by_hash(&item.hash).is_none() {
+                                if chain.block_height_by_hash(&item.hash).is_none()
+                                    && !node.peer_has_inflight_block_request(peer_id, item.hash)
+                                {
                                     needs_headers = true;
                                 }
                                 None

@@ -229,6 +229,7 @@ const MAX_BLOOM_FILTER_SIZE: usize = 36_000;
 const MAX_BLOOM_HASH_FUNCS: u32 = 50;
 const MAX_BLOOM_ELEMENT_SIZE: usize = 520;
 const MAX_ADDR_TO_SEND: usize = 1_000;
+const MAX_PCT_ADDR_TO_SEND: usize = 23;
 const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 const MAX_BLOCKTXN_DEPTH: u32 = 10;
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
@@ -4653,7 +4654,7 @@ async fn serve_peer_loop(
                 node.enable_peer_address_relay(peer_id);
                 let mut addresses = node.known_network_addresses();
                 addresses.shuffle(&mut rand::rng());
-                addresses.truncate(MAX_ADDR_TO_SEND);
+                addresses.truncate(getaddr_response_limit(addresses.len()));
                 if addrv2_received {
                     let addresses = addresses
                         .into_iter()
@@ -5301,6 +5302,13 @@ async fn maybe_send_getblocks_continuation(
 
 fn address_message_is_oversized(count: usize) -> bool {
     count > MAX_ADDR_TO_SEND
+}
+
+fn getaddr_response_limit(available: usize) -> usize {
+    available
+        .saturating_mul(MAX_PCT_ADDR_TO_SEND)
+        .saturating_div(100)
+        .min(MAX_ADDR_TO_SEND)
 }
 
 fn relay_address_message(
@@ -7760,6 +7768,14 @@ mod tests {
     fn oversized_address_messages_are_ignored_without_disconnect() {
         assert!(!address_message_is_oversized(MAX_ADDR_TO_SEND));
         assert!(address_message_is_oversized(MAX_ADDR_TO_SEND + 1));
+    }
+
+    #[test]
+    fn getaddr_response_matches_core_percentage_limit() {
+        assert_eq!(getaddr_response_limit(0), 0);
+        assert_eq!(getaddr_response_limit(4), 0);
+        assert_eq!(getaddr_response_limit(100), 23);
+        assert_eq!(getaddr_response_limit(10_000), MAX_ADDR_TO_SEND);
     }
 
     #[test]

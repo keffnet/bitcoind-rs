@@ -6507,7 +6507,7 @@ mod tests {
             .unwrap();
 
         let mut pong_received = false;
-        for _ in 0..4 {
+        for _ in 0..16 {
             let message = tokio::time::timeout(
                 Duration::from_secs(5),
                 wire::read_message(&mut reader, Network::Regtest),

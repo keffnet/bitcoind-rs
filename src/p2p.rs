@@ -764,6 +764,7 @@ struct PeerState {
     wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
     last_headers_request: parking_lot::Mutex<Option<Instant>>,
+    continuation_block: parking_lot::Mutex<Option<BlockHash>>,
     compact_block_version: parking_lot::Mutex<Option<u64>>,
     compact_block_announce: parking_lot::Mutex<bool>,
     tx_reconciliation_salt: parking_lot::Mutex<Option<u64>>,
@@ -2773,6 +2774,7 @@ async fn serve_peer(
         wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
         last_headers_request: parking_lot::Mutex::new(None),
+        continuation_block: parking_lot::Mutex::new(None),
         compact_block_version: parking_lot::Mutex::new(None),
         compact_block_announce: parking_lot::Mutex::new(false),
         tx_reconciliation_salt: parking_lot::Mutex::new(None),
@@ -3333,6 +3335,9 @@ async fn serve_peer_loop(
                         })
                         .collect::<Vec<_>>()
                 };
+                if hashes.len() == 500 {
+                    *peer_state.continuation_block.lock() = hashes.last().map(|item| item.hash);
+                }
                 send_message(
                     node,
                     peer_id,
@@ -3672,6 +3677,15 @@ async fn serve_peer_loop(
                                     &Message::Block(block),
                                 )
                                 .await?;
+                                maybe_send_getblocks_continuation(
+                                    node,
+                                    peer_id,
+                                    writer,
+                                    node.config.network,
+                                    peer_state,
+                                    item.hash,
+                                )
+                                .await?;
                             }
                         }
                         InventoryType::CompactBlock => {
@@ -3715,6 +3729,15 @@ async fn serve_peer_loop(
                                     &Message::Block(block),
                                 )
                                 .await?;
+                                maybe_send_getblocks_continuation(
+                                    node,
+                                    peer_id,
+                                    writer,
+                                    node.config.network,
+                                    peer_state,
+                                    item.hash,
+                                )
+                                .await?;
                                 continue;
                             }
                             let compact = HeaderAndShortIds::from_block(
@@ -3729,6 +3752,15 @@ async fn serve_peer_loop(
                                 writer,
                                 node.config.network,
                                 &Message::CompactBlock(compact),
+                            )
+                            .await?;
+                            maybe_send_getblocks_continuation(
+                                node,
+                                peer_id,
+                                writer,
+                                node.config.network,
+                                peer_state,
+                                item.hash,
                             )
                             .await?;
                         }
@@ -3783,6 +3815,15 @@ async fn serve_peer_loop(
                                 )
                                 .await?;
                             }
+                            maybe_send_getblocks_continuation(
+                                node,
+                                peer_id,
+                                writer,
+                                node.config.network,
+                                peer_state,
+                                item.hash,
+                            )
+                            .await?;
                         }
                         kind if kind.is_transaction() => {
                             if !peer_state.local_relay_transactions || !*relay_transactions.lock() {
@@ -5023,6 +5064,44 @@ async fn send_message(
     Ok(())
 }
 
+fn consume_getblocks_continuation(
+    continuation_block: &parking_lot::Mutex<Option<BlockHash>>,
+    hash: BlockHash,
+) -> bool {
+    let mut continuation = continuation_block.lock();
+    if *continuation == Some(hash) {
+        *continuation = None;
+        true
+    } else {
+        false
+    }
+}
+
+async fn maybe_send_getblocks_continuation(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    network: Network,
+    peer_state: &PeerState,
+    hash: BlockHash,
+) -> Result<()> {
+    if !consume_getblocks_continuation(&peer_state.continuation_block, hash) {
+        return Ok(());
+    }
+    let tip = node.chain.read().best_hash();
+    send_message(
+        node,
+        peer_id,
+        writer,
+        network,
+        &Message::Inv(vec![Inventory {
+            kind: InventoryType::Block,
+            hash: tip,
+        }]),
+    )
+    .await
+}
+
 fn relay_address_message(
     addresses: &[(NetworkEndpoint, u64, u64)],
     addrv2_received: bool,
@@ -5521,6 +5600,14 @@ mod tests {
 
     use crate::config::OnlyNet;
     use crate::{Config, Node};
+
+    #[test]
+    fn getblocks_continuation_is_consumed_once() {
+        let hash = BlockHash::from_byte_array([0x42; 32]);
+        let continuation = parking_lot::Mutex::new(Some(hash));
+        assert!(consume_getblocks_continuation(&continuation, hash));
+        assert!(!consume_getblocks_continuation(&continuation, hash));
+    }
 
     fn private_broadcast_test_config(
         datadir: &std::path::Path,
@@ -6580,6 +6667,7 @@ mod tests {
             wtxid_relay: parking_lot::Mutex::new(true),
             send_headers: parking_lot::Mutex::new(false),
             last_headers_request: parking_lot::Mutex::new(None),
+            continuation_block: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),
             compact_block_announce: parking_lot::Mutex::new(false),
             tx_reconciliation_salt: parking_lot::Mutex::new(None),
@@ -8657,6 +8745,7 @@ mod tests {
             wtxid_relay: parking_lot::Mutex::new(false),
             send_headers: parking_lot::Mutex::new(false),
             last_headers_request: parking_lot::Mutex::new(None),
+            continuation_block: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),
             compact_block_announce: parking_lot::Mutex::new(false),
             tx_reconciliation_salt: parking_lot::Mutex::new(None),

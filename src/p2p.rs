@@ -768,6 +768,14 @@ fn headers_sync_work_threshold(chain: &crate::chain::ChainState) -> Work {
     near_tip.max(minimum)
 }
 
+fn getheaders_should_suppress_for_low_work(
+    active_work: Work,
+    minimum_chain_work: Work,
+    permissions: PeerPermissions,
+) -> bool {
+    active_work < minimum_chain_work && !permissions.contains(PeerPermissions::DOWNLOAD)
+}
+
 struct PeerState {
     endpoint: NetworkEndpoint,
     local_address: Option<SocketAddr>,
@@ -3325,9 +3333,15 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetHeaders(request) => {
-                if node.chain.read().is_initial_block_download()
-                    && !peer_state.permissions.contains(PeerPermissions::DOWNLOAD)
-                {
+                let low_work = {
+                    let chain = node.chain.read();
+                    getheaders_should_suppress_for_low_work(
+                        chain.tip().work,
+                        chain.minimum_chain_work(),
+                        peer_state.permissions,
+                    )
+                };
+                if low_work {
                     send_message(
                         node,
                         peer_id,
@@ -6898,6 +6912,27 @@ mod tests {
         assert!(headers_download_timed_out(Some(
             now.checked_sub(HEADERS_DOWNLOAD_TIMEOUT).unwrap()
         )));
+    }
+
+    #[test]
+    fn getheaders_low_work_gate_matches_core_permissions() {
+        let active_work = Work::from_be_bytes([1; 32]);
+        let minimum_work = Work::from_be_bytes([2; 32]);
+        assert!(getheaders_should_suppress_for_low_work(
+            active_work,
+            minimum_work,
+            PeerPermissions::empty()
+        ));
+        assert!(!getheaders_should_suppress_for_low_work(
+            active_work,
+            minimum_work,
+            PeerPermissions::DOWNLOAD
+        ));
+        assert!(!getheaders_should_suppress_for_low_work(
+            minimum_work,
+            active_work,
+            PeerPermissions::empty()
+        ));
     }
 
     #[test]

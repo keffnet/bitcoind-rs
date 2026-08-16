@@ -20,6 +20,7 @@ use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use parking_lot::Mutex;
 use rand::random;
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +72,80 @@ struct UtxoLocation {
 }
 
 type UtxoIndexState = (HashMap<OutPoint, UtxoLocation>, u64, u64);
+
+#[derive(Default)]
+struct UtxoReadCache {
+    entries: HashMap<OutPoint, (StoredUtxo, usize)>,
+    order: VecDeque<OutPoint>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl UtxoReadCache {
+    fn configure_limit(&mut self, limit: usize) {
+        self.limit = limit;
+        self.trim();
+    }
+
+    fn get(&mut self, outpoint: &OutPoint) -> Option<StoredUtxo> {
+        let entry = self.entries.get(outpoint).map(|(entry, _)| entry.clone());
+        if entry.is_some() {
+            self.touch(*outpoint);
+        }
+        entry
+    }
+
+    fn insert(&mut self, outpoint: OutPoint, entry: StoredUtxo) {
+        let bytes = stored_utxo_cache_bytes(&entry);
+        if self.limit == 0 || bytes > self.limit {
+            return;
+        }
+        if let Some((_, old_bytes)) = self.entries.remove(&outpoint) {
+            self.bytes = self.bytes.saturating_sub(old_bytes);
+            self.order.retain(|cached| *cached != outpoint);
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.entries.insert(outpoint, (entry, bytes));
+        self.order.push_back(outpoint);
+        self.trim();
+    }
+
+    fn remove(&mut self, outpoint: &OutPoint) {
+        if let Some((_, bytes)) = self.entries.remove(outpoint) {
+            self.bytes = self.bytes.saturating_sub(bytes);
+            self.order.retain(|cached| cached != outpoint);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+
+    fn touch(&mut self, outpoint: OutPoint) {
+        if let Some(position) = self.order.iter().position(|cached| *cached == outpoint) {
+            self.order.remove(position);
+        }
+        self.order.push_back(outpoint);
+    }
+
+    fn trim(&mut self) {
+        while self.bytes > self.limit {
+            let Some(outpoint) = self.order.pop_front() else {
+                self.bytes = 0;
+                break;
+            };
+            if let Some((_, bytes)) = self.entries.remove(&outpoint) {
+                self.bytes = self.bytes.saturating_sub(bytes);
+            }
+        }
+    }
+}
+
+fn stored_utxo_cache_bytes(entry: &StoredUtxo) -> usize {
+    64usize.saturating_add(entry.output.script_pubkey.len())
+}
 
 #[derive(Clone, Copy, Debug)]
 struct HistoryLocation {
@@ -1033,6 +1108,7 @@ pub struct UtxoStore {
     next_batch_id: u64,
     generation: u64,
     pending_write_bytes: usize,
+    read_cache: Mutex<UtxoReadCache>,
 }
 
 impl UtxoStore {
@@ -1094,6 +1170,7 @@ impl UtxoStore {
             next_batch_id,
             generation,
             pending_write_bytes: 0,
+            read_cache: Mutex::new(UtxoReadCache::default()),
         })
     }
 
@@ -1117,6 +1194,18 @@ impl UtxoStore {
         self.generation
     }
 
+    /// Allocate one quarter of the configured storage cache to decoded UTXO
+    /// values. The remaining three quarters are reserved for block records,
+    /// matching the split used by the custom backend's block cache.
+    pub fn configure_cache_size_mib(&self, mib: i64) {
+        const MIN_CACHE_MIB: u64 = 4;
+        const MIB: u64 = 1024 * 1024;
+        let mib = u64::try_from(mib.max(0)).unwrap_or(u64::MAX);
+        let total_bytes = mib.max(MIN_CACHE_MIB).saturating_mul(MIB);
+        let limit = usize::try_from(total_bytes / 4).unwrap_or(usize::MAX);
+        self.read_cache.lock().configure_limit(limit);
+    }
+
     pub fn contains(&self, outpoint: &OutPoint) -> bool {
         self.index.contains_key(outpoint)
     }
@@ -1130,6 +1219,9 @@ impl UtxoStore {
     }
 
     pub fn get(&self, outpoint: &OutPoint) -> Result<Option<StoredUtxo>> {
+        if let Some(entry) = self.read_cache.lock().get(outpoint) {
+            return Ok(Some(entry));
+        }
         let Some(location) = self.index.get(outpoint).copied() else {
             return Ok(None);
         };
@@ -1141,7 +1233,9 @@ impl UtxoStore {
         if stored_outpoint != *outpoint {
             bail!("UTXO value key does not match its index");
         }
-        decode_stored_utxo(&body[45..]).map(Some)
+        let entry = decode_stored_utxo(&body[45..])?;
+        self.read_cache.lock().insert(*outpoint, entry.clone());
+        Ok(Some(entry))
     }
 
     /// Read all live entries.  This is intentionally explicit: normal block
@@ -1246,9 +1340,11 @@ impl UtxoStore {
             match operation {
                 PendingUtxoOperation::Put { outpoint, location } => {
                     self.index.insert(outpoint, location);
+                    self.read_cache.lock().remove(&outpoint);
                 }
                 PendingUtxoOperation::Delete { outpoint } => {
                     self.index.remove(&outpoint);
+                    self.read_cache.lock().remove(&outpoint);
                 }
             }
         }
@@ -1283,6 +1379,7 @@ impl UtxoStore {
         self.file.write_all(UTXO_DATA_MAGIC)?;
         self.file.sync_data()?;
         self.index.clear();
+        self.read_cache.lock().clear();
         self.next_batch_id = 1;
         self.generation = self
             .generation
@@ -3279,6 +3376,47 @@ mod tests {
         assert_eq!(recovered.get(&first).unwrap(), None);
         assert_eq!(recovered.get(&second).unwrap(), Some(second_entry));
         assert_eq!(std::fs::metadata(data_path).unwrap().len(), committed_len);
+    }
+
+    #[test]
+    fn utxo_read_cache_is_invalidated_by_replacement_and_clear() {
+        let directory = tempfile::tempdir().unwrap();
+        let outpoint = OutPoint::new(Txid::from_byte_array([9u8; 32]), 0);
+        let first = StoredUtxo {
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            },
+            height: 1,
+            median_time_past: 1,
+            coinbase: false,
+        };
+        let second = StoredUtxo {
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(2_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x52]),
+            },
+            height: 2,
+            median_time_past: 2,
+            coinbase: true,
+        };
+        let mut store = UtxoStore::open(directory.path()).unwrap();
+        store.configure_cache_size_mib(4);
+        store
+            .apply_batch(&[], &[(outpoint, first.clone())])
+            .unwrap();
+        assert_eq!(store.get(&outpoint).unwrap(), Some(first));
+        assert_eq!(store.read_cache.lock().entries.len(), 1);
+
+        store
+            .apply_batch(&[outpoint], &[(outpoint, second.clone())])
+            .unwrap();
+        assert_eq!(store.get(&outpoint).unwrap(), Some(second));
+        assert_eq!(store.read_cache.lock().entries.len(), 1);
+
+        store.clear().unwrap();
+        assert_eq!(store.get(&outpoint).unwrap(), None);
+        assert!(store.read_cache.lock().entries.is_empty());
     }
 
     #[test]

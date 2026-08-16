@@ -2232,6 +2232,7 @@ impl ChainState {
     /// Core-compatible `-dbcache` setting.
     pub fn configure_storage_cache_size_mib(&mut self, mib: i64) {
         self.store.configure_cache_size_mib(mib);
+        self.utxo_store.configure_cache_size_mib(mib);
     }
 
     /// Configure chainstate write batching from Core's debug-only

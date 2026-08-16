@@ -4052,6 +4052,19 @@ impl Node {
                 }
             }
         });
+        let unbroadcast_node = self.clone();
+        let unbroadcast_retry_task = tokio::spawn(async move {
+            let retry_interval = Duration::from_secs(MAX_INITIAL_BROADCAST_DELAY_SECS);
+            let first_retry = tokio::time::Instant::now() + retry_interval;
+            let mut ticker = tokio::time::interval_at(first_retry, retry_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => unbroadcast_node.reannounce_unbroadcast_transactions(),
+                    _ = unbroadcast_node.wait_for_shutdown() => break,
+                }
+            }
+        });
 
         let current_height = self.chain.read().height();
         if self.config.stop_at_height != 0 && current_height >= self.config.stop_at_height {
@@ -4098,6 +4111,7 @@ impl Node {
         background_validation_task.abort();
         mempool_expiry_task.abort();
         fee_estimator_task.abort();
+        unbroadcast_retry_task.abort();
         run_notify_command(self.config.shutdown_notify.as_deref(), None);
         if let Err(error) = self.flush_fee_estimates(true) {
             warn!(%error, "unable to flush fee estimates during shutdown");

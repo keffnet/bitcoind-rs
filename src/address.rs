@@ -295,7 +295,7 @@ impl NetworkEndpoint {
             return Ok(Self::from_socket(socket));
         };
         let port = port.ok_or_else(|| anyhow::anyhow!("network endpoint is missing a port"))?;
-        if port == 0 {
+        if port == 0 && network != "i2p" {
             bail!("network endpoint port must be non-zero")
         }
         match network {
@@ -579,6 +579,14 @@ mod tests {
             NetworkEndpoint::from_addr_v2(5, &[7; 32], 0),
             Some(NetworkEndpoint::I2p { port: 0, .. })
         ));
+        let endpoint = NetworkEndpoint::I2p {
+            address: [7; 32],
+            port: 0,
+        };
+        assert_eq!(
+            NetworkEndpoint::parse(Some("i2p"), &endpoint.host_string(), Some(0)).unwrap(),
+            endpoint
+        );
     }
 
     #[test]

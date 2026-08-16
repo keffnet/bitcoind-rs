@@ -5967,7 +5967,7 @@ mod tests {
         };
         let i2p = NetworkEndpoint::I2p {
             address: [5; 32],
-            port: 18445,
+            port: 0,
         };
         let cjdns = NetworkEndpoint::Cjdns {
             address: "fc00::42".parse().unwrap(),

@@ -2688,8 +2688,9 @@ fn network_info(node: &Arc<Node>) -> Value {
     ]
     .into_iter()
     .map(|(name, network, transport_available)| {
-        let limited = !node.config.onlynet.is_empty() && !node.config.onlynet.contains(&network);
-        let reachable = !limited && transport_available;
+        let limited = !transport_available
+            || (!node.config.onlynet.is_empty() && !node.config.onlynet.contains(&network));
+        let reachable = !limited;
         json!({
             "name": name,
             "limited": limited,
@@ -19963,6 +19964,29 @@ mod tests {
             dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap()["localaddresses"],
             json!([])
         );
+        Arc::get_mut(&mut node).unwrap().config.onlynet.clear();
+        Arc::get_mut(&mut node).unwrap().config.proxy = None;
+        let default_networks = dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap();
+        for name in ["ipv4", "ipv6"] {
+            let network = default_networks["networks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|network| network["name"] == name)
+                .unwrap();
+            assert_eq!(network["limited"], json!(false));
+            assert_eq!(network["reachable"], json!(true));
+        }
+        for name in ["onion", "i2p", "cjdns"] {
+            let network = default_networks["networks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|network| network["name"] == name)
+                .unwrap();
+            assert_eq!(network["limited"], json!(true));
+            assert_eq!(network["reachable"], json!(false));
+        }
     }
 
     #[test]

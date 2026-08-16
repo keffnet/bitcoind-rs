@@ -9578,6 +9578,7 @@ fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Val
     let secp = Secp256k1::new();
     let mut errors = Vec::new();
     for input_index in 0..transaction.input.len() {
+        let transaction_before_signing = transaction.clone();
         let input = &transaction.input[input_index];
         let Some(prevout) = prevouts.get(&input.previous_output) else {
             errors.push(signing_error(
@@ -9598,7 +9599,7 @@ fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Val
         {
             bail!("Missing amount")
         }
-        if let Err(error) = sign_transaction_input(
+        let signing_result = sign_transaction_input(
             &mut transaction,
             input_index,
             prevout,
@@ -9606,7 +9607,14 @@ fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Val
             &secp,
             sighash_type,
             previous_outputs.as_deref(),
-        ) {
+        );
+        let variants = [transaction_before_signing, transaction.clone()];
+        if let Err(error) =
+            combine_multisig_input(&mut transaction, input_index, &variants, &prevout.output)
+        {
+            debug!(input_index, %error, "unable to merge existing raw transaction signatures");
+        }
+        if let Err(error) = signing_result {
             errors.push(signing_error(&transaction, input_index, &error.to_string()));
         }
     }
@@ -22205,8 +22213,8 @@ mod tests {
         );
 
         let second_secret = bitcoin::secp256k1::SecretKey::from_slice(&[2; 32]).unwrap();
-        let second_public =
-            bitcoin::PrivateKey::new(second_secret, Network::Regtest).public_key(&secp);
+        let second_private = bitcoin::PrivateKey::new(second_secret, Network::Regtest);
+        let second_public = second_private.public_key(&secp);
         let witness_script = Builder::new()
             .push_int(1)
             .push_key(&public_key)
@@ -22250,6 +22258,60 @@ mod tests {
             deserialize(&hex::decode(multisig_result["hex"].as_str().unwrap()).unwrap()).unwrap();
         assert!(multisig_signed.input[0].script_sig.is_empty());
         assert_eq!(multisig_signed.input[0].witness.len(), 3);
+
+        let two_of_two_witness_script = Builder::new()
+            .push_int(2)
+            .push_key(&public_key)
+            .push_key(&second_public)
+            .push_int(2)
+            .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
+            .into_script();
+        let two_of_two_prevout_script = two_of_two_witness_script.to_p2wsh();
+        let two_of_two_previous_txid = Txid::from_byte_array([13; 32]);
+        let two_of_two_unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(two_of_two_previous_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(99_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let two_of_two_prevtx = json!([{
+            "txid": two_of_two_previous_txid.to_string(),
+            "vout": 0,
+            "scriptPubKey": hex::encode(two_of_two_prevout_script.as_bytes()),
+            "witnessScript": hex::encode(two_of_two_witness_script.as_bytes()),
+            "amount": "1.00000000",
+        }]);
+        let first_partial = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                hex::encode(serialize(&two_of_two_unsigned)),
+                [private.to_wif()],
+                two_of_two_prevtx,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(first_partial["complete"], false);
+        let completed = sign_raw_transaction_with_key(
+            &node,
+            &json!([
+                first_partial["hex"].clone(),
+                [second_private.to_wif()],
+                two_of_two_prevtx,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(completed["complete"], true);
+        let completed: Transaction =
+            deserialize(&hex::decode(completed["hex"].as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(completed.input[0].witness.len(), 4);
 
         let native_redeem_only = sign_raw_transaction_with_key(
             &node,

@@ -87,6 +87,7 @@ const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_KNOWN_ADDRESSES: usize = 256_000;
+const ADDRMAN_SECRET_FILE: &str = "addrman.key";
 pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 const BLOCK_STALLING_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
 const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
@@ -909,6 +910,7 @@ pub struct Node {
     private_broadcasts: parking_lot::Mutex<HashMap<Wtxid, PrivateBroadcastEntry>>,
     compact_extra_transactions: parking_lot::Mutex<CompactExtraTransactions>,
     orphans: parking_lot::Mutex<OrphanPool>,
+    addrman_key: [u8; 32],
     known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
     tried_addresses: parking_lot::RwLock<HashSet<SocketAddr>>,
     network_addresses: parking_lot::RwLock<HashMap<NetworkEndpoint, KnownNetworkAddress>>,
@@ -949,6 +951,7 @@ impl Node {
                 config.datadir.display()
             )
         })?;
+        let addrman_key = load_addrman_key(&config.datadir)?;
         let blocks_dir = config
             .blocks_dir
             .clone()
@@ -1233,6 +1236,7 @@ impl Node {
                 compact_extra_limit,
             )),
             orphans: parking_lot::Mutex::new(OrphanPool::default()),
+            addrman_key,
             known_addresses: parking_lot::RwLock::new(known_addresses),
             tried_addresses: parking_lot::RwLock::new(tried_addresses),
             network_addresses: parking_lot::RwLock::new(network_addresses),
@@ -1506,6 +1510,21 @@ impl Node {
 
     pub(crate) fn mapped_as(&self, endpoint: &NetworkEndpoint) -> Option<u32> {
         self.asmap.as_ref()?.mapped_as(endpoint)
+    }
+
+    pub(crate) fn addrman_siphash_keys(&self) -> (u64, u64) {
+        (
+            u64::from_le_bytes(
+                self.addrman_key[..8]
+                    .try_into()
+                    .expect("addrman key length"),
+            ),
+            u64::from_le_bytes(
+                self.addrman_key[8..16]
+                    .try_into()
+                    .expect("addrman key length"),
+            ),
+        )
     }
 
     fn log_asmap_health(&self) {
@@ -4515,6 +4534,29 @@ fn load_banlist(data_dir: &Path) -> Result<LoadedBanState> {
     Ok((ip_addresses, network_addresses))
 }
 
+fn load_addrman_key(data_dir: &Path) -> Result<[u8; 32]> {
+    let path = data_dir.join(ADDRMAN_SECRET_FILE);
+    if path.exists() {
+        let bytes = fs::read(&path)
+            .with_context(|| format!("reading address-manager secret {}", path.display()))?;
+        return bytes.try_into().map_err(|bytes: Vec<u8>| {
+            anyhow::anyhow!(
+                "address-manager secret {} has invalid length {}; expected 32 bytes",
+                path.display(),
+                bytes.len()
+            )
+        });
+    }
+
+    let key = random::<[u8; 32]>();
+    let temporary = data_dir.join(format!("{ADDRMAN_SECRET_FILE}.tmp"));
+    fs::write(&temporary, key)
+        .with_context(|| format!("writing address-manager secret {}", path.display()))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("installing address-manager secret {}", path.display()))?;
+    Ok(key)
+}
+
 fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
     let path = data_dir.join("peers.json");
     if !path.exists() {
@@ -5902,6 +5944,18 @@ mod tests {
 
         let reopened = Node::open(test_config(directory.path())).unwrap();
         assert_eq!(reopened.network_address_source(&endpoint), source);
+    }
+
+    #[test]
+    fn address_manager_secret_survives_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let keys = node.addrman_siphash_keys();
+        assert!(directory.path().join(ADDRMAN_SECRET_FILE).is_file());
+        drop(node);
+
+        let reopened = Node::open(test_config(directory.path())).unwrap();
+        assert_eq!(reopened.addrman_siphash_keys(), keys);
     }
 
     #[test]

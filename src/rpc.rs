@@ -19,7 +19,7 @@ use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{Decodable, VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::ecdsa::Signature as EcdsaSignature;
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::{Hash, siphash24};
 use bitcoin::key::TapTweak;
 use bitcoin::psbt::{GetKey, Input as PsbtInput, KeyRequest, Psbt};
 use bitcoin::secp256k1::{Message, Secp256k1};
@@ -3434,13 +3434,116 @@ fn add_peer_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
 }
 
+const ADDRMAN_NEW_BUCKET_COUNT: usize = 1_024;
+const ADDRMAN_TRIED_BUCKET_COUNT: usize = 256;
+const ADDRMAN_BUCKET_SIZE: usize = 64;
+
+fn addrman_endpoint_key(endpoint: &NetworkEndpoint) -> Vec<u8> {
+    let mut key = Vec::new();
+    if let Some((network, address)) = endpoint.to_addr_v2() {
+        key.push(network);
+        key.extend_from_slice(&address);
+    } else {
+        key.push(0);
+        key.extend_from_slice(endpoint.host_string().as_bytes());
+    }
+    key.extend_from_slice(&endpoint.port().to_be_bytes());
+    key
+}
+
+fn addrman_group(endpoint: &NetworkEndpoint) -> Vec<u8> {
+    match endpoint {
+        NetworkEndpoint::Ip(address) => match address.ip() {
+            IpAddr::V4(address) => vec![1, address.octets()[0], address.octets()[1]],
+            IpAddr::V6(address) => {
+                let octets = address.octets();
+                vec![2, octets[0], octets[1], octets[2], octets[3]]
+            }
+        },
+        NetworkEndpoint::Cjdns { address, .. } => {
+            let octets = address.octets();
+            vec![6, octets[0], octets[1], octets[2], octets[3]]
+        }
+        NetworkEndpoint::Dns { host, .. } => {
+            let digest = Sha256::digest(host.to_ascii_lowercase().as_bytes());
+            let mut group = vec![0];
+            group.extend_from_slice(&digest[..4]);
+            group
+        }
+        NetworkEndpoint::OnionV2 { .. } => vec![3],
+        NetworkEndpoint::OnionV3 { .. } => vec![4],
+        NetworkEndpoint::I2p { .. } => vec![5],
+    }
+}
+
+fn addrman_hash(keys: (u64, u64), domain: u8, parts: &[&[u8]]) -> u64 {
+    let mut input = vec![domain];
+    for part in parts {
+        input.extend_from_slice(
+            &u32::try_from(part.len())
+                .expect("address-manager hash component length fits u32")
+                .to_le_bytes(),
+        );
+        input.extend_from_slice(part);
+    }
+    siphash24::Hash::hash_to_u64_with_keys(keys.0, keys.1, &input)
+}
+
+fn addrman_location(
+    node: &Arc<Node>,
+    endpoint: &NetworkEndpoint,
+    source: &NetworkEndpoint,
+    tried: bool,
+    occupied: &mut HashSet<(usize, usize)>,
+) -> Option<(usize, usize)> {
+    let endpoint_key = addrman_endpoint_key(endpoint);
+    let endpoint_group = addrman_group(endpoint);
+    let source_group = addrman_group(source);
+    let bucket_count = if tried {
+        ADDRMAN_TRIED_BUCKET_COUNT
+    } else {
+        ADDRMAN_NEW_BUCKET_COUNT
+    };
+    let domain = if tried { b'T' } else { b'N' };
+    let bucket_parts: [&[u8]; 2] = if tried {
+        [endpoint_group.as_slice(), endpoint_key.as_slice()]
+    } else {
+        [endpoint_group.as_slice(), source_group.as_slice()]
+    };
+    let bucket =
+        (addrman_hash(node.addrman_siphash_keys(), domain, &bucket_parts) as usize) % bucket_count;
+    let bucket_bytes = bucket.to_le_bytes();
+    let preferred_position = (addrman_hash(
+        node.addrman_siphash_keys(),
+        domain.wrapping_add(1),
+        &[bucket_bytes.as_slice(), endpoint_key.as_slice()],
+    ) as usize)
+        % ADDRMAN_BUCKET_SIZE;
+
+    for bucket_offset in 0..bucket_count {
+        let candidate_bucket = (bucket + bucket_offset) % bucket_count;
+        let first_position = if bucket_offset == 0 {
+            preferred_position
+        } else {
+            0
+        };
+        for position_offset in 0..ADDRMAN_BUCKET_SIZE {
+            let position = (first_position + position_offset) % ADDRMAN_BUCKET_SIZE;
+            if occupied.insert((candidate_bucket, position)) {
+                return Some((candidate_bucket, position));
+            }
+        }
+    }
+    None
+}
+
 fn get_raw_addrman(node: &Arc<Node>) -> Result<Value> {
     let mut peers = node.known_network_addresses();
     peers.sort_by(|left, right| left.endpoint.cmp(&right.endpoint));
     let mut new_table = serde_json::Map::new();
     let mut tried_table = serde_json::Map::new();
-    let mut new_position = 0usize;
-    let mut tried_position = 0usize;
+    let mut new_occupied = HashSet::new();
+    let mut tried_occupied = HashSet::new();
     for peer in peers {
         let network = peer.endpoint.network_name();
         let host = peer.endpoint.host_string();
@@ -3460,16 +3563,22 @@ fn get_raw_addrman(node: &Arc<Node>) -> Result<Value> {
         if let Some(source_mapped_as) = node.mapped_as(&source) {
             entry["source_mapped_as"] = json!(source_mapped_as);
         }
-        let (table, position) = if node.is_network_address_tried(&peer.endpoint) {
-            let position = tried_position;
-            tried_position = tried_position.saturating_add(1);
-            (&mut tried_table, position)
+        let (table, bucket, position) = if node.is_network_address_tried(&peer.endpoint) {
+            let Some((bucket, position)) =
+                addrman_location(node, &peer.endpoint, &source, true, &mut tried_occupied)
+            else {
+                continue;
+            };
+            (&mut tried_table, bucket, position)
         } else {
-            let position = new_position;
-            new_position = new_position.saturating_add(1);
-            (&mut new_table, position)
+            let Some((bucket, position)) =
+                addrman_location(node, &peer.endpoint, &source, false, &mut new_occupied)
+            else {
+                continue;
+            };
+            (&mut new_table, bucket, position)
         };
-        table.insert(format!("0/{position}"), entry);
+        table.insert(format!("{bucket}/{position}"), entry);
     }
     Ok(json!({"new": new_table, "tried": tried_table}))
 }
@@ -20284,10 +20393,18 @@ mod tests {
         let raw = dispatch_method(&node, "getrawaddrman", &json!([])).unwrap();
         assert_eq!(raw["new"].as_object().unwrap().len(), 1);
         assert_eq!(raw["tried"].as_object().unwrap().len(), 2);
-        assert!(raw["new"].get("0/0").is_some());
-        assert!(raw["tried"].get("0/0").is_some());
-        assert!(raw["tried"].get("0/1").is_some());
-        assert!(raw["new"]["0/0"].get("source_mapped_as").is_none());
+        for (table, bucket_count) in [
+            (&raw["new"], ADDRMAN_NEW_BUCKET_COUNT),
+            (&raw["tried"], ADDRMAN_TRIED_BUCKET_COUNT),
+        ] {
+            for location in table.as_object().unwrap().keys() {
+                let (bucket, position) = location.split_once('/').unwrap();
+                assert!(bucket.parse::<usize>().unwrap() < bucket_count);
+                assert!(position.parse::<usize>().unwrap() < ADDRMAN_BUCKET_SIZE);
+            }
+        }
+        let first_new_entry = raw["new"].as_object().unwrap().values().next().unwrap();
+        assert!(first_new_entry.get("source_mapped_as").is_none());
         let announced = crate::address::NetworkEndpoint::Ip("192.0.2.13:18444".parse().unwrap());
         let source = crate::address::NetworkEndpoint::Ip("198.51.100.7:18444".parse().unwrap());
         assert!(node.remember_network_address_from(

@@ -476,6 +476,36 @@ struct ChainSnapshot {
     spent_by: Option<HashMap<OutPoint, SpentTransaction>>,
     #[serde(default)]
     prune_height: Option<u32>,
+    #[serde(default)]
+    tx_index_duplicates: HashMap<Txid, Vec<TxLocation>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LegacyChainSnapshot {
+    tip: String,
+    headers: Vec<bitcoin::block::Header>,
+    utxos: HashMap<OutPoint, UtxoEntry>,
+    tx_index: HashMap<Txid, TxLocation>,
+    tx_index_all: HashMap<Txid, TxLocation>,
+    history: HashMap<String, Vec<HistoryEntry>>,
+    spent_by: Option<HashMap<OutPoint, SpentTransaction>>,
+    prune_height: Option<u32>,
+}
+
+impl From<LegacyChainSnapshot> for ChainSnapshot {
+    fn from(snapshot: LegacyChainSnapshot) -> Self {
+        Self {
+            tip: snapshot.tip,
+            headers: snapshot.headers,
+            utxos: snapshot.utxos,
+            tx_index: snapshot.tx_index,
+            tx_index_all: snapshot.tx_index_all,
+            history: snapshot.history,
+            spent_by: snapshot.spent_by,
+            prune_height: snapshot.prune_height,
+            tx_index_duplicates: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -634,6 +664,19 @@ fn deserialize_internal<T: DeserializeOwned>(bytes: &[u8], magic: &[u8]) -> Resu
     deserialize_binary(&bytes[magic.len()..]).context("decoding internal chainstate")
 }
 
+fn deserialize_chain_snapshot(bytes: &[u8]) -> Result<ChainSnapshot> {
+    match deserialize_internal::<ChainSnapshot>(bytes, CHAIN_SNAPSHOT_MAGIC) {
+        Ok(snapshot) => Ok(snapshot),
+        Err(new_format_error) => {
+            deserialize_internal::<LegacyChainSnapshot>(bytes, CHAIN_SNAPSHOT_MAGIC)
+                .map(ChainSnapshot::from)
+                .with_context(|| {
+                    format!("decoding chainstate snapshot (new format: {new_format_error})")
+                })
+        }
+    }
+}
+
 fn serialize_chainstate_delta(delta: &ChainstateDelta) -> Result<Vec<u8>> {
     let body = serialize_binary(delta).context("serializing chainstate delta body")?;
     let stored = StoredChainstateDelta {
@@ -743,6 +786,10 @@ pub struct ChainState {
     utxos: HashMap<OutPoint, UtxoEntry>,
     utxos_by_script: HashMap<String, HashSet<OutPoint>>,
     tx_index: HashMap<Txid, TxLocation>,
+    // Most txids have one active-chain location. Keep duplicate locations
+    // separately so the Core-style txindex remains a latest-location map
+    // while Electrum can return the earliest occurrence.
+    tx_index_duplicates: HashMap<Txid, Vec<TxLocation>>,
     tx_index_all: HashMap<Txid, TxLocation>,
     history: HashMap<String, Vec<HistoryEntry>>,
     spent_by: HashMap<OutPoint, SpentTransaction>,
@@ -1142,6 +1189,7 @@ impl ChainState {
             utxos: HashMap::new(),
             utxos_by_script: HashMap::new(),
             tx_index: HashMap::new(),
+            tx_index_duplicates: HashMap::new(),
             tx_index_all: HashMap::new(),
             history: HashMap::new(),
             spent_by: HashMap::new(),
@@ -1175,6 +1223,7 @@ impl ChainState {
             state.utxos = snapshot.utxos;
             state.rebuild_utxo_index();
             state.tx_index = snapshot.tx_index;
+            state.tx_index_duplicates = snapshot.tx_index_duplicates;
             state.tx_index_all = if state.tx_index_all_enabled {
                 if snapshot.tx_index_all.is_empty() {
                     state.tx_index.clone()
@@ -3226,10 +3275,44 @@ impl ChainState {
     /// serves side-chain transactions when the optional Core-style `-txindex`
     /// is enabled.
     pub fn active_transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
-        let Some(location) = self.tx_index.get(txid).cloned() else {
-            return Ok(None);
-        };
-        self.transaction_at_location(txid, location)
+        for location in self.active_transaction_locations(txid) {
+            if let Some((transaction, location)) = self.transaction_at_location(txid, location)? {
+                if transaction.compute_txid() == *txid {
+                    return Ok(Some((transaction, location)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Return active-chain locations in Electrum's chronological order.
+    /// Ordinary txids take the fast single-map path; only duplicate txids use
+    /// the side index.
+    pub(crate) fn active_transaction_locations(&self, txid: &Txid) -> Vec<TxLocation> {
+        let mut locations = self
+            .tx_index_duplicates
+            .get(txid)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(location) = self.tx_index.get(txid)
+            && !locations.iter().any(|candidate| candidate == location)
+        {
+            locations.push(location.clone());
+        }
+        locations.sort_by_key(|location| (location.height, location.transaction_index));
+        locations
+    }
+
+    /// Find an active occurrence at an exact height, including a duplicate
+    /// txid whose latest location is in a later block.
+    pub(crate) fn active_transaction_location_at_height(
+        &self,
+        txid: &Txid,
+        height: u32,
+    ) -> Option<TxLocation> {
+        self.active_transaction_locations(txid)
+            .into_iter()
+            .find(|location| location.height == height)
     }
 
     pub fn transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
@@ -3429,6 +3512,21 @@ impl ChainState {
             })
             .map(|(txid, location)| (*txid, location.clone()))
             .collect();
+        let tx_index_duplicates = self
+            .tx_index_duplicates
+            .iter()
+            .filter_map(|(txid, locations)| {
+                let locations = locations
+                    .iter()
+                    .filter(|location| {
+                        location.height <= target_height
+                            && active_hashes.contains(&location.block_hash)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!locations.is_empty()).then_some((*txid, locations))
+            })
+            .collect();
         let tx_index_all = self
             .tx_index_all
             .iter()
@@ -3468,6 +3566,7 @@ impl ChainState {
                 .collect(),
             utxos,
             tx_index,
+            tx_index_duplicates,
             tx_index_all,
             history,
             spent_by,
@@ -4080,7 +4179,7 @@ impl ChainState {
                 merkle_branch_for_block(&block, transaction_index),
             )
         } else {
-            let Some(location) = self.tx_index.get(txid).cloned() else {
+            let Some(location) = self.active_transaction_location_at_height(txid, height) else {
                 return Ok(None);
             };
             if location.block_hash != block_hash || location.height != height {
@@ -5016,7 +5115,7 @@ impl ChainState {
                 height,
                 transaction_index,
             };
-            self.tx_index.insert(txid, location.clone());
+            self.index_active_transaction(txid, location.clone());
             if self.tx_index_all_enabled {
                 if let Some(changes) = tx_index_all_changes.as_deref_mut()
                     && !changes.contains_key(&txid)
@@ -5310,6 +5409,7 @@ impl ChainState {
         let old_utxos = std::mem::take(&mut self.utxos);
         let old_utxos_by_script = std::mem::take(&mut self.utxos_by_script);
         let old_tx_index = std::mem::take(&mut self.tx_index);
+        let old_tx_index_duplicates = std::mem::take(&mut self.tx_index_duplicates);
         let mut tx_index_all_changes = HashMap::new();
         let old_history = std::mem::take(&mut self.history);
         let old_spent_by = std::mem::take(&mut self.spent_by);
@@ -5327,6 +5427,7 @@ impl ChainState {
         self.utxos.clear();
         self.utxos_by_script.clear();
         self.tx_index.clear();
+        self.tx_index_duplicates.clear();
         self.history.clear();
         self.spent_by.clear();
         self.coin_stats = self.coinstats_index_enabled.then(CoinStatsState::default);
@@ -5343,6 +5444,7 @@ impl ChainState {
                 self.utxos = snapshot.utxos;
                 self.rebuild_utxo_index();
                 self.tx_index = snapshot.tx_index;
+                self.tx_index_duplicates = snapshot.tx_index_duplicates;
                 self.history = snapshot.history;
                 self.active_tx_counts = old_active_tx_counts
                     .get(..snapshot_chain_len)
@@ -5397,6 +5499,7 @@ impl ChainState {
             self.utxos = old_utxos;
             self.utxos_by_script = old_utxos_by_script;
             self.tx_index = old_tx_index;
+            self.tx_index_duplicates = old_tx_index_duplicates;
             for (txid, previous) in tx_index_all_changes {
                 match previous {
                     Some(location) => {
@@ -5666,7 +5769,7 @@ impl ChainState {
             for script_hash in scripts {
                 self.add_history(&script_hash, HistoryEntry { txid, height });
             }
-            self.tx_index.insert(
+            self.index_active_transaction(
                 txid,
                 TxLocation {
                     block_hash: block.block_hash(),
@@ -5776,6 +5879,25 @@ impl ChainState {
                     transaction_index,
                 },
             );
+        }
+    }
+
+    fn index_active_transaction(&mut self, txid: Txid, location: TxLocation) {
+        let previous = self.tx_index.insert(txid, location.clone());
+        if let Some(previous) = previous {
+            if previous == location {
+                return;
+            }
+            let locations = self.tx_index_duplicates.entry(txid).or_default();
+            if !locations.iter().any(|candidate| candidate == &previous) {
+                locations.push(previous);
+            }
+        }
+        if let Some(locations) = self.tx_index_duplicates.get_mut(&txid) {
+            if !locations.iter().any(|candidate| candidate == &location) {
+                locations.push(location);
+            }
+            locations.sort_by_key(|candidate| (candidate.height, candidate.transaction_index));
         }
     }
 
@@ -6000,7 +6122,7 @@ impl ChainState {
         }
         let bytes = fs::read(path)?;
         let snapshot = if bytes.starts_with(CHAIN_SNAPSHOT_MAGIC) {
-            deserialize_internal(&bytes, CHAIN_SNAPSHOT_MAGIC)?
+            deserialize_chain_snapshot(&bytes)?
         } else {
             let Ok(snapshot) = serde_json::from_slice::<ChainSnapshot>(&bytes) else {
                 return Ok(None);
@@ -6175,7 +6297,7 @@ impl ChainState {
             if location.block_hash != delta.block_hash || location.height != delta.height {
                 bail!("chainstate delta contains invalid transaction metadata")
             }
-            self.tx_index.insert(*txid, location.clone());
+            self.index_active_transaction(*txid, location.clone());
             if self.tx_index_all_enabled {
                 self.tx_index_all.insert(*txid, location.clone());
             }
@@ -6387,6 +6509,7 @@ impl ChainState {
             headers: self.headers.clone(),
             utxos: self.utxos.clone(),
             tx_index: self.tx_index.clone(),
+            tx_index_duplicates: self.tx_index_duplicates.clone(),
             tx_index_all: if self.tx_index_all_enabled {
                 self.tx_index_all.clone()
             } else {
@@ -6579,7 +6702,7 @@ fn load_assumeutxo_expected_snapshot(
     let bytes = fs::read(&path)
         .with_context(|| format!("reading chainstate snapshot {}", path.display()))?;
     let snapshot: ChainSnapshot = if bytes.starts_with(CHAIN_SNAPSHOT_MAGIC) {
-        deserialize_internal(&bytes, CHAIN_SNAPSHOT_MAGIC)?
+        deserialize_chain_snapshot(&bytes)?
     } else {
         serde_json::from_slice(&bytes).context("decoding chainstate snapshot")?
     };
@@ -6670,6 +6793,7 @@ fn open_background_replay_state(
         utxos: HashMap::new(),
         utxos_by_script: HashMap::new(),
         tx_index: HashMap::new(),
+        tx_index_duplicates: HashMap::new(),
         tx_index_all: HashMap::new(),
         history: HashMap::new(),
         spent_by: HashMap::new(),
@@ -7426,6 +7550,23 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn legacy_chain_snapshot_defaults_duplicate_index() {
+        let legacy = LegacyChainSnapshot {
+            tip: String::new(),
+            headers: Vec::new(),
+            utxos: HashMap::new(),
+            tx_index: HashMap::new(),
+            tx_index_all: HashMap::new(),
+            history: HashMap::new(),
+            spent_by: None,
+            prune_height: None,
+        };
+        let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &legacy).unwrap();
+        let snapshot = deserialize_chain_snapshot(&bytes).unwrap();
+        assert!(snapshot.tx_index_duplicates.is_empty());
     }
 
     #[test]
@@ -8741,6 +8882,71 @@ mod tests {
         .unwrap();
         assert!(reopened.transaction(&side_txid).unwrap().is_some());
         assert!(reopened.active_transaction(&side_txid).unwrap().is_none());
+    }
+
+    #[test]
+    fn active_transaction_lookup_returns_earliest_duplicate_txid() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut deployment_parameters =
+            validation::DeploymentParameters::for_network(Network::Regtest);
+        // Regtest activates BIP34 at height one, while the historical
+        // duplicate-coinbase shape predates that rule. Delay it for this
+        // focused index test so the genesis coinbase can be repeated.
+        deployment_parameters.buried.bip34 = 500;
+        let mut state = ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters(
+            Network::Regtest,
+            directory.path(),
+            directory.path(),
+            None,
+            true,
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            deployment_parameters,
+        )
+        .unwrap();
+        let genesis = genesis_block(Network::Regtest);
+        let duplicate_txid = genesis.txdata[0].compute_txid();
+        let previous = *state.header(0).unwrap();
+        let mut duplicate = Block {
+            header: Header {
+                version: BlockVersion::from_consensus(4),
+                prev_blockhash: previous.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: previous.time.saturating_add(1),
+                bits: previous.bits,
+                nonce: 0,
+            },
+            txdata: vec![genesis.txdata[0].clone()],
+        };
+        duplicate.header.merkle_root = duplicate.compute_merkle_root().unwrap();
+        while !duplicate.header.target().is_met_by(duplicate.block_hash()) {
+            duplicate.header.nonce = duplicate.header.nonce.wrapping_add(1);
+        }
+        state.connect_block(duplicate).unwrap();
+
+        let (_, earliest) = state
+            .active_transaction(&duplicate_txid)
+            .unwrap()
+            .expect("duplicate transaction is indexed");
+        assert_eq!(earliest.height, 0);
+        let (_, latest) = state
+            .transaction(&duplicate_txid)
+            .unwrap()
+            .expect("latest transaction index location is present");
+        assert_eq!(latest.height, 1);
+
+        state.persist_snapshot().unwrap();
+        drop(state);
+        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let (_, earliest) = reopened
+            .active_transaction(&duplicate_txid)
+            .unwrap()
+            .expect("duplicate transaction survives snapshot reload");
+        assert_eq!(earliest.height, 0);
     }
 
     fn mine_block(state: &ChainState, height: u32) -> Block {

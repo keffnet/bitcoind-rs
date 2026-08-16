@@ -3063,6 +3063,9 @@ impl ChainState {
                 if existing.header != *header {
                     bail!("header hash collision for {hash}");
                 }
+                if self.has_invalid_ancestor(hash) {
+                    bail!("header {hash} is on an invalidated branch");
+                }
                 hashes.push(hash);
                 continue;
             }
@@ -3072,6 +3075,9 @@ impl ChainState {
                 .get(&parent_hash)
                 .copied()
                 .with_context(|| format!("header {hash} has an unknown parent {parent_hash}"))?;
+            if self.has_invalid_ancestor(parent_hash) {
+                bail!("header {hash} has an invalidated parent {parent_hash}");
+            }
             validation::validate_bip94_timewarp_with_params(
                 &self.deployment_parameters,
                 parent.height.saturating_add(1),
@@ -9318,6 +9324,21 @@ mod tests {
         }
         state.accept_headers(&[parent.header]).unwrap();
         assert!(state.accept_headers(&[stale.header]).is_err());
+    }
+
+    #[test]
+    fn header_sync_rejects_invalidated_branches() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let child = mine_block_from_header(&parent.header, 2, 12);
+
+        state.accept_headers(&[parent.header]).unwrap();
+        state.invalidate_block(&parent.block_hash()).unwrap();
+
+        assert!(state.accept_headers(&[parent.header]).is_err());
+        assert!(state.accept_headers(&[child.header]).is_err());
+        assert!(state.block_height_by_hash(&child.block_hash()).is_none());
     }
 
     #[test]

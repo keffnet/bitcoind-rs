@@ -378,7 +378,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         let mut encoded = serde_json::to_vec(&json!({
                             "jsonrpc": "2.0",
                             "id": null,
-                            "error": {"code": -32700, "message": "Parse error"},
+                            "error": {"code": -32700, "message": "parse error"},
                         }))?;
                         encoded.push(b'\n');
                         write_half.write_all(&encoded).await?;
@@ -458,7 +458,7 @@ fn invalid_request_response() -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": null,
-        "error": {"code": -32600, "message": "Invalid Request"},
+        "error": {"code": -32600, "message": "invalid request"},
     })
 }
 
@@ -3429,6 +3429,20 @@ mod tests {
         assert_eq!(response.as_array().map(Vec::len), Some(1));
         assert_eq!(response[0]["id"], json!(3));
         assert_eq!(response[0]["result"]["protocol_min"], json!("1.4"));
+
+        line.clear();
+        reader.get_mut().write_all(b"{\n").await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["error"]["code"], json!(-32700));
+        assert_eq!(response["error"]["message"], json!("parse error"));
+
+        line.clear();
+        reader.get_mut().write_all(b"[]\n").await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response[0]["error"]["code"], json!(-32600));
+        assert_eq!(response[0]["error"]["message"], json!("invalid request"));
 
         line.clear();
         reader

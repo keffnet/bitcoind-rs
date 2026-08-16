@@ -102,6 +102,7 @@ const MAX_TIME_OFFSET_SAMPLES: usize = 50;
 const CLOCK_OUT_OF_SYNC_THRESHOLD_SECS: u64 = 10 * 60;
 pub(crate) const PRIVATE_BROADCAST_PEERS_PER_TRANSACTION: usize = 3;
 pub(crate) const PRIVATE_BROADCAST_RETRY_SECS: u64 = 60;
+pub(crate) const MAX_INITIAL_BROADCAST_DELAY_SECS: u64 = 15 * 60;
 
 /// Match Core's default `SanitizeString` rule for peer user-agent strings.
 ///
@@ -888,6 +889,7 @@ pub struct Node {
     outbound_usage: parking_lot::Mutex<OutboundUsage>,
     network_active: AtomicBool,
     block_stalling_timeout_secs: AtomicU64,
+    mock_scheduler_elapsed_secs: AtomicU64,
     block_stalling_since: parking_lot::RwLock<HashMap<usize, Instant>>,
     shutdown_requested: AtomicBool,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
@@ -1204,6 +1206,7 @@ impl Node {
             outbound_usage: parking_lot::Mutex::new(OutboundUsage::default()),
             network_active: AtomicBool::new(network_active),
             block_stalling_timeout_secs: AtomicU64::new(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
+            mock_scheduler_elapsed_secs: AtomicU64::new(0),
             block_stalling_since: parking_lot::RwLock::new(HashMap::new()),
             shutdown_requested: AtomicBool::new(false),
             peers: parking_lot::RwLock::new(HashMap::new()),
@@ -2062,6 +2065,23 @@ impl Node {
 
     pub(crate) fn notify_mempool_transaction(&self, transaction: Transaction) {
         self.notify_mempool_transaction_with_exclusions(transaction, Vec::new());
+    }
+
+    pub(crate) fn mock_scheduler_forward(&self, delta_secs: u64) {
+        let previous = self
+            .mock_scheduler_elapsed_secs
+            .fetch_add(delta_secs, Ordering::Relaxed);
+        let next = previous.saturating_add(delta_secs);
+        if next / MAX_INITIAL_BROADCAST_DELAY_SECS > previous / MAX_INITIAL_BROADCAST_DELAY_SECS {
+            self.reannounce_unbroadcast_transactions();
+        }
+    }
+
+    fn reannounce_unbroadcast_transactions(&self) {
+        let txids = self.mempool.read().unbroadcast_txids();
+        for txid in txids {
+            self.announce_peer_mempool_transaction(txid, Vec::new());
+        }
     }
 
     pub(crate) fn notify_mempool_transaction_from_peer(
@@ -4844,6 +4864,27 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
             }],
         }
+    }
+
+    #[test]
+    fn mock_scheduler_reannounces_unbroadcast_transactions() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let transaction = private_broadcast_test_transaction(&node);
+        let txid = transaction.compute_txid();
+        let mut events = node.subscribe_peer_mempool();
+
+        assert_eq!(node.accept_transaction(transaction).unwrap(), txid);
+        assert_eq!(events.try_recv().unwrap().txid, txid);
+
+        node.mock_scheduler_forward(MAX_INITIAL_BROADCAST_DELAY_SECS - 1);
+        assert!(events.try_recv().is_err());
+        node.mock_scheduler_forward(1);
+        assert_eq!(events.try_recv().unwrap().txid, txid);
+
+        node.mempool.write().remove_unbroadcast(&txid);
+        node.mock_scheduler_forward(MAX_INITIAL_BROADCAST_DELAY_SECS);
+        assert!(events.try_recv().is_err());
     }
 
     #[test]

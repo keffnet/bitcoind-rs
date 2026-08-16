@@ -2294,9 +2294,7 @@ fn mock_scheduler(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if !(1..=3_600).contains(&delta) {
         bail!("delta_time must be between 1 and 3600 seconds (1 hr)")
     }
-    // Tokio's scheduler is real-time in this implementation. The RPC still
-    // validates and accepts the same testing range; validation notifications
-    // are synchronous, so no scheduler wake-up is needed here.
+    node.mock_scheduler_forward(delta as u64);
     Ok(Value::Null)
 }
 

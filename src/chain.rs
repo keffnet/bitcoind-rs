@@ -1362,6 +1362,18 @@ impl ChainState {
         self.prune_mode || self.prune_height.is_some()
     }
 
+    /// Return whether the block body was removed by pruning.
+    ///
+    /// A block-index entry can outlive its body for two different reasons:
+    /// the body may never have been downloaded, or it may have been removed
+    /// by pruning. RPCs use this distinction to match Core's diagnostics.
+    pub fn is_block_pruned(&self, hash: &BlockHash) -> bool {
+        self.prune_height.is_some_and(|prune_height| {
+            self.block_height_by_hash(hash)
+                .is_some_and(|height| height < prune_height)
+        })
+    }
+
     /// Return whether the node must advertise limited historical block
     /// service. Core keeps NODE_NETWORK disabled while an AssumeUTXO
     /// background chainstate is validating, even when explicit prune mode is
@@ -7876,10 +7888,14 @@ mod tests {
         let tip_hash = state.best_hash();
         let old_block_hash = old_block_hash.expect("prune test block");
         assert!(state.store.contains(&old_block_hash));
+        assert!(!state.is_block_pruned(&old_block_hash));
         assert_eq!(state.prune(1).unwrap(), 0);
         assert_eq!(state.prune_height(), None);
         assert_eq!(state.prune(50).unwrap(), 12);
         assert!(!state.store.contains(&old_block_hash));
+        assert!(state.is_block_pruned(&old_block_hash));
+        assert!(!state.is_block_pruned(&state.block_hash(12).unwrap()));
+        assert!(!state.is_block_pruned(&state.block_hash(13).unwrap()));
         assert_eq!(
             state.proposal_duplicate_status(&old_block_hash),
             Some("duplicate")
@@ -7892,6 +7908,7 @@ mod tests {
         assert_eq!(reopened.height(), 300);
         assert_eq!(reopened.prune_height(), Some(12));
         assert!(!reopened.store.contains(&old_block_hash));
+        assert!(reopened.is_block_pruned(&old_block_hash));
         assert_eq!(
             reopened.block_transaction_count(&old_block_hash).unwrap(),
             Some(1)

@@ -856,11 +856,15 @@ fn rest_block(
         .strip_prefix(prefix)
         .ok_or_else(|| anyhow!("invalid block path"))?;
     let hash: BlockHash = hash_text.parse()?;
-    let block = node
-        .chain
-        .write()
-        .block(&hash)?
-        .ok_or_else(|| anyhow!("block not found"))?;
+    let mut chain = node.chain.write();
+    let block = match chain.block(&hash)? {
+        Some(block) => block,
+        None if chain.block_height_by_hash(&hash).is_some() => {
+            return Err(missing_block_data_rest_error(&chain, &hash));
+        }
+        None => return Err(anyhow!("block not found")),
+    };
+    drop(chain);
     match format {
         "json" => rest_json(get_block(
             node,
@@ -899,11 +903,15 @@ fn rest_block_part(
         .parse()?;
     let offset = rest_query_usize(query, "offset")?;
     let size = rest_query_usize(query, "size")?;
-    let bytes = node
-        .chain
-        .write()
-        .block(&hash)?
-        .ok_or_else(|| anyhow!("block not found"))?;
+    let mut chain = node.chain.write();
+    let bytes = match chain.block(&hash)? {
+        Some(block) => block,
+        None if chain.block_height_by_hash(&hash).is_some() => {
+            return Err(missing_block_data_rest_error(&chain, &hash));
+        }
+        None => return Err(anyhow!("block not found")),
+    };
+    drop(chain);
     let bytes = serialize(&bytes);
     let end = offset
         .checked_add(size)
@@ -4247,6 +4255,28 @@ fn get_mining_info(node: &Arc<Node>) -> Result<Value> {
     Ok(result)
 }
 
+fn missing_block_data_reason(chain: &chain::ChainState, hash: &BlockHash) -> &'static str {
+    if chain.is_block_pruned(hash) {
+        "pruned data"
+    } else {
+        "not fully downloaded"
+    }
+}
+
+fn missing_block_data_error(chain: &chain::ChainState, hash: &BlockHash) -> anyhow::Error {
+    anyhow!(
+        "Block not available ({})",
+        missing_block_data_reason(chain, hash)
+    )
+}
+
+fn missing_block_data_rest_error(chain: &chain::ChainState, hash: &BlockHash) -> anyhow::Error {
+    anyhow!(
+        "{hash} not available ({})",
+        missing_block_data_reason(chain, hash)
+    )
+}
+
 fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
     let verbosity = parse_verbosity(params.get(1), 1)?;
@@ -4256,7 +4286,7 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("Block not found"))?;
     let block = chain
         .block(&hash)?
-        .ok_or_else(|| anyhow!("Block not available"))?;
+        .ok_or_else(|| missing_block_data_error(&chain, &hash))?;
     if verbosity <= 0 {
         return Ok(json!(hex::encode(serialize(&block))));
     }
@@ -4999,7 +5029,7 @@ fn get_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     let block = chain
         .block(&block_hash)?
-        .ok_or_else(|| anyhow!("Block not available"))?;
+        .ok_or_else(|| missing_block_data_error(&chain, &block_hash))?;
     let block_txids: HashMap<Txid, usize> = block
         .txdata
         .iter()
@@ -5369,7 +5399,7 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("Block not found"))?;
     let block = chain
         .block(&hash)?
-        .ok_or_else(|| anyhow!("Block not available (not fully downloaded)"))?;
+        .ok_or_else(|| missing_block_data_error(&chain, &hash))?;
     let fee_stats = chain
         .block_fee_stats(&hash)?
         .ok_or_else(|| anyhow!("Undo data not available"))?;
@@ -12287,7 +12317,7 @@ fn block_matches_scripts(
 ) -> Result<bool> {
     let block = chain
         .block(hash)?
-        .ok_or_else(|| anyhow!("block not found while verifying filter match"))?;
+        .ok_or_else(|| missing_block_data_error(chain, hash))?;
     for transaction in &block.txdata {
         if transaction
             .output
@@ -12341,7 +12371,7 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .ok_or_else(|| anyhow!("block not found"))?;
             let block = chain
                 .block(&hash)?
-                .ok_or_else(|| anyhow!("block not found"))?;
+                .ok_or_else(|| missing_block_data_error(&chain, &hash))?;
             Ok((height, hash, block))
         })
         .collect::<Result<Vec<_>>>()?;

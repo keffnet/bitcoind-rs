@@ -12115,6 +12115,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
 
     let chain = node.chain.read();
     let original_mempool = node.mempool.read();
+    let mut individual_candidate = original_mempool.clone();
     let before_transactions = original_mempool
         .transactions()
         .map(|transaction| (transaction.compute_txid(), transaction.clone()))
@@ -12228,6 +12229,95 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
 
     if !package_rbf {
         if let Some(failure_index) = max_fee_failure {
+            if transactions.len() > 1 {
+                // Core's submitpackage path first evaluates each transaction
+                // on its own.  A transaction that exceeds maxfeerate is not
+                // made available to later package members, so its children
+                // are reported as missing-input failures.  Independent
+                // parents that still pass individually remain submitable.
+                let mut accepted = Vec::new();
+                for (index, transaction) in transactions.iter().enumerate() {
+                    let txid = transaction.compute_txid();
+                    let package_max_failure = index == failure_index
+                        && candidate.get(&txid).is_some_and(|entry| {
+                            exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate)
+                        });
+                    if preexisting.contains(&txid) {
+                        results.insert(
+                            transaction.compute_wtxid().to_string(),
+                            package_transaction_json(
+                                transaction,
+                                &transactions,
+                                &individual_candidate,
+                                false,
+                            )?,
+                        );
+                        continue;
+                    }
+                    match individual_candidate.accept_for_test(transaction.clone(), &chain) {
+                        Ok(accepted_txid) => {
+                            let entry = individual_candidate
+                                .get(&accepted_txid)
+                                .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
+                            if package_max_failure
+                                || exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate)
+                            {
+                                individual_candidate.remove(&accepted_txid);
+                                results.insert(
+                                    transaction.compute_wtxid().to_string(),
+                                    json!({
+                                        "txid": txid.to_string(),
+                                        "error": "max feerate exceeded",
+                                    }),
+                                );
+                            } else {
+                                accepted.push(transaction.clone());
+                                results.insert(
+                                    transaction.compute_wtxid().to_string(),
+                                    package_transaction_json(
+                                        transaction,
+                                        &transactions,
+                                        &individual_candidate,
+                                        true,
+                                    )?,
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            results.insert(
+                                transaction.compute_wtxid().to_string(),
+                                if package_max_failure {
+                                    json!({
+                                        "txid": txid.to_string(),
+                                        "error": "max feerate exceeded",
+                                    })
+                                } else {
+                                    json!({
+                                        "txid": txid.to_string(),
+                                        "error": submit_package_error_message(&error),
+                                    })
+                                },
+                            );
+                        }
+                    }
+                }
+                drop(chain);
+                let replaced_transactions = if accepted.is_empty() {
+                    Vec::new()
+                } else {
+                    commit_submitted_package(
+                        node,
+                        individual_candidate,
+                        before_transactions,
+                        accepted,
+                    )
+                };
+                return Ok(json!({
+                    "package_msg": "transaction failed",
+                    "tx-results": results,
+                    "replaced-transactions": replaced_transactions,
+                }));
+            }
             let accepted = transactions
                 .iter()
                 .take(failure_index)
@@ -12330,6 +12420,13 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         "tx-results": results,
         "replaced-transactions": replaced_transactions,
     }))
+}
+
+fn submit_package_error_message(error: &MempoolError) -> String {
+    match error {
+        MempoolError::MissingInput(_) => "bad-txns-inputs-missingorspent".to_owned(),
+        _ => error.to_string(),
+    }
 }
 
 fn commit_submitted_package(
@@ -25178,6 +25275,56 @@ mod tests {
         let funding_hash: BlockHash = mined[0].as_str().unwrap().parse().unwrap();
         let funding = node.chain.write().block(&funding_hash).unwrap().unwrap();
         let funding_outpoint = OutPoint::new(funding.txdata[0].compute_txid(), 0);
+        let max_fee_parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding_outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(4_999_000_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let max_fee_child = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(max_fee_parent.compute_txid(), 0),
+                script_sig: ScriptBuf::from_bytes(vec![0x00; 8]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(4_998_999_980),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let max_fee_result = submit_package(
+            &node,
+            &json!([
+                [
+                    hex::encode(serialize(&max_fee_parent)),
+                    hex::encode(serialize(&max_fee_child)),
+                ],
+                0.00001
+            ]),
+        )
+        .unwrap();
+        assert_eq!(max_fee_result["package_msg"], "transaction failed");
+        assert_eq!(
+            max_fee_result["tx-results"][max_fee_parent.compute_wtxid().to_string()]["error"],
+            "max feerate exceeded"
+        );
+        assert_eq!(
+            max_fee_result["tx-results"][max_fee_child.compute_wtxid().to_string()]["error"],
+            "bad-txns-inputs-missingorspent"
+        );
+        assert!(node.mempool.read().is_empty());
+
         let parent = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,

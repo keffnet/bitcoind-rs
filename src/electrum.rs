@@ -25,6 +25,7 @@ use crate::{Node, StartupLatch};
 const MAX_LINE_SIZE: usize = 2 * crate::validation::MAX_BLOCK_WEIGHT + 64 * 1024;
 const SERVER_NAME: &str = "bitcoind-rs 0.1.0";
 const MAX_ELECTRUM_PEERS: usize = 1_024;
+const MAX_SCRIPTPUBKEY_SIZE: usize = 10_000;
 
 #[derive(Clone, Debug)]
 struct ElectrumPeer {
@@ -1739,7 +1740,11 @@ fn script_hash_param(params: &Value, index: usize) -> Result<String> {
 
 fn scriptpubkey_param(params: &Value, index: usize) -> Result<ScriptBuf> {
     let value = param::<String>(params, index)?;
-    Ok(ScriptBuf::from_bytes(hex::decode(value)?))
+    let bytes = hex::decode(value)?;
+    if bytes.len() > MAX_SCRIPTPUBKEY_SIZE {
+        bail!("scriptPubKey exceeds the 10,000-byte limit")
+    }
+    Ok(ScriptBuf::from_bytes(bytes))
 }
 
 fn scriptpubkey_hash_param(params: &Value, index: usize) -> Result<String> {
@@ -1835,6 +1840,17 @@ mod tests {
         let params = json!(["AA".repeat(32)]);
         assert_eq!(script_hash_param(&params, 0).unwrap(), "aa".repeat(32));
         assert!(script_hash_param(&json!(["00"]), 0).is_err());
+    }
+
+    #[test]
+    fn scriptpubkey_parameters_match_consensus_size_limit() {
+        assert!(
+            scriptpubkey_param(&json!([hex::encode(vec![0; MAX_SCRIPTPUBKEY_SIZE])]), 0).is_ok()
+        );
+        assert!(
+            scriptpubkey_param(&json!([hex::encode(vec![0; MAX_SCRIPTPUBKEY_SIZE + 1])]), 0,)
+                .is_err()
+        );
     }
 
     #[test]

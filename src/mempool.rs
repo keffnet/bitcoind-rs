@@ -2992,7 +2992,8 @@ fn validate_standard_policy_with_modified_fee_and_policy(
             "bad-txns-too-many-sigops".to_owned(),
         ));
     }
-    validate_standard_witnesses(transaction, previous_outputs)
+    validate_standard_witnesses(transaction, previous_outputs)?;
+    validate_standard_simple_ecdsa_spends(transaction, previous_outputs)
 }
 
 fn is_minimal_push_encoding(script: &Script) -> bool {
@@ -3274,6 +3275,181 @@ fn validate_standard_witnesses(
     Ok(())
 }
 
+fn standard_script_policy_failure(reason: &'static str) -> MempoolError {
+    MempoolError::NonStandard(format!("mempool-script-verify-flag-failed ({reason})"))
+}
+
+/// Validate the non-consensus signature policy rules for the simple standard
+/// templates whose executed CHECKSIG arguments are directly visible in the
+/// input. More general P2WSH and multisig scripts need an execution-aware
+/// policy interpreter because their signature arguments can be produced or
+/// consumed by arbitrary script operations.
+fn validate_standard_simple_ecdsa_spends(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+) -> Result<(), MempoolError> {
+    for (input, previous) in transaction.input.iter().zip(previous_outputs) {
+        if previous.script_pubkey.is_p2sh() {
+            let Some(mut stack) = push_only_stack_items(&input.script_sig) else {
+                continue;
+            };
+            let Some(redeem_script) = stack.pop() else {
+                continue;
+            };
+            let redeem_script = Script::from_bytes(&redeem_script);
+
+            if redeem_script.is_p2pkh() {
+                if stack.len() != 2 {
+                    return Err(standard_script_policy_failure(
+                        "Stack size must be exactly one after execution",
+                    ));
+                }
+                validate_standard_ecdsa_pair(&stack[0], &stack[1], false)?;
+            } else if redeem_script.is_p2wpkh() {
+                validate_standard_wpkh_witness(input)?;
+            } else if let Some(pubkey) = p2pk_pubkey_bytes(redeem_script) {
+                if stack.len() != 1 {
+                    return Err(standard_script_policy_failure(
+                        "Stack size must be exactly one after execution",
+                    ));
+                }
+                validate_standard_ecdsa_pair(&stack[0], &pubkey, false)?;
+            }
+            continue;
+        }
+
+        if previous.script_pubkey.is_p2pkh() {
+            let Some(stack) = push_only_stack_items(&input.script_sig) else {
+                continue;
+            };
+            if stack.len() != 2 {
+                return Err(standard_script_policy_failure(
+                    "Stack size must be exactly one after execution",
+                ));
+            }
+            validate_standard_ecdsa_pair(&stack[0], &stack[1], false)?;
+        } else if previous.script_pubkey.is_p2wpkh() {
+            validate_standard_wpkh_witness(input)?;
+        } else if let Some(pubkey) = p2pk_pubkey_bytes(&previous.script_pubkey) {
+            let Some(stack) = push_only_stack_items(&input.script_sig) else {
+                continue;
+            };
+            if stack.len() != 1 {
+                return Err(standard_script_policy_failure(
+                    "Stack size must be exactly one after execution",
+                ));
+            }
+            validate_standard_ecdsa_pair(&stack[0], &pubkey, false)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_standard_wpkh_witness(input: &TxIn) -> Result<(), MempoolError> {
+    let witness = input.witness.iter().collect::<Vec<_>>();
+    if witness.len() == 2 {
+        validate_standard_ecdsa_pair(witness[0], witness[1], true)?;
+    }
+    Ok(())
+}
+
+fn validate_standard_ecdsa_pair(
+    signature: &[u8],
+    pubkey: &[u8],
+    witness_v0: bool,
+) -> Result<(), MempoolError> {
+    validate_standard_ecdsa_signature(signature).map_err(standard_script_policy_failure)?;
+
+    if witness_v0 && !(pubkey.len() == 33 && matches!(pubkey[0], 0x02 | 0x03)) {
+        return Err(standard_script_policy_failure(
+            "Public key is not compressed",
+        ));
+    }
+    if !is_strict_pubkey_encoding(pubkey) {
+        return Err(standard_script_policy_failure(
+            "Public key is neither compressed or uncompressed",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_standard_ecdsa_signature(signature: &[u8]) -> Result<(), &'static str> {
+    // Core permits an empty signature as the intentional false value used by
+    // CHECK(MULTI)SIG. The surrounding standard templates still have to pass
+    // consensus validation, but the encoding policy itself accepts it.
+    if signature.is_empty() {
+        return Ok(());
+    }
+    if !is_valid_der_signature(signature) {
+        return Err("Non-canonical DER signature");
+    }
+
+    let der = &signature[..signature.len() - 1];
+    let mut parsed = bitcoin::secp256k1::ecdsa::Signature::from_der(der)
+        .map_err(|_| "Non-canonical DER signature")?;
+    let original = parsed;
+    parsed.normalize_s();
+    if parsed != original {
+        return Err("Non-canonical signature: S value is unnecessarily high");
+    }
+
+    let hash_type = signature[signature.len() - 1] & 0x7f;
+    if !(1..=3).contains(&hash_type) {
+        return Err("Signature hash type missing or not understood");
+    }
+    Ok(())
+}
+
+/// Bitcoin Core's IsValidSignatureEncoding, including the final sighash byte.
+fn is_valid_der_signature(signature: &[u8]) -> bool {
+    if !(9..=73).contains(&signature.len())
+        || signature[0] != 0x30
+        || usize::from(signature[1]) != signature.len() - 3
+    {
+        return false;
+    }
+
+    let len_r = usize::from(signature[3]);
+    if 5 + len_r >= signature.len() {
+        return false;
+    }
+    let len_s = usize::from(signature[5 + len_r]);
+    if len_r + len_s + 7 != signature.len()
+        || signature[2] != 0x02
+        || len_r == 0
+        || signature[4] & 0x80 != 0
+        || (len_r > 1 && signature[4] == 0x00 && signature[5] & 0x80 == 0)
+    {
+        return false;
+    }
+
+    let s_tag = len_r + 4;
+    let s_start = s_tag + 2;
+    len_s != 0
+        && signature[s_tag] == 0x02
+        && signature[s_start] & 0x80 == 0
+        && !(len_s > 1 && signature[s_start + 1] == 0x00 && signature[s_start + 2] & 0x80 == 0)
+}
+
+fn is_strict_pubkey_encoding(pubkey: &[u8]) -> bool {
+    (pubkey.len() == 33 && matches!(pubkey.first(), Some(0x02 | 0x03)))
+        || (pubkey.len() == 65 && pubkey.first() == Some(&0x04))
+}
+
+fn p2pk_pubkey_bytes(script: &Script) -> Option<Vec<u8>> {
+    let mut instructions = script.instructions();
+    let pubkey = match instructions.next()? {
+        Ok(Instruction::PushBytes(bytes)) => bytes.as_bytes().to_vec(),
+        _ => return None,
+    };
+    match instructions.next()? {
+        Ok(Instruction::Op(op)) if op.to_u8() == 0xac && instructions.next().is_none() => {
+            Some(pubkey)
+        }
+        _ => None,
+    }
+}
+
 fn is_standard_output_script(script: &Script, permit_bare_multisig: bool) -> bool {
     script.is_p2pkh()
         || script.is_p2sh()
@@ -3294,11 +3470,11 @@ fn is_core_nulldata(script: &Script) -> bool {
         && Script::from_bytes(&script.as_bytes()[1..]).is_push_only()
 }
 
-fn push_only_stack_top(script: &Script) -> Option<Vec<u8>> {
-    let mut last = None;
+fn push_only_stack_items(script: &Script) -> Option<Vec<Vec<u8>>> {
+    let mut stack = Vec::new();
     for instruction in script.instructions() {
         match instruction {
-            Ok(Instruction::PushBytes(bytes)) => last = Some(bytes.as_bytes().to_vec()),
+            Ok(Instruction::PushBytes(bytes)) => stack.push(bytes.as_bytes().to_vec()),
             Ok(Instruction::Op(op)) => {
                 let value = match op.to_u8() {
                     0x00 => Vec::new(),
@@ -3306,12 +3482,16 @@ fn push_only_stack_top(script: &Script) -> Option<Vec<u8>> {
                     0x51..=0x60 => vec![op.to_u8() - 0x50],
                     _ => return None,
                 };
-                last = Some(value);
+                stack.push(value);
             }
             Err(_) => return None,
         }
     }
-    last
+    Some(stack)
+}
+
+fn push_only_stack_top(script: &Script) -> Option<Vec<u8>> {
+    push_only_stack_items(script)?.pop()
 }
 
 fn is_standard_spend_script(script: &Script) -> bool {
@@ -4749,7 +4929,12 @@ mod tests {
             }),
         };
         let mut nonstandard = graph_transaction(Txid::from_byte_array([7; 32]), 7);
-        nonstandard.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00]);
+        let standard_p2pkh_script_sig = ScriptBuf::from_bytes({
+            let mut bytes = vec![0x00, 0x21, 0x02];
+            bytes.extend([0u8; 32]);
+            bytes
+        });
+        nonstandard.input[0].script_sig = standard_p2pkh_script_sig.clone();
         assert!(matches!(
             validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1),
             Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
@@ -4772,7 +4957,7 @@ mod tests {
             validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1),
             Err(MempoolError::NonStandard(reason)) if reason == "bad-txns-nonstandard-inputs"
         ));
-        nonstandard.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00]);
+        nonstandard.input[0].script_sig = standard_p2pkh_script_sig;
 
         nonstandard.output[0].value = Amount::from_sat(1);
         assert!(is_dust_output(&nonstandard.output[0]));
@@ -4909,6 +5094,87 @@ mod tests {
     }
 
     #[test]
+    fn standard_policy_enforces_simple_ecdsa_script_flags() {
+        let pubkey =
+            hex::decode("03363d90d447b00c9c99ceac05b6262ee053441c7e55552ffe526bad8f83ff4640")
+                .unwrap();
+        let previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: {
+                let mut bytes = vec![0x76, 0xa9, 0x14];
+                bytes.extend([0u8; 20]);
+                bytes.extend([0x88, 0xac]);
+                ScriptBuf::from_bytes(bytes)
+            },
+        };
+        let mut transaction = graph_transaction(Txid::from_byte_array([13; 32]), 13);
+        transaction.output[0] = TxOut {
+            value: Amount::from_sat(99_999),
+            script_pubkey: ScriptBuf::from_bytes({
+                let mut bytes = vec![0x00, 0x14];
+                bytes.extend([0u8; 20]);
+                bytes
+            }),
+        };
+
+        let push_signature_and_pubkey = |signature: &[u8], pubkey: &[u8]| {
+            let mut bytes = Vec::with_capacity(signature.len() + pubkey.len() + 2);
+            bytes.push(u8::try_from(signature.len()).unwrap());
+            bytes.extend_from_slice(signature);
+            bytes.push(u8::try_from(pubkey.len()).unwrap());
+            bytes.extend_from_slice(pubkey);
+            ScriptBuf::from_bytes(bytes)
+        };
+
+        let high_s_signature = hex::decode(
+            "304502203e4516da7253cf068effec6b95c41221c0cf3a8e6ccb8cbf1725b562e9afde2c022100ab1e3da73d67e32045a20e0b999e049978ea8d6ee5480d485fcf2ce0d03b2ef001",
+        )
+        .unwrap();
+        transaction.input[0].script_sig = push_signature_and_pubkey(&high_s_signature, &pubkey);
+        assert!(matches!(
+            validate_standard_policy(&transaction, std::slice::from_ref(&previous), 1),
+            Err(MempoolError::NonStandard(reason))
+                if reason.contains("S value is unnecessarily high")
+        ));
+
+        transaction.input[0].script_sig = push_signature_and_pubkey(&[0x30, 0x01], &pubkey);
+        assert!(matches!(
+            validate_standard_policy(&transaction, std::slice::from_ref(&previous), 1),
+            Err(MempoolError::NonStandard(reason))
+                if reason.contains("Non-canonical DER signature")
+        ));
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let message = bitcoin::secp256k1::Message::from_digest([2u8; 32]);
+        let mut undefined_hash_type = secp
+            .sign_ecdsa(&message, &secret_key)
+            .serialize_der()
+            .to_vec();
+        undefined_hash_type.push(0x05);
+        transaction.input[0].script_sig = push_signature_and_pubkey(&undefined_hash_type, &pubkey);
+        assert!(matches!(
+            validate_standard_policy(&transaction, std::slice::from_ref(&previous), 1),
+            Err(MempoolError::NonStandard(reason))
+                if reason.contains("Signature hash type missing or not understood")
+        ));
+
+        let hybrid_pubkey = hex::decode(
+            "0679be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8",
+        )
+        .unwrap();
+        undefined_hash_type.pop();
+        undefined_hash_type.push(0x01);
+        transaction.input[0].script_sig =
+            push_signature_and_pubkey(&undefined_hash_type, &hybrid_pubkey);
+        assert!(matches!(
+            validate_standard_policy(&transaction, std::slice::from_ref(&previous), 1),
+            Err(MempoolError::NonStandard(reason))
+                if reason.contains("neither compressed or uncompressed")
+        ));
+    }
+
+    #[test]
     fn standard_policy_honors_data_carrier_and_bare_multisig_switches() {
         let previous = TxOut {
             value: Amount::from_sat(100_000),
@@ -4920,7 +5186,11 @@ mod tests {
             }),
         };
         let mut transaction = graph_transaction(Txid::from_byte_array([8; 32]), 8);
-        transaction.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00]);
+        transaction.input[0].script_sig = ScriptBuf::from_bytes({
+            let mut bytes = vec![0x00, 0x21, 0x02];
+            bytes.extend([0u8; 32]);
+            bytes
+        });
         transaction.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x6a, 0x01, 0x01]);
         let mut policy = MempoolPolicy {
             max_datacarrier_bytes: None,

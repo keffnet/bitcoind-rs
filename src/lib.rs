@@ -798,6 +798,8 @@ pub struct BannedNetworkAddress {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct PersistedBannedAddress {
+    #[serde(default = "default_ban_version")]
+    version: u32,
     address: String,
     #[serde(default)]
     prefix: Option<u8>,
@@ -806,6 +808,10 @@ struct PersistedBannedAddress {
     ban_created: u64,
     ban_until: u64,
     reason: String,
+}
+
+fn default_ban_version() -> u32 {
+    1
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4172,6 +4178,7 @@ impl Node {
             .read()
             .values()
             .map(|entry| PersistedBannedAddress {
+                version: 1,
                 address: entry.address.to_string(),
                 prefix: Some(entry.prefix),
                 network: None,
@@ -4182,6 +4189,7 @@ impl Node {
             .collect::<Vec<_>>();
         entries.extend(self.banned_network_addresses.read().values().map(|entry| {
             PersistedBannedAddress {
+                version: 1,
                 address: entry.endpoint.host_string(),
                 prefix: None,
                 network: Some(entry.endpoint.network_name().to_owned()),
@@ -4346,6 +4354,9 @@ fn load_banlist(data_dir: &Path) -> Result<LoadedBanState> {
     let mut ip_addresses = HashMap::new();
     let mut network_addresses = HashMap::new();
     for entry in entries {
+        if entry.version != 1 {
+            continue;
+        }
         if let Ok(address) = entry.address.parse::<IpAddr>() {
             let prefix = entry.prefix.unwrap_or_else(|| address_bits(address));
             let subnet = IpSubnet::new(address, prefix)?;

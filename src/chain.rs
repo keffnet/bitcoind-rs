@@ -1708,6 +1708,15 @@ impl ChainState {
         let Some(target_size) = self.prune_target_size else {
             return Ok(false);
         };
+        // Core's snapshot chainstate keeps the historical block range needed
+        // by background validation until that validation completes.  This
+        // block store is record-based rather than Core's block-file layout,
+        // so it cannot represent the same discontiguous prune range without
+        // making the contiguous prune-height metadata lie.  Defer pruning
+        // until the snapshot is validated instead.
+        if self.snapshot_base.is_some() && !self.snapshot_validated {
+            return Ok(false);
+        }
         if self.height() <= self.prune_after_height {
             return Ok(false);
         }
@@ -1731,6 +1740,14 @@ impl ChainState {
     /// snapshotted before returning so a pruned node can restart without the
     /// removed block bodies.
     pub fn prune(&mut self, requested: u64) -> Result<u32> {
+        // The historical chain must remain available while an AssumeUTXO
+        // snapshot is being validated in the background.  Returning the
+        // current boundary is the same observable no-op as Core's prune
+        // range when no block file falls entirely outside that protected
+        // prefix.
+        if self.snapshot_base.is_some() && !self.snapshot_validated {
+            return Ok(self.prune_height.unwrap_or_default());
+        }
         let tip_height = self.height();
         if tip_height < self.prune_after_height {
             bail!("Blockchain is too short for pruning.");
@@ -8562,6 +8579,35 @@ mod tests {
         assert!(!state.store.contains(&old_block_hash.unwrap()));
         assert!(state.store.contains(&state.block_hash(13).unwrap()));
         assert!(state.store.contains(&state.block_hash(12).unwrap()));
+    }
+
+    #[test]
+    fn pruning_waits_for_assumeutxo_background_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_prune_after_height(Network::Regtest, true);
+        let mut old_block_hash = None;
+        for height in 1..=300 {
+            let block = mine_block(&state, height);
+            if height == 5 {
+                old_block_hash = Some(block.block_hash());
+            }
+            state.connect_block(block).unwrap();
+        }
+        let snapshot_base = state.block_hash(3).unwrap();
+        state.snapshot_base = Some(snapshot_base);
+        state.snapshot_validated = false;
+        state.prune_mode = true;
+        state.prune_target_size = Some(0);
+
+        assert!(!state.maybe_auto_prune().unwrap());
+        assert_eq!(state.prune(50).unwrap(), 0);
+        assert!(state.store.contains(&old_block_hash.unwrap()));
+        assert_eq!(state.prune_height(), None);
+
+        state.snapshot_validated = true;
+        assert_eq!(state.prune(50).unwrap(), 12);
+        assert!(!state.store.contains(&old_block_hash.unwrap()));
     }
 
     #[test]

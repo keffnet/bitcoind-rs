@@ -1155,6 +1155,16 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
             "funder_height".to_owned(),
             json!(mempool_transaction_height(&entry.transaction, &mempool)),
         );
+    } else if let Some(entry) = chain.utxo(outpoint) {
+        // A pruned node can retain an unspent output in the UTXO set after
+        // its funding block body has been removed.
+        status.insert("funder_height".to_owned(), json!(entry.height));
+    } else if chain.spending_transaction(outpoint).is_some()
+        && let Some(location) = chain.transaction_location(&outpoint.txid)
+    {
+        // For a spent output, the durable spender index proves that this
+        // outpoint existed even when pruning removed the funding transaction.
+        status.insert("funder_height".to_owned(), json!(location.height));
     }
 
     if let Some((txid, _, _, height)) = chain.spending_transaction(outpoint) {

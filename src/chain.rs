@@ -2885,15 +2885,27 @@ impl ChainState {
         if locator.is_empty() {
             return Vec::new();
         }
-        let start = locator
-            .iter()
-            .find_map(|hash| {
-                let node = self.block_index.get(hash)?;
-                self.active_chain
-                    .get(node.height as usize)
-                    .is_some_and(|active_hash| active_hash == hash)
-                    .then_some(node.height as usize + 1)
-            })
+        // Match Core's FindForkInGlobalIndex: a locator entry on a side
+        // branch that extends the active tip still identifies the active tip
+        // as the common fork. Without this case, a header-only branch causes
+        // us to fall back to genesis and resend the entire active chain.
+        let active_tip_height = self.active_chain.len().saturating_sub(1) as u32;
+        let fork_height = locator.iter().find_map(|hash| {
+            let node = self.block_index.get(hash)?;
+            if self
+                .active_chain
+                .get(node.height as usize)
+                .is_some_and(|active_hash| active_hash == hash)
+            {
+                return Some(node.height);
+            }
+            (node.height >= active_tip_height
+                && self.ancestor_hash(*hash, active_tip_height) == Some(self.best_hash()))
+            .then_some(active_tip_height)
+        });
+        let start = fork_height
+            .and_then(|height| usize::try_from(height).ok())
+            .and_then(|height| height.checked_add(1))
             .unwrap_or(0);
         let stop = if stop_hash == BlockHash::all_zeros() {
             self.active_chain.len()
@@ -7759,6 +7771,27 @@ mod tests {
                     30 * 24 * 60 * 60
                 )
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn getheaders_uses_active_tip_for_a_side_branch_locator() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let active = mine_block(&state, 1);
+        state.connect_block(active).unwrap();
+
+        // A header-only branch extending the active tip is present in Core's
+        // global block index but is not itself part of the active chain.
+        let side = mine_block(&state, 2);
+        let side_hash = side.block_hash();
+        state
+            .accept_headers(std::slice::from_ref(&side.header))
+            .unwrap();
+
+        assert_eq!(
+            state.headers_after_locator(&[side_hash], BlockHash::all_zeros()),
+            Vec::new()
         );
     }
 

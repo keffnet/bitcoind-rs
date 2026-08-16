@@ -3499,20 +3499,43 @@ impl ChainState {
     }
 
     pub fn utxo(&self, outpoint: &OutPoint) -> Option<UtxoEntry> {
-        self.utxo_store
-            .get(outpoint)
-            .ok()
-            .flatten()
+        self.utxo_checked(outpoint).ok().flatten()
+    }
+
+    pub fn utxo_checked(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>> {
+        Ok(self
+            .utxo_store
+            .get(outpoint)?
             .map(Self::decoded_utxo)
-            .or_else(|| self.utxos.get(outpoint).cloned())
+            .or_else(|| self.utxos.get(outpoint).cloned()))
     }
 
     pub fn all_utxos(&self) -> impl Iterator<Item = (OutPoint, UtxoEntry)> {
-        self.utxo_store
-            .entries()
-            .unwrap_or_default()
+        self.all_utxos_checked()
+            .unwrap_or_else(|_| {
+                self.utxos
+                    .iter()
+                    .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+                    .collect()
+            })
+            .into_iter()
+    }
+
+    pub fn all_utxos_checked(&self) -> Result<Vec<(OutPoint, UtxoEntry)>> {
+        let entries = self
+            .utxo_store
+            .entries()?
             .into_iter()
             .map(|(outpoint, entry)| (outpoint, Self::decoded_utxo(entry)))
+            .collect::<Vec<_>>();
+        if entries.is_empty() && !self.utxos.is_empty() {
+            return Ok(self
+                .utxos
+                .iter()
+                .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+                .collect());
+        }
+        Ok(entries)
     }
 
     pub fn utxo_stats(&self) -> (usize, usize, u64) {

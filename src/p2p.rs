@@ -253,6 +253,7 @@ const AVG_FEEFILTER_BROADCAST_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MAX_FEEFILTER_CHANGE_DELAY: Duration = Duration::from_secs(5 * 60);
 const MAX_FUTURE_BLOCK_TIME_SECS: u64 = 2 * 60 * 60;
 const MAX_TX_INVENTORY_BATCH: usize = 50_000;
+const BLOCK_RELAY_IDLE_DELAY: Duration = Duration::from_secs(1);
 const MAX_PEER_TX_ANNOUNCEMENTS: usize = 5_000;
 const MAX_PEER_TX_REQUEST_IN_FLIGHT: usize = 100;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
@@ -450,6 +451,23 @@ fn headers_request_is_due(last_request: Option<Instant>) -> bool {
 
 fn headers_download_timed_out(last_request: Option<Instant>) -> bool {
     last_request.is_some_and(|sent| sent.elapsed() > HEADERS_DOWNLOAD_TIMEOUT)
+}
+
+fn block_relay_is_suppressed(peer_state: &PeerState) -> bool {
+    peer_state
+        .last_block_request
+        .lock()
+        .is_some_and(|sent| sent.elapsed() < BLOCK_RELAY_IDLE_DELAY)
+}
+
+fn take_deferred_block_relay(peer_state: &PeerState) -> bool {
+    let mut last_request = peer_state.last_block_request.lock();
+    if last_request.is_some_and(|sent| sent.elapsed() >= BLOCK_RELAY_IDLE_DELAY) {
+        *last_request = None;
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -908,6 +926,7 @@ struct PeerState {
     send_headers_sent: parking_lot::Mutex<bool>,
     last_headers_request: parking_lot::Mutex<Option<Instant>>,
     continuation_block: parking_lot::Mutex<Option<BlockHash>>,
+    last_block_request: parking_lot::Mutex<Option<Instant>>,
     compact_block_version: parking_lot::Mutex<Option<u64>>,
     compact_block_announce: parking_lot::Mutex<bool>,
     tx_reconciliation_salt: parking_lot::Mutex<Option<u64>>,
@@ -2925,6 +2944,7 @@ async fn serve_peer(
         send_headers_sent: parking_lot::Mutex::new(false),
         last_headers_request: parking_lot::Mutex::new(None),
         continuation_block: parking_lot::Mutex::new(None),
+        last_block_request: parking_lot::Mutex::new(None),
         compact_block_version: parking_lot::Mutex::new(None),
         compact_block_announce: parking_lot::Mutex::new(false),
         tx_reconciliation_salt: parking_lot::Mutex::new(None),
@@ -3201,6 +3221,20 @@ async fn serve_peer_loop(
                         .await?;
                     }
                     continue;
+                }
+                if take_deferred_block_relay(peer_state) {
+                    let tip = node.chain.read().best_hash();
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Inv(vec![Inventory {
+                            kind: block_request_inventory_type(peer_services),
+                            hash: tip,
+                        }]),
+                    )
+                    .await?;
                 }
                 maybe_send_send_headers(
                     node,
@@ -3749,15 +3783,48 @@ async fn serve_peer_loop(
                     node.update_peer_presynced_headers(peer_id, Some(sync.presync_height()));
                 }
 
-                let hashes = node.chain.write().accept_headers(&headers_to_accept)?;
-                if let Some(hash) = hashes.last().copied() {
+                let (last_hash, hashes) = {
+                    let mut chain = node.chain.write();
+                    // A headers response can repeat headers that are already
+                    // indexed.  Only newly inserted headers should trigger a
+                    // body request; otherwise a pruned node would repeatedly
+                    // download old active bodies merely because its peer sent
+                    // a fresh headers batch.
+                    let known = headers_to_accept
+                        .iter()
+                        .filter_map(|header| {
+                            let hash = header.block_hash();
+                            chain.block_height_by_hash(&hash).map(|_| hash)
+                        })
+                        .collect::<HashSet<_>>();
+                    let last_hash = headers_to_accept.last().map(|header| header.block_hash());
+                    let accepted = chain.accept_headers(&headers_to_accept)?;
+                    let hashes = accepted
+                        .into_iter()
+                        .filter(|hash| !known.contains(hash))
+                        .collect::<Vec<_>>();
+                    (last_hash, hashes)
+                };
+                if let Some(hash) = last_hash {
                     node.update_peer_best_known_block(peer_id, hash);
                 }
                 let requests = {
                     let chain = node.chain.read();
+                    // Headers for a lower-work side chain are useful for
+                    // getchaintips and later getblockfrompeer requests, but
+                    // Core does not immediately download their bodies.  A
+                    // body request is needed here only when this header
+                    // batch can make the advertised chain the active one.
+                    let request_candidate_bodies = hashes
+                        .last()
+                        .and_then(|hash| chain.chain_work_by_hash(hash))
+                        .is_some_and(|work| work > chain.tip().work);
                     hashes
                         .into_iter()
-                        .filter(|hash| !chain.store.contains(hash))
+                        .filter(|hash| {
+                            !chain.store.contains(hash)
+                                && (request_candidate_bodies || chain.is_active_block(hash))
+                        })
                         .map(|hash| Inventory {
                             kind: block_request_inventory_type(peer_services),
                             hash,
@@ -3925,6 +3992,16 @@ async fn serve_peer_loop(
                         .await?;
                     }
                     continue;
+                }
+                if items.iter().any(|item| {
+                    matches!(
+                        item.kind,
+                        InventoryType::Block
+                            | InventoryType::WitnessBlock
+                            | InventoryType::CompactBlock
+                    )
+                }) {
+                    *peer_state.last_block_request.lock() = Some(Instant::now());
                 }
                 let mut missing = Vec::new();
                 for item in items {
@@ -4206,10 +4283,14 @@ async fn serve_peer_loop(
                 for transaction in &block.txdata {
                     forget_transaction_requests(peers, transaction);
                 }
-                node.clear_peer_block_request(peer_id, hash);
                 if handle_received_block(node, peers, peer_id, block, requested, false).await {
                     node.record_peer_block(peer_id, hash);
                 }
+                // Keep the completed request marked until after chain-event
+                // relays have observed the accepted block. This prevents a
+                // relay task from racing the download loop in the brief gap
+                // between validation and scheduling the next body.
+                node.clear_peer_block_request(peer_id, hash);
                 flush_pending_block_requests(
                     node,
                     peer_id,
@@ -5650,16 +5731,18 @@ async fn send_message(
     network: Network,
     message: &Message,
 ) -> Result<()> {
-    let mut writer = writer.lock().await;
-    let bytes = match &mut *writer {
-        PeerWriterKind::V1(writer) => {
-            wire::write_message_with_size(writer, network, message).await?
-        }
-        PeerWriterKind::V2(writer) => {
-            let contents = wire::encode_v2_message(message)?;
-            let bytes = contents.len().saturating_add(20);
-            writer.write(&Payload::genuine(contents)).await?;
-            bytes
+    let bytes = {
+        let mut writer = writer.lock().await;
+        match &mut *writer {
+            PeerWriterKind::V1(writer) => {
+                wire::write_message_with_size(writer, network, message).await?
+            }
+            PeerWriterKind::V2(writer) => {
+                let contents = wire::encode_v2_message(message)?;
+                let bytes = contents.len().saturating_add(20);
+                writer.write(&Payload::genuine(contents)).await?;
+                bytes
+            }
         }
     };
     node.capture_message(peer_id, false, message)?;
@@ -6047,6 +6130,17 @@ async fn broadcast_inventory_excluding(
         .map(|(peer_id, state)| (*peer_id, state.clone()))
         .collect();
     for (peer_id, state) in recipients {
+        // A peer with blocks in flight already has a headers-first download
+        // schedule. Announcing those same active-chain blocks can make the
+        // relay task compete with the download loop for the single writer
+        // and create head-of-line blocking while the peer is syncing.
+        if matches!(
+            item.kind,
+            InventoryType::Block | InventoryType::WitnessBlock | InventoryType::CompactBlock
+        ) && (node.peer_inflight_block_count(peer_id) != 0 || block_relay_is_suppressed(&state))
+        {
+            continue;
+        }
         let item = transaction
             .as_ref()
             .map(|transaction| transaction_inventory(transaction, *state.wtxid_relay.lock()))
@@ -7662,6 +7756,7 @@ mod tests {
             send_headers_sent: parking_lot::Mutex::new(false),
             last_headers_request: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),
+            last_block_request: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),
             compact_block_announce: parking_lot::Mutex::new(false),
             tx_reconciliation_salt: parking_lot::Mutex::new(None),
@@ -10091,6 +10186,7 @@ mod tests {
             send_headers_sent: parking_lot::Mutex::new(false),
             last_headers_request: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),
+            last_block_request: parking_lot::Mutex::new(None),
             compact_block_version: parking_lot::Mutex::new(None),
             compact_block_announce: parking_lot::Mutex::new(false),
             tx_reconciliation_salt: parking_lot::Mutex::new(None),

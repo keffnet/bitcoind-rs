@@ -2921,6 +2921,7 @@ impl Node {
                 .skip(1)
                 .map(|header| header.block_hash())
                 .filter(|hash| !chain.store.contains(hash))
+                .filter(|hash| !chain.is_block_pruned(hash))
                 .filter(|hash| {
                     !limited_peer
                         || chain
@@ -3569,7 +3570,12 @@ impl Node {
     }
 
     pub fn peer_infos(&self) -> Vec<PeerInfo> {
-        self.peers.read().values().cloned().collect()
+        let mut peers = self.peers.read().values().cloned().collect::<Vec<_>>();
+        // Core exposes getpeerinfo in peer-id order.  Keeping the ordering
+        // deterministic also makes the first/second peer distinction used by
+        // compatibility clients meaningful when connections are concurrent.
+        peers.sort_by_key(|peer| peer.id);
+        peers
     }
 
     /// Return the median clock offset reported by connected outbound peers.

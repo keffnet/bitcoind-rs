@@ -45,6 +45,7 @@ const MAX_BASIC_FILTER_CACHE_ENTRIES: usize = 256;
 // hash-table/deque bookkeeping is accounted for as roughly 64 bytes here.
 const DEFAULT_SCRIPT_CACHE_ENTRIES: usize = (32 * 1024 * 1024) / 64;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
+const FAST_PRUNE_BLOCKFILE_SIZE: usize = 0x10_000;
 const MAX_ORPHAN_BLOCKS: usize = 128;
 const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
 const MAX_UNSPENDABLE_SCRIPT_SIZE: usize = 10_000;
@@ -497,6 +498,34 @@ struct ChainMetadata {
     prune_height: Option<u32>,
     #[serde(default)]
     prune_locks: HashMap<String, PruneLock>,
+    #[serde(default)]
+    prune_protected_blocks: HashMap<String, u32>,
+}
+
+#[derive(Deserialize)]
+struct LegacyChainMetadata {
+    active_chain: Vec<String>,
+    #[serde(default)]
+    headers: Vec<bitcoin::block::Header>,
+    #[serde(default)]
+    invalid_blocks: Vec<String>,
+    #[serde(default)]
+    prune_height: Option<u32>,
+    #[serde(default)]
+    prune_locks: HashMap<String, PruneLock>,
+}
+
+impl From<LegacyChainMetadata> for ChainMetadata {
+    fn from(metadata: LegacyChainMetadata) -> Self {
+        Self {
+            active_chain: metadata.active_chain,
+            headers: metadata.headers,
+            invalid_blocks: metadata.invalid_blocks,
+            prune_height: metadata.prune_height,
+            prune_locks: metadata.prune_locks,
+            prune_protected_blocks: HashMap::new(),
+        }
+    }
 }
 
 /// A Core-style pruning lock. An unbounded upper height is represented by
@@ -828,9 +857,14 @@ pub struct ChainState {
     invalid_blocks: HashSet<BlockHash>,
     prune_height: Option<u32>,
     prune_locks: HashMap<String, PruneLock>,
+    // Bodies fetched again after pruning live in the current block file in
+    // Core. Keep them protected until the file's height range is old enough
+    // to be pruned, rather than dropping them solely by block height.
+    prune_protected_blocks: HashMap<BlockHash, u32>,
     prune_mode: bool,
     prune_target_size: Option<u64>,
     prune_after_height: u32,
+    fast_prune: bool,
     utxos: HashMap<OutPoint, UtxoEntry>,
     utxos_materialized: bool,
     tx_index: HashMap<Txid, ActiveTxLocation>,
@@ -1116,52 +1150,80 @@ impl ChainState {
                 }
             }
         }
-        let (active_chain, persisted_headers, invalid_blocks, prune_height, prune_locks) =
-            if !rebuild_chainstate && (metadata_path.exists() || legacy_metadata_path.exists()) {
-                let metadata = if metadata_path.exists() {
-                    let bytes = fs::read(&metadata_path)
-                        .with_context(|| format!("reading {}", metadata_path.display()))?;
-                    deserialize_internal(&bytes, CHAIN_METADATA_MAGIC)
-                        .with_context(|| format!("decoding {}", metadata_path.display()))?
-                } else {
-                    let bytes = fs::read(&legacy_metadata_path)
-                        .with_context(|| format!("reading {}", legacy_metadata_path.display()))?;
-                    serde_json::from_slice(&bytes)
-                        .with_context(|| format!("decoding {}", legacy_metadata_path.display()))?
-                };
-                let metadata: ChainMetadata = metadata;
-                let active_chain = metadata
-                    .active_chain
-                    .into_iter()
-                    .map(|hash| {
-                        hash.parse()
-                            .with_context(|| format!("invalid block hash {hash}"))
-                    })
-                    .collect::<Result<Vec<BlockHash>>>()?;
-                let invalid_blocks = metadata
-                    .invalid_blocks
-                    .into_iter()
-                    .map(|hash| {
-                        hash.parse()
-                            .with_context(|| format!("invalid invalidated block hash {hash}"))
-                    })
-                    .collect::<Result<HashSet<BlockHash>>>()?;
-                (
-                    active_chain,
-                    metadata.headers,
-                    invalid_blocks,
-                    metadata.prune_height,
-                    metadata.prune_locks,
-                )
+        let (
+            active_chain,
+            persisted_headers,
+            invalid_blocks,
+            prune_height,
+            prune_locks,
+            prune_protected_blocks,
+        ) = if !rebuild_chainstate && (metadata_path.exists() || legacy_metadata_path.exists()) {
+            let metadata = if metadata_path.exists() {
+                let bytes = fs::read(&metadata_path)
+                    .with_context(|| format!("reading {}", metadata_path.display()))?;
+                match deserialize_internal::<ChainMetadata>(&bytes, CHAIN_METADATA_MAGIC) {
+                    Ok(metadata) => metadata,
+                    Err(new_format_error) => {
+                        deserialize_internal::<LegacyChainMetadata>(&bytes, CHAIN_METADATA_MAGIC)
+                            .map(ChainMetadata::from)
+                            .with_context(|| {
+                                format!(
+                                    "decoding {} (new format: {new_format_error})",
+                                    metadata_path.display()
+                                )
+                            })?
+                    }
+                }
             } else {
-                (
-                    vec![genesis_hash],
-                    Vec::new(),
-                    HashSet::new(),
-                    None,
-                    HashMap::new(),
-                )
+                let bytes = fs::read(&legacy_metadata_path)
+                    .with_context(|| format!("reading {}", legacy_metadata_path.display()))?;
+                serde_json::from_slice(&bytes)
+                    .with_context(|| format!("decoding {}", legacy_metadata_path.display()))?
             };
+            let metadata: ChainMetadata = metadata;
+            let active_chain = metadata
+                .active_chain
+                .into_iter()
+                .map(|hash| {
+                    hash.parse()
+                        .with_context(|| format!("invalid block hash {hash}"))
+                })
+                .collect::<Result<Vec<BlockHash>>>()?;
+            let invalid_blocks = metadata
+                .invalid_blocks
+                .into_iter()
+                .map(|hash| {
+                    hash.parse()
+                        .with_context(|| format!("invalid invalidated block hash {hash}"))
+                })
+                .collect::<Result<HashSet<BlockHash>>>()?;
+            let prune_protected_blocks = metadata
+                .prune_protected_blocks
+                .into_iter()
+                .map(|(hash, height)| {
+                    hash.parse()
+                        .map(|hash| (hash, height))
+                        .with_context(|| format!("invalid protected pruned block hash {hash}"))
+                })
+                .collect::<Result<HashMap<BlockHash, u32>>>()?;
+            (
+                active_chain,
+                metadata.headers,
+                invalid_blocks,
+                metadata.prune_height,
+                metadata.prune_locks,
+                prune_protected_blocks,
+            )
+        } else {
+            (
+                vec![genesis_hash],
+                Vec::new(),
+                HashSet::new(),
+                None,
+                HashMap::new(),
+                HashMap::new(),
+            )
+        };
         let persisted_tx_counts = if rebuild_chainstate {
             None
         } else {
@@ -1235,11 +1297,13 @@ impl ChainState {
             invalid_blocks,
             prune_height,
             prune_locks,
+            prune_protected_blocks,
             prune_mode: false,
             prune_target_size: None,
             // Keep the direct ChainState API's historical test behavior until
             // the owning Node applies the network-specific Core parameter.
             prune_after_height: MIN_BLOCKS_TO_KEEP,
+            fast_prune: false,
             utxos: HashMap::new(),
             utxos_materialized: true,
             tx_index: HashMap::new(),
@@ -1540,7 +1604,7 @@ impl ChainState {
     pub fn is_block_pruned(&self, hash: &BlockHash) -> bool {
         self.prune_height.is_some_and(|prune_height| {
             self.block_height_by_hash(hash)
-                .is_some_and(|height| height < prune_height)
+                .is_some_and(|height| height < prune_height && !self.store.contains(hash))
         })
     }
 
@@ -1590,11 +1654,68 @@ impl ChainState {
     /// debug-only fast-prune mode changes regtest's threshold from 1000 to
     /// 100, as in Core v31.1.
     pub fn configure_prune_after_height(&mut self, network: Network, fast_prune: bool) {
+        self.fast_prune = fast_prune;
         self.prune_after_height = match network {
             Network::Bitcoin => 100_000,
             Network::Regtest if fast_prune => 100,
             Network::Regtest | Network::Testnet | Network::Testnet4 | Network::Signet => 1_000,
         };
+    }
+
+    fn fast_prune_boundary(&mut self, requested_height: u32) -> Result<Option<u32>> {
+        let mut file_size = 0usize;
+        let mut first_retained = None;
+        let start_height = usize::try_from(self.prune_height.unwrap_or_default()).unwrap_or(0);
+        let end_height = usize::try_from(requested_height).unwrap_or(usize::MAX);
+        if start_height > end_height {
+            return Ok(None);
+        }
+        // Core writes a body fetched again through getblockfrompeer at the
+        // current tip, rather than restoring it to its original block file.
+        // That extra record can move a later 64 KiB file boundary by one or
+        // more blocks. Preserve the fetch height and replay the append here.
+        let mut refetched = self
+            .prune_protected_blocks
+            .iter()
+            .map(|(hash, height)| (*height, *hash))
+            .collect::<Vec<_>>();
+        refetched.sort_by_key(|(height, _)| *height);
+        for (height, hash) in self
+            .active_chain
+            .iter()
+            .enumerate()
+            .skip(start_height)
+            .take(end_height.saturating_sub(start_height).saturating_add(1))
+        {
+            let height = u32::try_from(height).context("active chain height does not fit u32")?;
+            let Some(block) = self.store.get(hash)? else {
+                break;
+            };
+            let block_size = serialize(&block).len().saturating_add(8);
+            if file_size != 0 && file_size.saturating_add(block_size) >= FAST_PRUNE_BLOCKFILE_SIZE {
+                first_retained = Some(height);
+                file_size = 0;
+            }
+            file_size = file_size.saturating_add(block_size);
+
+            for (_, refetched_hash) in refetched
+                .iter()
+                .filter(|(fetch_height, _)| *fetch_height == height)
+            {
+                let Some(refetched_block) = self.store.get(refetched_hash)? else {
+                    continue;
+                };
+                let refetched_size = serialize(&refetched_block).len().saturating_add(8);
+                if file_size != 0
+                    && file_size.saturating_add(refetched_size) >= FAST_PRUNE_BLOCKFILE_SIZE
+                {
+                    first_retained = Some(height.saturating_add(1));
+                    file_size = 0;
+                }
+                file_size = file_size.saturating_add(refetched_size);
+            }
+        }
+        Ok(first_retained)
     }
 
     pub fn blockfilter_index_enabled(&self) -> bool {
@@ -1824,6 +1945,11 @@ impl ChainState {
                     target_height.min(u32::try_from(lock.height_first).unwrap_or(u32::MAX));
             }
         }
+        if self.fast_prune {
+            if let Some(file_boundary) = self.fast_prune_boundary(target_height)? {
+                target_height = file_boundary;
+            }
+        }
         if let Some(previous) = self.prune_height
             && target_height <= previous
         {
@@ -1840,12 +1966,19 @@ impl ChainState {
             .block_index
             .iter()
             .filter_map(|(hash, node)| {
-                (stored_hashes.contains(hash) && (node.height == 0 || node.height >= target_height))
+                let protected = self
+                    .prune_protected_blocks
+                    .get(hash)
+                    .is_some_and(|height| *height >= target_height);
+                (stored_hashes.contains(hash)
+                    && (node.height == 0 || node.height >= target_height || protected))
                     .then_some(*hash)
             })
             .collect::<HashSet<_>>();
         self.store.prune(&retained_blocks, &retained_blocks)?;
         self.prune_height = Some(target_height);
+        self.prune_protected_blocks
+            .retain(|hash, height| *height >= target_height && retained_blocks.contains(hash));
         self.persist_metadata()?;
         self.persist_snapshot()?;
         Ok(target_height)
@@ -4515,6 +4648,33 @@ impl ChainState {
             bail!("block {hash} is on an invalidated branch")
         }
         if self.active_chain.contains(&hash) {
+            if self.store.contains(&hash) {
+                return Ok(self.tip());
+            }
+            // A pruned active-chain block still has a block-index entry, but
+            // its body can be fetched again through getblockfrompeer.  Do
+            // not treat that body as a duplicate merely because the header
+            // remains on the active chain.
+            let node = self
+                .block_index
+                .get(&hash)
+                .copied()
+                .context("active block index entry is missing")?;
+            self.validate_block_structure(
+                &block,
+                self.network,
+                node.height,
+                Amount::MAX_MONEY.to_sat(),
+            )?;
+            self.store.insert(&block)?;
+            if let Some(store) = self.electrum_store.as_mut() {
+                store.insert(&block)?;
+            }
+            self.index_all_transactions(&block, node.height);
+            if self.prune_height.is_some() {
+                self.prune_protected_blocks.insert(hash, self.height());
+                self.persist_metadata()?
+            }
             return Ok(self.tip());
         }
         // Core's AcceptBlock returns immediately for a block body that is
@@ -6741,6 +6901,11 @@ impl ChainState {
                 .filter(|(_, lock)| !lock.temporary)
                 .map(|(id, lock)| (id.clone(), lock.clone()))
                 .collect(),
+            prune_protected_blocks: self
+                .prune_protected_blocks
+                .iter()
+                .map(|(hash, height)| (hash.to_string(), *height))
+                .collect(),
         };
         let bytes = serialize_internal(CHAIN_METADATA_MAGIC, &metadata)?;
         let path = self.data_dir.join("chainstate.bin");
@@ -7469,9 +7634,11 @@ fn open_background_replay_state(
         invalid_blocks: HashSet::new(),
         prune_height: None,
         prune_locks: HashMap::new(),
+        prune_protected_blocks: HashMap::new(),
         prune_mode: false,
         prune_target_size: None,
         prune_after_height: MIN_BLOCKS_TO_KEEP,
+        fast_prune: false,
         utxos: HashMap::new(),
         utxos_materialized: true,
         tx_index: HashMap::new(),
@@ -8685,6 +8852,7 @@ mod tests {
                 .collect(),
             prune_height: state.prune_height,
             prune_locks: HashMap::new(),
+            prune_protected_blocks: HashMap::new(),
         };
         let snapshot = state.current_snapshot().unwrap();
         let metadata_json = serde_json::to_vec_pretty(&metadata).unwrap();

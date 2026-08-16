@@ -267,6 +267,7 @@ async fn handle_connection(
             return Ok(());
         };
         let keep_alive = request.keep_alive;
+        let mut shutdown_after_response = false;
         let (status, content_type, body) = if node.config.rest
             && (request.method.eq_ignore_ascii_case("GET")
                 || request.method.eq_ignore_ascii_case("POST"))
@@ -342,6 +343,8 @@ async fn handle_connection(
             .await
             {
                 Ok(response) => {
+                    shutdown_after_response =
+                        successful_stop_request(&request.body, response.body.as_ref());
                     let body = response
                         .body
                         .map(|value| {
@@ -366,6 +369,10 @@ async fn handle_connection(
         connection
             .write_response(status, content_type, &body, keep_alive)
             .await?;
+        if shutdown_after_response {
+            node.request_shutdown();
+            return Ok(());
+        }
         if !keep_alive {
             return Ok(());
         }
@@ -1490,7 +1497,6 @@ async fn dispatch_method_async_for_user(
     let result = match method {
         "stop" => match stop_wait(&normalized_params) {
             Ok(wait) => {
-                node.request_shutdown();
                 if let Some(wait) = wait {
                     tokio::time::sleep(wait).await;
                 }
@@ -1522,6 +1528,19 @@ async fn dispatch_method_async_for_user(
     result
 }
 
+fn successful_stop_request(request_body: &[u8], response: Option<&Value>) -> bool {
+    let Some(request) = serde_json::from_slice::<Value>(request_body).ok() else {
+        return false;
+    };
+    let Some(request) = request.as_object() else {
+        return false;
+    };
+    if request.get("method").and_then(Value::as_str) != Some("stop") {
+        return false;
+    }
+    response.is_some_and(|response| response.get("error").is_none_or(|error| error.is_null()))
+}
+
 fn stop_wait(params: &Value) -> Result<Option<std::time::Duration>> {
     let Some(value) = params.get(0).filter(|value| !value.is_null()) else {
         return Ok(None);
@@ -1536,6 +1555,12 @@ fn stop_wait(params: &Value) -> Result<Option<std::time::Duration>> {
 
 fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
     if params.is_array() {
+        if let Some(values) = params.as_array()
+            && method == "getblockstats"
+            && !(1..=2).contains(&values.len())
+        {
+            bail!("getblockstats hash_or_height ( stats )")
+        }
         if let Some(names) = rpc_parameter_names(method)
             && params
                 .as_array()
@@ -1548,6 +1573,15 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
     let Some(object) = params.as_object() else {
         bail!("RPC params must be an array or object")
     };
+    if method == "getblockstats"
+        && object
+            .get("args")
+            .and_then(Value::as_array)
+            .is_none_or(|args| args.is_empty())
+        && !object.contains_key("hash_or_height")
+    {
+        bail!("getblockstats hash_or_height ( stats )")
+    }
     if matches!(method, "echo" | "echojson") {
         let mut values = object
             .get("args")
@@ -2097,6 +2131,14 @@ fn dispatch_method_for_user(
             } else {
                 wire::NODE_NETWORK
             };
+            let subversion = if node.config.user_agent_comments.is_empty() {
+                "/bitcoind-rs:0.1.0/".to_owned()
+            } else {
+                format!(
+                    "/bitcoind-rs:0.1.0({})/",
+                    node.config.user_agent_comments.join("; ")
+                )
+            };
             let local_services = network_service
                 | wire::NODE_WITNESS
                 | if node.config.v2_transport {
@@ -2117,7 +2159,7 @@ fn dispatch_method_for_user(
             let mempool = node.mempool.read();
             Ok(json!({
             "version": 310100,
-            "subversion": "/bitcoind-rs:0.1.0/",
+            "subversion": subversion,
             "protocolversion": 70016,
             "localservices": format!("{local_services:016x}"),
             "localservicesnames": peer_services_names(local_services),
@@ -3720,10 +3762,26 @@ fn add_connection(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_block_from_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let hash: BlockHash = param::<String>(params, 0)?.parse()?;
-    let peer_id = param::<u64>(params, 1)?;
-    let peer_id = usize::try_from(peer_id).map_err(|_| anyhow!("peer id is out of range"))?;
-    node.request_block_from_peer(peer_id, hash)?;
+    let hash_value = params
+        .get(0)
+        .ok_or_else(|| anyhow!("missing parameter 0"))?;
+    let hash_string = hash_value
+        .as_str()
+        .ok_or_else(|| json_type_error(hash_value, "string"))?;
+    let hash = parse_core_hash(hash_string, "hash")?;
+    let peer_value = params
+        .get(1)
+        .ok_or_else(|| anyhow!("missing parameter 1"))?;
+    let peer_id = peer_value
+        .as_i64()
+        .ok_or_else(|| json_type_error(peer_value, "number"))?;
+    let peer_id = usize::try_from(peer_id).unwrap_or(usize::MAX);
+    if let Err(error) = node.request_block_from_peer(peer_id, hash) {
+        if error.to_string().starts_with("peer ") && error.to_string().contains("not connected") {
+            bail!("Peer does not exist");
+        }
+        return Err(error);
+    }
     Ok(json!({}))
 }
 
@@ -4731,18 +4789,27 @@ fn submit_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn invalidate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    if node.chain.read().block_height_by_hash(&hash).is_none() {
+        bail!("Block not found");
+    }
     node.invalidate_block(hash)?;
     Ok(Value::Null)
 }
 
 fn reconsider_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    if node.chain.read().block_height_by_hash(&hash).is_none() {
+        bail!("Block not found");
+    }
     node.reconsider_block(hash)?;
     Ok(Value::Null)
 }
 
 fn precious_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
+    if node.chain.read().block_height_by_hash(&hash).is_none() {
+        bail!("Block not found");
+    }
     node.precious_block(hash)?;
     Ok(Value::Null)
 }
@@ -5696,6 +5763,12 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = chain
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
+    if chain.is_active_block(&hash)
+        && core_network_blocks_dir(&node.config.datadir, node.config.network)
+            .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
+    {
+        bail!("Block not found on disk");
+    }
     let block = chain
         .block(&hash)?
         .ok_or_else(|| missing_block_data_error(&chain, &hash))?;
@@ -10406,6 +10479,13 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
             } else if message.contains("invalidated branch") {
                 Ok(json!("duplicate-invalid"))
             } else if let Some(reason) = bip22_validation_result(&error) {
+                // Core records a header as failed-validation when a known
+                // header is later rejected with a block body.  Preserve that
+                // state so getchaintips reports the branch as invalid rather
+                // than leaving it in headers-only/valid-fork status.
+                if let Err(mark_error) = node.invalidate_block(hash) {
+                    debug!(%hash, %mark_error, "could not mark rejected block invalid");
+                }
                 Ok(reason)
             } else {
                 Ok(json!(message))
@@ -10899,7 +10979,9 @@ fn mining_block_with_deployment_parameters(
     } = template;
     let segwit_active = height >= deployment_parameters.buried.segwit;
     let mut coinbase = Transaction {
-        version: Version::ONE,
+        // Core's CMutableTransaction default is version 2, including for
+        // coinbase transactions assembled by generatetoaddress.
+        version: Version::TWO,
         lock_time: LockTime::from_consensus(height.saturating_sub(1)),
         input: vec![TxIn {
             previous_output: OutPoint::null(),

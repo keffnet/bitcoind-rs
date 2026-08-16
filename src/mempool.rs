@@ -447,7 +447,7 @@ impl Ord for MiningCandidate {
         left.cmp(&right)
             // BinaryHeap is a max-heap, while Core's deterministic tie break
             // prefers the lexicographically smaller transaction id.
-            .then_with(|| other.txid.to_string().cmp(&self.txid.to_string()))
+            .then_with(|| other.txid.cmp(&self.txid))
             .then_with(|| self.version.cmp(&other.version))
             .then_with(|| self.fee.cmp(&other.fee))
             .then_with(|| self.weight.cmp(&other.weight))
@@ -714,7 +714,7 @@ impl Mempool {
         transactions.sort_by(|(left_sequence, left_txid), (right_sequence, right_txid)| {
             left_sequence
                 .cmp(right_sequence)
-                .then_with(|| left_txid.to_string().cmp(&right_txid.to_string()))
+                .then_with(|| left_txid.cmp(right_txid))
         });
         transactions
     }
@@ -928,7 +928,7 @@ impl Mempool {
                 (*txid, *delta, modified_fee.is_some(), modified_fee)
             })
             .collect::<Vec<_>>();
-        result.sort_by_key(|(txid, _, _, _)| txid.to_string());
+        result.sort_by_key(|(txid, _, _, _)| *txid);
         result
     }
 
@@ -956,7 +956,7 @@ impl Mempool {
 
     pub fn unbroadcast_txids(&self) -> Vec<Txid> {
         let mut txids = self.unbroadcast.iter().copied().collect::<Vec<_>>();
-        txids.sort_by_key(ToString::to_string);
+        txids.sort();
         txids.retain(|txid| self.entries.contains_key(txid));
         txids
     }
@@ -970,7 +970,7 @@ impl Mempool {
         transaction_ids.sort_by(|left, right| {
             self.fee_delta(right)
                 .cmp(&self.fee_delta(left))
-                .then_with(|| left.to_string().cmp(&right.to_string()))
+                .then_with(|| left.cmp(right))
         });
         let mut ordered = Vec::with_capacity(transaction_ids.len());
         let mut visited = HashSet::new();
@@ -994,7 +994,7 @@ impl Mempool {
                     .map(|input| input.previous_output.txid)
                     .filter(|parent| entries.contains_key(parent))
                     .collect();
-                parents.sort_by_key(ToString::to_string);
+                parents.sort();
                 for parent in parents {
                     visit(parent, entries, visited, visiting, ordered);
                 }
@@ -1169,7 +1169,7 @@ impl Mempool {
             .map(|input| input.previous_output.txid)
             .filter(|parent| self.entries.contains_key(parent))
             .collect();
-        parents.sort_by_key(ToString::to_string);
+        parents.sort();
         parents.dedup();
         parents
     }
@@ -1182,7 +1182,7 @@ impl Mempool {
                 .copied()
                 .collect::<Vec<_>>()
         });
-        children.sort_by_key(ToString::to_string);
+        children.sort();
         children
     }
 
@@ -1507,7 +1507,7 @@ impl Mempool {
                 .iter()
                 .flat_map(|transaction| candidate.conflicts_for(transaction))
                 .collect::<Vec<_>>();
-            direct_conflicts.sort_by_key(ToString::to_string);
+            direct_conflicts.sort();
             direct_conflicts.dedup();
             if let Some(transaction) = transactions.first() {
                 candidate.check_replacement_cluster_limit(
@@ -1739,7 +1739,7 @@ impl Mempool {
             .iter()
             .filter_map(|input| self.spent.get(&input.previous_output).copied())
             .collect::<Vec<_>>();
-        conflicts.sort_by_key(ToString::to_string);
+        conflicts.sort();
         conflicts.dedup();
         conflicts
     }
@@ -1847,7 +1847,7 @@ impl Mempool {
             .map(|input| input.previous_output.txid)
             .filter(|parent| self.entries.contains_key(parent))
             .collect::<Vec<_>>();
-        parent_ids.sort_by_key(ToString::to_string);
+        parent_ids.sort();
         parent_ids.dedup();
         if parent_ids.len() != 1 {
             return None;
@@ -2324,7 +2324,7 @@ impl Mempool {
                 Some((_, best_txid, best_vsize, best_fee)) => {
                     let left = package_fee.saturating_mul(i128::from(*best_vsize));
                     let right = best_fee.saturating_mul(i128::from(package_vsize));
-                    left < right || (left == right && txid.to_string() < best_txid.to_string())
+                    left < right || (left == right && txid < *best_txid)
                 }
             };
             if replace {
@@ -2396,7 +2396,7 @@ impl Mempool {
             })
             .collect();
         let mut transaction_ids: Vec<Txid> = entries.keys().copied().collect();
-        transaction_ids.sort_by_key(ToString::to_string);
+        transaction_ids.sort();
         let mut ordered = Vec::with_capacity(entries.len());
         let mut visited = HashSet::new();
         let mut visiting = HashSet::new();
@@ -2418,7 +2418,7 @@ impl Mempool {
                     .map(|input| input.previous_output.txid)
                     .filter(|parent| entries.contains_key(parent))
                     .collect();
-                parents.sort_by_key(ToString::to_string);
+                parents.sort();
                 for parent in parents {
                     visit(parent, entries, visited, visiting, ordered);
                 }
@@ -2570,7 +2570,7 @@ fn graph_optimality_certificate(mempool: &Mempool) -> bool {
         return true;
     }
     for txids in children.values_mut() {
-        txids.sort_by_key(ToString::to_string);
+        txids.sort();
         txids.dedup();
     }
 
@@ -2612,7 +2612,7 @@ fn graph_component(
             }
         }
     }
-    component.sort_by_key(ToString::to_string);
+    component.sort();
     component
 }
 
@@ -2707,7 +2707,7 @@ impl ComponentOrderSearch<'_> {
             .copied()
             .filter(|txid| !self.order.contains(txid) && self.indegree.get(txid) == Some(&0))
             .collect::<Vec<_>>();
-        available.sort_by_key(ToString::to_string);
+        available.sort();
         if available.is_empty() {
             return false;
         }
@@ -4582,6 +4582,30 @@ mod tests {
             pool.mining_order_with_min_fee(4_000_000, 0, 1_000),
             vec![parent_id, child_id]
         );
+    }
+
+    #[test]
+    fn equal_fee_mining_ties_use_native_txid_order() {
+        let candidates = (0..=255u8)
+            .map(|marker| {
+                let transaction = graph_transaction(Txid::from_byte_array([marker; 32]), marker);
+                (transaction.compute_txid(), transaction)
+            })
+            .collect::<Vec<_>>();
+        let pair = candidates.iter().enumerate().find_map(|(index, left)| {
+            candidates.iter().skip(index + 1).find_map(|right| {
+                (left.0 < right.0 && left.0.to_string() > right.0.to_string())
+                    .then(|| (left.clone(), right.clone()))
+            })
+        });
+        let ((left_id, left), (right_id, right)) = pair.expect("find reversed txid ordering");
+
+        let mut pool = Mempool::new(Network::Regtest);
+        insert_policy_entry(&mut pool, right);
+        insert_policy_entry(&mut pool, left);
+
+        assert_eq!(pool.transaction_order(), vec![left_id, right_id]);
+        assert_eq!(pool.main_order(), vec![left_id, right_id]);
     }
 
     #[test]

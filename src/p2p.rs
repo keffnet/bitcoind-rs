@@ -5403,14 +5403,15 @@ async fn maybe_send_fee_filter(
         return Ok(());
     }
     let initial_block_download = node.chain.read().is_initial_block_download();
-    let (mempool_min_fee, min_relay_fee) = {
+    let (mempool_min_fee, min_relay_fee, incremental_relay_fee) = {
         let mut mempool = node.mempool.write();
         (
             mempool.mempool_min_fee_sat_per_kvb(),
             mempool.min_relay_fee_sat_per_kvb(),
+            mempool.incremental_relay_fee_sat_per_kvb(),
         )
     };
-    let Some(relay_fee) = outbound_fee_filter(
+    let Some(raw_relay_fee) = outbound_fee_filter(
         node.config.blocksonly,
         initial_block_download,
         peer_state
@@ -5421,6 +5422,12 @@ async fn maybe_send_fee_filter(
         min_relay_fee,
     ) else {
         return Ok(());
+    };
+    let rounded_relay_fee = rounded_fee_filter(raw_relay_fee, incremental_relay_fee);
+    let relay_fee = if initial_block_download {
+        rounded_relay_fee
+    } else {
+        rounded_relay_fee.max(i64::try_from(min_relay_fee).unwrap_or(i64::MAX))
     };
 
     let now = Instant::now();
@@ -5481,6 +5488,26 @@ fn random_fee_filter_delay_at_most(maximum: Duration) -> Duration {
         return Duration::ZERO;
     }
     Duration::from_secs(random::<u64>() % (maximum_seconds + 1))
+}
+
+fn rounded_fee_filter(current: i64, incremental_relay_fee: u64) -> i64 {
+    const MAX_FILTER_FEERATE: f64 = 1e7;
+    const FEE_FILTER_SPACING: f64 = 1.1;
+
+    let minimum = incremental_relay_fee.saturating_div(2).max(1) as f64;
+    let mut boundaries = vec![0.0];
+    let mut boundary = minimum;
+    while boundary <= MAX_FILTER_FEERATE {
+        boundaries.push(boundary);
+        boundary *= FEE_FILTER_SPACING;
+    }
+
+    let current = current as f64;
+    let mut index = boundaries.partition_point(|boundary| *boundary < current);
+    if index == boundaries.len() || (index != 0 && random::<u32>() % 3 != 0) {
+        index = index.saturating_sub(1);
+    }
+    boundaries[index] as i64
 }
 
 async fn maybe_send_send_headers(
@@ -7952,6 +7979,18 @@ mod tests {
     }
 
     #[test]
+    fn fee_filter_rounding_matches_core_bucket_boundaries() {
+        for _ in 0..128 {
+            assert!(matches!(rounded_fee_filter(1_000, 1_000), 974 | 1_071));
+        }
+        assert_eq!(rounded_fee_filter(-1, 1_000), 0);
+        assert_eq!(
+            rounded_fee_filter(i64::try_from(Amount::MAX_MONEY.to_sat()).unwrap(), 1_000,),
+            9_170_997
+        );
+    }
+
+    #[test]
     fn send_headers_waits_for_core_peer_work_threshold() {
         let zero = Work::from_be_bytes([0; 32]);
         let mut one_bytes = [0; 32];
@@ -9936,12 +9975,15 @@ mod tests {
                 version: 2,
             }
         );
-        assert_eq!(
-            wire::read_message(&mut server_reader, Network::Regtest)
-                .await
-                .unwrap(),
-            Message::FeeFilter(i64::try_from(Amount::MAX_MONEY.to_sat()).unwrap())
-        );
+        let Message::FeeFilter(rate) = wire::read_message(&mut server_reader, Network::Regtest)
+            .await
+            .unwrap()
+        else {
+            panic!("expected feefilter extension");
+        };
+        assert!(rate > 0);
+        assert!(fee_filter_in_money_range(rate));
+        assert!(rate < i64::try_from(Amount::MAX_MONEY.to_sat()).unwrap());
         assert!(sent);
         assert!(post_verack_extensions_sent);
     }

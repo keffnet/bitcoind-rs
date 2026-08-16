@@ -1484,11 +1484,12 @@ impl PeerManager {
                     if !available {
                         continue;
                     }
-                    broadcast_inventory(
+                    broadcast_inventory_excluding(
                         &block_relay_node,
                         &block_relay_peers,
-                        0,
+                        &[],
                         block_relay_network,
+                        false,
                         Inventory {
                             kind: InventoryType::WitnessBlock,
                             hash,

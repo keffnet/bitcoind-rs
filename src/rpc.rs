@@ -36,6 +36,8 @@ use miniscript::{
     Miniscript, Segwitv0, Tap,
 };
 use rand::seq::SliceRandom;
+use serde::Deserialize;
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1323,6 +1325,127 @@ struct JsonRpcHttpResponse {
     body: Option<Value>,
 }
 
+/// `serde_json::Value` intentionally overwrites duplicate object keys.  Core
+/// accepts the JSON and lets RPC methods decide what repeated keys mean, so
+/// retain them as an ordered array of one-entry objects for the handful of
+/// methods (notably `createrawtransaction`) that need to detect duplicates.
+struct DuplicateAwareJson(Value);
+
+impl<'de> Deserialize<'de> for DuplicateAwareJson {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateAwareJsonVisitor)
+    }
+}
+
+struct DuplicateAwareJsonVisitor;
+
+impl<'de> Visitor<'de> for DuplicateAwareJsonVisitor {
+    type Value = DuplicateAwareJson;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DuplicateAwareJson(Value::Null))
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DuplicateAwareJson(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DuplicateAwareJson(json!(value)))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DuplicateAwareJson(json!(value)))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DuplicateAwareJson(json!(value)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DuplicateAwareJson(Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DuplicateAwareJson(Value::String(value)))
+    }
+
+    fn visit_seq<A>(self, mut access: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = access.next_element::<DuplicateAwareJson>()? {
+            values.push(value.0);
+        }
+        Ok(DuplicateAwareJson(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut access: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut entries = Vec::new();
+        while let Some(key) = access.next_key::<String>()? {
+            let value = access.next_value::<DuplicateAwareJson>()?;
+            entries.push((key, value.0));
+        }
+        let has_duplicate = entries
+            .iter()
+            .enumerate()
+            .any(|(index, (key, _))| entries[..index].iter().any(|(seen, _)| seen == key));
+        if has_duplicate {
+            let values = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let mut object = serde_json::Map::new();
+                    object.insert(key, value);
+                    Value::Object(object)
+                })
+                .collect();
+            Ok(DuplicateAwareJson(Value::Array(values)))
+        } else {
+            let object = entries.into_iter().collect();
+            Ok(DuplicateAwareJson(Value::Object(object)))
+        }
+    }
+}
+
+fn parse_rpc_json(body: &[u8]) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let value = DuplicateAwareJson::deserialize(&mut deserializer)?.0;
+    deserializer.end()?;
+    Ok(value)
+}
+
 #[cfg(test)]
 async fn dispatch_json_rpc(node: &Arc<Node>, body: &[u8]) -> Option<Value> {
     dispatch_json_rpc_http(node, body, None).await.body
@@ -1333,7 +1456,7 @@ async fn dispatch_json_rpc_http(
     body: &[u8],
     auth_user: Option<String>,
 ) -> JsonRpcHttpResponse {
-    let request: Value = match serde_json::from_slice(body) {
+    let request: Value = match parse_rpc_json(body) {
         Ok(value) => value,
         Err(error) => {
             return JsonRpcHttpResponse {
@@ -1576,6 +1699,9 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
     let Some(object) = params.as_object() else {
         bail!("RPC params must be an array or object")
     };
+    if method == "createrawtransaction" && object.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
     if method == "getblockstats"
         && object
             .get("args")
@@ -5735,7 +5861,7 @@ fn coinbase_transaction_json(transaction: &Transaction) -> Value {
     let input = &transaction.input[0];
     let witness = input.witness.to_vec();
     let mut value = json!({
-        "version": transaction.version.0,
+        "version": transaction.version.0 as u32,
         "locktime": transaction.lock_time.to_consensus_u32(),
         "sequence": input.sequence.to_consensus_u32(),
         "coinbase": hex::encode(input.script_sig.as_bytes()),
@@ -5974,11 +6100,10 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .get(2)
         .filter(|value| !value.is_null())
         .map(|value| {
-            value
+            let value = value
                 .as_str()
-                .ok_or_else(|| anyhow!("blockhash must be a string"))?
-                .parse::<BlockHash>()
-                .map_err(|error| anyhow!("invalid blockhash: {error}"))
+                .ok_or_else(|| json_type_error(value, "string"))?;
+            parse_core_hash(value, "parameter 3")
         })
         .transpose()?;
     let mut chain = node.chain.write();
@@ -6595,36 +6720,45 @@ fn merge_multisig_witnesses(left: &Witness, right: &Witness) -> Option<Witness> 
 }
 
 fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let parameter_count = params.as_array().map_or(0, Vec::len);
+    if !(2..=5).contains(&parameter_count) {
+        bail!("createrawtransaction expects between 2 and 5 parameters")
+    }
     let inputs = match params.get(0) {
         Some(Value::Null) => &[][..],
         Some(value) => value
             .as_array()
-            .ok_or_else(|| anyhow!("createrawtransaction inputs must be an array"))?,
-        None => bail!("createrawtransaction inputs must be an array"),
+            .ok_or_else(|| json_type_error(value, "array"))?,
+        None => bail!("createrawtransaction expects between 2 and 5 parameters"),
     };
-    let outputs = params
-        .get(1)
-        .ok_or_else(|| anyhow!("createrawtransaction outputs are missing"))?;
-    let lock_time = u32::try_from(optional_u64(params, 2, 0, "locktime")?)
-        .map(LockTime::from_consensus)
-        .map_err(|_| anyhow!("locktime is out of range"))?;
-    let replaceable = params
-        .get(3)
-        .filter(|value| !value.is_null())
-        .map(|value| {
-            value
-                .as_bool()
-                .ok_or_else(|| anyhow!("replaceable must be a boolean"))
-        })
-        .transpose()?
-        .unwrap_or(true);
+    let outputs = params.get(1).expect("parameter count checked above");
+    let lock_time = match params.get(2).filter(|value| !value.is_null()) {
+        Some(value) => {
+            let lock_time = value
+                .as_i64()
+                .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+                .ok_or_else(|| json_type_error(value, "number"))?;
+            if !(0..=i64::from(u32::MAX)).contains(&lock_time) {
+                bail!("Invalid parameter, locktime out of range")
+            }
+            LockTime::from_consensus(u32::try_from(lock_time).expect("locktime is in range"))
+        }
+        None => LockTime::ZERO,
+    };
+    let replaceable_explicit = params.get(3).is_some_and(|value| !value.is_null());
+    let replaceable = match params.get(3).filter(|value| !value.is_null()) {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| json_type_error(value, "bool"))?,
+        None => true,
+    };
     let version = match params.get(4).filter(|value| !value.is_null()) {
         Some(value) => {
             let version = value
                 .as_u64()
-                .ok_or_else(|| anyhow!("transaction version must be an unsigned integer"))?;
+                .ok_or_else(|| json_type_error(value, "number"))?;
             if !(1..=3).contains(&version) {
-                bail!("transaction version is out of range (1~3)")
+                bail!("Invalid parameter, version out of range(1~3)")
             }
             Version::non_standard(i32::try_from(version).expect("version is at most three"))
         }
@@ -6640,32 +6774,37 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let transaction_inputs = inputs
         .iter()
         .map(|value| {
-            let txid: Txid = value
-                .get("txid")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("transaction input txid is missing"))?
-                .parse()?;
-            let vout_value = value
+            let object = value
+                .as_object()
+                .ok_or_else(|| json_type_error(value, "object"))?;
+            let txid_value = object.get("txid").unwrap_or(&Value::Null);
+            let txid_value = txid_value
+                .as_str()
+                .ok_or_else(|| json_type_error(txid_value, "string"))?;
+            let txid = parse_core_txid(txid_value)?;
+            let vout_value = object
                 .get("vout")
-                .ok_or_else(|| anyhow!("transaction input vout is missing"))?;
+                .filter(|value| value.is_number())
+                .ok_or_else(|| anyhow!("Invalid parameter, missing vout key"))?;
             if vout_value.as_i64().is_some_and(|vout| vout < 0) {
                 bail!("Invalid parameter, vout cannot be negative")
             }
             let vout = vout_value
                 .as_u64()
-                .ok_or_else(|| anyhow!("transaction input vout is missing"))?;
+                .ok_or_else(|| anyhow!("Invalid parameter, missing vout key"))?;
             let vout = u32::try_from(vout)
                 .map_err(|_| anyhow!("transaction input vout is out of range"))?;
-            let sequence = match value.get("sequence").filter(|value| !value.is_null()) {
+            let sequence = match object.get("sequence").filter(|value| value.is_number()) {
                 Some(value) => {
                     if value.as_i64().is_some_and(|sequence| sequence < 0) {
                         bail!("Invalid parameter, sequence number is out of range")
                     }
-                    let sequence = value
-                        .as_u64()
-                        .ok_or_else(|| anyhow!("transaction input sequence must be an integer"))?;
-                    u32::try_from(sequence)
-                        .map_err(|_| anyhow!("transaction input sequence is out of range"))?
+                    let sequence = value.as_u64().ok_or_else(|| {
+                        anyhow!("Invalid parameter, sequence number is out of range")
+                    })?;
+                    u32::try_from(sequence).map_err(|_| {
+                        anyhow!("Invalid parameter, sequence number is out of range")
+                    })?
                 }
                 None => default_sequence,
             };
@@ -6677,7 +6816,8 @@ fn create_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    if replaceable
+    if replaceable_explicit
+        && replaceable
         && !transaction_inputs.is_empty()
         && transaction_inputs
             .iter()
@@ -6702,17 +6842,19 @@ fn create_transaction_outputs(node: &Arc<Node>, outputs: &Value) -> Result<Vec<T
         array
             .iter()
             .map(|value| {
-                let object = value
-                    .as_object()
-                    .ok_or_else(|| anyhow!("transaction output must be an object"))?;
+                let object = value.as_object().ok_or_else(|| {
+                    anyhow!("Invalid parameter, key-value pair not an object as expected")
+                })?;
                 if object.len() != 1 {
-                    bail!("transaction output object must contain one entry")
+                    bail!("Invalid parameter, key-value pair must contain exactly one key")
                 }
                 Ok(object.iter().next().expect("one output entry"))
             })
             .collect::<Result<Vec<_>>>()?
+    } else if outputs.is_null() {
+        bail!("Invalid parameter, output argument must be non-null")
     } else {
-        bail!("transaction outputs must be an object or array")
+        return Err(json_type_error(outputs, "array"));
     };
     let mut seen_scripts = HashSet::new();
     let mut seen_data = false;
@@ -6726,8 +6868,12 @@ fn create_transaction_outputs(node: &Arc<Node>, outputs: &Value) -> Result<Vec<T
                 seen_data = true;
                 let data = value
                     .as_str()
-                    .ok_or_else(|| anyhow!("data output must be hexadecimal"))?;
-                let data = hex::decode(data)?;
+                    .ok_or_else(|| anyhow!("Data must be hexadecimal string"))?;
+                if !data.bytes().all(|byte| byte.is_ascii_hexdigit()) || data.len() % 2 != 0 {
+                    bail!("Data must be hexadecimal string")
+                }
+                let data =
+                    hex::decode(data).map_err(|_| anyhow!("Data must be hexadecimal string"))?;
                 let data = PushBytesBuf::try_from(data)
                     .map_err(|_| anyhow!("data output is too large"))?;
                 return Ok(TxOut {
@@ -6739,12 +6885,10 @@ fn create_transaction_outputs(node: &Arc<Node>, outputs: &Value) -> Result<Vec<T
                 });
             }
             let address = destination
-                .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
-                .require_network(node.config.network)?;
+                .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+                .and_then(|address| address.require_network(node.config.network))
+                .map_err(|_| anyhow!("Invalid Bitcoin address: {destination}"))?;
             let amount = parse_btc_amount(value, "transaction output amount")?;
-            if amount > Amount::MAX_MONEY {
-                bail!("transaction output amount exceeds MAX_MONEY")
-            }
             let script_pubkey = address.script_pubkey();
             if !seen_scripts.insert(script_pubkey.as_bytes().to_vec()) {
                 bail!("Invalid parameter, duplicated address: {destination}")
@@ -6757,16 +6901,22 @@ fn create_transaction_outputs(node: &Arc<Node>, outputs: &Value) -> Result<Vec<T
         .collect()
 }
 
-fn parse_btc_amount(value: &Value, field: &str) -> Result<Amount> {
+fn parse_btc_amount(value: &Value, _field: &str) -> Result<Amount> {
     let text = match value {
         Value::Number(number) => number.to_string(),
         Value::String(string) => string.clone(),
-        _ => bail!("{field} must be a number or string"),
+        _ => bail!("Amount is not a number or string"),
     };
-    let text =
-        expand_decimal_exponent(&text).map_err(|error| anyhow!("invalid {field}: {error}"))?;
-    Amount::from_str_in(&text, Denomination::Bitcoin)
-        .map_err(|error| anyhow!("invalid {field}: {error}"))
+    let text = expand_decimal_exponent(&text).map_err(|_| anyhow!("Invalid amount"))?;
+    if text.starts_with('-') {
+        bail!("Amount out of range")
+    }
+    let amount =
+        Amount::from_str_in(&text, Denomination::Bitcoin).map_err(|_| anyhow!("Invalid amount"))?;
+    if amount < Amount::ZERO || amount > Amount::MAX_MONEY {
+        bail!("Amount out of range")
+    }
+    Ok(amount)
 }
 
 fn expand_decimal_exponent(value: &str) -> Result<String> {
@@ -9915,7 +10065,7 @@ fn enforce_max_fee_rate(
         .get(&txid)
         .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
     if exceeds_max_fee(entry.fee_sat, entry.vsize, Some(max_fee_rate)) {
-        bail!("Fee exceeds maximum configured by user (e.g. maxfeerate)")
+        bail!("Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)")
     }
     Ok(())
 }
@@ -13841,7 +13991,7 @@ fn rpc_transaction(
     let mut value = json!({
         "txid": transaction.compute_txid().to_string(),
         "hash": transaction.compute_wtxid().to_string(),
-        "version": transaction.version.0,
+        "version": transaction.version.0 as u32,
         "hex": chain::transaction_hex(transaction),
         "size": serialize(transaction).len(),
         "vsize": transaction.vsize(),
@@ -14006,7 +14156,7 @@ fn optional_i64_core(params: &Value, index: usize, default: i64) -> Result<i64> 
 fn json_type_error(value: &Value, expected: &str) -> anyhow::Error {
     let actual = match value {
         Value::Null => "null",
-        Value::Bool(_) => "boolean",
+        Value::Bool(_) => "bool",
         Value::Number(_) => "number",
         Value::String(_) => "string",
         Value::Array(_) => "array",
@@ -14017,6 +14167,21 @@ fn json_type_error(value: &Value, expected: &str) -> anyhow::Error {
 
 fn parse_core_block_hash(value: &str) -> Result<BlockHash> {
     parse_core_hash(value, "blockhash")
+}
+
+fn parse_core_txid(value: &str) -> Result<Txid> {
+    if value.len() != 64 {
+        bail!(
+            "txid must be of length 64 (not {}, for '{value}')",
+            value.len()
+        );
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("txid must be hexadecimal string (not '{value}')");
+    }
+    value
+        .parse::<Txid>()
+        .map_err(|error| anyhow!("invalid blockhash: {error}"))
 }
 
 fn parse_core_hash(value: &str, name: &str) -> Result<BlockHash> {
@@ -14044,7 +14209,12 @@ pub(crate) fn optional_u64(params: &Value, index: usize, default: u64, name: &st
 }
 
 fn rpc_error(error: &anyhow::Error) -> Value {
-    let message = error.to_string();
+    let rendered = error.to_string();
+    let message = if rendered.contains(" input is missing") {
+        "bad-txns-inputs-missingorspent".to_owned()
+    } else {
+        rendered
+    };
     let code = rpc_error_code(&message);
     json!({"code": code, "message": message})
 }
@@ -14072,6 +14242,15 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "input not found or already spent" {
         return -25;
     }
+    if lower == "bad-txns-inputs-missingorspent" {
+        return -25;
+    }
+    if lower == "unspendable output exceeds maximum configured by user (maxburnamount)" {
+        return -25;
+    }
+    if lower == "fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)" {
+        return -25;
+    }
     if lower == "invalid ip/subnet" || lower == "unban failed: address is not banned" {
         return -30;
     }
@@ -14084,10 +14263,18 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "specified sighash value does not match value stored in psbt" {
         return -22;
     }
-    if lower == "amount out of range" || lower == "missing amount" {
+    if lower == "amount is not a number or string"
+        || lower == "invalid amount"
+        || lower == "amount out of range"
+        || lower == "missing amount"
+    {
         return -3;
     }
-    if lower.starts_with("failed to parse hex digit:")
+    if lower.starts_with("invalid bitcoin address") {
+        return -5;
+    }
+    if lower == "data must be hexadecimal string"
+        || lower.starts_with("failed to parse hex digit:")
         || lower.starts_with("failed to parse hex: invilad hex string length")
     {
         return -8;
@@ -14130,8 +14317,12 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "block does not exist at specified height"
         || lower.starts_with("invalid block count:")
         || lower.starts_with("invalid blockhash:")
+        || lower.starts_with("invalid parameter")
         || lower.starts_with("blockhash must be")
         || lower.starts_with("hash must be")
+        || lower.starts_with("txid must be")
+        || (lower.starts_with("parameter ")
+            && (lower.contains("must be of length") || lower.contains("must be hexadecimal")))
         || lower.starts_with("invalid nblocks.")
         || lower.starts_with("invalid selected statistic ")
         || lower.starts_with("target block height ")
@@ -14567,6 +14758,14 @@ mod tests {
         assert_eq!(rpc_error_code("TX decode failed"), -22);
         assert_eq!(rpc_error_code("TX decode failed: invalid hex"), -22);
         assert_eq!(rpc_error_code("Input not found or already spent"), -25);
+        assert_eq!(
+            rpc_error(&anyhow!("transaction deadbeef:0 input is missing")),
+            json!({"code": -25, "message": "bad-txns-inputs-missingorspent"})
+        );
+        assert_eq!(
+            rpc_error_code("Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"),
+            -25
+        );
         assert_eq!(rpc_error_code("Block not found"), -5);
         assert_eq!(rpc_error_code("Transaction not yet in block"), -5);
         assert_eq!(
@@ -14598,6 +14797,15 @@ mod tests {
             -32603
         );
         assert_eq!(rpc_error_code("Fee estimation disabled"), -32603);
+    }
+
+    #[test]
+    fn duplicate_json_object_keys_are_retained_as_ordered_pairs() {
+        let value = parse_rpc_json(
+            br#"{"method":"createrawtransaction","params":[[],{"data":"aa","data":"bb"}],"id":1}"#,
+        )
+        .unwrap();
+        assert_eq!(value["params"][1], json!([{"data": "aa"}, {"data": "bb"}]));
     }
 
     #[test]
@@ -22449,7 +22657,7 @@ mod tests {
                 {"txid": Txid::from_byte_array([7; 32]).to_string(), "vout": 1, "sequence": "1"}
             ], {"data": "00"}])
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             create_raw_transaction(

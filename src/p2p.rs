@@ -324,6 +324,19 @@ fn inventory_broadcast_limit(pending: usize) -> usize {
         .min(INVENTORY_BROADCAST_MAX)
 }
 
+fn transaction_inventory_send_due(
+    peer_state: &PeerState,
+    now: Instant,
+    average_interval: Duration,
+) -> bool {
+    let mut next_send = peer_state.next_tx_inventory_send.lock();
+    if next_send.is_some_and(|deadline| now < deadline) {
+        return false;
+    }
+    *next_send = Some(now + random_fee_filter_delay(average_interval));
+    true
+}
+
 fn queue_block_requests(
     pending: &mut Vec<Inventory>,
     requests: impl IntoIterator<Item = Inventory>,
@@ -850,6 +863,7 @@ struct PeerState {
     fee_filter: parking_lot::Mutex<i64>,
     sent_fee_filter: parking_lot::Mutex<Option<i64>>,
     next_fee_filter: parking_lot::Mutex<Option<Instant>>,
+    next_tx_inventory_send: parking_lot::Mutex<Option<Instant>>,
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
@@ -2864,6 +2878,7 @@ async fn serve_peer(
         fee_filter: parking_lot::Mutex::new(0),
         sent_fee_filter: parking_lot::Mutex::new(None),
         next_fee_filter: parking_lot::Mutex::new(None),
+        next_tx_inventory_send: parking_lot::Mutex::new(None),
         relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
@@ -3008,13 +3023,12 @@ async fn serve_peer_loop(
     let addr_fetch_started_at = unix_time_seconds();
     let mut addr_fetch_interval = tokio::time::interval(Duration::from_secs(1));
     addr_fetch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let tx_inventory_interval_secs = if peer_state.connection_type == "inbound" {
-        5
+    let tx_inventory_average = if peer_state.connection_type == "inbound" {
+        Duration::from_secs(5)
     } else {
-        2
+        Duration::from_secs(2)
     };
-    let mut tx_inventory_interval =
-        tokio::time::interval(Duration::from_secs(tx_inventory_interval_secs));
+    let mut tx_inventory_interval = tokio::time::interval(tx_inventory_average);
     tx_inventory_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tx_inventory_interval.tick().await;
     let mut pending_block_requests = Vec::new();
@@ -3202,14 +3216,21 @@ async fn serve_peer_loop(
                         node.note_block_staller(staller);
                     }
                 }
-                flush_peer_transaction_inventory(
-                    node,
-                    peer_id,
+                if transaction_inventory_send_due(
                     peer_state,
-                    writer,
-                    node.config.network,
+                    Instant::now(),
+                    tx_inventory_average,
                 )
-                .await?;
+                {
+                    flush_peer_transaction_inventory(
+                        node,
+                        peer_id,
+                        peer_state,
+                        writer,
+                        node.config.network,
+                    )
+                    .await?;
+                }
                 flush_peer_transaction_requests(
                     node,
                     peer_id,
@@ -7524,6 +7545,7 @@ mod tests {
             fee_filter: parking_lot::Mutex::new(0),
             sent_fee_filter: parking_lot::Mutex::new(None),
             next_fee_filter: parking_lot::Mutex::new(None),
+            next_tx_inventory_send: parking_lot::Mutex::new(None),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(true),
             send_headers: parking_lot::Mutex::new(false),
@@ -9936,6 +9958,7 @@ mod tests {
             fee_filter: parking_lot::Mutex::new(0),
             sent_fee_filter: parking_lot::Mutex::new(None),
             next_fee_filter: parking_lot::Mutex::new(None),
+            next_tx_inventory_send: parking_lot::Mutex::new(None),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(false),
             send_headers: parking_lot::Mutex::new(false),

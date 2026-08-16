@@ -83,6 +83,7 @@ const MIN_MERKLE_TRANSACTION_WEIGHT: usize = 4 * 60;
 const MAX_MERKLE_PROOF_TRANSACTIONS: usize =
     validation::MAX_BLOCK_WEIGHT / MIN_MERKLE_TRANSACTION_WEIGHT;
 const SCAN_BLOCKFILTER_BATCH_SIZE: usize = 10_000;
+const MAX_MOCK_TIME: i64 = i64::MAX / 1_000_000_000;
 /// Core's default sigop allowance for the coinbase output when assembling a
 /// block.  The allowance is reserved before selecting mempool transactions,
 /// so every mining entry point must use the same value as getblocktemplate
@@ -2278,8 +2279,8 @@ fn set_mock_time(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("setmocktime is for regression testing (-regtest mode) only")
     }
     let timestamp = param::<i64>(params, 0)?;
-    if timestamp < 0 {
-        bail!("Mocktime must be in the range [0, 9223372036854775807]")
+    if !(0..=MAX_MOCK_TIME).contains(&timestamp) {
+        bail!("Mocktime must be in the range [0, {MAX_MOCK_TIME}], not {timestamp}.")
     }
     crate::time::set_mock_time(timestamp);
     Ok(Value::Null)
@@ -15730,7 +15731,13 @@ mod tests {
                 .is_empty()
         );
         assert!(dispatch_method(&node, "mockscheduler", &json!([0])).is_err());
-        assert!(dispatch_method(&node, "setmocktime", &json!([-1])).is_err());
+        assert_eq!(
+            dispatch_method(&node, "setmocktime", &json!([-1]))
+                .unwrap_err()
+                .to_string(),
+            "Mocktime must be in the range [0, 9223372036], not -1."
+        );
+        assert!(dispatch_method(&node, "setmocktime", &json!([i64::MAX])).is_err());
     }
 
     #[test]

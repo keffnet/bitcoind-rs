@@ -4525,7 +4525,7 @@ async fn serve_peer_loop(
                 node.update_peer_fee_filter(peer_id, rate);
             }
             Message::SendCmpct { announce, version } => {
-                if version == 1 || version == 2 {
+                if compact_block_version_supported(version) {
                     compact_block_version = version;
                     *peer_state.compact_block_version.lock() = Some(version);
                     *peer_state.compact_block_announce.lock() = announce;
@@ -4830,7 +4830,7 @@ fn reconstruct_compact_block(
     node: &Arc<Node>,
     version: u64,
 ) -> Result<(Vec<Option<Transaction>>, Vec<u64>)> {
-    if version != 1 && version != 2 {
+    if !compact_block_version_supported(version) {
         anyhow::bail!("unsupported compact block version {version}");
     }
     let transaction_count = compact
@@ -4911,7 +4911,6 @@ fn add_compact_candidate(
 
 fn compact_short_id(transaction: &Transaction, version: u64, siphash_keys: (u64, u64)) -> ShortId {
     match version {
-        1 => ShortId::with_siphash_keys(&transaction.compute_txid().to_raw_hash(), siphash_keys),
         2 => ShortId::with_siphash_keys(&transaction.compute_wtxid().to_raw_hash(), siphash_keys),
         _ => unreachable!("compact block version validated by caller"),
     }
@@ -5604,6 +5603,10 @@ fn peer_can_request_mempool(peer_bloom_filters: bool, permissions: PeerPermissio
 
 fn blocktxn_block_is_recent(height: u32, tip_height: u32) -> bool {
     height >= tip_height.saturating_sub(MAX_BLOCKTXN_DEPTH)
+}
+
+fn compact_block_version_supported(version: u64) -> bool {
+    version == 2
 }
 
 fn network_limited_block_request_is_too_old(
@@ -7216,6 +7219,13 @@ mod tests {
 
         assert!(can_direct_fetch(1_000, 1_000 + 20 * 600 - 1, 600));
         assert!(!can_direct_fetch(1_000, 1_000 + 20 * 600, 600));
+    }
+
+    #[test]
+    fn compact_block_versions_match_core() {
+        assert!(compact_block_version_supported(2));
+        assert!(!compact_block_version_supported(1));
+        assert!(!compact_block_version_supported(3));
     }
 
     #[test]

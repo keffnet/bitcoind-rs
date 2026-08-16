@@ -3564,15 +3564,15 @@ impl ChainState {
             if !include_serialized_hash {
                 return coin_stats.statistics(include_muhash);
             }
-            let utxos = self.active_utxo_map_for_read();
-            let mut statistics = calculate_utxo_statistics(&utxos, true, false);
+            let entries = self.active_utxo_entries_for_read();
+            let mut statistics = calculate_utxo_statistics_from_entries(&entries, true, false);
             if include_muhash {
                 statistics.muhash = Some(coin_stats.muhash.finalize());
             }
             return statistics;
         }
-        let utxos = self.active_utxo_map_for_read();
-        calculate_utxo_statistics(&utxos, include_serialized_hash, include_muhash)
+        let entries = self.active_utxo_entries_for_read();
+        calculate_utxo_statistics_from_entries(&entries, include_serialized_hash, include_muhash)
     }
 
     pub fn utxo_statistics_without_index(
@@ -3580,8 +3580,8 @@ impl ChainState {
         include_serialized_hash: bool,
         include_muhash: bool,
     ) -> UtxoSetStats {
-        let utxos = self.active_utxo_map_for_read();
-        calculate_utxo_statistics(&utxos, include_serialized_hash, include_muhash)
+        let entries = self.active_utxo_entries_for_read();
+        calculate_utxo_statistics_from_entries(&entries, include_serialized_hash, include_muhash)
     }
 
     /// Calculate UTXO statistics at a stored block. A historical state is
@@ -6130,12 +6130,32 @@ impl ChainState {
     }
 
     fn load_utxo_map_from_store(&self) -> Result<HashMap<OutPoint, UtxoEntry>> {
+        Ok(self.load_utxo_entries_from_store()?.into_iter().collect())
+    }
+
+    fn load_utxo_entries_from_store(&self) -> Result<Vec<(OutPoint, UtxoEntry)>> {
         Ok(self
             .utxo_store
             .entries()?
             .into_iter()
             .map(|(outpoint, entry)| (outpoint, Self::decoded_utxo(entry)))
             .collect())
+    }
+
+    fn active_utxo_entries_for_read(&self) -> Vec<(OutPoint, UtxoEntry)> {
+        if self.utxos_materialized {
+            self.utxos
+                .iter()
+                .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+                .collect()
+        } else {
+            self.load_utxo_entries_from_store().unwrap_or_else(|_| {
+                self.utxos
+                    .iter()
+                    .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+                    .collect()
+            })
+        }
     }
 
     fn active_utxo_map_for_read(&self) -> HashMap<OutPoint, UtxoEntry> {
@@ -7275,6 +7295,36 @@ fn calculate_utxo_statistics(
     include_serialized_hash: bool,
     include_muhash: bool,
 ) -> UtxoSetStats {
+    calculate_utxo_statistics_iter(
+        utxos.iter(),
+        utxos.len(),
+        include_serialized_hash,
+        include_muhash,
+    )
+}
+
+fn calculate_utxo_statistics_from_entries(
+    entries: &[(OutPoint, UtxoEntry)],
+    include_serialized_hash: bool,
+    include_muhash: bool,
+) -> UtxoSetStats {
+    calculate_utxo_statistics_iter(
+        entries.iter().map(|(outpoint, entry)| (outpoint, entry)),
+        entries.len(),
+        include_serialized_hash,
+        include_muhash,
+    )
+}
+
+fn calculate_utxo_statistics_iter<'a, I>(
+    entries: I,
+    output_count: usize,
+    include_serialized_hash: bool,
+    include_muhash: bool,
+) -> UtxoSetStats
+where
+    I: IntoIterator<Item = (&'a OutPoint, &'a UtxoEntry)>,
+{
     let mut transactions = HashSet::new();
     let mut total_amount_sat = 0u64;
     let mut bogo_size = 0u64;
@@ -7292,12 +7342,13 @@ fn calculate_utxo_statistics(
         );
     };
 
+    let entries = entries.into_iter().collect::<Vec<_>>();
     let (serialized_hash, muhash) = if include_serialized_hash {
-        let mut entries: Vec<(&OutPoint, &UtxoEntry)> = utxos.iter().collect();
-        entries.sort_by_key(|(outpoint, _)| (outpoint.txid.to_byte_array(), outpoint.vout));
+        let mut sorted_entries = entries;
+        sorted_entries.sort_by_key(|(outpoint, _)| (outpoint.txid.to_byte_array(), outpoint.vout));
         let mut serialized_engine = bitcoin::hashes::sha256d::Hash::engine();
         let mut muhash = include_muhash.then(MuHash3072::default);
-        for (outpoint, entry) in entries {
+        for (outpoint, entry) in sorted_entries {
             accumulate_stats(outpoint, entry);
             let coin_bytes = serialize_utxo_coin(outpoint, entry);
             use bitcoin::hashes::HashEngine;
@@ -7312,7 +7363,7 @@ fn calculate_utxo_statistics(
         )
     } else {
         let mut muhash = include_muhash.then(MuHash3072::default);
-        for (outpoint, entry) in utxos {
+        for (outpoint, entry) in entries {
             accumulate_stats(outpoint, entry);
             if let Some(accumulator) = muhash.as_mut() {
                 let coin_bytes = serialize_utxo_coin(outpoint, entry);
@@ -7324,7 +7375,7 @@ fn calculate_utxo_statistics(
 
     UtxoSetStats {
         transactions: transactions.len(),
-        outputs: utxos.len(),
+        outputs: output_count,
         total_amount_sat,
         bogo_size,
         serialized_hash,

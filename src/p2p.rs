@@ -4437,8 +4437,13 @@ async fn serve_peer_loop(
             }
             Message::MerkleBlock(_) => {}
             Message::Addr(addresses) => {
-                if addresses.len() > MAX_ADDR_TO_SEND {
-                    bail!("addr message contains too many addresses");
+                if address_message_is_oversized(addresses.len()) {
+                    debug!(
+                        peer_id,
+                        count = addresses.len(),
+                        "ignoring oversized addr message"
+                    );
+                    continue;
                 }
                 if peer_state.connection_type == "addr-fetch" && addresses.len() > 1 {
                     bail!("addr-fetch connection received too many addresses");
@@ -4463,8 +4468,13 @@ async fn serve_peer_loop(
                 node.relay_peer_addresses(peer_id, relay_addresses);
             }
             Message::AddrV2(addresses) => {
-                if addresses.len() > MAX_ADDR_TO_SEND {
-                    bail!("addrv2 message contains too many addresses");
+                if address_message_is_oversized(addresses.len()) {
+                    debug!(
+                        peer_id,
+                        count = addresses.len(),
+                        "ignoring oversized addrv2 message"
+                    );
+                    continue;
                 }
                 if peer_state.connection_type == "addr-fetch" && addresses.len() > 1 {
                     bail!("addr-fetch connection received too many addresses");
@@ -5185,6 +5195,10 @@ async fn maybe_send_getblocks_continuation(
         }]),
     )
     .await
+}
+
+fn address_message_is_oversized(count: usize) -> bool {
+    count > MAX_ADDR_TO_SEND
 }
 
 fn relay_address_message(
@@ -7490,6 +7504,12 @@ mod tests {
         assert_eq!(addrv2[1].time, 456);
         assert_eq!(addrv2[2].network, 4);
         assert_eq!(addrv2[2].address, vec![6; 32]);
+    }
+
+    #[test]
+    fn oversized_address_messages_are_ignored_without_disconnect() {
+        assert!(!address_message_is_oversized(MAX_ADDR_TO_SEND));
+        assert!(address_message_is_oversized(MAX_ADDR_TO_SEND + 1));
     }
 
     #[test]

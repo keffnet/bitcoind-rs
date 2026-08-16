@@ -437,6 +437,8 @@ fn dispatch_with_session(
     subscriptions: &mut HashMap<String, Subscription>,
     session: &mut ElectrumSession,
 ) -> Result<Value> {
+    let normalized_params = normalize_electrum_params(method, params)?;
+    let params = &normalized_params;
     if let Some(required) = minimum_protocol_version(method)
         && session.protocol_version < required
     {
@@ -651,6 +653,86 @@ fn dispatch_with_session(
     }
 }
 
+fn normalize_electrum_params(method: &str, params: &Value) -> Result<Value> {
+    if params.is_array() {
+        return Ok(params.clone());
+    }
+    let object = params
+        .as_object()
+        .ok_or_else(|| anyhow!("Electrum parameters must be an array or object"))?;
+    let names = electrum_parameter_names(method)
+        .ok_or_else(|| anyhow!("named parameters are not supported for {method}"))?;
+    let mut normalized = vec![Value::Null; names.len()];
+    for (name, value) in object {
+        let Some(index) = names.iter().position(|candidate| *candidate == name) else {
+            // server.version explicitly permits redundant arguments so that
+            // clients can add future negotiation hints without breaking older
+            // servers.
+            if method == "server.version" {
+                continue;
+            }
+            bail!("unknown named parameter {name} for {method}");
+        };
+        normalized[index] = value.clone();
+    }
+    while normalized.last().is_some_and(Value::is_null) {
+        normalized.pop();
+    }
+    Ok(Value::Array(normalized))
+}
+
+fn electrum_parameter_names(method: &str) -> Option<&'static [&'static str]> {
+    match method {
+        "server.version" => Some(&["client_name", "protocol_version"]),
+        "server.ping" => Some(&["pong_len", "data"]),
+        "server.add_peer" => Some(&["features"]),
+        "blockchain.headers.subscribe" => Some(&["raw"]),
+        "blockchain.block.header" | "blockchain.block.get_header" => Some(&["height", "cp_height"]),
+        "blockchain.block.headers" => Some(&["start_height", "count", "cp_height"]),
+        "blockchain.block.get_chunk" => Some(&["index"]),
+        "blockchain.scripthash.get_history"
+        | "blockchain.scripthash.get_balance"
+        | "blockchain.scripthash.listunspent"
+        | "blockchain.scripthash.get_mempool"
+        | "blockchain.scripthash.subscribe"
+        | "blockchain.scripthash.unsubscribe" => Some(&["scripthash"]),
+        "blockchain.address.get_history"
+        | "blockchain.address.get_balance"
+        | "blockchain.address.listunspent"
+        | "blockchain.address.get_mempool"
+        | "blockchain.address.subscribe"
+        | "blockchain.address.unsubscribe" => Some(&["address"]),
+        "blockchain.scriptpubkey.get_history"
+        | "blockchain.scriptpubkey.get_balance"
+        | "blockchain.scriptpubkey.listunspent"
+        | "blockchain.scriptpubkey.get_mempool"
+        | "blockchain.scriptpubkey.subscribe"
+        | "blockchain.scriptpubkey.unsubscribe" => Some(&["scriptpubkey"]),
+        "blockchain.transaction.get" => Some(&["tx_hash", "verbose"]),
+        "blockchain.transaction.get_batch" => Some(&["tx_hashes", "verbose"]),
+        "blockchain.transaction.get_merkle" => Some(&["tx_hash", "height"]),
+        "blockchain.transaction.id_from_pos" => Some(&["height", "tx_pos", "merkle"]),
+        "blockchain.transaction.broadcast" => Some(&["raw_tx"]),
+        "blockchain.transaction.broadcast_package" => Some(&["raw_txs", "verbose"]),
+        "blockchain.transaction.testmempoolaccept" => Some(&["raw_txs"]),
+        "blockchain.outpoint.subscribe" | "blockchain.outpoint.get_status" => {
+            Some(&["tx_hash", "txout_idx", "spk_hint"])
+        }
+        "blockchain.outpoint.unsubscribe" => Some(&["tx_hash", "txout_idx"]),
+        "blockchain.estimatefee" => Some(&["number", "mode"]),
+        "blockchain.relayfee"
+        | "mempool.get_fee_histogram"
+        | "mempool.get_info"
+        | "mempool.recent"
+        | "server.banner"
+        | "server.donation_address"
+        | "server.features"
+        | "server.peers.subscribe"
+        | "blockchain.numblocks.subscribe" => Some(&[]),
+        _ => None,
+    }
+}
+
 fn minimum_protocol_version(method: &str) -> Option<ProtocolVersion> {
     if method.starts_with("blockchain.scriptpubkey.")
         || method.starts_with("blockchain.outpoint.")
@@ -733,7 +815,10 @@ fn protocol_version_string(version: ProtocolVersion) -> String {
 
 fn client_protocol_range(params: &Value) -> Result<(ProtocolVersion, ProtocolVersion)> {
     let default_version = Value::String("1.4".to_owned());
-    let requested = params.get(1).unwrap_or(&default_version);
+    let requested = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .unwrap_or(&default_version);
     match requested {
         Value::String(version) => {
             let version = parse_protocol_version(version)?;
@@ -1743,6 +1828,42 @@ mod tests {
     }
 
     #[test]
+    fn named_electrum_parameters_preserve_positional_slots() {
+        assert_eq!(
+            normalize_electrum_params(
+                "blockchain.block.headers",
+                &json!({"count": 2, "start_height": 3, "cp_height": 0}),
+            )
+            .unwrap(),
+            json!([3, 2, 0])
+        );
+        assert_eq!(
+            normalize_electrum_params("server.ping", &json!({"data": "deadbeef"})).unwrap(),
+            json!([null, "deadbeef"])
+        );
+        assert_eq!(
+            normalize_electrum_params(
+                "server.version",
+                &json!({"client_name": "test", "future_hint": true}),
+            )
+            .unwrap(),
+            json!(["test"])
+        );
+        let default_range = client_protocol_range(
+            &normalize_electrum_params("server.version", &json!({"client_name": "test"})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(default_range, (MIN_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION));
+        assert!(
+            normalize_electrum_params(
+                "blockchain.block.header",
+                &json!({"height": 0, "unexpected": true})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn history_status_uses_electrum_digest_order() {
         let txid = Txid::from_byte_array([1; 32]);
         assert_eq!(
@@ -2319,7 +2440,11 @@ mod tests {
             dispatch_with_session(
                 &node,
                 "server.version",
-                &json!(["test-client", ["1.4", "1.7"]]),
+                &json!({
+                    "client_name": "test-client",
+                    "protocol_version": ["1.4", "1.7"],
+                    "future_hint": true
+                }),
                 &mut subscriptions,
                 &mut session,
             )
@@ -2486,6 +2611,17 @@ mod tests {
                 &node,
                 "server.ping",
                 &json!([3]),
+                &mut subscriptions,
+                &mut session,
+            )
+            .unwrap(),
+            json!({"data": "000"})
+        );
+        assert_eq!(
+            dispatch_with_session(
+                &node,
+                "server.ping",
+                &json!({"pong_len": 3}),
                 &mut subscriptions,
                 &mut session,
             )

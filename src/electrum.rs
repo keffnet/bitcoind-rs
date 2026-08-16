@@ -373,38 +373,50 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                 let bytes = read?;
                 if bytes == 0 { return Ok(()); }
                 if line.len() > MAX_LINE_SIZE { bail!("Electrum request exceeds limit"); }
-                let request: Value = serde_json::from_slice(&line)
-                    .map_err(|error| anyhow!("invalid Electrum JSON: {error}"))?;
-                let id = request.get("id").cloned().unwrap_or(Value::Null);
-                let method = request.get("method").and_then(Value::as_str).unwrap_or("");
-                let params = request.get("params").cloned().unwrap_or_else(|| Value::Array(Vec::new()));
-                let is_notification = request.get("id").is_none();
-                if !session.request_seen && method != "server.version" {
-                    bail!("server.version must be the first Electrum request");
-                }
-                session.request_seen = true;
-                if !session.version_negotiated && method != "server.version" {
-                    bail!("server.version must be negotiated before other requests");
-                }
-                let result = dispatch_with_session(&node, method, &params, &mut subscriptions, &mut session);
-                if method == "server.version" && !session.version_negotiated && result.is_err() {
-                    // Protocol negotiation failures are connection-fatal. This is
-                    // required for clients to retry with a compatible range and
-                    // prevents serving requests under the default 1.4 session.
-                    return Ok(());
-                }
-                if method == "blockchain.headers.subscribe" && result.is_ok() {
-                    headers_subscribed = true;
-                }
-                if method == "blockchain.numblocks.subscribe" && result.is_ok() {
-                    numblocks_subscribed = true;
-                }
-                if is_notification {
+                let requests: Value = match serde_json::from_slice(&line) {
+                    Ok(requests) => requests,
+                    Err(_) => {
+                        let mut encoded = serde_json::to_vec(&json!({
+                            "jsonrpc": "2.0",
+                            "id": null,
+                            "error": {"code": -32700, "message": "Parse error"},
+                        }))?;
+                        encoded.push(b'\n');
+                        write_half.write_all(&encoded).await?;
+                        continue;
+                    }
+                };
+                let response = if let Some(batch) = requests.as_array() {
+                    if batch.is_empty() {
+                        Some(json!([invalid_request_response()]))
+                    } else {
+                        let mut responses = Vec::new();
+                        for request in batch {
+                            if let Some(response) = process_electrum_request(
+                                &node,
+                                request,
+                                &mut subscriptions,
+                                &mut session,
+                                &mut headers_subscribed,
+                                &mut numblocks_subscribed,
+                            )? {
+                                responses.push(response);
+                            }
+                        }
+                        (!responses.is_empty()).then_some(Value::Array(responses))
+                    }
+                } else {
+                    process_electrum_request(
+                        &node,
+                        &requests,
+                        &mut subscriptions,
+                        &mut session,
+                        &mut headers_subscribed,
+                        &mut numblocks_subscribed,
+                    )?
+                };
+                let Some(response) = response else {
                     continue;
-                }
-                let response = match result {
-                    Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-                    Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": -1, "message": error.to_string()}}),
                 };
                 let mut encoded = serde_json::to_vec(&response)?;
                 encoded.push(b'\n');
@@ -412,6 +424,65 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
             }
         }
     }
+}
+
+fn invalid_request_response() -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": null,
+        "error": {"code": -32600, "message": "Invalid Request"},
+    })
+}
+
+fn process_electrum_request(
+    node: &Arc<Node>,
+    request: &Value,
+    subscriptions: &mut HashMap<String, Subscription>,
+    session: &mut ElectrumSession,
+    headers_subscribed: &mut bool,
+    numblocks_subscribed: &mut bool,
+) -> Result<Option<Value>> {
+    let Some(request) = request.as_object() else {
+        return Ok(Some(invalid_request_response()));
+    };
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return Ok(Some(invalid_request_response()));
+    };
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let params = request
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let is_notification = request.get("id").is_none();
+    if !session.request_seen && method != "server.version" {
+        bail!("server.version must be the first Electrum request");
+    }
+    session.request_seen = true;
+    if !session.version_negotiated && method != "server.version" {
+        bail!("server.version must be negotiated before other requests");
+    }
+    let result = dispatch_with_session(node, method, &params, subscriptions, session);
+    if method == "server.version" && !session.version_negotiated && result.is_err() {
+        // Protocol negotiation failures are connection-fatal. This is
+        // required for clients to retry with a compatible range and
+        // prevents serving requests under the default 1.4 session.
+        bail!("server.version negotiation failed");
+    }
+    if method == "blockchain.headers.subscribe" && result.is_ok() {
+        *headers_subscribed = true;
+    }
+    if method == "blockchain.numblocks.subscribe" && result.is_ok() {
+        *numblocks_subscribed = true;
+    }
+    if is_notification {
+        return Ok(None);
+    }
+    Ok(Some(match result {
+        Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+        Err(error) => {
+            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -1, "message": error.to_string()}})
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -3265,6 +3336,20 @@ mod tests {
         let response: Value = serde_json::from_slice(&line)?;
         assert_eq!(response["result"]["protocol_min"], json!("1.4"));
         assert_eq!(response["result"]["protocol_max"], json!("1.7"));
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"[{"jsonrpc":"2.0","id":3,"method":"server.features","params":[]},{"jsonrpc":"2.0","method":"server.ping","params":[]}]
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response.as_array().map(Vec::len), Some(1));
+        assert_eq!(response[0]["id"], json!(3));
+        assert_eq!(response[0]["result"]["protocol_min"], json!("1.4"));
         drop(reader);
         server.await??;
         Ok(())

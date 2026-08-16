@@ -3332,6 +3332,18 @@ fn validate_standard_simple_ecdsa_spends(
                 validate_standard_ecdsa_pair(&stack[0], &stack[1], false)?;
             } else if redeem_script.is_p2wpkh() {
                 validate_standard_wpkh_witness(input)?;
+            } else if let Some(pubkey) = p2pk_checksig_not_pubkey_bytes(redeem_script) {
+                if stack.len() != 1 {
+                    return Err(standard_script_policy_failure(
+                        "Stack size must be exactly one after execution",
+                    ));
+                }
+                validate_standard_ecdsa_pair(&stack[0], &pubkey, false)?;
+                if !stack[0].is_empty() {
+                    return Err(standard_script_policy_failure(
+                        "Signature must be zero for failed CHECK(MULTI)SIG operation",
+                    ));
+                }
             } else if let Some(pubkey) = p2pk_pubkey_bytes(redeem_script) {
                 if stack.len() != 1 {
                     return Err(standard_script_policy_failure(
@@ -3469,6 +3481,24 @@ fn p2pk_pubkey_bytes(script: &Script) -> Option<Vec<u8>> {
     };
     match instructions.next()? {
         Ok(Instruction::Op(op)) if op.to_u8() == 0xac && instructions.next().is_none() => {
+            Some(pubkey)
+        }
+        _ => None,
+    }
+}
+
+fn p2pk_checksig_not_pubkey_bytes(script: &Script) -> Option<Vec<u8>> {
+    let mut instructions = script.instructions();
+    let pubkey = match instructions.next()? {
+        Ok(Instruction::PushBytes(bytes)) => bytes.as_bytes().to_vec(),
+        _ => return None,
+    };
+    match instructions.next()? {
+        Ok(Instruction::Op(op)) if op.to_u8() == 0xac => {}
+        _ => return None,
+    }
+    match instructions.next()? {
+        Ok(Instruction::Op(op)) if op.to_u8() == 0x92 && instructions.next().is_none() => {
             Some(pubkey)
         }
         _ => None,
@@ -5411,6 +5441,60 @@ mod tests {
             validate_standard_policy(&transaction, std::slice::from_ref(&previous), 1),
             Err(MempoolError::NonStandard(reason))
                 if reason.contains("OP_IF/NOTIF argument must be minimal")
+        ));
+    }
+
+    #[test]
+    fn standard_policy_enforces_nullfail_for_negated_p2sh_checksig() {
+        let pubkey =
+            hex::decode("03363d90d447b00c9c99ceac05b6262ee053441c7e55552ffe526bad8f83ff4640")
+                .unwrap();
+        let redeem_script = {
+            let mut bytes = vec![0x21];
+            bytes.extend_from_slice(&pubkey);
+            bytes.extend([0xac, 0x92]);
+            ScriptBuf::from_bytes(bytes)
+        };
+        let redeem_hash = bitcoin::hashes::hash160::Hash::hash(redeem_script.as_bytes());
+        let previous = TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: {
+                let mut bytes = vec![0xa9, 0x14];
+                bytes.extend_from_slice(&redeem_hash.to_byte_array());
+                bytes.push(0x87);
+                ScriptBuf::from_bytes(bytes)
+            },
+        };
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let message = bitcoin::secp256k1::Message::from_digest([3u8; 32]);
+        let mut signature = secp
+            .sign_ecdsa(&message, &secret_key)
+            .serialize_der()
+            .to_vec();
+        signature.push(0x01);
+
+        let mut transaction = graph_transaction(Txid::from_byte_array([16; 32]), 16);
+        transaction.input[0].script_sig = ScriptBuf::from_bytes({
+            let mut bytes = vec![signature.len() as u8];
+            bytes.extend_from_slice(&signature);
+            bytes.push(redeem_script.len() as u8);
+            bytes.extend_from_slice(redeem_script.as_bytes());
+            bytes
+        });
+        transaction.output[0] = TxOut {
+            value: Amount::from_sat(99_999),
+            script_pubkey: ScriptBuf::from_bytes({
+                let mut bytes = vec![0x00, 0x14];
+                bytes.extend([0u8; 20]);
+                bytes
+            }),
+        };
+
+        assert!(matches!(
+            validate_standard_policy(&transaction, std::slice::from_ref(&previous), 1),
+            Err(MempoolError::NonStandard(reason))
+                if reason.contains("Signature must be zero for failed CHECK(MULTI)SIG operation")
         ));
     }
 

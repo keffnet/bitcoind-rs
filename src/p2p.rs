@@ -689,6 +689,12 @@ fn valid_header_pow(network: Network, header: &BlockHeader) -> bool {
         && target.is_met_by(header.block_hash())
 }
 
+fn headers_are_continuous(headers: &[BlockHeader]) -> bool {
+    headers
+        .windows(2)
+        .all(|pair| pair[1].prev_blockhash == pair[0].block_hash())
+}
+
 fn add_work_saturating(left: Work, right: Work) -> Work {
     let maximum = Work::from_be_bytes([0xff; 32]);
     if left > maximum - right {
@@ -3334,6 +3340,14 @@ async fn serve_peer_loop(
                 if headers.is_empty() {
                     headers_sync = None;
                     node.update_peer_presynced_headers(peer_id, None);
+                    continue;
+                }
+
+                // Core rejects a batch whose headers do not link to one
+                // another before entering either headers sync or the global
+                // block index. A short batch can otherwise bypass the
+                // low-work synchronizer and be accepted one header at a time.
+                if !headers_are_continuous(&headers) {
                     continue;
                 }
 
@@ -6616,6 +6630,16 @@ mod tests {
         assert!(headers_download_timed_out(Some(
             now.checked_sub(HEADERS_DOWNLOAD_TIMEOUT).unwrap()
         )));
+    }
+
+    #[test]
+    fn header_batches_must_be_continuous() {
+        let (_, headers) = mined_regtest_headers(2);
+        assert!(headers_are_continuous(&headers));
+
+        let mut non_continuous = headers.clone();
+        non_continuous[1].prev_blockhash = BlockHash::from_byte_array([0x42; 32]);
+        assert!(!headers_are_continuous(&non_continuous));
     }
 
     fn mined_regtest_headers(count: usize) -> (Header, Vec<Header>) {

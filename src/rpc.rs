@@ -11226,11 +11226,8 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
     }
     if let Some(longpoll_id) = longpoll_id {
         let mut chain_events = node.subscribe_chain();
-        let mut mempool_events = node.subscribe_mempool();
         // Core wakes immediately for a new best tip, but polls the mempool
         // transaction counter after one minute and then every ten seconds.
-        // Keep the timer running across mempool notifications so a burst of
-        // transactions does not turn longpoll into a busy notification loop.
         let check_interval = Duration::from_secs(60);
         let check_timer = sleep(check_interval);
         tokio::pin!(check_timer);
@@ -11241,10 +11238,6 @@ async fn get_block_template_async(node: &Arc<Node>, params: &Value) -> Result<Va
             tokio::select! {
                 event = chain_events.recv() => match event {
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                event = mempool_events.recv() => match event {
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {},
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
                 _ = &mut check_timer => {

@@ -1695,6 +1695,7 @@ impl ChainState {
     pub fn best_header_tip(&self) -> ChainTip {
         self.block_index
             .iter()
+            .filter(|(hash, _)| !self.has_invalid_ancestor(**hash))
             .max_by(|(left_hash, left), (right_hash, right)| {
                 left.chain_work
                     .cmp(&right.chain_work)
@@ -8532,6 +8533,7 @@ mod tests {
         state.connect_block(second).unwrap();
         state.invalidate_block(&second_hash).unwrap();
         assert_eq!(state.height(), 1);
+        assert_eq!(state.best_header_tip().hash, state.best_hash());
         drop(state);
 
         let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
@@ -8547,6 +8549,7 @@ mod tests {
         reopened.reconsider_block(&second_hash).unwrap();
         assert_eq!(reopened.height(), 2);
         assert_eq!(reopened.best_hash(), second_hash);
+        assert_eq!(reopened.best_header_tip().hash, second_hash);
     }
 
     #[test]

@@ -1925,7 +1925,7 @@ fn dispatch_method_for_user(
                 "maxdatacarriersize": mempool.max_datacarrier_bytes().unwrap_or_default(),
                 "limitclustercount": mempool.cluster_count_limit(),
                 "limitclustersize": mempool.cluster_vsize_limit(),
-                "optimal": true,
+                "optimal": mempool.optimal(),
             }))
         }
         "getrawmempool" => {

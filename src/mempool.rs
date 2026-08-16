@@ -53,6 +53,12 @@ pub const MAX_PACKAGE_WEIGHT: u64 = 404_000;
 pub const MAX_CLUSTER_COUNT: usize = MAX_CLUSTER_COUNT_LIMIT;
 pub const MAX_CLUSTER_VSIZE: u64 = DEFAULT_CLUSTER_SIZE_KVB * 1_000;
 const MAX_REPLACEMENT_CANDIDATES: usize = 100;
+/// Maximum non-tree cluster size for which the local optimality certificate
+/// enumerates every topological linearization.
+const MAX_GRAPH_OPTIMALITY_EXACT_TX_COUNT: usize = 12;
+/// Bound the number of partial topological orders explored by the certificate
+/// so an RPC query cannot turn into an unbounded factorial search.
+const MAX_GRAPH_OPTIMALITY_STATES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RbfPolicy {
@@ -411,6 +417,11 @@ pub struct Mempool {
     /// runtime-only relay metadata and is not persisted in mempool.dat.
     relay_sequences: HashMap<Txid, u64>,
     changes: Vec<MempoolChange>,
+    /// Cached result for the Core-style `getmempoolinfo.optimal` projection.
+    /// Graph mutations invalidate the result; the certificate is computed on
+    /// the next query rather than on the admission/removal hot path.
+    graph_optimal: bool,
+    graph_optimal_dirty: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -542,6 +553,8 @@ impl Mempool {
             unbroadcast: HashSet::new(),
             relay_sequences: HashMap::new(),
             changes: Vec::new(),
+            graph_optimal: true,
+            graph_optimal_dirty: false,
         }
     }
 
@@ -661,6 +674,29 @@ impl Mempool {
 
     pub fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    /// Return whether the mempool graph has a known optimal linearization.
+    ///
+    /// Core's TxGraph exposes this as a best-effort work status: `true` means
+    /// the graph has no currently available optimization work, not that every
+    /// possible graph is solved by an unbounded optimizer. Keep the same
+    /// meaning here by reporting `false` when a bounded local certificate
+    /// cannot prove optimality.
+    pub fn optimal(&mut self) -> bool {
+        if self.graph_optimal_dirty {
+            self.graph_optimal = self.compute_graph_optimality();
+            self.graph_optimal_dirty = false;
+        }
+        self.graph_optimal
+    }
+
+    fn invalidate_graph_optimality(&mut self) {
+        self.graph_optimal_dirty = true;
+    }
+
+    fn compute_graph_optimality(&self) -> bool {
+        graph_optimality_certificate(self)
     }
 
     /// Return entries whose admission sequence is at least `start_sequence`.
@@ -794,6 +830,7 @@ impl Mempool {
         let wtxid = entry.transaction.compute_wtxid();
         self.entries.insert(txid, entry);
         self.wtxids.insert(wtxid, txid);
+        self.invalidate_graph_optimality();
     }
 
     pub fn get_by_wtxid(&self, wtxid: &Wtxid) -> Option<&MempoolEntry> {
@@ -855,10 +892,14 @@ impl Mempool {
     }
 
     pub fn prioritise(&mut self, txid: Txid, fee_delta: i64) {
+        let in_mempool = self.entries.contains_key(&txid);
         let delta = self.priorities.entry(txid).or_insert(0);
         *delta = delta.saturating_add(fee_delta);
         if *delta == 0 {
             self.priorities.remove(&txid);
+        }
+        if in_mempool && fee_delta != 0 {
+            self.invalidate_graph_optimality();
         }
     }
 
@@ -2059,6 +2100,7 @@ impl Mempool {
         self.adjusted_weights.insert(txid, adjusted_weight);
         self.wtxids.insert(wtxid, txid);
         self.relay_sequences.insert(txid, self.sequence);
+        self.invalidate_graph_optimality();
         if record_sequence {
             let sequence = self.sequence;
             self.sequence = self.sequence.saturating_add(1);
@@ -2380,6 +2422,7 @@ impl Mempool {
         self.spent.clear();
         self.children.clear();
         self.wtxids.clear();
+        self.invalidate_graph_optimality();
         let relay_sequences = std::mem::take(&mut self.relay_sequences);
         self.memory_usage = 0;
         self.bytes = 0;
@@ -2430,6 +2473,7 @@ impl Mempool {
         }
         self.children.remove(txid);
         self.record_removal(entry.transaction.clone(), notify_zmq);
+        self.invalidate_graph_optimality();
         Some(entry)
     }
 
@@ -2475,6 +2519,226 @@ impl Mempool {
 
         signals_with_ancestors(self, *txid, &mut HashSet::new())
     }
+}
+
+/// Build a bounded certificate for the Core-style mempool graph optimality
+/// status. The production graph is maintained lazily because recomputing all
+/// clusters on every admission would put graph analysis on the hot path.
+fn graph_optimality_certificate(mempool: &Mempool) -> bool {
+    if mempool.entries.len() <= 1 {
+        return true;
+    }
+
+    let mut parents = HashMap::<Txid, Vec<Txid>>::new();
+    let mut children = HashMap::<Txid, Vec<Txid>>::new();
+    for (txid, entry) in &mempool.entries {
+        let mut tx_parents = Vec::new();
+        for input in &entry.transaction.input {
+            let parent = input.previous_output.txid;
+            if parent != *txid
+                && mempool.entries.contains_key(&parent)
+                && !tx_parents.contains(&parent)
+            {
+                tx_parents.push(parent);
+            }
+        }
+        if tx_parents.is_empty() {
+            continue;
+        }
+        for parent in &tx_parents {
+            children.entry(*parent).or_default().push(*txid);
+        }
+        parents.insert(*txid, tx_parents);
+    }
+    if parents.is_empty() {
+        return true;
+    }
+    for txids in children.values_mut() {
+        txids.sort_by_key(ToString::to_string);
+        txids.dedup();
+    }
+
+    let mut visited = HashSet::with_capacity(mempool.entries.len());
+    for start in mempool.entries.keys().copied() {
+        if !visited.insert(start) {
+            continue;
+        }
+        let component = graph_component(start, &parents, &children, &mut visited);
+        if !component_graph_is_known_optimal(mempool, &component, &parents, &children) {
+            return false;
+        }
+    }
+    true
+}
+
+fn graph_component(
+    start: Txid,
+    parents: &HashMap<Txid, Vec<Txid>>,
+    children: &HashMap<Txid, Vec<Txid>>,
+    visited: &mut HashSet<Txid>,
+) -> Vec<Txid> {
+    let mut component = Vec::new();
+    let mut pending = vec![start];
+    while let Some(txid) = pending.pop() {
+        component.push(txid);
+        if let Some(txids) = parents.get(&txid) {
+            for parent in txids {
+                if visited.insert(*parent) {
+                    pending.push(*parent);
+                }
+            }
+        }
+        if let Some(txids) = children.get(&txid) {
+            for child in txids {
+                if visited.insert(*child) {
+                    pending.push(*child);
+                }
+            }
+        }
+    }
+    component.sort_by_key(ToString::to_string);
+    component
+}
+
+fn component_graph_is_known_optimal(
+    mempool: &Mempool,
+    component: &[Txid],
+    parents: &HashMap<Txid, Vec<Txid>>,
+    children: &HashMap<Txid, Vec<Txid>>,
+) -> bool {
+    if component.len() <= 1 {
+        return true;
+    }
+
+    // Core's post-linearization is provably optimal for a graph that is a
+    // tree in either direction. The existing package order has the same
+    // ancestor-before-descendant property, so these common chain/fan-in/fan-
+    // out clusters do not need factorial enumeration.
+    let at_most_one_parent = component
+        .iter()
+        .all(|txid| parents.get(txid).map_or(0, Vec::len) <= 1);
+    let at_most_one_child = component
+        .iter()
+        .all(|txid| children.get(txid).map_or(0, Vec::len) <= 1);
+    if at_most_one_parent || at_most_one_child {
+        return true;
+    }
+
+    if component.len() > MAX_GRAPH_OPTIMALITY_EXACT_TX_COUNT {
+        return false;
+    }
+
+    exact_component_optimality(mempool, component, parents, children)
+}
+
+fn exact_component_optimality(
+    mempool: &Mempool,
+    component: &[Txid],
+    parents: &HashMap<Txid, Vec<Txid>>,
+    children: &HashMap<Txid, Vec<Txid>>,
+) -> bool {
+    let indegree = component
+        .iter()
+        .map(|txid| (*txid, parents.get(txid).map_or(0, Vec::len)))
+        .collect::<HashMap<_, _>>();
+    let mut search = ComponentOrderSearch {
+        mempool,
+        component,
+        children,
+        indegree,
+        order: Vec::with_capacity(component.len()),
+        best_diagram: None,
+        incomparable: false,
+        states: 0,
+    };
+    search.visit() && !search.incomparable
+}
+
+struct ComponentOrderSearch<'a> {
+    mempool: &'a Mempool,
+    component: &'a [Txid],
+    children: &'a HashMap<Txid, Vec<Txid>>,
+    indegree: HashMap<Txid, usize>,
+    order: Vec<Txid>,
+    best_diagram: Option<Vec<(i128, u64)>>,
+    incomparable: bool,
+    states: usize,
+}
+
+impl ComponentOrderSearch<'_> {
+    fn visit(&mut self) -> bool {
+        self.states = self.states.saturating_add(1);
+        if self.states > MAX_GRAPH_OPTIMALITY_STATES {
+            return false;
+        }
+        if self.order.len() == self.component.len() {
+            let diagram = component_feerate_diagram(self.mempool, &self.order);
+            if let Some(previous) = self.best_diagram.as_ref() {
+                match compare_fee_rate_diagrams(&diagram, previous) {
+                    Some(Ordering::Greater) => self.best_diagram = Some(diagram),
+                    Some(Ordering::Equal | Ordering::Less) => {}
+                    None => self.incomparable = true,
+                }
+            } else {
+                self.best_diagram = Some(diagram);
+            }
+            return true;
+        }
+
+        let mut available = self
+            .component
+            .iter()
+            .copied()
+            .filter(|txid| !self.order.contains(txid) && self.indegree.get(txid) == Some(&0))
+            .collect::<Vec<_>>();
+        available.sort_by_key(ToString::to_string);
+        if available.is_empty() {
+            return false;
+        }
+
+        for txid in available {
+            self.order.push(txid);
+            if let Some(txids) = self.children.get(&txid) {
+                for child in txids {
+                    let degree = self
+                        .indegree
+                        .get_mut(child)
+                        .expect("component child has an indegree entry");
+                    *degree = degree.saturating_sub(1);
+                }
+            }
+            let complete = self.visit();
+            if let Some(txids) = self.children.get(&txid) {
+                for child in txids {
+                    let degree = self
+                        .indegree
+                        .get_mut(child)
+                        .expect("component child has an indegree entry");
+                    *degree = degree.saturating_add(1);
+                }
+            }
+            self.order.pop();
+            if !complete {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+fn component_feerate_diagram(mempool: &Mempool, order: &[Txid]) -> Vec<(i128, u64)> {
+    let mut chunks = Vec::with_capacity(order.len());
+    for txid in order {
+        let Some(entry) = mempool.entries.get(txid) else {
+            continue;
+        };
+        append_feerate_chunk(
+            &mut chunks,
+            mempool.modified_fee_sat(txid, entry.fee_sat),
+            mempool.adjusted_weight(txid),
+        );
+    }
+    chunks
 }
 
 fn fee_rate_meets(fee_sat: i128, vsize: u64, fee_rate_sat_per_kvb: u64) -> bool {
@@ -4098,7 +4362,65 @@ mod tests {
             },
         );
         pool.wtxids.insert(wtxid, txid);
+        pool.invalidate_graph_optimality();
         txid
+    }
+
+    #[test]
+    fn mempool_graph_optimality_is_invalidated_by_graph_and_fee_changes() {
+        let mut pool = Mempool::new(Network::Regtest);
+        assert!(pool.optimal());
+
+        let parent = graph_transaction(Txid::from_byte_array([40; 32]), 40);
+        let parent_id = insert_policy_entry(&mut pool, parent);
+        assert!(pool.optimal());
+
+        let child = graph_transaction(parent_id, 41);
+        let child_id = insert_policy_entry(&mut pool, child);
+        assert!(pool.optimal());
+
+        pool.prioritise(child_id, 100);
+        assert!(pool.optimal());
+
+        pool.remove(&parent_id);
+        assert!(pool.optimal());
+    }
+
+    #[test]
+    fn unresolved_large_non_tree_cluster_is_not_reported_as_optimal() {
+        let mut pool = Mempool::new(Network::Regtest);
+        let first = graph_transaction(Txid::from_byte_array([50; 32]), 50);
+        let first_id = insert_policy_entry(&mut pool, first);
+        let second = graph_transaction(Txid::from_byte_array([51; 32]), 51);
+        let second_id = insert_policy_entry(&mut pool, second);
+
+        for marker in 0..11u8 {
+            let transaction = Transaction {
+                version: Version::ONE,
+                lock_time: LockTime::ZERO,
+                input: vec![
+                    TxIn {
+                        previous_output: OutPoint::new(first_id, 0),
+                        script_sig: ScriptBuf::from_bytes(vec![marker]),
+                        sequence: bitcoin::Sequence::MAX,
+                        witness: Witness::default(),
+                    },
+                    TxIn {
+                        previous_output: OutPoint::new(second_id, 0),
+                        script_sig: ScriptBuf::from_bytes(vec![marker, 1]),
+                        sequence: bitcoin::Sequence::MAX,
+                        witness: Witness::default(),
+                    },
+                ],
+                output: vec![TxOut {
+                    value: Amount::from_sat(1),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                }],
+            };
+            insert_policy_entry(&mut pool, transaction);
+        }
+
+        assert!(!pool.optimal());
     }
 
     #[test]

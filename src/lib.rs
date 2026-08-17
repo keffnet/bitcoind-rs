@@ -203,6 +203,7 @@ fn addrman_tried_slot(key: &[u8; 32], endpoint: &NetworkEndpoint) -> (usize, usi
     (bucket, position)
 }
 pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+const BLOCK_DOWNLOAD_WINDOW: u32 = 1024;
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 const BLOCK_STALLING_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
 const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
@@ -1971,7 +1972,9 @@ impl Node {
             };
             (tip, activated_blocks, disconnected_blocks)
         };
-        self.reduce_block_stalling_timeout();
+        for _ in &activated_blocks {
+            self.reduce_block_stalling_timeout();
+        }
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
             self.reconcile_mempool_after_chain_change(
                 &activated_blocks,
@@ -2376,12 +2379,13 @@ impl Node {
         }
         let reduced =
             (current.saturating_mul(85) / 100).max(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs());
-        let _ = self.block_stalling_timeout_secs.compare_exchange(
-            current,
-            reduced,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+        if self
+            .block_stalling_timeout_secs
+            .compare_exchange(current, reduced, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            info!("Decreased stalling timeout to {reduced} seconds");
+        }
     }
 
     pub fn accept_transaction(&self, transaction: Transaction) -> Result<Txid> {
@@ -3974,7 +3978,8 @@ impl Node {
                 .get(&id)
                 .and_then(|peer| peer.best_known_block)
         });
-        let candidates = {
+        let peer_has_known_tip = peer_best_known.is_some();
+        let (candidates, window_end_height) = {
             let chain = self.chain.read();
             let target_hash = if let Some(peer_best_known) = peer_best_known {
                 let Some(peer_work) = chain.chain_work_by_hash(&peer_best_known) else {
@@ -4002,23 +4007,45 @@ impl Node {
             let peer_best_height = peer_best_known
                 .and_then(|hash| chain.block_height_by_hash(&hash))
                 .unwrap_or_else(|| chain.height());
-            chain
+            let headers = chain
                 .headers_to_hash(&target_hash)
                 .into_iter()
                 .flatten()
-                .skip(1)
-                .map(|header| header.block_hash())
-                .filter(|hash| !chain.store.contains(hash))
-                .filter(|hash| !chain.is_block_pruned(hash))
-                .filter(|hash| {
-                    !limited_peer
-                        || chain.block_height_by_hash(hash).is_some_and(|height| {
-                            peer_best_height.saturating_sub(height)
-                                < NODE_NETWORK_LIMITED_MIN_BLOCKS.saturating_sub(2)
-                        })
+                .collect::<Vec<_>>();
+            let last_common_height = headers
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(height, header)| {
+                    chain
+                        .is_active_block(&header.block_hash())
+                        .then_some(u32::try_from(height).unwrap_or(u32::MAX))
                 })
-                .take(max_scan)
-                .collect::<Vec<_>>()
+                .unwrap_or_default();
+            let window_end_height = last_common_height.saturating_add(BLOCK_DOWNLOAD_WINDOW);
+            let candidates = headers
+                .into_iter()
+                .enumerate()
+                .skip(1)
+                .map(|(height, header)| {
+                    (
+                        header.block_hash(),
+                        u32::try_from(height).unwrap_or(u32::MAX),
+                    )
+                })
+                .filter(|(hash, _)| !chain.store.contains(hash))
+                .filter(|(hash, _)| !chain.is_block_pruned(hash))
+                .filter(|(_, height)| {
+                    !limited_peer
+                        || peer_best_height.saturating_sub(*height)
+                            < NODE_NETWORK_LIMITED_MIN_BLOCKS.saturating_sub(2)
+                })
+                // Keep the first missing block beyond the window so the
+                // caller can distinguish a true staller from a peer that is
+                // merely waiting for an in-window block.
+                .take(max_scan.saturating_add(1))
+                .collect::<Vec<_>>();
+            (candidates, window_end_height)
         };
         if candidates.is_empty() {
             return BlockDownloadSchedule {
@@ -4035,7 +4062,12 @@ impl Node {
         });
         let mut requests = Vec::with_capacity(limit);
         let mut waiting_for = None;
-        for hash in candidates {
+        let mut window_exceeded = false;
+        for (hash, height) in candidates {
+            if height > window_end_height {
+                window_exceeded = true;
+                break;
+            }
             let owner = peers.values().find_map(|peer| {
                 peer.inflight_blocks
                     .iter()
@@ -4061,23 +4093,29 @@ impl Node {
             });
         }
 
-        let staller = (!peer_has_inflight && requests.is_empty())
-            .then_some(waiting_for)
-            .flatten();
+        let staller =
+            (!peer_has_inflight && requests.is_empty() && (window_exceeded || !peer_has_known_tip))
+                .then_some(waiting_for)
+                .flatten();
         BlockDownloadSchedule { requests, staller }
     }
 
     pub(crate) fn note_block_staller(&self, peer_id: usize) {
-        self.note_block_staller_at(peer_id, Instant::now());
+        if self.note_block_staller_at(peer_id, Instant::now()) {
+            info!("Stall started peer={peer_id}");
+        }
     }
 
-    fn note_block_staller_at(&self, peer_id: usize, since: Instant) {
+    fn note_block_staller_at(&self, peer_id: usize, since: Instant) -> bool {
         if self.peers.read().contains_key(&peer_id) {
-            self.block_stalling_since
-                .write()
-                .entry(peer_id)
-                .or_insert(since);
+            let mut stalling = self.block_stalling_since.write();
+            if stalling.contains_key(&peer_id) {
+                return false;
+            }
+            stalling.insert(peer_id, since);
+            return true;
         }
+        false
     }
 
     pub(crate) fn take_stalled_block_peer(&self) -> Option<usize> {
@@ -4105,11 +4143,16 @@ impl Node {
     }
 
     pub(crate) fn clear_peer_block_request(&self, peer_id: usize, hash: BlockHash) {
+        let mut cleared = false;
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            let before = peer.inflight_blocks.len();
             peer.inflight_blocks
                 .retain(|inflight| inflight.hash != hash);
+            cleared = peer.inflight_blocks.len() != before;
         }
-        self.block_stalling_since.write().remove(&peer_id);
+        if cleared {
+            self.block_stalling_since.write().remove(&peer_id);
+        }
     }
 
     pub(crate) fn clear_peer_block_requests_for_hash(&self, hash: BlockHash) {
@@ -4463,6 +4506,11 @@ impl Node {
     ) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             let user_agent = sanitize_peer_user_agent(user_agent);
+            let relay_transactions = relay_transactions
+                && !matches!(
+                    peer.connection_type,
+                    "block-relay-only" | "feeler" | "private-broadcast"
+                );
             peer.version = Some(version);
             peer.services = services;
             peer.user_agent.clone_from(&user_agent);
@@ -4486,6 +4534,11 @@ impl Node {
 
     pub(crate) fn update_peer_relay_transactions(&self, id: usize, relay_transactions: bool) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
+            let relay_transactions = relay_transactions
+                && !matches!(
+                    peer.connection_type,
+                    "block-relay-only" | "feeler" | "private-broadcast"
+                );
             peer.relay_transactions = relay_transactions;
             if peer.connection_type != "private-broadcast"
                 && let Some(address) = peer.endpoint.legacy_socket_addr()

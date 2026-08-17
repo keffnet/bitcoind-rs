@@ -2092,6 +2092,9 @@ fn normalize_core_style_argument(argument: OsString) -> OsString {
     let Some(value) = argument.to_str() else {
         return argument;
     };
+    if matches!(value, "-noblocksonly" | "--noblocksonly") {
+        return OsString::from("--blocksonly=false");
+    }
     if value.len() <= 2
         || !value.starts_with('-')
         || value.starts_with("--")

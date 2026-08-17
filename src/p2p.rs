@@ -4613,6 +4613,12 @@ async fn serve_peer_loop(
                 if !peer_state.local_relay_transactions
                     && items.iter().any(|item| item.kind.is_transaction())
                 {
+                    if let Some(item) = items.iter().find(|item| item.kind.is_transaction()) {
+                        info!(
+                            "transaction ({}) inv sent in violation of protocol, disconnecting peer",
+                            item.hash
+                        );
+                    }
                     anyhow::bail!("transaction inventory sent to a non-relaying connection");
                 }
                 let wtxid_relay = *peer_state.wtxid_relay.lock();
@@ -5066,6 +5072,15 @@ async fn serve_peer_loop(
                             .await?;
                         }
                         kind if kind.is_transaction() => {
+                            let inventory_name = if item.kind.is_witness_transaction() {
+                                "wtx"
+                            } else {
+                                "tx"
+                            };
+                            debug!(
+                                "received getdata for: {inventory_name} {} peer={peer_id}",
+                                item.hash
+                            );
                             if !peer_can_serve_transaction_getdata(
                                 peer_state.connection_type,
                                 *relay_transactions.lock(),
@@ -5146,6 +5161,7 @@ async fn serve_peer_loop(
                     .block_height_by_hash(&block.header.prev_blockhash)
                     .is_none()
                 {
+                    debug!("AcceptBlock FAILED (prev-blk-not-found)");
                     anyhow::bail!(
                         "block {hash} has an unknown parent {}",
                         block.header.prev_blockhash
@@ -5735,6 +5751,9 @@ async fn serve_peer_loop(
                     );
                 }
                 if !peer_state.local_relay_transactions {
+                    info!(
+                        "transaction sent in violation of protocol, disconnecting peer={peer_id}"
+                    );
                     anyhow::bail!("transaction sent to a non-relaying connection");
                 }
                 let txid = transaction.compute_txid();
@@ -6343,10 +6362,32 @@ async fn handle_received_block(
             let should_mark_invalid = error
                 .downcast_ref::<ValidationError>()
                 .is_some_and(ValidationError::should_mark_block_invalid);
+            let is_mutated = error
+                .downcast_ref::<ValidationError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        ValidationError::BadMerkleRoot
+                            | ValidationError::BadWitnessNonceSize
+                            | ValidationError::BadWitnessMerkleMatch
+                    )
+                });
             if should_mark_invalid {
                 if let Err(mark_error) = node.chain.write().mark_block_invalid(&hash) {
                     debug!(%hash, %mark_error, "failed to cache invalid peer block");
                 }
+            }
+            if disconnect_on_invalid && is_mutated {
+                if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
+                    let reason = validation_error.bip22_reject_reason();
+                    let detail = if matches!(validation_error, ValidationError::BadMerkleRoot) {
+                        "hashMerkleRoot mismatch"
+                    } else {
+                        "witness commitment mismatch"
+                    };
+                    debug!("Block mutated: {reason}, {detail}");
+                }
+                anyhow::bail!("invalid peer block {hash}: {error}");
             }
             if disconnect_on_invalid && should_mark_invalid {
                 anyhow::bail!("invalid peer block {hash}: {error}");
@@ -8027,7 +8068,15 @@ async fn broadcast_inventory_excluding(
             }
         }
         if item.kind.is_transaction() {
-            if !state.local_relay_transactions || !*state.relay_transactions.lock() {
+            // `local_relay_transactions` controls whether this node accepts
+            // transaction relay from the peer.  It must not suppress
+            // announcements of transactions submitted locally via RPC: Core
+            // still broadcasts those while running in -blocksonly mode.
+            if matches!(
+                state.connection_type,
+                "block-relay-only" | "feeler" | "private-broadcast"
+            ) || !*state.relay_transactions.lock()
+            {
                 continue;
             }
             if force_relay {

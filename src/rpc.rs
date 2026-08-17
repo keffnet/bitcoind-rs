@@ -2609,11 +2609,7 @@ fn dispatch_method_for_user(
                         "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
                         "bytessent_per_msg": peer.bytes_sent_per_msg,
                         "bytesrecv_per_msg": peer.bytes_received_per_msg,
-                        "connection_type": if peer.manual {
-                            "manual"
-                        } else {
-                            rpc_connection_type(peer.connection_type)
-                        },
+                        "connection_type": rpc_connection_type(peer.connection_type),
                         "transport_protocol_type": peer.transport_protocol_type,
                         "session_id": peer.session_id,
                     });

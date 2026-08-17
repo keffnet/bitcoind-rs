@@ -1145,6 +1145,7 @@ pub struct PeerInfo {
     addr_token_timestamp: u128,
     ping_nonce: Option<u64>,
     ping_sent_at: Option<Instant>,
+    ping_sent_mocktime: Option<u128>,
 }
 
 pub(crate) struct PeerRegistrationOptions {
@@ -1187,8 +1188,12 @@ pub(crate) struct BlockDownloadSchedule {
 
 impl PeerInfo {
     pub(crate) fn ping_wait(&self) -> Option<f64> {
-        self.ping_sent_at
-            .map(|sent_at| sent_at.elapsed().as_secs_f64())
+        self.ping_sent_mocktime
+            .map(|sent_at| time::unix_time_millis().saturating_sub(sent_at) as f64 / 1_000.0)
+            .or_else(|| {
+                self.ping_sent_at
+                    .map(|sent_at| sent_at.elapsed().as_secs_f64())
+            })
     }
 
     pub(crate) fn inflight_heights(&self) -> Vec<u32> {
@@ -1492,6 +1497,7 @@ pub struct Node {
     versionbits_warning_scanned: AtomicBool,
     fee_estimator: Mutex<FeeEstimator>,
     pub started_at: Instant,
+    pub(crate) network_nonce: u64,
     shutdown: Notify,
 }
 
@@ -1912,6 +1918,7 @@ impl Node {
             versionbits_warning_scanned: AtomicBool::new(false),
             fee_estimator: Mutex::new(fee_estimator),
             started_at: Instant::now(),
+            network_nonce: random(),
             shutdown: Notify::new(),
         });
         if node.config.check_addrman != 0 {
@@ -3447,6 +3454,40 @@ impl Node {
         Ok(())
     }
 
+    /// Account bytes as soon as they arrive from a v1 socket. The frame may
+    /// still be incomplete, so there is no message bucket to update yet.
+    pub(crate) fn record_partial_bytes_received(&self, peer_id: usize, bytes: usize) {
+        let _ = peer_id;
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.total_bytes_received
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Update the per-message byte bucket after a complete frame has been
+    /// decoded. v1 transport totals were already updated while reading the
+    /// socket, including fragmented frames.
+    pub(crate) fn record_received_message(&self, peer_id: usize, bytes: usize, command: &str) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let mut peers = if bytes > 1_000_000 && command == P2P_MESSAGE_TYPE_OTHER {
+            let Some(peers) = self.peers.try_write() else {
+                return;
+            };
+            peers
+        } else {
+            self.peers.write()
+        };
+        if let Some(peer) = peers.get_mut(&peer_id) {
+            peer.bytes_received = peer.bytes_received.saturating_add(bytes);
+            peer.last_recv = unix_time_seconds();
+            let command = received_p2p_message_type(command);
+            let total = peer
+                .bytes_received_per_msg
+                .entry(command.to_owned())
+                .or_default();
+            *total = total.saturating_add(bytes);
+        }
+    }
+
     pub(crate) fn record_bytes_received(&self, peer_id: usize, bytes: usize, command: &str) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.total_bytes_received
@@ -3913,12 +3954,34 @@ impl Node {
         });
         let candidates = {
             let chain = self.chain.read();
-            let best_header = chain.best_header_tip().hash;
+            let target_hash = if let Some(peer_best_known) = peer_best_known {
+                let Some(peer_work) = chain.chain_work_by_hash(&peer_best_known) else {
+                    return BlockDownloadSchedule {
+                        requests: Vec::new(),
+                        staller: None,
+                    };
+                };
+                let tip = chain.tip();
+                if peer_work < tip.work || peer_work < chain.minimum_chain_work() {
+                    return BlockDownloadSchedule {
+                        requests: Vec::new(),
+                        staller: None,
+                    };
+                }
+                peer_best_known
+            } else {
+                // The live peer loop only calls this scheduler after it has
+                // observed block availability. Keep the header-tip fallback
+                // for callers that use the queue as a durable resume view
+                // (and for the staller accounting path before availability
+                // has been materialized).
+                chain.best_header_tip().hash
+            };
             let peer_best_height = peer_best_known
                 .and_then(|hash| chain.block_height_by_hash(&hash))
                 .unwrap_or_else(|| chain.height());
             chain
-                .headers_to_hash(&best_header)
+                .headers_to_hash(&target_hash)
                 .into_iter()
                 .flatten()
                 .skip(1)
@@ -4046,6 +4109,28 @@ impl Node {
         }
     }
 
+    pub(crate) fn clear_other_peer_block_requests(&self, peer_id: usize, hash: BlockHash) {
+        let mut cleared_peers = Vec::new();
+        {
+            let mut peers = self.peers.write();
+            for (candidate_id, peer) in peers.iter_mut() {
+                if *candidate_id == peer_id {
+                    continue;
+                }
+                let before = peer.inflight_blocks.len();
+                peer.inflight_blocks
+                    .retain(|inflight| inflight.hash != hash);
+                if peer.inflight_blocks.len() != before {
+                    cleared_peers.push(*candidate_id);
+                }
+            }
+        }
+        let mut stalling = self.block_stalling_since.write();
+        for candidate_id in cleared_peers {
+            stalling.remove(&candidate_id);
+        }
+    }
+
     pub(crate) fn record_pong(&self, peer_id: usize, nonce: u64) -> bool {
         let mut peers = self.peers.write();
         let Some(peer) = peers.get_mut(&peer_id) else {
@@ -4055,8 +4140,17 @@ impl Node {
             return false;
         }
         peer.ping_nonce = None;
-        if let Some(sent_at) = peer.ping_sent_at.take() {
-            let ping_time = sent_at.elapsed().as_secs_f64();
+        let sent_at = peer.ping_sent_at.take();
+        let sent_mocktime = peer.ping_sent_mocktime.take();
+        if sent_at.is_some() || sent_mocktime.is_some() {
+            let ping_time = sent_mocktime
+                .map(|sent_at| time::unix_time_millis().saturating_sub(sent_at) as f64 / 1_000.0)
+                .unwrap_or_else(|| {
+                    sent_at
+                        .expect("ping timestamp exists")
+                        .elapsed()
+                        .as_secs_f64()
+                });
             peer.ping_time = Some(ping_time);
             peer.min_ping = Some(
                 peer.min_ping
@@ -4064,6 +4158,21 @@ impl Node {
             );
         }
         true
+    }
+
+    pub(crate) fn peer_ping_nonce(&self, peer_id: usize) -> Option<u64> {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .and_then(|peer| peer.ping_nonce)
+    }
+
+    pub(crate) fn cancel_peer_ping(&self, peer_id: usize) {
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.ping_nonce = None;
+            peer.ping_sent_at = None;
+            peer.ping_sent_mocktime = None;
+        }
     }
 
     pub fn network_active(&self) -> bool {
@@ -4272,11 +4381,13 @@ impl Node {
             min_ping: None,
             ping_nonce: None,
             ping_sent_at: None,
+            ping_sent_mocktime: None,
             addr_token_bucket: 1.0,
             addr_token_timestamp: time::unix_time_millis(),
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
+        info!("Added connection peer={id}");
         let endpoint_is_addrman_candidate = match &endpoint {
             NetworkEndpoint::Ip(address) => is_core_routable_ip(address.ip()),
             NetworkEndpoint::Dns { .. } => false,
@@ -4650,6 +4761,7 @@ impl Node {
                 known.local_address = None;
                 known.ping_nonce = None;
                 known.ping_sent_at = None;
+                known.ping_sent_mocktime = None;
             }
         }
         if let Some(sender) = replacement {
@@ -4967,6 +5079,7 @@ impl Node {
                 min_ping: None,
                 ping_nonce: None,
                 ping_sent_at: None,
+                ping_sent_mocktime: None,
                 addr_token_bucket: 1.0,
                 addr_token_timestamp: time::unix_time_millis(),
             },
@@ -5035,6 +5148,7 @@ impl Node {
             min_ping: None,
             ping_nonce: None,
             ping_sent_at: None,
+            ping_sent_mocktime: None,
             addr_token_bucket: 1.0,
             addr_token_timestamp: time::unix_time_millis(),
         });
@@ -5350,6 +5464,7 @@ impl Node {
         }
         peer.ping_nonce = Some(nonce);
         peer.ping_sent_at = Some(Instant::now());
+        peer.ping_sent_mocktime = (time::mock_time() > 0).then(time::unix_time_millis);
         true
     }
 
@@ -5359,15 +5474,21 @@ impl Node {
         {
             peer.ping_nonce = None;
             peer.ping_sent_at = None;
+            peer.ping_sent_mocktime = None;
         }
     }
 
     pub(crate) fn ping_timed_out(&self, peer_id: usize, timeout: Duration) -> bool {
-        self.peers
-            .read()
-            .get(&peer_id)
-            .and_then(|peer| peer.ping_sent_at)
-            .is_some_and(|sent_at| sent_at.elapsed() >= timeout)
+        self.peers.read().get(&peer_id).is_some_and(|peer| {
+            peer.ping_sent_mocktime
+                .map(|sent_at| {
+                    time::unix_time_millis().saturating_sub(sent_at) >= timeout.as_millis()
+                })
+                .unwrap_or_else(|| {
+                    peer.ping_sent_at
+                        .is_some_and(|sent_at| sent_at.elapsed() >= timeout)
+                })
+        })
     }
 
     pub fn is_banned(&self, address: IpAddr) -> bool {
@@ -6099,6 +6220,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                         min_ping: None,
                         ping_nonce: None,
                         ping_sent_at: None,
+                        ping_sent_mocktime: None,
                         addr_token_bucket: 1.0,
                         addr_token_timestamp: time::unix_time_millis(),
                     },

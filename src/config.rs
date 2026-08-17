@@ -53,8 +53,8 @@ pub const MAX_SCRIPT_CHECK_THREADS: usize = 15;
 pub const MAX_SUBVERSION_LENGTH: usize = 256;
 pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
 pub const DEFAULT_I2P_ACCEPT_INCOMING: bool = true;
-pub const DEFAULT_MAX_RECEIVE_BUFFER_KB: u64 = 5;
-pub const DEFAULT_MAX_SEND_BUFFER_KB: u64 = 1;
+pub const DEFAULT_MAX_RECEIVE_BUFFER_KB: u64 = 5_000;
+pub const DEFAULT_MAX_SEND_BUFFER_KB: u64 = 1_000;
 pub const DEFAULT_BAN_TIME_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_CLUSTER_COUNT: usize = 64;
 pub const MAX_CLUSTER_COUNT_LIMIT: usize = 64;
@@ -2949,7 +2949,7 @@ impl Config {
             .unwrap_or(!args.rpc_whitelist.is_empty());
         let rpc_whitelist = parse_rpc_whitelist(&args.rpc_whitelist);
         if args.peertimeout == 0 {
-            bail!("--peertimeout must be greater than zero");
+            bail!("peertimeout must be a positive integer.");
         }
         if args.timeout == 0 {
             bail!("--timeout must be greater than zero");

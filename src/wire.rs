@@ -279,8 +279,17 @@ pub enum WireError {
     Magic([u8; 4]),
     #[error("message payload exceeds limit: {0} bytes")]
     Oversized(usize),
+    #[error("message payload exceeds limit: {command}, {size} bytes")]
+    OversizedFrame { command: String, size: usize },
     #[error("invalid message checksum")]
-    Checksum,
+    Checksum {
+        command: String,
+        payload_size: usize,
+        expected: [u8; 4],
+        actual: [u8; 4],
+    },
+    #[error("invalid message type")]
+    InvalidMessageType,
     #[error("unknown command {0}")]
     UnknownCommand(String),
     #[error("malformed payload: {0}")]
@@ -325,7 +334,7 @@ pub fn decode_message(network: Network, frame: &[u8]) -> Result<Message> {
     if magic != network_magic(network) {
         return Err(WireError::Magic(magic).into());
     }
-    let command = decode_command(&frame[4..16])?;
+    let command = decode_command(&frame[4..16]).map_err(|_| WireError::InvalidMessageType)?;
     let length = u32::from_le_bytes(frame[16..20].try_into().expect("slice length")) as usize;
     if length > MAX_MESSAGE_SIZE {
         return Err(WireError::Oversized(length).into());
@@ -333,8 +342,15 @@ pub fn decode_message(network: Network, frame: &[u8]) -> Result<Message> {
     if frame.len() != HEADER_SIZE + length {
         bail!("message frame length does not match payload length");
     }
-    if frame[20..24] != checksum(&frame[24..]) {
-        return Err(WireError::Checksum.into());
+    let expected = checksum(&frame[24..]);
+    if frame[20..24] != expected {
+        return Err(WireError::Checksum {
+            command: command.to_owned(),
+            payload_size: length,
+            expected,
+            actual: frame[20..24].try_into().expect("checksum is four bytes"),
+        }
+        .into());
     }
     decode_payload(command, &frame[24..]).map_err(Into::into)
 }
@@ -361,6 +377,9 @@ pub async fn read_message_with_size<R: AsyncRead + Unpin>(
 pub(crate) struct MessageReader<R> {
     reader: R,
     buffer: Vec<u8>,
+    discard_remaining: usize,
+    discard_frame_size: usize,
+    discard_buffer: Vec<u8>,
 }
 
 impl<R: AsyncRead + Unpin> MessageReader<R> {
@@ -368,14 +387,63 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
         Self {
             reader,
             buffer: Vec::new(),
+            discard_remaining: 0,
+            discard_frame_size: 0,
+            discard_buffer: Vec::new(),
         }
     }
 
+    pub(crate) fn has_partial_frame(&self) -> bool {
+        !self.buffer.is_empty() || self.discard_remaining != 0
+    }
+
+    #[cfg(test)]
     pub(crate) async fn read_message_with_size_allow_reject(
         &mut self,
         network: Network,
     ) -> Result<(Option<Message>, usize)> {
+        self.read_message_with_size_allow_reject_with_callback(network, &mut |_| {})
+            .await
+    }
+
+    pub(crate) async fn read_message_with_size_allow_reject_with_callback(
+        &mut self,
+        network: Network,
+        on_bytes: &mut impl FnMut(usize),
+    ) -> Result<(Option<Message>, usize)> {
         loop {
+            if self.discard_remaining != 0 {
+                let buffered = self.discard_remaining.min(self.buffer.len());
+                if buffered != 0 {
+                    self.buffer.drain(..buffered);
+                    self.discard_remaining -= buffered;
+                }
+                if self.discard_remaining == 0 {
+                    let size = self.discard_frame_size;
+                    self.discard_frame_size = 0;
+                    return Ok((None, size));
+                }
+
+                if self.discard_buffer.is_empty() {
+                    self.discard_buffer.resize(256 * 1024, 0);
+                }
+                let read_limit = self.discard_remaining.min(self.discard_buffer.len());
+                let count = self
+                    .reader
+                    .read(&mut self.discard_buffer[..read_limit])
+                    .await?;
+                if count == 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "peer closed during Bitcoin message",
+                    )
+                    .into());
+                }
+                on_bytes(count);
+                self.discard_remaining -= count;
+                continue;
+            }
+
             if self.buffer.len() >= HEADER_SIZE {
                 let length = u32::from_le_bytes(
                     self.buffer[16..20]
@@ -383,15 +451,28 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
                         .expect("v1 header has a length field"),
                 ) as usize;
                 if length > MAX_MESSAGE_SIZE {
-                    return Err(WireError::Oversized(length).into());
+                    let command = command_for_header_log(&self.buffer[4..16]);
+                    let error = WireError::OversizedFrame {
+                        command,
+                        size: length,
+                    };
+                    log_v1_header_error(&error);
+                    return Err(error.into());
                 }
                 let frame_size = HEADER_SIZE + length;
+                if length > 1_000_000 && decode_command(&self.buffer[4..16]).is_err() {
+                    log_v1_header_error(&WireError::InvalidMessageType);
+                    self.discard_remaining = frame_size;
+                    self.discard_frame_size = frame_size;
+                    continue;
+                }
                 if self.buffer.len() >= frame_size {
                     let remainder = self.buffer.split_off(frame_size);
                     let frame = std::mem::replace(&mut self.buffer, remainder);
                     return match decode_message(network, &frame) {
                         Ok(message) => Ok((Some(message), frame.len())),
                         Err(error) => {
+                            log_v1_header_error_for_frame(network, &frame);
                             if let Some(message) = recoverable_payload_message(network, &frame) {
                                 Ok((Some(message), frame.len()))
                             } else if frame_has_recoverable_error(network, &frame) {
@@ -413,6 +494,7 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
                 )
                 .into());
             }
+            on_bytes(count);
             self.buffer.extend_from_slice(&chunk[..count]);
         }
     }
@@ -447,7 +529,13 @@ async fn read_frame_with_size<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(V
     reader.read_exact(&mut header).await?;
     let length = u32::from_le_bytes(header[16..20].try_into().expect("slice length")) as usize;
     if length > MAX_MESSAGE_SIZE {
-        return Err(WireError::Oversized(length).into());
+        let command = command_for_header_log(&header[4..16]);
+        let error = WireError::OversizedFrame {
+            command,
+            size: length,
+        };
+        log_v1_header_error(&error);
+        return Err(error.into());
     }
     let mut frame = Vec::with_capacity(HEADER_SIZE + length);
     frame.extend_from_slice(&header);
@@ -457,13 +545,98 @@ async fn read_frame_with_size<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(V
     Ok((frame, size))
 }
 
+fn log_v1_header_error(error: &WireError) {
+    match error {
+        WireError::Magic(magic) => {
+            tracing::debug!(target: "bitcoind_rs::p2p",
+                "Header error: Wrong MessageStart {} received",
+                hex::encode(magic)
+            );
+        }
+        WireError::Checksum {
+            command,
+            payload_size,
+            expected,
+            actual,
+        } => {
+            tracing::debug!(target: "bitcoind_rs::p2p",
+                "Header error: Wrong checksum ({command}, {payload_size} bytes), expected {} was {}",
+                hex::encode(expected),
+                hex::encode(actual),
+            );
+        }
+        WireError::OversizedFrame { command, size } => {
+            tracing::debug!(target: "bitcoind_rs::p2p", "Header error: Size too large ({command}, {size} bytes)");
+        }
+        WireError::InvalidMessageType => {
+            tracing::debug!(target: "bitcoind_rs::p2p", "Header error: Invalid message type");
+        }
+        WireError::Oversized(_)
+        | WireError::UnknownCommand(_)
+        | WireError::Payload(_)
+        | WireError::CompactSize => {}
+    }
+}
+
+fn log_v1_header_error_for_frame(network: Network, frame: &[u8]) {
+    if frame.len() < HEADER_SIZE {
+        return;
+    }
+    if frame[..4] != network_magic(network) {
+        let mut magic = [0u8; 4];
+        magic.copy_from_slice(&frame[..4]);
+        log_v1_header_error(&WireError::Magic(magic));
+        return;
+    }
+    let length = u32::from_le_bytes(frame[16..20].try_into().expect("slice length")) as usize;
+    let command_valid = decode_command(&frame[4..16]).is_ok();
+    if !command_valid && length > 1_000_000 {
+        log_v1_header_error(&WireError::InvalidMessageType);
+        return;
+    }
+    let expected = checksum(&frame[24..]);
+    if frame[20..24] != expected {
+        log_v1_header_error(&WireError::Checksum {
+            command: command_for_header_log(&frame[4..16]),
+            payload_size: length,
+            expected,
+            actual: frame[20..24].try_into().expect("checksum is four bytes"),
+        });
+        return;
+    }
+    let Ok(command) = decode_command(&frame[4..16]) else {
+        log_v1_header_error(&WireError::InvalidMessageType);
+        return;
+    };
+    if length > MAX_MESSAGE_SIZE {
+        log_v1_header_error(&WireError::OversizedFrame {
+            command: command.to_owned(),
+            size: length,
+        });
+        return;
+    }
+}
+
+fn command_for_header_log(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0 || !byte.is_ascii_graphic())
+        .unwrap_or(bytes.len());
+    if end == 0 {
+        "unknown".to_owned()
+    } else {
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    }
+}
+
 fn frame_has_recoverable_error(network: Network, frame: &[u8]) -> bool {
     if frame.len() < HEADER_SIZE || frame[..4] != network_magic(network) {
         return false;
     }
-    let command_valid = decode_command(&frame[4..16]).is_ok();
-    let checksum_valid = frame[20..24] == checksum(&frame[24..]);
-    !command_valid || !checksum_valid
+    if decode_command(&frame[4..16]).is_err() {
+        return true;
+    }
+    frame[20..24] != checksum(&frame[24..])
 }
 
 fn recoverable_payload_message(network: Network, frame: &[u8]) -> Option<Message> {
@@ -471,7 +644,9 @@ fn recoverable_payload_message(network: Network, frame: &[u8]) -> Option<Message
         return None;
     }
     let command = decode_command(&frame[4..16]).ok()?;
-    if frame[20..24] != checksum(&frame[24..]) || !matches!(command, "addr" | "addrv2") {
+    if frame[20..24] != checksum(&frame[24..])
+        || !matches!(command, "addr" | "addrv2" | "inv" | "getdata" | "headers")
+    {
         return None;
     }
     Some(Message::Unknown {
@@ -813,11 +988,19 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
         } else {
             reader.u64_le()?
         }),
-        "pong" => Message::Pong(if reader.remaining() == 0 {
-            0
-        } else {
-            reader.u64_le()?
-        }),
+        "pong" => {
+            if reader.remaining() == 0 {
+                Message::Pong(0)
+            } else if reader.remaining() == 8 {
+                Message::Pong(reader.u64_le()?)
+            } else {
+                let payload = reader.bytes(reader.remaining())?.to_vec();
+                Message::Unknown {
+                    command: "pong".to_owned(),
+                    payload,
+                }
+            }
+        }
         "getheaders" => Message::GetHeaders(decode_getheaders(&mut reader)?),
         "getblocks" => Message::GetBlocks(decode_getheaders(&mut reader)?),
         "headers" => Message::Headers(decode_headers(&mut reader)?),

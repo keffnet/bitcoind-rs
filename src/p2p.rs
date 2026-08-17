@@ -252,6 +252,7 @@ const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(2 * 60);
 const HEADERS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const AVG_FEEFILTER_BROADCAST_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MAX_FEEFILTER_CHANGE_DELAY: Duration = Duration::from_secs(5 * 60);
 const MAX_FUTURE_BLOCK_TIME_SECS: u64 = 2 * 60 * 60;
@@ -405,14 +406,18 @@ fn block_request_inventory_type(peer_services: u64) -> InventoryType {
 }
 
 fn peer_services_are_desirable(peer_services: u64, approximate_best_block_depth: i64) -> bool {
-    let desirable = if peer_services & wire::NODE_NETWORK_LIMITED != 0
+    let desirable = desirable_peer_services(peer_services, approximate_best_block_depth);
+    peer_services & desirable == desirable
+}
+
+fn desirable_peer_services(peer_services: u64, approximate_best_block_depth: i64) -> u64 {
+    if peer_services & wire::NODE_NETWORK_LIMITED != 0
         && approximate_best_block_depth < NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS
     {
         wire::NODE_NETWORK_LIMITED | wire::NODE_WITNESS
     } else {
         wire::NODE_NETWORK | wire::NODE_WITNESS
-    };
-    peer_services & desirable == desirable
+    }
 }
 
 fn peer_block_download_allowed(initial_block_download: bool, peer_services: u64) -> bool {
@@ -1031,6 +1036,7 @@ struct PeerState {
     send_headers_sent: parking_lot::Mutex<bool>,
     last_header_sent: parking_lot::Mutex<Option<BlockHash>>,
     pending_block_relay: parking_lot::Mutex<Vec<BlockHash>>,
+    suppressed_block_relay: parking_lot::Mutex<HashSet<BlockHash>>,
     last_headers_request: parking_lot::Mutex<Option<Instant>>,
     last_headers_request_time: parking_lot::Mutex<Option<u64>>,
     continuation_block: parking_lot::Mutex<Option<BlockHash>>,
@@ -1536,9 +1542,25 @@ fn murmur_hash3(seed: u32, data: &[u8]) -> u32 {
 }
 
 impl PeerReader {
-    async fn read_message(&mut self, network: Network) -> Result<(Option<Message>, usize)> {
+    fn has_partial_frame(&self) -> bool {
         match self {
-            Self::V1(reader) => reader.read_message_with_size_allow_reject(network).await,
+            Self::V1(reader) => reader.has_partial_frame(),
+            Self::V2(_) => false,
+        }
+    }
+
+    async fn read_message(
+        &mut self,
+        network: Network,
+        on_bytes: &mut impl FnMut(usize),
+    ) -> Result<(Option<Message>, usize, bool)> {
+        match self {
+            Self::V1(reader) => {
+                let (message, bytes) = reader
+                    .read_message_with_size_allow_reject_with_callback(network, on_bytes)
+                    .await?;
+                Ok((message, bytes, true))
+            }
             Self::V2(reader) => loop {
                 let payload = reader.read().await?;
                 if payload.packet_type() == PacketType::Decoy {
@@ -1547,10 +1569,10 @@ impl PeerReader {
                 let contents = payload.contents();
                 let bytes = contents.len().saturating_add(20);
                 if !wire::v2_message_type_is_valid(contents) {
-                    break Ok((None, bytes));
+                    break Ok((None, bytes, false));
                 }
                 let message = wire::decode_v2_message(contents)?;
-                break Ok((Some(message), bytes));
+                break Ok((Some(message), bytes, false));
             },
         }
     }
@@ -3272,6 +3294,7 @@ async fn serve_peer(
         send_headers_sent: parking_lot::Mutex::new(false),
         last_header_sent: parking_lot::Mutex::new(None),
         pending_block_relay: parking_lot::Mutex::new(Vec::new()),
+        suppressed_block_relay: parking_lot::Mutex::new(HashSet::new()),
         last_headers_request: parking_lot::Mutex::new(None),
         last_headers_request_time: parking_lot::Mutex::new(None),
         continuation_block: parking_lot::Mutex::new(None),
@@ -3331,7 +3354,7 @@ async fn serve_peer_loop(
     let fee_filter = &peer_state.fee_filter;
     let relay_transactions = &peer_state.relay_transactions;
     let height = node.chain.read().height() as i32;
-    let local_nonce = random();
+    let local_nonce = node.network_nonce;
     let mut version = if peer_state.connection_type == "private-broadcast" {
         VersionMessage {
             version: VersionMessage::PROTOCOL_VERSION,
@@ -3426,8 +3449,13 @@ async fn serve_peer_loop(
     // attempt is a protocol error and disconnects the peer.
     let mut compact_reconstruction_failed = None;
     let peer_timeout = Duration::from_secs(node.config.peer_timeout_secs);
-    let mut ping_interval = tokio::time::interval(Duration::from_secs(120));
+    // Poll frequently enough to notice Core-style mocktime jumps. The due
+    // time itself is kept in the node's clock, not Tokio's wall clock.
+    let mut ping_interval = tokio::time::interval(Duration::from_millis(100));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut next_ping_at = 0;
+    let mut handshake_timeout_interval = tokio::time::interval(Duration::from_millis(100));
+    handshake_timeout_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let addr_fetch_started_at = unix_time_seconds();
     let mut addr_fetch_interval = tokio::time::interval(Duration::from_secs(1));
     addr_fetch_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3454,10 +3482,62 @@ async fn serve_peer_loop(
         if !node.network_active() {
             anyhow::bail!("networking is disabled");
         }
+        let mut record_partial_bytes = |count| {
+            node.record_partial_bytes_received(peer_id, count);
+        };
+        let mut short_pong = false;
         let message = if let Some(items) = take_getdata_batch(&mut pending_getdata) {
             Message::GetData(items)
         } else {
             tokio::select! {
+            biased;
+            message = reader.read_message(
+                node.config.network,
+                &mut record_partial_bytes,
+            ) => {
+                let (message, bytes, bytes_accounted) = message?;
+                let Some(message) = message else {
+                    if bytes_accounted {
+                        node.record_received_message(
+                            peer_id,
+                            bytes,
+                            crate::P2P_MESSAGE_TYPE_OTHER,
+                        );
+                    } else {
+                        node.record_bytes_received(peer_id, bytes, crate::P2P_MESSAGE_TYPE_OTHER);
+                    }
+                    continue;
+                };
+                short_pong = bytes == 24 && matches!(&message, Message::Pong(0));
+                if let Some((command, count)) = oversized_vector_message(&message) {
+                    debug!("Misbehaving peer={peer_id}: {command} message size = {count}");
+                    anyhow::bail!("{command} message size = {count}");
+                }
+                if let Some((command, count)) = oversized_address_message(&message) {
+                    debug!("{command} message size = {count}");
+                    anyhow::bail!("{command} message size = {count}");
+                }
+                debug!(
+                    "received: {} ({} bytes) peer={peer_id}",
+                    message.command(),
+                    message_payload_size(&message, bytes)
+                );
+                if bytes_accounted {
+                    node.record_received_message(peer_id, bytes, message.command());
+                } else {
+                    node.record_bytes_received(peer_id, bytes, message.command());
+                }
+                node.capture_message(peer_id, true, &message)?;
+                if let Message::GetData(items) = message {
+                    pending_getdata.extend(items);
+                    let Some(items) = take_getdata_batch(&mut pending_getdata) else {
+                        continue;
+                    };
+                    Message::GetData(items)
+                } else {
+                    message
+                }
+            },
             command = commands.recv() => {
                 match command {
                     Some(PeerCommand::Disconnect) | None => anyhow::bail!("peer disconnected by node"),
@@ -3524,35 +3604,17 @@ async fn serve_peer_loop(
                     }
                 }
             }
-            message = reader.read_message(node.config.network) => {
-                let (message, bytes) = message?;
-                let Some(message) = message else {
-                    node.record_bytes_received(peer_id, bytes, crate::P2P_MESSAGE_TYPE_OTHER);
-                    continue;
-                };
-                if let Some((command, count)) = oversized_address_message(&message) {
-                    debug!("{command} message size = {count}");
-                    anyhow::bail!("{command} message size = {count}");
-                }
-                debug!(
-                    "received: {} ({} bytes) peer={peer_id}",
-                    message.command(),
-                    message_payload_size(&message, bytes)
-                );
-                node.record_bytes_received(peer_id, bytes, message.command());
-                node.capture_message(peer_id, true, &message)?;
-                if let Message::GetData(items) = message {
-                    pending_getdata.extend(items);
-                    let Some(items) = take_getdata_batch(&mut pending_getdata) else {
-                        continue;
-                    };
-                    Message::GetData(items)
-                } else {
-                    message
-                }
-            },
-            _ = ping_interval.tick(), if version_received && verack_received && peer_version > BIP31_VERSION && !*peer_state.private_broadcast_peer.lock() => {
-                if node.ping_timed_out(peer_id, peer_timeout) {
+            _ = ping_interval.tick(), if version_received && verack_received && peer_version > BIP31_VERSION && !*peer_state.private_broadcast_peer.lock() && !reader.has_partial_frame() && unix_time_seconds() >= next_ping_at => {
+                let now = unix_time_seconds();
+                next_ping_at = now.saturating_add(120);
+                if node.ping_timed_out(peer_id, PING_TIMEOUT) {
+                    let ping_wait = node
+                        .peer_infos()
+                        .into_iter()
+                        .find(|peer| peer.id == peer_id)
+                        .and_then(|peer| peer.ping_wait())
+                        .unwrap_or_else(|| PING_TIMEOUT.as_secs_f64());
+                    debug!("ping timeout: {ping_wait:.6}s");
                     anyhow::bail!("peer ping timed out");
                 }
                 let nonce = random();
@@ -3568,13 +3630,46 @@ async fn serve_peer_loop(
                 }
                 continue;
             }
-            _ = addr_fetch_interval.tick(), if peer_state.connection_type == "addr-fetch" => {
+            _ = handshake_timeout_interval.tick(), if (!version_received || !verack_received) && !reader.has_partial_frame() => {
+                let now = unix_time_seconds();
+                let connected_at = node
+                    .peer_infos()
+                    .into_iter()
+                    .find(|peer| peer.id == peer_id)
+                    .map_or(now, |peer| peer.connected_at);
+                if now.saturating_sub(connected_at) >= peer_timeout.as_secs() {
+                    let (last_send, last_recv) = node
+                        .peer_infos()
+                        .into_iter()
+                        .find(|peer| peer.id == peer_id)
+                        .map(|peer| (peer.last_send, peer.last_recv))
+                        .unwrap_or_default();
+                    if version_received {
+                        debug!("version handshake timeout, disconnecting peer={peer_id}");
+                    } else if last_send == 0 && last_recv != 0 {
+                        debug!(
+                            "socket no message in first {} seconds, never sent to peer, disconnecting peer={peer_id}",
+                            peer_timeout.as_secs()
+                        );
+                    } else if last_send == 0 && last_recv == 0 {
+                        debug!(
+                            "socket no message in first {} seconds, never received from peer, never sent to peer, disconnecting peer={peer_id}",
+                            peer_timeout.as_secs()
+                        );
+                    } else {
+                        debug!("version handshake timeout, disconnecting peer={peer_id}");
+                    }
+                    anyhow::bail!("version handshake timeout");
+                }
+                continue;
+            }
+            _ = addr_fetch_interval.tick(), if peer_state.connection_type == "addr-fetch" && !reader.has_partial_frame() => {
                 if addr_fetch_timed_out(addr_fetch_started_at, unix_time_seconds()) {
                     anyhow::bail!("addr-fetch connection timed out");
                 }
                 continue;
             }
-            _ = tx_inventory_interval.tick(), if version_received && verack_received => {
+            _ = tx_inventory_interval.tick(), if version_received && verack_received && !reader.has_partial_frame() => {
                 if *peer_state.private_broadcast_peer.lock() {
                     if peer_state.connection_type != "private-broadcast" {
                         flush_peer_transaction_requests(
@@ -3660,7 +3755,7 @@ async fn serve_peer_loop(
                 .await?;
                 continue;
             }
-            _ = block_download_interval.tick(), if version_received && verack_received => {
+            _ = block_download_interval.tick(), if version_received && verack_received && !reader.has_partial_frame() => {
                 if handle_headers_download_timeout(node, peer_id, peer_state)? {
                     request_headers(node, peer_id, writer, peer_state).await?;
                     continue;
@@ -3708,7 +3803,7 @@ async fn serve_peer_loop(
                 }
                 continue;
             }
-            _ = block_relay_interval.tick(), if version_received && verack_received && !*peer_state.private_broadcast_peer.lock() => {
+            _ = block_relay_interval.tick(), if version_received && verack_received && !*peer_state.private_broadcast_peer.lock() && !reader.has_partial_frame() => {
                 maybe_send_local_address_announcement(
                     node,
                     peer_id,
@@ -3735,9 +3830,10 @@ async fn serve_peer_loop(
             }
         };
         if !version_received && !matches!(&message, Message::Version(_)) {
-            // Core ignores application messages until VERSION has been
-            // received. In particular, a VERACK received first must not
-            // complete the handshake state prematurely.
+            debug!(
+                "non-version message before version handshake. Message \"{}\" from peer={peer_id}",
+                message.command()
+            );
             continue;
         }
         if version_received
@@ -3753,14 +3849,16 @@ async fn serve_peer_loop(
                     | Message::SendTxRcncl(_)
             )
         {
-            // Core processes only handshake extensions before VERACK; all
-            // other application messages are ignored until the connection is
-            // fully established.
+            debug!(
+                "Unsupported message \"{}\" prior to verack from peer={peer_id}",
+                message.command()
+            );
             continue;
         }
         match message {
             Message::Version(version) => {
                 if version_received {
+                    debug!("redundant version message from peer={peer_id}");
                     continue;
                 }
                 if !local_version_sent {
@@ -3779,7 +3877,9 @@ async fn serve_peer_loop(
                     anyhow::bail!("peer protocol version is too old");
                 }
                 if peer_nonce_is_self_connection(outbound, version.nonce, local_nonce) {
-                    anyhow::bail!("peer connected to itself");
+                    debug!("connected to self");
+                    debug!("disconnecting peer={peer_id}");
+                    anyhow::bail!("connected to self");
                 }
                 if peer_state.connection_type == "feeler" {
                     anyhow::bail!("feeler connection completed");
@@ -3793,10 +3893,20 @@ async fn serve_peer_loop(
                     peer_state.connection_type,
                     "outbound-full" | "block-relay-only" | "addr-fetch"
                 ) && !private_broadcast_version
-                    && !peer_services_are_desirable(
-                        version.services,
-                        approximate_best_block_depth(node),
-                    )
+                    && {
+                        let expected = desirable_peer_services(
+                            version.services,
+                            approximate_best_block_depth(node),
+                        );
+                        let acceptable = version.services & expected == expected;
+                        if !acceptable {
+                            debug!(
+                                "does not offer the expected services ({:08x} offered, {:08x} expected)",
+                                version.services, expected
+                            );
+                        }
+                        !acceptable
+                    }
                 {
                     anyhow::bail!("peer does not advertise the required services");
                 }
@@ -3858,6 +3968,10 @@ async fn serve_peer_loop(
                 }
             }
             Message::Verack => {
+                if verack_received {
+                    debug!("ignoring redundant verack message");
+                    continue;
+                }
                 verack_received = true;
                 if !version_received {
                     continue;
@@ -3928,27 +4042,6 @@ async fn serve_peer_loop(
                         "initial getheaders ({start_height}) to peer={peer_id} (startheight:{peer_start_height})"
                     );
                     request_headers(node, peer_id, writer, peer_state).await?;
-                }
-                // A peer that was connected after the local tip was mined
-                // has no block announcement queued for it by the chain-event
-                // relay task. Core's block-inventory state still advertises
-                // the current tip, allowing a node in IBD to discover a
-                // full peer even when it learned the same headers from a
-                // network-limited peer first.
-                if !node.chain.read().is_initial_block_download()
-                    && peer_state.connection_type != "addr-fetch"
-                    && peer_state.connection_type != "feeler"
-                {
-                    let tip = node.chain.read().best_hash();
-                    send_block_relay_announcement(
-                        node,
-                        peer_id,
-                        writer,
-                        peer_state,
-                        node.config.network,
-                        tip,
-                    )
-                    .await?;
                 }
                 if connection_fetches_addresses(outbound, peer_state.connection_type) {
                     send_message(
@@ -4076,18 +4169,45 @@ async fn serve_peer_loop(
                 }
             }
             Message::Pong(nonce) => {
-                if peer_version > BIP31_VERSION
-                    && node.record_pong(peer_id, nonce)
-                    && peer_state.connection_type == "private-broadcast"
-                    && let Some(transaction) = peer_state.private_broadcast_transaction.as_ref()
-                    && let Some(address) = node
-                        .peer_infos()
-                        .into_iter()
-                        .find(|peer| peer.id == peer_id)
-                        .map(|peer| peer.address)
-                {
-                    node.mark_private_broadcast_peer_ack(transaction, address);
-                    anyhow::bail!("private broadcast peer acknowledged transaction");
+                if short_pong {
+                    let expected = node.peer_ping_nonce(peer_id);
+                    debug!(
+                        "pong peer={peer_id}: Short payload, {:x} expected, 0 received, 0 bytes",
+                        expected.unwrap_or_default()
+                    );
+                    node.cancel_peer_ping(peer_id);
+                } else if peer_version > BIP31_VERSION {
+                    let expected = node.peer_ping_nonce(peer_id);
+                    if expected.is_none() {
+                        debug!(
+                            "pong peer={peer_id}: Unsolicited pong without ping, 0 expected, {nonce:x} received, 8 bytes"
+                        );
+                    } else if expected == Some(nonce) {
+                        if node.record_pong(peer_id, nonce)
+                            && peer_state.connection_type == "private-broadcast"
+                            && let Some(transaction) =
+                                peer_state.private_broadcast_transaction.as_ref()
+                            && let Some(address) = node
+                                .peer_infos()
+                                .into_iter()
+                                .find(|peer| peer.id == peer_id)
+                                .map(|peer| peer.address)
+                        {
+                            node.mark_private_broadcast_peer_ack(transaction, address);
+                            anyhow::bail!("private broadcast peer acknowledged transaction");
+                        }
+                    } else if nonce == 0 {
+                        debug!(
+                            "pong peer={peer_id}: Nonce zero, {:x} expected, 0 received, 8 bytes",
+                            expected.unwrap_or_default()
+                        );
+                        node.cancel_peer_ping(peer_id);
+                    } else {
+                        debug!(
+                            "pong peer={peer_id}: Nonce mismatch, {:x} expected, {nonce:x} received, 8 bytes",
+                            expected.unwrap_or_default()
+                        );
+                    }
                 }
             }
             Message::GetHeaders(request) => {
@@ -4174,7 +4294,8 @@ async fn serve_peer_loop(
                 // block index. A short batch can otherwise bypass the
                 // low-work synchronizer and be accepted one header at a time.
                 if !headers_are_continuous(&headers) {
-                    continue;
+                    debug!("Misbehaving peer={peer_id}: non-continuous headers sequence");
+                    anyhow::bail!("non-continuous headers sequence");
                 }
 
                 // Core checks proof of work before allowing a header batch to
@@ -4184,7 +4305,8 @@ async fn serve_peer_loop(
                     .iter()
                     .any(|header| !valid_header_pow(node.config.network, header))
                 {
-                    continue;
+                    debug!("Misbehaving peer={peer_id}: header with invalid proof of work");
+                    anyhow::bail!("header with invalid proof of work");
                 }
 
                 let mut headers_to_accept = headers;
@@ -4420,6 +4542,14 @@ async fn serve_peer_loop(
                         .collect::<Vec<_>>()
                 };
                 if !requests.is_empty() {
+                    for request in &requests {
+                        // A duplicate INV can race a connecting headers
+                        // announcement from another peer. Prefer the peer
+                        // that supplied the headers, as Core's direct-fetch
+                        // path does, instead of leaving the body owned by
+                        // the stale inventory announcer.
+                        node.clear_other_peer_block_requests(peer_id, request.hash);
+                    }
                     queue_block_requests(&mut pending_block_requests, requests);
                     flush_pending_block_requests(
                         node,
@@ -4482,18 +4612,6 @@ async fn serve_peer_loop(
                         node.update_peer_best_known_block(peer_id, item.hash);
                     }
                 }
-                let block_items = items
-                    .iter()
-                    .filter(|item| {
-                        matches!(
-                            item.kind,
-                            InventoryType::Block
-                                | InventoryType::WitnessBlock
-                                | InventoryType::CompactBlock
-                        )
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
                 let mut best_block = None;
                 let transaction_requests = {
                     let chain = node.chain.read();
@@ -4590,80 +4708,6 @@ async fn serve_peer_loop(
                         peer_state,
                         peers,
                         writer,
-                    )
-                    .await?;
-                }
-                let peer_best_known = node
-                    .peer_infos()
-                    .into_iter()
-                    .find(|peer| peer.id == peer_id)
-                    .and_then(|peer| peer.best_known_block);
-                let block_download_allowed =
-                    peer_block_download_allowed_for_node(node, peer_id, peer_services);
-                let block_requests = {
-                    let chain = node.chain.read();
-                    let peer_best_height =
-                        peer_best_known.and_then(|hash| chain.block_height_by_hash(&hash));
-                    let mut requests = Vec::new();
-                    if block_download_allowed {
-                        for announcement in &block_items {
-                            if node.block_request_in_flight(announcement.hash) {
-                                continue;
-                            }
-                            let Some(work) = chain.chain_work_by_hash(&announcement.hash) else {
-                                continue;
-                            };
-                            if work < chain.tip().work {
-                                continue;
-                            }
-                            let mut branch = Vec::new();
-                            let mut cursor = Some(announcement.hash);
-                            while let Some(hash) = cursor {
-                                if chain.is_active_block(&hash) {
-                                    break;
-                                }
-                                if !chain.store.contains(&hash) {
-                                    branch.push(hash);
-                                }
-                                cursor = chain
-                                    .header_by_hash(&hash)
-                                    .map(|header| header.prev_blockhash);
-                            }
-                            if branch.is_empty() && chain.is_active_block(&announcement.hash) {
-                                branch.push(announcement.hash);
-                            }
-                            branch.reverse();
-                            requests.extend(
-                                branch
-                                    .into_iter()
-                                    .map(|hash| Inventory {
-                                        kind: block_request_inventory_type(peer_services),
-                                        hash,
-                                    })
-                                    .filter(|request| {
-                                        chain.block_height_by_hash(&request.hash).is_some_and(
-                                            |height| {
-                                                network_limited_block_download_allowed(
-                                                    peer_services,
-                                                    peer_best_height,
-                                                    height,
-                                                )
-                                            },
-                                        )
-                                    }),
-                            );
-                        }
-                    }
-                    requests
-                };
-                if !block_requests.is_empty() {
-                    queue_block_requests(&mut pending_block_requests, block_requests);
-                    flush_pending_block_requests(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &mut pending_block_requests,
                     )
                     .await?;
                 }
@@ -5011,7 +5055,8 @@ async fn serve_peer_loop(
                 }
                 let disconnect_on_invalid =
                     !peer_state.permissions.contains(PeerPermissions::NO_BAN);
-                if handle_received_block(
+                suppress_block_relay(peer_state, hash);
+                let accepted = handle_received_block(
                     node,
                     peer_id,
                     block,
@@ -5019,8 +5064,8 @@ async fn serve_peer_loop(
                     true,
                     disconnect_on_invalid,
                 )
-                .await?
-                {
+                .await?;
+                if accepted {
                     if compact_reconstruction_failed == Some(hash) {
                         compact_reconstruction_failed = None;
                     }
@@ -5037,6 +5082,12 @@ async fn serve_peer_loop(
                         )
                         .await?;
                     }
+                    remove_pending_block_relay(peer_state, hash);
+                    if !node.chain.read().is_active_block(&hash) {
+                        unsuppress_block_relay(peer_state, hash);
+                    }
+                } else {
+                    unsuppress_block_relay(peer_state, hash);
                 }
                 // Keep the completed request marked until after chain-event
                 // relays have observed the accepted block. This prevents a
@@ -5157,6 +5208,7 @@ async fn serve_peer_loop(
                         match complete_compact_block(&compact, transactions) {
                             Ok(block) => {
                                 let block_hash = block.block_hash();
+                                suppress_block_relay(peer_state, block_hash);
                                 let was_stored = node.chain.read().store.contains(&block_hash);
                                 for transaction in &block.txdata {
                                     forget_transaction_requests(peers, transaction);
@@ -5179,6 +5231,12 @@ async fn serve_peer_loop(
                                         )
                                         .await?;
                                     }
+                                    remove_pending_block_relay(peer_state, block_hash);
+                                    if !node.chain.read().is_active_block(&block_hash) {
+                                        unsuppress_block_relay(peer_state, block_hash);
+                                    }
+                                } else {
+                                    unsuppress_block_relay(peer_state, block_hash);
                                 }
                             }
                             Err(error) => {
@@ -5392,6 +5450,7 @@ async fn serve_peer_loop(
                 match complete_compact_block(&pending.compact, pending.transactions) {
                     Ok(block) => {
                         let block_hash = block.block_hash();
+                        suppress_block_relay(peer_state, block_hash);
                         let was_stored = node.chain.read().store.contains(&block_hash);
                         for transaction in &block.txdata {
                             forget_transaction_requests(peers, transaction);
@@ -5422,7 +5481,12 @@ async fn serve_peer_loop(
                                 )
                                 .await?;
                             }
+                            remove_pending_block_relay(peer_state, block_hash);
+                            if !node.chain.read().is_active_block(&block_hash) {
+                                unsuppress_block_relay(peer_state, block_hash);
+                            }
                         } else {
+                            unsuppress_block_relay(peer_state, block_hash);
                             debug!(%block_hash, "invalid compact block completion");
                             compact_reconstruction_failed = Some(block_hash);
                             request_full_block(
@@ -5892,6 +5956,7 @@ async fn serve_peer_loop(
                 }
                 addresses.shuffle(&mut rand::rng());
                 let mut relay_addresses = Vec::new();
+                let mut added_addresses = 0;
                 for address in addresses {
                     if !node.allow_peer_address(peer_id)
                         || !peer_address_should_be_stored(address.services, approximate_depth)
@@ -5907,15 +5972,21 @@ async fn serve_peer_loop(
                             normalize_peer_address_time(u64::from(address.time), address_time);
                         let reachable = node.config.network_endpoint_is_reachable(&endpoint);
                         if reachable {
-                            node.remember_network_address_from(
+                            if node.remember_network_address_from(
                                 endpoint.clone(),
                                 address.services,
                                 time,
                                 peer_state.endpoint.clone(),
-                            );
+                            ) {
+                                added_addresses += 1;
+                            }
                         }
+                        debug!("{endpoint}");
                         relay_addresses.push((endpoint, address.services, time));
                     }
+                }
+                if added_addresses > 0 {
+                    debug!("Added {added_addresses} addresses");
                 }
                 if !suppress_relay && address_count <= 10 {
                     node.relay_peer_addresses(peer_id, relay_addresses);
@@ -5924,10 +5995,33 @@ async fn serve_peer_loop(
             Message::SendHeaders => {
                 *peer_state.send_headers.lock() = true;
             }
-            Message::CFilter(_)
-            | Message::CFHeaders(_)
-            | Message::CFCheckpt(_)
-            | Message::Unknown { .. } => {}
+            Message::CFilter(_) | Message::CFHeaders(_) | Message::CFCheckpt(_) => {}
+            Message::Unknown { command, payload } if command == "pong" => {
+                if peer_version > BIP31_VERSION {
+                    let expected = node.peer_ping_nonce(peer_id);
+                    debug!(
+                        "pong peer={peer_id}: Short payload, {:x} expected, 0 received, {} bytes",
+                        expected.unwrap_or_default(),
+                        payload.len()
+                    );
+                    node.cancel_peer_ping(peer_id);
+                }
+            }
+            Message::Unknown { command, payload } if command == "addr" || command == "addrv2" => {
+                debug!(
+                    "ProcessMessages({command}, {} bytes): Exception",
+                    payload.len()
+                );
+                if payload.is_empty() {
+                    debug!("end of data");
+                }
+                if command == "addrv2"
+                    && let Some(length) = oversized_addrv2_address_length(&payload)
+                {
+                    debug!("Address too long: {length} > 512");
+                }
+            }
+            Message::Unknown { .. } => {}
             Message::NotFound(items) => {
                 if let Some(transaction_items) = notfound_transaction_items(&items) {
                     for item in transaction_items {
@@ -7060,6 +7154,66 @@ fn oversized_address_message(message: &Message) -> Option<(&str, usize)> {
     address_message_is_oversized(count).then_some((command.as_str(), count))
 }
 
+fn oversized_vector_message(message: &Message) -> Option<(&str, usize)> {
+    let Message::Unknown { command, payload } = message else {
+        return None;
+    };
+    let limit = match command.as_str() {
+        "inv" | "getdata" => 50_000,
+        "headers" => 2_000,
+        _ => return None,
+    };
+    let mut cursor = 0;
+    let count = usize::try_from(read_compact_size_from_slice(payload, &mut cursor)?).ok()?;
+    (count > limit).then_some((command.as_str(), count))
+}
+
+fn oversized_addrv2_address_length(payload: &[u8]) -> Option<usize> {
+    let mut cursor = 0;
+    let count = read_compact_size_from_slice(payload, &mut cursor)?;
+    for _ in 0..count {
+        cursor = cursor.checked_add(4)?;
+        let _services = read_compact_size_from_slice(payload, &mut cursor)?;
+        cursor = cursor.checked_add(1)?;
+        let address_length =
+            usize::try_from(read_compact_size_from_slice(payload, &mut cursor)?).ok()?;
+        if address_length > 512 {
+            return Some(address_length);
+        }
+        cursor = cursor.checked_add(address_length + 2)?;
+        if cursor > payload.len() {
+            return None;
+        }
+    }
+    None
+}
+
+fn read_compact_size_from_slice(payload: &[u8], cursor: &mut usize) -> Option<u64> {
+    let prefix = *payload.get(*cursor)?;
+    *cursor = (*cursor).checked_add(1)?;
+    match prefix {
+        0..=252 => Some(u64::from(prefix)),
+        253 => {
+            let end = (*cursor).checked_add(2)?;
+            let bytes = payload.get(*cursor..end)?;
+            *cursor += 2;
+            Some(u64::from(u16::from_le_bytes(bytes.try_into().ok()?)))
+        }
+        254 => {
+            let end = (*cursor).checked_add(4)?;
+            let bytes = payload.get(*cursor..end)?;
+            *cursor += 4;
+            Some(u64::from(u32::from_le_bytes(bytes.try_into().ok()?)))
+        }
+        255 => {
+            let end = (*cursor).checked_add(8)?;
+            let bytes = payload.get(*cursor..end)?;
+            *cursor += 8;
+            Some(u64::from_le_bytes(bytes.try_into().ok()?))
+        }
+    }
+}
+
 #[cfg(test)]
 fn getaddr_response_limit(available: usize) -> usize {
     available
@@ -7491,13 +7645,33 @@ fn queue_block_relay_batch(peers: &PeerRegistry, hashes: &[BlockHash]) {
     }
     let recipients = peers.lock().values().cloned().collect::<Vec<_>>();
     for state in recipients {
+        let mut suppressed = state.suppressed_block_relay.lock();
         let mut pending = state.pending_block_relay.lock();
         for hash in hashes {
+            if suppressed.remove(hash) {
+                continue;
+            }
             if !pending.contains(hash) {
                 pending.push(*hash);
             }
         }
     }
+}
+
+fn remove_pending_block_relay(state: &PeerState, hash: BlockHash) {
+    state
+        .pending_block_relay
+        .lock()
+        .retain(|pending| *pending != hash);
+}
+
+fn suppress_block_relay(state: &PeerState, hash: BlockHash) {
+    state.suppressed_block_relay.lock().insert(hash);
+    remove_pending_block_relay(state, hash);
+}
+
+fn unsuppress_block_relay(state: &PeerState, hash: BlockHash) {
+    state.suppressed_block_relay.lock().remove(&hash);
 }
 
 async fn flush_pending_block_relay(
@@ -9358,6 +9532,7 @@ mod tests {
             send_headers_sent: parking_lot::Mutex::new(false),
             last_header_sent: parking_lot::Mutex::new(None),
             pending_block_relay: parking_lot::Mutex::new(Vec::new()),
+            suppressed_block_relay: parking_lot::Mutex::new(HashSet::new()),
             last_headers_request: parking_lot::Mutex::new(None),
             last_headers_request_time: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),
@@ -11799,6 +11974,7 @@ mod tests {
             send_headers_sent: parking_lot::Mutex::new(false),
             last_header_sent: parking_lot::Mutex::new(None),
             pending_block_relay: parking_lot::Mutex::new(Vec::new()),
+            suppressed_block_relay: parking_lot::Mutex::new(HashSet::new()),
             last_headers_request: parking_lot::Mutex::new(None),
             last_headers_request_time: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),

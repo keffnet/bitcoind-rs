@@ -352,10 +352,70 @@ pub async fn read_message_with_size<R: AsyncRead + Unpin>(
     Ok((decode_message(network, &frame)?, size))
 }
 
+/// A cancellation-safe v1 frame reader.  Peer processing uses `select!` to
+/// interleave socket reads with timers and commands; `read_exact` cannot be
+/// canceled halfway through a frame because the bytes already consumed would
+/// otherwise be lost.  Keep the partial frame in this reader instead.
+pub(crate) struct MessageReader<R> {
+    reader: R,
+    buffer: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> MessageReader<R> {
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buffer: Vec::new(),
+        }
+    }
+
+    pub(crate) async fn read_message_with_size_allow_reject(
+        &mut self,
+        network: Network,
+    ) -> Result<(Option<Message>, usize)> {
+        loop {
+            if self.buffer.len() >= HEADER_SIZE {
+                let length = u32::from_le_bytes(
+                    self.buffer[16..20]
+                        .try_into()
+                        .expect("v1 header has a length field"),
+                ) as usize;
+                if length > MAX_MESSAGE_SIZE {
+                    return Err(WireError::Oversized(length).into());
+                }
+                let frame_size = HEADER_SIZE + length;
+                if self.buffer.len() >= frame_size {
+                    let remainder = self.buffer.split_off(frame_size);
+                    let frame = std::mem::replace(&mut self.buffer, remainder);
+                    return match decode_message(network, &frame) {
+                        Ok(message) => Ok((Some(message), frame.len())),
+                        Err(_error) if frame_has_recoverable_error(network, &frame) => {
+                            Ok((None, frame.len()))
+                        }
+                        Err(error) => Err(error),
+                    };
+                }
+            }
+
+            let mut chunk = [0u8; 16 * 1024];
+            let count = self.reader.read(&mut chunk).await?;
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed during Bitcoin message",
+                )
+                .into());
+            }
+            self.buffer.extend_from_slice(&chunk[..count]);
+        }
+    }
+}
+
 /// Read a v1 frame while preserving Core's distinction between a recoverable
 /// message rejection and a fatal transport/framing error. Core discards a
 /// complete frame with a bad checksum or invalid command header, accounts its
 /// bytes as `*other*`, and continues reading the connection.
+#[cfg(test)]
 pub(crate) async fn read_message_with_size_allow_reject<R: AsyncRead + Unpin>(
     reader: &mut R,
     network: Network,
@@ -1234,6 +1294,41 @@ mod tests {
             .unwrap();
         assert_eq!(message, Some(Message::Pong(2)));
         assert_eq!(size, valid.len());
+    }
+
+    #[tokio::test]
+    async fn buffered_v1_reader_survives_cancellation_mid_frame() {
+        let first = encode_message(Network::Regtest, &Message::Ping(1)).unwrap();
+        let second = encode_message(Network::Regtest, &Message::Pong(2)).unwrap();
+        let (mut writer, reader) = tokio::io::duplex(first.len() + second.len());
+        writer.write_all(&first[..HEADER_SIZE + 2]).await.unwrap();
+        let mut reader = MessageReader::new(reader);
+
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(1),
+            reader.read_message_with_size_allow_reject(Network::Regtest),
+        )
+        .await;
+        assert!(timed_out.is_err());
+
+        writer.write_all(&first[HEADER_SIZE + 2..]).await.unwrap();
+        writer.write_all(&second).await.unwrap();
+        assert_eq!(
+            reader
+                .read_message_with_size_allow_reject(Network::Regtest)
+                .await
+                .unwrap()
+                .0,
+            Some(Message::Ping(1))
+        );
+        assert_eq!(
+            reader
+                .read_message_with_size_allow_reject(Network::Regtest)
+                .await
+                .unwrap()
+                .0,
+            Some(Message::Pong(2))
+        );
     }
 
     #[test]

@@ -71,7 +71,7 @@ macro_rules! peer_log {
 }
 
 enum PeerReader {
-    V1(OwnedReadHalf),
+    V1(wire::MessageReader<OwnedReadHalf>),
     V2(Box<V2Reader>),
 }
 
@@ -995,6 +995,41 @@ struct PendingTxRequest {
     key: TxRequestKey,
     item: Inventory,
     ready_at: Instant,
+    ready_at_mock: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct TxRequestMoment {
+    wall: Instant,
+    mock: Option<u64>,
+}
+
+impl TxRequestMoment {
+    fn from_deadline(deadline: Instant) -> Self {
+        let wall_now = Instant::now();
+        let delay = deadline.saturating_duration_since(wall_now);
+        Self {
+            wall: deadline,
+            mock: (crate::time::mock_time() > 0)
+                .then(|| crate::time::unix_time().saturating_add(delay.as_secs())),
+        }
+    }
+
+    fn reached(self, now: Instant) -> bool {
+        self.wall <= now
+            || self.mock.is_some_and(|deadline| {
+                crate::time::mock_time() > 0 && crate::time::unix_time() >= deadline
+            })
+    }
+
+    fn expired(self, now: Instant) -> bool {
+        now.saturating_duration_since(self.wall) >= GETDATA_TX_INTERVAL
+            || self.mock.is_some_and(|started| {
+                crate::time::mock_time() > 0
+                    && crate::time::unix_time().saturating_sub(started)
+                        >= GETDATA_TX_INTERVAL.as_secs()
+            })
+    }
 }
 
 /// The transaction-request half of Core's TxRequestTracker. Announcements are
@@ -1005,7 +1040,7 @@ struct PendingTxRequest {
 struct TxRequestState {
     pending: VecDeque<PendingTxRequest>,
     pending_keys: HashSet<TxRequestKey>,
-    in_flight: HashMap<TxRequestKey, Instant>,
+    in_flight: HashMap<TxRequestKey, TxRequestMoment>,
 }
 
 fn peer_package_retryable_error(error: &anyhow::Error) -> bool {
@@ -1084,6 +1119,7 @@ impl TxRequestState {
             key,
             item,
             ready_at,
+            ready_at_mock: TxRequestMoment::from_deadline(ready_at).mock,
         });
         self.pending_keys.insert(key);
         true
@@ -1093,6 +1129,12 @@ impl TxRequestState {
         let Some(key) = TxRequestKey::from_inventory(&item) else {
             return false;
         };
+        // A second orphan must not displace a request already sent from this
+        // peer. The request remains in flight until the response or Core's
+        // timeout, after which it can be queued again.
+        if self.in_flight.contains_key(&key) {
+            return false;
+        }
         self.remove(key);
         if self.pending.len().saturating_add(self.in_flight.len()) >= MAX_PEER_TX_ANNOUNCEMENTS {
             return false;
@@ -1101,6 +1143,7 @@ impl TxRequestState {
             key,
             item,
             ready_at,
+            ready_at_mock: TxRequestMoment::from_deadline(ready_at).mock,
         });
         self.pending_keys.insert(key);
         true
@@ -1108,17 +1151,21 @@ impl TxRequestState {
 
     fn expire(&mut self, now: Instant) {
         self.in_flight
-            .retain(|_, requested_at| now.duration_since(*requested_at) < GETDATA_TX_INTERVAL);
+            .retain(|_, requested_at| !requested_at.expired(now));
     }
 
     fn in_flight_count(&self) -> usize {
         self.in_flight.len()
     }
 
+    fn has_pending_or_in_flight(&self) -> bool {
+        !self.pending.is_empty() || !self.in_flight.is_empty()
+    }
+
     fn has_live_in_flight(&self, key: TxRequestKey, now: Instant) -> bool {
         self.in_flight
             .get(&key)
-            .is_some_and(|requested_at| now.duration_since(*requested_at) < GETDATA_TX_INTERVAL)
+            .is_some_and(|requested_at| !requested_at.expired(now))
     }
 
     fn take_ready(&mut self, now: Instant, limit: usize) -> Vec<PendingTxRequest> {
@@ -1129,7 +1176,11 @@ impl TxRequestState {
             let Some(request) = self.pending.pop_front() else {
                 break;
             };
-            if request.ready_at <= now && ready.len() < limit {
+            let ready_at = TxRequestMoment {
+                wall: request.ready_at,
+                mock: request.ready_at_mock,
+            };
+            if ready_at.reached(now) && ready.len() < limit {
                 self.pending_keys.remove(&request.key);
                 ready.push(request);
             } else {
@@ -1140,7 +1191,13 @@ impl TxRequestState {
     }
 
     fn mark_sent(&mut self, request: &PendingTxRequest, now: Instant) {
-        self.in_flight.insert(request.key, now);
+        self.in_flight.insert(
+            request.key,
+            TxRequestMoment {
+                wall: now,
+                mock: (crate::time::mock_time() > 0).then(crate::time::unix_time),
+            },
+        );
     }
 
     fn requeue(&mut self, request: PendingTxRequest, ready_at: Instant) {
@@ -1151,6 +1208,7 @@ impl TxRequestState {
             key: request.key,
             item: request.item,
             ready_at,
+            ready_at_mock: TxRequestMoment::from_deadline(ready_at).mock,
         });
         self.pending_keys.insert(request.key);
     }
@@ -1166,10 +1224,35 @@ impl TxRequestState {
             witness: false,
             hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
         });
+        // Orphan-parent requests use MSG_TX | MSG_WITNESS_FLAG: the hash is
+        // a txid, but the request key is still witness-bearing.
+        self.remove(TxRequestKey {
+            witness: true,
+            hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
+        });
         self.remove(TxRequestKey {
             witness: true,
             hash: BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
         });
+    }
+
+    fn contains_transaction(&self, transaction: &Transaction) -> bool {
+        [
+            TxRequestKey {
+                witness: false,
+                hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
+            },
+            TxRequestKey {
+                witness: true,
+                hash: BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
+            },
+            TxRequestKey {
+                witness: true,
+                hash: BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
+            },
+        ]
+        .into_iter()
+        .any(|key| self.pending_keys.contains(&key) || self.in_flight.contains_key(&key))
     }
 
     fn remove_inventory(&mut self, item: &Inventory) {
@@ -1390,7 +1473,7 @@ fn murmur_hash3(seed: u32, data: &[u8]) -> u32 {
 impl PeerReader {
     async fn read_message(&mut self, network: Network) -> Result<(Option<Message>, usize)> {
         match self {
-            Self::V1(reader) => wire::read_message_with_size_allow_reject(reader, network).await,
+            Self::V1(reader) => reader.read_message_with_size_allow_reject(network).await,
             Self::V2(reader) => loop {
                 let payload = reader.read().await?;
                 if payload.packet_type() == PacketType::Decoy {
@@ -2972,7 +3055,7 @@ fn establish_v1(
     let local_address = stream.local_addr().ok();
     let (reader, writer) = stream.into_split();
     Ok((
-        PeerReader::V1(reader),
+        PeerReader::V1(wire::MessageReader::new(reader)),
         PeerWriterKind::V1(writer),
         local_address,
         None,
@@ -3722,6 +3805,20 @@ async fn serve_peer_loop(
                 if retry_headers {
                     request_headers(node, peer_id, writer, peer_state).await?;
                 }
+                // Core's message-send pass also runs when the peer loop is
+                // woken by ordinary traffic. Functional tests use ping after
+                // advancing mocktime to drive delayed transaction requests;
+                // flush here so those deadlines do not depend on the real
+                // transaction-inventory interval.
+                flush_peer_transaction_requests(
+                    node,
+                    peer_id,
+                    peer_state,
+                    peers,
+                    writer,
+                    node.config.network,
+                )
+                .await?;
             }
             Message::Pong(nonce) => {
                 if peer_version > BIP31_VERSION
@@ -4040,6 +4137,24 @@ async fn serve_peer_loop(
                     anyhow::bail!("transaction inventory sent to a non-relaying connection");
                 }
                 let wtxid_relay = *peer_state.wtxid_relay.lock();
+                let late_orphan_transactions = items
+                    .iter()
+                    .filter_map(|item| {
+                        (item.kind.is_transaction()
+                            && node.add_orphan_inventory_announcer(
+                                item.hash,
+                                item.kind.is_witness_transaction(),
+                                peer_id,
+                            ))
+                        .then(|| {
+                            node.orphan_transaction_for_inventory(
+                                item.hash,
+                                item.kind.is_witness_transaction(),
+                            )
+                        })
+                        .flatten()
+                    })
+                    .collect::<Vec<_>>();
                 {
                     let mut known = peer_state.known_tx_inventory.lock();
                     for item in &items {
@@ -4086,6 +4201,12 @@ async fn serve_peer_loop(
                             }
                             kind if kind.is_transaction() => {
                                 if initial_block_download {
+                                    return None;
+                                }
+                                if node.orphan_has_inventory(
+                                    item.hash,
+                                    item.kind.is_witness_transaction(),
+                                ) {
                                     return None;
                                 }
                                 if node.recently_rejected_transaction(item.hash) {
@@ -4142,6 +4263,17 @@ async fn serve_peer_loop(
                     node.config.network,
                 )
                 .await?;
+                for transaction in late_orphan_transactions {
+                    queue_orphan_parent_requests(
+                        node,
+                        &transaction,
+                        peer_id,
+                        peer_state,
+                        peers,
+                        writer,
+                    )
+                    .await?;
+                }
                 if best_block
                     .is_some_and(|hash| node.headers_sync_for_block_inventory(peer_id, hash))
                 {
@@ -4973,7 +5105,41 @@ async fn serve_peer_loop(
                     anyhow::bail!("transaction sent to a non-relaying connection");
                 }
                 let txid = transaction.compute_txid();
-                forget_transaction_requests(peers, &transaction);
+                let orphan_announcers_before = node.orphan_announcers(&transaction);
+                let current_peer_requested = peer_state
+                    .tx_requests
+                    .lock()
+                    .contains_transaction(&transaction);
+                let orphan_announcers = if orphan_announcers_before.is_empty() {
+                    peers
+                        .lock()
+                        .iter()
+                        .filter_map(|(announcer_id, state)| {
+                            state
+                                .tx_requests
+                                .lock()
+                                .contains_transaction(&transaction)
+                                .then_some(*announcer_id)
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    // An existing orphan already has its initial announcers.
+                    // A transaction request for it can only be live on the
+                    // peer sending this response, because request ownership
+                    // suppresses the same key on other peers.
+                    current_peer_requested
+                        .then_some(peer_id)
+                        .into_iter()
+                        .collect()
+                };
+                if orphan_announcers_before.is_empty() {
+                    forget_transaction_requests(peers, &transaction);
+                } else {
+                    peer_state
+                        .tx_requests
+                        .lock()
+                        .remove_transaction(&transaction);
+                }
                 if node.chain.read().is_initial_block_download() {
                     continue;
                 }
@@ -5012,6 +5178,14 @@ async fn serve_peer_loop(
                                         );
                                     }
                                     Err(package_error) => {
+                                        // A rejected package is already in the recent-reject
+                                        // cache.  Drop its deferred members as well, otherwise a
+                                        // later high-fee child can be shadowed by an earlier
+                                        // rejected child when the parent is retried.
+                                        forget_peer_package_transactions(
+                                            peer_state,
+                                            &package_txids,
+                                        );
                                         debug!(
                                             %txid,
                                             %package_error,
@@ -5051,51 +5225,67 @@ async fn serve_peer_loop(
                                 peer_id,
                             );
                         }
-                        if let Some(MempoolError::MissingInput(outpoint)) =
-                            error.downcast_ref::<MempoolError>()
+                        if error
+                            .downcast_ref::<MempoolError>()
+                            .is_some_and(|error| matches!(error, MempoolError::MissingInput(_)))
                         {
-                            let parent_txid = outpoint.txid;
-                            let in_mempool = node.mempool.read().get(&parent_txid).is_some();
-                            let pending_package_parent = peer_state
-                                .pending_package_transactions
-                                .lock()
-                                .contains_key(&parent_txid);
-                            let in_chain = if in_mempool {
-                                true
-                            } else {
-                                node.chain.write().transaction(&parent_txid)?.is_some()
-                            };
-                            if !in_chain && !pending_package_parent && {
-                                let parent = Inventory {
-                                    // Orphan parent fetching uses MSG_TX
-                                    // even when wtxid relay is negotiated.
-                                    kind: InventoryType::Transaction,
-                                    hash: BlockHash::from_raw_hash(parent_txid.to_raw_hash()),
+                            if !orphan_announcers.is_empty() {
+                                node.add_orphan_announcers(&transaction, &orphan_announcers);
+                            }
+                            if !node.peer_orphan_has_rejected_parent(&transaction) {
+                                let unsolicited_orphan = orphan_announcers.is_empty()
+                                    && orphan_announcers_before.is_empty();
+                                let can_queue_unsolicited = !unsolicited_orphan
+                                    || !peer_state.tx_requests.lock().has_pending_or_in_flight();
+                                let mut announcer_ids = if can_queue_unsolicited
+                                    && orphan_announcers_before.is_empty()
+                                {
+                                    node.orphan_announcers(&transaction)
+                                } else {
+                                    Vec::new()
                                 };
-                                let delay = transaction_request_delay(
-                                    peer_state.connection_type == "outbound-full",
-                                    false,
-                                    has_wtxid_relay_peer(peers),
-                                    peer_state.tx_requests.lock().in_flight_count()
-                                        >= MAX_PEER_TX_REQUEST_IN_FLIGHT,
-                                );
-                                peer_state
-                                    .tx_requests
-                                    .lock()
-                                    .queue_force(parent, Instant::now() + delay)
-                            } {
-                                flush_peer_transaction_requests(
-                                    node,
-                                    peer_id,
-                                    peer_state,
-                                    peers,
-                                    writer,
-                                    node.config.network,
-                                )
-                                .await?;
+                                if announcer_ids.is_empty()
+                                    && orphan_announcers_before.is_empty()
+                                    && can_queue_unsolicited
+                                {
+                                    announcer_ids.push(peer_id);
+                                }
+                                let announcer_states = announcer_ids
+                                    .into_iter()
+                                    .filter_map(|announcer_id| {
+                                        peers
+                                            .lock()
+                                            .get(&announcer_id)
+                                            .cloned()
+                                            .map(|state| (announcer_id, state))
+                                    })
+                                    .collect::<Vec<_>>();
+                                for (announcer_id, announcer_state) in announcer_states {
+                                    queue_orphan_parent_requests(
+                                        node,
+                                        &transaction,
+                                        announcer_id,
+                                        &announcer_state,
+                                        peers,
+                                        &announcer_state.writer,
+                                    )
+                                    .await?;
+                                }
                             }
                         }
-                        debug!(%txid, %error, "rejected peer transaction");
+                        let reject_reason = error
+                            .downcast_ref::<MempoolError>()
+                            .map(|error| match error {
+                                MempoolError::MissingInput(_) => "bad-txns-inputs-missingorspent",
+                                _ => "",
+                            })
+                            .unwrap_or("");
+                        debug!(
+                            %txid,
+                            %error,
+                            reject_reason,
+                            "rejected peer transaction"
+                        );
                     }
                 }
                 flush_peer_transaction_requests(
@@ -6318,6 +6508,77 @@ async fn flush_peer_transaction_requests(
         requests.push(candidate.item);
     }
     send_getdata_batches(node, peer_id, writer, network, &requests).await
+}
+
+async fn queue_orphan_parent_requests(
+    node: &Arc<Node>,
+    transaction: &Transaction,
+    peer_id: usize,
+    peer_state: &PeerState,
+    peers: &PeerRegistry,
+    writer: &PeerWriter,
+) -> Result<()> {
+    let mut parent_txids = HashSet::new();
+    let mut queued_parent = false;
+    let mut retryable_rejected_parent_count = 0usize;
+    for input in &transaction.input {
+        let parent_txid = input.previous_output.txid;
+        if parent_txids.insert(parent_txid)
+            && node
+                .recently_rejected_transaction(BlockHash::from_raw_hash(parent_txid.to_raw_hash()))
+        {
+            retryable_rejected_parent_count = retryable_rejected_parent_count.saturating_add(1);
+        }
+    }
+    if retryable_rejected_parent_count >= 2 {
+        // Opportunistic package relay is defined for one parent and one
+        // child. Once two distinct parents are already known to have been
+        // rejected for retryable policy, requesting either one cannot produce
+        // a valid 1p1c retry and only creates needless traffic.
+        return Ok(());
+    }
+    parent_txids.clear();
+    let has_wtxid_peer = has_wtxid_relay_peer(peers);
+    let delay = transaction_request_delay(
+        peer_state.connection_type == "outbound-full",
+        false,
+        has_wtxid_peer,
+        peer_state.tx_requests.lock().in_flight_count() >= MAX_PEER_TX_REQUEST_IN_FLIGHT,
+    );
+    let ready_at = Instant::now() + delay;
+    for input in &transaction.input {
+        let parent_txid = input.previous_output.txid;
+        if !parent_txids.insert(parent_txid)
+            || node.mempool.read().get(&parent_txid).is_some()
+            || node.recently_confirmed_transaction(parent_txid)
+            || node.orphan_nonwitness_transaction_by_txid(parent_txid)
+            || peer_state
+                .pending_package_transactions
+                .lock()
+                .contains_key(&parent_txid)
+        {
+            continue;
+        }
+        let parent = Inventory {
+            // Parent requests are keyed by txid but carry witness data,
+            // matching Core's MSG_TX | MSG_WITNESS_FLAG fetch type.
+            kind: InventoryType::LegacyWitnessTransaction,
+            hash: BlockHash::from_raw_hash(parent_txid.to_raw_hash()),
+        };
+        queued_parent |= peer_state.tx_requests.lock().queue_force(parent, ready_at);
+    }
+    if queued_parent {
+        flush_peer_transaction_requests(
+            node,
+            peer_id,
+            peer_state,
+            peers,
+            writer,
+            node.config.network,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn flush_peer_transaction_inventory(

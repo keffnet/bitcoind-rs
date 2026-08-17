@@ -41,6 +41,7 @@ const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const SNAPSHOT_INTERVAL: u32 = 1_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
 const MAX_BASIC_FILTER_CACHE_ENTRIES: usize = 256;
+const MAX_MISSING_UTXO_CACHE_ENTRIES: usize = 8_192;
 // Core's default validation cache is 32 MiB. A compact 32-byte digest plus
 // hash-table/deque bookkeeping is accounted for as roughly 64 bytes here.
 const DEFAULT_SCRIPT_CACHE_ENTRIES: usize = (32 * 1024 * 1024) / 64;
@@ -93,6 +94,36 @@ struct ChainTxData {
     time: i64,
     tx_count: u64,
     tx_rate: f64,
+}
+
+#[derive(Default)]
+struct MissingUtxoCache {
+    entries: HashSet<OutPoint>,
+    order: VecDeque<OutPoint>,
+}
+
+impl MissingUtxoCache {
+    fn contains(&self, outpoint: &OutPoint) -> bool {
+        self.entries.contains(outpoint)
+    }
+
+    fn insert(&mut self, outpoint: OutPoint) {
+        if !self.entries.insert(outpoint) {
+            return;
+        }
+        self.order.push_back(outpoint);
+        while self.order.len() > MAX_MISSING_UTXO_CACHE_ENTRIES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+    }
+
+    fn remove(&mut self, outpoint: &OutPoint) {
+        if self.entries.remove(outpoint) {
+            self.order.retain(|queued| queued != outpoint);
+        }
+    }
 }
 
 /// A hardcoded UTXO commitment from Bitcoin Core v31.1's chain parameters.
@@ -826,6 +857,7 @@ pub struct ChainState {
     filter_store: FilterStore,
     chainstate_store: ChainstateStore,
     utxo_store: UtxoStore,
+    missing_utxo_cache: Mutex<MissingUtxoCache>,
     electrum_history_store: ElectrumHistoryStore,
     blockfilter_index_enabled: bool,
     tx_index_all_enabled: bool,
@@ -1264,6 +1296,7 @@ impl ChainState {
             filter_store,
             chainstate_store,
             utxo_store,
+            missing_utxo_cache: Mutex::new(MissingUtxoCache::default()),
             electrum_history_store,
             blockfilter_index_enabled,
             tx_index_all_enabled,
@@ -2688,6 +2721,13 @@ impl ChainState {
             return false;
         }
 
+        // A retained side branch can have more work than the selected header
+        // tip while headers are still being reconciled. Core treats that
+        // branch as ineligible here; do not subtract the work values in the
+        // opposite order because Work's debug subtraction is checked.
+        if node.chain_work > best_node.chain_work {
+            return false;
+        }
         let work_delta = best_node.chain_work - node.chain_work;
         let tip_proof = BigUint::from_bytes_be(&best_node.header.work().to_be_bytes());
         if tip_proof == BigUint::from(0u8) {
@@ -3737,11 +3777,18 @@ impl ChainState {
     }
 
     pub fn utxo_checked(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>> {
-        Ok(self
+        if self.missing_utxo_cache.lock().contains(outpoint) {
+            return Ok(None);
+        }
+        let entry = self
             .utxo_store
             .get(outpoint)?
             .map(Self::decoded_utxo)
-            .or_else(|| self.utxos.get(outpoint).cloned()))
+            .or_else(|| self.utxos.get(outpoint).cloned());
+        if entry.is_none() {
+            self.missing_utxo_cache.lock().insert(*outpoint);
+        }
+        Ok(entry)
     }
 
     pub fn all_utxos(&self) -> impl Iterator<Item = (OutPoint, UtxoEntry)> {
@@ -6743,6 +6790,7 @@ impl ChainState {
     }
 
     fn insert_utxo(&mut self, outpoint: OutPoint, entry: UtxoEntry) {
+        self.missing_utxo_cache.lock().remove(&outpoint);
         if self.utxos_materialized {
             if self.utxos.contains_key(&outpoint) {
                 self.remove_utxo(&outpoint);
@@ -7626,6 +7674,7 @@ fn open_background_replay_state(
         filter_store,
         chainstate_store,
         utxo_store,
+        missing_utxo_cache: Mutex::new(MissingUtxoCache::default()),
         electrum_history_store,
         blockfilter_index_enabled: false,
         tx_index_all_enabled: false,

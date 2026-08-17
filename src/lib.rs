@@ -87,12 +87,13 @@ use crate::mempool::{
     Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
 };
 
-const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 // Core assigns live peer IDs from zero. Address-manager entries use a
 // separate sentinel so peer 0 remains distinguishable from an unconnected
 // address.
 const UNCONNECTED_PEER_ID: usize = usize::MAX;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
+const MAX_ORPHANAGE_LATENCY_SCORE: usize = 3_000;
+const RESERVED_ORPHAN_WEIGHT_PER_PEER: u64 = 404_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_RECENTLY_REJECTED_TRANSACTIONS: usize = 4_096;
 const MAX_KNOWN_ADDRESSES: usize = 256_000;
@@ -276,6 +277,7 @@ struct CompactExtraTransactions {
 /// requests can still bypass it.
 struct RecentlyRejectedTransactions {
     hashes: HashSet<BlockHash>,
+    non_retryable: HashSet<BlockHash>,
     order: VecDeque<BlockHash>,
 }
 
@@ -283,22 +285,44 @@ impl RecentlyRejectedTransactions {
     fn new() -> Self {
         Self {
             hashes: HashSet::new(),
+            non_retryable: HashSet::new(),
             order: VecDeque::new(),
         }
     }
 
-    fn insert(&mut self, transaction: &Transaction) {
-        for hash in [
-            BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
-            BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
-        ] {
+    fn insert(&mut self, transaction: &Transaction, include_txid: bool) {
+        self.insert_with_kind(transaction, include_txid, false);
+    }
+
+    fn insert_non_retryable(&mut self, transaction: &Transaction, include_txid: bool) {
+        self.insert_with_kind(transaction, include_txid, true);
+    }
+
+    fn insert_with_kind(
+        &mut self,
+        transaction: &Transaction,
+        include_txid: bool,
+        non_retryable: bool,
+    ) {
+        let wtxid = BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash());
+        let txid = BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash());
+        let hashes = if include_txid && txid != wtxid {
+            vec![txid, wtxid]
+        } else {
+            vec![wtxid]
+        };
+        for hash in hashes {
             if self.hashes.insert(hash) {
                 self.order.push_back(hash);
+            }
+            if non_retryable {
+                self.non_retryable.insert(hash);
             }
         }
         while self.order.len() > MAX_RECENTLY_REJECTED_TRANSACTIONS.saturating_mul(2) {
             if let Some(hash) = self.order.pop_front() {
                 self.hashes.remove(&hash);
+                self.non_retryable.remove(&hash);
             }
         }
     }
@@ -311,11 +335,16 @@ impl RecentlyRejectedTransactions {
             if self.hashes.remove(&hash) {
                 self.order.retain(|queued| *queued != hash);
             }
+            self.non_retryable.remove(&hash);
         }
     }
 
     fn contains(&self, hash: BlockHash) -> bool {
         self.hashes.contains(&hash)
+    }
+
+    fn contains_non_retryable(&self, hash: BlockHash) -> bool {
+        self.non_retryable.contains(&hash)
     }
 }
 
@@ -580,9 +609,9 @@ struct OrphanEntry {
 
 #[derive(Default)]
 struct OrphanPool {
-    entries: HashMap<Txid, OrphanEntry>,
-    by_prevout: HashMap<OutPoint, HashSet<Txid>>,
-    insertion_order: VecDeque<Txid>,
+    entries: HashMap<Wtxid, OrphanEntry>,
+    by_prevout: HashMap<OutPoint, HashSet<Wtxid>>,
+    insertion_order: VecDeque<Wtxid>,
 }
 
 impl OrphanPool {
@@ -597,9 +626,11 @@ impl OrphanPool {
 
     fn add_entry(&mut self, entry: OrphanEntry) -> bool {
         self.prune_expired();
-        let txid = entry.transaction.compute_txid();
-        if let Some(existing) = self.entries.get_mut(&txid) {
-            existing.announcers.extend(entry.announcers);
+        let wtxid = entry.transaction.compute_wtxid();
+        if let Some(existing) = self.entries.get_mut(&wtxid) {
+            for peer_id in entry.announcers {
+                existing.announcers.insert(peer_id);
+            }
             return false;
         }
         if entry.transaction.weight().to_wu() > MAX_ORPHAN_TRANSACTION_WEIGHT
@@ -611,59 +642,150 @@ impl OrphanPool {
             self.by_prevout
                 .entry(input.previous_output)
                 .or_default()
-                .insert(txid);
+                .insert(wtxid);
         }
-        self.entries.insert(txid, entry);
-        self.insertion_order.push_back(txid);
-        while self.entries.len() > MAX_ORPHAN_TRANSACTIONS {
-            let Some(oldest) = self.insertion_order.pop_front() else {
-                break;
-            };
-            self.remove(&oldest);
-        }
+        self.entries.insert(wtxid, entry);
+        self.insertion_order.push_back(wtxid);
+        self.limit_orphans();
         true
     }
 
-    fn remove(&mut self, txid: &Txid) -> Option<OrphanEntry> {
-        let entry = self.entries.remove(txid)?;
+    fn add_announcers(&mut self, transaction: &Transaction, peer_ids: &[usize]) -> bool {
+        self.prune_expired();
+        let Some(entry) = self.entries.get_mut(&transaction.compute_wtxid()) else {
+            return false;
+        };
+        let mut added = false;
+        for peer_id in peer_ids {
+            added |= entry.announcers.insert(*peer_id);
+        }
+        added
+    }
+
+    fn announcers(&mut self, transaction: &Transaction) -> Vec<usize> {
+        self.prune_expired();
+        let Some(entry) = self.entries.get(&transaction.compute_wtxid()) else {
+            return Vec::new();
+        };
+        let mut peer_ids = entry.announcers.iter().copied().collect::<Vec<_>>();
+        peer_ids.sort_unstable();
+        peer_ids
+    }
+
+    fn add_inventory_announcer(&mut self, hash: BlockHash, witness: bool, peer_id: usize) -> bool {
+        self.prune_expired();
+        let matching_wtxids = if witness {
+            let wtxid = Wtxid::from_byte_array(hash.to_byte_array());
+            self.entries
+                .contains_key(&wtxid)
+                .then_some(wtxid)
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            let txid = Txid::from_byte_array(hash.to_byte_array());
+            self.entries
+                .iter()
+                .filter_map(|(wtxid, entry)| {
+                    (entry.transaction.compute_txid() == txid).then_some(*wtxid)
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut added = false;
+        for wtxid in matching_wtxids {
+            if let Some(entry) = self.entries.get_mut(&wtxid) {
+                added |= entry.announcers.insert(peer_id);
+            }
+        }
+        added
+    }
+
+    fn has_inventory(&mut self, hash: BlockHash, witness: bool) -> bool {
+        self.prune_expired();
+        if witness {
+            return self
+                .entries
+                .contains_key(&Wtxid::from_byte_array(hash.to_byte_array()));
+        }
+        let txid = Txid::from_byte_array(hash.to_byte_array());
+        self.entries.values().any(|entry| {
+            let transaction = &entry.transaction;
+            transaction.compute_txid() == txid
+                && transaction.compute_txid().to_raw_hash()
+                    == transaction.compute_wtxid().to_raw_hash()
+        })
+    }
+
+    fn transaction_for_inventory(&mut self, hash: BlockHash, witness: bool) -> Option<Transaction> {
+        self.prune_expired();
+        if witness {
+            return self
+                .entries
+                .get(&Wtxid::from_byte_array(hash.to_byte_array()))
+                .map(|entry| entry.transaction.clone());
+        }
+        let txid = Txid::from_byte_array(hash.to_byte_array());
+        self.entries
+            .values()
+            .find(|entry| entry.transaction.compute_txid() == txid)
+            .map(|entry| entry.transaction.clone())
+    }
+
+    fn remove(&mut self, wtxid: &Wtxid) -> Option<OrphanEntry> {
+        let entry = self.entries.remove(wtxid)?;
         for input in &entry.transaction.input {
             if let Some(children) = self.by_prevout.get_mut(&input.previous_output) {
-                children.remove(txid);
+                children.remove(wtxid);
                 if children.is_empty() {
                     self.by_prevout.remove(&input.previous_output);
                 }
             }
         }
+        self.insertion_order.retain(|queued| queued != wtxid);
         Some(entry)
+    }
+
+    fn remove_announcement(&mut self, wtxid: &Wtxid, peer_id: usize) -> bool {
+        let remove_transaction = match self.entries.get_mut(wtxid) {
+            Some(entry) => {
+                entry.announcers.remove(&peer_id);
+                entry.announcers.is_empty()
+            }
+            None => return false,
+        };
+        if remove_transaction {
+            self.remove(wtxid);
+        }
+        true
     }
 
     fn take_children(&mut self, parent: &Transaction) -> Vec<OrphanEntry> {
         self.prune_expired();
         let parent_txid = parent.compute_txid();
-        let mut txids = HashSet::new();
+        let mut wtxids = HashSet::new();
         for vout in 0..parent.output.len() {
             let outpoint = OutPoint::new(parent_txid, vout as u32);
             if let Some(children) = self.by_prevout.get(&outpoint) {
-                txids.extend(children.iter().copied());
+                wtxids.extend(children.iter().copied());
             }
         }
-        let mut txids: Vec<_> = txids.into_iter().collect();
-        txids.sort_by_key(ToString::to_string);
-        txids
+        let mut wtxids: Vec<_> = wtxids.into_iter().collect();
+        wtxids.sort_by_key(ToString::to_string);
+        wtxids
             .into_iter()
-            .filter_map(|txid| self.remove(&txid))
+            .filter_map(|wtxid| self.remove(&wtxid))
             .collect()
     }
 
     fn erase_for_peer(&mut self, peer_id: usize) {
-        let txids: Vec<_> = self
+        let wtxids: Vec<_> = self
             .entries
             .iter()
-            .filter_map(|(txid, entry)| entry.announcers.contains(&peer_id).then_some(*txid))
+            .filter_map(|(wtxid, entry)| entry.announcers.contains(&peer_id).then_some(*wtxid))
             .collect();
-        for txid in txids {
-            self.remove(&txid);
+        for wtxid in wtxids {
+            self.remove_announcement(&wtxid, peer_id);
         }
+        self.limit_orphans();
     }
 
     fn transactions(&mut self) -> Vec<OrphanTransaction> {
@@ -685,26 +807,49 @@ impl OrphanPool {
     }
 
     fn erase_for_block(&mut self, block: &Block) {
-        let mut txids = HashSet::new();
+        let mut wtxids = HashSet::new();
         for transaction in &block.txdata {
-            let transaction_id = transaction.compute_txid();
+            let transaction_id = transaction.compute_wtxid();
             if self.entries.contains_key(&transaction_id) {
-                txids.insert(transaction_id);
+                wtxids.insert(transaction_id);
             }
             for input in &transaction.input {
                 if let Some(children) = self.by_prevout.get(&input.previous_output) {
-                    txids.extend(children.iter().copied());
+                    wtxids.extend(children.iter().copied());
                 }
             }
         }
-        for txid in txids {
-            self.remove(&txid);
+        for wtxid in wtxids {
+            self.remove(&wtxid);
         }
+        self.limit_orphans();
     }
 
     fn len(&mut self) -> usize {
         self.prune_expired();
         self.entries.len()
+    }
+
+    fn contains_txid(&mut self, txid: Txid) -> bool {
+        self.prune_expired();
+        self.entries
+            .values()
+            .any(|entry| entry.transaction.compute_txid() == txid)
+    }
+
+    fn contains_wtxid(&mut self, wtxid: Wtxid) -> bool {
+        self.prune_expired();
+        self.entries.contains_key(&wtxid)
+    }
+
+    fn contains_nonwitness_txid(&mut self, txid: Txid) -> bool {
+        self.prune_expired();
+        self.entries.values().any(|entry| {
+            let transaction = &entry.transaction;
+            transaction.compute_txid() == txid
+                && transaction.compute_txid().to_raw_hash()
+                    == transaction.compute_wtxid().to_raw_hash()
+        })
     }
 
     fn prune_expired(&mut self) {
@@ -718,6 +863,79 @@ impl OrphanPool {
             }
             self.insertion_order.pop_front();
             self.remove(&txid);
+        }
+    }
+
+    fn total_weight(&self) -> u64 {
+        self.entries
+            .values()
+            .map(|entry| entry.transaction.weight().to_wu())
+            .sum()
+    }
+
+    fn total_latency_score(&self) -> usize {
+        self.entries
+            .values()
+            .map(|entry| 1 + entry.transaction.input.len() / 10)
+            .sum()
+    }
+
+    fn peer_stats(&self) -> HashMap<usize, (u64, usize)> {
+        let mut stats = HashMap::new();
+        for entry in self.entries.values() {
+            let weight = entry.transaction.weight().to_wu();
+            let latency = 1 + entry.transaction.input.len() / 10;
+            for peer_id in &entry.announcers {
+                let peer = stats.entry(*peer_id).or_insert((0u64, 0usize));
+                peer.0 = peer.0.saturating_add(weight);
+                peer.1 = peer.1.saturating_add(latency);
+            }
+        }
+        stats
+    }
+
+    fn limit_orphans(&mut self) {
+        loop {
+            let stats = self.peer_stats();
+            let peer_count = stats.len().max(1) as u64;
+            let max_global_weight = RESERVED_ORPHAN_WEIGHT_PER_PEER.saturating_mul(peer_count);
+            if self.total_latency_score() <= MAX_ORPHANAGE_LATENCY_SCORE
+                && self.total_weight() <= max_global_weight
+            {
+                return;
+            }
+
+            let max_peer_latency = (MAX_ORPHANAGE_LATENCY_SCORE / stats.len().max(1)).max(1);
+            let Some((&worst_peer, _)) =
+                stats.iter().max_by(|(left_id, left), (right_id, right)| {
+                    let left_score = (left.0 as u128)
+                        .saturating_mul(max_peer_latency as u128)
+                        .max(
+                            (left.1 as u128)
+                                .saturating_mul(RESERVED_ORPHAN_WEIGHT_PER_PEER as u128),
+                        );
+                    let right_score = (right.0 as u128)
+                        .saturating_mul(max_peer_latency as u128)
+                        .max(
+                            (right.1 as u128)
+                                .saturating_mul(RESERVED_ORPHAN_WEIGHT_PER_PEER as u128),
+                        );
+                    left_score
+                        .cmp(&right_score)
+                        .then_with(|| left_id.cmp(right_id))
+                })
+            else {
+                return;
+            };
+
+            let Some(wtxid) = self.insertion_order.iter().copied().find(|wtxid| {
+                self.entries
+                    .get(wtxid)
+                    .is_some_and(|entry| entry.announcers.contains(&worst_peer))
+            }) else {
+                return;
+            };
+            self.remove_announcement(&wtxid, worst_peer);
         }
     }
 }
@@ -2195,6 +2413,17 @@ impl Node {
         peer_id: usize,
         transaction: Transaction,
     ) -> Result<Txid> {
+        // Repeated announcements of the same orphan are common during relay
+        // storms. The first admission already established that its inputs are
+        // missing; rerunning full mempool validation for every announcer only
+        // serializes the peer workers on the mempool lock. Refresh the
+        // announcer set and return the same admission result instead.
+        if !transaction.input.is_empty()
+            && self.orphan_transaction_by_wtxid(transaction.compute_wtxid())
+        {
+            self.orphans.lock().add(transaction.clone(), Some(peer_id));
+            return Err(MempoolError::MissingInput(transaction.input[0].previous_output).into());
+        }
         match self.try_accept_transaction(transaction.clone()) {
             Ok((txid, _)) => {
                 self.notify_mempool_transaction_from_peer(transaction, peer_id);
@@ -2202,17 +2431,114 @@ impl Node {
             }
             Err(error @ MempoolError::MissingInput(_)) => {
                 self.add_compact_extra_transaction(transaction.clone());
-                self.orphans.lock().add(transaction, Some(peer_id));
+                if self.peer_orphan_has_rejected_parent(&transaction) {
+                    // A child of a non-retryable rejected parent inherits the
+                    // reject filter entry so descendants cannot be retained
+                    // as orphans and repeatedly re-request this child.
+                    self.recently_rejected_transactions
+                        .lock()
+                        .insert_non_retryable(&transaction, true);
+                } else {
+                    self.orphans.lock().add(transaction, Some(peer_id));
+                }
                 Err(error.into())
             }
             Err(error) => {
                 self.add_compact_extra_transaction(transaction.clone());
-                self.recently_rejected_transactions
-                    .lock()
-                    .insert(&transaction);
+                self.cache_peer_rejection(&transaction, &error);
                 Err(error.into())
             }
         }
+    }
+
+    fn cache_peer_rejection(&self, transaction: &Transaction, error: &MempoolError) {
+        // Missing-input results are retryable by definition and are not
+        // entries in Core's recent-reject filter. This also matters for a
+        // failed package containing an orphan parent: that parent remains
+        // reconsiderable from the orphanage.
+        if matches!(error, MempoolError::MissingInput(_)) {
+            return;
+        }
+        // A txid is safe to cache only when policy failure is independent of
+        // witness data.  Core otherwise caches the wtxid so a different
+        // witness can still be downloaded and tried by txid.
+        let stripped_witness = matches!(error, MempoolError::Script(_))
+            && transaction
+                .input
+                .iter()
+                .all(|input| input.witness.is_empty())
+            && transaction
+                .input
+                .iter()
+                .any(|input| self.spends_witness_program(input.previous_output));
+        if stripped_witness {
+            return;
+        }
+        let include_txid = transaction.compute_txid().to_raw_hash()
+            == transaction.compute_wtxid().to_raw_hash()
+            || matches!(
+                error,
+                MempoolError::NonStandard(reason)
+                    if reason == "bad-txns-nonstandard-inputs"
+            );
+        let retryable = matches!(
+            error,
+            MempoolError::FeeRate
+                | MempoolError::MinRelayFee
+                | MempoolError::Full
+                | MempoolError::ReplacementFee
+                | MempoolError::ReplacementFeerateDiagram
+        );
+        if retryable {
+            self.recently_rejected_transactions
+                .lock()
+                .insert(transaction, include_txid);
+        } else {
+            self.recently_rejected_transactions
+                .lock()
+                .insert_non_retryable(transaction, include_txid);
+        }
+    }
+
+    fn spends_witness_program(&self, outpoint: OutPoint) -> bool {
+        if let Some(is_witness) = self
+            .mempool
+            .read()
+            .get(&outpoint.txid)
+            .and_then(|entry| entry.transaction.output.get(outpoint.vout as usize))
+            .map(|output| output.script_pubkey.is_witness_program())
+        {
+            return is_witness;
+        }
+        self.chain
+            .read()
+            .utxo(&outpoint)
+            .is_some_and(|entry| entry.output.script_pubkey.is_witness_program())
+    }
+
+    pub(crate) fn peer_orphan_has_rejected_parent(&self, transaction: &Transaction) -> bool {
+        let rejected = self.recently_rejected_transactions.lock();
+        transaction.input.iter().any(|input| {
+            let parent_txid = input.previous_output.txid;
+            if !rejected.contains_non_retryable(BlockHash::from_raw_hash(parent_txid.to_raw_hash()))
+            {
+                return false;
+            }
+            let available = self
+                .mempool
+                .read()
+                .get(&parent_txid)
+                .and_then(|entry| {
+                    entry
+                        .transaction
+                        .output
+                        .get(input.previous_output.vout as usize)
+                })
+                .is_some()
+                || self.chain.read().utxo(&input.previous_output).is_some();
+            let in_orphanage = self.orphan_transaction_by_txid(parent_txid);
+            !available && !in_orphanage
+        })
     }
 
     /// Accept a package received from a peer and publish the same mempool
@@ -2234,9 +2560,8 @@ impl Node {
         let txids = match result {
             Ok(txids) => txids,
             Err(error) => {
-                let mut rejected = self.recently_rejected_transactions.lock();
                 for transaction in transactions {
-                    rejected.insert(transaction);
+                    self.cache_peer_rejection(transaction, &error);
                 }
                 return Err(error.into());
             }
@@ -2263,7 +2588,7 @@ impl Node {
         {
             let mut orphans = self.orphans.lock();
             for transaction in transactions {
-                orphans.remove(&transaction.compute_txid());
+                orphans.remove(&transaction.compute_wtxid());
             }
         }
         for transaction in transactions {
@@ -2285,6 +2610,60 @@ impl Node {
 
     pub(crate) fn recently_rejected_transaction(&self, hash: BlockHash) -> bool {
         self.recently_rejected_transactions.lock().contains(hash)
+    }
+
+    pub(crate) fn recently_confirmed_transaction(&self, txid: Txid) -> bool {
+        let chain = self.chain.read();
+        chain
+            .transaction_location(&txid)
+            .is_some_and(|location| location.height >= chain.height().saturating_sub(1))
+    }
+
+    pub(crate) fn orphan_transaction_by_txid(&self, txid: Txid) -> bool {
+        self.orphans.lock().contains_txid(txid)
+    }
+
+    pub(crate) fn orphan_transaction_by_wtxid(&self, wtxid: Wtxid) -> bool {
+        self.orphans.lock().contains_wtxid(wtxid)
+    }
+
+    pub(crate) fn orphan_nonwitness_transaction_by_txid(&self, txid: Txid) -> bool {
+        self.orphans.lock().contains_nonwitness_txid(txid)
+    }
+
+    pub(crate) fn add_orphan_announcers(
+        &self,
+        transaction: &Transaction,
+        peer_ids: &[usize],
+    ) -> bool {
+        self.orphans.lock().add_announcers(transaction, peer_ids)
+    }
+
+    pub(crate) fn orphan_announcers(&self, transaction: &Transaction) -> Vec<usize> {
+        self.orphans.lock().announcers(transaction)
+    }
+
+    pub(crate) fn add_orphan_inventory_announcer(
+        &self,
+        hash: BlockHash,
+        witness: bool,
+        peer_id: usize,
+    ) -> bool {
+        self.orphans
+            .lock()
+            .add_inventory_announcer(hash, witness, peer_id)
+    }
+
+    pub(crate) fn orphan_has_inventory(&self, hash: BlockHash, witness: bool) -> bool {
+        self.orphans.lock().has_inventory(hash, witness)
+    }
+
+    pub(crate) fn orphan_transaction_for_inventory(
+        &self,
+        hash: BlockHash,
+        witness: bool,
+    ) -> Option<Transaction> {
+        self.orphans.lock().transaction_for_inventory(hash, witness)
     }
 
     pub fn orphan_count(&self) -> usize {
@@ -2530,7 +2909,7 @@ impl Node {
         excluded_peers: Vec<usize>,
     ) {
         let txid = transaction.compute_txid();
-        self.orphans.lock().remove(&txid);
+        self.orphans.lock().remove(&transaction.compute_wtxid());
         self.announce_mempool_transaction(txid);
         self.announce_peer_mempool_transaction(txid, excluded_peers);
         self.promote_orphans_for_parent(&transaction);

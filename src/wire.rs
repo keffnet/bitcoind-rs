@@ -7,7 +7,9 @@
 use std::io::Cursor;
 
 use anyhow::{Result, bail};
+use bitcoin::absolute::LockTime;
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
+use bitcoin::blockdata::transaction::Version;
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_bloom::{FilterAdd, FilterLoad};
@@ -767,6 +769,29 @@ fn v2_message_command(message_type: u8) -> Option<&'static str> {
     })
 }
 
+/// Decode transactions using the ambiguity rule from Core's
+/// `UnserializeTransaction`. In particular, a transaction with zero inputs,
+/// zero outputs, and a four-byte locktime is a valid legacy transaction. The
+/// bitcoin crate interprets the second zero as a SegWit flag and rejects it,
+/// but Core treats it as the output count in this case.
+fn decode_transaction_core_compatible(payload: &[u8]) -> Result<Transaction, WireError> {
+    if payload.len() == 10 && payload[4] == 0 && payload[5] == 0 {
+        return Ok(Transaction {
+            version: Version::non_standard(i32::from_le_bytes(
+                payload[..4].try_into().expect("transaction version length"),
+            )),
+            lock_time: LockTime::from_consensus(u32::from_le_bytes(
+                payload[6..]
+                    .try_into()
+                    .expect("transaction locktime length"),
+            )),
+            input: Vec::new(),
+            output: Vec::new(),
+        });
+    }
+    deserialize(payload).map_err(payload_error)
+}
+
 fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
     let mut reader = Reader::new(payload);
     let message = match command {
@@ -801,7 +826,7 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
         "notfound" => Message::NotFound(decode_inventory(&mut reader)?),
         "block" => Message::Block(deserialize(payload).map_err(payload_error)?),
         "merkleblock" => Message::MerkleBlock(deserialize(payload).map_err(payload_error)?),
-        "tx" => Message::Transaction(deserialize(payload).map_err(payload_error)?),
+        "tx" => Message::Transaction(decode_transaction_core_compatible(payload)?),
         "filterload" => Message::FilterLoad(deserialize(payload).map_err(payload_error)?),
         "filteradd" => Message::FilterAdd(deserialize(payload).map_err(payload_error)?),
         "filterclear" => Message::FilterClear,
@@ -1289,6 +1314,21 @@ mod tests {
             decode_message(Network::Regtest, &frame).unwrap(),
             Message::Headers(vec![header])
         );
+    }
+
+    #[test]
+    fn decodes_core_empty_legacy_transaction() {
+        let transaction = decode_transaction_core_compatible(&[
+            2, 0, 0, 0, // version
+            0, // input count
+            0, // output count
+            0, 0, 0, 0, // locktime
+        ])
+        .unwrap();
+        assert_eq!(transaction.version, Version::non_standard(2));
+        assert!(transaction.input.is_empty());
+        assert!(transaction.output.is_empty());
+        assert_eq!(transaction.lock_time, LockTime::from_consensus(0));
     }
 
     #[tokio::test]

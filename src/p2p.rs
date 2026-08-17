@@ -4843,7 +4843,18 @@ async fn serve_peer_loop(
                 for transaction in &block.txdata {
                     forget_transaction_requests(peers, transaction);
                 }
-                if handle_received_block(node, peer_id, block, requested, true, true).await? {
+                let disconnect_on_invalid =
+                    !peer_state.permissions.contains(PeerPermissions::NO_BAN);
+                if handle_received_block(
+                    node,
+                    peer_id,
+                    block,
+                    requested,
+                    true,
+                    disconnect_on_invalid,
+                )
+                .await?
+                {
                     if compact_reconstruction_failed == Some(hash) {
                         compact_reconstruction_failed = None;
                     }
@@ -5513,15 +5524,22 @@ async fn serve_peer_loop(
                                     )
                                     .await?;
                                 }
+                            } else {
+                                debug!("not keeping orphan with rejected parents {txid}");
                             }
                         }
                         let reject_reason = error
                             .downcast_ref::<MempoolError>()
                             .map(|error| match error {
-                                MempoolError::MissingInput(_) => "bad-txns-inputs-missingorspent",
-                                _ => "",
+                                // Core uses the consensus-style reason in
+                                // peer logs for unavailable inputs, while
+                                // the RPC path uses the shorter policy code.
+                                MempoolError::MissingInput(_) => {
+                                    "bad-txns-inputs-missingorspent".to_owned()
+                                }
+                                _ => error.reject_reason(),
                             })
-                            .unwrap_or("");
+                            .unwrap_or_default();
                         debug!(
                             %txid,
                             %error,
@@ -5869,7 +5887,11 @@ async fn handle_received_block(
             if chain.block_height_by_hash(&hash).is_some() {
                 false
             } else if let Err(error) = chain.accept_headers(std::slice::from_ref(&block.header)) {
-                debug!(%hash, %error, "rejected unrequested block header");
+                let reject_reason = error
+                    .downcast_ref::<ValidationError>()
+                    .map(ValidationError::bip22_reject_reason)
+                    .unwrap_or_default();
+                debug!(%hash, %error, reject_reason, "rejected unrequested block header");
                 return Ok(false);
             } else {
                 true
@@ -5916,7 +5938,11 @@ async fn handle_received_block(
             {
                 anyhow::bail!("invalid peer block {hash}: {error}");
             }
-            debug!(%hash, %error, "rejected peer block");
+            let reject_reason = error
+                .downcast_ref::<ValidationError>()
+                .map(ValidationError::bip22_reject_reason)
+                .unwrap_or_default();
+            debug!(%hash, %error, reject_reason, "rejected peer block");
             Ok(false)
         }
     }

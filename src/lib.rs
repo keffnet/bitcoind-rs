@@ -905,7 +905,7 @@ impl OrphanPool {
         transactions
     }
 
-    fn erase_for_block(&mut self, block: &Block) {
+    fn erase_for_block(&mut self, block: &Block) -> usize {
         let mut wtxids = HashSet::new();
         for transaction in &block.txdata {
             let transaction_id = transaction.compute_wtxid();
@@ -918,10 +918,14 @@ impl OrphanPool {
                 }
             }
         }
+        let mut erased = 0;
         for wtxid in wtxids {
-            self.remove(&wtxid);
+            if self.remove(&wtxid).is_some() {
+                erased += 1;
+            }
         }
         self.limit_orphans();
+        erased
     }
 
     fn len(&mut self) -> usize {
@@ -2312,7 +2316,10 @@ impl Node {
         disconnected_blocks: &[Block],
     ) {
         for block in activated_blocks {
-            self.orphans.lock().erase_for_block(block);
+            let erased = self.orphans.lock().erase_for_block(block);
+            if erased > 0 {
+                info!("Erased {erased} orphan transaction(s) included or conflicted by block");
+            }
         }
         for block in activated_blocks {
             for transaction in &block.txdata {
@@ -3108,11 +3115,12 @@ impl Node {
             .collect::<VecDeque<_>>();
         while let Some(entry) = pending.pop_front() {
             let transaction = entry.transaction.clone();
+            let txid = transaction.compute_txid();
             match self.try_accept_transaction(transaction.clone()) {
-                Ok((txid, _)) => {
-                    self.announce_mempool_transaction(txid);
+                Ok((accepted_txid, _)) => {
+                    self.announce_mempool_transaction(accepted_txid);
                     self.announce_peer_mempool_transaction(
-                        txid,
+                        accepted_txid,
                         entry.announcers.into_iter().collect(),
                     );
                     pending.extend(self.orphans.lock().take_children(&transaction));
@@ -3120,7 +3128,16 @@ impl Node {
                 Err(MempoolError::MissingInput(_)) => {
                     self.orphans.lock().add_entry(entry);
                 }
-                Err(_) => {}
+                Err(error) => {
+                    self.cache_peer_rejection(&transaction, &error);
+                    let reject_reason = error.reject_reason();
+                    info!(
+                        %txid,
+                        %error,
+                        reject_reason,
+                        "rejected orphan transaction"
+                    );
+                }
             }
         }
     }

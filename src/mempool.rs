@@ -537,6 +537,50 @@ pub enum MempoolError {
     Truc(String),
 }
 
+impl MempoolError {
+    /// Return the stable reject reason exposed by Core's mempool RPCs and
+    /// peer diagnostics. Keep this separate from `Display`, which is meant
+    /// for operator-facing context.
+    pub(crate) fn reject_reason(&self) -> String {
+        match self {
+            Self::EmptyPackage => "package-too-large".to_owned(),
+            Self::Coinbase => "coinbase".to_owned(),
+            Self::AlreadyPresent => "txn-already-in-mempool".to_owned(),
+            Self::SameNonWitnessData(_) => "txn-same-nonwitness-data-in-mempool".to_owned(),
+            Self::AlreadyInChain => "txn-already-known".to_owned(),
+            Self::Conflict(_) => "txn-mempool-conflict".to_owned(),
+            Self::TooManyReplacementCandidates { .. } => {
+                "too many potential replacements".to_owned()
+            }
+            Self::ReplacementFeerateDiagram => {
+                "insufficient feerate: does not improve feerate diagram".to_owned()
+            }
+            Self::MissingInput(_) => "missing-inputs".to_owned(),
+            Self::PrematureCoinbase => "bad-txns-premature-spend-of-coinbase".to_owned(),
+            Self::DustWithFee => "dust".to_owned(),
+            Self::EmptyInputs => "bad-txns-vin-empty".to_owned(),
+            Self::EmptyOutputs => "bad-txns-vout-empty".to_owned(),
+            Self::Oversized => "bad-txns-oversize".to_owned(),
+            Self::NegativeOutput => "bad-txns-vout-negative".to_owned(),
+            Self::OutputTooLarge => "bad-txns-vout-toolarge".to_owned(),
+            Self::OutputTotalTooLarge => "bad-txns-txouttotal-toolarge".to_owned(),
+            Self::InputValuesOutOfRange => "bad-txns-inputvalues-outofrange".to_owned(),
+            Self::DuplicateInput => "bad-txns-inputs-duplicate".to_owned(),
+            Self::NullPrevout => "bad-txns-prevout-null".to_owned(),
+            Self::NegativeFee => "bad-txns-in-belowout".to_owned(),
+            Self::FeeRate => "mempool min fee not met".to_owned(),
+            Self::MinRelayFee => "min relay fee not met".to_owned(),
+            Self::NonStandard(reason) => reason.clone(),
+            Self::ClusterLimit => "too-large-cluster".to_owned(),
+            Self::Truc(reason) => format!("TRUC-violation, {reason}"),
+            Self::Script(reason) if reason.contains("sequence") => "non-BIP68-final".to_owned(),
+            Self::Script(reason) if reason.contains("locktime") => "non-final".to_owned(),
+            Self::Script(reason) => reason.clone(),
+            _ => self.to_string(),
+        }
+    }
+}
+
 /// The package test-accept path needs to preserve the first transaction that
 /// failed. Core returns no per-transaction result for package members that it
 /// did not reach, unlike a package-wide policy failure which is reported on
@@ -2285,6 +2329,13 @@ impl Mempool {
         let sigop_cost =
             validation::transaction_sigop_cost(&transaction, &previous_outputs, script_flags)
                 as u64;
+        // Core checks the single-transaction sigop ceiling before fee and
+        // cluster policy, even when standard transaction policy is disabled.
+        if sigop_cost > MAX_STANDARD_TX_SIGOPS_COST as u64 {
+            return Err(MempoolError::NonStandard(
+                "bad-txns-too-many-sigops".to_owned(),
+            ));
+        }
         let adjusted_weight = transaction
             .weight()
             .to_wu()
@@ -2310,7 +2361,13 @@ impl Mempool {
         }
         chain
             .validate_mempool_transaction_scripts(&transaction, &previous_outputs)
-            .map_err(|error| MempoolError::Script(error.to_string()))?;
+            .map_err(|error| {
+                MempoolError::Script(mempool_script_reject_reason(
+                    &transaction,
+                    &previous_outputs,
+                    error,
+                ))
+            })?;
         let truc_min_fee_exempt =
             self.policy.truc_policy == TrucPolicy::Enforce && transaction.version.0 == TRUC_VERSION;
         if enforce_fee_rate
@@ -3623,6 +3680,58 @@ fn validate_standard_witnesses(
 
 fn standard_script_policy_failure(reason: &'static str) -> MempoolError {
     MempoolError::NonStandard(format!("mempool-script-verify-flag-failed ({reason})"))
+}
+
+/// libbitcoinconsensus intentionally returns only the coarse `ERR_SCRIPT`
+/// code. Core's mempool diagnostics preserve the script interpreter's more
+/// useful reason, so recover the small set of structural errors that can be
+/// identified without changing consensus validation itself.
+fn mempool_script_reject_reason(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+    error: ValidationError,
+) -> String {
+    let ValidationError::Script { input, reason, .. } = &error else {
+        return error.to_string();
+    };
+    if reason != "ERR_SCRIPT" {
+        return format!("mempool-script-verify-flag-failed ({reason})");
+    }
+
+    let Some(transaction_input) = transaction.input.get(*input) else {
+        return format!("mempool-script-verify-flag-failed ({reason})");
+    };
+    let script_reason = script_interpreter_hint(&transaction_input.script_sig)
+        .or_else(|| {
+            previous_outputs
+                .get(*input)
+                .and_then(|output| script_interpreter_hint(output.script_pubkey.as_script()))
+        })
+        .unwrap_or(reason.as_str());
+    format!("mempool-script-verify-flag-failed ({script_reason})")
+}
+
+fn script_interpreter_hint(script: &Script) -> Option<&'static str> {
+    let mut conditional_depth = 0usize;
+    for instruction in script.instructions() {
+        let Ok(Instruction::Op(opcode)) = instruction else {
+            continue;
+        };
+        match opcode.to_u8() {
+            // The disabled arithmetic and bitwise opcodes are reported by
+            // Core as a single stable reason.
+            0x7e..=0x81 | 0x83..=0x86 | 0x8d..=0x8e | 0x95..=0x99 => {
+                return Some("disabled opcode");
+            }
+            0xab => return Some("Using OP_CODESEPARATOR in non-witness script"),
+            0x63 | 0x64 => conditional_depth = conditional_depth.saturating_add(1),
+            0x67 if conditional_depth == 0 => return Some("Invalid OP_IF construction"),
+            0x68 if conditional_depth == 0 => return Some("Invalid OP_IF construction"),
+            0x67 | 0x68 => conditional_depth = conditional_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    (conditional_depth != 0).then_some("Invalid OP_IF construction")
 }
 
 fn standard_stack_size_failure(actual: usize, required: usize) -> MempoolError {

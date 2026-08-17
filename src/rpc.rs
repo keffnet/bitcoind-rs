@@ -12792,42 +12792,7 @@ fn package_policy_error(transactions: &[Transaction]) -> Option<&'static str> {
 }
 
 fn mempool_reject_reason(error: &MempoolError) -> String {
-    match error {
-        MempoolError::EmptyPackage => "package-too-large".to_owned(),
-        MempoolError::Coinbase => "coinbase".to_owned(),
-        MempoolError::AlreadyPresent => "txn-already-in-mempool".to_owned(),
-        MempoolError::SameNonWitnessData(_) => "txn-same-nonwitness-data-in-mempool".to_owned(),
-        MempoolError::AlreadyInChain => "txn-already-known".to_owned(),
-        MempoolError::Conflict(_) => "txn-mempool-conflict".to_owned(),
-        MempoolError::TooManyReplacementCandidates { .. } => {
-            "too many potential replacements".to_owned()
-        }
-        MempoolError::ReplacementFeerateDiagram => {
-            "insufficient feerate: does not improve feerate diagram".to_owned()
-        }
-        MempoolError::MissingInput(_) => "missing-inputs".to_owned(),
-        MempoolError::PrematureCoinbase => "bad-txns-premature-spend-of-coinbase".to_owned(),
-        MempoolError::DustWithFee => "dust".to_owned(),
-        MempoolError::EmptyInputs => "bad-txns-vin-empty".to_owned(),
-        MempoolError::EmptyOutputs => "bad-txns-vout-empty".to_owned(),
-        MempoolError::Oversized => "bad-txns-oversize".to_owned(),
-        MempoolError::NegativeOutput => "bad-txns-vout-negative".to_owned(),
-        MempoolError::OutputTooLarge => "bad-txns-vout-toolarge".to_owned(),
-        MempoolError::OutputTotalTooLarge => "bad-txns-txouttotal-toolarge".to_owned(),
-        MempoolError::InputValuesOutOfRange => "bad-txns-inputvalues-outofrange".to_owned(),
-        MempoolError::DuplicateInput => "bad-txns-inputs-duplicate".to_owned(),
-        MempoolError::NullPrevout => "bad-txns-prevout-null".to_owned(),
-        MempoolError::NegativeFee => "bad-txns-in-belowout".to_owned(),
-        MempoolError::FeeRate => "mempool min fee not met".to_owned(),
-        MempoolError::MinRelayFee => "min relay fee not met".to_owned(),
-        MempoolError::NonStandard(reason) => reason.clone(),
-        MempoolError::ClusterLimit => "too-large-cluster".to_owned(),
-        MempoolError::Truc(reason) => format!("TRUC-violation, {reason}"),
-        MempoolError::Script(reason) if reason.contains("sequence") => "non-BIP68-final".to_owned(),
-        MempoolError::Script(reason) if reason.contains("locktime") => "non-final".to_owned(),
-        MempoolError::Script(reason) => reason.clone(),
-        _ => error.to_string(),
-    }
+    error.reject_reason()
 }
 
 fn package_fee_calculation(

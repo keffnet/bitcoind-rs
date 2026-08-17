@@ -247,6 +247,29 @@ pub fn network_params(network: Network) -> &'static Params {
     network.params()
 }
 
+/// Validate only the proof-of-work claim in a block header.
+///
+/// Core performs this cheap check before attempting to connect a submitted
+/// block to its parent.  Keeping it separate from contextual header checks
+/// lets callers preserve BIP22's `high-hash` result even for an otherwise
+/// unknown-parent block.
+pub fn validate_proof_of_work(
+    network: Network,
+    header: &bitcoin::block::Header,
+) -> Result<(), ValidationError> {
+    let compact = header.bits.to_consensus();
+    let mantissa = compact & 0x007f_ffff;
+    let compact_valid =
+        mantissa != 0 && (compact & 0x0080_0000) == 0 && header.target() != Target::ZERO;
+    if !compact_valid
+        || header.target() > network_params(network).max_attainable_target
+        || !header.target().is_met_by(header.block_hash())
+    {
+        return Err(ValidationError::BadProofOfWork);
+    }
+    Ok(())
+}
+
 /// Consensus activation heights used by Bitcoin Core v31.1.
 pub fn buried_deployment_heights(network: Network) -> BuriedDeploymentHeights {
     match network {

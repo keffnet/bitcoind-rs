@@ -285,7 +285,7 @@ async fn handle_connection(
                     .write_response(
                         "503 Service Unavailable",
                         "text/plain",
-                        b"RPC work queue depth exceeded\r\n",
+                        b"Work queue depth exceeded\r\n",
                         false,
                     )
                     .await?;
@@ -300,7 +300,7 @@ async fn handle_connection(
                 Ok(Err(error)) => (
                     rest_error_status(&error),
                     "text/plain",
-                    format!("{error}\r\n").into_bytes(),
+                    format!("{}\r\n", rest_error_message(&error)).into_bytes(),
                 ),
                 Err(_) => (
                     "500 Internal Server Error",
@@ -310,15 +310,34 @@ async fn handle_connection(
             }
         } else {
             if !request.method.eq_ignore_ascii_case("POST") {
+                let status = if request.method.eq_ignore_ascii_case("GET") {
+                    // Core's HTTP server exposes no GET RPC endpoint.  Its
+                    // request-line parser also rejects an excessively long
+                    // target before routing it.
+                    if request.target.len() > 8 * 1024 {
+                        "400 Bad Request"
+                    } else {
+                        "404 Not Found"
+                    }
+                } else {
+                    "405 Method Not Allowed"
+                };
                 connection
                     .write_response(
-                        "405 Method Not Allowed",
+                        status,
                         "text/plain",
-                        b"JSON-RPC server handles only POST requests\r\n",
-                        false,
+                        if status == "404 Not Found" {
+                            b"Not Found\r\n"
+                        } else {
+                            b"JSON-RPC server handles only POST requests\r\n"
+                        },
+                        request.keep_alive,
                     )
                     .await?;
-                return Ok(());
+                if !request.keep_alive {
+                    return Ok(());
+                }
+                continue;
             }
             let Some(username) = authorized_user(&node, &request.headers) else {
                 connection
@@ -337,7 +356,7 @@ async fn handle_connection(
                     .write_response(
                         "503 Service Unavailable",
                         "text/plain",
-                        b"RPC work queue depth exceeded\r\n",
+                        b"Work queue depth exceeded\r\n",
                         false,
                     )
                     .await?;
@@ -440,23 +459,37 @@ impl HttpConnection {
                     .flatten()
             })
             .unwrap_or(0);
-        if header_end.saturating_add(content_length) > MAX_HTTP_REQUEST {
-            bail!("HTTP request body exceeds limit");
-        }
-        while self.buffered.len() < header_end + content_length {
-            let mut chunk = [0u8; 4096];
-            let read = self.stream.read(&mut chunk).await?;
-            if read == 0 {
-                bail!("truncated HTTP request body");
+        let chunked = headers.lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            name.eq_ignore_ascii_case("Transfer-Encoding")
+                && value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+        });
+        let (body, body_end) = if chunked {
+            self.read_chunked_body(header_end).await?
+        } else {
+            if header_end.saturating_add(content_length) > MAX_HTTP_REQUEST {
+                bail!("HTTP request body exceeds limit");
             }
-            self.buffered.extend_from_slice(&chunk[..read]);
-            if self.buffered.len() > MAX_HTTP_REQUEST {
-                bail!("HTTP request exceeds limit");
+            while self.buffered.len() < header_end + content_length {
+                let mut chunk = [0u8; 4096];
+                let read = self.stream.read(&mut chunk).await?;
+                if read == 0 {
+                    bail!("truncated HTTP request body");
+                }
+                self.buffered.extend_from_slice(&chunk[..read]);
+                if self.buffered.len() > MAX_HTTP_REQUEST {
+                    bail!("HTTP request exceeds limit");
+                }
             }
-        }
-
-        let body_end = header_end + content_length;
-        let body = self.buffered[header_end..body_end].to_vec();
+            (
+                self.buffered[header_end..header_end + content_length].to_vec(),
+                header_end + content_length,
+            )
+        };
         self.buffered.drain(..body_end);
         let keep_alive = if version.eq_ignore_ascii_case("HTTP/1.1") {
             !header_has_token(&headers, "Connection", "close")
@@ -470,6 +503,77 @@ impl HttpConnection {
             body,
             keep_alive,
         }))
+    }
+
+    async fn read_chunked_body(&mut self, header_end: usize) -> Result<(Vec<u8>, usize)> {
+        let mut cursor = header_end;
+        let mut body = Vec::new();
+        loop {
+            let line_end = loop {
+                if let Some(relative) = self.buffered[cursor..]
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                {
+                    break cursor + relative;
+                }
+                let mut chunk = [0u8; 4096];
+                let read = self.stream.read(&mut chunk).await?;
+                if read == 0 {
+                    bail!("truncated chunked HTTP request");
+                }
+                self.buffered.extend_from_slice(&chunk[..read]);
+                if self.buffered.len() > MAX_HTTP_REQUEST {
+                    bail!("HTTP request exceeds limit");
+                }
+            };
+            let size_line = std::str::from_utf8(&self.buffered[cursor..line_end])?;
+            let size_text = size_line.split(';').next().unwrap_or_default().trim();
+            let chunk_size =
+                usize::from_str_radix(size_text, 16).map_err(|_| anyhow!("invalid chunk size"))?;
+            cursor = line_end + 2;
+            if chunk_size == 0 {
+                loop {
+                    if self.buffered[cursor..].starts_with(b"\r\n") {
+                        cursor += 2;
+                        return Ok((body, cursor));
+                    }
+                    if let Some(relative) = self.buffered[cursor..]
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                    {
+                        return Ok((body, cursor + relative + 4));
+                    }
+                    let mut chunk = [0u8; 4096];
+                    let read = self.stream.read(&mut chunk).await?;
+                    if read == 0 {
+                        bail!("truncated chunked HTTP request trailers");
+                    }
+                    self.buffered.extend_from_slice(&chunk[..read]);
+                    if self.buffered.len() > MAX_HTTP_REQUEST {
+                        bail!("HTTP request exceeds limit");
+                    }
+                }
+            }
+            if body.len().saturating_add(chunk_size) > MAX_HTTP_REQUEST {
+                bail!("HTTP request body exceeds limit");
+            }
+            while self.buffered.len() < cursor.saturating_add(chunk_size).saturating_add(2) {
+                let mut chunk = [0u8; 4096];
+                let read = self.stream.read(&mut chunk).await?;
+                if read == 0 {
+                    bail!("truncated chunked HTTP request");
+                }
+                self.buffered.extend_from_slice(&chunk[..read]);
+                if self.buffered.len() > MAX_HTTP_REQUEST {
+                    bail!("HTTP request exceeds limit");
+                }
+            }
+            body.extend_from_slice(&self.buffered[cursor..cursor + chunk_size]);
+            if &self.buffered[cursor + chunk_size..cursor + chunk_size + 2] != b"\r\n" {
+                bail!("invalid chunk terminator");
+            }
+            cursor += chunk_size + 2;
+        }
     }
 
     async fn write_response(
@@ -655,6 +759,9 @@ fn dispatch_rest_with_body(
     target: &str,
     body: &[u8],
 ) -> Result<(&'static str, Vec<u8>)> {
+    if !rest_uri_has_valid_percent_encoding(target) {
+        bail!("URI parsing failed, it likely contained RFC 3986 invalid characters")
+    }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let route = path
         .strip_prefix("/rest/")
@@ -704,8 +811,35 @@ fn dispatch_rest_with_body(
     }
 }
 
+fn rest_uri_has_valid_percent_encoding(uri: &str) -> bool {
+    let bytes = uri.as_bytes();
+    bytes.iter().enumerate().all(|(index, byte)| {
+        *byte != b'%'
+            || (index + 2 < bytes.len()
+                && bytes[index + 1].is_ascii_hexdigit()
+                && bytes[index + 2].is_ascii_hexdigit())
+    })
+}
+
+const REST_BAD_REQUEST_PREFIX: &str = "__rest_bad_request__: ";
+
+fn rest_bad_request(message: impl Into<String>) -> anyhow::Error {
+    anyhow!("{REST_BAD_REQUEST_PREFIX}{}", message.into())
+}
+
+fn rest_error_message(error: &anyhow::Error) -> String {
+    let message = error.to_string();
+    message
+        .strip_prefix(REST_BAD_REQUEST_PREFIX)
+        .unwrap_or(&message)
+        .to_owned()
+}
+
 fn rest_error_status(error: &anyhow::Error) -> &'static str {
     let message = error.to_string().to_ascii_lowercase();
+    if message.starts_with(&REST_BAD_REQUEST_PREFIX.to_ascii_lowercase()) {
+        return "400 Bad Request";
+    }
     if message.contains("internal")
         || message.contains("i/o")
         || message.contains("io error")
@@ -720,7 +854,6 @@ fn rest_error_status(error: &anyhow::Error) -> &'static str {
         || message.contains("unsupported rest endpoint")
         || message.contains("unsupported rest output format")
         || message.contains("only the basic rest block filter is available")
-        || message.contains("rest blockpart supports binary and hex output only")
         || message.contains("rest deploymentinfo supports json output only")
     {
         return "404 Not Found";
@@ -758,20 +891,39 @@ fn rest_format_bytes(bytes: Vec<u8>, format: &str) -> Result<(&'static str, Vec<
     }
 }
 
+fn parse_rest_block_hash(value: &str) -> Result<BlockHash> {
+    value.parse().map_err(|_| anyhow!("Invalid hash: {value}"))
+}
+
+fn parse_rest_header_count(value: &str) -> Result<usize> {
+    let Some(count) = value.parse::<usize>().ok() else {
+        bail!("Header count is invalid or out of acceptable range (1-2000): {value}")
+    };
+    if !(1..=2_000).contains(&count) {
+        bail!("Header count is invalid or out of acceptable range (1-2000): {value}")
+    }
+    Ok(count)
+}
+
 fn rest_blockhash_by_height(
     node: &Arc<Node>,
     route: &str,
     format: &str,
 ) -> Result<(&'static str, Vec<u8>)> {
-    let height = route
+    let height_text = route
         .strip_prefix("blockhashbyheight/")
-        .ok_or_else(|| anyhow!("invalid blockhashbyheight path"))?
-        .parse::<u32>()?;
+        .ok_or_else(|| anyhow!("invalid blockhashbyheight path"))?;
+    if height_text.is_empty() || !height_text.bytes().all(|byte| byte.is_ascii_digit()) {
+        bail!("Invalid height: {height_text}")
+    }
+    let height = height_text
+        .parse::<u32>()
+        .map_err(|_| anyhow!("Invalid height: {height_text}"))?;
     let hash = node
         .chain
         .read()
         .block_hash(height)
-        .ok_or_else(|| anyhow!("block height out of range"))?;
+        .ok_or_else(|| anyhow!("Block height out of range"))?;
     match format {
         "json" => rest_json(json!({"blockhash": hash.to_string()})),
         "bin" => Ok(("application/octet-stream", hash.to_byte_array().to_vec())),
@@ -791,24 +943,22 @@ fn rest_headers(
         .ok_or_else(|| anyhow!("invalid headers path"))?;
     let parts = suffix.split('/').collect::<Vec<_>>();
     let (count, hash_text) = if parts.len() == 2 {
-        (parts[0].parse::<u32>()?, parts[1])
+        (parse_rest_header_count(parts[0])?, parts[1])
     } else if parts.len() == 1 {
         (
-            query
-                .split('&')
-                .filter_map(|part| part.split_once('='))
-                .find_map(|(key, value)| (key == "count").then_some(value))
-                .unwrap_or("5")
-                .parse::<u32>()?,
+            parse_rest_header_count(
+                query
+                    .split('&')
+                    .filter_map(|part| part.split_once('='))
+                    .find_map(|(key, value)| (key == "count").then_some(value))
+                    .unwrap_or("5"),
+            )?,
             parts[0],
         )
     } else {
         bail!("invalid headers path")
     };
-    if !(1..=2_000).contains(&count) {
-        bail!("header count must be between 1 and 2000")
-    }
-    let hash: BlockHash = hash_text.parse()?;
+    let hash = parse_rest_block_hash(hash_text)?;
     let heights = {
         let chain = node.chain.read();
         let Some(start) = chain.block_height_by_hash(&hash) else {
@@ -825,7 +975,7 @@ fn rest_headers(
                 rest_format_bytes(Vec::new(), format)
             };
         }
-        (start..start.saturating_add(count))
+        (start..start.saturating_add(u32::try_from(count).unwrap_or(u32::MAX)))
             .filter_map(|height| chain.block_hash(height))
             .collect::<Vec<_>>()
     };
@@ -878,8 +1028,14 @@ fn rest_block(
     let hash_text = route
         .strip_prefix(prefix)
         .ok_or_else(|| anyhow!("invalid block path"))?;
-    let hash: BlockHash = hash_text.parse()?;
+    let hash = parse_rest_block_hash(hash_text)?;
     let mut chain = node.chain.write();
+    if chain.is_active_block(&hash)
+        && core_network_blocks_dir(&node.config.datadir, node.config.network)
+            .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
+    {
+        bail!("I/O error reading {hash}")
+    }
     let block = match chain.block(&hash)? {
         Some(block) => block,
         None if chain.block_height_by_hash(&hash).is_some() => {
@@ -895,6 +1051,7 @@ fn rest_block(
             // the extended JSON form, which is RPC verbosity 3 here.
             &json!([hash.to_string(), 3]),
         )?),
+        "json" if !details => rest_json(get_block(node, &json!([hash.to_string(), 1]))?),
         "json" => bail!("JSON output is not supported for this request type"),
         "bin" => Ok(("application/octet-stream", serialize(&block))),
         "hex" => rest_format_bytes(serialize(&block), format),
@@ -903,13 +1060,22 @@ fn rest_block(
 }
 
 fn rest_query_usize(query: &str, name: &str) -> Result<usize> {
-    query
+    let Some(value) = query
         .split('&')
         .filter_map(|part| part.split_once('='))
         .find_map(|(key, value)| (key == name).then_some(value))
-        .ok_or_else(|| anyhow!("REST query parameter {name} is required"))?
-        .parse::<usize>()
-        .map_err(|_| anyhow!("REST query parameter {name} must be a non-negative integer"))
+    else {
+        bail!(
+            "Block part {} missing or invalid",
+            if name == "offset" { "offset" } else { "size" }
+        )
+    };
+    value.parse::<usize>().map_err(|_| {
+        anyhow!(
+            "Block part {} missing or invalid",
+            if name == "offset" { "offset" } else { "size" }
+        )
+    })
 }
 
 fn rest_block_part(
@@ -918,16 +1084,29 @@ fn rest_block_part(
     format: &str,
     query: &str,
 ) -> Result<(&'static str, Vec<u8>)> {
+    if format == "json" {
+        bail!("JSON output is not supported for this request type")
+    }
     if !matches!(format, "bin" | "hex") {
         bail!("REST blockpart supports binary and hex output only")
     }
-    let hash: BlockHash = route
-        .strip_prefix("blockpart/")
-        .ok_or_else(|| anyhow!("invalid blockpart path"))?
-        .parse()?;
+    let hash = parse_rest_block_hash(
+        route
+            .strip_prefix("blockpart/")
+            .ok_or_else(|| anyhow!("invalid blockpart path"))?,
+    )?;
     let offset = rest_query_usize(query, "offset")?;
     let size = rest_query_usize(query, "size")?;
+    if size == 0 {
+        bail!("block part offset/size is outside the block")
+    }
     let mut chain = node.chain.write();
+    if chain.is_active_block(&hash)
+        && core_network_blocks_dir(&node.config.datadir, node.config.network)
+            .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
+    {
+        bail!("I/O error reading {hash}")
+    }
     let bytes = match chain.block(&hash)? {
         Some(block) => block,
         None if chain.block_height_by_hash(&hash).is_some() => {
@@ -963,7 +1142,7 @@ fn rest_block_filter(
     if filter_type != "basic" || parts.next().is_some() {
         bail!("only the basic REST block filter is available")
     }
-    let hash: BlockHash = hash_text.parse()?;
+    let hash = parse_rest_block_hash(hash_text)?;
     let (content, _header) = node
         .chain
         .write()
@@ -998,24 +1177,24 @@ fn rest_block_filter_headers(
     let (filter_type, count, hash_text) = match parts.as_slice() {
         [filter_type, hash_text] => (
             *filter_type,
-            query
-                .split('&')
-                .filter_map(|part| part.split_once('='))
-                .find_map(|(key, value)| (key == "count").then_some(value))
-                .unwrap_or("5")
-                .parse::<usize>()?,
+            parse_rest_header_count(
+                query
+                    .split('&')
+                    .filter_map(|part| part.split_once('='))
+                    .find_map(|(key, value)| (key == "count").then_some(value))
+                    .unwrap_or("5"),
+            )?,
             *hash_text,
         ),
-        [filter_type, count, hash_text] => (*filter_type, count.parse::<usize>()?, *hash_text),
+        [filter_type, count, hash_text] => {
+            (*filter_type, parse_rest_header_count(count)?, *hash_text)
+        }
         _ => bail!("invalid blockfilterheaders path"),
     };
     if filter_type != "basic" {
-        bail!("only the basic REST block filter is available")
+        bail!("Unknown filtertype {filter_type}")
     }
-    if !(1..=2_000).contains(&count) {
-        bail!("filter header count must be between 1 and 2000")
-    }
-    let hash: BlockHash = hash_text.parse()?;
+    let hash = parse_rest_block_hash(hash_text)?;
     let filter_headers = {
         let mut chain = node.chain.write();
         match chain.block_height_by_hash(&hash) {
@@ -1082,9 +1261,17 @@ fn rest_deployment_info(
         if hash.is_empty() || hash.contains('/') {
             bail!("invalid deploymentinfo path")
         }
+        parse_rest_block_hash(hash)?;
         json!([hash])
     };
-    rest_json(get_deployment_info(node, &params)?)
+    let value = get_deployment_info(node, &params).map_err(|error| {
+        if error.to_string() == "Block not found" {
+            rest_bad_request("Block not found")
+        } else {
+            error
+        }
+    })?;
+    rest_json(value)
 }
 
 fn serialize_block_undo(undo: &[Vec<TxOut>]) -> Vec<u8> {
@@ -1104,10 +1291,11 @@ fn rest_spent_txouts(
     route: &str,
     format: &str,
 ) -> Result<(&'static str, Vec<u8>)> {
-    let hash: BlockHash = route
-        .strip_prefix("spenttxouts/")
-        .ok_or_else(|| anyhow!("invalid spenttxouts path"))?
-        .parse()?;
+    let hash = parse_rest_block_hash(
+        route
+            .strip_prefix("spenttxouts/")
+            .ok_or_else(|| anyhow!("invalid spenttxouts path"))?,
+    )?;
     let undo = node
         .chain
         .write()
@@ -1145,7 +1333,16 @@ fn rest_transaction(
     let txid = route
         .strip_prefix("tx/")
         .ok_or_else(|| anyhow!("invalid transaction path"))?;
-    let raw = get_raw_transaction(node, &json!([txid, false]))?;
+    if txid.len() != 64 || hex::decode(txid).is_err() {
+        bail!("Invalid hash: {txid}");
+    }
+    let raw = get_raw_transaction(node, &json!([txid, false])).map_err(|error| {
+        if error.to_string().starts_with("No such ") {
+            anyhow!("{txid} not found")
+        } else {
+            error
+        }
+    })?;
     let raw = raw
         .as_str()
         .ok_or_else(|| anyhow!("raw transaction response is not hex"))?;
@@ -1197,6 +1394,9 @@ fn rest_get_utxos(
                 let (txid, vout) = value
                     .rsplit_once('-')
                     .ok_or_else(|| anyhow!("invalid getutxos outpoint"))?;
+                if vout.is_empty() || !vout.bytes().all(|byte| byte.is_ascii_digit()) {
+                    bail!("invalid getutxos outpoint")
+                }
                 Ok(OutPoint::new(txid.parse()?, vout.parse()?))
             })
             .collect::<Result<Vec<_>>>()?
@@ -1460,11 +1660,11 @@ async fn dispatch_json_rpc_http(
 ) -> JsonRpcHttpResponse {
     let request: Value = match parse_rpc_json(body) {
         Ok(value) => value,
-        Err(error) => {
+        Err(_error) => {
             return JsonRpcHttpResponse {
                 status: "500 Internal Server Error",
                 body: Some(
-                    json!({"result": null, "error": {"code": -32700, "message": error.to_string()}, "id": null}),
+                    json!({"result": null, "error": {"code": -32700, "message": "Parse error"}, "id": null}),
                 ),
             };
         }
@@ -1531,16 +1731,26 @@ async fn dispatch_request(
         None | Some(Value::Null) => false,
         Some(Value::String(value)) if value == "1.0" => false,
         Some(Value::String(value)) if value == "2.0" => true,
-        Some(_) => {
+        Some(Value::String(_)) => {
             return Some(json_rpc_invalid_request(
                 id,
                 false,
                 "JSON-RPC version not supported",
             ));
         }
+        Some(_) => {
+            return Some(json_rpc_invalid_request(
+                id,
+                false,
+                "jsonrpc field must be a string",
+            ));
+        }
     };
     let is_notification = json_rpc_2 && !request_object.contains_key("id");
     let Some(method) = request_object.get("method").and_then(Value::as_str) else {
+        if is_notification {
+            return None;
+        }
         return Some(json_rpc_invalid_request(id, json_rpc_2, "Missing method"));
     };
     let params = match request_object.get("params") {
@@ -1573,8 +1783,8 @@ async fn dispatch_request(
             "error": rpc_error(&error),
             "id": id,
         }),
-        Ok(result) => json!({"result": result, "error": null, "id": id}),
-        Err(error) => json!({"result": null, "error": rpc_error(&error), "id": id}),
+        Ok(result) => legacy_rpc_response(json!({"result": result, "error": null}), id),
+        Err(error) => legacy_rpc_response(json!({"result": null, "error": rpc_error(&error)}), id),
     };
     (!is_notification).then_some(response)
 }
@@ -1587,12 +1797,23 @@ fn json_rpc_invalid_request(id: Value, json_rpc_2: bool, message: &str) -> Value
             "id": id,
         })
     } else {
-        json!({
-            "result": null,
-            "error": {"code": -32600, "message": message},
-            "id": id,
-        })
+        legacy_rpc_response(
+            json!({
+                "result": null,
+                "error": {"code": -32600, "message": message},
+            }),
+            id,
+        )
     }
+}
+
+fn legacy_rpc_response(mut response: Value, id: Value) -> Value {
+    if !id.is_null()
+        && let Some(object) = response.as_object_mut()
+    {
+        object.insert("id".to_owned(), id);
+    }
+    response
 }
 
 fn json_rpc_error_status(response: &Value) -> &'static str {
@@ -1702,6 +1923,9 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
         bail!("RPC params must be an array or object")
     };
     if method == "createrawtransaction" && object.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+    if method == "validateaddress" && object.is_empty() {
         return Ok(Value::Array(Vec::new()));
     }
     if method == "getblockstats"
@@ -3254,20 +3478,43 @@ fn validateaddress_bech32_error(
         Network::Regtest => "bcrt",
         Network::Testnet | Network::Testnet4 | Network::Signet => "tb",
     };
+    let base58_error = || {
+        if fallback.starts_with("legacy address base58 prefix") {
+            "Invalid or unsupported Base58-encoded address.".to_owned()
+        } else if bitcoin::base58::decode(value).is_ok() {
+            "Invalid checksum or length of Base58 address (P2PKH or P2SH)".to_owned()
+        } else {
+            "Invalid or unsupported Segwit (Bech32) or Base58 encoding.".to_owned()
+        }
+    };
     let Some(separator) = value.rfind('1') else {
+        if value.len() > expected_hrp.len()
+            && value[..expected_hrp.len()].eq_ignore_ascii_case(expected_hrp)
+        {
+            return ("Missing separator".to_owned(), Vec::new());
+        }
+        if fallback.starts_with("base58 error") || fallback.starts_with("legacy address") {
+            return (base58_error(), Vec::new());
+        }
         return (fallback, Vec::new());
     };
     if !value[..separator].eq_ignore_ascii_case(expected_hrp) {
-        if fallback.starts_with("tried to parse an unknown hrp")
-            || fallback.starts_with("legacy address")
-            || fallback == "base58 error"
-        {
+        if fallback.starts_with("tried to parse an unknown hrp") {
             return (
                 "Invalid or unsupported Segwit (Bech32) or Base58 encoding.".to_owned(),
                 Vec::new(),
             );
         }
+        if fallback.starts_with("base58 error") || fallback.starts_with("legacy address") {
+            return (base58_error(), Vec::new());
+        }
         return (fallback, Vec::new());
+    }
+    if value.len() > 90 {
+        return (
+            "Bech32 string too long".to_owned(),
+            (90..value.len()).collect(),
+        );
     }
 
     let mut lower_seen = false;
@@ -3401,7 +3648,24 @@ fn validateaddress_bech32_error(
         }
     }
 
-    let find_single_error = |bech32m: bool| {
+    let find_error_locations = |bech32m: bool| {
+        let candidate_is_valid = |candidate: &[u8]| {
+            let Ok(candidate) = String::from_utf8(candidate.to_vec()) else {
+                return false;
+            };
+            let Ok(candidate) =
+                bitcoin::bech32::primitives::decode::UncheckedHrpstring::new(&candidate)
+            else {
+                return false;
+            };
+            if bech32m {
+                candidate.has_valid_checksum::<bitcoin::bech32::Bech32m>()
+            } else {
+                candidate.has_valid_checksum::<bitcoin::bech32::Bech32>()
+            }
+        };
+
+        // Most malformed addresses contain one wrong data/checksum symbol.
         for index in separator + 1..value.len() {
             for replacement in CHARSET {
                 if value.as_bytes()[index].to_ascii_lowercase() == *replacement {
@@ -3409,41 +3673,60 @@ fn validateaddress_bech32_error(
                 }
                 let mut candidate = value.as_bytes().to_vec();
                 candidate[index] = *replacement;
-                let Ok(candidate) = String::from_utf8(candidate) else {
-                    continue;
-                };
-                let Ok(candidate) =
-                    bitcoin::bech32::primitives::decode::UncheckedHrpstring::new(&candidate)
-                else {
-                    continue;
-                };
-                let valid = if bech32m {
-                    candidate.has_valid_checksum::<bitcoin::bech32::Bech32m>()
-                } else {
-                    candidate.has_valid_checksum::<bitcoin::bech32::Bech32>()
-                };
-                if valid {
-                    return Some(index);
+                if candidate_is_valid(&candidate) {
+                    return vec![index];
                 }
             }
         }
-        None
+
+        // Core's Bech32 locator also identifies two-symbol errors. A direct
+        // bounded search is small here (at most 90 data symbols and 32
+        // alphabet entries) and keeps the returned positions deterministic.
+        for first in separator + 1..value.len() {
+            for second in first + 1..value.len() {
+                for first_replacement in CHARSET {
+                    if value.as_bytes()[first].to_ascii_lowercase() == *first_replacement {
+                        continue;
+                    }
+                    for second_replacement in CHARSET {
+                        if value.as_bytes()[second].to_ascii_lowercase() == *second_replacement {
+                            continue;
+                        }
+                        let mut candidate = value.as_bytes().to_vec();
+                        candidate[first] = *first_replacement;
+                        candidate[second] = *second_replacement;
+                        if candidate_is_valid(&candidate) {
+                            return vec![first, second];
+                        }
+                    }
+                }
+            }
+        }
+        Vec::new()
     };
-    let (message, location) = if raw_version == Some(0) {
-        (
-            "Invalid Bech32 checksum",
-            find_single_error(false).or_else(|| find_single_error(true)),
-        )
+    // Core tries both checksum encodings and reports the one with the
+    // shortest correction set; the witness version itself may be one of the
+    // corrupted symbols, so it cannot select the diagnostic encoding here.
+    let bech32_locations = find_error_locations(false);
+    let bech32m_locations = find_error_locations(true);
+    if !bech32m_locations.is_empty()
+        && (bech32_locations.is_empty() || bech32m_locations.len() < bech32_locations.len())
+    {
+        ("Invalid Bech32m checksum".to_owned(), bech32m_locations)
+    } else if !bech32_locations.is_empty() {
+        ("Invalid Bech32 checksum".to_owned(), bech32_locations)
     } else {
-        (
-            "Invalid Bech32m checksum",
-            find_single_error(true).or_else(|| find_single_error(false)),
-        )
-    };
-    (message.to_owned(), location.into_iter().collect())
+        ("Invalid checksum".to_owned(), Vec::new())
+    }
 }
 
 fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    if params.as_array().is_some_and(Vec::is_empty) {
+        bail!("Return information about the given bitcoin address.");
+    }
+    if params.get(0).is_some_and(Value::is_null) {
+        bail!("JSON value of type null is not of expected type string");
+    }
     let value = param::<String>(params, 0)?;
     let unchecked = match value.parse::<Address<bitcoin::address::NetworkUnchecked>>() {
         Ok(address) => address,
@@ -3457,13 +3740,19 @@ fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
             }));
         }
     };
+    let address_type = unchecked.clone().assume_checked().address_type();
     let address = match unchecked.require_network(node.config.network) {
         Ok(address) => address,
         Err(error) => {
+            let error = if matches!(address_type, Some(AddressType::P2pkh | AddressType::P2sh)) {
+                "Invalid or unsupported Base58-encoded address.".to_owned()
+            } else {
+                error.to_string()
+            };
             return Ok(json!({
                 "isvalid": false,
                 "error_locations": [],
-                "error": error.to_string(),
+                "error": error,
             }));
         }
     };
@@ -11088,7 +11377,9 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("dummy must be a string")
     }
     let bytes = hex::decode(param::<String>(params, 0)?)?;
-    let mut block: bitcoin::Block = deserialize(&bytes)?;
+    // Core's BIP22 block decoder accepts trailing bytes and can report a
+    // cheap proof-of-work failure before fully validating the body.
+    let (mut block, _) = deserialize_partial::<bitcoin::Block>(&bytes)?;
     node.chain
         .read()
         .update_uncommitted_block_structures(&mut block);
@@ -11097,6 +11388,9 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         && status != "duplicate-inconclusive"
     {
         return Ok(json!(status));
+    }
+    if let Err(error) = validation::validate_proof_of_work(node.config.network, &block.header) {
+        return Ok(json!(error.bip22_reject_reason()));
     }
     let result = node.connect_block(block);
     match result {
@@ -12652,7 +12946,6 @@ fn package_fee_calculation(
 
 fn accepted_transaction_json(
     transaction: &Transaction,
-    package: &[Transaction],
     mempool: &Mempool,
     include_allowed: bool,
     include_wtxid: bool,
@@ -12662,9 +12955,14 @@ fn accepted_transaction_json(
     let entry = mempool
         .get(&txid)
         .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
+    // testmempoolaccept uses Core's single-transaction fee calculation even
+    // when the request contains a package. Package feerates are reserved for
+    // submitpackage; an already-present mempool ancestor must not change this
+    // transaction's effective-includes list.
+    let package = std::slice::from_ref(transaction);
     let excluded_ancestors = HashSet::new();
     let (effective_fee, effective_vsize, effective_includes) =
-        package_fee_calculation(transaction, package, mempool, true, &excluded_ancestors);
+        package_fee_calculation(transaction, package, mempool, false, &excluded_ancestors);
     let effective_rate = if effective_vsize == 0 {
         0
     } else {
@@ -12901,7 +13199,6 @@ fn package_test_failure_json(
                 } else {
                     result.push(accepted_transaction_json(
                         transaction,
-                        transactions,
                         candidate,
                         true,
                         true,
@@ -13002,7 +13299,6 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
             } else {
                 result.push(accepted_transaction_json(
                     transaction,
-                    &transactions,
                     &candidate,
                     true,
                     true,
@@ -13028,7 +13324,6 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
             } else {
                 Ok(json!([accepted_transaction_json(
                     &transactions[0],
-                    &transactions,
                     &candidate,
                     true,
                     true,
@@ -15951,6 +16246,26 @@ mod tests {
         )
         .unwrap();
         assert_eq!(value["params"][1], json!([{"data": "aa"}, {"data": "bb"}]));
+    }
+
+    #[test]
+    fn notification_batch_json_keeps_each_request_object() {
+        let value = parse_rpc_json(
+            br#"[{"jsonrpc":"2.0","method":"getblockcount"},{"jsonrpc":"2.0","method":"invalidmethod"},{"jsonrpc":"2.0","method":"getblockhash","params":[0]},{"jsonrpc":"2.0","pizza":"sausage"}]"#,
+        )
+        .unwrap();
+        assert_eq!(value.as_array().map(Vec::len), Some(4));
+        assert_eq!(value[0]["method"], "getblockcount");
+        assert_eq!(value[3]["pizza"], "sausage");
+    }
+
+    #[test]
+    fn parse_rpc_json_accepts_large_string_values() {
+        let mut body = br#"{"method":"submitblock","params":[""#.to_vec();
+        body.extend(std::iter::repeat_n(b'0', 4_000_000));
+        body.extend_from_slice(br#""]}"#);
+        let value = parse_rpc_json(&body).unwrap();
+        assert_eq!(value["params"][0].as_str().map(str::len), Some(4_000_000));
     }
 
     #[test]
@@ -19207,14 +19522,16 @@ mod tests {
             1
         );
         let genesis_hash = node.chain.read().best_hash();
-        assert_eq!(
-            dispatch_rest(
-                &node,
-                &format!("/rest/block/notxdetails/{genesis_hash}.json")
-            )
-            .unwrap_err()
-            .to_string(),
-            "JSON output is not supported for this request type"
+        let (_, notxdetails) = dispatch_rest(
+            &node,
+            &format!("/rest/block/notxdetails/{genesis_hash}.json"),
+        )
+        .unwrap();
+        let notxdetails = serde_json::from_slice::<Value>(&notxdetails).unwrap();
+        assert!(
+            notxdetails["tx"]
+                .as_array()
+                .is_some_and(|txs| !txs.is_empty())
         );
         let (_, block_part) = dispatch_rest(
             &node,

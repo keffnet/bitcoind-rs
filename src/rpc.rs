@@ -2026,7 +2026,7 @@ fn dispatch_method_for_user(
         "generatetodescriptor" => generate_to_descriptor(node, params),
         "generateblock" => generate_block(node, params),
         "generate" => bail!(
-            "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information."
+            "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
         ),
         "submitpackage" => submit_package(node, params),
         "testmempoolaccept" => test_mempool_accept(node, params),
@@ -10665,8 +10665,10 @@ fn generate_to_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("nblocks must not be negative");
     }
     let address = param::<String>(params, 1)?
-        .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
-        .require_network(node.config.network)?;
+        .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+        .map_err(|_| anyhow!("Invalid address"))?
+        .require_network(node.config.network)
+        .map_err(|_| anyhow!("Invalid address"))?;
     let max_tries = optional_i64(params, 2, 1_000_000, "maxtries")?;
     if max_tries < 0 {
         bail!("maxtries must not be negative");
@@ -10696,6 +10698,7 @@ fn generate_blocks_to_script(
     count: i64,
     max_tries: u64,
 ) -> Result<Value> {
+    let _mining_lock = node.mining_lock.lock();
     let mut hashes = Vec::with_capacity(usize::try_from(count).unwrap_or_default());
     for _ in 0..count {
         let block = build_mining_block(node, script_pubkey.clone())?;
@@ -10710,14 +10713,27 @@ fn generate_blocks_to_script(
 }
 
 fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let _mining_lock = node.mining_lock.lock();
     let output = param::<String>(params, 0)?;
-    let output_script = mining_descriptor_script(node, &output).or_else(|_| {
-        output
-            .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
-            .require_network(node.config.network)
-            .map(|address| address.script_pubkey())
-            .map_err(anyhow::Error::from)
-    })?;
+    if output
+        .split('#')
+        .next()
+        .is_some_and(|descriptor| descriptor.contains('*'))
+    {
+        bail!("Ranged descriptor not accepted. Maybe pass through deriveaddresses first?");
+    }
+    if output.contains("xpub") || output.contains("tpub") {
+        bail!("Cannot derive script without private keys");
+    }
+    let output_script = mining_descriptor_script(node, &output)
+        .or_else(|_| {
+            output
+                .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
+                .require_network(node.config.network)
+                .map(|address| address.script_pubkey())
+                .map_err(anyhow::Error::from)
+        })
+        .map_err(|_| anyhow!("Invalid address or descriptor"))?;
     let requested = params
         .get(1)
         .and_then(Value::as_array)
@@ -10734,11 +10750,18 @@ fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 return mempool
                     .get(&txid)
                     .map(|entry| entry.transaction.clone())
-                    .ok_or_else(|| anyhow!("Transaction {txid} not in mempool"));
+                    .ok_or_else(|| anyhow!("Transaction {txid} not in mempool."));
             }
-            let bytes = hex::decode(text)
-                .with_context(|| format!("transaction decode failed for {text}"))?;
-            deserialize(&bytes).context("transaction decode failed")
+            let bytes = hex::decode(text).map_err(|_| {
+                anyhow!(
+                    "Transaction decode failed for {text}. Make sure the tx has at least one input."
+                )
+            })?;
+            deserialize(&bytes).map_err(|_| {
+                anyhow!(
+                    "Transaction decode failed for {text}. Make sure the tx has at least one input."
+                )
+            })
         })
         .collect::<Result<Vec<Transaction>>>()?;
     drop(mempool);
@@ -10747,7 +10770,13 @@ fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let Some(block) = mine_block(block, 1_000_000) else {
         bail!("failed to make block")
     };
-    node.chain.read().validate_candidate_block(&block)?;
+    if let Err(error) = node.chain.read().validate_candidate_block(&block) {
+        let reason = error
+            .downcast_ref::<validation::ValidationError>()
+            .map(validation::ValidationError::bip22_reject_reason)
+            .unwrap_or_else(|| error.to_string());
+        bail!("TestBlockValidity failed: {reason}");
+    }
     let hash = block.block_hash();
     let serialized = (!submit).then(|| hex::encode(serialize(&block)));
     if submit {
@@ -12017,7 +12046,7 @@ fn mempool_reject_reason(error: &MempoolError) -> String {
         MempoolError::FeeRate => "mempool min fee not met".to_owned(),
         MempoolError::MinRelayFee => "min relay fee not met".to_owned(),
         MempoolError::NonStandard(reason) => reason.clone(),
-        MempoolError::ClusterLimit => "too-long-mempool-chain".to_owned(),
+        MempoolError::ClusterLimit => "too-large-cluster".to_owned(),
         MempoolError::Truc(reason) => format!("TRUC-violation, {reason}"),
         MempoolError::Script(reason) if reason.contains("sequence") => "non-BIP68-final".to_owned(),
         MempoolError::Script(reason) if reason.contains("locktime") => "non-final".to_owned(),
@@ -12030,6 +12059,7 @@ fn package_fee_calculation(
     transaction: &Transaction,
     package: &[Transaction],
     mempool: &Mempool,
+    include_mempool_ancestors: bool,
 ) -> (i64, u64, Vec<String>) {
     let by_txid = package
         .iter()
@@ -12041,6 +12071,8 @@ fn package_fee_calculation(
     fn visit(
         txid: Txid,
         by_txid: &HashMap<Txid, &Transaction>,
+        mempool: &Mempool,
+        include_mempool_ancestors: bool,
         seen: &mut HashSet<Txid>,
         ordered: &mut Vec<Txid>,
     ) {
@@ -12049,10 +12081,29 @@ fn package_fee_calculation(
         }
         if let Some(transaction) = by_txid.get(&txid) {
             for input in &transaction.input {
-                if by_txid.contains_key(&input.previous_output.txid) {
-                    visit(input.previous_output.txid, by_txid, seen, ordered);
-                }
+                visit(
+                    input.previous_output.txid,
+                    by_txid,
+                    mempool,
+                    include_mempool_ancestors,
+                    seen,
+                    ordered,
+                );
             }
+        } else if include_mempool_ancestors && let Some(entry) = mempool.get(&txid) {
+            for input in &entry.transaction.input {
+                visit(
+                    input.previous_output.txid,
+                    by_txid,
+                    mempool,
+                    include_mempool_ancestors,
+                    seen,
+                    ordered,
+                );
+            }
+        } else {
+            // Confirmed inputs are not part of the effective-fee set.
+            return;
         }
         ordered.push(txid);
     }
@@ -12060,6 +12111,8 @@ fn package_fee_calculation(
     visit(
         transaction.compute_txid(),
         &by_txid,
+        mempool,
+        include_mempool_ancestors,
         &mut seen,
         &mut ordered,
     );
@@ -12091,7 +12144,7 @@ fn accepted_transaction_json(
         .get(&txid)
         .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
     let (effective_fee, effective_vsize, effective_includes) =
-        package_fee_calculation(transaction, package, mempool);
+        package_fee_calculation(transaction, package, mempool, true);
     let effective_rate = if effective_vsize == 0 {
         0
     } else {
@@ -12126,6 +12179,7 @@ fn package_transaction_json(
     package: &[Transaction],
     mempool: &Mempool,
     include_effective_fee: bool,
+    include_mempool_ancestors: bool,
 ) -> Result<Value> {
     let txid = transaction.compute_txid();
     let entry = mempool
@@ -12137,17 +12191,73 @@ fn package_transaction_json(
             "other-wtxid": entry.transaction.compute_wtxid().to_string(),
         }));
     }
-    accepted_transaction_json(
-        transaction,
-        package,
-        mempool,
-        false,
-        false,
-        include_effective_fee,
-    )
+    let (effective_fee, effective_vsize, effective_includes) =
+        package_fee_calculation(transaction, package, mempool, include_mempool_ancestors);
+    let effective_rate = if effective_vsize == 0 {
+        0
+    } else {
+        effective_fee
+            .saturating_mul(1_000)
+            .checked_div(i64::try_from(effective_vsize).unwrap_or(i64::MAX))
+            .unwrap_or_default()
+    };
+    let mut result = serde_json::Map::new();
+    result.insert("txid".to_owned(), json!(txid.to_string()));
+    result.insert("vsize".to_owned(), json!(entry.vsize));
+    let mut fees = json!({"base": sat_to_btc(entry.fee_sat)});
+    if include_effective_fee {
+        fees["effective-feerate"] = json!(sat_to_btc_signed(effective_rate));
+        fees["effective-includes"] = json!(effective_includes);
+    }
+    result.insert("fees".to_owned(), fees);
+    Ok(Value::Object(result))
+}
+
+fn submit_package_transaction_json(
+    transaction: &Transaction,
+    package: &[Transaction],
+    mempool: &Mempool,
+    include_effective_fee: bool,
+    individually_accepted: &HashSet<Txid>,
+) -> Result<Value> {
+    if individually_accepted.contains(&transaction.compute_txid()) {
+        package_transaction_json(
+            transaction,
+            std::slice::from_ref(transaction),
+            mempool,
+            include_effective_fee,
+            false,
+        )
+    } else {
+        package_transaction_json(transaction, package, mempool, include_effective_fee, true)
+    }
 }
 
 fn rejected_transaction_json(transaction: &Transaction, error: &MempoolError) -> Value {
+    // MempoolError's Display adds an internal "transaction is non-standard"
+    // prefix, while Core exposes the underlying policy reason in
+    // TxValidationState::ToString().
+    let reject_details = match error {
+        MempoolError::NonStandard(reason) => reason.clone(),
+        _ => error.to_string(),
+    };
+    let reject_details = if reject_details.starts_with("mempool-script-verify-flag-failed") {
+        transaction
+            .input
+            .first()
+            .map(|input| {
+                format!(
+                    "{reject_details}, input 0 of {} (wtxid {}), spending {}:{}",
+                    transaction.compute_txid(),
+                    transaction.compute_wtxid(),
+                    input.previous_output.txid,
+                    input.previous_output.vout,
+                )
+            })
+            .unwrap_or(reject_details)
+    } else {
+        reject_details
+    };
     let mut result = json!({
         "txid": transaction.compute_txid().to_string(),
         "wtxid": transaction.compute_wtxid().to_string(),
@@ -12155,13 +12265,23 @@ fn rejected_transaction_json(transaction: &Transaction, error: &MempoolError) ->
         "reject-reason": mempool_reject_reason(error),
     });
     if !matches!(error, MempoolError::MissingInput(_)) {
-        result["reject-details"] = json!(error.to_string());
+        result["reject-details"] = json!(reject_details);
     }
     result
 }
 
 fn exceeds_max_fee(fee_sat: u64, vsize: u64, max_fee_rate: Option<u64>) -> bool {
     max_fee_rate.is_some_and(|max_fee_rate| fee_sat > max_fee_for_vsize(max_fee_rate, vsize))
+}
+
+/// `submitpackage` compares the transaction's exact feerate with the caller's
+/// `CFeeRate`, unlike the raw-transaction RPCs which compare against the
+/// rounded-up fee for a concrete vsize.
+fn exceeds_max_feerate(fee_sat: u64, vsize: u64, max_fee_rate: Option<u64>) -> bool {
+    max_fee_rate.is_some_and(|max_fee_rate| {
+        u128::from(fee_sat).saturating_mul(1_000)
+            > u128::from(max_fee_rate).saturating_mul(u128::from(vsize))
+    })
 }
 
 fn max_fee_for_vsize(max_fee_rate_sat_per_kvb: u64, vsize: u64) -> u64 {
@@ -12184,7 +12304,7 @@ fn first_max_fee_failure_index(
                 (!preexisting.contains(&txid))
                     .then(|| mempool.get(&txid))
                     .flatten()
-                    .filter(|entry| exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate))
+                    .filter(|entry| exceeds_max_feerate(entry.fee_sat, entry.vsize, max_fee_rate))
                     .map(|_| index)
             })
     })
@@ -12396,8 +12516,12 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         let raw = raw
             .as_str()
             .ok_or_else(|| anyhow!("TX decode failed: package transaction must be hex"))?;
-        let transaction: Transaction = deserialize(&hex::decode(raw).context("TX decode failed")?)
-            .context("TX decode failed")?;
+        let transaction: Transaction = deserialize(&hex::decode(raw).with_context(|| {
+            format!("TX decode failed: {raw} Make sure the tx has at least one input.")
+        })?)
+        .with_context(|| {
+            format!("TX decode failed: {raw} Make sure the tx has at least one input.")
+        })?;
         validate_burn_amount(&transaction, max_burn_amount)?;
         let txid = transaction.compute_txid();
         if !transaction_ids.insert(txid) {
@@ -12409,7 +12533,25 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         && error != "package-not-sorted"
         && error != "package-contains-duplicates"
     {
-        bail!("{error}");
+        // Core reports package-wide validation errors as a structured
+        // submitpackage result.  In particular, conflicting inputs are not
+        // an RPC exception: every member is marked as not validated.
+        return Ok(json!({
+            "package_msg": error,
+            "tx-results": transactions
+                .iter()
+                .map(|transaction| {
+                    (
+                        transaction.compute_wtxid().to_string(),
+                        json!({
+                            "txid": transaction.compute_txid().to_string(),
+                            "error": "package-not-validated",
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>(),
+            "replaced-transactions": [],
+        }));
     }
     if transactions.len() > 1 && !package_is_child_with_parents_tree(&transactions) {
         bail!(
@@ -12418,7 +12560,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
     }
 
     let chain = node.chain.read();
-    let original_mempool = node.mempool.read();
+    let original_mempool = node.mempool.read().clone();
     let mut individual_candidate = original_mempool.clone();
     let before_transactions = original_mempool
         .transactions()
@@ -12432,9 +12574,20 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 .map(|_| transaction.compute_txid())
         })
         .collect::<HashSet<_>>();
+    let mut individual_probe = individual_candidate.clone();
+    let mut individually_accepted = HashSet::new();
+    for transaction in &transactions {
+        let txid = transaction.compute_txid();
+        if !preexisting.contains(&txid)
+            && individual_probe
+                .accept_for_test(transaction.clone(), &chain)
+                .is_ok()
+        {
+            individually_accepted.insert(txid);
+        }
+    }
     let (mut candidate, package_result, package_rbf) =
         original_mempool.accept_package_with_state(&transactions, &chain);
-    drop(original_mempool);
     let max_fee_failure =
         first_max_fee_failure_index(&transactions, &candidate, &preexisting, max_fee_rate);
     let mut results = serde_json::Map::new();
@@ -12442,11 +12595,20 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         // submitpackage exposes the detailed validation error in each
         // per-transaction result. testmempoolaccept uses the shorter
         // reject-reason classification instead.
-        let reason = error.to_string();
+        let reason = submit_package_error_message(&error);
         let first_missing = transactions
             .iter()
             .position(|transaction| candidate.get(&transaction.compute_txid()).is_none());
-        let failure_index = if package_rbf {
+        // Core evaluates package members individually first.  A replacement
+        // parent may therefore be committed even when a later child fails
+        // because it depended on the displaced transaction.  Other package
+        // RBF policy failures remain atomic.
+        let package_rbf_atomic = package_rbf
+            && !matches!(
+                &error,
+                MempoolError::MissingInput(_) | MempoolError::ClusterLimit
+            );
+        let failure_index = if package_rbf_atomic {
             None
         } else {
             match (max_fee_failure, first_missing) {
@@ -12473,11 +12635,12 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 if index < failure_index {
                     results.insert(
                         transaction.compute_wtxid().to_string(),
-                        package_transaction_json(
+                        submit_package_transaction_json(
                             transaction,
                             &transactions,
                             &candidate,
                             !preexisting.contains(&txid),
+                            &individually_accepted,
                         )?,
                     );
                     continue;
@@ -12515,6 +12678,25 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 "replaced-transactions": replaced_transactions,
             }));
         }
+        let standalone_accepted = transactions
+            .iter()
+            .filter(|transaction| individually_accepted.contains(&transaction.compute_txid()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let replaced_transactions = if package_rbf_atomic && !standalone_accepted.is_empty() {
+            // Core has already committed independently valid package members
+            // before running the package-RBF retry.  Commit that prefix while
+            // keeping the failed fallback package atomic.
+            drop(chain);
+            commit_submitted_package(
+                node,
+                individual_probe,
+                before_transactions,
+                standalone_accepted,
+            )
+        } else {
+            Vec::new()
+        };
         for transaction in &transactions {
             results.insert(
                 transaction.compute_wtxid().to_string(),
@@ -12524,10 +12706,17 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 }),
             );
         }
+        let package_msg = submit_package_failure_message_with_context(
+            &error,
+            package_rbf,
+            &transactions,
+            &candidate,
+            &original_mempool,
+        );
         return Ok(json!({
-            "package_msg": submit_package_failure_message(&error, package_rbf),
+            "package_msg": package_msg,
             "tx-results": results,
-            "replaced-transactions": [],
+            "replaced-transactions": replaced_transactions,
         }));
     }
 
@@ -12544,16 +12733,17 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                     let txid = transaction.compute_txid();
                     let package_max_failure = index == failure_index
                         && candidate.get(&txid).is_some_and(|entry| {
-                            exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate)
+                            exceeds_max_feerate(entry.fee_sat, entry.vsize, max_fee_rate)
                         });
                     if preexisting.contains(&txid) {
                         results.insert(
                             transaction.compute_wtxid().to_string(),
-                            package_transaction_json(
+                            submit_package_transaction_json(
                                 transaction,
                                 &transactions,
                                 &individual_candidate,
                                 false,
+                                &individually_accepted,
                             )?,
                         );
                         continue;
@@ -12564,7 +12754,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                                 .get(&accepted_txid)
                                 .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
                             if package_max_failure
-                                || exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate)
+                                || exceeds_max_feerate(entry.fee_sat, entry.vsize, max_fee_rate)
                             {
                                 individual_candidate.remove(&accepted_txid);
                                 results.insert(
@@ -12578,11 +12768,12 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                                 accepted.push(transaction.clone());
                                 results.insert(
                                     transaction.compute_wtxid().to_string(),
-                                    package_transaction_json(
+                                    submit_package_transaction_json(
                                         transaction,
                                         &transactions,
                                         &individual_candidate,
                                         true,
+                                        &individually_accepted,
                                     )?,
                                 );
                             }
@@ -12632,11 +12823,12 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 if index < failure_index {
                     results.insert(
                         transaction.compute_wtxid().to_string(),
-                        package_transaction_json(
+                        submit_package_transaction_json(
                             transaction,
                             &transactions,
                             &candidate,
                             !preexisting.contains(&transaction.compute_txid()),
+                            &individually_accepted,
                         )?,
                     );
                 } else if index == failure_index {
@@ -12682,7 +12874,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         let entry = candidate
             .get(&transaction.compute_txid())
             .ok_or_else(|| anyhow!("accepted package transaction disappeared"))?;
-        if exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate) {
+        if exceeds_max_feerate(entry.fee_sat, entry.vsize, max_fee_rate) {
             max_fee_exceeded = true;
             results.insert(
                 transaction.compute_wtxid().to_string(),
@@ -12694,11 +12886,12 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         } else {
             results.insert(
                 transaction.compute_wtxid().to_string(),
-                package_transaction_json(
+                submit_package_transaction_json(
                     transaction,
                     &transactions,
                     &candidate,
                     !preexisting.contains(&transaction.compute_txid()),
+                    &individually_accepted,
                 )?,
             );
         }
@@ -12729,6 +12922,8 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
 fn submit_package_error_message(error: &MempoolError) -> String {
     match error {
         MempoolError::MissingInput(_) => "bad-txns-inputs-missingorspent".to_owned(),
+        MempoolError::FeeRate => "mempool min fee not met".to_owned(),
+        MempoolError::NonStandard(reason) => reason.clone(),
         _ => error.to_string(),
     }
 }
@@ -12771,6 +12966,114 @@ fn commit_submitted_package(
     replaced_transactions
 }
 
+fn format_sat_amount(sat: i128) -> String {
+    let negative = sat < 0;
+    let magnitude = sat.unsigned_abs();
+    let whole = magnitude / 100_000_000;
+    let fractional = magnitude % 100_000_000;
+    if negative {
+        format!("-{whole}.{fractional:08}")
+    } else {
+        format!("{whole}.{fractional:08}")
+    }
+}
+
+fn format_sat_amount_trimmed(sat: i128) -> String {
+    let mut formatted = format_sat_amount(sat);
+    if let Some(dot) = formatted.find('.') {
+        while formatted.ends_with('0') {
+            formatted.pop();
+        }
+        if formatted.len() == dot + 1 {
+            formatted.pop();
+        }
+    }
+    formatted
+}
+
+fn replacement_conflicting_fee(mempool: &Mempool, transactions: &[Transaction]) -> i128 {
+    let mut removal = HashSet::new();
+    for transaction in transactions {
+        for input in &transaction.input {
+            let Some(conflict) = mempool.spender(&input.previous_output) else {
+                continue;
+            };
+            removal.insert(conflict);
+            removal.extend(mempool.descendants(&conflict));
+        }
+    }
+    removal
+        .into_iter()
+        .filter_map(|txid| {
+            let entry = mempool.get(&txid)?;
+            Some(mempool.modified_fee_sat_for(&txid, entry.fee_sat))
+        })
+        .fold(0i128, i128::saturating_add)
+}
+
+fn package_fee_and_vsize(mempool: &Mempool, transactions: &[Transaction]) -> Option<(i128, u64)> {
+    let mut fee = 0i128;
+    let mut vsize = 0u64;
+    for transaction in transactions {
+        let txid = transaction.compute_txid();
+        let entry = mempool.get(&txid)?;
+        fee = fee.saturating_add(mempool.modified_fee_sat_for(&txid, entry.fee_sat));
+        vsize = vsize.saturating_add(entry.vsize);
+    }
+    Some((fee, vsize))
+}
+
+fn submit_package_failure_message_with_context(
+    error: &MempoolError,
+    package_rbf: bool,
+    transactions: &[Transaction],
+    candidate: &Mempool,
+    original_mempool: &Mempool,
+) -> String {
+    if package_rbf && matches!(error, MempoolError::ReplacementFee) {
+        if let Some((package_fee, package_vsize)) = package_fee_and_vsize(candidate, transactions) {
+            let conflicting_fee = replacement_conflicting_fee(original_mempool, transactions);
+            let replacement = transactions
+                .last()
+                .map(Transaction::compute_txid)
+                .map(|txid| txid.to_string())
+                .unwrap_or_default();
+            if package_fee < conflicting_fee {
+                return format!(
+                    "package RBF failed: insufficient anti-DoS fees, rejecting replacement {replacement}, less fees than conflicting txs; {} < {}",
+                    format_sat_amount_trimmed(package_fee),
+                    format_sat_amount_trimmed(conflicting_fee),
+                );
+            }
+            let incremental_fee = i128::try_from(
+                (u128::from(candidate.incremental_relay_fee_sat_per_kvb())
+                    .saturating_mul(u128::from(package_vsize)))
+                .div_ceil(1_000),
+            )
+            .unwrap_or(i128::MAX);
+            let additional_fee = package_fee.saturating_sub(conflicting_fee);
+            if additional_fee < incremental_fee {
+                return format!(
+                    "package RBF failed: insufficient anti-DoS fees, rejecting replacement {replacement}, not enough additional fees to relay; {} < {}",
+                    format_sat_amount(additional_fee),
+                    format_sat_amount(incremental_fee),
+                );
+            }
+            if let Some(parent) = transactions.first()
+                && let Some(parent_entry) = candidate.get(&parent.compute_txid())
+                && package_fee.saturating_mul(i128::from(parent_entry.vsize))
+                    <= candidate
+                        .modified_fee_sat_for(&parent.compute_txid(), parent_entry.fee_sat)
+                        .saturating_mul(i128::from(package_vsize))
+            {
+                return "package RBF failed: package feerate is less than or equal to parent feerate"
+                    .to_owned();
+            }
+        }
+    }
+    submit_package_failure_message(error, package_rbf).to_owned()
+}
+
 fn submit_package_failure_message(error: &MempoolError, package_rbf: bool) -> &'static str {
     if !package_rbf {
         return "transaction failed";
@@ -12782,6 +13085,7 @@ fn submit_package_failure_message(error: &MempoolError, package_rbf: bool) -> &'
         MempoolError::ReplacementUnconfirmedInput => {
             "package RBF failed: new transaction cannot have mempool ancestors"
         }
+        MempoolError::PackageRbfWrongSize => "package RBF failed: package must be 1-parent-1-child",
         _ => "transaction failed",
     }
 }
@@ -14255,13 +14559,31 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "input not found or already spent" {
         return -25;
     }
+    if lower.starts_with("transaction ") && lower.ends_with(" not in mempool.") {
+        return -5;
+    }
+    if lower.starts_with("ranged descriptor not accepted") {
+        return -8;
+    }
+    if lower == "cannot derive script without private keys" {
+        return -5;
+    }
     if lower == "bad-txns-inputs-missingorspent" {
         return -25;
+    }
+    if lower.starts_with("testblockvalidity failed:") {
+        return -25;
+    }
+    if lower == "too-large-cluster" {
+        return -26;
     }
     if lower == "unspendable output exceeds maximum configured by user (maxburnamount)" {
         return -25;
     }
     if lower == "fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)" {
+        return -25;
+    }
+    if lower.starts_with("package topology disallowed") {
         return -25;
     }
     if lower == "invalid ip/subnet" || lower == "unban failed: address is not banned" {
@@ -14283,7 +14605,10 @@ fn rpc_error_code(message: &str) -> i32 {
     {
         return -3;
     }
-    if lower.starts_with("invalid bitcoin address") {
+    if lower == "invalid address"
+        || lower.starts_with("invalid bitcoin address")
+        || lower == "invalid address or descriptor"
+    {
         return -5;
     }
     if lower == "data must be hexadecimal string"
@@ -14560,6 +14885,9 @@ fn rpc_help(method: &str) -> String {
             "logging: Gets and sets the logging configuration.\nvalid logging categories are: {}",
             LOG_CATEGORIES.join(", ")
         )
+    } else if method == "generate" {
+        "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
+            .to_owned()
     } else if METHODS.contains(&method) {
         format!("{method}\n\n{method}: wallet-free Bitcoin Core-compatible RPC")
     } else {
@@ -14780,6 +15108,12 @@ mod tests {
         );
         assert_eq!(
             rpc_error_code("Fee exceeds maximum configured by user (e.g. -maxtxfee, maxfeerate)"),
+            -25
+        );
+        assert_eq!(
+            rpc_error_code(
+                "package topology disallowed. not child-with-parents or parents depend on each other."
+            ),
             -25
         );
         assert_eq!(rpc_error_code("Block not found"), -5);
@@ -15113,6 +15447,8 @@ mod tests {
         assert_eq!(max_fee_for_vsize(1, 101), 1);
         assert!(!exceeds_max_fee(1, 101, Some(1)));
         assert!(exceeds_max_fee(2, 101, Some(1)));
+        assert!(!exceeds_max_feerate(31_200, 104, Some(300_000)));
+        assert!(exceeds_max_feerate(31_200, 104, Some(299_999)));
         assert_eq!(parse_max_burn_amount(None).unwrap(), 0);
         assert_eq!(parse_max_burn_amount(Some(&json!(0.00000001))).unwrap(), 1);
         assert_eq!(
@@ -15185,7 +15521,8 @@ mod tests {
         assert_eq!(exact_rejected["reject-reason"], "txn-already-in-mempool");
         assert_eq!(exact_rejected["reject-details"], "txn-already-in-mempool");
         let package =
-            package_transaction_json(&submitted, &[submitted.clone()], &mempool, false).unwrap();
+            package_transaction_json(&submitted, &[submitted.clone()], &mempool, false, true)
+                .unwrap();
         assert_eq!(
             package,
             json!({

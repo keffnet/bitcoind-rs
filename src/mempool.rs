@@ -489,6 +489,8 @@ pub enum MempoolError {
     ReplacementFee,
     #[error("replacement transaction spends an unconfirmed output outside the conflicts")]
     ReplacementUnconfirmedInput,
+    #[error("package RBF failed: package must be 1-parent-1-child")]
+    PackageRbfWrongSize,
     #[error("insufficient feerate: does not improve feerate diagram")]
     ReplacementFeerateDiagram,
     #[error("transaction {0} input is missing")]
@@ -525,7 +527,7 @@ pub enum MempoolError {
     NonStandard(String),
     #[error("mempool size limit exceeded")]
     Full,
-    #[error("transaction cluster exceeds the mempool cluster limits")]
+    #[error("too-large-cluster")]
     ClusterLimit,
     #[error("TRUC-violation, {0}")]
     Truc(String),
@@ -544,6 +546,18 @@ pub(crate) enum PackageTestAcceptFailure {
     Package {
         error: String,
     },
+}
+
+fn package_individual_retryable(error: &MempoolError) -> bool {
+    matches!(
+        error,
+        MempoolError::FeeRate
+            | MempoolError::MinRelayFee
+            | MempoolError::Full
+            | MempoolError::ReplacementFee
+            | MempoolError::ReplacementFeerateDiagram
+            | MempoolError::MissingInput(_)
+    )
 }
 
 impl Mempool {
@@ -1504,18 +1518,76 @@ impl Mempool {
         chain: &ChainState,
     ) -> (Self, Result<Vec<Txid>, MempoolError>, bool) {
         let mut candidate = self.clone();
-        let package_has_preexisting = transactions
-            .iter()
-            .any(|transaction| candidate.get(&transaction.compute_txid()).is_some());
-        let allow_low_fee_parent = package_is_child_with_parents_tree(transactions);
-        let package_rbf = transactions.len() == 2
-            && allow_low_fee_parent
-            && !package_has_preexisting
+        if transactions.len() <= 1 {
+            let result = self.accept_package_inner(&mut candidate, transactions, chain);
+            return (candidate, result, false);
+        }
+
+        let package_may_rbf = package_is_child_with_parents_tree(transactions)
+            && !transactions
+                .iter()
+                .any(|transaction| candidate.get(&transaction.compute_txid()).is_some())
             && transactions
                 .iter()
                 .any(|transaction| !candidate.conflicts_for(transaction).is_empty());
-        let result = self.accept_package_inner(&mut candidate, transactions, chain);
-        (candidate, result, package_rbf)
+        if !package_may_rbf {
+            let result = self.accept_package_inner(&mut candidate, transactions, chain);
+            return (candidate, result, false);
+        }
+
+        // AcceptPackage in Core first tries every new member individually.
+        // Only reconsiderable failures (feerate, replacement economics, or
+        // missing inputs) are retried as one package; this preserves valid
+        // independent parents when a package child later fails.
+        let mut individually_accepted = Vec::with_capacity(transactions.len());
+        let mut package_fallback = Vec::with_capacity(transactions.len());
+        let mut first_retryable_error = None;
+        for transaction in transactions {
+            let txid = transaction.compute_txid();
+            if candidate.get(&txid).is_some() {
+                individually_accepted.push(txid);
+                continue;
+            }
+            match candidate.accept(transaction.clone(), chain) {
+                Ok(txid) => individually_accepted.push(txid),
+                Err(error) if package_individual_retryable(&error) => {
+                    first_retryable_error.get_or_insert(error);
+                    package_fallback.push(transaction.clone());
+                }
+                Err(error) => return (candidate, Err(error), false),
+            }
+        }
+        if package_fallback.is_empty() {
+            return (candidate, Ok(individually_accepted), false);
+        }
+        if package_fallback.len() == 1 {
+            return (
+                candidate,
+                Err(first_retryable_error.expect("package fallback has an error")),
+                false,
+            );
+        }
+
+        let package_rbf = package_is_child_with_parents_tree(&package_fallback)
+            && !package_fallback
+                .iter()
+                .any(|transaction| candidate.get(&transaction.compute_txid()).is_some())
+            && package_fallback
+                .iter()
+                .any(|transaction| !candidate.conflicts_for(transaction).is_empty());
+        let result = self.accept_package_inner(&mut candidate, &package_fallback, chain);
+        match result {
+            Ok(mut package_accepted) => {
+                individually_accepted.append(&mut package_accepted);
+                (candidate, Ok(individually_accepted), package_rbf)
+            }
+            Err(error) => {
+                // The candidate is diagnostic state for callers such as
+                // submitpackage; package-RBF callers must not commit it when
+                // the result is an error.
+                (candidate, Err(error), package_rbf)
+            }
+        }
     }
 
     fn accept_package_inner(
@@ -1545,8 +1617,7 @@ impl Mempool {
             .iter()
             .filter(|transaction| candidate.get(&transaction.compute_txid()).is_none())
             .count();
-        let package_rbf = transactions.len() == 2
-            && allow_low_fee_parent
+        let package_rbf = allow_low_fee_parent
             && !package_has_preexisting
             && transactions
                 .iter()
@@ -1554,6 +1625,15 @@ impl Mempool {
         let mut conflicting_fee = 0i128;
         let mut package_replaced = false;
         if package_rbf {
+            if transactions.len() != 2 {
+                return Err(MempoolError::PackageRbfWrongSize);
+            }
+            if transactions
+                .iter()
+                .any(|transaction| !candidate.ancestors_for_transaction(transaction).is_empty())
+            {
+                return Err(MempoolError::ReplacementUnconfirmedInput);
+            }
             let mut direct_conflicts = transactions
                 .iter()
                 .flat_map(|transaction| candidate.conflicts_for(transaction))
@@ -1570,14 +1650,6 @@ impl Mempool {
                 candidate.check_replacement_policy(&direct_conflicts)?;
                 package_replaced = true;
                 let removal = candidate.conflicts_and_descendants(&direct_conflicts);
-                if transactions.iter().any(|transaction| {
-                    transaction.input.iter().any(|input| {
-                        candidate.entries.contains_key(&input.previous_output.txid)
-                            && !removal.contains(&input.previous_output.txid)
-                    })
-                }) {
-                    return Err(MempoolError::ReplacementUnconfirmedInput);
-                }
                 conflicting_fee = removal
                     .iter()
                     .filter_map(|txid| {
@@ -1722,7 +1794,20 @@ impl Mempool {
                             Some(error) => PackageTestAcceptFailure::Package { error },
                             None => PackageTestAcceptFailure::Transaction {
                                 index,
-                                prior_results_validated: matches!(error, MempoolError::Script(_)),
+                                // Core can report complete results for the
+                                // package members preceding a script-policy
+                                // failure.  The lightweight standardness
+                                // checker uses NonStandard for the same
+                                // mempool-script-verify-flag-failed class,
+                                // so treat both representations alike.
+                                prior_results_validated: matches!(&error, MempoolError::Script(_))
+                                    || matches!(
+                                        &error,
+                                        MempoolError::NonStandard(reason)
+                                            if reason.starts_with(
+                                                "mempool-script-verify-flag-failed"
+                                            )
+                                    ),
                                 error,
                             },
                         }),
@@ -1769,18 +1854,6 @@ impl Mempool {
         self.check_replacement_cluster_limit(transaction.compute_txid(), &direct_conflicts)?;
         self.check_replacement_policy(&direct_conflicts)?;
         let removal = self.conflicts_and_descendants(&conflicts);
-        let mut allowed_unconfirmed = HashSet::new();
-        for conflict in &conflicts {
-            allowed_unconfirmed.extend(self.ancestors(conflict));
-        }
-        for input in &transaction.input {
-            if self.entries.contains_key(&input.previous_output.txid)
-                && !removal.contains(&input.previous_output.txid)
-                && !allowed_unconfirmed.contains(&input.previous_output.txid)
-            {
-                return Err(MempoolError::ReplacementUnconfirmedInput);
-            }
-        }
         let conflict_fees = removal
             .iter()
             .filter_map(|txid| self.entries.get(txid))
@@ -2194,7 +2267,7 @@ impl Mempool {
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
         let memory_usage = mempool_entry_memory_usage(&transaction);
         if enforce_mempool_policy {
-            self.check_cluster_limits_with_vsize(&transaction, vsize)?;
+            self.check_cluster_limits_with_weight(&transaction, adjusted_weight)?;
             let protected = self.ancestors_for_transaction(&transaction);
             self.ensure_space(memory_usage, &protected)?;
         }
@@ -2462,13 +2535,13 @@ impl Mempool {
 
     #[cfg(test)]
     fn check_cluster_limits(&self, transaction: &Transaction) -> Result<(), MempoolError> {
-        self.check_cluster_limits_with_vsize(transaction, transaction.vsize() as u64)
+        self.check_cluster_limits_with_weight(transaction, transaction.weight().to_wu())
     }
 
-    fn check_cluster_limits_with_vsize(
+    fn check_cluster_limits_with_weight(
         &self,
         transaction: &Transaction,
-        transaction_vsize: u64,
+        transaction_weight: u64,
     ) -> Result<(), MempoolError> {
         let mut connected = HashSet::new();
         let mut pending = transaction
@@ -2493,14 +2566,14 @@ impl Mempool {
             }
             pending.extend(self.children(&txid));
         }
-        let connected_vsize = connected
+        let connected_weight = connected
             .iter()
-            .filter_map(|txid| self.entries.get(txid))
-            .map(|entry| entry.vsize)
+            .map(|txid| self.adjusted_weight(txid))
             .fold(0u64, u64::saturating_add)
-            .saturating_add(transaction_vsize);
+            .saturating_add(transaction_weight);
+        let cluster_weight_limit = self.policy.cluster_vsize_limit.saturating_mul(4);
         if connected.len().saturating_add(1) > self.policy.cluster_count_limit
-            || connected_vsize > self.policy.cluster_vsize_limit
+            || connected_weight > cluster_weight_limit
         {
             return Err(MempoolError::ClusterLimit);
         }
@@ -3460,6 +3533,15 @@ fn standard_script_policy_failure(reason: &'static str) -> MempoolError {
     MempoolError::NonStandard(format!("mempool-script-verify-flag-failed ({reason})"))
 }
 
+fn standard_stack_size_failure(actual: usize, required: usize) -> MempoolError {
+    let reason = if actual < required {
+        "Operation not valid with the current stack size"
+    } else {
+        "Stack size must be exactly one after execution"
+    };
+    standard_script_policy_failure(reason)
+}
+
 /// Validate the non-consensus signature policy rules for the simple standard
 /// templates whose executed CHECKSIG arguments are directly visible in the
 /// input. More general P2WSH and multisig scripts need an execution-aware
@@ -3481,18 +3563,14 @@ fn validate_standard_simple_ecdsa_spends(
 
             if redeem_script.is_p2pkh() {
                 if stack.len() != 2 {
-                    return Err(standard_script_policy_failure(
-                        "Stack size must be exactly one after execution",
-                    ));
+                    return Err(standard_stack_size_failure(stack.len(), 2));
                 }
                 validate_standard_ecdsa_pair(&stack[0], &stack[1], false)?;
             } else if redeem_script.is_p2wpkh() {
                 validate_standard_wpkh_witness(input)?;
             } else if let Some(pubkey) = p2pk_checksig_not_pubkey_bytes(redeem_script) {
                 if stack.len() != 1 {
-                    return Err(standard_script_policy_failure(
-                        "Stack size must be exactly one after execution",
-                    ));
+                    return Err(standard_stack_size_failure(stack.len(), 1));
                 }
                 validate_standard_ecdsa_pair(&stack[0], &pubkey, false)?;
                 if !stack[0].is_empty() {
@@ -3502,9 +3580,7 @@ fn validate_standard_simple_ecdsa_spends(
                 }
             } else if let Some(pubkey) = p2pk_pubkey_bytes(redeem_script) {
                 if stack.len() != 1 {
-                    return Err(standard_script_policy_failure(
-                        "Stack size must be exactly one after execution",
-                    ));
+                    return Err(standard_stack_size_failure(stack.len(), 1));
                 }
                 validate_standard_ecdsa_pair(&stack[0], &pubkey, false)?;
             }
@@ -3516,9 +3592,7 @@ fn validate_standard_simple_ecdsa_spends(
                 continue;
             };
             if stack.len() != 2 {
-                return Err(standard_script_policy_failure(
-                    "Stack size must be exactly one after execution",
-                ));
+                return Err(standard_stack_size_failure(stack.len(), 2));
             }
             validate_standard_ecdsa_pair(&stack[0], &stack[1], false)?;
         } else if previous.script_pubkey.is_p2wpkh() {
@@ -3528,9 +3602,7 @@ fn validate_standard_simple_ecdsa_spends(
                 continue;
             };
             if stack.len() != 1 {
-                return Err(standard_script_policy_failure(
-                    "Stack size must be exactly one after execution",
-                ));
+                return Err(standard_stack_size_failure(stack.len(), 1));
             }
             validate_standard_ecdsa_pair(&stack[0], &pubkey, false)?;
         }

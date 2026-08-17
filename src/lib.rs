@@ -1048,6 +1048,9 @@ pub struct Node {
     pub(crate) i2p_sam: Option<Arc<i2p::I2pSam>>,
     pub(crate) tor_controller: Option<Arc<tor::TorController>>,
     mempool_path: std::path::PathBuf,
+    /// Serialize RPC mining operations so a block template cannot become
+    /// stale between reading the active tip and connecting the mined block.
+    pub(crate) mining_lock: Mutex<()>,
     pub peer_count: AtomicUsize,
     mempool_check_operations: AtomicUsize,
     block_index_check_operations: AtomicUsize,
@@ -1421,6 +1424,7 @@ impl Node {
             i2p_sam,
             tor_controller,
             mempool_path,
+            mining_lock: Mutex::new(()),
             peer_count: AtomicUsize::new(0),
             mempool_check_operations: AtomicUsize::new(0),
             block_index_check_operations: AtomicUsize::new(0),
@@ -2152,6 +2156,54 @@ impl Node {
                 Err(error.into())
             }
         }
+    }
+
+    /// Accept a package received from a peer and publish the same mempool
+    /// notifications as ordinary peer transaction admission.  Core uses this
+    /// path when a replacement parent and its child arrive separately over
+    /// the wire but only pass policy when evaluated together.
+    pub(crate) fn accept_peer_package_from(
+        &self,
+        peer_id: usize,
+        transactions: &[Transaction],
+    ) -> Result<Vec<Txid>> {
+        let (result, changes, current_height) = {
+            let chain = self.chain.read();
+            let mut mempool = self.mempool.write();
+            let result = mempool.accept_package(transactions, &chain);
+            let changes = mempool.take_changes();
+            (result, changes, chain.height())
+        };
+        let txids = result?;
+        self.update_fee_estimator_for_changes(&changes, current_height);
+        let removed_ids = changes
+            .iter()
+            .filter_map(|change| match &change.kind {
+                MempoolChangeKind::Removed { .. } => {
+                    self.add_compact_extra_transaction(change.transaction.clone());
+                    Some(change.transaction.compute_txid())
+                }
+                MempoolChangeKind::Added => None,
+            })
+            .collect::<Vec<_>>();
+        self.announce_mempool_changes(removed_ids);
+        self.notify_zmq_mempool_changes(changes);
+        self.maybe_check_mempool();
+
+        // A child that arrived before its replacement parent may already be
+        // in the orphan pool. Remove both package members before publishing
+        // the successful parent notification so ordinary orphan promotion
+        // cannot race the package result.
+        {
+            let mut orphans = self.orphans.lock();
+            for transaction in transactions {
+                orphans.remove(&transaction.compute_txid());
+            }
+        }
+        for transaction in transactions {
+            self.notify_mempool_transaction_from_peer(transaction.clone(), peer_id);
+        }
+        Ok(txids)
     }
 
     fn add_compact_extra_transaction(&self, transaction: Transaction) {

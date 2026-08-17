@@ -5593,6 +5593,9 @@ impl ChainState {
             .map(|(outpoint, _)| *outpoint)
             .collect::<Vec<_>>();
         for (outpoint, entry) in &application.spent_entries {
+            if self.utxos_materialized {
+                self.utxos.remove(outpoint);
+            }
             self.remove_utxo_entry(outpoint, entry);
         }
         let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();

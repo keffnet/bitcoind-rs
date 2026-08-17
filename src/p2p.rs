@@ -256,6 +256,7 @@ const MAX_TX_INVENTORY_BATCH: usize = 50_000;
 const BLOCK_RELAY_IDLE_DELAY: Duration = Duration::from_secs(1);
 const MAX_PEER_TX_ANNOUNCEMENTS: usize = 5_000;
 const MAX_PEER_TX_REQUEST_IN_FLIGHT: usize = 100;
+const MAX_PENDING_PACKAGE_TRANSACTIONS: usize = 64;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
 const TXID_RELAY_DELAY: Duration = Duration::from_secs(2);
 const NONPREF_PEER_TX_DELAY: Duration = Duration::from_secs(2);
@@ -959,6 +960,7 @@ struct PeerState {
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
     pending_tx_inventory: parking_lot::Mutex<Vec<Inventory>>,
+    pending_package_transactions: parking_lot::Mutex<HashMap<Txid, Transaction>>,
     send_mempool: parking_lot::Mutex<bool>,
     tx_requests: parking_lot::Mutex<TxRequestState>,
     fee_filter: parking_lot::Mutex<i64>,
@@ -1009,6 +1011,67 @@ struct TxRequestState {
     pending: VecDeque<PendingTxRequest>,
     pending_keys: HashSet<TxRequestKey>,
     in_flight: HashMap<TxRequestKey, Instant>,
+}
+
+fn peer_package_retryable_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<MempoolError>().is_some_and(|error| {
+        matches!(
+            error,
+            MempoolError::FeeRate
+                | MempoolError::MinRelayFee
+                | MempoolError::Full
+                | MempoolError::ReplacementFee
+                | MempoolError::ReplacementFeerateDiagram
+                | MempoolError::MissingInput(_)
+        )
+    })
+}
+
+fn is_direct_parent(parent: &Transaction, child: &Transaction) -> bool {
+    let parent_txid = parent.compute_txid();
+    child
+        .input
+        .iter()
+        .any(|input| input.previous_output.txid == parent_txid)
+}
+
+fn peer_package_with_current(
+    pending: &HashMap<Txid, Transaction>,
+    current: &Transaction,
+) -> Option<(Vec<Transaction>, Vec<Txid>)> {
+    for candidate in pending.values() {
+        if is_direct_parent(candidate, current) {
+            return Some((
+                vec![candidate.clone(), current.clone()],
+                vec![candidate.compute_txid(), current.compute_txid()],
+            ));
+        }
+        if is_direct_parent(current, candidate) {
+            return Some((
+                vec![current.clone(), candidate.clone()],
+                vec![current.compute_txid(), candidate.compute_txid()],
+            ));
+        }
+    }
+    None
+}
+
+fn remember_peer_package_transaction(state: &PeerState, transaction: Transaction) {
+    let mut pending = state.pending_package_transactions.lock();
+    pending.insert(transaction.compute_txid(), transaction);
+    while pending.len() > MAX_PENDING_PACKAGE_TRANSACTIONS {
+        let Some(txid) = pending.keys().next().copied() else {
+            break;
+        };
+        pending.remove(&txid);
+    }
+}
+
+fn forget_peer_package_transactions(state: &PeerState, txids: &[Txid]) {
+    let mut pending = state.pending_package_transactions.lock();
+    for txid in txids {
+        pending.remove(txid);
+    }
 }
 
 impl TxRequestState {
@@ -1509,7 +1572,8 @@ impl PeerManager {
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 };
-                if relay_node.chain.read().is_initial_block_download() {
+                let initial_block_download = relay_node.chain.read().is_initial_block_download();
+                if initial_block_download {
                     continue;
                 }
                 let Some(hash) = relay_node
@@ -2980,6 +3044,7 @@ async fn serve_peer(
         bloom_filter: parking_lot::Mutex::new(None),
         known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
         pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
+        pending_package_transactions: parking_lot::Mutex::new(HashMap::new()),
         send_mempool: parking_lot::Mutex::new(false),
         tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
         fee_filter: parking_lot::Mutex::new(0),
@@ -4782,12 +4847,58 @@ async fn serve_peer_loop(
                 };
                 peer_state.known_tx_inventory.lock().insert(&known_hash);
                 let transaction_for_force_relay = transaction.clone();
-                match node.accept_peer_transaction_from(peer_id, transaction) {
+                match node.accept_peer_transaction_from(peer_id, transaction.clone()) {
                     Ok(_) => {
                         node.record_peer_transaction(peer_id);
                         debug!(%txid, "accepted peer transaction");
                     }
                     Err(error) => {
+                        let mut accepted_as_package = false;
+                        let package_retryable = peer_package_retryable_error(&error);
+                        if package_retryable {
+                            let package = {
+                                let pending = peer_state.pending_package_transactions.lock();
+                                peer_package_with_current(&pending, &transaction)
+                            };
+                            if let Some((package, package_txids)) = package {
+                                match node.accept_peer_package_from(peer_id, &package) {
+                                    Ok(_) => {
+                                        forget_peer_package_transactions(
+                                            peer_state,
+                                            &package_txids,
+                                        );
+                                        node.record_peer_transaction(peer_id);
+                                        accepted_as_package = true;
+                                        debug!(
+                                            %txid,
+                                            "accepted peer transaction package"
+                                        );
+                                    }
+                                    Err(package_error) => {
+                                        debug!(
+                                            %txid,
+                                            %package_error,
+                                            "rejected peer transaction package"
+                                        );
+                                    }
+                                }
+                            }
+                            if !accepted_as_package {
+                                remember_peer_package_transaction(peer_state, transaction.clone());
+                            }
+                        }
+                        if accepted_as_package {
+                            flush_peer_transaction_requests(
+                                node,
+                                peer_id,
+                                peer_state,
+                                peers,
+                                writer,
+                                node.config.network,
+                            )
+                            .await?;
+                            continue;
+                        }
                         if peer_state
                             .permissions
                             .contains(PeerPermissions::FORCE_RELAY)
@@ -4803,12 +4914,16 @@ async fn serve_peer_loop(
                         {
                             let parent_txid = outpoint.txid;
                             let in_mempool = node.mempool.read().get(&parent_txid).is_some();
+                            let pending_package_parent = peer_state
+                                .pending_package_transactions
+                                .lock()
+                                .contains_key(&parent_txid);
                             let in_chain = if in_mempool {
                                 true
                             } else {
                                 node.chain.write().transaction(&parent_txid)?.is_some()
                             };
-                            if !in_chain && {
+                            if !in_chain && !pending_package_parent && {
                                 let parent = Inventory {
                                     // Orphan parent fetching uses MSG_TX
                                     // even when wtxid relay is negotiated.
@@ -5647,9 +5762,10 @@ async fn maybe_send_fee_filter(
     let now = Instant::now();
     let sent_fee = *peer_state.sent_fee_filter.lock();
     let max_money = i64::try_from(Amount::MAX_MONEY.to_sat()).expect("MAX_MONEY fits in i64");
+    let max_filter = rounded_fee_filter(max_money, incremental_relay_fee);
     let should_send = {
         let mut next_fee_filter = peer_state.next_fee_filter.lock();
-        if !initial_block_download && sent_fee == Some(max_money) {
+        if !initial_block_download && sent_fee == Some(max_filter) {
             // Core immediately re-advertises the normal relay floor after leaving
             // IBD instead of waiting for the old randomized timer.
             *next_fee_filter = None;
@@ -6013,7 +6129,8 @@ async fn flush_peer_transaction_inventory(
     writer: &PeerWriter,
     network: Network,
 ) -> Result<()> {
-    if !*state.relay_transactions.lock() {
+    let relay_transactions = *state.relay_transactions.lock();
+    if !relay_transactions {
         state.pending_tx_inventory.lock().clear();
         node.set_peer_inv_to_send(peer_id, 0);
         return Ok(());
@@ -7831,6 +7948,7 @@ mod tests {
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
             pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
+            pending_package_transactions: parking_lot::Mutex::new(HashMap::new()),
             send_mempool: parking_lot::Mutex::new(false),
             tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
             fee_filter: parking_lot::Mutex::new(0),
@@ -10268,6 +10386,7 @@ mod tests {
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
             pending_tx_inventory: parking_lot::Mutex::new(Vec::new()),
+            pending_package_transactions: parking_lot::Mutex::new(HashMap::new()),
             send_mempool: parking_lot::Mutex::new(false),
             tx_requests: parking_lot::Mutex::new(TxRequestState::default()),
             fee_filter: parking_lot::Mutex::new(0),

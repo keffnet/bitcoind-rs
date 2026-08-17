@@ -49,8 +49,8 @@ use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
 };
 use crate::{
-    MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, PRIVATE_BROADCAST_RETRY_SECS, PeerRegistrationOptions,
-    StartupLatch, unix_time_seconds,
+    AddrResponseCacheKey, MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, PRIVATE_BROADCAST_RETRY_SECS,
+    PeerRegistrationOptions, StartupLatch, unix_time_seconds,
 };
 
 macro_rules! peer_log {
@@ -249,6 +249,7 @@ const KNOWN_TX_FILTER_BITS: usize = 1 << 20;
 const KNOWN_TX_FILTER_HASHES: u32 = 4;
 const KNOWN_TX_FILTER_GENERATION: usize = 25_000;
 const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
+const AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(2 * 60);
 const HEADERS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const AVG_FEEFILTER_BROADCAST_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -527,6 +528,15 @@ fn handle_headers_download_timeout(
     peer_id: usize,
     peer_state: &PeerState,
 ) -> Result<bool> {
+    // Core disables the initial-header stalling timer once the best header is
+    // within a day of the node clock. This matters for mocktime-driven tests:
+    // a recent chain may legitimately have an unanswered getheaders request,
+    // but it must not be disconnected merely because mocktime advances.
+    if node.best_header_is_recent() {
+        *peer_state.last_headers_request.lock() = None;
+        *peer_state.last_headers_request_time.lock() = None;
+        return Ok(false);
+    }
     if !headers_download_timed_out_with_mocktime(
         *peer_state.last_headers_request.lock(),
         *peer_state.last_headers_request_time.lock(),
@@ -3350,7 +3360,7 @@ async fn serve_peer_loop(
         )
     };
     if peer_state.connection_type != "private-broadcast" {
-        if let Some(address) = advertised_local_address(node, peer_state) {
+        if let Some(address) = advertised_local_address(node, peer_state, peer_id) {
             version.sender_address = socket_address_bytes(address);
             version.sender_port = address.port();
         }
@@ -3404,6 +3414,8 @@ async fn serve_peer_loop(
     let mut post_verack_extensions_sent = false;
     let mut addrv2_received = false;
     let mut getaddr_received = false;
+    let mut getaddr_sent = false;
+    let mut next_local_addr_send = None;
     let mut getaddr_response_pending = false;
     let mut peer_version = 0i32;
     let mut peer_services = 0u64;
@@ -3518,9 +3530,15 @@ async fn serve_peer_loop(
                     node.record_bytes_received(peer_id, bytes, crate::P2P_MESSAGE_TYPE_OTHER);
                     continue;
                 };
-                if matches!(&message, Message::Unknown { .. }) {
-                    debug!("received: {}", message.command());
+                if let Some((command, count)) = oversized_address_message(&message) {
+                    debug!("{command} message size = {count}");
+                    anyhow::bail!("{command} message size = {count}");
                 }
+                debug!(
+                    "received: {} ({} bytes) peer={peer_id}",
+                    message.command(),
+                    message_payload_size(&message, bytes)
+                );
                 node.record_bytes_received(peer_id, bytes, message.command());
                 node.capture_message(peer_id, true, &message)?;
                 if let Message::GetData(items) = message {
@@ -3691,6 +3709,16 @@ async fn serve_peer_loop(
                 continue;
             }
             _ = block_relay_interval.tick(), if version_received && verack_received && !*peer_state.private_broadcast_peer.lock() => {
+                maybe_send_local_address_announcement(
+                    node,
+                    peer_id,
+                    peer_state,
+                    writer,
+                    version.services,
+                    addrv2_received,
+                    &mut next_local_addr_send,
+                )
+                .await?;
                 flush_pending_block_relay(
                     node,
                     peer_id,
@@ -3834,6 +3862,7 @@ async fn serve_peer_loop(
                 if !version_received {
                     continue;
                 }
+                node.setup_outbound_address_relay(peer_id);
                 send_peer_extensions(
                     node,
                     peer_id,
@@ -3873,6 +3902,18 @@ async fn serve_peer_loop(
                         .await?;
                     }
                     continue;
+                }
+                if outbound && peer_state.connection_type != "block-relay-only" {
+                    maybe_send_local_address_announcement(
+                        node,
+                        peer_id,
+                        peer_state,
+                        writer,
+                        version.services,
+                        addrv2_received,
+                        &mut next_local_addr_send,
+                    )
+                    .await?;
                 }
                 if connection_requests_headers(peer_state.connection_type)
                     && node.start_initial_headers_sync(peer_id)
@@ -3918,11 +3959,13 @@ async fn serve_peer_loop(
                         &Message::GetAddr,
                     )
                     .await?;
+                    getaddr_sent = true;
                     node.grant_peer_address_tokens(peer_id, MAX_ADDR_TO_SEND);
                 }
             }
             Message::SendAddrV2 => {
                 if verack_received {
+                    debug!("sendaddrv2 received after verack, disconnecting peer={peer_id}");
                     anyhow::bail!("sendaddrv2 received after verack");
                 }
                 // BIP155 permits the signal for every protocol version. Core
@@ -3994,6 +4037,16 @@ async fn serve_peer_loop(
                 )
                 .await?;
                 if !*peer_state.private_broadcast_peer.lock() {
+                    maybe_send_local_address_announcement(
+                        node,
+                        peer_id,
+                        peer_state,
+                        writer,
+                        version.services,
+                        addrv2_received,
+                        &mut next_local_addr_send,
+                    )
+                    .await?;
                     let inventory_send_due = transaction_inventory_send_due(
                         node,
                         peer_state,
@@ -5000,7 +5053,7 @@ async fn serve_peer_loop(
                 .await?;
                 if getaddr_response_pending && !node.chain.read().is_initial_block_download() {
                     getaddr_response_pending = false;
-                    send_getaddr_response(
+                    if send_getaddr_response(
                         node,
                         peer_id,
                         peer_state,
@@ -5008,7 +5061,12 @@ async fn serve_peer_loop(
                         version.services,
                         addrv2_received,
                     )
-                    .await?;
+                    .await?
+                    {
+                        next_local_addr_send = Some(next_local_address_announcement_time(
+                            crate::time::unix_time(),
+                        ));
+                    }
                 }
             }
             Message::CompactBlock(compact) => {
@@ -5760,13 +5818,13 @@ async fn serve_peer_loop(
             }
             Message::MerkleBlock(_) => {}
             Message::Addr(addresses) => {
-                if address_message_is_oversized(addresses.len()) {
-                    debug!(
-                        peer_id,
-                        count = addresses.len(),
-                        "ignoring oversized addr message"
-                    );
+                if peer_state.connection_type == "block-relay-only" {
+                    debug!("ignoring addr message from block-relay-only peer={peer_id}");
                     continue;
+                }
+                if address_message_is_oversized(addresses.len()) {
+                    debug!("addr message size = {}", addresses.len());
+                    anyhow::bail!("addr message size = {}", addresses.len());
                 }
                 if peer_state.connection_type == "addr-fetch" && addresses.len() > 1 {
                     bail!("addr-fetch connection received too many addresses");
@@ -5774,7 +5832,12 @@ async fn serve_peer_loop(
                 node.enable_peer_address_relay(peer_id);
                 let address_time = crate::time::unix_time();
                 let approximate_depth = approximate_best_block_depth(node);
+                let suppress_relay = getaddr_sent;
+                let address_count = addresses.len();
                 let mut addresses = addresses;
+                if addresses.len() < MAX_ADDR_TO_SEND {
+                    getaddr_sent = false;
+                }
                 addresses.shuffle(&mut rand::rng());
                 let mut relay_addresses = Vec::new();
                 for entry in addresses {
@@ -5786,26 +5849,34 @@ async fn serve_peer_loop(
                     if let Some(address) = socket_address_from_legacy(&entry) {
                         let time = normalize_peer_address_time(u64::from(entry.time), address_time);
                         let endpoint = NetworkEndpoint::from_socket(address);
-                        if node.remember_network_address_from(
-                            endpoint.clone(),
-                            entry.services,
-                            time,
-                            peer_state.endpoint.clone(),
-                        ) {
-                            relay_addresses.push((endpoint, entry.services, time));
+                        let reachable = node.config.network_endpoint_is_reachable(&endpoint);
+                        if reachable {
+                            node.remember_network_address_from(
+                                endpoint.clone(),
+                                entry.services,
+                                time,
+                                peer_state.endpoint.clone(),
+                            );
                         }
+                        // Relay eligibility is independent of whether the
+                        // address was new to AddrMan. Core may relay a
+                        // duplicate so its rotating destination selection can
+                        // provide propagation over later 24-hour windows.
+                        relay_addresses.push((endpoint, entry.services, time));
                     }
                 }
-                node.relay_peer_addresses(peer_id, relay_addresses);
+                if !suppress_relay && address_count <= 10 {
+                    node.relay_peer_addresses(peer_id, relay_addresses);
+                }
             }
             Message::AddrV2(addresses) => {
-                if address_message_is_oversized(addresses.len()) {
-                    debug!(
-                        peer_id,
-                        count = addresses.len(),
-                        "ignoring oversized addrv2 message"
-                    );
+                if peer_state.connection_type == "block-relay-only" {
+                    debug!("ignoring addrv2 message from block-relay-only peer={peer_id}");
                     continue;
+                }
+                if address_message_is_oversized(addresses.len()) {
+                    debug!("addrv2 message size = {}", addresses.len());
+                    anyhow::bail!("addrv2 message size = {}", addresses.len());
                 }
                 if peer_state.connection_type == "addr-fetch" && addresses.len() > 1 {
                     bail!("addr-fetch connection received too many addresses");
@@ -5813,7 +5884,12 @@ async fn serve_peer_loop(
                 node.enable_peer_address_relay(peer_id);
                 let address_time = crate::time::unix_time();
                 let approximate_depth = approximate_best_block_depth(node);
+                let suppress_relay = getaddr_sent;
+                let address_count = addresses.len();
                 let mut addresses = addresses;
+                if addresses.len() < MAX_ADDR_TO_SEND {
+                    getaddr_sent = false;
+                }
                 addresses.shuffle(&mut rand::rng());
                 let mut relay_addresses = Vec::new();
                 for address in addresses {
@@ -5829,17 +5905,21 @@ async fn serve_peer_loop(
                     ) {
                         let time =
                             normalize_peer_address_time(u64::from(address.time), address_time);
-                        if node.remember_network_address_from(
-                            endpoint.clone(),
-                            address.services,
-                            time,
-                            peer_state.endpoint.clone(),
-                        ) {
-                            relay_addresses.push((endpoint, address.services, time));
+                        let reachable = node.config.network_endpoint_is_reachable(&endpoint);
+                        if reachable {
+                            node.remember_network_address_from(
+                                endpoint.clone(),
+                                address.services,
+                                time,
+                                peer_state.endpoint.clone(),
+                            );
                         }
+                        relay_addresses.push((endpoint, address.services, time));
                     }
                 }
-                node.relay_peer_addresses(peer_id, relay_addresses);
+                if !suppress_relay && address_count <= 10 {
+                    node.relay_peer_addresses(peer_id, relay_addresses);
+                }
             }
             Message::SendHeaders => {
                 *peer_state.send_headers.lock() = true;
@@ -5880,7 +5960,12 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetAddr => {
-                if outbound || getaddr_received {
+                if outbound {
+                    debug!("Ignoring \"getaddr\" from outbound connection. peer={peer_id}");
+                    continue;
+                }
+                if getaddr_received {
+                    debug!("Ignoring repeated \"getaddr\". peer={peer_id}");
                     continue;
                 }
                 getaddr_received = true;
@@ -5888,7 +5973,7 @@ async fn serve_peer_loop(
                 getaddr_response_pending = true;
                 if !node.chain.read().is_initial_block_download() {
                     getaddr_response_pending = false;
-                    send_getaddr_response(
+                    if send_getaddr_response(
                         node,
                         peer_id,
                         peer_state,
@@ -5896,7 +5981,12 @@ async fn serve_peer_loop(
                         version.services,
                         addrv2_received,
                     )
-                    .await?;
+                    .await?
+                    {
+                        next_local_addr_send = Some(next_local_address_announcement_time(
+                            crate::time::unix_time(),
+                        ));
+                    }
                 }
             }
             Message::Mempool => {
@@ -6366,7 +6456,7 @@ fn complete_compact_block(
     Ok(block)
 }
 
-fn advertised_local_address(node: &Node, peer: &PeerState) -> Option<SocketAddr> {
+fn advertised_local_address(node: &Node, peer: &PeerState, peer_id: usize) -> Option<SocketAddr> {
     let peer_network = peer.endpoint.network_name();
     let matches_peer_network = |address: SocketAddr| {
         let endpoint = NetworkEndpoint::from_socket(address);
@@ -6379,7 +6469,8 @@ fn advertised_local_address(node: &Node, peer: &PeerState) -> Option<SocketAddr>
             && node.config.allows_address(address)
             && matches_peer_network(address)
     };
-    node.config
+    let address = node
+        .config
         .external_addresses
         .iter()
         .copied()
@@ -6395,12 +6486,17 @@ fn advertised_local_address(node: &Node, peer: &PeerState) -> Option<SocketAddr>
                 .then_some(peer.local_address)
                 .flatten()
                 .filter(|address| usable(*address))
-        })
+        });
+    if let Some(address) = address {
+        debug!("Advertising address {address} to peer={peer_id}");
+    }
+    address
 }
 
 fn initial_self_announcement(
     node: &Node,
     peer: &PeerState,
+    peer_id: usize,
     services: u64,
     addrv2: bool,
 ) -> Option<Message> {
@@ -6416,10 +6512,15 @@ fn initial_self_announcement(
             && (peer_network == "not_publicly_routable"
                 || NetworkEndpoint::from_socket(address).network_name() == peer_network)
     };
-    let address = advertised_local_address(node, peer).or_else(|| {
-        node.listen_addresses()
-            .into_iter()
-            .find(compatible_listener)
+    let address = advertised_local_address(node, peer, peer_id).or_else(|| {
+        node.config
+            .discover
+            .then(|| {
+                node.listen_addresses()
+                    .into_iter()
+                    .find(compatible_listener)
+            })
+            .flatten()
     })?;
     let time = crate::time::unix_time();
     if addrv2 {
@@ -6435,6 +6536,39 @@ fn initial_self_announcement(
     }
 }
 
+fn next_local_address_announcement_time(now: u64) -> u64 {
+    // Core schedules local-address announcements with an exponential delay
+    // whose mean is 24 hours. Avoid the singular zero sample while retaining
+    // the same distribution and mocktime-driven behavior.
+    let sample = random::<f64>().max(f64::MIN_POSITIVE);
+    let delay = ((-sample.ln()) * AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL_SECS as f64).max(1.0) as u64;
+    now.saturating_add(delay)
+}
+
+async fn maybe_send_local_address_announcement(
+    node: &Arc<Node>,
+    peer_id: usize,
+    peer: &PeerState,
+    writer: &PeerWriter,
+    services: u64,
+    addrv2: bool,
+    next_send: &mut Option<u64>,
+) -> Result<()> {
+    if !node.peer_address_relay_enabled(peer_id) {
+        return Ok(());
+    }
+    let now = crate::time::unix_time();
+    if next_send.is_some_and(|scheduled| now < scheduled) {
+        return Ok(());
+    }
+    let Some(message) = initial_self_announcement(node, peer, peer_id, services, addrv2) else {
+        return Ok(());
+    };
+    send_message(node, peer_id, writer, node.config.network, &message).await?;
+    *next_send = Some(next_local_address_announcement_time(now));
+    Ok(())
+}
+
 async fn send_getaddr_response(
     node: &Arc<Node>,
     peer_id: usize,
@@ -6442,13 +6576,22 @@ async fn send_getaddr_response(
     writer: &PeerWriter,
     services: u64,
     addrv2: bool,
-) -> Result<()> {
-    if let Some(address) = initial_self_announcement(node, peer, services, addrv2) {
-        send_message(node, peer_id, writer, node.config.network, &address).await?;
-    }
-    let mut addresses = node.known_network_addresses();
-    addresses.shuffle(&mut rand::rng());
-    addresses.truncate(getaddr_response_limit(addresses.len()));
+) -> Result<bool> {
+    let self_announced =
+        if let Some(address) = initial_self_announcement(node, peer, peer_id, services, addrv2) {
+            send_message(node, peer_id, writer, node.config.network, &address).await?;
+            true
+        } else {
+            false
+        };
+    let addresses = node.cached_addr_response(
+        AddrResponseCacheKey {
+            network: peer.endpoint.network_name(),
+            local_address: peer.local_address,
+        },
+        MAX_ADDR_TO_SEND,
+        MAX_PCT_ADDR_TO_SEND,
+    );
     if addrv2 {
         let addresses = addresses
             .into_iter()
@@ -6486,7 +6629,7 @@ async fn send_getaddr_response(
         )
         .await?;
     }
-    Ok(())
+    Ok(self_announced)
 }
 
 fn socket_address_bytes(address: std::net::SocketAddr) -> [u8; 16] {
@@ -6835,9 +6978,20 @@ async fn send_message(
             }
         }
     };
+    debug!(
+        "sending {} ({} bytes) peer={peer_id}",
+        message.command(),
+        message_payload_size(message, bytes)
+    );
     node.capture_message(peer_id, false, message)?;
     node.record_bytes_sent(peer_id, bytes, message.command());
     Ok(())
+}
+
+fn message_payload_size(message: &Message, fallback: usize) -> usize {
+    wire::encode_message_payload(message)
+        .map(|payload| payload.len())
+        .unwrap_or(fallback)
 }
 
 fn consume_getblocks_continuation(
@@ -6882,6 +7036,31 @@ fn address_message_is_oversized(count: usize) -> bool {
     count > MAX_ADDR_TO_SEND
 }
 
+fn oversized_address_message(message: &Message) -> Option<(&str, usize)> {
+    let Message::Unknown { command, payload } = message else {
+        return None;
+    };
+    if command != "addr" && command != "addrv2" {
+        return None;
+    }
+    let first = *payload.first()?;
+    let (count, _) = match first {
+        0..=252 => (u64::from(first), 1),
+        253 => (
+            u64::from(u16::from_le_bytes(payload.get(1..3)?.try_into().ok()?)),
+            3,
+        ),
+        254 => (
+            u64::from(u32::from_le_bytes(payload.get(1..5)?.try_into().ok()?)),
+            5,
+        ),
+        255 => (u64::from_le_bytes(payload.get(1..9)?.try_into().ok()?), 9),
+    };
+    let count = usize::try_from(count).ok()?;
+    address_message_is_oversized(count).then_some((command.as_str(), count))
+}
+
+#[cfg(test)]
 fn getaddr_response_limit(available: usize) -> usize {
     available
         .saturating_mul(MAX_PCT_ADDR_TO_SEND)

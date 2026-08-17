@@ -3432,6 +3432,22 @@ impl Config {
                 .any(|network| network.matches_endpoint(endpoint))
     }
 
+    /// Whether this node currently has a transport path for an endpoint's
+    /// network. Core may relay an otherwise unreachable address, but does not
+    /// retain it in AddrMan for later selection.
+    pub fn network_endpoint_is_reachable(&self, endpoint: &NetworkEndpoint) -> bool {
+        if !self.allows_network_endpoint(endpoint) {
+            return false;
+        }
+        match endpoint.network_name() {
+            "ipv4" | "ipv6" => true,
+            "onion" => self.onion_proxy.is_some() || self.listen_onion,
+            "i2p" => self.i2p_sam.is_some(),
+            "cjdns" => self.cjdns_reachable,
+            _ => false,
+        }
+    }
+
     pub fn peer_permissions(&self, address: IpAddr, incoming: bool) -> PeerPermissions {
         self.peer_permissions.permissions_for(address, incoming)
     }

@@ -70,7 +70,7 @@ use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid, Wtxid};
 use fs2::FileExt;
 use parking_lot::{Mutex, RwLock};
-use rand::random;
+use rand::{random, seq::SliceRandom};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, oneshot};
@@ -96,6 +96,10 @@ const MAX_ORPHANAGE_LATENCY_SCORE: usize = 3_000;
 const RESERVED_ORPHAN_WEIGHT_PER_PEER: u64 = 404_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_RECENTLY_REJECTED_TRANSACTIONS: usize = 4_096;
+const ADDR_RESPONSE_CACHE_MIN_LIFETIME: u64 = 21 * 60 * 60;
+const ADDR_RESPONSE_CACHE_RANDOM_LIFETIME: u64 = 6 * 60 * 60;
+const ADDR_RELAY_DESTINATIONS: usize = 2;
+const ADDR_RELAY_DESTINATION_ROTATION: u64 = 24 * 60 * 60;
 // Core's AddrMan stores at most 10,000 entries across its new and tried
 // tables. Keep the same bound for both the legacy IP table and BIP155 table.
 const MAX_KNOWN_ADDRESSES: usize = 10_000;
@@ -1138,7 +1142,7 @@ pub struct PeerInfo {
     pub connection_type: &'static str,
     pub manual: bool,
     addr_token_bucket: f64,
-    addr_token_timestamp: Instant,
+    addr_token_timestamp: u128,
     ping_nonce: Option<u64>,
     ping_sent_at: Option<Instant>,
 }
@@ -1156,6 +1160,17 @@ pub struct KnownNetworkAddress {
     pub endpoint: NetworkEndpoint,
     pub services: u64,
     pub time: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct AddrResponseCacheKey {
+    pub(crate) network: &'static str,
+    pub(crate) local_address: Option<SocketAddr>,
+}
+
+struct CachedAddrResponse {
+    addresses: Vec<KnownNetworkAddress>,
+    expiration: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -1462,6 +1477,7 @@ pub struct Node {
     network_addresses: parking_lot::RwLock<HashMap<NetworkEndpoint, KnownNetworkAddress>>,
     network_tried_addresses: parking_lot::RwLock<HashSet<NetworkEndpoint>>,
     network_address_sources: parking_lot::RwLock<HashMap<NetworkEndpoint, NetworkEndpoint>>,
+    addr_response_caches: parking_lot::Mutex<HashMap<AddrResponseCacheKey, CachedAddrResponse>>,
     added_nodes: parking_lot::RwLock<HashMap<NetworkEndpoint, Option<bool>>>,
     added_node_names: parking_lot::RwLock<HashMap<NetworkEndpoint, String>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
@@ -1881,6 +1897,7 @@ impl Node {
             network_addresses: parking_lot::RwLock::new(network_addresses),
             network_tried_addresses: parking_lot::RwLock::new(network_tried_addresses),
             network_address_sources: parking_lot::RwLock::new(network_address_sources),
+            addr_response_caches: parking_lot::Mutex::new(HashMap::new()),
             added_nodes: parking_lot::RwLock::new(added_nodes),
             added_node_names: parking_lot::RwLock::new(added_node_names),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
@@ -3559,7 +3576,7 @@ impl Node {
             && peer.services & (wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED) != 0
     }
 
-    fn best_header_is_recent(&self) -> bool {
+    pub(crate) fn best_header_is_recent(&self) -> bool {
         let chain = self.chain.read();
         let best_header = chain.best_header_tip();
         let Some(header) = chain.header(best_header.height) else {
@@ -4194,6 +4211,19 @@ impl Node {
         } = options;
         let address = endpoint.peer_socket_addr();
         let connected_at = time::unix_time();
+        let addr_relay_enabled = {
+            #[cfg(test)]
+            {
+                // Unit-test registration helpers represent an already
+                // negotiated peer; production transport registration starts
+                // disabled until the VERSION/VERACK handshake completes.
+                !inbound && connection_type != "block-relay-only"
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
         let peer = PeerInfo {
             id,
             address,
@@ -4233,13 +4263,17 @@ impl Node {
             time_offset: 0,
             addr_processed: 0,
             addr_rate_limited: 0,
-            addr_relay_enabled: !inbound || permissions.contains(PeerPermissions::ADDR),
+            // Core enables address relay for outbound peers during the
+            // version handshake, and for inbound peers only after their
+            // first address-related message. The `addr` permission bypasses
+            // processing limits; it does not enroll an inbound peer in relay.
+            addr_relay_enabled,
             ping_time: None,
             min_ping: None,
             ping_nonce: None,
             ping_sent_at: None,
             addr_token_bucket: 1.0,
-            addr_token_timestamp: Instant::now(),
+            addr_token_timestamp: time::unix_time_millis(),
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
@@ -4464,6 +4498,22 @@ impl Node {
         }
     }
 
+    pub(crate) fn peer_address_relay_enabled(&self, id: usize) -> bool {
+        self.peers
+            .read()
+            .get(&id)
+            .is_some_and(|peer| peer.addr_relay_enabled)
+    }
+
+    pub(crate) fn setup_outbound_address_relay(&self, id: usize) {
+        if let Some(peer) = self.peers.write().get_mut(&id)
+            && !peer.inbound
+            && peer.connection_type != "block-relay-only"
+        {
+            peer.addr_relay_enabled = true;
+        }
+    }
+
     pub(crate) fn allow_peer_address(&self, id: usize) -> bool {
         let mut peers = self.peers.write();
         let Some(peer) = peers.get_mut(&id) else {
@@ -4473,11 +4523,9 @@ impl Node {
             peer.addr_processed = peer.addr_processed.saturating_add(1);
             return true;
         }
-        let now = Instant::now();
+        let now = time::unix_time_millis();
         if peer.addr_token_bucket < MAX_ADDR_PROCESSING_TOKEN_BUCKET {
-            let elapsed = now
-                .saturating_duration_since(peer.addr_token_timestamp)
-                .as_secs_f64();
+            let elapsed = now.saturating_sub(peer.addr_token_timestamp) as f64 / 1_000.0;
             peer.addr_token_bucket = (peer.addr_token_bucket + elapsed * MAX_ADDR_RATE_PER_SECOND)
                 .min(MAX_ADDR_PROCESSING_TOKEN_BUCKET);
         }
@@ -4508,21 +4556,50 @@ impl Node {
         if addresses.is_empty() {
             return;
         }
-        let recipients = self
-            .peers
-            .read()
-            .values()
-            .filter(|peer| {
-                peer.id != origin_peer_id && peer.version.is_some() && peer.addr_relay_enabled
-            })
-            .map(|peer| peer.id)
-            .collect::<Vec<_>>();
+        let now = time::unix_time();
+        let peers = self.peers.read();
+        let mut selected = HashMap::<usize, Vec<(NetworkEndpoint, u64, u64)>>::new();
+        for address in addresses {
+            let address_hash = addrman_hash(&self.addrman_key, |input| {
+                input.extend_from_slice(&addrman_endpoint_key(&address.0));
+            });
+            let rotation = now
+                .saturating_add(address_hash)
+                .saturating_div(ADDR_RELAY_DESTINATION_ROTATION);
+            let mut candidates = peers
+                .values()
+                .filter(|peer| {
+                    peer.id != origin_peer_id && peer.version.is_some() && peer.addr_relay_enabled
+                })
+                .map(|peer| {
+                    let score = addrman_hash(&self.addrman_key, |input| {
+                        input.extend_from_slice(&address_hash.to_le_bytes());
+                        input.extend_from_slice(&rotation.to_le_bytes());
+                        input.extend_from_slice(
+                            &u64::try_from(peer.id)
+                                .expect("peer id fits in the address relay hash")
+                                .to_le_bytes(),
+                        );
+                    });
+                    (peer.id, score)
+                })
+                .collect::<Vec<_>>();
+            candidates.sort_unstable_by(|left, right| {
+                right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
+            });
+            for peer_id in candidates
+                .into_iter()
+                .take(ADDR_RELAY_DESTINATIONS)
+                .map(|candidate| candidate.0)
+            {
+                selected.entry(peer_id).or_default().push(address.clone());
+            }
+        }
+        drop(peers);
         let commands = self.peer_commands.read();
-        for peer_id in recipients {
+        for (peer_id, addresses) in selected {
             if let Some(sender) = commands.get(&peer_id) {
-                let _ = sender.send(p2p::PeerCommand::RelayAddresses {
-                    addresses: addresses.clone(),
-                });
+                let _ = sender.send(p2p::PeerCommand::RelayAddresses { addresses });
             }
         }
     }
@@ -4542,8 +4619,9 @@ impl Node {
     pub(crate) fn set_peer_connection_type(&self, id: usize, connection_type: &'static str) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.connection_type = connection_type;
-            peer.addr_relay_enabled = (!peer.inbound && connection_type != "block-relay-only")
-                || peer.permissions.contains(PeerPermissions::ADDR);
+            if peer.inbound || connection_type == "block-relay-only" {
+                peer.addr_relay_enabled = false;
+            }
         }
     }
 
@@ -4627,6 +4705,40 @@ impl Node {
             .collect::<Vec<_>>();
         addresses.extend(self.network_addresses.read().values().cloned());
         addresses
+    }
+
+    /// Return the privacy-preserving address snapshot used for a getaddr
+    /// response. Core keeps a separate randomized snapshot for each network
+    /// key (network plus local bind) for roughly a day so repeated requests
+    /// cannot reveal address-manager churn or correlate listeners.
+    pub(crate) fn cached_addr_response(
+        &self,
+        key: AddrResponseCacheKey,
+        max_addresses: usize,
+        max_pct: usize,
+    ) -> Vec<KnownNetworkAddress> {
+        let now = time::unix_time();
+        let mut caches = self.addr_response_caches.lock();
+        let cache = caches.entry(key).or_insert_with(|| CachedAddrResponse {
+            addresses: Vec::new(),
+            expiration: 0,
+        });
+        if cache.expiration < now {
+            let mut addresses = self.known_network_addresses();
+            let limit = if max_pct == 0 {
+                addresses.len()
+            } else {
+                addresses.len().saturating_mul(max_pct).saturating_div(100)
+            }
+            .min(max_addresses);
+            addresses.shuffle(&mut rand::rng());
+            addresses.truncate(limit);
+            cache.addresses = addresses;
+            cache.expiration = now
+                .saturating_add(ADDR_RESPONSE_CACHE_MIN_LIFETIME)
+                .saturating_add(rand::random_range(0..ADDR_RESPONSE_CACHE_RANDOM_LIFETIME));
+        }
+        cache.addresses.clone()
     }
 
     /// Return the peer or discovery endpoint that introduced an address to
@@ -4856,7 +4968,7 @@ impl Node {
                 ping_nonce: None,
                 ping_sent_at: None,
                 addr_token_bucket: 1.0,
-                addr_token_timestamp: Instant::now(),
+                addr_token_timestamp: time::unix_time_millis(),
             },
         );
         drop(known);
@@ -4924,7 +5036,7 @@ impl Node {
             ping_nonce: None,
             ping_sent_at: None,
             addr_token_bucket: 1.0,
-            addr_token_timestamp: Instant::now(),
+            addr_token_timestamp: time::unix_time_millis(),
         });
         if entry.id == UNCONNECTED_PEER_ID {
             entry.services |= services;
@@ -5988,7 +6100,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                         ping_nonce: None,
                         ping_sent_at: None,
                         addr_token_bucket: 1.0,
-                        addr_token_timestamp: Instant::now(),
+                        addr_token_timestamp: time::unix_time_millis(),
                     },
                 );
                 network_address_sources.insert(NetworkEndpoint::from_socket(address), source);

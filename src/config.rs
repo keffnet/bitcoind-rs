@@ -3213,10 +3213,10 @@ impl Config {
         let blockfilterindex = match args.blockfilterindex.as_str() {
             "0" | "false" => false,
             "1" | "true" | "basic" => true,
-            value => bail!("unknown --blockfilterindex value {value}"),
+            value => bail!("Unknown -blockfilterindex value {value}."),
         };
         if args.peerblockfilters && !blockfilterindex {
-            bail!("--peerblockfilters requires --blockfilterindex");
+            bail!("Cannot set -peerblockfilters without -blockfilterindex.");
         }
         let connect_disabled = args.no_connect
             || (args.connect.len() == 1 && args.connect.first().is_some_and(|value| value == "0"));

@@ -4654,7 +4654,8 @@ async fn serve_peer_loop(
                         node.update_peer_best_known_block(peer_id, item.hash);
                     }
                 }
-                let mut best_block = None;
+                let mut unknown_block = None;
+                let mut known_block_missing_body = false;
                 let transaction_requests = {
                     let chain = node.chain.read();
                     let mempool = node.mempool.read();
@@ -4674,7 +4675,17 @@ async fn serve_peer_loop(
                                 if chain.block_height_by_hash(&item.hash).is_none()
                                     && !node.peer_has_inflight_block_request(peer_id, item.hash)
                                 {
-                                    best_block = Some(item.hash);
+                                    unknown_block = Some(item.hash);
+                                } else if chain.block_height_by_hash(&item.hash).is_some()
+                                    && !node.peer_has_inflight_block_request(peer_id, item.hash)
+                                {
+                                    // An announcement can refer to a header
+                                    // retained from an earlier headers-first
+                                    // attempt.  Core immediately schedules the
+                                    // first missing body on that chain instead
+                                    // of waiting for the periodic download
+                                    // timer.
+                                    known_block_missing_body = true;
                                 }
                                 None
                             }
@@ -4753,10 +4764,32 @@ async fn serve_peer_loop(
                     )
                     .await?;
                 }
-                if best_block
+                if unknown_block
                     .is_some_and(|hash| node.headers_sync_for_block_inventory(peer_id, hash))
                 {
                     request_headers(node, peer_id, writer, peer_state).await?;
+                }
+                if known_block_missing_body {
+                    let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                        .saturating_sub(node.peer_inflight_block_count(peer_id));
+                    if available != 0 {
+                        let schedule =
+                            node.next_block_download_schedule(peer_id, available, peer_services);
+                        queue_block_requests(&mut pending_block_requests, schedule.requests);
+                        flush_pending_block_requests(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            &mut pending_block_requests,
+                        )
+                        .await?;
+                        if pending_block_requests.is_empty()
+                            && let Some(staller) = schedule.staller
+                        {
+                            node.note_block_staller(staller);
+                        }
+                    }
                 }
             }
             Message::GetData(items) => {
@@ -5361,6 +5394,9 @@ async fn serve_peer_loop(
                     }
                     Err(error) => {
                         debug!(%hash, %error, "unable to reconstruct compact block");
+                        if compact_block_reconstruction_error_is_malformed(&error) {
+                            anyhow::bail!("invalid compact block: {error}");
+                        }
                         request_full_block(
                             node,
                             peer_id,
@@ -5381,15 +5417,12 @@ async fn serve_peer_loop(
                 if !compact_block_indexes_are_strictly_increasing(&request.indexes) {
                     anyhow::bail!("compact block transaction indexes are not strictly increasing");
                 }
-                let (block, recent) = {
-                    let mut chain = node.chain.write();
+                let recent = {
+                    let chain = node.chain.read();
                     let Some(height) = chain.block_height_by_hash(&request.block_hash) else {
                         continue;
                     };
                     let recent = blocktxn_block_is_recent(height, chain.height());
-                    let Some(block) = chain.block(&request.block_hash)? else {
-                        continue;
-                    };
                     // Core answers recent getblocktxn requests whenever the
                     // block body is available. Its stale-relay policy is
                     // applied only to the full-block fallback for older
@@ -5400,7 +5433,10 @@ async fn serve_peer_loop(
                     {
                         continue;
                     }
-                    (block, recent)
+                    recent
+                };
+                let Some(block) = node.block_store_reader.get(&request.block_hash)? else {
+                    continue;
                 };
                 if !recent {
                     if peer_requests_too_old_network_limited_block(
@@ -6304,20 +6340,15 @@ async fn handle_received_block(
             Ok(true)
         }
         Err(error) => {
-            if disconnect_on_invalid
-                && error
-                    .downcast_ref::<ValidationError>()
-                    .is_some_and(ValidationError::should_mark_block_invalid)
-            {
+            let should_mark_invalid = error
+                .downcast_ref::<ValidationError>()
+                .is_some_and(ValidationError::should_mark_block_invalid);
+            if should_mark_invalid {
                 if let Err(mark_error) = node.chain.write().mark_block_invalid(&hash) {
                     debug!(%hash, %mark_error, "failed to cache invalid peer block");
                 }
             }
-            if disconnect_on_invalid
-                && error
-                    .downcast_ref::<ValidationError>()
-                    .is_some_and(ValidationError::should_mark_block_invalid)
-            {
+            if disconnect_on_invalid && should_mark_invalid {
                 anyhow::bail!("invalid peer block {hash}: {error}");
             }
             let reject_reason = error
@@ -6568,6 +6599,13 @@ fn reconstruct_compact_block(
         anyhow::bail!("compact block has too many short ids");
     }
     Ok((transactions, missing))
+}
+
+fn compact_block_reconstruction_error_is_malformed(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("invalid compact block")
+        || message.contains("compact block short-id count is inconsistent")
+        || message.contains("compact block has too many short ids")
 }
 
 fn add_compact_candidate(

@@ -1063,7 +1063,7 @@ struct TxRequestKey {
 impl TxRequestKey {
     fn from_inventory(item: &Inventory) -> Option<Self> {
         item.kind.is_transaction().then_some(Self {
-            witness: item.kind.is_witness_transaction(),
+            witness: item.kind.uses_wtxid(),
             hash: item.hash,
         })
     }
@@ -3814,6 +3814,19 @@ async fn serve_peer_loop(
                 continue;
             }
             _ = tx_request_interval.tick(), if version_received && verack_received && !reader.has_partial_frame() => {
+                // Core evaluates fee-filter transitions in its regular
+                // SendMessages loop. Refreshing here prevents a peer from
+                // retaining the temporary IBD filter after the active tip
+                // becomes current while an inventory announcement is queued.
+                maybe_send_fee_filter(
+                    node,
+                    peer_id,
+                    writer,
+                    peer_state,
+                    node.config.network,
+                    peer_version,
+                )
+                .await?;
                 if !*peer_state.private_broadcast_peer.lock()
                     || peer_state.connection_type != "private-broadcast"
                 {
@@ -4731,14 +4744,11 @@ async fn serve_peer_loop(
                         (item.kind.is_transaction()
                             && node.add_orphan_inventory_announcer(
                                 item.hash,
-                                item.kind.is_witness_transaction(),
+                                item.kind.uses_wtxid(),
                                 peer_id,
                             ))
                         .then(|| {
-                            node.orphan_transaction_for_inventory(
-                                item.hash,
-                                item.kind.is_witness_transaction(),
-                            )
+                            node.orphan_transaction_for_inventory(item.hash, item.kind.uses_wtxid())
                         })
                         .flatten()
                     })
@@ -4746,8 +4756,10 @@ async fn serve_peer_loop(
                 {
                     let mut known = peer_state.known_tx_inventory.lock();
                     for item in &items {
-                        let matching_kind = (wtxid_relay && item.kind.is_witness_transaction())
-                            || (!wtxid_relay && item.kind == InventoryType::Transaction);
+                        let matching_kind = (wtxid_relay && item.kind.uses_wtxid())
+                            || (!wtxid_relay
+                                && item.kind.is_transaction()
+                                && !item.kind.uses_wtxid());
                         if matching_kind {
                             known.insert(&item.hash);
                         }
@@ -4802,21 +4814,18 @@ async fn serve_peer_loop(
                                 if initial_block_download {
                                     return None;
                                 }
-                                if node.orphan_has_inventory(
-                                    item.hash,
-                                    item.kind.is_witness_transaction(),
-                                ) {
+                                if node.orphan_has_inventory(item.hash, item.kind.uses_wtxid()) {
                                     return None;
                                 }
                                 if node.recently_rejected_transaction(item.hash) {
                                     return None;
                                 }
                                 if (wtxid_relay && item.kind == InventoryType::Transaction)
-                                    || (!wtxid_relay && item.kind.is_witness_transaction())
+                                    || (!wtxid_relay && item.kind.uses_wtxid())
                                 {
                                     return None;
                                 }
-                                if item.kind.is_witness_transaction() {
+                                if item.kind.uses_wtxid() {
                                     mempool
                                         .get_by_wtxid(&Wtxid::from_byte_array(
                                             item.hash.to_byte_array(),
@@ -5212,7 +5221,7 @@ async fn serve_peer_loop(
                                 .unwrap_or(1);
                             let transaction = {
                                 let mempool = node.mempool.read();
-                                if item.kind.is_witness_transaction() {
+                                if item.kind.uses_wtxid() {
                                     mempool
                                         .get_by_wtxid_for_relay(
                                             &Wtxid::from_byte_array(item.hash.to_byte_array()),
@@ -8325,7 +8334,7 @@ fn compact_block_for_inventory(
 fn transaction_fee_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<(u64, u64)> {
     let mempool = node.mempool.read();
     match item.kind {
-        kind if kind.is_witness_transaction() => mempool
+        kind if kind.uses_wtxid() => mempool
             .get_by_wtxid(&Wtxid::from_byte_array(item.hash.to_byte_array()))
             .map(|entry| (entry.fee_sat, entry.vsize)),
         InventoryType::Transaction => mempool
@@ -8340,7 +8349,7 @@ fn transaction_id_for_inventory(
     item: &Inventory,
 ) -> Option<Txid> {
     match item.kind {
-        kind if kind.is_witness_transaction() => mempool
+        kind if kind.uses_wtxid() => mempool
             .get_by_wtxid(&Wtxid::from_byte_array(item.hash.to_byte_array()))
             .map(|entry| entry.transaction.compute_txid()),
         InventoryType::Transaction => Some(Txid::from_byte_array(item.hash.to_byte_array())),
@@ -8591,7 +8600,7 @@ fn clear_bloom_filter(
 fn transaction_for_inventory(node: &Arc<Node>, item: &Inventory) -> Option<Transaction> {
     let mempool = node.mempool.read();
     match item.kind {
-        kind if kind.is_witness_transaction() => mempool
+        kind if kind.uses_wtxid() => mempool
             .get_by_wtxid(&Wtxid::from_byte_array(item.hash.to_byte_array()))
             .map(|entry| entry.transaction.clone()),
         InventoryType::Transaction => mempool
@@ -8608,7 +8617,7 @@ fn transaction_for_getdata_tip(node: &Arc<Node>, item: &Inventory) -> Result<Opt
         return Ok(None);
     };
     let transaction = block.txdata.into_iter().find(|transaction| {
-        if item.kind.is_witness_transaction() {
+        if item.kind.uses_wtxid() {
             Wtxid::from_byte_array(item.hash.to_byte_array()) == transaction.compute_wtxid()
         } else {
             Txid::from_byte_array(item.hash.to_byte_array()) == transaction.compute_txid()

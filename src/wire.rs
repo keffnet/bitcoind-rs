@@ -90,6 +90,15 @@ impl InventoryType {
             Self::WitnessTransaction | Self::LegacyWitnessTransaction
         )
     }
+
+    /// Whether the inventory hash is a witness transaction id.
+    ///
+    /// `MSG_WTX` (type 5) is keyed by wtxid, while the legacy
+    /// `MSG_TX | MSG_WITNESS_FLAG` type carries a txid and merely requests
+    /// the witness-bearing serialization.
+    pub fn uses_wtxid(self) -> bool {
+        self == Self::WitnessTransaction
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1673,6 +1682,8 @@ mod tests {
             InventoryType::LegacyWitnessTransaction
         );
         assert!(InventoryType::LegacyWitnessTransaction.is_witness_transaction());
+        assert!(!InventoryType::LegacyWitnessTransaction.uses_wtxid());
+        assert!(InventoryType::WitnessTransaction.uses_wtxid());
         assert_eq!(
             InventoryType::LegacyWitnessTransaction.as_u32(),
             0x4000_0001

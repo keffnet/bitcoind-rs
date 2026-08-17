@@ -335,11 +335,22 @@ fn inventory_broadcast_limit(pending: usize) -> usize {
 }
 
 fn transaction_inventory_send_due(
-    node: &Node,
+    _node: &Node,
     peer_state: &PeerState,
     now: Instant,
     average_interval: Duration,
 ) -> bool {
+    let mock_now = crate::time::mock_time();
+    if mock_now == 0 {
+        *peer_state.next_tx_inventory_send_mock.lock() = None;
+    } else if peer_state
+        .next_tx_inventory_send_mock
+        .lock()
+        .is_some_and(|deadline| mock_now >= deadline)
+    {
+        *peer_state.next_tx_inventory_send.lock() = None;
+        *peer_state.next_tx_inventory_send_mock.lock() = None;
+    }
     if peer_state.connection_type == "inbound" {
         if peer_state
             .next_tx_inventory_send
@@ -348,17 +359,10 @@ fn transaction_inventory_send_due(
         {
             return false;
         }
-        let deadline = {
-            let mut next_inbound = node.next_inbound_tx_inventory_send.lock();
-            match *next_inbound {
-                Some(deadline) if now < deadline => deadline,
-                _ => {
-                    let deadline = now + random_fee_filter_delay(average_interval);
-                    *next_inbound = Some(deadline);
-                    deadline
-                }
-            }
-        };
+        let delay = random_fee_filter_delay(average_interval);
+        let deadline = now + delay;
+        *peer_state.next_tx_inventory_send_mock.lock() = (mock_now > 0)
+            .then(|| mock_now.saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)));
         *peer_state.next_tx_inventory_send.lock() = Some(deadline);
         return true;
     }
@@ -367,7 +371,10 @@ fn transaction_inventory_send_due(
     if next_send.is_some_and(|deadline| now < deadline) {
         return false;
     }
-    *next_send = Some(now + random_fee_filter_delay(average_interval));
+    let delay = random_fee_filter_delay(average_interval);
+    *next_send = Some(now + delay);
+    *peer_state.next_tx_inventory_send_mock.lock() = (mock_now > 0)
+        .then(|| mock_now.saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)));
     true
 }
 
@@ -967,6 +974,7 @@ struct PeerState {
     sent_fee_filter: parking_lot::Mutex<Option<i64>>,
     next_fee_filter: parking_lot::Mutex<Option<Instant>>,
     next_tx_inventory_send: parking_lot::Mutex<Option<Instant>>,
+    next_tx_inventory_send_mock: parking_lot::Mutex<Option<i64>>,
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
@@ -1544,6 +1552,10 @@ impl PeerManager {
     }
 
     pub(crate) async fn run_with_startup(self, startup: Option<Arc<StartupLatch>>) -> Result<()> {
+        info!(
+            "Loaded {} addresses from peers.dat",
+            self.node.known_network_addresses().len()
+        );
         let listeners = if self.node.config.listen {
             let binds = if self.node.config.p2p_binds.is_empty() {
                 vec![self.node.config.p2p_bind]
@@ -1743,12 +1755,19 @@ impl PeerManager {
             && has_known_network_addresses;
         let fixed_seed_fallback_started_at = unix_time_seconds();
         let mut fixed_seeds_added = false;
+        if !self.node.config.dnsseed {
+            info!("DNS seeding disabled");
+        }
+        if !self.node.config.fixed_seeds {
+            info!("Fixed seeds are disabled");
+        }
         let connect_nodes = if should_query_dns {
             let addresses = discover_dns_seeds(
                 self.node.config.network,
                 &self.node.config.signet_seed_nodes,
             )
             .await;
+            info!("{} addresses found from DNS seeds", addresses.len());
             let mut remembered = 0usize;
             for address in &addresses {
                 if self.node.config.allows_address(*address) {
@@ -1770,9 +1789,13 @@ impl PeerManager {
                     has_add_nodes,
                     elapsed,
                 )
-                && has_empty_fixed_seed_network(&self.node)
             {
-                remembered = add_fixed_seed_addresses(&self.node);
+                info!(
+                    "Adding fixed seeds as 60 seconds have passed and addrman is empty for at least one reachable network"
+                );
+                if has_empty_fixed_seed_network(&self.node) {
+                    remembered = add_fixed_seed_addresses(&self.node);
+                }
                 fixed_seeds_added = true;
             }
             if remembered != 0 {
@@ -1792,9 +1815,15 @@ impl PeerManager {
                     has_add_nodes,
                     elapsed,
                 )
-                && has_empty_fixed_seed_network(&self.node)
             {
-                let remembered = add_fixed_seed_addresses(&self.node);
+                info!(
+                    "Adding fixed seeds as -dnsseed=0 (or IPv4/IPv6 connections are disabled via -onlynet) and neither -addnode nor -seednode are provided"
+                );
+                let remembered = if has_empty_fixed_seed_network(&self.node) {
+                    add_fixed_seed_addresses(&self.node)
+                } else {
+                    0
+                };
                 fixed_seeds_added = true;
                 if remembered != 0 {
                     info!(remembered, "added fixed seed peer addresses");
@@ -1824,9 +1853,14 @@ impl PeerManager {
         }
         let discovery_node = self.node.clone();
         let discovery_outbound = outbound.clone();
-        if !configured_connect_nodes {
+        if configured_connect_nodes {
+            info!("addcon thread start");
+        } else {
+            info!("opencon thread start");
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(30));
+                // Core's open-connection thread wakes frequently enough for
+                // mocktime-driven fixed-seed fallback and address discovery.
+                let mut ticker = tokio::time::interval(Duration::from_millis(500));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let discovery_started = Instant::now();
                 let mut queried_delayed_dns_seed = false;
@@ -1873,9 +1907,15 @@ impl PeerManager {
                                 unix_time_seconds().saturating_sub(fixed_seed_fallback_started_at),
                             ),
                         )
-                        && has_empty_fixed_seed_network(&discovery_node)
                     {
-                        let remembered = add_fixed_seed_addresses(&discovery_node);
+                        info!(
+                            "Adding fixed seeds as 60 seconds have passed and addrman is empty for at least one reachable network"
+                        );
+                        let remembered = if has_empty_fixed_seed_network(&discovery_node) {
+                            add_fixed_seed_addresses(&discovery_node)
+                        } else {
+                            0
+                        };
                         fixed_seeds_added = true;
                         if remembered != 0 {
                             info!(remembered, "added fixed seed peer addresses");
@@ -3175,6 +3215,7 @@ async fn serve_peer(
         sent_fee_filter: parking_lot::Mutex::new(None),
         next_fee_filter: parking_lot::Mutex::new(None),
         next_tx_inventory_send: parking_lot::Mutex::new(None),
+        next_tx_inventory_send_mock: parking_lot::Mutex::new(None),
         relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
@@ -3884,6 +3925,34 @@ async fn serve_peer_loop(
                     node.config.network,
                 )
                 .await?;
+                if !*peer_state.private_broadcast_peer.lock() {
+                    let inventory_send_due = transaction_inventory_send_due(
+                        node,
+                        peer_state,
+                        Instant::now(),
+                        tx_inventory_average,
+                    );
+                    let force_inventory_send =
+                        peer_state.permissions.contains(PeerPermissions::NO_BAN);
+                    if inventory_send_due || force_inventory_send {
+                        flush_peer_mempool_request(
+                            node,
+                            peer_id,
+                            peer_state,
+                            writer,
+                            node.config.network,
+                        )
+                        .await?;
+                        flush_peer_transaction_inventory(
+                            node,
+                            peer_id,
+                            peer_state,
+                            writer,
+                            node.config.network,
+                        )
+                        .await?;
+                    }
+                }
             }
             Message::Pong(nonce) => {
                 if peer_version > BIP31_VERSION
@@ -5366,7 +5435,11 @@ async fn serve_peer_loop(
                             if !accepted_as_package
                                 && matches!(
                                     error.downcast_ref::<MempoolError>(),
-                                    Some(MempoolError::MissingInput(_))
+                                    Some(
+                                        MempoolError::MissingInput(_)
+                                            | MempoolError::FeeRate
+                                            | MempoolError::MinRelayFee
+                                    )
                                 )
                             {
                                 remember_peer_package_transaction(peer_state, transaction.clone());
@@ -8849,6 +8922,7 @@ mod tests {
             sent_fee_filter: parking_lot::Mutex::new(None),
             next_fee_filter: parking_lot::Mutex::new(None),
             next_tx_inventory_send: parking_lot::Mutex::new(None),
+            next_tx_inventory_send_mock: parking_lot::Mutex::new(None),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(true),
             send_headers: parking_lot::Mutex::new(false),
@@ -11289,6 +11363,7 @@ mod tests {
             sent_fee_filter: parking_lot::Mutex::new(None),
             next_fee_filter: parking_lot::Mutex::new(None),
             next_tx_inventory_send: parking_lot::Mutex::new(None),
+            next_tx_inventory_send_mock: parking_lot::Mutex::new(None),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(false),
             send_headers: parking_lot::Mutex::new(false),

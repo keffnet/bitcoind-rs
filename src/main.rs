@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 #[cfg(not(unix))]
 use anyhow::bail;
 use anyhow::{Context, Result};
+use bitcoin::Network;
 use time::{OffsetDateTime, macros::format_description};
 use tracing::Metadata;
 use tracing_subscriber::EnvFilter;
@@ -21,7 +22,7 @@ use tracing_subscriber::fmt::{
 
 use bitcoind_rs::{
     Node,
-    config::{Args, Config},
+    config::{Args, Config, ConfigFileArg, is_known_config_option},
 };
 
 fn main() {
@@ -113,6 +114,21 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     } else {
         builder.init();
     }
+    if std::env::args().any(|argument| argument == "-nolisten=0" || argument == "--nolisten=0") {
+        tracing::warn!("[warning] Parsed potentially confusing double-negative -listen=0");
+    }
+    log_config_file_path(&node.config.config_file_args);
+    log_startup_arguments(&node.config.config_file_args);
+    log_ignored_config_values(&node.config.config_file_args);
+    log_config_warnings(&node.config.config_file_args);
+    log_config_section_warnings(&node.config.config_file_args);
+    if node.config.network == Network::Testnet {
+        tracing::warn!(
+            "Warning: Support for testnet3 is deprecated and will be removed in an upcoming release. Consider switching to testnet4."
+        );
+    }
+    log_parameter_interactions(&node.config.config_file_args);
+    log_ignored_config(&node.config.datadir);
     #[cfg(unix)]
     let log_reopen_task = log_file.map(|log_file| tokio::spawn(reopen_log_on_sighup(log_file)));
     let (startup_sender, startup_receiver) = tokio::sync::oneshot::channel();
@@ -132,6 +148,177 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
         task.abort();
     }
     result
+}
+
+fn log_config_file_path(config_file_args: &[ConfigFileArg]) {
+    if let Some(path) = config_file_args.first().map(|entry| &entry.path) {
+        tracing::info!("Config file: {}", path.display());
+    }
+}
+
+fn log_ignored_config_values(config_file_args: &[ConfigFileArg]) {
+    for entry in config_file_args {
+        if !entry.key.is_empty() && !is_known_config_option(&entry.key) {
+            tracing::info!("Ignoring unknown configuration value {}", entry.key);
+        }
+    }
+}
+
+fn log_config_section_warnings(config_file_args: &[ConfigFileArg]) {
+    let mut first = true;
+    for entry in config_file_args {
+        let section = if entry.key.is_empty() {
+            entry.section.as_deref()
+        } else if entry.section.is_none() {
+            entry.key.split_once('.').map(|(section, _)| section)
+        } else {
+            None
+        };
+        let Some(section) = section else {
+            continue;
+        };
+        if matches!(section, "main" | "regtest" | "test" | "testnet4" | "signet") {
+            continue;
+        }
+        if first {
+            eprintln!(
+                "Warning: {}:{} Section [{}] is not recognized.",
+                entry.path.display(),
+                entry.line,
+                section
+            );
+            first = false;
+        } else {
+            eprintln!(
+                "{}:{} Section [{}] is not recognized.",
+                entry.path.display(),
+                entry.line,
+                section
+            );
+        }
+    }
+}
+
+fn log_config_warnings(config_file_args: &[ConfigFileArg]) {
+    if config_file_args
+        .iter()
+        .any(|entry| entry.key == "reindex" && (entry.value == "1" || entry.value == "true"))
+    {
+        tracing::warn!(
+            "[warning] reindex=1 is set in the configuration file, which will significantly slow down startup. Consider removing or commenting out this option for better performance, unless there is currently a condition which makes rebuilding the indexes necessary"
+        );
+    }
+}
+
+fn log_startup_arguments(config_file_args: &[ConfigFileArg]) {
+    for argument in std::env::args().skip(1) {
+        let Some(argument) = argument
+            .strip_prefix("--")
+            .or_else(|| argument.strip_prefix('-'))
+        else {
+            continue;
+        };
+        let (key, value) = argument.split_once('=').unwrap_or((argument, "1"));
+        let key = key.to_ascii_lowercase();
+        if matches!(key.as_str(), "rpcbind" | "rpcallowip") {
+            continue;
+        }
+        let redacted = matches!(
+            key.as_str(),
+            "rpcauth" | "rpcpassword" | "rpcuser" | "torpassword"
+        );
+        if redacted {
+            tracing::info!("Command-line arg: {key}=****");
+        } else {
+            tracing::info!("Command-line arg: {key}=\"{value}\"");
+        }
+    }
+
+    for entry in config_file_args {
+        if entry.key.is_empty() {
+            continue;
+        }
+        let value = if matches!(
+            entry.key.as_str(),
+            "rpcauth" | "rpcpassword" | "rpcuser" | "torpassword"
+        ) {
+            "****"
+        } else {
+            entry.value.as_str()
+        };
+        if let Some(section) = &entry.section {
+            tracing::info!("Config file arg: [{section}] {}=\"{value}\"", entry.key);
+        } else {
+            tracing::info!("Config file arg: {}=\"{value}\"", entry.key);
+        }
+    }
+}
+
+fn log_parameter_interactions(config_file_args: &[ConfigFileArg]) {
+    let mut connect_enabled = false;
+    let mut connect_disabled = false;
+    let mut seednode = false;
+    let mut dnsseed = false;
+    let mut proxy = false;
+    let mut explicit_dnsseed = false;
+    for argument in std::env::args().skip(1) {
+        let Some(argument) = argument
+            .strip_prefix("--")
+            .or_else(|| argument.strip_prefix('-'))
+        else {
+            continue;
+        };
+        let (key, value) = argument.split_once('=').unwrap_or((argument, "1"));
+        match key.to_ascii_lowercase().as_str() {
+            "connect" => {
+                let disabled = value == "0" || value.eq_ignore_ascii_case("false");
+                connect_disabled |= disabled;
+                connect_enabled |= !disabled;
+            }
+            "noconnect" => connect_disabled = true,
+            "seednode" => seednode = true,
+            "dnsseed" => {
+                explicit_dnsseed = true;
+                dnsseed = value == "1" || value.eq_ignore_ascii_case("true");
+            }
+            "proxy" => proxy = true,
+            _ => {}
+        }
+    }
+    if connect_enabled && seednode {
+        tracing::warn!("-seednode is ignored when -connect is used");
+    }
+    if (connect_enabled || connect_disabled) && dnsseed && proxy {
+        tracing::warn!("-dnsseed is ignored when -connect is used and -proxy is specified");
+    }
+    let config_has = |key: &str| config_file_args.iter().any(|entry| entry.key == key);
+    if connect_disabled && !explicit_dnsseed && !config_has("dnsseed") {
+        tracing::warn!(
+            "parameter interaction: -connect or -maxconnections=0 set -> setting -dnsseed=0"
+        );
+    }
+    if connect_disabled && !config_has("bind") && !config_has("whitebind") {
+        tracing::warn!(
+            "parameter interaction: -connect or -maxconnections=0 set -> setting -listen=0"
+        );
+    }
+}
+
+fn log_ignored_config(datadir: &std::path::Path) {
+    let noconf = std::env::args().skip(1).any(|argument| {
+        let argument = argument
+            .strip_prefix("--")
+            .or_else(|| argument.strip_prefix('-'))
+            .unwrap_or_default();
+        let (key, value) = argument.split_once('=').unwrap_or((argument, "1"));
+        key.eq_ignore_ascii_case("noconf") && (value == "1" || value.eq_ignore_ascii_case("true"))
+    });
+    if noconf && datadir.join("bitcoin.conf").exists() {
+        tracing::info!(
+            "Data directory \"{}\" contains a \"bitcoin.conf\" file which is explicitly ignored using -noconf.",
+            datadir.display()
+        );
+    }
 }
 
 #[derive(Clone)]

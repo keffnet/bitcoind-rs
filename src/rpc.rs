@@ -10390,11 +10390,29 @@ fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let max_fee_rate = parse_max_fee_rate(params.get(1))?;
     let max_burn_amount = parse_max_burn_amount(params.get(2))?;
     validate_burn_amount(&transaction, max_burn_amount)?;
-    enforce_max_fee_rate(node, &transaction, max_fee_rate)?;
+    let txid = transaction.compute_txid();
+    let wtxid = transaction.compute_wtxid();
+    enforce_max_fee_rate(node, &transaction, max_fee_rate).map_err(|error| {
+        if error.to_string() == "transaction is non-standard: missing-ephemeral-spends" {
+            anyhow!(
+                "missing-ephemeral-spends, tx {txid} (wtxid={wtxid}) did not spend parent's ephemeral dust"
+            )
+        } else {
+            error
+        }
+    })?;
     let txid = if node.config.private_broadcast {
         node.queue_private_broadcast(transaction)?
     } else {
-        node.accept_transaction(transaction)?
+        node.accept_transaction(transaction).map_err(|error| {
+            if error.to_string() == "transaction is non-standard: missing-ephemeral-spends" {
+                anyhow!(
+                    "missing-ephemeral-spends, tx {txid} (wtxid={wtxid}) did not spend parent's ephemeral dust"
+                )
+            } else {
+                error
+            }
+        })?
     };
     Ok(json!(txid.to_string()))
 }
@@ -11335,7 +11353,12 @@ fn build_mining_block_with_transactions(
                         })
                         .cloned()
                 })
-                .ok_or_else(|| anyhow!("transaction input {} is missing", input.previous_output))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "TestBlockValidity failed: bad-txns-inputs-missingorspent, CheckTxInputs: inputs missing/spent in transaction {}",
+                    transaction.compute_txid()
+                )
+            })?;
             input_total = input_total
                 .checked_add(output.value.to_sat())
                 .ok_or_else(|| anyhow!("transaction input total overflow"))?;
@@ -12489,6 +12512,8 @@ fn mempool_reject_reason(error: &MempoolError) -> String {
             "insufficient feerate: does not improve feerate diagram".to_owned()
         }
         MempoolError::MissingInput(_) => "missing-inputs".to_owned(),
+        MempoolError::PrematureCoinbase => "bad-txns-premature-spend-of-coinbase".to_owned(),
+        MempoolError::DustWithFee => "dust".to_owned(),
         MempoolError::EmptyInputs => "bad-txns-vin-empty".to_owned(),
         MempoolError::EmptyOutputs => "bad-txns-vout-empty".to_owned(),
         MempoolError::Oversized => "bad-txns-oversize".to_owned(),
@@ -12516,19 +12541,34 @@ fn package_fee_calculation(
     package: &[Transaction],
     mempool: &Mempool,
     include_mempool_ancestors: bool,
+    excluded_ancestors: &HashSet<Txid>,
 ) -> (i64, u64, Vec<String>) {
     let by_txid = package
         .iter()
         .map(|candidate| (candidate.compute_txid(), candidate))
         .collect::<HashMap<_, _>>();
+    let mut children = HashMap::<Txid, Vec<Txid>>::new();
+    for candidate in package {
+        let txid = candidate.compute_txid();
+        for input in &candidate.input {
+            if by_txid.contains_key(&input.previous_output.txid) {
+                children
+                    .entry(input.previous_output.txid)
+                    .or_default()
+                    .push(txid);
+            }
+        }
+    }
     let mut seen = HashSet::new();
     let mut ordered = Vec::new();
 
     fn visit(
         txid: Txid,
         by_txid: &HashMap<Txid, &Transaction>,
+        children: &HashMap<Txid, Vec<Txid>>,
         mempool: &Mempool,
         include_mempool_ancestors: bool,
+        excluded_ancestors: &HashSet<Txid>,
         seen: &mut HashSet<Txid>,
         ordered: &mut Vec<Txid>,
     ) {
@@ -12540,19 +12580,26 @@ fn package_fee_calculation(
                 visit(
                     input.previous_output.txid,
                     by_txid,
+                    children,
                     mempool,
                     include_mempool_ancestors,
+                    excluded_ancestors,
                     seen,
                     ordered,
                 );
             }
-        } else if include_mempool_ancestors && let Some(entry) = mempool.get(&txid) {
+        } else if include_mempool_ancestors
+            && !excluded_ancestors.contains(&txid)
+            && let Some(entry) = mempool.get(&txid)
+        {
             for input in &entry.transaction.input {
                 visit(
                     input.previous_output.txid,
                     by_txid,
+                    children,
                     mempool,
                     include_mempool_ancestors,
+                    excluded_ancestors,
                     seen,
                     ordered,
                 );
@@ -12562,13 +12609,29 @@ fn package_fee_calculation(
             return;
         }
         ordered.push(txid);
+        if let Some(descendants) = children.get(&txid) {
+            for descendant in descendants {
+                visit(
+                    *descendant,
+                    by_txid,
+                    children,
+                    mempool,
+                    include_mempool_ancestors,
+                    excluded_ancestors,
+                    seen,
+                    ordered,
+                );
+            }
+        }
     }
 
     visit(
         transaction.compute_txid(),
         &by_txid,
+        &children,
         mempool,
         include_mempool_ancestors,
+        excluded_ancestors,
         &mut seen,
         &mut ordered,
     );
@@ -12599,8 +12662,9 @@ fn accepted_transaction_json(
     let entry = mempool
         .get(&txid)
         .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
+    let excluded_ancestors = HashSet::new();
     let (effective_fee, effective_vsize, effective_includes) =
-        package_fee_calculation(transaction, package, mempool, true);
+        package_fee_calculation(transaction, package, mempool, true, &excluded_ancestors);
     let effective_rate = if effective_vsize == 0 {
         0
     } else {
@@ -12636,6 +12700,7 @@ fn package_transaction_json(
     mempool: &Mempool,
     include_effective_fee: bool,
     include_mempool_ancestors: bool,
+    excluded_ancestors: &HashSet<Txid>,
 ) -> Result<Value> {
     let txid = transaction.compute_txid();
     let entry = mempool
@@ -12647,8 +12712,13 @@ fn package_transaction_json(
             "other-wtxid": entry.transaction.compute_wtxid().to_string(),
         }));
     }
-    let (effective_fee, effective_vsize, effective_includes) =
-        package_fee_calculation(transaction, package, mempool, include_mempool_ancestors);
+    let (effective_fee, effective_vsize, effective_includes) = package_fee_calculation(
+        transaction,
+        package,
+        mempool,
+        include_mempool_ancestors,
+        excluded_ancestors,
+    );
     let effective_rate = if effective_vsize == 0 {
         0
     } else {
@@ -12677,15 +12747,29 @@ fn submit_package_transaction_json(
     individually_accepted: &HashSet<Txid>,
 ) -> Result<Value> {
     if individually_accepted.contains(&transaction.compute_txid()) {
+        let excluded_ancestors = HashSet::new();
         package_transaction_json(
             transaction,
             std::slice::from_ref(transaction),
             mempool,
             include_effective_fee,
             false,
+            &excluded_ancestors,
         )
     } else {
-        package_transaction_json(transaction, package, mempool, include_effective_fee, true)
+        let effective_package = package
+            .iter()
+            .filter(|candidate| !individually_accepted.contains(&candidate.compute_txid()))
+            .cloned()
+            .collect::<Vec<_>>();
+        package_transaction_json(
+            transaction,
+            &effective_package,
+            mempool,
+            include_effective_fee,
+            true,
+            individually_accepted,
+        )
     }
 }
 
@@ -13031,6 +13115,9 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         })
         .collect::<HashSet<_>>();
     let mut individual_probe = individual_candidate.clone();
+    // Classify members against ordinary policy before the package-wide size
+    // decision, matching Core's effective-fee result semantics.
+    individual_probe.set_max_bytes(usize::MAX);
     let mut individually_accepted = HashSet::new();
     for transaction in &transactions {
         let txid = transaction.compute_txid();
@@ -13051,7 +13138,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         // submitpackage exposes the detailed validation error in each
         // per-transaction result. testmempoolaccept uses the shorter
         // reject-reason classification instead.
-        let reason = submit_package_error_message(&error);
+        let reason = submit_package_error_message(&error, transactions.last());
         let first_missing = transactions
             .iter()
             .position(|transaction| candidate.get(&transaction.compute_txid()).is_none());
@@ -13059,32 +13146,36 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         // parent may therefore be committed even when a later child fails
         // because it depended on the displaced transaction.  Other package
         // RBF policy failures remain atomic.
-        let package_rbf_atomic = package_rbf
-            && !matches!(
+        let package_rbf_atomic = package_rbf && !matches!(&error, MempoolError::ClusterLimit);
+        let unspent_dust_failure = !package_rbf
+            && matches!(
                 &error,
-                MempoolError::MissingInput(_) | MempoolError::ClusterLimit
+                MempoolError::NonStandard(reason) if reason == "unspent-dust"
             );
-        let failure_index = if package_rbf_atomic {
-            None
-        } else {
-            match (max_fee_failure, first_missing) {
-                (Some(max_fee_index), Some(missing_index)) if max_fee_index < missing_index => {
-                    Some(max_fee_index)
+        let failure_index =
+            if package_rbf_atomic || unspent_dust_failure || matches!(&error, MempoolError::Full) {
+                None
+            } else {
+                match (max_fee_failure, first_missing) {
+                    (Some(max_fee_index), Some(missing_index)) if max_fee_index < missing_index => {
+                        Some(max_fee_index)
+                    }
+                    (_, Some(missing_index)) => Some(missing_index),
+                    (Some(max_fee_index), None) => Some(max_fee_index),
+                    (None, None) => None,
                 }
-                (_, Some(missing_index)) => Some(missing_index),
-                (Some(max_fee_index), None) => Some(max_fee_index),
-                (None, None) => None,
-            }
-        };
+            };
         if let Some(failure_index) = failure_index {
             let accepted = transactions
                 .iter()
-                .take(failure_index)
-                .filter(|transaction| {
-                    !preexisting.contains(&transaction.compute_txid())
+                .enumerate()
+                .filter(|(index, transaction)| {
+                    *index < failure_index
+                        && !preexisting.contains(&transaction.compute_txid())
+                        && individually_accepted.contains(&transaction.compute_txid())
                         && candidate.get(&transaction.compute_txid()).is_some()
                 })
-                .cloned()
+                .map(|(_, transaction)| transaction.clone())
                 .collect::<Vec<_>>();
             for (index, transaction) in transactions.iter().enumerate() {
                 let txid = transaction.compute_txid();
@@ -13245,7 +13336,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                                 } else {
                                     json!({
                                         "txid": txid.to_string(),
-                                        "error": submit_package_error_message(&error),
+                                        "error": submit_package_error_message(&error, Some(transaction)),
                                     })
                                 },
                             );
@@ -13375,10 +13466,22 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
     }))
 }
 
-fn submit_package_error_message(error: &MempoolError) -> String {
+fn submit_package_error_message(error: &MempoolError, transaction: Option<&Transaction>) -> String {
     match error {
         MempoolError::MissingInput(_) => "bad-txns-inputs-missingorspent".to_owned(),
+        MempoolError::Full => "mempool full".to_owned(),
         MempoolError::FeeRate => "mempool min fee not met".to_owned(),
+        MempoolError::DustWithFee => "dust, tx with dust output must be 0-fee".to_owned(),
+        MempoolError::NonStandard(reason)
+            if reason == "missing-ephemeral-spends" || reason == "unspent-dust" => transaction
+            .map(|transaction| {
+                format!(
+                    "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                    transaction.compute_txid(),
+                    transaction.compute_wtxid()
+                )
+            })
+            .unwrap_or_else(|| reason.clone()),
         MempoolError::NonStandard(reason) => reason.clone(),
         _ => error.to_string(),
     }
@@ -13417,7 +13520,22 @@ fn commit_submitted_package(
     node.notify_zmq_mempool_changes(changes);
     node.notify_mempool_removals(removed);
     for transaction in accepted {
-        node.notify_mempool_transaction(transaction);
+        let txid = transaction.compute_txid();
+        let force_package_relay = {
+            let mempool = node.mempool.read();
+            mempool
+                .get(&txid)
+                .is_some_and(|entry| entry.fee_sat == 0 && mempool.has_dust_outputs(&txid))
+        };
+        if force_package_relay {
+            // Zero-fee ephemeral-dust parents are not independently relayable
+            // under the normal fee filter. Core still announces them through
+            // package relay so the receiving node can pair them with the
+            // high-fee child and validate the 1-parent-1-child package.
+            node.notify_mempool_transaction_force(transaction);
+        } else {
+            node.notify_mempool_transaction(transaction);
+        }
     }
     replaced_transactions
 }
@@ -13486,6 +13604,12 @@ fn submit_package_failure_message_with_context(
     candidate: &Mempool,
     original_mempool: &Mempool,
 ) -> String {
+    if matches!(
+        error,
+        MempoolError::NonStandard(reason) if reason == "unspent-dust"
+    ) {
+        return "unspent-dust".to_owned();
+    }
     if package_rbf && matches!(error, MempoolError::ReplacementFee) {
         if let Some((package_fee, package_vsize)) = package_fee_and_vsize(candidate, transactions) {
             let conflicting_fee = replacement_conflicting_fee(original_mempool, transactions);
@@ -15074,6 +15198,16 @@ fn rpc_error(error: &anyhow::Error) -> Value {
     let rendered = error.to_string();
     let message = if rendered.contains(" input is missing") {
         "bad-txns-inputs-missingorspent".to_owned()
+    } else if rendered
+        == "transaction script validation failed: transaction locktime is not yet satisfied"
+    {
+        "non-final".to_owned()
+    } else if rendered
+        == "transaction script validation failed: transaction locktime/sequence locks are not yet satisfied"
+    {
+        "non-BIP68-final".to_owned()
+    } else if rendered == "transaction fee rate is below the relay minimum" {
+        "mempool min fee not met".to_owned()
     } else {
         rendered
     };
@@ -15098,6 +15232,9 @@ fn rpc_error_code(message: &str) -> i32 {
         return -22;
     }
     if lower == "parameter 'txids' cannot be empty" {
+        return -8;
+    }
+    if lower == "priority is not supported for transactions with dust outputs." {
         return -8;
     }
     if lower == "verbosity was boolean but only integer allowed" {
@@ -15139,6 +15276,24 @@ fn rpc_error_code(message: &str) -> i32 {
         return -25;
     }
     if lower == "too-large-cluster" {
+        return -26;
+    }
+    if lower == "bad-txns-premature-spend-of-coinbase"
+        || lower == "non-final"
+        || lower == "non-bip68-final"
+        || lower == "dust"
+        || lower.starts_with("missing-ephemeral-spends,")
+    {
+        return -26;
+    }
+    if lower == "min relay fee not met"
+        || lower == "mempool min fee not met"
+        || lower == "transaction fee rate is below the relay minimum"
+        || lower.starts_with("transaction is non-standard:")
+        || lower.starts_with("transaction script validation failed:")
+        || lower.starts_with("replacement transaction fee is too low")
+        || lower.starts_with("truc-violation,")
+    {
         return -26;
     }
     if lower == "unspendable output exceeds maximum configured by user (maxburnamount)" {
@@ -16160,9 +16315,16 @@ mod tests {
         let exact_rejected = rejected_transaction_json(&existing, &MempoolError::AlreadyPresent);
         assert_eq!(exact_rejected["reject-reason"], "txn-already-in-mempool");
         assert_eq!(exact_rejected["reject-details"], "txn-already-in-mempool");
-        let package =
-            package_transaction_json(&submitted, &[submitted.clone()], &mempool, false, true)
-                .unwrap();
+        let excluded_ancestors = HashSet::new();
+        let package = package_transaction_json(
+            &submitted,
+            &[submitted.clone()],
+            &mempool,
+            false,
+            true,
+            &excluded_ancestors,
+        )
+        .unwrap();
         assert_eq!(
             package,
             json!({

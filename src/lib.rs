@@ -64,7 +64,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid, Wtxid};
@@ -1436,7 +1436,6 @@ pub struct Node {
     total_bytes_sent: AtomicU64,
     total_bytes_received: AtomicU64,
     outbound_usage: parking_lot::Mutex<OutboundUsage>,
-    pub(crate) next_inbound_tx_inventory_send: parking_lot::Mutex<Option<Instant>>,
     network_active: AtomicBool,
     block_stalling_timeout_secs: AtomicU64,
     mock_scheduler_elapsed_secs: AtomicU64,
@@ -1610,11 +1609,29 @@ impl Node {
         let deployment_parameters = config
             .deployment_parameters
             .unwrap_or_else(|| validation::DeploymentParameters::for_network(config.network));
+        let network_datadir = if network_data_dir_name(config.network).is_empty() {
+            config.datadir.clone()
+        } else {
+            config.datadir.join(network_data_dir_name(config.network))
+        };
+        let chain_blocks_dir = if config.blocks_dir_explicit {
+            blocks_dir.clone()
+        } else if matches!(config.network, Network::Bitcoin | Network::Regtest) {
+            blocks_dir.clone()
+        } else {
+            core_network_blocks_dir(&config.datadir, config.network)
+                .unwrap_or_else(|| blocks_dir.clone())
+        };
+        let chain_data_dir = if matches!(config.network, Network::Bitcoin | Network::Regtest) {
+            config.datadir.clone()
+        } else {
+            network_datadir.clone()
+        };
         let mut chain =
             ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters(
                 config.network,
-                &config.datadir,
-                blocks_dir,
+                &chain_data_dir,
+                chain_blocks_dir,
                 config.signet_challenge.as_deref(),
                 config.blockfilterindex,
                 config.reindex,
@@ -1652,11 +1669,6 @@ impl Node {
                 .verify_active_chain_with_level(check_level, check_blocks)
                 .context("startup block verification failed")?;
         }
-        let network_datadir = if network_data_dir_name(config.network).is_empty() {
-            config.datadir.clone()
-        } else {
-            config.datadir.join(network_data_dir_name(config.network))
-        };
         fs::create_dir_all(&network_datadir).with_context(|| {
             format!(
                 "creating network data directory {}",
@@ -1841,7 +1853,6 @@ impl Node {
             total_bytes_sent: AtomicU64::new(0),
             total_bytes_received: AtomicU64::new(0),
             outbound_usage: parking_lot::Mutex::new(OutboundUsage::default()),
-            next_inbound_tx_inventory_send: parking_lot::Mutex::new(None),
             network_active: AtomicBool::new(network_active),
             block_stalling_timeout_secs: AtomicU64::new(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
             mock_scheduler_elapsed_secs: AtomicU64::new(0),
@@ -2352,7 +2363,24 @@ impl Node {
             self.notify_mempool_transaction(existing);
             return Ok(txid);
         }
-        let (txid, _) = self.try_accept_transaction(transaction.clone())?;
+        let (txid, _) = self
+            .try_accept_transaction(transaction.clone())
+            .map_err(|error| {
+                let detailed = matches!(
+                    &error,
+                    MempoolError::NonStandard(reason)
+                        if reason == "missing-ephemeral-spends"
+                ) || error.to_string() == "transaction is non-standard: missing-ephemeral-spends";
+                if detailed {
+                    anyhow!(
+                        "missing-ephemeral-spends, tx {} (wtxid={}) did not spend parent's ephemeral dust",
+                        transaction.compute_txid(),
+                        transaction.compute_wtxid()
+                    )
+                } else {
+                    anyhow::Error::new(error)
+                }
+            })?;
         self.mempool.write().add_unbroadcast(txid);
         self.notify_mempool_transaction(transaction);
         Ok(txid)
@@ -3049,6 +3077,14 @@ impl Node {
         let txid = transaction.compute_txid();
         self.announce_mempool_transaction(txid);
         self.announce_peer_mempool_transaction_with_force(txid, vec![peer_id], true);
+    }
+
+    pub(crate) fn notify_mempool_transaction_force(&self, transaction: Transaction) {
+        let txid = transaction.compute_txid();
+        self.orphans.lock().remove(&transaction.compute_wtxid());
+        self.announce_mempool_transaction(txid);
+        self.announce_peer_mempool_transaction_with_force(txid, Vec::new(), true);
+        self.promote_orphans_for_parent(&transaction);
     }
 
     fn notify_mempool_transaction_with_exclusions(
@@ -5362,6 +5398,7 @@ impl Node {
     ) -> Result<()> {
         let startup_services = 4 + usize::from(!self.config.ipc_bind.is_empty());
         let startup = startup_sender.map(|sender| StartupLatch::new(sender, startup_services));
+        info!("SetNetworkActive: {}", self.network_active());
         if self.peers_dat_created {
             let peers_dat_path = self
                 .config

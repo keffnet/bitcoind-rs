@@ -495,6 +495,8 @@ pub enum MempoolError {
     ReplacementFeerateDiagram,
     #[error("transaction {0} input is missing")]
     MissingInput(OutPoint),
+    #[error("bad-txns-premature-spend-of-coinbase")]
+    PrematureCoinbase,
     #[error("transaction contains a duplicate input")]
     DuplicateInput,
     #[error("transaction contains a null prevout")]
@@ -523,6 +525,8 @@ pub enum MempoolError {
     MinRelayFee,
     #[error("transaction script validation failed: {0}")]
     Script(String),
+    #[error("dust")]
+    DustWithFee,
     #[error("transaction is non-standard: {0}")]
     NonStandard(String),
     #[error("mempool size limit exceeded")]
@@ -1499,7 +1503,8 @@ impl Mempool {
         transactions: &[Transaction],
         chain: &ChainState,
     ) -> Result<Vec<Txid>, MempoolError> {
-        let (candidate, result, _) = self.accept_package_with_state(transactions, chain);
+        let mut candidate = self.clone();
+        let result = self.accept_package_inner(&mut candidate, transactions, chain);
         if result.is_ok() {
             *self = candidate;
         }
@@ -1507,11 +1512,11 @@ impl Mempool {
     }
 
     /// Validate a package on a cloned mempool and return the candidate even
-    /// when a later transaction fails. The returned boolean identifies an
-    /// actual two-transaction package-RBF attempt, rather than merely a
-    /// package that could have used the package-RBF topology. Core can commit
-    /// a valid prefix from ordinary package submission; package RBF remains
-    /// atomic.
+    /// when a later transaction fails. The returned boolean identifies a
+    /// package-RBF attempt, including packages where an independently valid
+    /// replacement is admitted before a later package member fails. Core can
+    /// commit that valid replacement while keeping the failed fallback
+    /// package atomic.
     pub(crate) fn accept_package_with_state(
         &self,
         transactions: &[Transaction],
@@ -1523,16 +1528,26 @@ impl Mempool {
             return (candidate, result, false);
         }
 
-        let package_may_rbf = package_is_child_with_parents_tree(transactions)
-            && !transactions
-                .iter()
-                .any(|transaction| candidate.get(&transaction.compute_txid()).is_some())
+        let new_transaction_count = transactions
+            .iter()
+            .filter(|transaction| candidate.get(&transaction.compute_txid()).is_none())
+            .count();
+        let package_may_rbf = new_transaction_count > 1
+            && package_is_child_with_parents_tree(transactions)
             && transactions
                 .iter()
                 .any(|transaction| !candidate.conflicts_for(transaction).is_empty());
-        if !package_may_rbf {
+        // A package can replace a child while its parent is already in the
+        // mempool. In that case the individual probe cannot evaluate the
+        // replacement child without first making the package parent visible,
+        // so run the atomic package path directly.
+        if package_may_rbf
+            && transactions
+                .iter()
+                .any(|transaction| candidate.get(&transaction.compute_txid()).is_some())
+        {
             let result = self.accept_package_inner(&mut candidate, transactions, chain);
-            return (candidate, result, false);
+            return (candidate, result, true);
         }
 
         // AcceptPackage in Core first tries every new member individually.
@@ -1568,13 +1583,11 @@ impl Mempool {
             );
         }
 
-        let package_rbf = package_is_child_with_parents_tree(&package_fallback)
-            && !package_fallback
-                .iter()
-                .any(|transaction| candidate.get(&transaction.compute_txid()).is_some())
+        let fallback_package_rbf = package_is_child_with_parents_tree(&package_fallback)
             && package_fallback
                 .iter()
                 .any(|transaction| !candidate.conflicts_for(transaction).is_empty());
+        let package_rbf = package_may_rbf || fallback_package_rbf;
         let result = self.accept_package_inner(&mut candidate, &package_fallback, chain);
         match result {
             Ok(mut package_accepted) => {
@@ -1596,6 +1609,32 @@ impl Mempool {
         transactions: &[Transaction],
         chain: &ChainState,
     ) -> Result<Vec<Txid>, MempoolError> {
+        if transactions.len() <= 1 {
+            return self.accept_package_inner_unbounded(candidate, transactions, chain);
+        }
+
+        // Core stages a package before trimming the mempool. Individual
+        // insertion must therefore not evict an existing transaction before
+        // the aggregate package feerate and final eviction decision are known.
+        let original_max_bytes = candidate.max_bytes;
+        candidate.max_bytes = usize::MAX;
+        let result = self.accept_package_inner_unbounded(candidate, transactions, chain);
+        candidate.max_bytes = original_max_bytes;
+        let accepted = result?;
+
+        candidate.enforce_size_limit();
+        if accepted.iter().any(|txid| candidate.get(txid).is_none()) {
+            return Err(MempoolError::Full);
+        }
+        Ok(accepted)
+    }
+
+    fn accept_package_inner_unbounded(
+        &self,
+        candidate: &mut Self,
+        transactions: &[Transaction],
+        chain: &ChainState,
+    ) -> Result<Vec<Txid>, MempoolError> {
         if transactions.is_empty() {
             return Err(MempoolError::EmptyPackage);
         }
@@ -1604,9 +1643,6 @@ impl Mempool {
         let mut package_fee = 0i128;
         let mut package_vsize = 0u64;
         let allow_low_fee_parent = package_is_child_with_parents_tree(transactions);
-        let package_has_preexisting = transactions
-            .iter()
-            .any(|transaction| candidate.get(&transaction.compute_txid()).is_some());
         // Core evaluates only the transactions that are not already in the
         // mempool.  A child-with-parents package still gets aggregate
         // feerate treatment when at least two new transactions remain (for
@@ -1618,7 +1654,6 @@ impl Mempool {
             .filter(|transaction| candidate.get(&transaction.compute_txid()).is_none())
             .count();
         let package_rbf = allow_low_fee_parent
-            && !package_has_preexisting
             && transactions
                 .iter()
                 .any(|transaction| !candidate.conflicts_for(transaction).is_empty());
@@ -1628,10 +1663,16 @@ impl Mempool {
             if transactions.len() != 2 {
                 return Err(MempoolError::PackageRbfWrongSize);
             }
-            if transactions
+            let package_txids = transactions
                 .iter()
-                .any(|transaction| !candidate.ancestors_for_transaction(transaction).is_empty())
-            {
+                .map(Transaction::compute_txid)
+                .collect::<HashSet<_>>();
+            if transactions.iter().any(|transaction| {
+                candidate
+                    .ancestors_for_transaction(transaction)
+                    .iter()
+                    .any(|ancestor| !package_txids.contains(ancestor))
+            }) {
                 return Err(MempoolError::ReplacementUnconfirmedInput);
             }
             let mut direct_conflicts = transactions
@@ -1667,7 +1708,8 @@ impl Mempool {
         let mut new_count = 0usize;
         for transaction in transactions {
             let txid = transaction.compute_txid();
-            if candidate.get(&txid).is_some() {
+            let already_present = candidate.get(&txid).is_some();
+            if already_present {
                 // Core's package path de-duplicates both exact entries and
                 // same-txid/different-witness entries. The latter is reported
                 // by submitpackage as `other-wtxid`, rather than rejecting the
@@ -1675,19 +1717,21 @@ impl Mempool {
                 accepted.push(txid);
                 continue;
             }
-            let txid = if transactions.len() == 1 {
+            let enforce_fee_rate = !(allow_low_fee_parent && new_transaction_count > 1);
+            let result = if transactions.len() == 1 {
                 // Core's package path still permits a single transaction to
                 // replace an existing mempool conflict, but does not apply
                 // the single-transaction TRUC sibling-eviction carve-out.
-                candidate.accept_without_sibling(transaction.clone(), chain)?
+                candidate.accept_without_sibling(transaction.clone(), chain)
             } else {
                 candidate.accept_at_with_policy(
                     transaction.clone(),
                     chain,
                     added_at,
-                    !(allow_low_fee_parent && new_transaction_count > 1),
-                )?
+                    enforce_fee_rate,
+                )
             };
+            let txid = result?;
             let entry = candidate.get(&txid).ok_or(MempoolError::BadOutput)?;
             package_fee =
                 package_fee.saturating_add(candidate.modified_fee_sat(&txid, entry.fee_sat));
@@ -1702,7 +1746,8 @@ impl Mempool {
                 candidate.mempool_min_fee_sat_per_kvb(),
             )
         {
-            return Err(candidate.fee_rate_error(package_fee, package_vsize));
+            let error = candidate.fee_rate_error(package_fee, package_vsize);
+            return Err(error);
         }
         if package_rbf && conflicting_fee > 0 {
             let required_fee = conflicting_fee.saturating_add(fee_for_rate(
@@ -1724,7 +1769,16 @@ impl Mempool {
         if package_rbf && package_replaced && !self.improves_feerate_diagram(candidate) {
             return Err(MempoolError::ReplacementFeerateDiagram);
         }
-        validate_ephemeral_spends(transactions, candidate)?;
+        validate_ephemeral_spends(transactions, candidate).map_err(|error| {
+            if matches!(
+                &error,
+                MempoolError::NonStandard(reason) if reason == "missing-ephemeral-spends"
+            ) {
+                MempoolError::NonStandard("unspent-dust".to_owned())
+            } else {
+                error
+            }
+        })?;
         Ok(accepted)
     }
 
@@ -1905,10 +1959,12 @@ impl Mempool {
     }
 
     fn conflicts_for(&self, transaction: &Transaction) -> Vec<Txid> {
+        let txid = transaction.compute_txid();
         let mut conflicts = transaction
             .input
             .iter()
             .filter_map(|input| self.spent.get(&input.previous_output).copied())
+            .filter(|spender| *spender != txid)
             .collect::<Vec<_>>();
         conflicts.sort();
         conflicts.dedup();
@@ -2054,7 +2110,17 @@ impl Mempool {
         added_at: u64,
         enforce_fee_rate: bool,
     ) -> Result<Txid, MempoolError> {
-        self.accept_at_with_options(transaction, chain, added_at, enforce_fee_rate, true)
+        // Package admission performs the ephemeral-dust spentness check once
+        // after all members have been staged, matching Core's package path.
+        self.accept_at_with_sequence(
+            transaction,
+            chain,
+            added_at,
+            enforce_fee_rate,
+            true,
+            false,
+            true,
+        )
     }
 
     pub(crate) fn accept_reorg(
@@ -2065,7 +2131,8 @@ impl Mempool {
     ) -> Result<Txid, MempoolError> {
         // Core's reorg path bypasses fee-rate and rolling-size limits, but it
         // still applies structural mempool policy such as cluster limits.
-        let txid = self.accept_at_with_options(transaction, chain, added_at, false, true)?;
+        let txid =
+            self.accept_at_with_sequence(transaction, chain, added_at, false, true, false, true)?;
         self.relay_sequences.insert(txid, 0);
         Ok(txid)
     }
@@ -2085,6 +2152,7 @@ impl Mempool {
             enforce_fee_rate,
             enforce_mempool_policy,
             true,
+            true,
         )
     }
 
@@ -2094,7 +2162,7 @@ impl Mempool {
         chain: &ChainState,
         added_at: u64,
     ) -> Result<Txid, MempoolError> {
-        self.accept_at_with_sequence(transaction, chain, added_at, false, false, false)
+        self.accept_at_with_sequence(transaction, chain, added_at, false, false, false, false)
     }
 
     fn accept_at_with_sequence(
@@ -2104,6 +2172,7 @@ impl Mempool {
         added_at: u64,
         enforce_fee_rate: bool,
         enforce_mempool_policy: bool,
+        check_ephemeral_spends: bool,
         record_sequence: bool,
     ) -> Result<Txid, MempoolError> {
         let txid = transaction.compute_txid();
@@ -2166,7 +2235,7 @@ impl Mempool {
                     .utxo(&input.previous_output)
                     .ok_or(MempoolError::MissingInput(input.previous_output))?;
                 if entry.coinbase && chain.height() + 1 < entry.height.saturating_add(100) {
-                    return Err(MempoolError::MissingInput(input.previous_output));
+                    return Err(MempoolError::PrematureCoinbase);
                 }
                 previous_entries.push(entry.clone());
                 entry.output.clone()
@@ -2252,7 +2321,23 @@ impl Mempool {
                 self.mempool_min_fee_sat_per_kvb(),
             )
         {
-            return Err(self.fee_rate_error(i128::from(modified_fee_sat), vsize));
+            let error = self.fee_rate_error(i128::from(modified_fee_sat), vsize);
+            tracing::debug!(
+                %txid,
+                modified_fee_sat,
+                vsize,
+                error = %error,
+                "transaction fee policy rejection"
+            );
+            return Err(error);
+        }
+        if enforce_mempool_policy && check_ephemeral_spends {
+            // Core checks package and single-transaction fee floors before
+            // the final ephemeral-dust spentness check.  This preserves the
+            // ordinary relay-fee error for an otherwise too-cheap sweep,
+            // while still reporting missing ephemeral spends for a relayable
+            // transaction.
+            validate_ephemeral_spends(std::slice::from_ref(&transaction), self)?;
         }
         if enforce_mempool_policy {
             match self.policy.truc_policy {
@@ -2262,7 +2347,6 @@ impl Mempool {
                 TrucPolicy::Enforce => self.check_truc_policy(&transaction, vsize)?,
                 TrucPolicy::Accept | TrucPolicy::Reject => {}
             }
-            validate_ephemeral_spends(std::slice::from_ref(&transaction), self)?;
         }
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
         let memory_usage = mempool_entry_memory_usage(&transaction);
@@ -2377,6 +2461,11 @@ impl Mempool {
             self.rolling_min_fee_sat_per_kvb = self.rolling_min_fee_sat_per_kvb.max(
                 package_fee_rate.saturating_add(self.policy.incremental_relay_fee_sat_per_kvb)
                     as f64,
+            );
+            tracing::debug!(
+                removed = package.len(),
+                rolling_min_fee_sat_per_kvb = self.rolling_min_fee_sat_per_kvb,
+                "rolling minimum fee bumped"
             );
             self.block_since_last_rolling_fee_bump = false;
             for txid in package {
@@ -3174,8 +3263,11 @@ fn validate_standard_policy_with_modified_fee_and_policy(
             dust_outputs = dust_outputs.saturating_add(1);
         }
     }
-    if dust_outputs > 1 || ((base_fee_sat != 0 || modified_fee_sat != 0) && dust_outputs != 0) {
+    if dust_outputs > 1 {
         return Err(MempoolError::NonStandard("dust".to_owned()));
+    }
+    if dust_outputs == 1 && (base_fee_sat != 0 || modified_fee_sat != 0) {
+        return Err(MempoolError::DustWithFee);
     }
 
     validate_standard_inputs(transaction, previous_outputs)?;

@@ -1,14 +1,15 @@
 use std::collections::{HashMap, HashSet};
+use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use bitcoin::pow::Work;
 use bitcoin::{Amount, BlockHash, Denomination, Network};
-use clap::{Parser, ValueEnum};
+use clap::{CommandFactory, Parser, ValueEnum};
 
 use crate::IpSubnet;
 use crate::address::NetworkEndpoint;
@@ -58,6 +59,26 @@ pub const DEFAULT_BAN_TIME_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_CLUSTER_COUNT: usize = 64;
 pub const MAX_CLUSTER_COUNT_LIMIT: usize = 64;
 pub const DEFAULT_CLUSTER_SIZE_KVB: u64 = 101;
+
+fn parse_socket_addr(value: &str) -> std::result::Result<SocketAddr, String> {
+    value
+        .to_socket_addrs()
+        .map_err(|error| error.to_string())?
+        .next()
+        .ok_or_else(|| format!("could not resolve socket address '{value}'"))
+}
+
+fn default_data_dir() -> PathBuf {
+    let home = env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/Bitcoin")
+    } else {
+        home.join(".bitcoin")
+    }
+}
 
 /// Logging categories accepted by Bitcoin Core's `-debug` and
 /// `-debugexclude` options in v31.1.  The Rust logger maps these categories
@@ -701,6 +722,12 @@ pub struct Args {
     #[arg(long, default_value = "./data")]
     pub datadir: PathBuf,
 
+    #[arg(skip)]
+    pub datadir_explicit: bool,
+
+    #[arg(skip)]
+    pub config_loaded: bool,
+
     #[arg(long = "blocksdir", value_name = "PATH")]
     pub blocks_dir: Option<PathBuf>,
 
@@ -1118,6 +1145,28 @@ pub struct Args {
     )]
     pub listen_onion: Option<bool>,
 
+    /// Core's negated spelling for disabling inbound P2P listening.
+    #[arg(
+        long = "nolisten",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub no_listen: bool,
+
+    /// Core's negated spelling for disabling Tor support.
+    #[arg(
+        long = "noonion",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub no_onion: bool,
+
     /// Use PCP or NAT-PMP to map the P2P listening port when a gateway
     /// supports automatic port forwarding.
     #[arg(
@@ -1184,6 +1233,16 @@ pub struct Args {
     /// intentionally ignored because this build does not implement wallets.
     #[arg(long = "wallet", value_name = "NAME")]
     pub wallets: Vec<String>,
+
+    /// Wallet-only notification command accepted for daemon compatibility.
+    /// Wallet functionality is intentionally not implemented.
+    #[arg(long = "walletnotify", value_name = "COMMAND", hide = true)]
+    pub wallet_notify: Option<String>,
+
+    /// Wallet-only address type accepted for daemon compatibility.
+    /// Address derivation is intentionally not wallet-backed in this build.
+    #[arg(long = "addresstype", value_name = "TYPE", hide = true)]
+    pub address_type: Option<String>,
 
     /// Accept Core's wallet fallback fee setting without retaining wallet
     /// state. Raw transaction and node fee policy use their own explicit
@@ -1315,6 +1374,17 @@ pub struct Args {
     )]
     pub network_active: bool,
 
+    /// Core's negated spelling for disabling network activity.
+    #[arg(
+        long = "nonetworkactive",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub no_network_active: bool,
+
     #[arg(
         long,
         num_args = 0..=1,
@@ -1338,11 +1408,15 @@ pub struct Args {
     #[arg(long = "onlynet", value_enum, value_delimiter = ',')]
     pub onlynet: Vec<OnlyNet>,
 
-    #[arg(long, value_name = "IP:PORT")]
+    #[arg(long, value_name = "IP:PORT", value_parser = parse_socket_addr)]
     pub proxy: Option<SocketAddr>,
 
     /// I2P SAM v3.1 control service used for I2P peer connections.
-    #[arg(long = "i2psam", value_name = "IP:PORT")]
+    #[arg(
+        long = "i2psam",
+        value_name = "IP:PORT",
+        value_parser = parse_socket_addr
+    )]
     pub i2p_sam: Option<SocketAddr>,
 
     #[arg(
@@ -1355,7 +1429,7 @@ pub struct Args {
     pub i2p_accept_incoming: bool,
 
     /// SOCKS5 proxy used specifically for Tor onion endpoints.
-    #[arg(long = "onion", value_name = "IP:PORT")]
+    #[arg(long = "onion", value_name = "IP:PORT", value_parser = parse_socket_addr)]
     pub onion_proxy: Option<SocketAddr>,
 
     /// Tor control service used for automatic onion listening.
@@ -1492,7 +1566,14 @@ pub struct Args {
     )]
     pub permitbaremultisig: bool,
 
-    #[arg(long, visible_alias = "peerbloomfilters", default_value_t = false)]
+    #[arg(
+        long,
+        visible_alias = "peerbloomfilters",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub peer_bloom_filters: bool,
 
     #[arg(
@@ -1604,7 +1685,13 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub txospenderindex: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub coinstatsindex: bool,
 
     #[arg(
@@ -1710,14 +1797,21 @@ pub struct Args {
 
     #[arg(long = "zmqpubsequencehwm", default_value_t = DEFAULT_ZMQ_HWM)]
     pub zmq_pub_sequence_hwm: u32,
+
+    #[arg(skip)]
+    pub config_file_args: Vec<ConfigFileArg>,
 }
 
 #[derive(Clone, Debug)]
-struct ConfigFileEntry {
-    section: Option<String>,
-    key: String,
-    value: String,
+pub struct ConfigFileArg {
+    pub section: Option<String>,
+    pub key: String,
+    pub value: String,
+    pub line: usize,
+    pub path: PathBuf,
 }
+
+type ConfigFileEntry = ConfigFileArg;
 
 impl Args {
     /// Parse command-line arguments after loading the default or explicitly
@@ -1731,14 +1825,23 @@ impl Args {
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        let raw = args
-            .into_iter()
+        let original = args.into_iter().map(Into::into).collect::<Vec<_>>();
+        let raw = original
+            .iter()
+            .cloned()
             .map(Into::into)
             .map(normalize_core_style_argument)
             .collect::<Vec<_>>();
+        let datadir_explicit = raw_option_value(&raw, "datadir").is_some();
+        if let Err(error) = Self::try_parse_from(raw.clone()) {
+            let error_text = error.to_string();
+            if let Some(message) = core_cli_parse_error(&original, &error_text) {
+                bail!("{message}");
+            }
+        }
         let datadir = raw_option_value(&raw, "datadir")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("./data"));
+            .unwrap_or_else(default_data_dir);
         let no_config = raw_bool_option(&raw, "noconf");
         let no_include_conf = raw_bool_option(&raw, "noincludeconf");
         let explicit_config = raw_option_value(&raw, "conf");
@@ -1756,6 +1859,12 @@ impl Args {
         let mut entries = Vec::new();
         if !no_config {
             if config_path.exists() {
+                if config_path.is_dir() {
+                    bail!(
+                        "Error reading configuration file: Config file \"{}\" is a directory.",
+                        config_path.display()
+                    );
+                }
                 read_config_file(
                     &config_path,
                     &datadir,
@@ -1768,7 +1877,7 @@ impl Args {
                 .is_some_and(|value| !value.is_empty())
             {
                 bail!(
-                    "configuration file does not exist: {}",
+                    "Error reading configuration file: specified config file \"{}\" could not be opened.",
                     config_path.display()
                 );
             }
@@ -1795,7 +1904,10 @@ impl Args {
             && !allow_ignored_conf
         {
             bail!(
-                "data directory contains bitcoin.conf, but a different configuration file is selected; use --allowignoredconf=1 to ignore it"
+                "Data directory \"{}\" contains a \"bitcoin.conf\" file which is ignored, because a different configuration file \"{}\" from command line argument \"-conf={}\" is being used instead. Use -allowignoredconf=1 to override.",
+                datadir.display(),
+                config_path.display(),
+                explicit_config.as_deref().unwrap_or_default()
             );
         }
 
@@ -1835,13 +1947,54 @@ impl Args {
                     .map(|entry| canonical_network_name(&entry.key))
             })
             .unwrap_or("bitcoin");
+        let config_file_args = entries.clone();
+        if raw_option_value(&raw, "datadir").is_none() {
+            if let Some(configured_datadir) = config_file_args.iter().rev().find_map(|entry| {
+                (entry.section.is_none() && entry.key == "datadir")
+                    .then(|| PathBuf::from(&entry.value))
+            }) {
+                let configured_datadir = if configured_datadir.is_absolute() {
+                    configured_datadir
+                } else {
+                    env::current_dir()
+                        .unwrap_or_else(|_| PathBuf::from("."))
+                        .join(configured_datadir)
+                };
+                let configured_conf = configured_datadir.join("bitcoin.conf");
+                if configured_datadir != datadir {
+                    if !configured_datadir.is_dir() {
+                        bail!(
+                            "Error reading configuration file: specified data directory \"{}\" does not exist.",
+                            configured_datadir.display()
+                        );
+                    }
+                    if configured_conf.exists() && !allow_ignored_conf {
+                        bail!(
+                            "Data directory \"{}\" contains a \"bitcoin.conf\" file which is ignored, because a different configuration file \"{}\" from data directory \"{}\" is being used instead.",
+                            configured_datadir.display(),
+                            config_path.display(),
+                            datadir.display()
+                        );
+                    }
+                }
+            }
+        }
         let config_args = entries
             .into_iter()
             .filter(|entry| config_section_applies(entry.section.as_deref(), selected_network))
             .filter(|entry| !is_network_selector_key(&entry.key))
-            .filter_map(config_entry_to_arg)
+            .filter_map(|entry| {
+                is_known_config_option(&entry.key).then(|| config_entry_to_arg(entry))
+            })
+            .flatten()
             .collect::<Vec<_>>();
         let mut config_args = config_args;
+        if !datadir_explicit {
+            config_args.insert(
+                0,
+                OsString::from(format!("--datadir={}", datadir.display())),
+            );
+        }
         if !cli_network_selector {
             config_args.push(OsString::from(format!("--network={selected_network}")));
         }
@@ -1852,8 +2005,82 @@ impl Args {
         }
         merged.extend(config_args);
         merged.extend(raw.into_iter().skip(1));
-        Ok(Self::try_parse_from(merged)?)
+        let mut parsed = match Self::try_parse_from(merged) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let error_text = error.to_string();
+                let error_head = error_text.lines().next().unwrap_or(&error_text);
+                if let Some(entry) = config_file_args
+                    .iter()
+                    .find(|entry| error_head.contains(&format!("--{}", entry.key)))
+                {
+                    bail!(
+                        "Error reading configuration file: parse error on line {}: {}",
+                        entry.line,
+                        entry.key
+                    );
+                }
+                if let Some(message) = core_cli_parse_error(&original, &error_text) {
+                    bail!("{message}");
+                }
+                return Err(error.into());
+            }
+        };
+        parsed.config_file_args = config_file_args;
+        parsed.datadir_explicit = datadir_explicit;
+        parsed.config_loaded = true;
+        Ok(parsed)
     }
+}
+
+fn core_cli_parse_error(args: &[OsString], error: &str) -> Option<String> {
+    if error.contains("unexpected argument") {
+        let argument = cli_argument_for_error(args, error)?;
+        return Some(format!(
+            "Error parsing command line arguments: Invalid parameter {argument}"
+        ));
+    }
+    if error.contains("a value is required") {
+        let key = cli_key_for_error(args, error)?;
+        return Some(format!(
+            "Error parsing command line arguments: Can not set -{key} with no value. Please specify value with -{key}=value."
+        ));
+    }
+    None
+}
+
+fn cli_argument_for_error(args: &[OsString], error: &str) -> Option<String> {
+    let key = error
+        .split("'--")
+        .nth(1)?
+        .split(|character: char| character == '\'' || character.is_whitespace())
+        .next()?;
+    args.iter().skip(1).find_map(|argument| {
+        let argument = argument.to_str()?;
+        let argument_key = argument
+            .strip_prefix("--")
+            .or_else(|| argument.strip_prefix('-'))?
+            .split_once('=')
+            .map_or(argument.trim_start_matches('-'), |(key, _)| key);
+        (argument_key == key).then(|| argument.to_owned())
+    })
+}
+
+fn cli_key_for_error(args: &[OsString], error: &str) -> Option<String> {
+    let key = error
+        .split("'--")
+        .nth(1)?
+        .split(|character: char| character == '\'' || character.is_whitespace())
+        .next()?;
+    args.iter().skip(1).find_map(|argument| {
+        let argument = argument.to_str()?;
+        let argument_key = argument
+            .strip_prefix("--")
+            .or_else(|| argument.strip_prefix('-'))?
+            .split_once('=')
+            .map_or(argument.trim_start_matches('-'), |(key, _)| key);
+        (argument_key == key).then(|| key.to_owned())
+    })
 }
 
 /// Core uses a single dash for long options (for example, `-regtest` and
@@ -1952,6 +2179,17 @@ fn read_config_file(
 ) -> Result<()> {
     let path = fs::canonicalize(path)
         .with_context(|| format!("resolving configuration file {}", path.display()))?;
+    if path.is_dir() {
+        let label = if stack.is_empty() {
+            "Config file"
+        } else {
+            "Included config file"
+        };
+        bail!(
+            "Error reading configuration file: {label} \"{}\" is a directory.",
+            path.display()
+        );
+    }
     if stack.iter().any(|current| current == &path) {
         bail!("configuration file include cycle at {}", path.display());
     }
@@ -1980,10 +2218,42 @@ fn read_config_file(
                 );
             }
             section = Some(section_name);
+            entries.push(ConfigFileEntry {
+                section: section.clone(),
+                key: String::new(),
+                value: String::new(),
+                line: line_number + 1,
+                path: path.clone(),
+            });
             continue;
         }
-        let (key, value) = line.split_once('=').unwrap_or((line, "1"));
-        let key = key.trim().trim_start_matches('-').to_ascii_lowercase();
+        let (raw_key, value, has_equals) = line
+            .split_once('=')
+            .map_or((line, "1", false), |(key, value)| (key, value, true));
+        let raw_key = raw_key.trim();
+        if raw_key.starts_with('-') {
+            bail!(
+                "Error reading configuration file: parse error on line {}: {}, options in configuration file must be specified without leading -",
+                line_number + 1,
+                line
+            );
+        }
+        let key = raw_key.to_ascii_lowercase();
+        if !has_equals && !is_known_config_option(&key) {
+            if key.starts_with("no") {
+                bail!(
+                    "Error reading configuration file: parse error on line {}: {}, if you intended to specify a negated option, use {}=1 instead",
+                    line_number + 1,
+                    line,
+                    line
+                );
+            }
+            bail!(
+                "Error reading configuration file: parse error on line {}: {}",
+                line_number + 1,
+                line
+            );
+        }
         let value = value.trim().to_owned();
         if key.is_empty() {
             bail!(
@@ -1994,13 +2264,13 @@ fn read_config_file(
         }
         if key == "conf" {
             bail!(
-                "configuration line {} sets conf; use includeconf instead",
-                line_number + 1
+                "Error reading configuration file: conf cannot be set in the configuration file; use includeconf= if you want to include additional config files"
             );
         }
-        if used_hash && key == "rpcpassword" {
+        let option_name = key.rsplit_once('.').map_or(key.as_str(), |(_, name)| name);
+        if used_hash && option_name == "rpcpassword" {
             bail!(
-                "configuration line {} uses # in rpcpassword; this is ambiguous and should be avoided",
+                "Error reading configuration file: parse error on line {}, using # in rpcpassword can be ambiguous and should be avoided",
                 line_number + 1
             );
         }
@@ -2017,6 +2287,8 @@ fn read_config_file(
                 section: section.clone(),
                 key,
                 value,
+                line: line_number + 1,
+                path: path.clone(),
             });
         } else {
             // `-noincludeconf` deliberately suppresses this directive and
@@ -2053,6 +2325,15 @@ fn config_entry_to_arg(entry: ConfigFileEntry) -> Option<OsString> {
         )));
     }
     Some(OsString::from(format!("--{}={}", entry.key, entry.value)))
+}
+
+pub fn is_known_config_option(key: &str) -> bool {
+    matches!(
+        key,
+        "chain" | "signetchallenge" | "maxconnections" | "peerbloomfilters"
+    ) || Args::command()
+        .get_arguments()
+        .any(|argument| argument.get_long().is_some_and(|long| long == key))
 }
 
 #[derive(Clone, Debug)]
@@ -2250,6 +2531,8 @@ fn parse_logging_config(args: &Args) -> Result<ParsedLoggingConfig> {
 pub struct Config {
     pub network: Network,
     pub datadir: PathBuf,
+    #[cfg(not(test))]
+    pub config_file_args: Vec<ConfigFileArg>,
     pub(crate) blocks_dir: Option<PathBuf>,
     pub(crate) blocks_dir_explicit: bool,
     pub blocks_xor: bool,
@@ -2467,6 +2750,12 @@ impl Config {
         }
         let logging = parse_logging_config(&args)?;
         let network = network_from_args(&args)?;
+        if args.datadir_explicit && !args.datadir.is_dir() {
+            bail!(
+                "Specified data directory \"{}\" does not exist.",
+                args.datadir.display()
+            );
+        }
         let blocks_dir = args.blocks_dir.as_ref().map_or_else(
             || args.datadir.join("blocks"),
             |path| {
@@ -2493,6 +2782,18 @@ impl Config {
         } else {
             args.datadir.join(debug_log_path)
         };
+        if !args.no_debug_log_file {
+            if let Some(parent) = debug_log_path.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!("creating debug log directory {}", parent.display())
+                })?;
+            }
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&debug_log_path)
+                .with_context(|| format!("opening debug log {}", debug_log_path.display()))?;
+        }
         if args.pid_file.as_os_str().is_empty() {
             bail!("--pid must not be empty");
         }
@@ -2668,8 +2969,20 @@ impl Config {
         let rbf_policy =
             parse_rbf_policy(args.mempool_replacement.as_deref(), args.mempool_full_rbf)?;
         let truc_policy = parse_truc_policy(args.mempool_truc.as_deref())?;
+        if args.config_loaded && args.accept_stale_fee_estimates {
+            let chain_name = match network {
+                Network::Bitcoin => Some("main"),
+                Network::Testnet => Some("test"),
+                Network::Testnet4 => Some("testnet4"),
+                Network::Signet => Some("signet"),
+                Network::Regtest => None,
+            };
+            if let Some(chain_name) = chain_name {
+                bail!("acceptstalefeeestimates is not supported on {chain_name} chain.");
+            }
+        }
         if args.accept_nonstd_txn && network == Network::Bitcoin {
-            bail!("--acceptnonstdtxn is not currently supported for main chain");
+            bail!("acceptnonstdtxn is not currently supported for main chain");
         }
         if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
             bail!("--proxy must use a non-zero port");
@@ -2682,14 +2995,6 @@ impl Config {
         }
         let tor_control = parse_tor_control(&args.tor_control)?;
         let connect_configured = args.no_connect || !args.connect.is_empty();
-        if args.privatebroadcast && args.proxy.is_none() {
-            bail!("--privatebroadcast requires --proxy for private connections");
-        }
-        if args.privatebroadcast && connect_configured {
-            bail!(
-                "Private broadcast of own transactions requested (--privatebroadcast), but --connect is also configured"
-            );
-        }
         if args.no_connect && !args.connect.is_empty() {
             bail!("--noconnect cannot be combined with --connect");
         }
@@ -2697,14 +3002,46 @@ impl Config {
             !args.bind.is_empty()
                 || !args.whitebind.is_empty()
                 || (args.proxy.is_none() && !connect_configured && args.max_peers > 0),
-        );
+        ) && !args.no_listen;
         if !listen && (!args.bind.is_empty() || !args.whitebind.is_empty()) {
             bail!("--bind/--whitebind cannot be used with --listen=false");
         }
         if !listen && args.listen_onion == Some(true) {
             bail!("--listen=false cannot be combined with --listenonion=true");
         }
-        let listen_onion = args.listen_onion.unwrap_or(true) && listen;
+        let listen_onion = args.listen_onion.unwrap_or(true) && listen && !args.no_onion;
+        if args.privatebroadcast
+            && args.onion_proxy.is_none()
+            && args.i2p_sam.is_none()
+            && args.proxy.is_none()
+            && args.listen_onion != Some(true)
+        {
+            bail!(
+                "Private broadcast of own transactions requested (-privatebroadcast), but none of Tor or I2P networks is reachable"
+            );
+        }
+        if args.privatebroadcast && connect_configured {
+            bail!(
+                "Private broadcast of own transactions requested (-privatebroadcast), but -connect is also configured. They are incompatible because the private broadcast needs to open new connections to randomly chosen Tor or I2P peers. Consider using -maxconnections=0 -addnode=... instead"
+            );
+        }
+        if args.privatebroadcast
+            && !args.proxy_randomize
+            && (args.proxy.is_some() || args.onion_proxy.is_some() || listen_onion)
+        {
+            eprintln!(
+                "Warning: Private broadcast of own transactions requested (-privatebroadcast) and -proxyrandomize is disabled. Tor circuits for private broadcast connections may be correlated to other connections over Tor. For maximum privacy set -proxyrandomize=1."
+            );
+        }
+        if args.no_onion
+            && args.proxy.is_none()
+            && args.onion_proxy.is_none()
+            && args.onlynet.contains(&OnlyNet::Onion)
+        {
+            bail!(
+                "Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching the Tor network is explicitly forbidden: -onion=0"
+            );
+        }
         if args.proxy.is_none()
             && args.onion_proxy.is_none()
             && args.onlynet.contains(&OnlyNet::Onion)
@@ -2731,6 +3068,11 @@ impl Config {
         let dnsseed = args
             .dnsseed
             .unwrap_or(!connect_configured && args.max_peers > 0 && clearnet_reachable);
+        if args.dnsseed == Some(true) && !clearnet_reachable {
+            bail!(
+                "Incompatible options: -dnsseed=1 was explicitly specified, but -onlynet forbids connections to IPv4/IPv6"
+            );
+        }
         if args.force_dns_seed && !dnsseed {
             bail!("Cannot set --forcednsseed=true when setting --dnsseed=false");
         }
@@ -2804,6 +3146,9 @@ impl Config {
         });
         if max_mempool == 0 {
             bail!("--maxmempool must be greater than zero");
+        }
+        if max_mempool < 5 {
+            bail!("-maxmempool must be at least 5 MB");
         }
         if args.mempoolexpiry == 0 {
             bail!("--mempoolexpiry must be greater than zero");
@@ -2917,6 +3262,8 @@ impl Config {
         Ok(Self {
             network,
             datadir: args.datadir,
+            #[cfg(not(test))]
+            config_file_args: args.config_file_args,
             blocks_dir: Some(blocks_dir),
             blocks_dir_explicit: args.blocks_dir.is_some(),
             blocks_xor: args.blocks_xor,
@@ -2991,7 +3338,7 @@ impl Config {
             seed_nodes,
             connect_disabled,
             v2_transport: args.v2_transport,
-            network_active: args.network_active,
+            network_active: args.network_active && !args.no_network_active,
             discover,
             external_addresses,
             dns_lookup: args.dns,
@@ -3371,7 +3718,7 @@ fn parse_rpc_auth(
     password: Option<&str>,
 ) -> Result<Vec<RpcAuth>> {
     let mut credentials = Vec::with_capacity(values.len() + usize::from(password.is_some()));
-    if let Some(password) = password {
+    if let Some(password) = password.filter(|password| !password.is_empty()) {
         credentials.push(RpcAuth::Plain {
             username: username.unwrap_or_default().to_owned(),
             password: password.to_owned(),
@@ -3387,11 +3734,15 @@ fn parse_rpc_auth(
         if username.is_empty() || salt.is_empty() || encoded_hash.is_empty() {
             bail!("invalid --rpcauth value; expected USER:SALT$HASH");
         }
-        let hash =
+        let decoded_hash =
             hex::decode(encoded_hash).with_context(|| "decoding --rpcauth hash as hexadecimal")?;
-        let hash: [u8; 32] = hash
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("--rpcauth hash must contain 32 bytes"))?;
+        if decoded_hash.len() > 32 {
+            bail!("--rpcauth hash must contain at most 32 bytes");
+        }
+        // Core parses the hash into a uint256, so shorter hexadecimal values
+        // are accepted and zero-extended on the left.
+        let mut hash = [0u8; 32];
+        hash[32 - decoded_hash.len()..].copy_from_slice(&decoded_hash);
         credentials.push(RpcAuth::Hmac {
             username: username.to_owned(),
             salt: salt.as_bytes().to_vec(),
@@ -3599,7 +3950,7 @@ mod tests {
         ])
         .unwrap_err()
         .to_string();
-        assert!(error.contains("use includeconf instead"));
+        assert!(error.contains("use includeconf= if you want to include additional config files"));
     }
 
     #[test]

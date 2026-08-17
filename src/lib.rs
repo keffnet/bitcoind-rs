@@ -3635,7 +3635,25 @@ impl Node {
         if started.contains(&peer_id) {
             return false;
         }
-        if !allow_parallel && self.headers_sync_peers.load(Ordering::Relaxed) != 0 {
+        let replaces_limited_peer = if allow_parallel {
+            false
+        } else {
+            let peers = self.peers.read();
+            let candidate_is_full = peers
+                .get(&peer_id)
+                .is_some_and(|peer| peer.services & wire::NODE_NETWORK != 0);
+            candidate_is_full
+                && started.iter().any(|started_peer_id| {
+                    peers.get(started_peer_id).is_some_and(|peer| {
+                        peer.services & wire::NODE_NETWORK == 0
+                            && peer.services & wire::NODE_NETWORK_LIMITED != 0
+                    })
+                })
+        };
+        if !allow_parallel
+            && !replaces_limited_peer
+            && self.headers_sync_peers.load(Ordering::Relaxed) != 0
+        {
             return false;
         }
         if !self

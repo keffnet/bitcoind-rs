@@ -4041,7 +4041,7 @@ async fn serve_peer_loop(
                     info!(
                         "initial getheaders ({start_height}) to peer={peer_id} (startheight:{peer_start_height})"
                     );
-                    request_headers(node, peer_id, writer, peer_state).await?;
+                    request_initial_headers(node, peer_id, writer, peer_state).await?;
                 }
                 if connection_fetches_addresses(outbound, peer_state.connection_type) {
                     send_message(
@@ -7018,6 +7018,31 @@ async fn request_headers(
     peer_state: &PeerState,
 ) -> Result<()> {
     let locator = node.chain.read().block_locator_hashes();
+    request_headers_with_locator(node, peer_id, writer, peer_state, locator, false).await
+}
+
+async fn request_initial_headers(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    peer_state: &PeerState,
+) -> Result<()> {
+    // Core starts the initial request one header before the best known header.
+    // That makes an already-known tip produce a short, non-empty response,
+    // which also records the peer's block availability for headers-first body
+    // download.  The active-chain locator alone would produce an empty
+    // response when headers are ahead of the active tip (for example after a
+    // connection to a pruned peer).
+    let locator = {
+        let chain = node.chain.read();
+        let best_header = chain.best_header_tip();
+        let start_hash = best_header
+            .height
+            .checked_sub(1)
+            .and_then(|height| chain.ancestor_hash_at_height(&best_header.hash, height))
+            .unwrap_or(best_header.hash);
+        chain.block_locator_hashes_from(start_hash)
+    };
     request_headers_with_locator(node, peer_id, writer, peer_state, locator, false).await
 }
 

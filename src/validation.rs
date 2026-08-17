@@ -168,6 +168,30 @@ pub enum ValidationError {
 }
 
 impl ValidationError {
+    /// Whether Core would cache this block as invalid after accepting its
+    /// header.  Merkle and witness-commitment failures are deliberately
+    /// treated as mutation failures: a peer may have supplied the wrong body
+    /// for a valid header, so caching them would incorrectly poison the
+    /// header.  UTXO, finality, and script failures, on the other hand, prove
+    /// that the block itself is invalid and its descendants must be rejected.
+    pub(crate) fn should_mark_block_invalid(&self) -> bool {
+        matches!(
+            self,
+            Self::BadCoinbaseHeight
+                | Self::MissingInput { .. }
+                | Self::ImmatureCoinbase { .. }
+                | Self::InputTotalOverflow
+                | Self::AccumulatedFeeOverflow
+                | Self::NegativeFee { .. }
+                | Self::Bip30(_)
+                | Self::NonFinalTransaction
+                | Self::NonFinalSequence
+                | Self::Script { .. }
+                | Self::CoinbaseOverpay { .. }
+                | Self::SubsidyOverflow
+        )
+    }
+
     /// Return the reject reason used by Core's BIP22 proposal and submitblock
     /// responses. Keep this separate from `Display`: the latter is intended
     /// for operator diagnostics, while BIP22 exposes stable protocol strings.

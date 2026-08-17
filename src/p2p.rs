@@ -44,6 +44,7 @@ use crate::config::DEFAULT_CONNECT_TIMEOUT_MS;
 use crate::config::{PeerPermissions, default_p2p_port};
 use crate::mempool::MempoolError;
 use crate::script::{core_multisig_solution, is_core_p2pk};
+use crate::validation::ValidationError;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
 };
@@ -233,6 +234,7 @@ const MAX_ADDR_TO_SEND: usize = 1_000;
 const MAX_PCT_ADDR_TO_SEND: usize = 23;
 const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 const MAX_BLOCKTXN_DEPTH: u32 = 10;
+const MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK: usize = 3;
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 const STALE_RELAY_AGE_LIMIT_SECS: u64 = 30 * 24 * 60 * 60;
 pub(crate) const MIN_PEER_PROTO_VERSION: i32 = 31_800;
@@ -497,13 +499,6 @@ fn handle_headers_download_timeout(
         anyhow::bail!("peer timed out responding to getheaders");
     }
     Ok(false)
-}
-
-fn block_relay_is_suppressed(peer_state: &PeerState) -> bool {
-    peer_state
-        .last_block_request
-        .lock()
-        .is_some_and(|sent| sent.elapsed() < BLOCK_RELAY_IDLE_DELAY)
 }
 
 fn take_deferred_block_relay(peer_state: &PeerState) -> bool {
@@ -1094,6 +1089,23 @@ impl TxRequestState {
         true
     }
 
+    fn queue_force(&mut self, item: Inventory, ready_at: Instant) -> bool {
+        let Some(key) = TxRequestKey::from_inventory(&item) else {
+            return false;
+        };
+        self.remove(key);
+        if self.pending.len().saturating_add(self.in_flight.len()) >= MAX_PEER_TX_ANNOUNCEMENTS {
+            return false;
+        }
+        self.pending.push_back(PendingTxRequest {
+            key,
+            item,
+            ready_at,
+        });
+        self.pending_keys.insert(key);
+        true
+    }
+
     fn expire(&mut self, now: Instant) {
         self.in_flight
             .retain(|_, requested_at| now.duration_since(*requested_at) < GETDATA_TX_INTERVAL);
@@ -1554,7 +1566,11 @@ impl PeerManager {
                         block_relay_network,
                         false,
                         Inventory {
-                            kind: InventoryType::WitnessBlock,
+                            // Core announces newly connected blocks with
+                            // MSG_BLOCK.  Witness data is selected when the
+                            // peer requests the block, not in the relay
+                            // announcement inventory.
+                            kind: InventoryType::Block,
                             hash,
                         },
                     )
@@ -3191,6 +3207,10 @@ async fn serve_peer_loop(
     let mut peer_services = 0u64;
     let mut compact_block_version = 2u64;
     let mut pending_compact = None;
+    // Core remembers a failed compact-block reconstruction until the
+    // corresponding full block arrives. A second blocktxn response for that
+    // attempt is a protocol error and disconnects the peer.
+    let mut compact_reconstruction_failed = None;
     let peer_timeout = Duration::from_secs(node.config.peer_timeout_secs);
     let mut ping_interval = tokio::time::interval(Duration::from_secs(120));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -3342,15 +3362,13 @@ async fn serve_peer_loop(
                 }
                 if take_deferred_block_relay(peer_state) {
                     let tip = node.chain.read().best_hash();
-                    send_message(
+                    send_block_relay_announcement(
                         node,
                         peer_id,
                         writer,
+                        peer_state,
                         node.config.network,
-                        &Message::Inv(vec![Inventory {
-                            kind: block_request_inventory_type(peer_services),
-                            hash: tip,
-                        }]),
+                        tip,
                     )
                     .await?;
                 }
@@ -3384,7 +3402,18 @@ async fn serve_peer_loop(
                 }
                 let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER
                     .saturating_sub(node.peer_inflight_block_count(peer_id));
-                if available > 0 {
+                let peer_has_block_availability = node
+                    .peer_infos()
+                    .into_iter()
+                    .find(|peer| peer.id == peer_id)
+                    .and_then(|peer| peer.best_known_block)
+                    .is_some();
+                // Do not assign headers-first bodies to a peer that has not
+                // announced any block yet. Core waits for block availability
+                // before using a newly connected relay peer for download;
+                // otherwise test and relay-only peers can be mistaken for a
+                // source and later disconnected as stalled downloaders.
+                if available > 0 && peer_has_block_availability {
                     let schedule = node.next_block_download_schedule(
                         peer_id,
                         available,
@@ -3955,6 +3984,21 @@ async fn serve_peer_loop(
                         .last()
                         .and_then(|hash| chain.chain_work_by_hash(hash))
                         .is_some_and(|work| work > chain.tip().work);
+                    // Core uses a compact-block getdata request for a
+                    // single direct-fetch candidate when the peer has
+                    // advertised compact-block support.  Parallel sync and
+                    // multi-header downloads continue to request witness
+                    // full blocks.
+                    let request_compact = hashes.len() == 1
+                        && !node.config.blocksonly
+                        && peer_state.compact_block_version.lock().is_some()
+                        && chain.header(chain.height()).is_some_and(|header| {
+                            can_direct_fetch(
+                                header.time,
+                                crate::time::unix_time_i64(),
+                                chain.network.params().pow_target_spacing,
+                            )
+                        });
                     hashes
                         .into_iter()
                         .filter(|hash| {
@@ -3962,7 +4006,11 @@ async fn serve_peer_loop(
                                 && (request_candidate_bodies || chain.is_active_block(hash))
                         })
                         .map(|hash| Inventory {
-                            kind: block_request_inventory_type(peer_services),
+                            kind: if request_compact {
+                                InventoryType::CompactBlock
+                            } else {
+                                block_request_inventory_type(peer_services)
+                            },
                             hash,
                         })
                         .collect::<Vec<_>>()
@@ -4038,6 +4086,9 @@ async fn serve_peer_loop(
                             }
                             kind if kind.is_transaction() => {
                                 if initial_block_download {
+                                    return None;
+                                }
+                                if node.recently_rejected_transaction(item.hash) {
                                     return None;
                                 }
                                 if (wtxid_relay && item.kind == InventoryType::Transaction)
@@ -4418,11 +4469,27 @@ async fn serve_peer_loop(
             Message::Block(block) => {
                 let hash = block.header.block_hash();
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
+                let was_stored = node.chain.read().store.contains(&hash);
                 for transaction in &block.txdata {
                     forget_transaction_requests(peers, transaction);
                 }
                 if handle_received_block(node, peers, peer_id, block, requested, false).await {
+                    if compact_reconstruction_failed == Some(hash) {
+                        compact_reconstruction_failed = None;
+                    }
                     node.record_peer_block(peer_id, hash);
+                    if !was_stored {
+                        maybe_select_peer_bip152_highbandwidth(
+                            node,
+                            peers,
+                            peer_id,
+                            hash,
+                            peer_state,
+                            writer,
+                            node.config.network,
+                        )
+                        .await?;
+                    }
                 }
                 // Keep the completed request marked until after chain-event
                 // relays have observed the accepted block. This prevents a
@@ -4441,6 +4508,9 @@ async fn serve_peer_loop(
             Message::CompactBlock(compact) => {
                 let hash = compact.header.block_hash();
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
+                let (already_in_flight, block_requested_from_outbound) =
+                    node.compact_block_request_state(hash);
+                let peer_inflight_before = node.peer_inflight_block_count(peer_id);
                 let compact_work = {
                     let chain = node.chain.read();
                     compact_block_work_state(&compact, &chain)
@@ -4477,6 +4547,7 @@ async fn serve_peer_loop(
                     )
                 };
                 if !work_allowed {
+                    debug!("[net] Ignoring low-work compact block from peer {peer_id}");
                     continue;
                 }
                 if let Err(error) = node
@@ -4484,6 +4555,13 @@ async fn serve_peer_loop(
                     .write()
                     .accept_headers(std::slice::from_ref(&compact.header))
                 {
+                    // A header whose parent is already known to be invalid
+                    // is a peer protocol violation.  Re-announcing the
+                    // cached-invalid block itself is harmless and is handled
+                    // like Core's BLOCK_CACHED_INVALID path.
+                    if error.to_string().contains("has an invalidated parent") {
+                        anyhow::bail!("{error}");
+                    }
                     debug!(%hash, %error, "invalid compact block header");
                     continue;
                 }
@@ -4508,6 +4586,7 @@ async fn serve_peer_loop(
                         match complete_compact_block(&compact, transactions) {
                             Ok(block) => {
                                 let block_hash = block.block_hash();
+                                let was_stored = node.chain.read().store.contains(&block_hash);
                                 for transaction in &block.txdata {
                                     forget_transaction_requests(peers, transaction);
                                 }
@@ -4517,6 +4596,18 @@ async fn serve_peer_loop(
                                 .await
                                 {
                                     node.record_peer_block(peer_id, block_hash);
+                                    if !was_stored {
+                                        maybe_select_peer_bip152_highbandwidth(
+                                            node,
+                                            peers,
+                                            peer_id,
+                                            block_hash,
+                                            peer_state,
+                                            writer,
+                                            node.config.network,
+                                        )
+                                        .await?;
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -4533,6 +4624,22 @@ async fn serve_peer_loop(
                         }
                     }
                     Ok((transactions, missing)) => {
+                        let first_in_flight = already_in_flight == 0 || requested;
+                        let peer_is_inbound = node.peer_is_inbound(peer_id);
+                        let high_bandwidth = node.peer_bip152_highbandwidth_to(peer_id);
+                        let can_request = ((already_in_flight
+                            < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK
+                            && peer_inflight_before < MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+                            || requested)
+                            && (first_in_flight
+                                || (high_bandwidth
+                                    && (!peer_is_inbound
+                                        || block_requested_from_outbound
+                                        || already_in_flight
+                                            < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK - 1)));
+                        if !can_request || !node.track_peer_block_request(peer_id, hash) {
+                            continue;
+                        }
                         let request = BlockTransactionsRequest {
                             block_hash: hash,
                             indexes: missing.clone(),
@@ -4624,11 +4731,12 @@ async fn serve_peer_loop(
                 }
                 let Some(transactions) = requested_block_transactions(&block, &request.indexes)
                 else {
-                    // Core records this as peer misbehavior and returns without
-                    // sending a response. There is no score accumulator here,
-                    // so keep the connection alive and ignore the request.
-                    debug!("compact block transaction index is out of bounds");
-                    continue;
+                    // Core records this as peer misbehavior.  Disconnecting
+                    // here is the wallet-free equivalent of applying the
+                    // misbehavior score that reaches the disconnect limit for
+                    // this malformed request.
+                    debug!("getblocktxn with out-of-bounds tx indices");
+                    anyhow::bail!("getblocktxn with out-of-bounds tx indices");
                 };
                 send_message(
                     node,
@@ -4644,19 +4752,20 @@ async fn serve_peer_loop(
             }
             Message::BlockTxn(response) => {
                 let Some(mut pending) = pending_compact.take() else {
+                    if compact_reconstruction_failed == Some(response.block_hash) {
+                        debug!("previous compact block reconstruction attempt failed");
+                        anyhow::bail!("previous compact block reconstruction attempt failed");
+                    }
                     continue;
                 };
+                let pending_hash = pending.compact.header.block_hash();
+                node.clear_peer_block_request(peer_id, pending_hash);
                 if response.block_hash != pending.compact.header.block_hash()
                     || response.transactions.len() != pending.requested_indexes.len()
                 {
-                    request_full_block(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        pending.compact.header.block_hash(),
-                    )
-                    .await?;
+                    compact_reconstruction_failed = Some(pending_hash);
+                    request_full_block(node, peer_id, writer, node.config.network, pending_hash)
+                        .await?;
                     continue;
                 }
                 let mut valid = true;
@@ -4681,23 +4790,19 @@ async fn serve_peer_loop(
                     *slot = Some(transaction);
                 }
                 if !valid || pending.transactions.iter().any(Option::is_none) {
-                    request_full_block(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        pending.compact.header.block_hash(),
-                    )
-                    .await?;
+                    compact_reconstruction_failed = Some(pending_hash);
+                    request_full_block(node, peer_id, writer, node.config.network, pending_hash)
+                        .await?;
                     continue;
                 }
                 match complete_compact_block(&pending.compact, pending.transactions) {
                     Ok(block) => {
                         let block_hash = block.block_hash();
+                        let was_stored = node.chain.read().store.contains(&block_hash);
                         for transaction in &block.txdata {
                             forget_transaction_requests(peers, transaction);
                         }
-                        if handle_received_block(
+                        let accepted = handle_received_block(
                             node,
                             peers,
                             peer_id,
@@ -4705,16 +4810,48 @@ async fn serve_peer_loop(
                             pending.requested,
                             true,
                         )
-                        .await
-                        {
+                        .await;
+                        if accepted {
+                            if compact_reconstruction_failed == Some(block_hash) {
+                                compact_reconstruction_failed = None;
+                            }
                             node.record_peer_block(peer_id, block_hash);
+                            if !was_stored {
+                                maybe_select_peer_bip152_highbandwidth(
+                                    node,
+                                    peers,
+                                    peer_id,
+                                    block_hash,
+                                    peer_state,
+                                    writer,
+                                    node.config.network,
+                                )
+                                .await?;
+                            }
+                        } else {
+                            debug!(%block_hash, "invalid compact block completion");
+                            compact_reconstruction_failed = Some(block_hash);
+                            request_full_block(
+                                node,
+                                peer_id,
+                                writer,
+                                node.config.network,
+                                block_hash,
+                            )
+                            .await?;
                         }
                     }
                     Err(error) => {
-                        let hash = pending.compact.header.block_hash();
-                        debug!(%hash, %error, "invalid compact block completion");
-                        request_full_block(node, peer_id, writer, node.config.network, hash)
-                            .await?;
+                        debug!(%pending_hash, %error, "invalid compact block completion");
+                        compact_reconstruction_failed = Some(pending_hash);
+                        request_full_block(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            pending_hash,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -4883,7 +5020,12 @@ async fn serve_peer_loop(
                                     }
                                 }
                             }
-                            if !accepted_as_package {
+                            if !accepted_as_package
+                                && matches!(
+                                    error.downcast_ref::<MempoolError>(),
+                                    Some(MempoolError::MissingInput(_))
+                                )
+                            {
                                 remember_peer_package_transaction(peer_state, transaction.clone());
                             }
                         }
@@ -4940,7 +5082,7 @@ async fn serve_peer_loop(
                                 peer_state
                                     .tx_requests
                                     .lock()
-                                    .queue(parent, Instant::now() + delay)
+                                    .queue_force(parent, Instant::now() + delay)
                             } {
                                 flush_peer_transaction_requests(
                                     node,
@@ -5294,6 +5436,7 @@ async fn handle_received_block(
     match node.connect_block(block) {
         Ok(tip) => {
             info!(%hash, height = tip.height, "accepted peer block");
+            node.clear_peer_block_requests_for_hash(hash);
             node.update_peer_best_known_block(peer_id, hash);
             // Active-tip updates are announced by the chain-event relay. A
             // side-chain block has no tip event, so relay a newly accepted
@@ -5309,7 +5452,9 @@ async fn handle_received_block(
                     peer_id,
                     node.config.network,
                     Inventory {
-                        kind: InventoryType::WitnessBlock,
+                        // Block announcements use MSG_BLOCK in Core even for
+                        // peers that negotiated witness relay.
+                        kind: InventoryType::Block,
                         hash,
                     },
                 )
@@ -5318,6 +5463,14 @@ async fn handle_received_block(
             true
         }
         Err(error) => {
+            if error
+                .downcast_ref::<ValidationError>()
+                .is_some_and(ValidationError::should_mark_block_invalid)
+            {
+                if let Err(mark_error) = node.chain.write().mark_block_invalid(&hash) {
+                    debug!(%hash, %mark_error, "failed to cache invalid peer block");
+                }
+            }
             debug!(%hash, %error, "rejected peer block");
             false
         }
@@ -5396,6 +5549,51 @@ async fn request_full_block(
             kind: InventoryType::WitnessBlock,
             hash,
         }]),
+    )
+    .await
+}
+
+async fn maybe_select_peer_bip152_highbandwidth(
+    node: &Arc<Node>,
+    peers: &PeerRegistry,
+    peer_id: usize,
+    block_hash: BlockHash,
+    peer_state: &PeerState,
+    writer: &PeerWriter,
+    network: Network,
+) -> Result<()> {
+    let Some(version) = *peer_state.compact_block_version.lock() else {
+        return Ok(());
+    };
+    let Some(evicted_id) = node.select_peer_bip152_highbandwidth(peer_id, block_hash) else {
+        return Ok(());
+    };
+
+    if let Some(evicted_id) = evicted_id {
+        let evicted = peers.lock().get(&evicted_id).cloned();
+        if let Some(evicted) = evicted {
+            send_message(
+                node,
+                evicted_id,
+                &evicted.writer,
+                network,
+                &Message::SendCmpct {
+                    announce: false,
+                    version,
+                },
+            )
+            .await?;
+        }
+    }
+    send_message(
+        node,
+        peer_id,
+        writer,
+        network,
+        &Message::SendCmpct {
+            announce: true,
+            version,
+        },
     )
     .await
 }
@@ -6294,6 +6492,53 @@ async fn flush_peer_mempool_request(
     Ok(())
 }
 
+async fn send_block_relay_announcement(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    peer_state: &PeerState,
+    network: Network,
+    hash: BlockHash,
+) -> Result<()> {
+    let compact_version = *peer_state.compact_block_version.lock();
+    let announce_compact =
+        *peer_state.compact_block_announce.lock() || node.peer_bip152_highbandwidth_to(peer_id);
+    if announce_compact
+        && let Some(version) = compact_version
+        && let Some(compact) = compact_block_for_inventory(
+            node,
+            &Inventory {
+                kind: InventoryType::Block,
+                hash,
+            },
+            version,
+        )?
+    {
+        return send_message(
+            node,
+            peer_id,
+            writer,
+            network,
+            &Message::CompactBlock(compact),
+        )
+        .await;
+    }
+    // Core's ordinary delayed continuation announces the current tip with
+    // MSG_BLOCK. Witness selection applies to the subsequent block request,
+    // not to this relay inventory.
+    send_message(
+        node,
+        peer_id,
+        writer,
+        network,
+        &Message::Inv(vec![Inventory {
+            kind: InventoryType::Block,
+            hash,
+        }]),
+    )
+    .await
+}
+
 async fn broadcast_inventory_excluding(
     node: &Arc<Node>,
     peers: &PeerRegistry,
@@ -6328,7 +6573,7 @@ async fn broadcast_inventory_excluding(
         if matches!(
             item.kind,
             InventoryType::Block | InventoryType::WitnessBlock | InventoryType::CompactBlock
-        ) && (node.peer_inflight_block_count(peer_id) != 0 || block_relay_is_suppressed(&state))
+        ) && node.peer_inflight_block_count(peer_id) != 0
         {
             continue;
         }
@@ -6341,7 +6586,8 @@ async fn broadcast_inventory_excluding(
             InventoryType::Block | InventoryType::WitnessBlock | InventoryType::CompactBlock
         ) {
             let compact_version = *state.compact_block_version.lock();
-            let announce_compact = *state.compact_block_announce.lock();
+            let announce_compact =
+                *state.compact_block_announce.lock() || node.peer_bip152_highbandwidth_to(peer_id);
             if announce_compact
                 && let Some(version) = compact_version
                 && let Some(compact) = compact_block_for_inventory(node, &item, version)

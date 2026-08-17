@@ -94,6 +94,7 @@ const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const UNCONNECTED_PEER_ID: usize = usize::MAX;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
+const MAX_RECENTLY_REJECTED_TRANSACTIONS: usize = 4_096;
 const MAX_KNOWN_ADDRESSES: usize = 256_000;
 const ADDRMAN_SECRET_FILE: &str = "addrman.key";
 pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
@@ -267,6 +268,55 @@ fn run_alert_notify_command(command: Option<&str>, message: &str) {
 struct CompactExtraTransactions {
     limit: usize,
     transactions: VecDeque<Transaction>,
+}
+
+/// A bounded cache of transactions rejected by peer admission. Core uses the
+/// reject cache to avoid requesting the same low-fee or policy-invalid
+/// transaction from every announcing peer, while explicit orphan-parent
+/// requests can still bypass it.
+struct RecentlyRejectedTransactions {
+    hashes: HashSet<BlockHash>,
+    order: VecDeque<BlockHash>,
+}
+
+impl RecentlyRejectedTransactions {
+    fn new() -> Self {
+        Self {
+            hashes: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, transaction: &Transaction) {
+        for hash in [
+            BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
+            BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
+        ] {
+            if self.hashes.insert(hash) {
+                self.order.push_back(hash);
+            }
+        }
+        while self.order.len() > MAX_RECENTLY_REJECTED_TRANSACTIONS.saturating_mul(2) {
+            if let Some(hash) = self.order.pop_front() {
+                self.hashes.remove(&hash);
+            }
+        }
+    }
+
+    fn remove(&mut self, transaction: &Transaction) {
+        for hash in [
+            BlockHash::from_raw_hash(transaction.compute_txid().to_raw_hash()),
+            BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
+        ] {
+            if self.hashes.remove(&hash) {
+                self.order.retain(|queued| *queued != hash);
+            }
+        }
+    }
+
+    fn contains(&self, hash: BlockHash) -> bool {
+        self.hashes.contains(&hash)
+    }
 }
 
 /// Transactions disconnected during a normal reorg are queued in Core's
@@ -1080,6 +1130,7 @@ pub struct Node {
     pub(crate) electrum_peers: parking_lot::Mutex<electrum::ElectrumPeerRegistry>,
     private_broadcasts: parking_lot::Mutex<HashMap<Wtxid, PrivateBroadcastEntry>>,
     compact_extra_transactions: parking_lot::Mutex<CompactExtraTransactions>,
+    recently_rejected_transactions: parking_lot::Mutex<RecentlyRejectedTransactions>,
     orphans: parking_lot::Mutex<OrphanPool>,
     addrman_key: [u8; 32],
     known_addresses: parking_lot::RwLock<HashMap<SocketAddr, PeerInfo>>,
@@ -1454,6 +1505,9 @@ impl Node {
             compact_extra_transactions: parking_lot::Mutex::new(CompactExtraTransactions::new(
                 compact_extra_limit,
             )),
+            recently_rejected_transactions: parking_lot::Mutex::new(
+                RecentlyRejectedTransactions::new(),
+            ),
             orphans: parking_lot::Mutex::new(OrphanPool::default()),
             addrman_key,
             known_addresses: parking_lot::RwLock::new(known_addresses),
@@ -2152,7 +2206,10 @@ impl Node {
                 Err(error.into())
             }
             Err(error) => {
-                self.add_compact_extra_transaction(transaction);
+                self.add_compact_extra_transaction(transaction.clone());
+                self.recently_rejected_transactions
+                    .lock()
+                    .insert(&transaction);
                 Err(error.into())
             }
         }
@@ -2174,7 +2231,16 @@ impl Node {
             let changes = mempool.take_changes();
             (result, changes, chain.height())
         };
-        let txids = result?;
+        let txids = match result {
+            Ok(txids) => txids,
+            Err(error) => {
+                let mut rejected = self.recently_rejected_transactions.lock();
+                for transaction in transactions {
+                    rejected.insert(transaction);
+                }
+                return Err(error.into());
+            }
+        };
         self.update_fee_estimator_for_changes(&changes, current_height);
         let removed_ids = changes
             .iter()
@@ -2201,6 +2267,9 @@ impl Node {
             }
         }
         for transaction in transactions {
+            self.recently_rejected_transactions
+                .lock()
+                .remove(transaction);
             self.notify_mempool_transaction_from_peer(transaction.clone(), peer_id);
         }
         Ok(txids)
@@ -2212,6 +2281,10 @@ impl Node {
 
     pub(crate) fn compact_extra_transactions(&self) -> Vec<Transaction> {
         self.compact_extra_transactions.lock().snapshot()
+    }
+
+    pub(crate) fn recently_rejected_transaction(&self, hash: BlockHash) -> bool {
+        self.recently_rejected_transactions.lock().contains(hash)
     }
 
     pub fn orphan_count(&self) -> usize {
@@ -2996,6 +3069,64 @@ impl Node {
         }
     }
 
+    /// Select a peer for BIP152 high-bandwidth announcements after it has
+    /// supplied a valid active-chain block. Core keeps at most three such
+    /// peers and prefers retaining an outbound peer when replacing an
+    /// inbound one.
+    pub(crate) fn select_peer_bip152_highbandwidth(
+        &self,
+        peer_id: usize,
+        block_hash: BlockHash,
+    ) -> Option<Option<usize>> {
+        let chain = self.chain.read();
+        if self.config.blocksonly
+            || chain.is_initial_block_download()
+            || !chain.is_active_block(&block_hash)
+        {
+            return None;
+        }
+        drop(chain);
+
+        let mut peers = self.peers.write();
+        let candidate = peers.get(&peer_id)?;
+        let candidate_inbound = candidate.inbound;
+        if candidate.bip152_highbandwidth_to {
+            return None;
+        }
+
+        let high_bandwidth = peers
+            .values()
+            .filter(|peer| peer.bip152_highbandwidth_to)
+            .collect::<Vec<_>>();
+        let evicted = if high_bandwidth.len() < 3 {
+            None
+        } else {
+            let outbound_count = high_bandwidth.iter().filter(|peer| !peer.inbound).count();
+            high_bandwidth
+                .iter()
+                .filter(|peer| !(candidate_inbound && outbound_count == 1 && !peer.inbound))
+                .min_by_key(|peer| (peer.connected_at, peer.id))
+                .map(|peer| peer.id)
+        };
+
+        if let Some(evicted_id) = evicted {
+            if let Some(peer) = peers.get_mut(&evicted_id) {
+                peer.bip152_highbandwidth_to = false;
+            }
+        }
+        if let Some(peer) = peers.get_mut(&peer_id) {
+            peer.bip152_highbandwidth_to = true;
+        }
+        Some(evicted)
+    }
+
+    pub(crate) fn peer_bip152_highbandwidth_to(&self, peer_id: usize) -> bool {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .is_some_and(|peer| peer.bip152_highbandwidth_to)
+    }
+
     pub(crate) fn update_peer_reported_local_address(
         &self,
         peer_id: usize,
@@ -3034,6 +3165,30 @@ impl Node {
             .read()
             .get(&peer_id)
             .map_or(0, |peer| peer.inflight_blocks.len())
+    }
+
+    pub(crate) fn compact_block_request_state(&self, hash: BlockHash) -> (usize, bool) {
+        let peers = self.peers.read();
+        let mut count = 0;
+        let mut outbound_request = false;
+        for peer in peers.values() {
+            if peer
+                .inflight_blocks
+                .iter()
+                .any(|inflight| inflight.hash == hash)
+            {
+                count += 1;
+                outbound_request |= !peer.inbound;
+            }
+        }
+        (count, outbound_request)
+    }
+
+    pub(crate) fn peer_is_inbound(&self, peer_id: usize) -> bool {
+        self.peers
+            .read()
+            .get(&peer_id)
+            .is_some_and(|peer| peer.inbound)
     }
 
     pub(crate) fn peer_has_inflight_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
@@ -3219,7 +3374,7 @@ impl Node {
         self.block_stalling_since.write().remove(&peer_id);
     }
 
-    fn clear_peer_block_requests_for_hash(&self, hash: BlockHash) {
+    pub(crate) fn clear_peer_block_requests_for_hash(&self, hash: BlockHash) {
         let mut cleared_peers = Vec::new();
         {
             let mut peers = self.peers.write();

@@ -2541,6 +2541,20 @@ impl ChainState {
         Ok(self.tip())
     }
 
+    /// Cache a consensus-invalid block discovered while processing a peer
+    /// body.  Core keeps the header in the block index but marks it failed so
+    /// that a later child header is rejected without re-running validation.
+    /// Mutation failures are filtered by the caller before reaching this
+    /// method.
+    pub fn mark_block_invalid(&mut self, hash: &BlockHash) -> Result<()> {
+        if self.block_index.contains_key(hash) {
+            if self.invalid_blocks.insert(*hash) {
+                self.persist_metadata()?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn reconsider_block(&mut self, hash: &BlockHash) -> Result<ChainTip> {
         self.block_index
             .get(hash)

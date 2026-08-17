@@ -2047,6 +2047,7 @@ async fn run_i2p_listener(
                             outbound: false,
                             transport_v2,
                             connection_type: "inbound",
+                            manual: false,
                             permissions: None,
                             private_broadcast_transaction: None,
                         },
@@ -2123,7 +2124,11 @@ async fn run_inbound_listener(
             Some(permissions) => node.is_banned_for_permissions(address, permissions),
             None => node.is_banned_for_peer(address, true),
         };
-        if !node.network_active() || banned {
+        if !node.network_active() {
+            continue;
+        }
+        if banned {
+            peer_log!(node, debug, address, "dropped (banned)");
             continue;
         }
         let node = node.clone();
@@ -2149,6 +2154,7 @@ async fn run_inbound_listener(
                     outbound: false,
                     transport_v2,
                     connection_type: "inbound",
+                    manual: false,
                     permissions,
                     private_broadcast_transaction: None,
                 },
@@ -2262,6 +2268,7 @@ fn spawn_outbound_loop(
                             outbound: true,
                             transport_v2,
                             connection_type,
+                            manual,
                             permissions: None,
                             private_broadcast_transaction: None,
                         },
@@ -2271,6 +2278,7 @@ fn spawn_outbound_loop(
                     .await
                     {
                         peer_log!(node, debug, endpoint, error, "outbound peer ended");
+                        debug!("Cleared nodestate for peer={peer_id}");
                     }
                     if !persistent {
                         return;
@@ -2364,6 +2372,7 @@ fn spawn_private_broadcast_loop(
                         outbound: true,
                         transport_v2: (!node.config.v2_transport).then_some(false),
                         connection_type: "private-broadcast",
+                        manual: false,
                         permissions: None,
                         private_broadcast_transaction: Some(transaction),
                     },
@@ -2955,6 +2964,10 @@ async fn establish_transport(
         }
     }
 
+    if transport_v2 == Some(false) {
+        return establish_v1(stream);
+    }
+
     let mut prefix = [0u8; 16];
     let mut received = 0;
     while received < prefix.len() {
@@ -3076,6 +3089,7 @@ struct PeerConnectionOptions {
     outbound: bool,
     transport_v2: Option<bool>,
     connection_type: &'static str,
+    manual: bool,
     permissions: Option<PeerPermissions>,
     private_broadcast_transaction: Option<Transaction>,
 }
@@ -3130,6 +3144,7 @@ async fn serve_peer(
             local_address,
             permissions,
             connection_type: options.connection_type,
+            manual: options.manual,
         },
     );
     node.set_peer_transport_protocol(peer_id, transport_v2);
@@ -3187,6 +3202,7 @@ async fn serve_peer(
     )
     .await;
     peers.lock().remove(&peer_id);
+    debug!("Cleared nodestate for peer={peer_id}");
     node.unregister_peer(peer_id);
     result
 }
@@ -3283,14 +3299,23 @@ async fn serve_peer_loop(
         version.sender_services &= !wire::NODE_COMPACT_FILTERS;
     }
     version.relay = peer_state.local_relay_transactions;
-    send_message(
-        node,
-        peer_id,
-        writer,
-        node.config.network,
-        &Message::Version(version),
-    )
-    .await?;
+    // Core leaves a newly accepted v1 peer unversioned until the remote side
+    // speaks first.  Besides matching getpeerinfo's zero-valued handshake
+    // fields, this avoids emitting a VERSION packet for a peer that is only
+    // being inspected and then immediately disconnected.
+    let local_version = version.clone();
+    let mut local_version_sent = false;
+    if outbound || peer_state.connection_type == "private-broadcast" {
+        send_message(
+            node,
+            peer_id,
+            writer,
+            node.config.network,
+            &Message::Version(local_version.clone()),
+        )
+        .await?;
+        local_version_sent = true;
+    }
     let mut version_received = false;
     let mut verack_received = false;
     let mut verack_sent = false;
@@ -3408,6 +3433,9 @@ async fn serve_peer_loop(
                     node.record_bytes_received(peer_id, bytes, crate::P2P_MESSAGE_TYPE_OTHER);
                     continue;
                 };
+                if matches!(&message, Message::Unknown { .. }) {
+                    debug!("received: {}", message.command());
+                }
                 node.record_bytes_received(peer_id, bytes, message.command());
                 node.capture_message(peer_id, true, &message)?;
                 if let Message::GetData(items) = message {
@@ -3618,6 +3646,17 @@ async fn serve_peer_loop(
             Message::Version(version) => {
                 if version_received {
                     continue;
+                }
+                if !local_version_sent {
+                    send_message(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &Message::Version(local_version.clone()),
+                    )
+                    .await?;
+                    local_version_sent = true;
                 }
                 version_received = true;
                 if version.version < MIN_PEER_PROTO_VERSION {
@@ -6288,10 +6327,13 @@ async fn maybe_send_fee_filter(
         return Ok(());
     };
     let rounded_relay_fee = rounded_fee_filter(raw_relay_fee, incremental_relay_fee);
-    let relay_fee = if initial_block_download {
+    let relay_floor = i64::try_from(min_relay_fee).unwrap_or(i64::MAX);
+    let relay_fee = if raw_relay_fee <= relay_floor {
+        relay_floor
+    } else if initial_block_download {
         rounded_relay_fee
     } else {
-        rounded_relay_fee.max(i64::try_from(min_relay_fee).unwrap_or(i64::MAX))
+        rounded_relay_fee.max(relay_floor)
     };
 
     let now = Instant::now();
@@ -7842,6 +7884,7 @@ mod tests {
                 outbound: true,
                 transport_v2: Some(false),
                 connection_type: "private-broadcast",
+                manual: false,
                 permissions: None,
                 private_broadcast_transaction: Some(transaction),
             },
@@ -7856,6 +7899,7 @@ mod tests {
                 outbound: false,
                 transport_v2: Some(false),
                 connection_type: "inbound",
+                manual: false,
                 permissions: None,
                 private_broadcast_transaction: None,
             },
@@ -7916,6 +7960,7 @@ mod tests {
                 outbound: false,
                 transport_v2: Some(false),
                 connection_type: "inbound",
+                manual: false,
                 permissions: None,
                 private_broadcast_transaction: None,
             },
@@ -7999,6 +8044,7 @@ mod tests {
                 outbound: false,
                 transport_v2: Some(false),
                 connection_type: "inbound",
+                manual: false,
                 permissions: None,
                 private_broadcast_transaction: None,
             },

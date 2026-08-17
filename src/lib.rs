@@ -66,7 +66,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bitcoin::consensus::encode::deserialize;
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, Txid, Wtxid};
 use fs2::FileExt;
 use parking_lot::{Mutex, RwLock};
@@ -74,9 +74,9 @@ use rand::random;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, oneshot};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::address::NetworkEndpoint;
+use crate::address::{NetworkEndpoint, is_core_routable_ip};
 use crate::asmap::AsMap;
 use crate::chain::ChainState;
 use crate::config::{
@@ -96,8 +96,107 @@ const MAX_ORPHANAGE_LATENCY_SCORE: usize = 3_000;
 const RESERVED_ORPHAN_WEIGHT_PER_PEER: u64 = 404_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
 const MAX_RECENTLY_REJECTED_TRANSACTIONS: usize = 4_096;
-const MAX_KNOWN_ADDRESSES: usize = 256_000;
+// Core's AddrMan stores at most 10,000 entries across its new and tried
+// tables. Keep the same bound for both the legacy IP table and BIP155 table.
+const MAX_KNOWN_ADDRESSES: usize = 10_000;
+const ADDRMAN_TRIED_BUCKET_COUNT: usize = 256;
+const ADDRMAN_BUCKET_SIZE: usize = 64;
 const ADDRMAN_SECRET_FILE: &str = "addrman.key";
+
+fn addrman_append_compact_size(input: &mut Vec<u8>, value: usize) {
+    let value = u64::try_from(value).expect("address-manager vector length fits u64");
+    if value <= 252 {
+        input.push(value as u8);
+    } else if value <= u64::from(u16::MAX) {
+        input.push(253);
+        input.extend_from_slice(&(value as u16).to_le_bytes());
+    } else if value <= u64::from(u32::MAX) {
+        input.push(254);
+        input.extend_from_slice(&(value as u32).to_le_bytes());
+    } else {
+        input.push(255);
+        input.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn addrman_hash<F>(key: &[u8; 32], append: F) -> u64
+where
+    F: FnOnce(&mut Vec<u8>),
+{
+    let mut input = key.to_vec();
+    append(&mut input);
+    let digest = sha256d::Hash::hash(&input).to_byte_array();
+    u64::from_le_bytes(digest[..8].try_into().expect("hash has eight-byte prefix"))
+}
+
+fn addrman_endpoint_key(endpoint: &NetworkEndpoint) -> Vec<u8> {
+    let mut key = match endpoint {
+        NetworkEndpoint::Ip(address) => match address.ip() {
+            IpAddr::V4(address) => {
+                let mut key = vec![0; 10];
+                key.extend_from_slice(&[0xff, 0xff]);
+                key.extend_from_slice(&address.octets());
+                key
+            }
+            IpAddr::V6(address) => address.octets().to_vec(),
+        },
+        NetworkEndpoint::Dns { host, .. } => host.as_bytes().to_vec(),
+        NetworkEndpoint::OnionV2 { address, .. } => address.to_vec(),
+        NetworkEndpoint::OnionV3 { address, .. } => address.to_vec(),
+        NetworkEndpoint::I2p { address, .. } => address.to_vec(),
+        NetworkEndpoint::Cjdns { address, .. } => address.octets().to_vec(),
+    };
+    key.extend_from_slice(&endpoint.port().to_be_bytes());
+    key
+}
+
+fn addrman_group(endpoint: &NetworkEndpoint) -> Vec<u8> {
+    match endpoint {
+        NetworkEndpoint::Ip(address) => match address.ip() {
+            IpAddr::V4(address) => vec![1, address.octets()[0], address.octets()[1]],
+            IpAddr::V6(address) => {
+                let octets = address.octets();
+                vec![2, octets[0], octets[1], octets[2], octets[3]]
+            }
+        },
+        NetworkEndpoint::Cjdns { address, .. } => {
+            let octets = address.octets();
+            vec![5, octets[0], octets[1] | 0x0f]
+        }
+        NetworkEndpoint::Dns { host, .. } => {
+            let digest = bitcoin::hashes::sha256::Hash::hash(host.to_ascii_lowercase().as_bytes());
+            let mut group = vec![0];
+            group.extend_from_slice(&digest[..4]);
+            group
+        }
+        NetworkEndpoint::OnionV2 { address, .. } => vec![3, address[0] | 0x0f],
+        NetworkEndpoint::OnionV3 { address, .. } => vec![3, address[0] | 0x0f],
+        NetworkEndpoint::I2p { address, .. } => vec![4, address[0] | 0x0f],
+    }
+}
+
+fn addrman_tried_slot(key: &[u8; 32], endpoint: &NetworkEndpoint) -> (usize, usize) {
+    let endpoint_key = addrman_endpoint_key(endpoint);
+    let endpoint_group = addrman_group(endpoint);
+    let hash1 = addrman_hash(key, |input| {
+        addrman_append_compact_size(input, endpoint_key.len());
+        input.extend_from_slice(&endpoint_key);
+    });
+    let bucket = addrman_hash(key, |input| {
+        addrman_append_compact_size(input, endpoint_group.len());
+        input.extend_from_slice(&endpoint_group);
+        input.extend_from_slice(&(hash1 % 8).to_le_bytes());
+    }) as usize
+        % ADDRMAN_TRIED_BUCKET_COUNT;
+    let position = addrman_hash(key, |input| {
+        input.push(b'K');
+        input.extend_from_slice(&(bucket as i32).to_le_bytes());
+        addrman_append_compact_size(input, endpoint_key.len());
+        input.extend_from_slice(&endpoint_key);
+    }) as usize
+        % ADDRMAN_BUCKET_SIZE;
+    (bucket, position)
+}
 pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
 const BLOCK_STALLING_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
 const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
@@ -1032,6 +1131,7 @@ pub struct PeerInfo {
     pub ping_time: Option<f64>,
     pub min_ping: Option<f64>,
     pub connection_type: &'static str,
+    pub manual: bool,
     addr_token_bucket: f64,
     addr_token_timestamp: Instant,
     ping_nonce: Option<u64>,
@@ -1042,6 +1142,7 @@ pub(crate) struct PeerRegistrationOptions {
     pub(crate) local_address: Option<SocketAddr>,
     pub(crate) permissions: PeerPermissions,
     pub(crate) connection_type: &'static str,
+    pub(crate) manual: bool,
 }
 
 /// Address-manager metadata for an endpoint that may not be connected yet.
@@ -1316,6 +1417,7 @@ pub struct Node {
     pub(crate) i2p_sam: Option<Arc<i2p::I2pSam>>,
     pub(crate) tor_controller: Option<Arc<tor::TorController>>,
     mempool_path: std::path::PathBuf,
+    peers_dat_created: bool,
     /// Serialize RPC mining operations so a block template cannot become
     /// stale between reading the active tip and connecting the mined block.
     pub(crate) mining_lock: Mutex<()>,
@@ -1391,7 +1493,13 @@ impl Node {
                 config.datadir.display()
             )
         })?;
-        let addrman_key = load_addrman_key(&config.datadir)?;
+        let mut addrman_key = load_addrman_key(&config.datadir)?;
+        let deterministic_addrman = std::env::args()
+            .any(|argument| argument == "-test=addrman" || argument == "--test=addrman");
+        if deterministic_addrman {
+            addrman_key = [0; 32];
+            addrman_key[0] = 1;
+        }
         let blocks_dir = config
             .blocks_dir
             .clone()
@@ -1626,6 +1734,19 @@ impl Node {
             }
         };
         let peers_path = config.datadir.join("peers.json");
+        let peers_dat_path = config
+            .datadir
+            .join(network_data_dir_name(config.network))
+            .join("peers.dat");
+        let peers_dat_missing = !peers_dat_path.exists();
+        if peers_dat_missing {
+            info!(
+                "Creating peers.dat because the file was not found (\"{}\")",
+                peers_dat_path.display()
+            );
+            fs::write(&peers_dat_path, [])
+                .with_context(|| format!("creating {}", peers_dat_path.display()))?;
+        }
         let (
             known_addresses,
             tried_addresses,
@@ -1633,7 +1754,14 @@ impl Node {
             network_tried_addresses,
             network_address_sources,
         ) = match load_known_addresses(&config.datadir) {
-            Ok(state) => state,
+            Ok(state) if !peers_dat_missing => state,
+            Ok(_) => (
+                HashMap::new(),
+                HashSet::new(),
+                HashMap::new(),
+                HashSet::new(),
+                HashMap::new(),
+            ),
             Err(error) => {
                 quarantine_persistent_file(&peers_path, &error);
                 (
@@ -1666,7 +1794,10 @@ impl Node {
                 }
                 Ok::<String, anyhow::Error>(cookie)
             })
-            .transpose()?;
+            .transpose()
+            .map_err(|_| {
+                anyhow::anyhow!("Unable to start HTTP server. See debug log for details.")
+            })?;
         let compact_extra_limit = config.block_reconstruction_extra_txn;
         let rpc_logging = if config.logging.debug_all {
             crate::config::CORE_LOG_CATEGORIES
@@ -1693,6 +1824,7 @@ impl Node {
             i2p_sam,
             tor_controller,
             mempool_path,
+            peers_dat_created: peers_dat_missing,
             mining_lock: Mutex::new(()),
             peer_count: AtomicUsize::new(0),
             mempool_check_operations: AtomicUsize::new(0),
@@ -3943,6 +4075,7 @@ impl Node {
     }
 
     pub fn set_network_active(&self, active: bool) {
+        info!("SetNetworkActive: {active}");
         self.network_active.store(active, Ordering::Relaxed);
         if !active {
             self.disconnect_all_peers();
@@ -3966,8 +4099,19 @@ impl Node {
                 local_address: None,
                 permissions: PeerPermissions::empty(),
                 connection_type: if inbound { "inbound" } else { "outbound-full" },
+                manual: false,
             },
         );
+        // The production registration path deliberately excludes unroutable
+        // sockets from AddrMan. Keep this test-only convenience helper's
+        // historical behavior for unit tests that inspect the connected
+        // peer's address after disconnecting it.
+        if !is_core_routable_ip(address.ip())
+            && let Some(peer) = self.peers.read().get(&id).cloned()
+        {
+            self.known_addresses.write().insert(address, peer);
+            self.tried_addresses.write().insert(address);
+        }
     }
 
     pub(crate) fn register_peer_with_endpoint(
@@ -3982,6 +4126,7 @@ impl Node {
             local_address,
             permissions,
             connection_type,
+            manual,
         } = options;
         let address = endpoint.peer_socket_addr();
         let connected_at = time::unix_time();
@@ -4002,6 +4147,7 @@ impl Node {
             transport_protocol_type: "v1",
             session_id: String::new(),
             connection_type,
+            manual,
             connected_at,
             last_send: 0,
             last_recv: 0,
@@ -4033,9 +4179,15 @@ impl Node {
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
-        if connection_type != "private-broadcast"
-            && !matches!(endpoint, NetworkEndpoint::Dns { .. })
-        {
+        let endpoint_is_addrman_candidate = match &endpoint {
+            NetworkEndpoint::Ip(address) => is_core_routable_ip(address.ip()),
+            NetworkEndpoint::Dns { .. } => false,
+            NetworkEndpoint::OnionV2 { .. }
+            | NetworkEndpoint::OnionV3 { .. }
+            | NetworkEndpoint::I2p { .. }
+            | NetworkEndpoint::Cjdns { .. } => true,
+        };
+        if connection_type != "private-broadcast" && endpoint_is_addrman_candidate {
             if let Some(address) = endpoint.legacy_socket_addr() {
                 let mut known = self.known_addresses.write();
                 if self.reserve_known_address(&mut known, address) {
@@ -4341,6 +4493,7 @@ impl Node {
 
     pub fn unregister_peer(&self, id: usize) {
         let endpoint = self.peers.write().remove(&id).map(|peer| peer.endpoint);
+        debug!("Cleared nodestate for peer={id}");
         self.peer_commands.write().remove(&id);
         let replacement = self.release_headers_sync_peer(id);
         self.inv_triggered_headers_sync.lock().remove(&id);
@@ -4454,6 +4607,52 @@ impl Node {
         }
     }
 
+    pub(crate) fn promote_network_address_to_tried(&self, endpoint: &NetworkEndpoint) -> bool {
+        let target_slot = addrman_tried_slot(&self.addrman_key, endpoint);
+        let occupied = match endpoint.legacy_socket_addr() {
+            Some(address) => {
+                let tried = self.tried_addresses.read();
+                self.known_addresses.read().keys().any(|candidate| {
+                    *candidate != address
+                        && tried.contains(candidate)
+                        && addrman_tried_slot(
+                            &self.addrman_key,
+                            &NetworkEndpoint::from_socket(*candidate),
+                        ) == target_slot
+                })
+            }
+            None => {
+                let tried = self.network_tried_addresses.read();
+                self.network_addresses.read().keys().any(|candidate| {
+                    candidate != endpoint
+                        && tried.contains(candidate)
+                        && addrman_tried_slot(&self.addrman_key, candidate) == target_slot
+                })
+            }
+        };
+        if occupied {
+            return false;
+        }
+        match endpoint.legacy_socket_addr() {
+            Some(address) => {
+                if !self.known_addresses.read().contains_key(&address) {
+                    return false;
+                }
+                self.tried_addresses.write().insert(address);
+            }
+            None => {
+                if !self.network_addresses.read().contains_key(endpoint) {
+                    return false;
+                }
+                self.network_tried_addresses
+                    .write()
+                    .insert(endpoint.clone());
+            }
+        }
+        self.maybe_check_addrman();
+        true
+    }
+
     pub(crate) fn add_network_address(&self, endpoint: NetworkEndpoint, tried: bool) -> bool {
         if matches!(endpoint, NetworkEndpoint::Dns { .. }) {
             return false;
@@ -4461,31 +4660,33 @@ impl Node {
         if !self.config.allows_network_endpoint(&endpoint) {
             return false;
         }
-        if let Some(address) = endpoint.legacy_socket_addr() {
-            return self.add_peer_address(address, tried);
-        }
-        let now = unix_time_seconds();
-        let mut known = self.network_addresses.write();
-        if known.contains_key(&endpoint) || !self.reserve_network_address(&mut known, &endpoint) {
+        let added = if let Some(address) = endpoint.legacy_socket_addr() {
+            self.add_peer_address(address, false)
+        } else {
+            let now = unix_time_seconds();
+            let mut known = self.network_addresses.write();
+            if known.contains_key(&endpoint) || !self.reserve_network_address(&mut known, &endpoint)
+            {
+                false
+            } else {
+                known.insert(
+                    endpoint.clone(),
+                    KnownNetworkAddress {
+                        endpoint: endpoint.clone(),
+                        services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+                        time: now,
+                    },
+                );
+                drop(known);
+                self.remember_network_address_source(&endpoint, &endpoint);
+                self.maybe_check_addrman();
+                true
+            }
+        };
+        if !added {
             return false;
         }
-        known.insert(
-            endpoint.clone(),
-            KnownNetworkAddress {
-                endpoint: endpoint.clone(),
-                services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
-                time: now,
-            },
-        );
-        drop(known);
-        if tried {
-            self.network_tried_addresses
-                .write()
-                .insert(endpoint.clone());
-        }
-        self.remember_network_address_source(&endpoint, &endpoint);
-        self.maybe_check_addrman();
-        true
+        !tried || self.promote_network_address_to_tried(&endpoint)
     }
 
     pub(crate) fn remember_network_address(
@@ -4563,6 +4764,7 @@ impl Node {
                 transport_protocol_type: "v1",
                 session_id: String::new(),
                 connection_type: "outbound-full",
+                manual: false,
                 connected_at: now,
                 last_send: now,
                 last_recv: now,
@@ -4630,6 +4832,7 @@ impl Node {
             transport_protocol_type: "v1",
             session_id: String::new(),
             connection_type: "outbound-full",
+            manual: false,
             connected_at: time,
             last_send: time,
             last_recv: time,
@@ -4932,10 +5135,10 @@ impl Node {
             .read()
             .get(&peer_id)
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("peer {peer_id} is not connected"))?;
+            .ok_or_else(|| anyhow::anyhow!("Error: Could not send message to peer"))?;
         sender
             .send(p2p::PeerCommand::SendMessage { command, payload })
-            .map_err(|_| anyhow::anyhow!("peer {peer_id} disconnected"))
+            .map_err(|_| anyhow::anyhow!("Error: Could not send message to peer"))
     }
 
     pub fn ping_peers(&self) {
@@ -5159,6 +5362,17 @@ impl Node {
     ) -> Result<()> {
         let startup_services = 4 + usize::from(!self.config.ipc_bind.is_empty());
         let startup = startup_sender.map(|sender| StartupLatch::new(sender, startup_services));
+        if self.peers_dat_created {
+            let peers_dat_path = self
+                .config
+                .datadir
+                .join(network_data_dir_name(self.config.network))
+                .join("peers.dat");
+            info!(
+                "Creating peers.dat because the file was not found (\"{}\")",
+                peers_dat_path.display()
+            );
+        }
         let ipc = ipc::IpcServer::bind(self.clone()).await?;
         if ipc.is_some()
             && let Some(startup) = startup.as_ref()
@@ -5187,6 +5401,7 @@ impl Node {
         let mut p2p_task = tokio::spawn(p2p.run_with_startup(startup.clone()));
         let mut rpc_task = tokio::spawn(rpc.run_with_startup(startup.clone()));
         let mut electrum_task = tokio::spawn(electrum.run_with_startup(startup));
+        info!("init message: Done loading");
         run_notify_command(self.config.startup_notify.as_deref(), None);
         let background_node = self.clone();
         let background_validation_task = tokio::spawn(async move {
@@ -5680,6 +5895,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                         transport_protocol_type: "v1",
                         session_id: String::new(),
                         connection_type: "outbound-full",
+                        manual: false,
                         connected_at: entry.time,
                         last_send: entry.time,
                         last_recv: entry.time,
@@ -7282,6 +7498,7 @@ mod tests {
                 local_address: None,
                 permissions: PeerPermissions::empty(),
                 connection_type: "private-broadcast",
+                manual: false,
             },
         );
         node.update_peer_version(7, 70016, crate::wire::NODE_NETWORK, "/peer/", 1, true);

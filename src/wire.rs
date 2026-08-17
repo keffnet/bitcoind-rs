@@ -389,10 +389,15 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
                     let frame = std::mem::replace(&mut self.buffer, remainder);
                     return match decode_message(network, &frame) {
                         Ok(message) => Ok((Some(message), frame.len())),
-                        Err(_error) if frame_has_recoverable_error(network, &frame) => {
-                            Ok((None, frame.len()))
+                        Err(error) => {
+                            if let Some(message) = recoverable_payload_message(network, &frame) {
+                                Ok((Some(message), frame.len()))
+                            } else if frame_has_recoverable_error(network, &frame) {
+                                Ok((None, frame.len()))
+                            } else {
+                                Err(error)
+                            }
                         }
-                        Err(error) => Err(error),
                     };
                 }
             }
@@ -423,8 +428,15 @@ pub(crate) async fn read_message_with_size_allow_reject<R: AsyncRead + Unpin>(
     let (frame, size) = read_frame_with_size(reader).await?;
     match decode_message(network, &frame) {
         Ok(message) => Ok((Some(message), size)),
-        Err(_error) if frame_has_recoverable_error(network, &frame) => Ok((None, size)),
-        Err(error) => Err(error),
+        Err(error) => {
+            if let Some(message) = recoverable_payload_message(network, &frame) {
+                Ok((Some(message), size))
+            } else if frame_has_recoverable_error(network, &frame) {
+                Ok((None, size))
+            } else {
+                Err(error)
+            }
+        }
     }
 }
 
@@ -450,6 +462,20 @@ fn frame_has_recoverable_error(network: Network, frame: &[u8]) -> bool {
     let command_valid = decode_command(&frame[4..16]).is_ok();
     let checksum_valid = frame[20..24] == checksum(&frame[24..]);
     !command_valid || !checksum_valid
+}
+
+fn recoverable_payload_message(network: Network, frame: &[u8]) -> Option<Message> {
+    if frame.len() < HEADER_SIZE || frame[..4] != network_magic(network) {
+        return None;
+    }
+    let command = decode_command(&frame[4..16]).ok()?;
+    if frame[20..24] != checksum(&frame[24..]) || !matches!(command, "addr" | "addrv2") {
+        return None;
+    }
+    Some(Message::Unknown {
+        command: command.to_owned(),
+        payload: frame[24..].to_vec(),
+    })
 }
 
 pub async fn write_message<W: AsyncWrite + Unpin>(

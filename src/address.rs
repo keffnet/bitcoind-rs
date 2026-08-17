@@ -269,6 +269,9 @@ impl NetworkEndpoint {
             None => (value, default_port),
             Some(_) => bail!("invalid network address {value}"),
         };
+        if let Some(address) = parse_abbreviated_ipv4(host) {
+            return Ok(Self::from_socket(SocketAddr::new(address.into(), port)));
+        }
         let lower_host = host.to_ascii_lowercase();
         if lower_host.ends_with(".onion") {
             return parse_onion(&lower_host, port);
@@ -344,6 +347,34 @@ impl NetworkEndpoint {
             .without_port()
             .ok_or_else(|| anyhow!("invalid IP/Subnet"))
     }
+}
+
+fn parse_abbreviated_ipv4(value: &str) -> Option<Ipv4Addr> {
+    let components = value.split('.').collect::<Vec<_>>();
+    if !(1..=4).contains(&components.len()) {
+        return None;
+    }
+    let numbers = components
+        .iter()
+        .map(|component| component.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    let (address, valid) = match numbers.as_slice() {
+        [value] => (*value, *value <= u32::MAX),
+        [first, last] => (
+            (first << 24) | last,
+            *first <= u8::MAX as u32 && *last <= 0x00ff_ffff,
+        ),
+        [first, second, last] => (
+            (first << 24) | (second << 16) | last,
+            *first <= u8::MAX as u32 && *second <= u8::MAX as u32 && *last <= u16::MAX as u32,
+        ),
+        [first, second, third, last] => (
+            (first << 24) | (second << 16) | (third << 8) | last,
+            numbers.iter().all(|value| *value <= u8::MAX as u32),
+        ),
+        _ => return None,
+    };
+    valid.then(|| Ipv4Addr::from(address))
 }
 
 fn is_ipv4_mapped(address: &Ipv6Addr) -> bool {

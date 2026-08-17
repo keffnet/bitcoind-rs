@@ -1227,8 +1227,16 @@ pub struct Args {
     #[arg(long = "rpcpassword", value_name = "PASSWORD")]
     pub rpc_password: Option<String>,
 
-    #[arg(long = "rpcauth", value_name = "USER:SALT$HASH")]
+    #[arg(
+        long = "rpcauth",
+        value_name = "USER:SALT$HASH",
+        num_args = 0..=1,
+        default_missing_value = ""
+    )]
     pub rpc_auth: Vec<String>,
+
+    #[arg(long = "norpcauth", default_value_t = false)]
+    pub no_rpc_auth: bool,
 
     #[arg(long = "rpccookiefile", value_name = "PATH")]
     pub rpc_cookie_file: Option<PathBuf>,
@@ -2604,11 +2612,18 @@ impl Config {
                 SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], rpc.port())),
             ]
         };
-        let rpc_auth = parse_rpc_auth(
-            &args.rpc_auth,
-            args.rpc_user.as_deref(),
-            args.rpc_password.as_deref(),
-        )?;
+        let rpc_auth = if args.no_rpc_auth {
+            Vec::new()
+        } else {
+            parse_rpc_auth(
+                &args.rpc_auth,
+                args.rpc_user.as_deref(),
+                args.rpc_password.as_deref(),
+            )
+            .map_err(|_| {
+                anyhow::anyhow!("Unable to start HTTP server. See debug log for details.")
+            })?
+        };
         let rpc_server_timeout_secs = args.rpc_server_timeout.max(1);
         let rpc_threads = args.rpc_threads.max(1);
         let rpc_work_queue = args.rpc_work_queue.max(1);

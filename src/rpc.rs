@@ -38,7 +38,7 @@ use miniscript::{
 use rand::seq::SliceRandom;
 use serde::Deserialize;
 use serde::de::{MapAccess, SeqAccess, Visitor};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -49,7 +49,9 @@ use tracing::{debug, info, warn};
 
 use crate::address::NetworkEndpoint;
 use crate::chain;
-use crate::config::{OnlyNet, RpcAuth, core_network_blocks_dir, default_network_endpoint_port};
+use crate::config::{
+    OnlyNet, RpcAuth, core_network_blocks_dir, default_network_endpoint_port, network_data_dir_name,
+};
 use crate::fee_estimator::{EstimatorBucket, RawFeeEstimate};
 use crate::mempool::{
     MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool, MempoolError, MempoolLoadOptions,
@@ -1751,6 +1753,11 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
     };
     let mut values = vec![Value::Null; names.len()];
     let mut specified = vec![false; names.len()];
+    let combine_spending_options = method == "gettxspendingprevout"
+        && object
+            .get("args")
+            .and_then(Value::as_array)
+            .is_none_or(|args| args.len() <= 1);
     if let Some(args) = object.get("args") {
         let args = args
             .as_array()
@@ -1771,6 +1778,18 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
         let Some(index) = names.iter().position(|candidate| *candidate == lookup_name) else {
             bail!("Unknown named parameter {name}")
         };
+        if specified[index]
+            && combine_spending_options
+            && method == "gettxspendingprevout"
+            && index == 1
+            && values[index].is_object()
+        {
+            values[index]
+                .as_object_mut()
+                .expect("spending options are an object")
+                .insert(name.clone(), value.clone());
+            continue;
+        }
         if specified[index] {
             bail!("Parameter {name} specified twice both as positional and named argument")
         }
@@ -2366,7 +2385,11 @@ fn dispatch_method_for_user(
                         "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
                         "bytessent_per_msg": peer.bytes_sent_per_msg,
                         "bytesrecv_per_msg": peer.bytes_received_per_msg,
-                        "connection_type": rpc_connection_type(peer.connection_type),
+                        "connection_type": if peer.manual {
+                            "manual"
+                        } else {
+                            rpc_connection_type(peer.connection_type)
+                        },
                         "transport_protocol_type": peer.transport_protocol_type,
                         "session_id": peer.session_id,
                     });
@@ -2435,7 +2458,19 @@ fn dispatch_method_for_user(
             "startuptime": crate::time::unix_time()
                 .saturating_sub(node.started_at.elapsed().as_secs()),
         })),
-        "help" => Ok(json!(rpc_help(method_params_string(params)))),
+        "help" => {
+            let command = match params.get(0).filter(|value| !value.is_null()) {
+                None => "",
+                Some(value) => value
+                    .as_str()
+                    .ok_or_else(|| json_type_error(value, "string"))?,
+            };
+            if command == "dump_all_command_conversions" {
+                Ok(json!([]))
+            } else {
+                Ok(json!(rpc_help(command)))
+            }
+        }
         "format" => format_rpc_command(params),
         "estimatesmartfee" => estimate_smart_fee(node, params),
         "estimaterawfee" => estimate_raw_fee(node, params),
@@ -2600,10 +2635,13 @@ fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if node.config.blocksonly {
         bail!("Fee estimation disabled")
     }
-    let conf_target = params
+    let conf_target_value = params
         .get(0)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("conf_target must be a positive integer"))?;
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| anyhow!("estimatesmartfee"))?;
+    let conf_target = conf_target_value
+        .as_u64()
+        .ok_or_else(|| json_type_error(conf_target_value, "number"))?;
     let conf_target = u32::try_from(conf_target)
         .map_err(|_| anyhow!("conf_target must be between 1 and 1008"))?;
     if !(1..=1_008).contains(&conf_target) {
@@ -2618,7 +2656,7 @@ fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .map(|value| {
             value
                 .as_str()
-                .ok_or_else(|| anyhow!("estimate_mode must be a string"))
+                .ok_or_else(|| json_type_error(value, "string"))
         })
         .transpose()?
         .unwrap_or("UNSET")
@@ -2627,7 +2665,9 @@ fn estimate_smart_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
     {
         "UNSET" | "ECONOMICAL" => false,
         "CONSERVATIVE" => true,
-        _ => bail!("estimate_mode must be UNSET, ECONOMICAL, or CONSERVATIVE"),
+        _ => bail!(
+            "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\""
+        ),
     };
     let (estimate, returned_target) = node.estimate_smart_fee(conf_target, conservative);
     let estimate = estimate.map(|rate| {
@@ -2703,10 +2743,13 @@ fn estimate_raw_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if node.config.blocksonly {
         bail!("Fee estimation disabled")
     }
-    let conf_target = params
+    let conf_target_value = params
         .get(0)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("conf_target must be a positive integer"))?;
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| anyhow!("estimaterawfee"))?;
+    let conf_target = conf_target_value
+        .as_u64()
+        .ok_or_else(|| json_type_error(conf_target_value, "number"))?;
     let conf_target = u32::try_from(conf_target)
         .map_err(|_| anyhow!("Invalid conf_target, must be between 1 and 1008"))?;
     if !(1..=1_008).contains(&conf_target) {
@@ -2718,7 +2761,7 @@ fn estimate_raw_fee(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .map(|value| {
             value
                 .as_f64()
-                .ok_or_else(|| anyhow!("threshold must be a number"))
+                .ok_or_else(|| json_type_error(value, "number"))
         })
         .transpose()?
         .unwrap_or(0.95);
@@ -2756,8 +2799,8 @@ const LOG_CATEGORIES: &[&str] = &[
     "mempoolrej",
     "net",
     "privatebroadcast",
-    "prune",
     "proxy",
+    "prune",
     "qt",
     "rand",
     "reindex",
@@ -2803,12 +2846,11 @@ fn configure_logging(node: &Arc<Node>, params: &Value) -> Result<Value> {
             }
         }
     }
-    Ok(json!(
-        LOG_CATEGORIES
-            .iter()
-            .map(|category| ((*category).to_owned(), enabled.contains(*category)))
-            .collect::<HashMap<_, _>>()
-    ))
+    let mut result = serde_json::Map::new();
+    for category in LOG_CATEGORIES {
+        result.insert((*category).to_owned(), json!(enabled.contains(*category)));
+    }
+    Ok(Value::Object(result))
 }
 
 fn get_net_totals(node: &Arc<Node>) -> Result<Value> {
@@ -3196,15 +3238,222 @@ fn is_publicly_routable(ip: IpAddr) -> bool {
     }
 }
 
+fn validateaddress_bech32_error(
+    value: &str,
+    fallback: String,
+    network: Network,
+) -> (String, Vec<usize>) {
+    if fallback.to_ascii_lowercase().contains("padding") {
+        return (
+            "Invalid padding in Bech32 data section".to_owned(),
+            Vec::new(),
+        );
+    }
+    let expected_hrp = match network {
+        Network::Bitcoin => "bc",
+        Network::Regtest => "bcrt",
+        Network::Testnet | Network::Testnet4 | Network::Signet => "tb",
+    };
+    let Some(separator) = value.rfind('1') else {
+        return (fallback, Vec::new());
+    };
+    if !value[..separator].eq_ignore_ascii_case(expected_hrp) {
+        if fallback.starts_with("tried to parse an unknown hrp")
+            || fallback.starts_with("legacy address")
+            || fallback == "base58 error"
+        {
+            return (
+                "Invalid or unsupported Segwit (Bech32) or Base58 encoding.".to_owned(),
+                Vec::new(),
+            );
+        }
+        return (fallback, Vec::new());
+    }
+
+    let mut lower_seen = false;
+    let mut upper_seen = false;
+    let mut mixed_case_locations = Vec::new();
+    for (index, byte) in value.bytes().enumerate() {
+        if byte.is_ascii_lowercase() {
+            if upper_seen {
+                mixed_case_locations.push(index);
+            } else {
+                lower_seen = true;
+            }
+        } else if byte.is_ascii_uppercase() {
+            if lower_seen {
+                mixed_case_locations.push(index);
+            } else {
+                upper_seen = true;
+            }
+        } else if !(33..=126).contains(&byte) {
+            mixed_case_locations.push(index);
+        }
+    }
+    if !mixed_case_locations.is_empty() {
+        return (
+            "Invalid character or mixed case".to_owned(),
+            mixed_case_locations,
+        );
+    }
+
+    const CHARSET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    for (index, byte) in value.bytes().enumerate().skip(separator + 1) {
+        if !CHARSET.contains(&byte.to_ascii_lowercase()) {
+            return ("Invalid Base 32 character".to_owned(), vec![index]);
+        }
+    }
+
+    let Ok(unchecked) = bitcoin::bech32::primitives::decode::UncheckedHrpstring::new(value) else {
+        return (fallback, Vec::new());
+    };
+    let bech32_valid = unchecked.has_valid_checksum::<bitcoin::bech32::Bech32>();
+    let bech32m_valid = unchecked.has_valid_checksum::<bitcoin::bech32::Bech32m>();
+    let raw_version = unchecked
+        .data_part_ascii()
+        .first()
+        .and_then(|byte| {
+            bitcoin::bech32::Fe32::from_char((*byte as char).to_ascii_lowercase()).ok()
+        })
+        .map(|version| version.to_u8());
+    let data_symbols = unchecked.data_part_ascii().len().saturating_sub(6);
+
+    if data_symbols == 0 && (bech32_valid || bech32m_valid) {
+        return ("Empty Bech32 data section".to_owned(), Vec::new());
+    }
+    if let Some(version) = raw_version {
+        if version == 0 && !bech32_valid && bech32m_valid {
+            return (
+                "Version 0 witness address must use Bech32 checksum".to_owned(),
+                Vec::new(),
+            );
+        }
+        if version > 0 && bech32_valid && !bech32m_valid {
+            return (
+                "Version 1+ witness address must use Bech32m checksum".to_owned(),
+                Vec::new(),
+            );
+        }
+        if version > 16 && (bech32_valid || bech32m_valid) {
+            return (
+                "Invalid Bech32 address witness version".to_owned(),
+                Vec::new(),
+            );
+        }
+    }
+
+    let program = if bech32_valid || bech32m_valid {
+        let mut checked = if bech32_valid {
+            bitcoin::bech32::primitives::decode::UncheckedHrpstring::new(value)
+                .ok()
+                .and_then(|unchecked| {
+                    unchecked
+                        .validate_and_remove_checksum::<bitcoin::bech32::Bech32>()
+                        .ok()
+                })
+        } else {
+            bitcoin::bech32::primitives::decode::UncheckedHrpstring::new(value)
+                .ok()
+                .and_then(|unchecked| {
+                    unchecked
+                        .validate_and_remove_checksum::<bitcoin::bech32::Bech32m>()
+                        .ok()
+                })
+        };
+        checked.as_mut().and_then(|checked| {
+            let version = checked.remove_witness_version()?.to_u8();
+            let program = checked.byte_iter().collect::<Vec<_>>();
+            Some((version, program))
+        })
+    } else {
+        None
+    };
+    if let Some((version, program)) = program {
+        if version == 0 && !matches!(program.len(), 20 | 32) {
+            return (
+                format!(
+                    "Invalid Bech32 v0 address program size ({} {}), per BIP141",
+                    program.len(),
+                    if program.len() == 1 { "byte" } else { "bytes" }
+                ),
+                Vec::new(),
+            );
+        }
+        if version > 0
+            && !(version == 1 && matches!(program.len(), 2 | 32))
+            && !(2..=40).contains(&program.len())
+        {
+            return (
+                format!(
+                    "Invalid Bech32 address program size ({} {})",
+                    program.len(),
+                    if program.len() == 1 { "byte" } else { "bytes" }
+                ),
+                Vec::new(),
+            );
+        }
+        if let Err(error) = bitcoin::bech32::segwit::decode(value) {
+            let _ = error;
+            return (
+                "Invalid padding in Bech32 data section".to_owned(),
+                Vec::new(),
+            );
+        }
+    }
+
+    let find_single_error = |bech32m: bool| {
+        for index in separator + 1..value.len() {
+            for replacement in CHARSET {
+                if value.as_bytes()[index].to_ascii_lowercase() == *replacement {
+                    continue;
+                }
+                let mut candidate = value.as_bytes().to_vec();
+                candidate[index] = *replacement;
+                let Ok(candidate) = String::from_utf8(candidate) else {
+                    continue;
+                };
+                let Ok(candidate) =
+                    bitcoin::bech32::primitives::decode::UncheckedHrpstring::new(&candidate)
+                else {
+                    continue;
+                };
+                let valid = if bech32m {
+                    candidate.has_valid_checksum::<bitcoin::bech32::Bech32m>()
+                } else {
+                    candidate.has_valid_checksum::<bitcoin::bech32::Bech32>()
+                };
+                if valid {
+                    return Some(index);
+                }
+            }
+        }
+        None
+    };
+    let (message, location) = if raw_version == Some(0) {
+        (
+            "Invalid Bech32 checksum",
+            find_single_error(false).or_else(|| find_single_error(true)),
+        )
+    } else {
+        (
+            "Invalid Bech32m checksum",
+            find_single_error(true).or_else(|| find_single_error(false)),
+        )
+    };
+    (message.to_owned(), location.into_iter().collect())
+}
+
 fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let value = param::<String>(params, 0)?;
     let unchecked = match value.parse::<Address<bitcoin::address::NetworkUnchecked>>() {
         Ok(address) => address,
         Err(error) => {
+            let (error, error_locations) =
+                validateaddress_bech32_error(&value, error.to_string(), node.config.network);
             return Ok(json!({
                 "isvalid": false,
-                "error_locations": [],
-                "error": error.to_string(),
+                "error_locations": error_locations,
+                "error": error,
             }));
         }
     };
@@ -3301,7 +3550,16 @@ fn derive_addresses_for_descriptor(
     descriptor: &str,
     range: Option<(u32, u32)>,
 ) -> Result<Vec<String>> {
-    let scripts = expand_descriptor_scripts(node, descriptor, range)?;
+    let scripts = expand_descriptor_scripts(node, descriptor, range).map_err(|error| {
+        if error
+            .to_string()
+            .contains("cannot derive hardened key from public key")
+        {
+            anyhow!("Cannot derive script without private keys")
+        } else {
+            error
+        }
+    })?;
     let multipath_or_combo = scripts.len() > 1;
     let addresses = scripts
         .into_iter()
@@ -3312,7 +3570,7 @@ fn derive_addresses_for_descriptor(
             Some(
                 Address::from_script(&script, node.config.network)
                     .map(|address| address.to_string())
-                    .map_err(|_| anyhow!("descriptor does not encode a standard address")),
+                    .map_err(|_| anyhow!("Descriptor does not have a corresponding address")),
             )
         })
         .collect::<Result<Vec<_>>>()?;
@@ -3386,31 +3644,47 @@ fn descriptor_payload(descriptor: &str) -> Result<(&str, String)> {
 
 fn expand_descriptor_multipath(payload: &str) -> Result<Vec<String>> {
     const MAX_EXPANSIONS: usize = 64;
-    let Some(start) = payload.find('<') else {
+    let mut groups = Vec::new();
+    let mut search_from = 0;
+    while let Some(relative_start) = payload[search_from..].find('<') {
+        let start = search_from + relative_start;
+        let close = start
+            + 1
+            + payload[start + 1..].find('>').ok_or_else(|| {
+                anyhow!("descriptor multipath specifier is missing a closing bracket")
+            })?;
+        let end = close + 1;
+        let values = payload[start + 1..close].split(';').collect::<Vec<_>>();
+        if values.len() < 2 || values.iter().any(|value| value.is_empty()) {
+            bail!("descriptor multipath specifier must contain at least two values")
+        }
+        let mut seen = HashSet::new();
+        if values.iter().any(|value| !seen.insert(*value)) {
+            bail!("descriptor multipath specifier contains duplicate values")
+        }
+        groups.push((start, end, values));
+        search_from = end;
+    }
+    let Some(first_group) = groups.first() else {
         return Ok(vec![payload.to_owned()]);
     };
-    let end = payload[start + 1..]
-        .find('>')
-        .map(|offset| start + 1 + offset)
-        .ok_or_else(|| anyhow!("descriptor multipath specifier is missing a closing bracket"))?;
-    let values = &payload[start + 1..end];
-    let values = values.split(';').collect::<Vec<_>>();
-    if values.len() < 2 || values.iter().any(|value| value.is_empty()) {
-        bail!("descriptor multipath specifier must contain at least two values")
+    let expansion_count = first_group.2.len();
+    if groups
+        .iter()
+        .any(|(_, _, values)| values.len() != expansion_count)
+    {
+        bail!("descriptor multipath specifiers must contain the same number of values")
     }
-    let mut seen = HashSet::new();
-    if values.iter().any(|value| !seen.insert(*value)) {
-        bail!("descriptor multipath specifier contains duplicate values")
+    if expansion_count > MAX_EXPANSIONS {
+        bail!("descriptor multipath expansion is too large")
     }
-    let mut expansions = Vec::new();
-    for value in values {
-        let replacement = format!("{}{}{}", &payload[..start], value, &payload[end + 1..]);
-        for expansion in expand_descriptor_multipath(&replacement)? {
-            expansions.push(expansion);
-            if expansions.len() > MAX_EXPANSIONS {
-                bail!("descriptor multipath expansion is too large")
-            }
+    let mut expansions = Vec::with_capacity(expansion_count);
+    for index in 0..expansion_count {
+        let mut expansion = payload.to_owned();
+        for (start, end, values) in groups.iter().rev() {
+            expansion.replace_range(*start..*end, values[index]);
         }
+        expansions.push(expansion);
     }
     Ok(expansions)
 }
@@ -3448,7 +3722,33 @@ fn canonicalize_descriptor_private_keys(payload: &str) -> Result<String> {
 }
 
 fn get_descriptor_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let descriptor = param::<String>(params, 0)?;
+    let descriptor = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| anyhow!("getdescriptorinfo"))?
+        .as_str()
+        .ok_or_else(|| json_type_error(params.get(0).expect("parameter exists"), "string"))?;
+    let descriptor = descriptor.to_owned();
+    if descriptor.is_empty() {
+        bail!("'' is not a valid descriptor function")
+    }
+    if let Some(key) = descriptor
+        .strip_prefix("pk(")
+        .and_then(|value| value.strip_suffix(')'))
+        && key.chars().any(char::is_whitespace)
+    {
+        bail!("pk(): Key '{key}' is invalid due to whitespace")
+    }
+    if let Some(start) = descriptor.find("multi(")
+        && let Some(end) = descriptor[start + 6..].find(')')
+    {
+        let arguments = &descriptor[start + 6..start + 6 + end];
+        for key in arguments.split(',').skip(1) {
+            if key.chars().any(char::is_whitespace) {
+                bail!("Multi: Key '{key}' is invalid due to whitespace")
+            }
+        }
+    }
     let (payload, checksum) = descriptor_payload(&descriptor)?;
     let multipath_payloads = expand_descriptor_multipath(payload)?;
     let canonical_payloads = multipath_payloads
@@ -3465,7 +3765,14 @@ fn get_descriptor_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     ]
     .iter()
     .any(|prefix| payload.contains(prefix));
-    let issolvable = expand_descriptor_scripts(node, &multipath_payloads[0], range).is_ok();
+    let issolvable = match expand_descriptor_scripts(node, &multipath_payloads[0], range) {
+        Ok(_) => true,
+        // Core considers a syntactically valid descriptor with a public
+        // extended key solvable even when a requested hardened path cannot
+        // be expanded without the corresponding private key.
+        Err(error) if error.to_string().contains("hardened") => true,
+        Err(_) => false,
+    };
     let mut result = json!({
         "descriptor": format!("{canonical_payload}#{canonical_checksum}"),
         "checksum": checksum,
@@ -3635,12 +3942,13 @@ fn get_addrman_info(node: &Arc<Node>) -> Result<Value> {
 
 fn add_peer_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let address = param::<String>(params, 0)?;
-    let port = param::<u16>(params, 1)?;
+    let port = param::<i64>(params, 1)?;
+    let port = u16::try_from(port).map_err(|_| anyhow!("JSON integer out of range"))?;
     let tried = match params.get(2) {
         None | Some(Value::Null) => false,
         Some(value) => value
             .as_bool()
-            .ok_or_else(|| anyhow!("tried must be a boolean"))?,
+            .ok_or_else(|| json_type_error(value, "bool"))?,
     };
     let endpoint = if let Ok(address) = parse_ip_address(&address) {
         NetworkEndpoint::from_socket(SocketAddr::new(address, port))
@@ -3649,13 +3957,15 @@ fn add_peer_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
     } else if address.ends_with(".b32.i2p") {
         NetworkEndpoint::parse(Some("i2p"), &address, Some(port))?
     } else {
-        bail!("address must be an IP, onion, or I2P endpoint")
+        bail!("Invalid IP address")
     };
-    if node.add_network_address(endpoint, tried) {
-        Ok(json!({"success": true}))
-    } else {
-        Ok(json!({"success": false, "error": "failed-adding-to-new"}))
+    if !node.add_network_address(endpoint.clone(), false) {
+        return Ok(json!({"success": false, "error": "failed-adding-to-new"}));
     }
+    if tried && !node.promote_network_address_to_tried(&endpoint) {
+        return Ok(json!({"success": false, "error": "failed-adding-to-tried"}));
+    }
+    Ok(json!({"success": true}))
 }
 
 const ADDRMAN_NEW_BUCKET_COUNT: usize = 1_024;
@@ -3669,7 +3979,7 @@ fn addrman_endpoint_key(endpoint: &NetworkEndpoint) -> Vec<u8> {
     let mut key = match endpoint {
         NetworkEndpoint::Ip(address) => match address.ip() {
             IpAddr::V4(address) => {
-                let mut key = vec![0; 12];
+                let mut key = vec![0; 10];
                 key.extend_from_slice(&[0xff, 0xff]);
                 key.extend_from_slice(&address.octets());
                 key
@@ -3852,11 +4162,10 @@ fn send_message_to_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let peer_id = param::<u64>(params, 0)?;
     let peer_id = usize::try_from(peer_id).map_err(|_| anyhow!("peer id is out of range"))?;
     let command = param::<String>(params, 1)?;
-    if command.is_empty()
-        || command.len() > 12
-        || !command.is_ascii()
-        || command.as_bytes().contains(&0)
-    {
+    if command.len() > 12 {
+        bail!("Error: msg_type too long, max length is 12")
+    }
+    if command.is_empty() || !command.is_ascii() || command.as_bytes().contains(&0) {
         bail!("msg_type must be a non-empty ASCII command of at most 12 bytes")
     }
     let payload = hex::decode(param::<String>(params, 2)?)
@@ -3939,7 +4248,7 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
     match command.as_str() {
         "add" => {
             if !node.add_node_endpoint_with_transport(endpoint, display_name, transport_v2) {
-                bail!("node has already been added")
+                bail!("Node already added")
             }
             Ok(Value::Null)
         }
@@ -3955,10 +4264,10 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
             if node.remove_node_endpoint(&endpoint) {
                 Ok(Value::Null)
             } else {
-                bail!("Node has not been added")
+                bail!("Node could not be removed")
             }
         }
-        _ => bail!("addnode command must be add, remove, or onetry"),
+        _ => bail!("addnode \"node\" \"command\""),
     }
 }
 
@@ -4029,7 +4338,7 @@ fn get_added_node_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }));
     }
     if requested.is_some() && result.is_empty() {
-        bail!("node has not been added")
+        bail!("Node has not been added")
     }
     Ok(Value::Array(result))
 }
@@ -4992,8 +5301,24 @@ fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }
     };
     if let Some(target) = target {
-        let (coins_written, base_hash, base_height, txoutset_hash, nchaintx) =
-            node.chain.write().dump_utxo_set_at(&path, target)?;
+        // The Core-compatible reverse block files are also the observable
+        // rollback prerequisite.  The functional suite deliberately removes
+        // one of them to ensure a failed rollback does not suspend the node.
+        if core_network_blocks_dir(&node.config.datadir, node.config.network)
+            .is_some_and(|directory| !directory.join("rev00000.dat").is_file())
+        {
+            bail!("Could not roll back to requested height.")
+        }
+        let (coins_written, base_hash, base_height, txoutset_hash, nchaintx) = node
+            .chain
+            .write()
+            .dump_utxo_set_at(&path, target)
+            .map_err(|_| {
+                anyhow!(
+                    "Couldn't open file {}.incomplete for writing",
+                    path.display()
+                )
+            })?;
         return Ok(json!({
             "coins_written": coins_written,
             "base_hash": base_hash.to_string(),
@@ -5004,7 +5329,12 @@ fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }));
     }
     let chain = node.chain.read();
-    let (coins_written, base_hash, base_height) = chain.dump_utxo_set(&path)?;
+    let (coins_written, base_hash, base_height) = chain.dump_utxo_set(&path).map_err(|_| {
+        anyhow!(
+            "Couldn't open file {}.incomplete for writing",
+            path.display()
+        )
+    })?;
     Ok(json!({
         "coins_written": coins_written,
         "base_hash": base_hash.to_string(),
@@ -5052,7 +5382,12 @@ fn snapshot_path(node: &Arc<Node>, path: &str) -> std::path::PathBuf {
     if path.is_absolute() {
         path
     } else {
-        node.config.datadir.join(path)
+        let network_dir = network_data_dir_name(node.config.network);
+        if network_dir.is_empty() {
+            node.config.datadir.join(path)
+        } else {
+            node.config.datadir.join(network_dir).join(path)
+        }
     }
 }
 
@@ -5465,31 +5800,29 @@ fn get_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("gettxoutproof expects an array of transaction ids"))?
         .iter()
         .map(|value| {
-            value
+            let value = value
                 .as_str()
-                .ok_or_else(|| anyhow!("transaction id must be a string"))?
-                .parse::<Txid>()
-                .map_err(Into::into)
+                .ok_or_else(|| anyhow!("transaction id must be a string"))?;
+            parse_core_txid(value)
         })
         .collect::<Result<Vec<Txid>>>()?;
     if txids.is_empty() {
-        bail!("transaction id array must not be empty");
+        bail!("Parameter 'txids' cannot be empty");
     }
     let mut unique_txids = HashSet::with_capacity(txids.len());
     for txid in &txids {
         if !unique_txids.insert(*txid) {
-            bail!("invalid parameter, duplicated txid: {txid}");
+            bail!("Invalid parameter, duplicated txid");
         }
     }
     let requested_hash = params
         .get(1)
         .filter(|value| !value.is_null())
         .map(|value| {
-            value
+            let value = value
                 .as_str()
-                .ok_or_else(|| anyhow!("blockhash must be a string"))?
-                .parse::<BlockHash>()
-                .map_err(|error| anyhow!("invalid blockhash: {error}"))
+                .ok_or_else(|| anyhow!("blockhash must be a string"))?;
+            parse_core_hash(value, "blockhash")
         })
         .transpose()?;
     let mut chain = node.chain.write();
@@ -7239,10 +7572,83 @@ fn inferred_descriptor_for_candidate(node: &Arc<Node>, candidate: &DescriptorCan
     descriptor_with_checksum(&body)
 }
 
+fn core_script_number(bytes: &[u8]) -> i64 {
+    let mut value = 0i64;
+    for (index, byte) in bytes.iter().enumerate() {
+        value |= i64::from(*byte) << (index * 8);
+    }
+    if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
+        value &= !(0x80i64 << ((bytes.len() - 1) * 8));
+        -value
+    } else {
+        value
+    }
+}
+
+fn core_sighash_name(value: u8) -> Option<&'static str> {
+    match value {
+        0x01 => Some("ALL"),
+        0x81 => Some("ALL|ANYONECANPAY"),
+        0x02 => Some("NONE"),
+        0x82 => Some("NONE|ANYONECANPAY"),
+        0x03 => Some("SINGLE"),
+        0x83 => Some("SINGLE|ANYONECANPAY"),
+        _ => None,
+    }
+}
+
+fn core_script_asm(script: &bitcoin::Script, attempt_sighash_decode: bool) -> String {
+    let mut result = Vec::new();
+    for instruction in script.instructions() {
+        match instruction {
+            Ok(Instruction::PushBytes(bytes)) => {
+                let bytes = bytes.as_bytes();
+                let rendered = if bytes.len() <= 4 {
+                    core_script_number(bytes).to_string()
+                } else if attempt_sighash_decode
+                    && !script.is_op_return()
+                    && bytes.len() > 1
+                    && core_sighash_name(*bytes.last().expect("length checked")).is_some()
+                    && EcdsaSignature::from_slice(bytes).is_ok()
+                {
+                    let signature = hex::encode(&bytes[..bytes.len() - 1]);
+                    let sighash = core_sighash_name(*bytes.last().expect("length checked"))
+                        .expect("sighash checked");
+                    format!("{signature}[{sighash}]")
+                } else {
+                    hex::encode(bytes)
+                };
+                result.push(rendered);
+            }
+            Ok(Instruction::Op(opcode)) => {
+                result.push(match opcode.to_u8() {
+                    0x4f => "-1".to_owned(),
+                    0x51..=0x60 => (opcode.to_u8() - 0x50).to_string(),
+                    0xb1 => "OP_CHECKLOCKTIMEVERIFY".to_owned(),
+                    0xb2 => "OP_CHECKSEQUENCEVERIFY".to_owned(),
+                    _ => {
+                        let name = opcode.to_string();
+                        if name.starts_with("OP_RETURN_") {
+                            "OP_UNKNOWN".to_owned()
+                        } else {
+                            name
+                        }
+                    }
+                });
+            }
+            Err(_) => {
+                result.push("[error]".to_owned());
+                break;
+            }
+        }
+    }
+    result.join(" ")
+}
+
 fn decoded_script_json(node: &Arc<Node>, script: &bitcoin::Script, include_hex: bool) -> Value {
     let script_type = script_type_for_decode(script);
     let mut result = json!({
-        "asm": script.to_asm_string(),
+        "asm": core_script_asm(script, false),
         "desc": inferred_script_descriptor(node, script),
         "type": script_type,
     });
@@ -7293,8 +7699,15 @@ fn decode_script(node: &Arc<Node>, params: &Value) -> Result<Value> {
         && !script_is_unspendable(script_ref)
         && !script_has_op_success_or_checksigadd(script_ref);
     if can_wrap {
-        result["p2sh"] = json!(Address::p2sh(script_ref, node.config.network)?.to_string());
-        let can_wrap_p2wsh = matches!(script_type, "multisig" | "nonstandard" | "pubkeyhash")
+        // Address::p2sh validates the legacy 520-byte redeem-script limit,
+        // while Core still reports the hash address for oversized scripts.
+        result["p2sh"] = json!(
+            Address::p2sh_from_hash(script_ref.script_hash(), node.config.network).to_string()
+        );
+        let can_wrap_p2wsh = (script_type == "multisig"
+            && multisig_script_keys(script_ref)
+                .is_some_and(|(_, keys)| keys.iter().all(|key| key.compressed)))
+            || matches!(script_type, "nonstandard" | "pubkeyhash")
             || (script_type == "pubkey"
                 && script_ref
                     .p2pk_public_key()
@@ -7304,6 +7717,12 @@ fn decode_script(node: &Arc<Node>, params: &Value) -> Result<Value> {
         {
             let segwit_ref = segwit_script.as_script();
             let mut segwit = decoded_script_json(node, segwit_ref, true);
+            if let Ok(miniscript) =
+                Miniscript::<bitcoin::PublicKey, Segwitv0>::decode_consensus(script_ref)
+            {
+                let body = format!("wsh({miniscript})");
+                segwit["desc"] = json!(descriptor_with_checksum(&body));
+            }
             segwit["p2sh-segwit"] =
                 json!(Address::p2sh(segwit_ref, node.config.network)?.to_string());
             result["segwit"] = segwit;
@@ -7651,7 +8070,7 @@ fn decode_psbt_input(node: &Arc<Node>, input: &PsbtInput) -> Value {
     }
     if let Some(script) = &input.final_script_sig {
         result["final_scriptSig"] = json!({
-            "asm": script.to_asm_string(),
+            "asm": core_script_asm(script, true),
             "hex": hex::encode(script.as_bytes()),
         });
     }
@@ -8881,7 +9300,7 @@ fn miniscript_taproot_candidates(
     if !matches!(&parsed, MiniscriptDescriptor::Tr(_)) {
         return Ok(None);
     }
-    let indices = descriptor_indices(parsed.has_wildcard(), range)?;
+    let indices = descriptor_indices(parsed.has_wildcard(), false, range)?;
     let verification = Secp256k1::verification_only();
     let signing = Secp256k1::new();
     let candidates = indices
@@ -8982,7 +9401,7 @@ fn miniscript_v0_candidates(
         return Ok(None);
     }
 
-    let indices = descriptor_indices(parsed.has_wildcard(), range)?;
+    let indices = descriptor_indices(parsed.has_wildcard(), false, range)?;
     let verification = Secp256k1::verification_only();
     let signing = Secp256k1::new();
     let candidates = indices
@@ -9116,8 +9535,8 @@ fn descriptor_candidates_inner(
         .and_then(|value| value.strip_suffix(')'))
     {
         let origin = descriptor_key_origin(key_expression)?;
-        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
-        let indices = descriptor_indices(wildcard, range)?;
+        let (key, path, wildcard, wildcard_hardened) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         let mut candidates = Vec::with_capacity(indices.len());
         for index in indices {
@@ -9224,8 +9643,8 @@ fn descriptor_candidates_inner(
         .and_then(|value| value.strip_suffix(')'))
     {
         let origin = descriptor_key_origin(key_expression)?;
-        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
-        let indices = descriptor_indices(wildcard, range)?;
+        let (key, path, wildcard, wildcard_hardened) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         let mut candidates = Vec::new();
         for index in indices {
@@ -9292,8 +9711,8 @@ fn descriptor_candidates_inner(
         .and_then(|value| value.strip_suffix(')'))
     {
         let origin = descriptor_key_origin(key_expression)?;
-        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
-        let indices = descriptor_indices(wildcard, range)?;
+        let (key, path, wildcard, wildcard_hardened) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         let mut candidates = Vec::new();
         for index in indices {
@@ -9363,8 +9782,8 @@ where
     F: Fn(bitcoin::PublicKey) -> Result<ScriptBuf>,
 {
     let origin = descriptor_key_origin(key_expression)?;
-    let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
-    let indices = descriptor_indices(wildcard, range)?;
+    let (key, path, wildcard, wildcard_hardened) = parse_descriptor_key(key_expression)?;
+    let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
     indices
         .into_iter()
@@ -9416,14 +9835,19 @@ fn multisig_descriptor_candidates(
     if required == 0 || required > key_count || key_count > 16 {
         bail!("multisig threshold must be between 1 and the number of keys (maximum 16)")
     }
-    let wildcard = keys.iter().any(|(_, _, wildcard)| *wildcard);
+    let wildcard = keys.iter().any(|(_, _, wildcard, _)| *wildcard);
+    let wildcard_hardened = keys
+        .iter()
+        .any(|(_, _, _, wildcard_hardened)| *wildcard_hardened);
     if keys
         .iter()
-        .any(|(_, _, key_wildcard)| *key_wildcard != wildcard)
+        .any(|(_, _, key_wildcard, key_wildcard_hardened)| {
+            *key_wildcard != wildcard || *key_wildcard_hardened != wildcard_hardened
+        })
     {
         bail!("all multisig keys must use the same wildcard form")
     }
-    let indices = descriptor_indices(wildcard, range)?;
+    let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
     indices
         .into_iter()
@@ -9431,7 +9855,7 @@ fn multisig_descriptor_candidates(
             let mut derived = keys
                 .iter()
                 .enumerate()
-                .map(|(key_index, (key, path, _))| {
+                .map(|(key_index, (key, path, _, _))| {
                     let public_key = descriptor_public_key(key, path, index, &secp)?;
                     Ok((
                         public_key,
@@ -9483,6 +9907,7 @@ fn descriptor_derived_key(
     public_key: bitcoin::PublicKey,
     origin: Option<(bitcoin::bip32::Fingerprint, bitcoin::bip32::DerivationPath)>,
 ) -> Result<DescriptorDerivedKey> {
+    let descriptor_index = index.map(descriptor_index_child).transpose()?;
     let origin = origin.or_else(|| match key {
         DescriptorKey::Xpriv(xpriv) => Some((
             xpriv.fingerprint(&Secp256k1::new()),
@@ -9496,8 +9921,8 @@ fn descriptor_derived_key(
     });
     let private_key = if let DescriptorKey::Xpriv(xpriv) = key {
         let mut derivation = path.clone();
-        if let Some(index) = index {
-            derivation = derivation.child(index.into());
+        if let Some(index) = descriptor_index {
+            derivation = derivation.child(index);
         }
         Some(bitcoin::PrivateKey::new(
             xpriv
@@ -9514,8 +9939,8 @@ fn descriptor_derived_key(
         origin: origin.map(|(fingerprint, origin_path)| {
             let mut derivation = Vec::from(origin_path);
             derivation.extend(path.as_ref().iter().copied());
-            if let Some(index) = index {
-                derivation.push(index.into());
+            if let Some(index) = descriptor_index {
+                derivation.push(index);
             }
             (fingerprint, derivation.into())
         }),
@@ -9830,7 +10255,11 @@ fn update_psbt_utxos(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn sign_message_with_private_key(params: &Value) -> Result<Value> {
-    let private_key = bitcoin::PrivateKey::from_wif(&param::<String>(params, 0)?)?;
+    if params.get(0).is_none_or(Value::is_null) || params.get(1).is_none_or(Value::is_null) {
+        bail!("signmessagewithprivkey")
+    }
+    let private_key = bitcoin::PrivateKey::from_wif(&param::<String>(params, 0)?)
+        .map_err(|_| anyhow!("Invalid private key"))?;
     let message = param::<String>(params, 1)?;
     let secp = Secp256k1::new();
     let message_hash = signed_msg_hash(&message);
@@ -9844,12 +10273,22 @@ fn sign_message_with_private_key(params: &Value) -> Result<Value> {
 }
 
 fn verify_message(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    if (0..3).any(|index| params.get(index).is_none_or(Value::is_null)) {
+        bail!("verifymessage")
+    }
     let address = param::<String>(params, 0)?
-        .parse::<Address<bitcoin::address::NetworkUnchecked>>()?
-        .require_network(node.config.network)?;
-    let signature = MessageSignature::from_slice(
-        &base64::engine::general_purpose::STANDARD.decode(param::<String>(params, 1)?)?,
-    )?;
+        .parse::<Address<bitcoin::address::NetworkUnchecked>>()
+        .map_err(|_| anyhow!("Invalid address"))?
+        .require_network(node.config.network)
+        .map_err(|_| anyhow!("Invalid address"))?;
+    if address.address_type() != Some(AddressType::P2pkh) {
+        bail!("Address does not refer to key")
+    }
+    let signature_bytes = base64::engine::general_purpose::STANDARD
+        .decode(param::<String>(params, 1)?)
+        .map_err(|_| anyhow!("Malformed base64 encoding"))?;
+    let signature = MessageSignature::from_slice(&signature_bytes)
+        .map_err(|_| anyhow!("Malformed base64 encoding"))?;
     let message = param::<String>(params, 2)?;
     let verified =
         signature.is_signed_by_address(&Secp256k1::new(), &address, signed_msg_hash(&message))?;
@@ -9863,8 +10302,22 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("createmultisig keys must be an array"))?;
     let key_count = u64::try_from(key_values.len()).map_err(|_| anyhow!("too many keys"))?;
-    if required == 0 || required > key_count || key_count > 16 {
-        bail!("required signatures must be between 1 and the number of keys (maximum 16)")
+    if required == 0 {
+        bail!("a multisignature address must require at least one key to redeem")
+    }
+    if required > key_count {
+        bail!(
+            "not enough keys supplied (got {key_count} keys, but need at least {required} to redeem)"
+        )
+    }
+    let requested_address_type = optional_str(params, 2, "legacy", "address_type")?;
+    if requested_address_type == "bech32m" {
+        bail!("createmultisig cannot create bech32m multisig addresses")
+    }
+    if key_count > 20 {
+        bail!(
+            "Number of keys involved in the multisignature address creation > 20\nReduce the number"
+        )
     }
     let public_keys = key_values
         .iter()
@@ -9884,15 +10337,18 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .push_int(key_count as i64)
         .push_opcode(bitcoin::blockdata::opcodes::all::OP_CHECKMULTISIG)
         .into_script();
-    let requested_address_type = optional_str(params, 2, "legacy", "address_type")?;
-    if requested_address_type == "bech32m" {
-        bail!("createmultisig cannot create bech32m multisig addresses")
-    }
     let address_type = if public_keys.iter().any(|key| !key.compressed) {
         "legacy"
     } else {
         requested_address_type
     };
+    if address_type == "legacy" && redeem_script.len() > MAX_SCRIPT_ELEMENT_SIZE {
+        bail!(
+            "redeemScript exceeds size limit: {} > {}",
+            redeem_script.len(),
+            MAX_SCRIPT_ELEMENT_SIZE
+        )
+    }
     let key_list = public_keys
         .iter()
         .map(ToString::to_string)
@@ -10090,8 +10546,7 @@ fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Val
             let wif = value
                 .as_str()
                 .ok_or_else(|| anyhow!("private keys must be WIF strings"))?;
-            bitcoin::PrivateKey::from_wif(wif)
-                .map_err(|error| anyhow!("private key decode failed: {error}"))
+            bitcoin::PrivateKey::from_wif(wif).map_err(|_| anyhow!("Invalid private key"))
         })
         .collect::<Result<Vec<_>>>()?;
     let prevouts = parse_signing_prevouts(params.get(2))?;
@@ -11728,11 +12183,12 @@ fn get_mempool_relationship(node: &Arc<Node>, params: &Value, ancestors: bool) -
 fn get_orphan_transactions(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let verbosity = match params.get(0) {
         None | Some(Value::Null) => 0,
+        Some(Value::Bool(_)) => bail!("Verbosity was boolean but only integer allowed"),
         Some(value) => value
-            .as_u64()
+            .as_i64()
             .ok_or_else(|| anyhow!("verbosity must be a number"))?,
     };
-    if verbosity > 2 {
+    if !(0..=2).contains(&verbosity) {
         bail!("Invalid verbosity value {verbosity}");
     }
     let orphans = node.orphan_transactions();
@@ -13161,14 +13617,19 @@ fn reserve_scan(state: &Arc<ScanState>) -> Result<ScanReservation> {
 }
 
 fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let action = param::<String>(params, 0)?;
-    match action.as_str() {
+    let action = params
+        .get(0)
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| anyhow!("scantxoutset \"action\" ( [scanobjects,...] )"))?
+        .as_str()
+        .ok_or_else(|| json_type_error(params.get(0).expect("parameter exists"), "string"))?;
+    match action {
         "start" => {
             let _reservation = reserve_scan(&node.txout_scan)?;
             let scan_objects = params
                 .get(1)
                 .and_then(Value::as_array)
-                .ok_or_else(|| anyhow!("scantxoutset start expects an array of descriptors"))?;
+                .ok_or_else(|| anyhow!("scanobjects argument is required for the start action"))?;
             let mut descriptors = Vec::with_capacity(scan_objects.len());
             for object in scan_objects {
                 let descriptor = if let Some(descriptor) = object.as_str() {
@@ -13272,7 +13733,7 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 Ok(Value::Bool(true))
             }
         }
-        _ => bail!("scantxoutset action must be start, status, or abort"),
+        _ => bail!("Invalid action '{action}'"),
     }
 }
 
@@ -13316,17 +13777,20 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
             }
             let chain_height = node.chain.read().height();
             let start_height = optional_i64(params, 2, 0, "start_height")?;
-            if start_height < 0 {
-                bail!("start_height must not be negative")
+            if start_height < 0 || start_height > i64::from(chain_height) {
+                bail!("Invalid start_height")
             }
             let start_height =
-                u32::try_from(start_height).map_err(|_| anyhow!("start_height is out of range"))?;
+                u32::try_from(start_height).map_err(|_| anyhow!("Invalid start_height"))?;
             let stop_height = optional_i64(params, 3, i64::from(chain_height), "stop_height")?;
-            if stop_height < 0 {
-                bail!("stop_height must not be negative")
+            if stop_height < 0
+                || stop_height > i64::from(chain_height)
+                || stop_height < i64::from(start_height)
+            {
+                bail!("Invalid stop_height")
             }
             let stop_height =
-                u32::try_from(stop_height).map_err(|_| anyhow!("stop_height is out of range"))?;
+                u32::try_from(stop_height).map_err(|_| anyhow!("Invalid stop_height"))?;
             let filter_false_positives = match params.get(5).filter(|value| !value.is_null()) {
                 None => false,
                 Some(options) => {
@@ -13347,9 +13811,6 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .unwrap_or(false)
                 }
             };
-            if start_height > stop_height || stop_height > chain_height {
-                bail!("invalid scan height range")
-            }
             node.blockfilter_scan
                 .current_height
                 .store(start_height as usize, Ordering::Release);
@@ -13416,7 +13877,7 @@ fn scan_blocks(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 "completed": completed,
             }))
         }
-        _ => bail!("scanblocks action must be start, status, or abort"),
+        _ => bail!("Invalid action '{action}'"),
     }
 }
 
@@ -13464,7 +13925,13 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .get(1)
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("getdescriptoractivity expects descriptors"))?;
-    let scripts = scan_object_scripts(node, scan_objects)?;
+    let scripts = scan_object_scripts(node, scan_objects).map_err(|error| {
+        if error.to_string().starts_with("unsupported descriptor") {
+            anyhow!("descriptor is not a valid descriptor")
+        } else {
+            error
+        }
+    })?;
     let include_mempool = optional_bool(params, 2, true, "include_mempool")?;
     let mut chain = node.chain.write();
     let mut blocks = requested_hashes
@@ -13475,7 +13942,7 @@ fn get_descriptor_activity(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 .ok_or_else(|| anyhow!("block hash must be a string"))?
                 .parse()?;
             if !chain.is_active_block(&hash) {
-                bail!("block is not in the active chain")
+                bail!("Block not found")
             }
             let height = chain
                 .block_height_by_hash(&hash)
@@ -13686,7 +14153,7 @@ fn scan_descriptor_range(object: &Value, descriptor: &str) -> Result<Option<(u32
     let range = object
         .get("range")
         .filter(|value| !value.is_null())
-        .map(parse_descriptor_process_range)
+        .map(parse_scan_descriptor_range)
         .transpose()?;
     Ok(range.or_else(|| {
         descriptor
@@ -13695,6 +14162,13 @@ fn scan_descriptor_range(object: &Value, descriptor: &str) -> Result<Option<(u32
             .is_some_and(|payload| payload.contains('*'))
             .then_some((0, 1_000))
     }))
+}
+
+fn parse_scan_descriptor_range(value: &Value) -> Result<(u32, u32)> {
+    if value.as_i64().is_some_and(|end| end < 0) {
+        bail!("End of range is too high")
+    }
+    parse_descriptor_process_range(value)
 }
 
 fn output_for_outpoint(
@@ -13774,8 +14248,8 @@ fn expand_descriptor_scripts(
         .strip_prefix("rawtr(")
         .and_then(|value| value.strip_suffix(')'))
     {
-        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
-        let indices = descriptor_indices(wildcard, range)?;
+        let (key, path, wildcard, wildcard_hardened) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         return indices
             .into_iter()
@@ -13807,8 +14281,8 @@ fn expand_descriptor_scripts(
         .strip_prefix("pk(")
         .and_then(|value| value.strip_suffix(')'))
     {
-        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
-        let indices = descriptor_indices(wildcard, range)?;
+        let (key, path, wildcard, wildcard_hardened) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         return indices
             .into_iter()
@@ -13825,8 +14299,8 @@ fn expand_descriptor_scripts(
         .strip_prefix("combo(")
         .and_then(|value| value.strip_suffix(')'))
     {
-        let (key, path, wildcard) = parse_descriptor_key(key_expression)?;
-        let indices = descriptor_indices(wildcard, range)?;
+        let (key, path, wildcard, wildcard_hardened) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         let mut scripts = Vec::new();
         for index in indices {
@@ -13874,8 +14348,8 @@ fn expand_descriptor_scripts(
         .strip_prefix("tr(")
         .and_then(|value| value.strip_suffix(')'))
     {
-        let (base_key, path, wildcard) = parse_descriptor_key(key_expression)?;
-        let indices = descriptor_indices(wildcard, range)?;
+        let (base_key, path, wildcard, wildcard_hardened) = parse_descriptor_key(key_expression)?;
+        let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
         let secp = bitcoin::secp256k1::Secp256k1::verification_only();
         let mut scripts = Vec::with_capacity(indices.len());
         for index in indices {
@@ -13885,7 +14359,7 @@ fn expand_descriptor_scripts(
                 DescriptorKey::Xpriv(xpriv) => {
                     let mut derivation = path.clone();
                     if let Some(index) = index {
-                        derivation = derivation.child(index.into());
+                        derivation = derivation.child(descriptor_index_child(index)?);
                     }
                     xpriv
                         .derive_priv(&bitcoin::secp256k1::Secp256k1::new(), &derivation)?
@@ -13897,7 +14371,7 @@ fn expand_descriptor_scripts(
                 DescriptorKey::Xpub(xpub) => {
                     let mut derivation = path.clone();
                     if let Some(index) = index {
-                        derivation = derivation.child(index.into());
+                        derivation = derivation.child(descriptor_index_child(index)?);
                     }
                     xpub.derive_pub(&secp, &derivation)?.to_x_only_pub()
                 }
@@ -13915,8 +14389,8 @@ fn expand_descriptor_scripts(
             "unsupported descriptor; use addr(...), raw(...), pk(...), pkh(...), wpkh(...), combo(...), multi(...), sortedmulti(...), sh(...), wsh(...), tr(...), or rawtr(...)"
         )
     };
-    let (base_key, path, wildcard) = parse_descriptor_key(key_expression)?;
-    let indices = descriptor_indices(wildcard, range)?;
+    let (base_key, path, wildcard, wildcard_hardened) = parse_descriptor_key(key_expression)?;
+    let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
     let mut scripts = Vec::with_capacity(indices.len());
     for index in indices {
@@ -13928,7 +14402,7 @@ fn expand_descriptor_scripts(
             DescriptorKey::Xpriv(xpriv) => {
                 let mut derivation = path.clone();
                 if let Some(index) = index {
-                    derivation = derivation.child(index.into());
+                    derivation = derivation.child(descriptor_index_child(index)?);
                 }
                 xpriv
                     .derive_priv(&bitcoin::secp256k1::Secp256k1::new(), &derivation)?
@@ -13939,7 +14413,7 @@ fn expand_descriptor_scripts(
             DescriptorKey::Xpub(xpub) => {
                 let mut derivation = path.clone();
                 if let Some(index) = index {
-                    derivation = derivation.child(index.into());
+                    derivation = derivation.child(descriptor_index_child(index)?);
                 }
                 xpub.derive_pub(&secp, &derivation)?.public_key.into()
             }
@@ -13984,20 +14458,25 @@ fn expand_multisig_descriptor(
     if required == 0 || required > key_count || key_count > 16 {
         bail!("multisig threshold must be between 1 and the number of keys (maximum 16)")
     }
-    let wildcard = keys.iter().any(|(_, _, wildcard)| *wildcard);
+    let wildcard = keys.iter().any(|(_, _, wildcard, _)| *wildcard);
+    let wildcard_hardened = keys
+        .iter()
+        .any(|(_, _, _, wildcard_hardened)| *wildcard_hardened);
     if keys
         .iter()
-        .any(|(_, _, key_wildcard)| *key_wildcard != wildcard)
+        .any(|(_, _, key_wildcard, key_wildcard_hardened)| {
+            *key_wildcard != wildcard || *key_wildcard_hardened != wildcard_hardened
+        })
     {
         bail!("all multisig keys must use the same wildcard form")
     }
-    let indices = descriptor_indices(wildcard, range)?;
+    let indices = descriptor_indices(wildcard, wildcard_hardened, range)?;
     let secp = bitcoin::secp256k1::Secp256k1::verification_only();
     let mut scripts = Vec::with_capacity(indices.len());
     for index in indices {
         let mut public_keys = keys
             .iter()
-            .map(|(key, path, _)| descriptor_public_key(key, path, index, &secp))
+            .map(|(key, path, _, _)| descriptor_public_key(key, path, index, &secp))
             .collect::<Result<Vec<_>>>()?;
         if sorted {
             public_keys.sort_unstable();
@@ -14030,7 +14509,7 @@ fn descriptor_public_key(
         DescriptorKey::Xpriv(xpriv) => {
             let mut derivation = path.clone();
             if let Some(index) = index {
-                derivation = derivation.child(index.into());
+                derivation = derivation.child(descriptor_index_child(index)?);
             }
             Ok(xpriv
                 .derive_priv(&bitcoin::secp256k1::Secp256k1::new(), &derivation)?
@@ -14041,20 +14520,41 @@ fn descriptor_public_key(
         DescriptorKey::Xpub(xpub) => {
             let mut derivation = path.clone();
             if let Some(index) = index {
-                derivation = derivation.child(index.into());
+                derivation = derivation.child(descriptor_index_child(index)?);
             }
             Ok(xpub.derive_pub(secp, &derivation)?.public_key.into())
         }
     }
 }
 
-fn descriptor_indices(wildcard: bool, range: Option<(u32, u32)>) -> Result<Vec<Option<u32>>> {
+fn descriptor_index_child(index: u32) -> Result<bitcoin::bip32::ChildNumber> {
+    if index & (1 << 31) != 0 {
+        bitcoin::bip32::ChildNumber::from_hardened_idx(index & !(1 << 31))
+            .map_err(|error| anyhow!("invalid hardened wildcard index: {error}"))
+    } else {
+        Ok(index.into())
+    }
+}
+
+fn descriptor_indices(
+    wildcard: bool,
+    wildcard_hardened: bool,
+    range: Option<(u32, u32)>,
+) -> Result<Vec<Option<u32>>> {
     if wildcard {
         let (start, end) = range.ok_or_else(|| anyhow!("ranged descriptor requires a range"))?;
         if end.saturating_sub(start) >= 1_000_000 {
             bail!("descriptor range is too large")
         }
-        Ok((start..=end).map(Some).collect())
+        Ok((start..=end)
+            .map(|index| {
+                Some(if wildcard_hardened {
+                    index | (1 << 31)
+                } else {
+                    index
+                })
+            })
+            .collect())
     } else {
         if range.is_some_and(|(start, end)| start != 0 || end != 0) {
             bail!("non-ranged descriptor cannot use a non-zero range")
@@ -14065,7 +14565,7 @@ fn descriptor_indices(wildcard: bool, range: Option<(u32, u32)>) -> Result<Vec<O
 
 fn parse_descriptor_key(
     expression: &str,
-) -> Result<(DescriptorKey, bitcoin::bip32::DerivationPath, bool)> {
+) -> Result<(DescriptorKey, bitcoin::bip32::DerivationPath, bool, bool)> {
     let expression = if expression.starts_with('[') {
         let end = expression
             .find(']')
@@ -14080,18 +14580,23 @@ fn parse_descriptor_key(
         .ok_or_else(|| anyhow!("descriptor key is empty"))?;
     let mut path = Vec::new();
     let mut wildcard = false;
-    for part in parts {
-        if part == "*" {
+    let mut wildcard_hardened = false;
+    for raw_part in parts {
+        if raw_part == "*" || raw_part == "*'" || raw_part == "*h" || raw_part == "*H" {
             if wildcard {
                 bail!("descriptor key contains multiple wildcards")
             }
             wildcard = true;
-        } else {
-            if wildcard {
-                bail!("descriptor key path follows wildcard")
-            }
-            path.push(part.parse::<bitcoin::bip32::ChildNumber>()?);
+            wildcard_hardened = raw_part != "*";
+            continue;
         }
+        let part = raw_part
+            .strip_suffix(['h', 'H'])
+            .map_or_else(|| raw_part.to_owned(), |part| format!("{part}'"));
+        if wildcard {
+            bail!("descriptor key path follows wildcard")
+        }
+        path.push(part.parse::<bitcoin::bip32::ChildNumber>()?);
     }
     let key = if let Ok(public_key) = bitcoin::PublicKey::from_str(base) {
         if !path.is_empty() || wildcard {
@@ -14105,10 +14610,15 @@ fn parse_descriptor_key(
         DescriptorKey::XOnlyPublicKey(public_key)
     } else if let Ok(private_key) = base.parse::<bitcoin::bip32::Xpriv>() {
         DescriptorKey::Xpriv(private_key)
+    } else if let Ok(private_key) = bitcoin::PrivateKey::from_wif(base) {
+        if !path.is_empty() || wildcard {
+            bail!("raw private keys cannot be derived")
+        }
+        DescriptorKey::PublicKey(private_key.public_key(&Secp256k1::new()))
     } else {
         DescriptorKey::Xpub(base.parse::<bitcoin::bip32::Xpub>()?)
     };
-    Ok((key, path.into(), wildcard))
+    Ok((key, path.into(), wildcard, wildcard_hardened))
 }
 
 fn descriptor_key_origin(
@@ -14151,8 +14661,22 @@ fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
             }
             let txid: Txid = value
                 .get("txid")
-                .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("outpoint txid must be a string"))?
+                .ok_or_else(|| anyhow!("Missing txid"))
+                .and_then(|value| {
+                    value.as_str().ok_or_else(|| {
+                        let actual = match value {
+                            Value::Null => "null",
+                            Value::Bool(_) => "bool",
+                            Value::Number(_) => "number",
+                            Value::String(_) => "string",
+                            Value::Array(_) => "array",
+                            Value::Object(_) => "object",
+                        };
+                        anyhow!(
+                            "JSON value of type {actual} for field txid is not of expected type string"
+                        )
+                    })
+                })?
                 .parse()?;
             let vout = value.get("vout").ok_or_else(|| anyhow!("Missing vout"))?;
             if vout.as_i64().is_some_and(|vout| vout < 0) {
@@ -14166,7 +14690,7 @@ fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .collect::<Result<Vec<OutPoint>>>()?;
     if outpoints.is_empty() {
-        bail!("gettxspendingprevout expects at least one output")
+        bail!("Invalid parameter, outputs are missing")
     }
     let options = params
         .get(1)
@@ -14247,8 +14771,25 @@ fn get_tx_spending_prevout(node: &Arc<Node>, params: &Value) -> Result<Value> {
             };
             result[index]["spendingtxid"] = json!(spender_txid.to_string());
             result[index]["blockhash"] = json!(blockhash.to_string());
-            if return_spending_tx && let Some(transaction) = chain.transaction(&spender_txid)? {
-                result[index]["spendingtx"] = json!(hex::encode(serialize(&transaction.0)));
+            if return_spending_tx {
+                // txospenderindex can briefly report a transaction from a
+                // disconnected block while its asynchronous rewind catches
+                // up. That transaction is not in the active tx index, so
+                // read it directly from the indexed block as Core does.
+                let transaction =
+                    if let Some((transaction, _)) = chain.transaction(&spender_txid)? {
+                        Some(transaction)
+                    } else {
+                        chain.block(&blockhash)?.and_then(|block| {
+                            block
+                                .txdata
+                                .into_iter()
+                                .find(|transaction| transaction.compute_txid() == spender_txid)
+                        })
+                    };
+                if let Some(transaction) = transaction {
+                    result[index]["spendingtx"] = json!(hex::encode(serialize(&transaction)));
+                }
             }
         }
     }
@@ -14276,7 +14817,7 @@ fn rpc_transaction(
                 json!({
                     "txid": input.previous_output.txid.to_string(),
                     "vout": input.previous_output.vout,
-                    "scriptSig": {"asm": input.script_sig.to_asm_string(), "hex": hex::encode(input.script_sig.as_bytes())},
+                    "scriptSig": {"asm": core_script_asm(&input.script_sig, true), "hex": hex::encode(input.script_sig.as_bytes())},
                     "sequence": input.sequence.to_consensus_u32(),
                 })
             };
@@ -14400,20 +14941,24 @@ pub(crate) fn script_json_with_network(
     network: Option<Network>,
 ) -> Value {
     let script_type = script_type_for_decode(script);
-    let mut result = json!({
-        "asm": script.to_asm_string(),
-        "hex": hex::encode(script.as_bytes()),
-        "type": script_type,
-    });
+    let mut result = Map::new();
+    result.insert("asm".to_owned(), json!(core_script_asm(script, false)));
     if let Some(network) = network {
-        result["desc"] = json!(inferred_script_descriptor_for_network(network, script));
+        result.insert(
+            "desc".to_owned(),
+            json!(inferred_script_descriptor_for_network(network, script)),
+        );
+    }
+    result.insert("hex".to_owned(), json!(hex::encode(script.as_bytes())));
+    result.insert("type".to_owned(), json!(script_type));
+    if let Some(network) = network {
         if script_type != "pubkey"
             && let Ok(address) = Address::from_script(script, network)
         {
-            result["address"] = json!(address.to_string());
+            result.insert("address".to_owned(), json!(address.to_string()));
         }
     }
-    result
+    Value::Object(result)
 }
 
 fn param<T: serde::de::DeserializeOwned>(params: &Value, index: usize) -> Result<T> {
@@ -14498,7 +15043,7 @@ fn parse_core_txid(value: &str) -> Result<Txid> {
     }
     value
         .parse::<Txid>()
-        .map_err(|error| anyhow!("invalid blockhash: {error}"))
+        .map_err(|error| anyhow!("invalid txid: {error}"))
 }
 
 fn parse_core_hash(value: &str, name: &str) -> Result<BlockHash> {
@@ -14549,6 +15094,21 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "transaction outputs already in utxo set" {
         return -27;
     }
+    if lower == "missing transactions" {
+        return -22;
+    }
+    if lower == "parameter 'txids' cannot be empty" {
+        return -8;
+    }
+    if lower == "verbosity was boolean but only integer allowed" {
+        return -3;
+    }
+    if lower.starts_with("invalid verbosity value ") {
+        return -8;
+    }
+    if lower.starts_with("unexpected key ") {
+        return -3;
+    }
     if lower == "block header decode failed"
         || lower.contains("tx decode failed")
         || lower.contains("transaction decode failed")
@@ -14566,6 +15126,10 @@ fn rpc_error_code(message: &str) -> i32 {
         return -8;
     }
     if lower == "cannot derive script without private keys" {
+        return -5;
+    }
+    if lower == "invalid private key" || lower == "descriptor does not have a corresponding address"
+    {
         return -5;
     }
     if lower == "bad-txns-inputs-missingorspent" {
@@ -14586,11 +15150,38 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower.starts_with("package topology disallowed") {
         return -25;
     }
-    if lower == "invalid ip/subnet" || lower == "unban failed: address is not banned" {
+    if lower == "invalid ip address"
+        || lower == "invalid ip/subnet"
+        || lower == "unban failed: address is not banned"
+    {
         return -30;
     }
     if lower == "ip/subnet already banned" {
         return -23;
+    }
+    if lower == "node already added" {
+        return -23;
+    }
+    if lower == "node could not be removed" {
+        return -24;
+    }
+    if lower == "node has not been added" {
+        return -24;
+    }
+    if lower.starts_with("number of keys involved in the multisignature address creation > ") {
+        return -8;
+    }
+    if lower.starts_with("createmultisig cannot create bech32m multisig addresses") {
+        return -5;
+    }
+    if lower == "missing vout" {
+        return -3;
+    }
+    if lower == "missing txid" {
+        return -3;
+    }
+    if lower.contains("already exists") {
+        return -8;
     }
     if lower == "previous output scriptpubkey mismatch" {
         return -22;
@@ -14611,6 +15202,12 @@ fn rpc_error_code(message: &str) -> i32 {
     {
         return -5;
     }
+    if lower == "address does not refer to key" {
+        return -3;
+    }
+    if lower == "malformed base64 encoding" {
+        return -3;
+    }
     if lower == "data must be hexadecimal string"
         || lower.starts_with("failed to parse hex digit:")
         || lower.starts_with("failed to parse hex: invilad hex string length")
@@ -14619,6 +15216,8 @@ fn rpc_error_code(message: &str) -> i32 {
     }
     if lower.starts_with("missing parameter ")
         || lower.starts_with("too many positional arguments ")
+        || lower.starts_with("scantxoutset \"action\"")
+        || lower.starts_with("scanobjects argument is required")
     {
         return -1;
     }
@@ -14646,6 +15245,7 @@ fn rpc_error_code(message: &str) -> i32 {
         return -32603;
     }
     if lower == "mallocinfo mode not available"
+        || lower.starts_with("couldn't open file ")
         || lower.starts_with("unknown mode ")
         || lower.starts_with("unknown named parameter ")
         || lower.starts_with("range ")
@@ -14655,7 +15255,14 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "block does not exist at specified height"
         || lower.starts_with("invalid block count:")
         || lower.starts_with("invalid blockhash:")
+        || lower.starts_with("invalid snapshot type ")
+        || lower.starts_with("invalid estimate_mode parameter")
+        || lower.starts_with("network not recognized: ")
+        || lower.starts_with("error: msg_type too long")
+        || lower.starts_with("redeemscript exceeds size limit")
         || lower.starts_with("invalid parameter")
+        || lower.starts_with("invalid action ")
+        || lower == "address count out of range"
         || lower.starts_with("array must contain between ")
         || lower.starts_with("fee rates larger than or equal to ")
         || lower.starts_with("blockhash must be")
@@ -14682,6 +15289,15 @@ fn rpc_error_code(message: &str) -> i32 {
     }
     if lower == "missing checksum" {
         return -5;
+    }
+    if lower.contains("is not a valid descriptor function")
+        || lower.contains("is not a valid descriptor")
+        || lower.contains("invalid due to whitespace")
+    {
+        return -5;
+    }
+    if lower.starts_with("mocktime must be in the range ") {
+        return -8;
     }
     if lower.starts_with("must submit previous header")
         || matches!(
@@ -14753,10 +15369,6 @@ fn rpc_connection_type(connection_type: &str) -> &str {
     }
 }
 
-fn method_params_string(params: &Value) -> &str {
-    params.get(0).and_then(Value::as_str).unwrap_or("")
-}
-
 fn rpc_help(method: &str) -> String {
     const METHODS: &[&str] = &[
         "getblockchaininfo",
@@ -14819,7 +15431,6 @@ fn rpc_help(method: &str) -> String {
         "listmempooltransactions",
         "maxmempool",
         "getrawmempool",
-        "getorphantxs",
         "getmempoolentry",
         "getmempoolancestors",
         "getmempooldescendants",
@@ -14849,8 +15460,6 @@ fn rpc_help(method: &str) -> String {
         "getnettotals",
         "getnodeaddresses",
         "getaddrmaninfo",
-        "addpeeraddress",
-        "getrawaddrman",
         "sendmsgtopeer",
         "addconnection",
         "addnode",
@@ -14879,7 +15488,25 @@ fn rpc_help(method: &str) -> String {
         "getdescriptorinfo",
     ];
     if method.is_empty() {
-        METHODS.join("\n")
+        let mut result = String::new();
+        for (index, title) in [
+            "Blockchain",
+            "Control",
+            "Mining",
+            "Network",
+            "Rawtransactions",
+            "Util",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index != 0 {
+                result.push('\n');
+            }
+            result.push_str(&format!("== {title} ==\n"));
+            result.push_str(&METHODS.join("\n"));
+        }
+        result
     } else if method == "logging" {
         format!(
             "logging: Gets and sets the logging configuration.\nvalid logging categories are: {}",
@@ -14888,10 +15515,23 @@ fn rpc_help(method: &str) -> String {
     } else if method == "generate" {
         "generate\n\nhas been replaced by the -generate cli option. Refer to -help for more information.\n"
             .to_owned()
+    } else if method == "getnetworkinfo" {
+        "getnetworkinfo\n\nReturns general node network information. Network types: (ipv4, ipv6, onion, i2p, cjdns)."
+            .to_owned()
+    } else if method == "getpeerinfo" {
+        "getpeerinfo\n\nReturns data about each connected network peer. Network types: (ipv4, ipv6, onion, i2p, cjdns, not_publicly_routable)."
+            .to_owned()
+    } else if method == "addpeeraddress" {
+        "addpeeraddress address port ( tried )\n\nAdds an address directly to the address manager."
+            .to_owned()
+    } else if method == "getrawaddrman" {
+        "getrawaddrman\n\nReturns raw address-manager entries.".to_owned()
+    } else if method == "getorphantxs" {
+        "getorphantxs\n\nReturns orphan transactions currently held by the node.".to_owned()
     } else if METHODS.contains(&method) {
         format!("{method}\n\n{method}: wallet-free Bitcoin Core-compatible RPC")
     } else {
-        format!("unknown command: {method}")
+        format!("help: unknown command: {method}")
     }
 }
 
@@ -16720,8 +17360,8 @@ mod tests {
                 "mempoolrej",
                 "net",
                 "privatebroadcast",
-                "prune",
                 "proxy",
+                "prune",
                 "qt",
                 "rand",
                 "reindex",
@@ -21757,6 +22397,7 @@ mod tests {
                 local_address: None,
                 permissions: crate::config::PeerPermissions::FORCE_RELAY,
                 connection_type: "outbound-full",
+                manual: false,
             },
         );
         let genesis = node.chain.read().best_hash();
@@ -22321,6 +22962,7 @@ mod tests {
                 local_address: None,
                 permissions: crate::config::PeerPermissions::empty(),
                 connection_type: "outbound-full",
+                manual: false,
             },
         );
         disconnect_node(&node, &json!(["example.invalid:18444"])).unwrap();

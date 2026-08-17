@@ -5771,6 +5771,16 @@ impl ChainState {
             self.persist_history_updates(history_updates)?;
         }
         if self.txospender_index_enabled {
+            if persist {
+                // The Core index may still expose spenders from a just
+                // disconnected branch until its next block notification.
+                // Reconcile those entries immediately before indexing the
+                // next connected block, then let the new block overwrite any
+                // matching outpoints.
+                let active_blocks: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
+                self.spent_by
+                    .retain(|_, (_, _, block_hash, _)| active_blocks.contains(block_hash));
+            }
             self.index_block_spends(block, height);
         }
         self.active_chain.push(hash);
@@ -6112,13 +6122,11 @@ impl ChainState {
                     .to_vec();
                 self.active_tx_totals = cumulative_tx_counts(&self.active_tx_counts);
                 if self.txospender_index_enabled {
+                    // Core's txospender index rewinds asynchronously.  Keep
+                    // the previous map visible while the chain transition is
+                    // reported, then let the next connected block overwrite
+                    // or remove entries from the disconnected branch.
                     self.spent_by = old_spent_by.clone();
-                    self.spent_by.retain(|_, (_, _, block_hash, height)| {
-                        usize::try_from(*height)
-                            .ok()
-                            .and_then(|height| self.active_chain.get(height))
-                            == Some(block_hash)
-                    });
                     if self.spent_by.is_empty() {
                         self.spent_by = snapshot.spent_by.unwrap_or_default();
                     }

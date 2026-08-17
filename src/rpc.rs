@@ -4483,7 +4483,7 @@ fn add_connection(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "feeler" => "feeler",
         _ => unreachable!("connection type was validated above"),
     };
-    node.request_one_try_with_connection_type(address, Some(transport_v2), connection_type);
+    node.request_add_connection_with_type(address, transport_v2, connection_type);
     Ok(json!({
         "address": address_string,
         "connection_type": requested_connection_type,
@@ -4576,15 +4576,15 @@ fn disconnect_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .transpose()?;
     let disconnected = match (address, peer_id) {
-        (Some(address), None) if !address.is_empty() => {
-            node.disconnect_peer_endpoint(&parse_node_endpoint(node, address)?)
-        }
+        (Some(address), None) if !address.is_empty() => parse_node_endpoint(node, address)
+            .map(|endpoint| node.disconnect_peer_endpoint(&endpoint))
+            .unwrap_or(false),
         (Some(""), Some(peer_id)) => node.disconnect_peer(peer_id),
         (None, Some(peer_id)) => node.disconnect_peer(peer_id),
-        _ => bail!("only one of address and nodeid should be provided"),
+        _ => bail!("Only one of address and nodeid should be provided."),
     };
     if !disconnected {
-        bail!("node is not connected")
+        bail!("Node not found in connected nodes")
     }
     Ok(Value::Null)
 }
@@ -4633,6 +4633,9 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let command = param::<String>(params, 1)?;
     let (subnet, network_address) = match crate::IpSubnet::parse(&address) {
         Ok(subnet) => (Some(subnet), None),
+        Err(_) if address.contains('/') => {
+            bail!("Error: Invalid IP/Subnet")
+        }
         Err(_) => (None, Some(NetworkEndpoint::parse_ban_address(&address)?)),
     };
     match command.as_str() {
@@ -4651,7 +4654,11 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 now.saturating_add(u64::try_from(bantime).unwrap_or(u64::MAX))
             };
             if let Some(subnet) = subnet {
-                node.ban_subnet(subnet, ban_until, "manually banned".to_owned())?;
+                if address.contains('/') {
+                    node.ban_subnet(subnet, ban_until, "manually banned".to_owned())?;
+                } else {
+                    node.ban_address(subnet.address(), ban_until, "manually banned".to_owned())?;
+                }
             } else {
                 node.ban_network_address(
                     network_address.expect("non-IP ban has a network address"),
@@ -4672,7 +4679,7 @@ fn set_ban(node: &Arc<Node>, params: &Value) -> Result<Value> {
             if removed {
                 Ok(Value::Null)
             } else {
-                bail!("unban failed: address is not banned")
+                bail!("Error: Unban failed")
             }
         }
         _ => bail!("setban command must be add or remove"),
@@ -15525,6 +15532,15 @@ fn rpc_error_code(message: &str) -> i32 {
     {
         return -5;
     }
+    if lower == "error: absolute timestamp is in the past" {
+        return -8;
+    }
+    if lower == "only one of address and nodeid should be provided." {
+        return -32602;
+    }
+    if lower == "node not found in connected nodes" {
+        return -29;
+    }
     if lower == "bad-txns-inputs-missingorspent" {
         return -25;
     }
@@ -15563,7 +15579,9 @@ fn rpc_error_code(message: &str) -> i32 {
     }
     if lower == "invalid ip address"
         || lower == "invalid ip/subnet"
+        || lower == "error: invalid ip/subnet"
         || lower == "unban failed: address is not banned"
+        || lower == "error: unban failed"
     {
         return -30;
     }
@@ -23173,8 +23191,8 @@ mod tests {
         );
         set_ban(&node, &json!(["192.0.2.0/24", "add", 60])).unwrap();
         assert!(node.is_banned("192.0.2.99".parse().unwrap()));
-        set_ban(&node, &json!(["192.0.2.2", "add", 60])).unwrap();
-        let duplicate_ban = set_ban(&node, &json!(["192.0.2.2", "add", 60])).unwrap_err();
+        set_ban(&node, &json!(["198.51.100.2", "add", 60])).unwrap();
+        let duplicate_ban = set_ban(&node, &json!(["198.51.100.2", "add", 60])).unwrap_err();
         assert_eq!(rpc_error(&duplicate_ban)["code"], json!(-23));
         let invalid_subnet = set_ban(&node, &json!(["192.0.2.0/33", "add", 60])).unwrap_err();
         assert_eq!(rpc_error(&invalid_subnet)["code"], json!(-30));
@@ -23187,7 +23205,7 @@ mod tests {
             .cloned()
             .unwrap();
         assert_eq!(subnet_entry["ban_duration"], json!(60));
-        set_ban(&node, &json!(["192.0.2.2", "remove"])).unwrap();
+        set_ban(&node, &json!(["198.51.100.2", "remove"])).unwrap();
         set_ban(&node, &json!(["192.0.2.0/24", "remove"])).unwrap();
         assert!(!node.is_banned("192.0.2.99".parse().unwrap()));
         let tor_address = "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion";

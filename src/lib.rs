@@ -1451,6 +1451,7 @@ pub struct Node {
     pub(crate) i2p_sam: Option<Arc<i2p::I2pSam>>,
     pub(crate) tor_controller: Option<Arc<tor::TorController>>,
     mempool_path: std::path::PathBuf,
+    banlist_recreated: bool,
     peers_dat_created: bool,
     /// Serialize RPC mining operations so a block template cannot become
     /// stale between reading the active tip and connecting the mined block.
@@ -1774,14 +1775,20 @@ impl Node {
                 .check_consistency()
                 .context("startup block-index consistency check failed")?;
         }
-        let banlist_path = config.datadir.join("banlist.json");
-        let (banned_addresses, banned_network_addresses) = match load_banlist(&config.datadir) {
+        let banlist_path = network_datadir.join("banlist.json");
+        let banlist_exists = banlist_path.exists();
+        let (banned_addresses, banned_network_addresses) = match load_banlist(&network_datadir) {
             Ok(entries) => entries,
             Err(error) => {
                 quarantine_persistent_file(&banlist_path, &error);
                 (HashMap::new(), HashMap::new())
             }
         };
+        if !banlist_exists {
+            info!("Recreating the banlist database");
+            fs::write(&banlist_path, b"[]")
+                .with_context(|| format!("creating {}", banlist_path.display()))?;
+        }
         let peers_path = config.datadir.join("peers.json");
         let peers_dat_path = config
             .datadir
@@ -1874,6 +1881,7 @@ impl Node {
             i2p_sam,
             tor_controller,
             mempool_path,
+            banlist_recreated: !banlist_exists,
             peers_dat_created: peers_dat_missing,
             mining_lock: Mutex::new(()),
             peer_count: AtomicUsize::new(0),
@@ -4866,6 +4874,64 @@ impl Node {
         peers
     }
 
+    /// Select an inbound peer using Core's main eviction protections.  The
+    /// network-group protection is intentionally omitted here because the
+    /// transport layer does not expose Core's keyed netgroup hash; all other
+    /// protections used by the functional eviction test are represented by
+    /// the peer state below.
+    pub(crate) fn select_inbound_peer_to_evict(&self) -> Option<usize> {
+        let candidates = self
+            .peer_infos()
+            .into_iter()
+            .filter(|peer| peer.inbound && !peer.permissions.contains(PeerPermissions::NO_BAN))
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let mut protected = HashSet::new();
+        let mut by_ping = candidates.clone();
+        by_ping.sort_by(|left, right| {
+            left.min_ping
+                .unwrap_or(f64::INFINITY)
+                .total_cmp(&right.min_ping.unwrap_or(f64::INFINITY))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        protected.extend(by_ping.into_iter().take(8).map(|peer| peer.id));
+
+        let mut by_transaction = candidates
+            .iter()
+            .filter(|peer| peer.last_transaction != 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        by_transaction.sort_by(|left, right| {
+            right
+                .last_transaction
+                .cmp(&left.last_transaction)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        protected.extend(by_transaction.into_iter().take(4).map(|peer| peer.id));
+
+        let mut by_block = candidates
+            .iter()
+            .filter(|peer| peer.last_block != 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        by_block.sort_by(|left, right| {
+            right
+                .last_block
+                .cmp(&left.last_block)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        protected.extend(by_block.into_iter().take(4).map(|peer| peer.id));
+
+        candidates
+            .into_iter()
+            .filter(|peer| !protected.contains(&peer.id))
+            .min_by_key(|peer| (peer.connected_at, peer.id))
+            .map(|peer| peer.id)
+    }
+
     /// Return the median clock offset reported by connected outbound peers.
     ///
     /// Bitcoin Core uses only outbound handshake samples for the node-wide
@@ -5342,30 +5408,47 @@ impl Node {
         inserted
     }
 
-    pub(crate) fn request_one_try_with_connection_type(
-        &self,
-        address: SocketAddr,
-        transport_v2: Option<bool>,
-        connection_type: &'static str,
-    ) {
-        self.request_one_try_endpoint_with_connection_type(
-            NetworkEndpoint::from_socket(address),
-            transport_v2,
-            connection_type,
-        );
-    }
-
     pub(crate) fn request_one_try_endpoint_with_connection_type(
         &self,
         endpoint: NetworkEndpoint,
         transport_v2: Option<bool>,
         connection_type: &'static str,
     ) {
+        self.request_one_try_endpoint_with_connection_type_mode(
+            endpoint,
+            transport_v2,
+            connection_type,
+            false,
+        );
+    }
+
+    pub(crate) fn request_add_connection_with_type(
+        &self,
+        address: SocketAddr,
+        transport_v2: bool,
+        connection_type: &'static str,
+    ) {
+        self.request_one_try_endpoint_with_connection_type_mode(
+            NetworkEndpoint::from_socket(address),
+            Some(transport_v2),
+            connection_type,
+            true,
+        );
+    }
+
+    fn request_one_try_endpoint_with_connection_type_mode(
+        &self,
+        endpoint: NetworkEndpoint,
+        transport_v2: Option<bool>,
+        connection_type: &'static str,
+        addconnection: bool,
+    ) {
         if let Some(sender) = self.peer_manager_requests.read().as_ref() {
             let _ = sender.send(p2p::PeerManagerRequest::OneTry(
                 endpoint,
                 transport_v2,
                 connection_type,
+                addconnection,
             ));
         }
     }
@@ -5631,7 +5714,7 @@ impl Node {
     }
 
     pub fn ban_address(&self, address: IpAddr, ban_until: u64, reason: String) -> Result<()> {
-        self.ban_subnet(IpSubnet::from_address(address), ban_until, reason)
+        self.ban_subnet_with_match(IpSubnet::from_address(address), ban_until, reason, true)
     }
 
     pub(crate) fn ban_subnet(
@@ -5640,10 +5723,27 @@ impl Node {
         ban_until: u64,
         reason: String,
     ) -> Result<()> {
+        self.ban_subnet_with_match(subnet, ban_until, reason, false)
+    }
+
+    fn ban_subnet_with_match(
+        &self,
+        subnet: IpSubnet,
+        ban_until: u64,
+        reason: String,
+        match_containing_subnet: bool,
+    ) -> Result<()> {
         let ban_created = time::unix_time();
         let mut banned = self.banned_addresses.write();
         remove_expired_bans(&mut banned, ban_created);
-        if banned.contains_key(&subnet) {
+        let already_banned = if match_containing_subnet {
+            banned
+                .keys()
+                .any(|existing| existing.contains(subnet.address()))
+        } else {
+            banned.contains_key(&subnet)
+        };
+        if already_banned {
             bail!("IP/Subnet already banned")
         }
         banned.insert(
@@ -5745,6 +5845,9 @@ impl Node {
         let startup_services = 4 + usize::from(!self.config.ipc_bind.is_empty());
         let startup = startup_sender.map(|sender| StartupLatch::new(sender, startup_services));
         info!("SetNetworkActive: {}", self.network_active());
+        if self.banlist_recreated {
+            info!("Recreating the banlist database");
+        }
         if self.peers_dat_created {
             let peers_dat_path = self
                 .config
@@ -5984,8 +6087,12 @@ impl Node {
     }
 
     fn persist_banlist(&self) -> Result<()> {
-        let path = self.config.datadir.join("banlist.json");
-        let temp = self.config.datadir.join("banlist.json.tmp");
+        let data_dir = self
+            .config
+            .datadir
+            .join(network_data_dir_name(self.config.network));
+        let path = data_dir.join("banlist.json");
+        let temp = data_dir.join("banlist.json.tmp");
         let mut entries = self
             .banned_addresses
             .read()
@@ -7969,15 +8076,17 @@ mod tests {
     fn corrupt_peer_and_ban_state_is_quarantined_on_restart() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("peers.json"), b"not-json").unwrap();
-        fs::write(directory.path().join("banlist.json"), b"not-json").unwrap();
+        let network_directory = directory.path().join("regtest");
+        fs::create_dir_all(&network_directory).unwrap();
+        fs::write(network_directory.join("banlist.json"), b"not-json").unwrap();
 
         let node = Node::open(test_config(directory.path())).unwrap();
 
         assert!(node.known_addresses().is_empty());
         assert!(node.banned_addresses().is_empty());
         assert!(!directory.path().join("peers.json").exists());
-        assert!(!directory.path().join("banlist.json").exists());
+        assert!(!network_directory.join("banlist.json").exists());
         assert!(directory.path().join("peers.json.corrupt").exists());
-        assert!(directory.path().join("banlist.json.corrupt").exists());
+        assert!(network_directory.join("banlist.json.corrupt").exists());
     }
 }

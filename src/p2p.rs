@@ -33,7 +33,7 @@ use tokio::net::{
     TcpListener, TcpStream,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -275,6 +275,9 @@ const FIXED_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(60);
 /// Core keeps manually added connections in a separate, bounded pool rather
 /// than consuming automatic `-maxconnections` slots.
 const MAX_ADDNODE_CONNECTIONS: usize = 8;
+const MAX_OUTBOUND_FULL_RELAY_CONNECTIONS: usize = 8;
+const MAX_BLOCK_RELAY_ONLY_CONNECTIONS: usize = 2;
+const MAX_FEELER_CONNECTIONS: usize = 1;
 /// Private broadcast connections are short-lived and have their own limit in
 /// Core, independent of ordinary peer slots.
 const MAX_PRIVATE_BROADCAST_CONNECTIONS: usize = 64;
@@ -1448,6 +1451,9 @@ type OutboundAttempts = Arc<parking_lot::Mutex<HashSet<NetworkEndpoint>>>;
 struct OutboundContext {
     slots: Arc<Semaphore>,
     manual_slots: Arc<Semaphore>,
+    addconnection_full_slots: Arc<Semaphore>,
+    addconnection_block_relay_slots: Arc<Semaphore>,
+    addconnection_feeler_slots: Arc<Semaphore>,
     private_slots: Arc<Semaphore>,
     peers: PeerRegistry,
     next_peer_id: Arc<AtomicUsize>,
@@ -1650,7 +1656,7 @@ pub(crate) enum PeerCommand {
 #[derive(Debug)]
 pub(crate) enum PeerManagerRequest {
     Add(NetworkEndpoint, Option<bool>),
-    OneTry(NetworkEndpoint, Option<bool>, &'static str),
+    OneTry(NetworkEndpoint, Option<bool>, &'static str, bool),
     PrivateBroadcast {
         address: SocketAddr,
         transaction: Transaction,
@@ -1732,14 +1738,44 @@ impl PeerManager {
         {
             tokio::spawn(crate::portmap::run(self.node.clone(), address.port()));
         }
-        let slots = Arc::new(Semaphore::new(self.node.config.max_peers));
+        let max_full_relay = self
+            .node
+            .config
+            .max_peers
+            .min(MAX_OUTBOUND_FULL_RELAY_CONNECTIONS);
+        let max_block_relay = self
+            .node
+            .config
+            .max_peers
+            .saturating_sub(max_full_relay)
+            .min(MAX_BLOCK_RELAY_ONLY_CONNECTIONS);
+        let max_automatic_outbound = max_full_relay
+            .saturating_add(max_block_relay)
+            .saturating_add(MAX_FEELER_CONNECTIONS);
+        let slots = Arc::new(Semaphore::new(
+            self.node.config.max_peers.min(max_automatic_outbound),
+        ));
+        let inbound_slots = Arc::new(Semaphore::new(
+            self.node
+                .config
+                .max_peers
+                .saturating_sub(max_automatic_outbound),
+        ));
         let manual_slots = Arc::new(Semaphore::new(MAX_ADDNODE_CONNECTIONS));
+        let addconnection_full_slots =
+            Arc::new(Semaphore::new(MAX_OUTBOUND_FULL_RELAY_CONNECTIONS));
+        let addconnection_block_relay_slots =
+            Arc::new(Semaphore::new(MAX_BLOCK_RELAY_ONLY_CONNECTIONS));
+        let addconnection_feeler_slots = Arc::new(Semaphore::new(MAX_FEELER_CONNECTIONS));
         let private_slots = Arc::new(Semaphore::new(MAX_PRIVATE_BROADCAST_CONNECTIONS));
         let peers: PeerRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let next_peer_id = Arc::new(AtomicUsize::new(0));
         let outbound = OutboundContext {
             slots: slots.clone(),
             manual_slots,
+            addconnection_full_slots,
+            addconnection_block_relay_slots,
+            addconnection_feeler_slots,
             private_slots,
             peers: peers.clone(),
             next_peer_id: next_peer_id.clone(),
@@ -1868,6 +1904,7 @@ impl PeerManager {
                     None,
                     "addr-fetch",
                     true,
+                    false,
                 );
             }
         }
@@ -1975,6 +2012,7 @@ impl PeerManager {
                 None,
                 "outbound-full",
                 true,
+                false,
             );
         }
         let discovery_node = self.node.clone();
@@ -2064,6 +2102,7 @@ impl PeerManager {
                             None,
                             "outbound-full",
                             false,
+                            false,
                         );
                     }
                 }
@@ -2080,10 +2119,10 @@ impl PeerManager {
                         let Some(request) = request else {
                             break;
                         };
-                        let (endpoint, persistent, transport_v2, connection_type, manual) = match request {
-                            PeerManagerRequest::Add(endpoint, transport_v2) => (endpoint, true, transport_v2, "outbound-full", true),
-                            PeerManagerRequest::OneTry(endpoint, transport_v2, connection_type) => {
-                                (endpoint, false, transport_v2, connection_type, true)
+                        let (endpoint, persistent, transport_v2, connection_type, manual, addconnection) = match request {
+                            PeerManagerRequest::Add(endpoint, transport_v2) => (endpoint, true, transport_v2, "outbound-full", true, false),
+                            PeerManagerRequest::OneTry(endpoint, transport_v2, connection_type, addconnection) => {
+                                (endpoint, false, transport_v2, connection_type, !addconnection, addconnection)
                             }
                             PeerManagerRequest::PrivateBroadcast { address, transaction } => {
                                 spawn_private_broadcast_loop(
@@ -2103,6 +2142,7 @@ impl PeerManager {
                             transport_v2,
                             connection_type,
                             manual,
+                            addconnection,
                         );
                     }
                     _ = private_retry_interval.tick() => {
@@ -2117,7 +2157,7 @@ impl PeerManager {
             inbound_listeners.spawn(run_inbound_listener(
                 self.node.clone(),
                 listener,
-                slots.clone(),
+                inbound_slots.clone(),
                 peers.clone(),
                 next_peer_id.clone(),
                 None,
@@ -2127,7 +2167,7 @@ impl PeerManager {
             inbound_listeners.spawn(run_inbound_listener(
                 self.node.clone(),
                 listener,
-                slots.clone(),
+                inbound_slots.clone(),
                 peers.clone(),
                 next_peer_id.clone(),
                 Some(permissions),
@@ -2138,7 +2178,7 @@ impl PeerManager {
                 inbound_listeners.spawn(run_i2p_listener(
                     self.node.clone(),
                     i2p_sam,
-                    slots.clone(),
+                    inbound_slots.clone(),
                     peers.clone(),
                     next_peer_id.clone(),
                 ));
@@ -2195,7 +2235,7 @@ async fn run_i2p_listener(
                 let peers = peers.clone();
                 let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    let Ok(_permit) = slots.try_acquire_owned() else {
+                    let Some(_permit) = acquire_inbound_slot(&node, &slots).await else {
                         peer_log!(
                             node,
                             debug,
@@ -2234,6 +2274,26 @@ async fn run_i2p_listener(
             }
         }
     }
+}
+
+async fn acquire_inbound_slot(
+    node: &Arc<Node>,
+    slots: &Arc<Semaphore>,
+) -> Option<OwnedSemaphorePermit> {
+    if let Ok(permit) = slots.clone().try_acquire_owned() {
+        return Some(permit);
+    }
+    let peer_id = node.select_inbound_peer_to_evict()?;
+    if !node.disconnect_peer(peer_id) {
+        return None;
+    }
+    for _ in 0..100 {
+        if let Ok(permit) = slots.clone().try_acquire_owned() {
+            return Some(permit);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
 }
 
 fn tor_service_target(address: SocketAddr) -> SocketAddr {
@@ -2303,7 +2363,7 @@ async fn run_inbound_listener(
         let transport_v2 = (!node.config.v2_transport).then_some(false);
         let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            let Ok(permit) = slots.try_acquire_owned() else {
+            let Some(permit) = acquire_inbound_slot(&node, &slots).await else {
                 peer_log!(
                     node,
                     debug,
@@ -2344,6 +2404,7 @@ fn spawn_outbound_loop(
     transport_v2: Option<bool>,
     connection_type: &'static str,
     manual: bool,
+    addconnection: bool,
 ) {
     {
         let mut attempts = outbound.attempts.lock();
@@ -2356,6 +2417,9 @@ fn spawn_outbound_loop(
     let OutboundContext {
         slots,
         manual_slots,
+        addconnection_full_slots,
+        addconnection_block_relay_slots,
+        addconnection_feeler_slots,
         peers,
         attempts: outbound_attempts,
         ..
@@ -2376,7 +2440,14 @@ fn spawn_outbound_loop(
             endpoint: endpoint.clone(),
             attempts: outbound_attempts,
         };
-        let permit = if manual {
+        let permit = if addconnection {
+            match connection_type {
+                "outbound-full" => addconnection_full_slots.acquire_owned().await,
+                "block-relay-only" => addconnection_block_relay_slots.acquire_owned().await,
+                "feeler" => addconnection_feeler_slots.acquire_owned().await,
+                _ => slots.acquire_owned().await,
+            }
+        } else if manual {
             manual_slots.acquire_owned().await
         } else {
             slots.acquire_owned().await
@@ -4923,6 +4994,7 @@ async fn serve_peer_loop(
                 }
             }
             Message::GetData(items) => {
+                debug!("received getdata peer={peer_id}");
                 if peer_state.connection_type == "private-broadcast" {
                     let Some(transaction) = peer_state.private_broadcast_transaction.as_ref()
                     else {
@@ -6102,7 +6174,7 @@ async fn serve_peer_loop(
                     // Core records an invalid filter as peer misbehavior but keeps
                     // the connection alive. This node has no score-based
                     // discouragement subsystem, so retain the socket and log it.
-                    debug!(peer_id, %error, "ignoring malformed bloom filter");
+                    debug!("Misbehaving peer={peer_id}: {error}");
                 } else {
                     node.update_peer_relay_transactions(peer_id, true);
                 }
@@ -6119,7 +6191,7 @@ async fn serve_peer_loop(
                     // Core marks an oversized element or an add before
                     // filterload as misbehavior without immediately closing the
                     // connection. Keep processing later messages.
-                    debug!(peer_id, "ignoring malformed bloom filter element");
+                    debug!("Misbehaving peer={peer_id}: malformed bloom filter element");
                 }
             }
             Message::FilterClear => {

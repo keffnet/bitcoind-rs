@@ -414,6 +414,46 @@ fn peer_services_are_desirable(peer_services: u64, approximate_best_block_depth:
     peer_services & desirable == desirable
 }
 
+fn peer_block_download_allowed(initial_block_download: bool, peer_services: u64) -> bool {
+    !initial_block_download || peer_services & wire::NODE_NETWORK != 0
+}
+
+fn peer_block_download_allowed_for_node(
+    node: &Arc<Node>,
+    peer_id: usize,
+    peer_services: u64,
+) -> bool {
+    let initial_block_download = node.chain.read().is_initial_block_download();
+    if !peer_block_download_allowed(initial_block_download, peer_services) {
+        return false;
+    }
+    if peer_services & wire::NODE_NETWORK_LIMITED == 0 || peer_services & wire::NODE_NETWORK != 0 {
+        return true;
+    }
+    // Core prefers a full peer for the initial historical download. A
+    // limited peer remains useful for its recent window once no full peer
+    // with an announced chain is available.
+    !node.peer_infos().into_iter().any(|peer| {
+        peer.id != peer_id
+            && peer.version.is_some()
+            && peer.services & wire::NODE_NETWORK != 0
+            && peer.best_known_block.is_some()
+    })
+}
+
+fn network_limited_block_download_allowed(
+    peer_services: u64,
+    peer_best_height: Option<u32>,
+    block_height: u32,
+) -> bool {
+    if peer_services & wire::NODE_NETWORK != 0 || peer_services & wire::NODE_NETWORK_LIMITED == 0 {
+        return true;
+    }
+    peer_best_height.is_none_or(|best_height| {
+        best_height.saturating_sub(block_height) < NODE_NETWORK_LIMITED_MIN_BLOCKS.saturating_sub(2)
+    })
+}
+
 fn peer_address_may_have_useful_database(peer_services: u64) -> bool {
     peer_services & (wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED) != 0
 }
@@ -3364,6 +3404,7 @@ async fn serve_peer_loop(
     let mut post_verack_extensions_sent = false;
     let mut addrv2_received = false;
     let mut getaddr_received = false;
+    let mut getaddr_response_pending = false;
     let mut peer_version = 0i32;
     let mut peer_services = 0u64;
     let mut compact_block_version = 2u64;
@@ -3389,6 +3430,9 @@ async fn serve_peer_loop(
     let mut block_relay_interval = tokio::time::interval(BLOCK_RELAY_INTERVAL);
     block_relay_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     block_relay_interval.tick().await;
+    let mut block_download_interval = tokio::time::interval(Duration::from_millis(100));
+    block_download_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    block_download_interval.tick().await;
     let mut pending_block_requests = Vec::new();
     let mut pending_getdata = VecDeque::new();
     let mut headers_sync: Option<LowWorkHeadersSync> = None;
@@ -3560,51 +3604,6 @@ async fn serve_peer_loop(
                 if let Some(staller) = node.take_stalled_block_peer() {
                     node.disconnect_peer(staller);
                 }
-                if handle_headers_download_timeout(node, peer_id, peer_state)? {
-                    request_headers(node, peer_id, writer, peer_state).await?;
-                    continue;
-                }
-                if node.peer_block_download_timed_out(peer_id) {
-                    anyhow::bail!("peer timed out downloading blocks");
-                }
-                let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER
-                    .saturating_sub(node.peer_inflight_block_count(peer_id));
-                let peer_has_block_availability = node
-                    .peer_infos()
-                    .into_iter()
-                    .find(|peer| peer.id == peer_id)
-                    .and_then(|peer| peer.best_known_block)
-                    .is_some();
-                // Do not assign headers-first bodies to a peer that has not
-                // announced any block yet. Core waits for block availability
-                // before using a newly connected relay peer for download;
-                // otherwise test and relay-only peers can be mistaken for a
-                // source and later disconnected as stalled downloaders.
-                if available > 0 && peer_has_block_availability {
-                    let schedule = node.next_block_download_schedule(
-                        peer_id,
-                        available,
-                        peer_services,
-                    );
-                    let staller = schedule.staller;
-                    queue_block_requests(
-                        &mut pending_block_requests,
-                        schedule.requests,
-                    );
-                    flush_pending_block_requests(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &mut pending_block_requests,
-                    )
-                    .await?;
-                    if pending_block_requests.is_empty()
-                        && let Some(staller) = staller
-                    {
-                        node.note_block_staller(staller);
-                    }
-                }
                 let inventory_send_due = transaction_inventory_send_due(
                     node,
                     peer_state,
@@ -3641,6 +3640,54 @@ async fn serve_peer_loop(
                     node.config.network,
                 )
                 .await?;
+                continue;
+            }
+            _ = block_download_interval.tick(), if version_received && verack_received => {
+                if handle_headers_download_timeout(node, peer_id, peer_state)? {
+                    request_headers(node, peer_id, writer, peer_state).await?;
+                    continue;
+                }
+                if !peer_block_download_allowed_for_node(node, peer_id, peer_services) {
+                    continue;
+                }
+                if node.peer_block_download_timed_out(peer_id) {
+                    anyhow::bail!("peer timed out downloading blocks");
+                }
+                let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                    .saturating_sub(node.peer_inflight_block_count(peer_id));
+                let peer_has_block_availability = node
+                    .peer_infos()
+                    .into_iter()
+                    .find(|peer| peer.id == peer_id)
+                    .and_then(|peer| peer.best_known_block)
+                    .is_some();
+                // Do not assign headers-first bodies to a peer that has not
+                // announced any block yet. Core waits for block availability
+                // before using a newly connected relay peer for download;
+                // otherwise test and relay-only peers can be mistaken for a
+                // source and later disconnected as stalled downloaders.
+                if available > 0 && peer_has_block_availability {
+                    let schedule = node.next_block_download_schedule(
+                        peer_id,
+                        available,
+                        peer_services,
+                    );
+                    let staller = schedule.staller;
+                    queue_block_requests(&mut pending_block_requests, schedule.requests);
+                    flush_pending_block_requests(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &mut pending_block_requests,
+                    )
+                    .await?;
+                    if pending_block_requests.is_empty()
+                        && let Some(staller) = staller
+                    {
+                        node.note_block_staller(staller);
+                    }
+                }
                 continue;
             }
             _ = block_relay_interval.tick(), if version_received && verack_received && !*peer_state.private_broadcast_peer.lock() => {
@@ -3840,6 +3887,27 @@ async fn serve_peer_loop(
                         "initial getheaders ({start_height}) to peer={peer_id} (startheight:{peer_start_height})"
                     );
                     request_headers(node, peer_id, writer, peer_state).await?;
+                }
+                // A peer that was connected after the local tip was mined
+                // has no block announcement queued for it by the chain-event
+                // relay task. Core's block-inventory state still advertises
+                // the current tip, allowing a node in IBD to discover a
+                // full peer even when it learned the same headers from a
+                // network-limited peer first.
+                if !node.chain.read().is_initial_block_download()
+                    && peer_state.connection_type != "addr-fetch"
+                    && peer_state.connection_type != "feeler"
+                {
+                    let tip = node.chain.read().best_hash();
+                    send_block_relay_announcement(
+                        node,
+                        peer_id,
+                        writer,
+                        peer_state,
+                        node.config.network,
+                        tip,
+                    )
+                    .await?;
                 }
                 if connection_fetches_addresses(outbound, peer_state.connection_type) {
                     send_message(
@@ -4208,18 +4276,30 @@ async fn serve_peer_loop(
                 if let Some(hash) = last_hash {
                     node.update_peer_best_known_block(peer_id, hash);
                 }
+                let peer_best_known = node
+                    .peer_infos()
+                    .into_iter()
+                    .find(|peer| peer.id == peer_id)
+                    .and_then(|peer| peer.best_known_block);
+                let request_block_bodies =
+                    peer_block_download_allowed_for_node(node, peer_id, peer_services);
                 let requests = {
                     let chain = node.chain.read();
+                    let peer_best_height =
+                        peer_best_known.and_then(|hash| chain.block_height_by_hash(&hash));
                     // Headers for a lower-work side chain are useful for
                     // getchaintips and later getblockfrompeer requests, but
                     // Core does not immediately download their bodies.  A
                     // body request is needed here only when this header
                     // batch can make the advertised chain the active one.
-                    let request_candidate_bodies = hashes
-                        .last()
-                        .and_then(|hash| chain.chain_work_by_hash(hash))
-                        .is_some_and(|work| work >= chain.tip().work);
-                    let request_hashes = if request_candidate_bodies {
+                    let request_candidate_bodies = request_block_bodies
+                        && hashes
+                            .last()
+                            .and_then(|hash| chain.chain_work_by_hash(hash))
+                            .is_some_and(|work| work >= chain.tip().work);
+                    let request_hashes = if !request_block_bodies {
+                        Vec::new()
+                    } else if request_candidate_bodies {
                         // Direct fetch can be triggered by a header that was
                         // announced separately from its predecessor.  Walk
                         // back to the active chain so the request includes
@@ -4268,6 +4348,13 @@ async fn serve_peer_loop(
                         .filter(|hash| {
                             !chain.store.contains(hash)
                                 && (request_candidate_bodies || chain.is_active_block(hash))
+                                && chain.block_height_by_hash(hash).is_some_and(|height| {
+                                    network_limited_block_download_allowed(
+                                        peer_services,
+                                        peer_best_height,
+                                        height,
+                                    )
+                                })
                         })
                         .map(|hash| Inventory {
                             kind: if request_compact {
@@ -4453,40 +4540,66 @@ async fn serve_peer_loop(
                     )
                     .await?;
                 }
+                let peer_best_known = node
+                    .peer_infos()
+                    .into_iter()
+                    .find(|peer| peer.id == peer_id)
+                    .and_then(|peer| peer.best_known_block);
+                let block_download_allowed =
+                    peer_block_download_allowed_for_node(node, peer_id, peer_services);
                 let block_requests = {
                     let chain = node.chain.read();
+                    let peer_best_height =
+                        peer_best_known.and_then(|hash| chain.block_height_by_hash(&hash));
                     let mut requests = Vec::new();
-                    for announcement in &block_items {
-                        if node.block_request_in_flight(announcement.hash) {
-                            continue;
-                        }
-                        let Some(work) = chain.chain_work_by_hash(&announcement.hash) else {
-                            continue;
-                        };
-                        if work < chain.tip().work {
-                            continue;
-                        }
-                        let mut branch = Vec::new();
-                        let mut cursor = Some(announcement.hash);
-                        while let Some(hash) = cursor {
-                            if chain.is_active_block(&hash) {
-                                break;
+                    if block_download_allowed {
+                        for announcement in &block_items {
+                            if node.block_request_in_flight(announcement.hash) {
+                                continue;
                             }
-                            if !chain.store.contains(&hash) {
-                                branch.push(hash);
+                            let Some(work) = chain.chain_work_by_hash(&announcement.hash) else {
+                                continue;
+                            };
+                            if work < chain.tip().work {
+                                continue;
                             }
-                            cursor = chain
-                                .header_by_hash(&hash)
-                                .map(|header| header.prev_blockhash);
+                            let mut branch = Vec::new();
+                            let mut cursor = Some(announcement.hash);
+                            while let Some(hash) = cursor {
+                                if chain.is_active_block(&hash) {
+                                    break;
+                                }
+                                if !chain.store.contains(&hash) {
+                                    branch.push(hash);
+                                }
+                                cursor = chain
+                                    .header_by_hash(&hash)
+                                    .map(|header| header.prev_blockhash);
+                            }
+                            if branch.is_empty() && chain.is_active_block(&announcement.hash) {
+                                branch.push(announcement.hash);
+                            }
+                            branch.reverse();
+                            requests.extend(
+                                branch
+                                    .into_iter()
+                                    .map(|hash| Inventory {
+                                        kind: block_request_inventory_type(peer_services),
+                                        hash,
+                                    })
+                                    .filter(|request| {
+                                        chain.block_height_by_hash(&request.hash).is_some_and(
+                                            |height| {
+                                                network_limited_block_download_allowed(
+                                                    peer_services,
+                                                    peer_best_height,
+                                                    height,
+                                                )
+                                            },
+                                        )
+                                    }),
+                            );
                         }
-                        if branch.is_empty() && chain.is_active_block(&announcement.hash) {
-                            branch.push(announcement.hash);
-                        }
-                        branch.reverse();
-                        requests.extend(branch.into_iter().map(|hash| Inventory {
-                            kind: block_request_inventory_type(peer_services),
-                            hash,
-                        }));
                     }
                     requests
                 };
@@ -4885,6 +4998,18 @@ async fn serve_peer_loop(
                     &mut pending_block_requests,
                 )
                 .await?;
+                if getaddr_response_pending && !node.chain.read().is_initial_block_download() {
+                    getaddr_response_pending = false;
+                    send_getaddr_response(
+                        node,
+                        peer_id,
+                        peer_state,
+                        writer,
+                        version.services,
+                        addrv2_received,
+                    )
+                    .await?;
+                }
             }
             Message::CompactBlock(compact) => {
                 let hash = compact.header.block_hash();
@@ -4949,8 +5074,15 @@ async fn serve_peer_loop(
                 node.update_peer_best_known_block(peer_id, hash);
                 if !should_reconstruct {
                     if requested {
-                        request_full_block(node, peer_id, writer, node.config.network, hash)
-                            .await?;
+                        request_full_block(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            peer_services,
+                            hash,
+                        )
+                        .await?;
                     }
                     continue;
                 }
@@ -4998,6 +5130,7 @@ async fn serve_peer_loop(
                                     peer_id,
                                     writer,
                                     node.config.network,
+                                    peer_services,
                                     hash,
                                 )
                                 .await?;
@@ -5008,16 +5141,17 @@ async fn serve_peer_loop(
                         let first_in_flight = already_in_flight == 0 || requested;
                         let peer_is_inbound = node.peer_is_inbound(peer_id);
                         let high_bandwidth = node.peer_bip152_highbandwidth_to(peer_id);
-                        let can_request = ((already_in_flight
-                            < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK
-                            && peer_inflight_before < MAX_BLOCKS_IN_TRANSIT_PER_PEER)
-                            || requested)
-                            && (first_in_flight
-                                || (high_bandwidth
-                                    && (!peer_is_inbound
-                                        || block_requested_from_outbound
-                                        || already_in_flight
-                                            < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK - 1)));
+                        let can_request =
+                            peer_block_download_allowed_for_node(node, peer_id, peer_services)
+                                && ((already_in_flight < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK
+                                    && peer_inflight_before < MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+                                    || requested)
+                                && (first_in_flight
+                                    || (high_bandwidth
+                                        && (!peer_is_inbound
+                                            || block_requested_from_outbound
+                                            || already_in_flight
+                                                < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK - 1)));
                         if !can_request || !node.track_peer_block_request(peer_id, hash) {
                             continue;
                         }
@@ -5042,8 +5176,15 @@ async fn serve_peer_loop(
                     }
                     Err(error) => {
                         debug!(%hash, %error, "unable to reconstruct compact block");
-                        request_full_block(node, peer_id, writer, node.config.network, hash)
-                            .await?;
+                        request_full_block(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            peer_services,
+                            hash,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -5145,8 +5286,15 @@ async fn serve_peer_loop(
                     || response.transactions.len() != pending.requested_indexes.len()
                 {
                     compact_reconstruction_failed = Some(pending_hash);
-                    request_full_block(node, peer_id, writer, node.config.network, pending_hash)
-                        .await?;
+                    request_full_block(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        peer_services,
+                        pending_hash,
+                    )
+                    .await?;
                     continue;
                 }
                 let mut valid = true;
@@ -5172,8 +5320,15 @@ async fn serve_peer_loop(
                 }
                 if !valid || pending.transactions.iter().any(Option::is_none) {
                     compact_reconstruction_failed = Some(pending_hash);
-                    request_full_block(node, peer_id, writer, node.config.network, pending_hash)
-                        .await?;
+                    request_full_block(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        peer_services,
+                        pending_hash,
+                    )
+                    .await?;
                     continue;
                 }
                 match complete_compact_block(&pending.compact, pending.transactions) {
@@ -5217,6 +5372,7 @@ async fn serve_peer_loop(
                                 peer_id,
                                 writer,
                                 node.config.network,
+                                peer_services,
                                 block_hash,
                             )
                             .await?;
@@ -5230,6 +5386,7 @@ async fn serve_peer_loop(
                             peer_id,
                             writer,
                             node.config.network,
+                            peer_services,
                             pending_hash,
                         )
                         .await?;
@@ -5728,44 +5885,16 @@ async fn serve_peer_loop(
                 }
                 getaddr_received = true;
                 node.enable_peer_address_relay(peer_id);
-                let mut addresses = node.known_network_addresses();
-                addresses.shuffle(&mut rand::rng());
-                addresses.truncate(getaddr_response_limit(addresses.len()));
-                if addrv2_received {
-                    let addresses = addresses
-                        .into_iter()
-                        .filter_map(|entry| {
-                            network_address_v2(&entry.endpoint, entry.time, entry.services)
-                        })
-                        .collect::<Vec<_>>();
-                    send_message(
+                getaddr_response_pending = true;
+                if !node.chain.read().is_initial_block_download() {
+                    getaddr_response_pending = false;
+                    send_getaddr_response(
                         node,
                         peer_id,
+                        peer_state,
                         writer,
-                        node.config.network,
-                        &Message::AddrV2(addresses),
-                    )
-                    .await?;
-                } else {
-                    let addresses = addresses
-                        .into_iter()
-                        .filter_map(|entry| {
-                            entry.endpoint.legacy_socket_addr().map(|address| {
-                                wire::NetworkAddress {
-                                    time: u32::try_from(entry.time).unwrap_or(u32::MAX),
-                                    services: entry.services,
-                                    address: socket_address_bytes(address),
-                                    port: address.port(),
-                                }
-                            })
-                        })
-                        .collect::<Vec<_>>();
-                    send_message(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &Message::Addr(addresses),
+                        version.services,
+                        addrv2_received,
                     )
                     .await?;
                 }
@@ -6006,8 +6135,12 @@ async fn request_full_block(
     peer_id: usize,
     writer: &PeerWriter,
     network: Network,
+    peer_services: u64,
     hash: BlockHash,
 ) -> Result<()> {
+    if !peer_block_download_allowed_for_node(node, peer_id, peer_services) {
+        return Ok(());
+    }
     if !node.track_peer_block_request(peer_id, hash) {
         return Ok(());
     }
@@ -6263,6 +6396,97 @@ fn advertised_local_address(node: &Node, peer: &PeerState) -> Option<SocketAddr>
                 .flatten()
                 .filter(|address| usable(*address))
         })
+}
+
+fn initial_self_announcement(
+    node: &Node,
+    peer: &PeerState,
+    services: u64,
+    addrv2: bool,
+) -> Option<Message> {
+    if !node.config.listen || node.chain.read().is_initial_block_download() {
+        return None;
+    }
+    let peer_network = peer.endpoint.network_name();
+    let compatible_listener = |address: &SocketAddr| {
+        let address = *address;
+        address.port() != 0
+            && !address.ip().is_unspecified()
+            && node.config.allows_address(address)
+            && (peer_network == "not_publicly_routable"
+                || NetworkEndpoint::from_socket(address).network_name() == peer_network)
+    };
+    let address = advertised_local_address(node, peer).or_else(|| {
+        node.listen_addresses()
+            .into_iter()
+            .find(compatible_listener)
+    })?;
+    let time = crate::time::unix_time();
+    if addrv2 {
+        network_address_v2(&NetworkEndpoint::from_socket(address), time, services)
+            .map(|address| Message::AddrV2(vec![address]))
+    } else {
+        Some(Message::Addr(vec![wire::NetworkAddress {
+            time: u32::try_from(time).unwrap_or(u32::MAX),
+            services,
+            address: socket_address_bytes(address),
+            port: address.port(),
+        }]))
+    }
+}
+
+async fn send_getaddr_response(
+    node: &Arc<Node>,
+    peer_id: usize,
+    peer: &PeerState,
+    writer: &PeerWriter,
+    services: u64,
+    addrv2: bool,
+) -> Result<()> {
+    if let Some(address) = initial_self_announcement(node, peer, services, addrv2) {
+        send_message(node, peer_id, writer, node.config.network, &address).await?;
+    }
+    let mut addresses = node.known_network_addresses();
+    addresses.shuffle(&mut rand::rng());
+    addresses.truncate(getaddr_response_limit(addresses.len()));
+    if addrv2 {
+        let addresses = addresses
+            .into_iter()
+            .filter_map(|entry| network_address_v2(&entry.endpoint, entry.time, entry.services))
+            .collect::<Vec<_>>();
+        send_message(
+            node,
+            peer_id,
+            writer,
+            node.config.network,
+            &Message::AddrV2(addresses),
+        )
+        .await?;
+    } else {
+        let addresses = addresses
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .endpoint
+                    .legacy_socket_addr()
+                    .map(|address| wire::NetworkAddress {
+                        time: u32::try_from(entry.time).unwrap_or(u32::MAX),
+                        services: entry.services,
+                        address: socket_address_bytes(address),
+                        port: address.port(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        send_message(
+            node,
+            peer_id,
+            writer,
+            node.config.network,
+            &Message::Addr(addresses),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn socket_address_bytes(address: std::net::SocketAddr) -> [u8; 16] {

@@ -198,6 +198,7 @@ fn addrman_tried_slot(key: &[u8; 32], endpoint: &NetworkEndpoint) -> (usize, usi
     (bucket, position)
 }
 pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 const BLOCK_STALLING_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
 const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
 const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
@@ -3887,9 +3888,18 @@ impl Node {
             )
         };
         let limited_peer = peer_services & wire::NODE_NETWORK == 0;
+        let peer_best_known = peer_id.and_then(|id| {
+            self.peers
+                .read()
+                .get(&id)
+                .and_then(|peer| peer.best_known_block)
+        });
         let candidates = {
             let chain = self.chain.read();
             let best_header = chain.best_header_tip().hash;
+            let peer_best_height = peer_best_known
+                .and_then(|hash| chain.block_height_by_hash(&hash))
+                .unwrap_or_else(|| chain.height());
             chain
                 .headers_to_hash(&best_header)
                 .into_iter()
@@ -3900,9 +3910,10 @@ impl Node {
                 .filter(|hash| !chain.is_block_pruned(hash))
                 .filter(|hash| {
                     !limited_peer
-                        || chain
-                            .block_height_by_hash(hash)
-                            .is_some_and(|height| height.saturating_add(290) >= chain.height())
+                        || chain.block_height_by_hash(hash).is_some_and(|height| {
+                            peer_best_height.saturating_sub(height)
+                                < NODE_NETWORK_LIMITED_MIN_BLOCKS.saturating_sub(2)
+                        })
                 })
                 .take(max_scan)
                 .collect::<Vec<_>>()

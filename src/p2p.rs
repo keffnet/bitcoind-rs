@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -346,13 +346,18 @@ fn transaction_inventory_send_due(
     let mock_now = crate::time::mock_time();
     if mock_now == 0 {
         *peer_state.next_tx_inventory_send_mock.lock() = None;
-    } else if peer_state
-        .next_tx_inventory_send_mock
-        .lock()
-        .is_some_and(|deadline| mock_now >= deadline)
-    {
-        *peer_state.next_tx_inventory_send.lock() = None;
-        *peer_state.next_tx_inventory_send_mock.lock() = None;
+    } else {
+        let mut next_send_mock = peer_state.next_tx_inventory_send_mock.lock();
+        if next_send_mock.is_none() {
+            // A mocktime jump supersedes a wall-clock deadline that was
+            // initialized before setmocktime. Core evaluates the existing
+            // inventory timer against the new clock and sends immediately
+            // when that deadline is already in the past.
+            *peer_state.next_tx_inventory_send.lock() = None;
+        } else if next_send_mock.is_some_and(|deadline| mock_now >= deadline) {
+            *peer_state.next_tx_inventory_send.lock() = None;
+            *next_send_mock = None;
+        }
     }
     if peer_state.connection_type == "inbound" {
         if peer_state
@@ -1019,6 +1024,7 @@ struct PeerState {
     permissions: PeerPermissions,
     private_broadcast_transaction: Option<Transaction>,
     private_broadcast_peer: parking_lot::Mutex<bool>,
+    peer_services: AtomicU64,
     local_relay_transactions: bool,
     bloom_filter: parking_lot::Mutex<Option<BloomFilter>>,
     known_tx_inventory: parking_lot::Mutex<KnownTxInventory>,
@@ -1076,7 +1082,12 @@ struct TxRequestMoment {
     mock: Option<u64>,
 }
 
+fn mock_deadline_after(delay: Duration) -> Option<u64> {
+    (crate::time::mock_time() > 0).then(|| crate::time::unix_time().saturating_add(delay.as_secs()))
+}
+
 impl TxRequestMoment {
+    #[cfg(test)]
     fn from_deadline(deadline: Instant) -> Self {
         let wall_now = Instant::now();
         let delay = deadline.saturating_duration_since(wall_now);
@@ -1177,27 +1188,54 @@ fn forget_peer_package_transactions(state: &PeerState, txids: &[Txid]) {
 }
 
 impl TxRequestState {
+    #[cfg(test)]
     fn queue(&mut self, item: Inventory, ready_at: Instant) -> bool {
+        self.queue_with_limit(item, ready_at, MAX_PEER_TX_ANNOUNCEMENTS)
+    }
+
+    #[cfg(test)]
+    fn queue_with_limit(&mut self, item: Inventory, ready_at: Instant, limit: usize) -> bool {
+        self.queue_with_limit_and_mock(
+            item,
+            ready_at,
+            limit,
+            TxRequestMoment::from_deadline(ready_at).mock,
+        )
+    }
+
+    fn queue_with_limit_and_mock(
+        &mut self,
+        item: Inventory,
+        ready_at: Instant,
+        limit: usize,
+        ready_at_mock: Option<u64>,
+    ) -> bool {
         let Some(key) = TxRequestKey::from_inventory(&item) else {
             return false;
         };
         if self.pending_keys.contains(&key) || self.in_flight.contains_key(&key) {
             return false;
         }
-        if self.pending.len().saturating_add(self.in_flight.len()) >= MAX_PEER_TX_ANNOUNCEMENTS {
+        if self.pending.len().saturating_add(self.in_flight.len()) >= limit {
             return false;
         }
         self.pending.push_back(PendingTxRequest {
             key,
             item,
             ready_at,
-            ready_at_mock: TxRequestMoment::from_deadline(ready_at).mock,
+            ready_at_mock,
         });
         self.pending_keys.insert(key);
         true
     }
 
-    fn queue_force(&mut self, item: Inventory, ready_at: Instant) -> bool {
+    fn queue_force_with_mock(
+        &mut self,
+        item: Inventory,
+        ready_at: Instant,
+        ready_at_mock: Option<u64>,
+        limit: usize,
+    ) -> bool {
         let Some(key) = TxRequestKey::from_inventory(&item) else {
             return false;
         };
@@ -1208,14 +1246,14 @@ impl TxRequestState {
             return false;
         }
         self.remove(key);
-        if self.pending.len().saturating_add(self.in_flight.len()) >= MAX_PEER_TX_ANNOUNCEMENTS {
+        if self.pending.len().saturating_add(self.in_flight.len()) >= limit {
             return false;
         }
         self.pending.push_back(PendingTxRequest {
             key,
             item,
             ready_at,
-            ready_at_mock: TxRequestMoment::from_deadline(ready_at).mock,
+            ready_at_mock,
         });
         self.pending_keys.insert(key);
         true
@@ -1240,9 +1278,20 @@ impl TxRequestState {
             .is_some_and(|requested_at| !requested_at.expired(now))
     }
 
+    fn has_ready_pending_key(&self, key: TxRequestKey, now: Instant) -> bool {
+        self.pending.iter().any(|request| {
+            request.key == key
+                && TxRequestMoment {
+                    wall: request.ready_at,
+                    mock: request.ready_at_mock,
+                }
+                .reached(now)
+        })
+    }
+
     fn take_ready(&mut self, now: Instant, limit: usize) -> Vec<PendingTxRequest> {
         self.expire(now);
-        let mut ready = Vec::with_capacity(limit);
+        let mut ready = Vec::with_capacity(limit.min(self.pending.len()));
         let pending_count = self.pending.len();
         for _ in 0..pending_count {
             let Some(request) = self.pending.pop_front() else {
@@ -1267,7 +1316,11 @@ impl TxRequestState {
             request.key,
             TxRequestMoment {
                 wall: now,
-                mock: (crate::time::mock_time() > 0).then(crate::time::unix_time),
+                // Keep an epoch timestamp even when mocktime was disabled
+                // when the request was sent. Core's expiry clock switches to
+                // mocktime dynamically, so a request sent before that switch
+                // must still expire after the test advances mocktime.
+                mock: Some(crate::time::unix_time()),
             },
         );
     }
@@ -1280,7 +1333,7 @@ impl TxRequestState {
             key: request.key,
             item: request.item,
             ready_at,
-            ready_at_mock: TxRequestMoment::from_deadline(ready_at).mock,
+            ready_at_mock: request.ready_at_mock,
         });
         self.pending_keys.insert(request.key);
     }
@@ -3273,6 +3326,7 @@ async fn serve_peer(
         private_broadcast_peer: parking_lot::Mutex::new(
             options.connection_type == "private-broadcast",
         ),
+        peer_services: AtomicU64::new(0),
         local_relay_transactions: local_transaction_relay_enabled(
             options.connection_type,
             node.config.blocksonly,
@@ -3468,6 +3522,9 @@ async fn serve_peer_loop(
     let mut tx_inventory_interval = tokio::time::interval(tx_inventory_average);
     tx_inventory_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tx_inventory_interval.tick().await;
+    let mut tx_request_interval = tokio::time::interval(Duration::from_millis(100));
+    tx_request_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tx_request_interval.tick().await;
     let mut block_relay_interval = tokio::time::interval(BLOCK_RELAY_INTERVAL);
     block_relay_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     block_relay_interval.tick().await;
@@ -3756,6 +3813,49 @@ async fn serve_peer_loop(
                 .await?;
                 continue;
             }
+            _ = tx_request_interval.tick(), if version_received && verack_received && !reader.has_partial_frame() => {
+                if !*peer_state.private_broadcast_peer.lock()
+                    || peer_state.connection_type != "private-broadcast"
+                {
+                    flush_peer_transaction_requests(
+                        node,
+                        peer_id,
+                        peer_state,
+                        peers,
+                        writer,
+                        node.config.network,
+                    )
+                    .await?;
+                    let inventory_send_due = transaction_inventory_send_due(
+                        node,
+                        peer_state,
+                        Instant::now(),
+                        tx_inventory_average,
+                    );
+                    let force_inventory_send = peer_state
+                        .permissions
+                        .contains(PeerPermissions::NO_BAN);
+                    if inventory_send_due || force_inventory_send {
+                        flush_peer_mempool_request(
+                            node,
+                            peer_id,
+                            peer_state,
+                            writer,
+                            node.config.network,
+                        )
+                        .await?;
+                        flush_peer_transaction_inventory(
+                            node,
+                            peer_id,
+                            peer_state,
+                            writer,
+                            node.config.network,
+                        )
+                        .await?;
+                    }
+                }
+                continue;
+            }
             _ = block_download_interval.tick(), if version_received && verack_received => {
                 if handle_headers_download_timeout(node, peer_id, peer_state)? {
                     request_headers(node, peer_id, writer, peer_state).await?;
@@ -3916,6 +4016,9 @@ async fn serve_peer_loop(
                 }
                 peer_version = version.version;
                 peer_services = version.services;
+                peer_state
+                    .peer_services
+                    .store(version.services, Ordering::Relaxed);
                 node.update_peer_version(
                     peer_id,
                     version.version,
@@ -4732,23 +4835,35 @@ async fn serve_peer_loop(
                         .take(50_000)
                         .collect::<Vec<_>>()
                 };
-                // Core tracks at most this many outstanding transaction
-                // announcements from one peer to bound announcement-driven
-                // memory and download work.
+                // Core bounds ordinary peers at MAX_PEER_TX_ANNOUNCEMENTS,
+                // while a peer with Relay permission bypasses that admission
+                // limit. The separate in-flight threshold below only affects
+                // the delay assigned to later announcements; it does not
+                // cap a batch that is already ready to request.
                 let has_wtxid_peer = has_wtxid_relay_peer(peers);
                 let now = Instant::now();
-                for item in transaction_requests
-                    .into_iter()
-                    .take(MAX_PEER_TX_ANNOUNCEMENTS)
+                let announcement_limit = if peer_state.permissions.contains(PeerPermissions::RELAY)
                 {
+                    usize::MAX
+                } else {
+                    MAX_PEER_TX_ANNOUNCEMENTS
+                };
+                for item in transaction_requests.into_iter().take(announcement_limit) {
+                    let in_flight = peer_state.tx_requests.lock().in_flight_count();
+                    let overloaded = !peer_state.permissions.contains(PeerPermissions::RELAY)
+                        && in_flight >= MAX_PEER_TX_REQUEST_IN_FLIGHT;
                     let delay = transaction_request_delay(
-                        peer_state.connection_type == "outbound-full",
+                        peer_is_preferred_tx_download(peer_state),
                         item.kind.is_witness_transaction(),
                         has_wtxid_peer,
-                        peer_state.tx_requests.lock().in_flight_count()
-                            >= MAX_PEER_TX_REQUEST_IN_FLIGHT,
+                        overloaded,
                     );
-                    peer_state.tx_requests.lock().queue(item, now + delay);
+                    peer_state.tx_requests.lock().queue_with_limit_and_mock(
+                        item,
+                        now + delay,
+                        announcement_limit,
+                        mock_deadline_after(delay),
+                    );
                 }
                 flush_peer_transaction_requests(
                     node,
@@ -5808,6 +5923,11 @@ async fn serve_peer_loop(
                         debug!(%txid, "accepted peer transaction");
                     }
                     Err(error) => {
+                        info!(
+                            "{} (wtxid={}) from peer={peer_id} was not accepted: {error}",
+                            txid,
+                            transaction.compute_wtxid()
+                        );
                         let mut accepted_as_package = false;
                         let package_retryable = peer_package_retryable_error(&error);
                         if package_retryable {
@@ -7476,6 +7596,17 @@ fn transaction_request_delay(
     delay
 }
 
+/// Match Core's fPreferredDownload flag used by TxRequestTracker. A peer is
+/// preferred when it is outbound (or has NoBan permission), is not an address
+/// fetch connection, and advertises block-serving capability.
+fn peer_is_preferred_tx_download(state: &PeerState) -> bool {
+    (state.connection_type != "inbound" || state.permissions.contains(PeerPermissions::NO_BAN))
+        && state.connection_type != "addr-fetch"
+        && state.peer_services.load(Ordering::Relaxed)
+            & (wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED)
+            != 0
+}
+
 fn has_wtxid_relay_peer(peers: &PeerRegistry) -> bool {
     peers.lock().values().any(|state| *state.wtxid_relay.lock())
 }
@@ -7488,6 +7619,19 @@ fn tx_request_owned_by_other_peer(
 ) -> bool {
     peers.lock().iter().any(|(other_id, state)| {
         *other_id != peer_id && state.tx_requests.lock().has_live_in_flight(key, now)
+    })
+}
+
+fn preferred_peer_has_pending_request(
+    peers: &PeerRegistry,
+    peer_id: usize,
+    key: TxRequestKey,
+    now: Instant,
+) -> bool {
+    peers.lock().iter().any(|(other_id, state)| {
+        *other_id != peer_id
+            && peer_is_preferred_tx_download(state)
+            && state.tx_requests.lock().has_ready_pending_key(key, now)
     })
 }
 
@@ -7506,18 +7650,16 @@ async fn flush_peer_transaction_requests(
     network: Network,
 ) -> Result<()> {
     let now = Instant::now();
-    let available = {
-        let mut requests = state.tx_requests.lock();
-        requests.expire(now);
-        MAX_PEER_TX_REQUEST_IN_FLIGHT.saturating_sub(requests.in_flight_count())
-    };
-    if available == 0 {
-        return Ok(());
-    }
-
-    let candidates = state.tx_requests.lock().take_ready(now, available);
+    let candidates = state.tx_requests.lock().take_ready(now, usize::MAX);
     let mut requests = Vec::with_capacity(candidates.len());
     for candidate in candidates {
+        if !peer_is_preferred_tx_download(state)
+            && preferred_peer_has_pending_request(peers, peer_id, candidate.key, now)
+        {
+            let ready_at = candidate.ready_at;
+            state.tx_requests.lock().requeue(candidate, ready_at);
+            continue;
+        }
         if tx_request_owned_by_other_peer(peers, peer_id, candidate.key, now) {
             let ready_at = candidate.ready_at;
             state.tx_requests.lock().requeue(candidate, ready_at);
@@ -7559,12 +7701,18 @@ async fn queue_orphan_parent_requests(
     parent_txids.clear();
     let has_wtxid_peer = has_wtxid_relay_peer(peers);
     let delay = transaction_request_delay(
-        peer_state.connection_type == "outbound-full",
+        peer_is_preferred_tx_download(peer_state),
         false,
         has_wtxid_peer,
-        peer_state.tx_requests.lock().in_flight_count() >= MAX_PEER_TX_REQUEST_IN_FLIGHT,
+        !peer_state.permissions.contains(PeerPermissions::RELAY)
+            && peer_state.tx_requests.lock().in_flight_count() >= MAX_PEER_TX_REQUEST_IN_FLIGHT,
     );
     let ready_at = Instant::now() + delay;
+    let announcement_limit = if peer_state.permissions.contains(PeerPermissions::RELAY) {
+        usize::MAX
+    } else {
+        MAX_PEER_TX_ANNOUNCEMENTS
+    };
     for input in &transaction.input {
         let parent_txid = input.previous_output.txid;
         if !parent_txids.insert(parent_txid)
@@ -7584,7 +7732,12 @@ async fn queue_orphan_parent_requests(
             kind: InventoryType::LegacyWitnessTransaction,
             hash: BlockHash::from_raw_hash(parent_txid.to_raw_hash()),
         };
-        queued_parent |= peer_state.tx_requests.lock().queue_force(parent, ready_at);
+        queued_parent |= peer_state.tx_requests.lock().queue_force_with_mock(
+            parent,
+            ready_at,
+            mock_deadline_after(delay),
+            announcement_limit,
+        );
     }
     if queued_parent {
         flush_peer_transaction_requests(
@@ -9560,7 +9713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transaction_request_flush_respects_the_core_inflight_window() {
+    async fn transaction_request_flush_sends_all_ready_requests() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
             network: Network::Regtest,
@@ -9706,6 +9859,7 @@ mod tests {
             permissions: PeerPermissions::empty(),
             private_broadcast_transaction: None,
             private_broadcast_peer: parking_lot::Mutex::new(false),
+            peer_services: AtomicU64::new(0),
             local_relay_transactions: true,
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),
@@ -9757,9 +9911,12 @@ mod tests {
         else {
             panic!("expected transaction getdata");
         };
-        assert_eq!(items.len(), MAX_PEER_TX_REQUEST_IN_FLIGHT);
-        assert_eq!(state.tx_requests.lock().in_flight_count(), 100);
-        assert_eq!(state.tx_requests.lock().pending.len(), 1);
+        assert_eq!(items.len(), MAX_PEER_TX_REQUEST_IN_FLIGHT + 1);
+        assert_eq!(
+            state.tx_requests.lock().in_flight_count(),
+            MAX_PEER_TX_REQUEST_IN_FLIGHT + 1
+        );
+        assert_eq!(state.tx_requests.lock().pending.len(), 0);
 
         flush_peer_transaction_requests(&node, 7, &state, &peers, &writer, Network::Regtest)
             .await
@@ -12148,6 +12305,7 @@ mod tests {
             permissions: PeerPermissions::empty(),
             private_broadcast_transaction: None,
             private_broadcast_peer: parking_lot::Mutex::new(false),
+            peer_services: AtomicU64::new(0),
             local_relay_transactions: true,
             bloom_filter: parking_lot::Mutex::new(None),
             known_tx_inventory: parking_lot::Mutex::new(KnownTxInventory::new()),

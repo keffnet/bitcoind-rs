@@ -445,6 +445,12 @@ impl RecentlyRejectedTransactions {
         }
     }
 
+    fn clear(&mut self) {
+        self.hashes.clear();
+        self.non_retryable.clear();
+        self.order.clear();
+    }
+
     fn contains(&self, hash: BlockHash) -> bool {
         self.hashes.contains(&hash)
     }
@@ -2236,6 +2242,10 @@ impl Node {
         disconnected_blocks: &[Block],
         manual_invalidation: bool,
     ) {
+        // Core resets both recent-reject filters whenever the active tip
+        // changes so transactions rejected under the previous chain state
+        // can be requested and reconsidered again.
+        self.recently_rejected_transactions.lock().clear();
         let mempool_before = self
             .mempool
             .read()

@@ -4695,13 +4695,18 @@ impl ChainState {
     }
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {
-        self.connect_block_with_existing_body(block, false)
+        self.connect_block_with_existing_body(block, false, false)
+    }
+
+    pub(crate) fn connect_block_from_peer(&mut self, block: Block) -> Result<ChainTip> {
+        self.connect_block_with_existing_body(block, false, true)
     }
 
     fn connect_block_with_existing_body(
         &mut self,
         block: Block,
         allow_existing_body: bool,
+        retain_invalid_body: bool,
     ) -> Result<ChainTip> {
         self.poll_background_validation()?;
         let hash = block.block_hash();
@@ -4753,7 +4758,21 @@ impl ChainState {
             bail!("block {hash} is on an invalidated branch")
         }
         if parent_hash == self.best_hash() {
-            self.connect_block_internal(&block, true)?;
+            if let Err(error) = self.connect_block_internal(&block, true) {
+                if retain_invalid_body
+                    && error
+                        .downcast_ref::<ValidationError>()
+                        .is_some_and(ValidationError::should_mark_block_invalid)
+                {
+                    self.store.insert(&block)?;
+                    if let Some(store) = self.electrum_store.as_mut() {
+                        store.insert(&block)?;
+                    }
+                    self.assign_block_sequence_id(hash);
+                    self.persist_metadata()?;
+                }
+                return Err(error);
+            }
             self.process_orphans(hash);
             self.process_known_children(hash);
             self.update_ibd_status();
@@ -4820,15 +4839,49 @@ impl ChainState {
             self.median_time_past_for_parent(parent_hash),
         )?;
         self.validate_block_structure(&block, self.network, height, Amount::MAX_MONEY.to_sat())?;
-        let parent_utxos = self
-            .utxos_for_block(parent_hash)?
-            .context("side-chain parent UTXO state is unavailable")?;
-        self.validate_block_transactions(
+        let Some(parent_utxos) = self.utxos_for_block(parent_hash)? else {
+            // Preserve a validated side-chain body even when its ancestry is
+            // not connected to the active UTXO set. Core keeps this body
+            // available for getblock and later reprocessing after the missing
+            // ancestor arrives, while postponing script validation.
+            self.store.insert(&block)?;
+            if let Some(store) = self.electrum_store.as_mut() {
+                store.insert(&block)?;
+            }
+            self.index_all_transactions(&block, height);
+            self.block_index.insert(
+                hash,
+                BlockNode {
+                    header: block.header,
+                    height,
+                    chain_work: parent.chain_work + block.header.work(),
+                },
+            );
+            self.assign_header_sequence_id(hash);
+            self.assign_block_sequence_id(hash);
+            self.persist_metadata()?;
+            bail!("side-chain parent UTXO state is unavailable")
+        };
+        if let Err(error) = self.validate_block_transactions(
             &block,
             height,
             &parent_utxos,
             self.median_time_past_for_parent(parent_hash),
-        )?;
+        ) {
+            if retain_invalid_body
+                && error
+                    .downcast_ref::<ValidationError>()
+                    .is_some_and(ValidationError::should_mark_block_invalid)
+            {
+                self.store.insert(&block)?;
+                if let Some(store) = self.electrum_store.as_mut() {
+                    store.insert(&block)?;
+                }
+                self.assign_block_sequence_id(hash);
+                self.persist_metadata()?;
+            }
+            return Err(error);
+        }
         self.store.insert(&block)?;
         if let Some(store) = self.electrum_store.as_mut() {
             store.insert(&block)?;
@@ -4859,7 +4912,7 @@ impl ChainState {
             return;
         };
         for child in children {
-            let _ = self.connect_block_with_existing_body(child, true);
+            let _ = self.connect_block_with_existing_body(child, true, false);
         }
     }
 
@@ -4893,7 +4946,7 @@ impl ChainState {
             let Ok(Some(child)) = self.store.get(&child_hash) else {
                 continue;
             };
-            let _ = self.connect_block_with_existing_body(child, true);
+            let _ = self.connect_block_with_existing_body(child, true, false);
         }
     }
 

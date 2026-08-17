@@ -2516,8 +2516,13 @@ impl Config {
                 if value == "0" {
                     Ok(Work::from_be_bytes([0; 32]))
                 } else {
-                    Work::from_unprefixed_hex(value)
-                        .with_context(|| format!("decoding --minimumchainwork as hex: {value}"))
+                    Work::from_unprefixed_hex(
+                        value
+                            .strip_prefix("0x")
+                            .or_else(|| value.strip_prefix("0X"))
+                            .unwrap_or(value),
+                    )
+                    .with_context(|| format!("decoding --minimumchainwork as hex: {value}"))
                 }
             })
             .transpose()?;
@@ -3988,6 +3993,18 @@ mod tests {
         assert_eq!(
             Config::from_args(args).unwrap().minimum_chain_work,
             Some(Work::from_be_bytes([0; 32]))
+        );
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--minimumchainwork=0x10",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().minimum_chain_work,
+            Some(Work::from_unprefixed_hex("10").unwrap())
         );
 
         let args = Args::try_parse_from(["bitcoind-rs", "--stopatheight=42"]).unwrap();

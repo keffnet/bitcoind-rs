@@ -1762,10 +1762,26 @@ impl Node {
     }
 
     pub fn connect_block(&self, block: Block) -> Result<ChainEvent> {
+        self.connect_block_with_policy(block, false)
+    }
+
+    pub(crate) fn connect_block_from_peer(&self, block: Block) -> Result<ChainEvent> {
+        self.connect_block_with_policy(block, true)
+    }
+
+    fn connect_block_with_policy(
+        &self,
+        block: Block,
+        retain_invalid_body: bool,
+    ) -> Result<ChainEvent> {
         let previous_tip = self.chain.read().best_hash();
         let (tip, activated_blocks, disconnected_blocks) = {
             let mut chain = self.chain.write();
-            let tip = chain.connect_block(block)?;
+            let tip = if retain_invalid_body {
+                chain.connect_block_from_peer(block)?
+            } else {
+                chain.connect_block(block)?
+            };
             chain.maybe_auto_prune()?;
             let activated_blocks = if tip.hash != previous_tip {
                 chain.active_blocks_after(previous_tip)?
@@ -3325,6 +3341,29 @@ impl Node {
         }
     }
 
+    pub(crate) fn process_peer_block_availability(&self, peer_id: usize) {
+        let chain = self.chain.read();
+        let mut peers = self.peers.write();
+        let Some(peer) = peers.get_mut(&peer_id) else {
+            return;
+        };
+        let Some(unknown_hash) = peer.last_unknown_block.take() else {
+            return;
+        };
+        let Some(unknown_work) = chain.chain_work_by_hash(&unknown_hash) else {
+            peer.last_unknown_block = Some(unknown_hash);
+            return;
+        };
+        let should_update = peer.best_known_block.is_none_or(|current| {
+            chain
+                .chain_work_by_hash(&current)
+                .is_none_or(|current_work| unknown_work >= current_work)
+        });
+        if should_update {
+            peer.best_known_block = Some(unknown_hash);
+        }
+    }
+
     fn headers_sync_peer_is_eligible(peer: &PeerInfo) -> bool {
         peer.version.is_some()
             && !matches!(
@@ -3546,6 +3585,20 @@ impl Node {
             .map_or(0, |peer| peer.inflight_blocks.len())
     }
 
+    pub(crate) fn clear_peer_block_requests_for_stored_blocks(&self, peer_id: usize) {
+        let chain = self.chain.read();
+        let mut cleared = false;
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            let before = peer.inflight_blocks.len();
+            peer.inflight_blocks
+                .retain(|inflight| !chain.store.contains(&inflight.hash));
+            cleared = peer.inflight_blocks.len() != before;
+        }
+        if cleared {
+            self.block_stalling_since.write().remove(&peer_id);
+        }
+    }
+
     pub(crate) fn compact_block_request_state(&self, hash: BlockHash) -> (usize, bool) {
         let peers = self.peers.read();
         let mut count = 0;
@@ -3572,6 +3625,14 @@ impl Node {
 
     pub(crate) fn peer_has_inflight_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
         self.peers.read().get(&peer_id).is_some_and(|peer| {
+            peer.inflight_blocks
+                .iter()
+                .any(|inflight| inflight.hash == hash)
+        })
+    }
+
+    pub(crate) fn block_request_in_flight(&self, hash: BlockHash) -> bool {
+        self.peers.read().values().any(|peer| {
             peer.inflight_blocks
                 .iter()
                 .any(|inflight| inflight.hash == hash)
@@ -6540,7 +6601,7 @@ mod tests {
             .write()
             .accept_headers(std::slice::from_ref(&block.header))
             .unwrap();
-        node.update_peer_best_known_block(1, genesis.block_hash());
+        node.process_peer_block_availability(1);
 
         let after = node
             .peer_infos()

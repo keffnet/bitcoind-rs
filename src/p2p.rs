@@ -277,6 +277,11 @@ const MAX_ADDNODE_CONNECTIONS: usize = 8;
 const MAX_PRIVATE_BROADCAST_CONNECTIONS: usize = 64;
 const INVENTORY_BROADCAST_TARGET: usize = 70;
 const INVENTORY_BROADCAST_MAX: usize = 1_000;
+const BLOCK_RELAY_INTERVAL: Duration = Duration::from_millis(100);
+
+fn block_relay_cursor_after_batch(previous: BlockHash, announced: &[BlockHash]) -> BlockHash {
+    announced.last().copied().unwrap_or(previous)
+}
 
 fn local_transaction_relay_enabled(
     connection_type: &str,
@@ -966,6 +971,8 @@ struct PeerState {
     wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
     send_headers_sent: parking_lot::Mutex<bool>,
+    last_header_sent: parking_lot::Mutex<Option<BlockHash>>,
+    pending_block_relay: parking_lot::Mutex<Vec<BlockHash>>,
     last_headers_request: parking_lot::Mutex<Option<Instant>>,
     last_headers_request_time: parking_lot::Mutex<Option<u64>>,
     continuation_block: parking_lot::Mutex<Option<BlockHash>>,
@@ -1606,7 +1613,6 @@ impl PeerManager {
         let mut mempool_events = self.node.subscribe_peer_mempool();
         let block_relay_node = self.node.clone();
         let block_relay_peers = peers.clone();
-        let block_relay_network = self.node.config.network;
         tokio::spawn(async move {
             let mut last_announced_tip = block_relay_node.chain.read().best_hash();
             loop {
@@ -1624,41 +1630,45 @@ impl PeerManager {
                 }
                 let hashes = {
                     let mut chain = block_relay_node.chain.write();
+                    let previous_tip_is_active = chain.is_active_block(&last_announced_tip);
                     let hashes = chain
                         .active_blocks_after(last_announced_tip)
                         .map(|blocks| {
+                            let blocks = if blocks.len() > MAX_BLOCKS_TO_ANNOUNCE
+                                && !previous_tip_is_active
+                            {
+                                blocks
+                                    .into_iter()
+                                    .rev()
+                                    .take(MAX_BLOCKS_TO_ANNOUNCE)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect::<Vec<_>>()
+                            } else {
+                                blocks
+                                    .into_iter()
+                                    .take(MAX_BLOCKS_TO_ANNOUNCE)
+                                    .collect::<Vec<_>>()
+                            };
                             blocks
                                 .into_iter()
-                                .take(MAX_BLOCKS_TO_ANNOUNCE)
                                 .map(|block| block.block_hash())
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_else(|_| vec![tip.hash]);
-                    last_announced_tip = tip.hash;
+                    // For an append-only active chain, advance through the
+                    // prefix that was actually queued so lagged chain events
+                    // continue with the next block.  For a reorg, mirror
+                    // Core's capped reverse walk: retain the newest hashes,
+                    // including the new tip, so peers can fall back to an
+                    // inventory announcement when the truncated batch no
+                    // longer connects to their known header.
+                    last_announced_tip =
+                        block_relay_cursor_after_batch(last_announced_tip, &hashes);
                     hashes
                 };
-                for hash in hashes {
-                    let available = block_relay_node.chain.read().store.contains(&hash);
-                    if !available {
-                        continue;
-                    }
-                    broadcast_inventory_excluding(
-                        &block_relay_node,
-                        &block_relay_peers,
-                        &[],
-                        block_relay_network,
-                        false,
-                        Inventory {
-                            // Core announces newly connected blocks with
-                            // MSG_BLOCK.  Witness data is selected when the
-                            // peer requests the block, not in the relay
-                            // announcement inventory.
-                            kind: InventoryType::Block,
-                            hash,
-                        },
-                    )
-                    .await;
-                }
+                queue_block_relay_batch(&block_relay_peers, &hashes);
             }
         });
         let relay_peers = peers.clone();
@@ -3154,6 +3164,8 @@ async fn serve_peer(
         wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
         send_headers_sent: parking_lot::Mutex::new(false),
+        last_header_sent: parking_lot::Mutex::new(None),
+        pending_block_relay: parking_lot::Mutex::new(Vec::new()),
         last_headers_request: parking_lot::Mutex::new(None),
         last_headers_request_time: parking_lot::Mutex::new(None),
         continuation_block: parking_lot::Mutex::new(None),
@@ -3308,6 +3320,9 @@ async fn serve_peer_loop(
     let mut tx_inventory_interval = tokio::time::interval(tx_inventory_average);
     tx_inventory_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tx_inventory_interval.tick().await;
+    let mut block_relay_interval = tokio::time::interval(BLOCK_RELAY_INTERVAL);
+    block_relay_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    block_relay_interval.tick().await;
     let mut pending_block_requests = Vec::new();
     let mut pending_getdata = VecDeque::new();
     let mut headers_sync: Option<LowWorkHeadersSync> = None;
@@ -3553,6 +3568,17 @@ async fn serve_peer_loop(
                     peer_id,
                     peer_state,
                     peers,
+                    writer,
+                    node.config.network,
+                )
+                .await?;
+                continue;
+            }
+            _ = block_relay_interval.tick(), if version_received && verack_received && !*peer_state.private_broadcast_peer.lock() => {
+                flush_pending_block_relay(
+                    node,
+                    peer_id,
+                    peer_state,
                     writer,
                     node.config.network,
                 )
@@ -3861,6 +3887,10 @@ async fn serve_peer_loop(
                     STALE_RELAY_AGE_LIMIT_SECS,
                 );
                 if let Some(headers) = headers {
+                    let last_header = headers
+                        .last()
+                        .map(BlockHeader::block_hash)
+                        .unwrap_or_else(|| node.chain.read().best_hash());
                     send_message(
                         node,
                         peer_id,
@@ -3869,6 +3899,7 @@ async fn serve_peer_loop(
                         &Message::Headers(headers),
                     )
                     .await?;
+                    *peer_state.last_header_sent.lock() = Some(last_header);
                 }
             }
             Message::GetBlocks(request) => {
@@ -4019,12 +4050,11 @@ async fn serve_peer_loop(
                     let chain = node.chain.read();
                     missing_headers_parent(&chain, &headers_to_accept)
                 };
-                if let Some(parent_hash) = missing_parent {
+                if missing_parent.is_some() {
                     // Core treats a continuous batch whose first parent is
                     // unknown as a BIP130-style announcement. Ask for the
                     // missing chain instead of disconnecting merely because
                     // this peer announced a header before another peer did.
-                    debug!(%parent_hash, "received unconnecting headers");
                     node.update_peer_best_known_block(
                         peer_id,
                         headers_to_accept
@@ -4080,13 +4110,42 @@ async fn serve_peer_loop(
                     let request_candidate_bodies = hashes
                         .last()
                         .and_then(|hash| chain.chain_work_by_hash(hash))
-                        .is_some_and(|work| work > chain.tip().work);
+                        .is_some_and(|work| work >= chain.tip().work);
+                    let request_hashes = if request_candidate_bodies {
+                        // Direct fetch can be triggered by a header that was
+                        // announced separately from its predecessor.  Walk
+                        // back to the active chain so the request includes
+                        // every missing body in the now-competitive branch,
+                        // not only the newest header accepted in this
+                        // message.
+                        let mut branch = Vec::new();
+                        let mut cursor = hashes.last().copied();
+                        while let Some(hash) = cursor {
+                            if chain.is_active_block(&hash) {
+                                break;
+                            }
+                            if !chain.store.contains(&hash) {
+                                branch.push(hash);
+                            }
+                            cursor = chain
+                                .header_by_hash(&hash)
+                                .map(|header| header.prev_blockhash);
+                        }
+                        branch.reverse();
+                        if branch.is_empty() {
+                            hashes.clone()
+                        } else {
+                            branch
+                        }
+                    } else {
+                        hashes.clone()
+                    };
                     // Core uses a compact-block getdata request for a
                     // single direct-fetch candidate when the peer has
                     // advertised compact-block support.  Parallel sync and
                     // multi-header downloads continue to request witness
                     // full blocks.
-                    let request_compact = hashes.len() == 1
+                    let request_compact = request_hashes.len() == 1
                         && !node.config.blocksonly
                         && peer_state.compact_block_version.lock().is_some()
                         && chain.header(chain.height()).is_some_and(|header| {
@@ -4096,7 +4155,7 @@ async fn serve_peer_loop(
                                 chain.network.params().pow_target_spacing,
                             )
                         });
-                    hashes
+                    request_hashes
                         .into_iter()
                         .filter(|hash| {
                             !chain.store.contains(hash)
@@ -4175,6 +4234,18 @@ async fn serve_peer_loop(
                         node.update_peer_best_known_block(peer_id, item.hash);
                     }
                 }
+                let block_items = items
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item.kind,
+                            InventoryType::Block
+                                | InventoryType::WitnessBlock
+                                | InventoryType::CompactBlock
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 let mut best_block = None;
                 let transaction_requests = {
                     let chain = node.chain.read();
@@ -4271,6 +4342,54 @@ async fn serve_peer_loop(
                         peer_state,
                         peers,
                         writer,
+                    )
+                    .await?;
+                }
+                let block_requests = {
+                    let chain = node.chain.read();
+                    let mut requests = Vec::new();
+                    for announcement in &block_items {
+                        if node.block_request_in_flight(announcement.hash) {
+                            continue;
+                        }
+                        let Some(work) = chain.chain_work_by_hash(&announcement.hash) else {
+                            continue;
+                        };
+                        if work < chain.tip().work {
+                            continue;
+                        }
+                        let mut branch = Vec::new();
+                        let mut cursor = Some(announcement.hash);
+                        while let Some(hash) = cursor {
+                            if chain.is_active_block(&hash) {
+                                break;
+                            }
+                            if !chain.store.contains(&hash) {
+                                branch.push(hash);
+                            }
+                            cursor = chain
+                                .header_by_hash(&hash)
+                                .map(|header| header.prev_blockhash);
+                        }
+                        if branch.is_empty() && chain.is_active_block(&announcement.hash) {
+                            branch.push(announcement.hash);
+                        }
+                        branch.reverse();
+                        requests.extend(branch.into_iter().map(|hash| Inventory {
+                            kind: block_request_inventory_type(peer_services),
+                            hash,
+                        }));
+                    }
+                    requests
+                };
+                if !block_requests.is_empty() {
+                    queue_block_requests(&mut pending_block_requests, block_requests);
+                    flush_pending_block_requests(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &mut pending_block_requests,
                     )
                     .await?;
                 }
@@ -4601,11 +4720,22 @@ async fn serve_peer_loop(
             Message::Block(block) => {
                 let hash = block.header.block_hash();
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
+                if node
+                    .chain
+                    .read()
+                    .block_height_by_hash(&block.header.prev_blockhash)
+                    .is_none()
+                {
+                    anyhow::bail!(
+                        "block {hash} has an unknown parent {}",
+                        block.header.prev_blockhash
+                    );
+                }
                 let was_stored = node.chain.read().store.contains(&hash);
                 for transaction in &block.txdata {
                     forget_transaction_requests(peers, transaction);
                 }
-                if handle_received_block(node, peers, peer_id, block, requested, false).await {
+                if handle_received_block(node, peer_id, block, requested, true, true).await? {
                     if compact_reconstruction_failed == Some(hash) {
                         compact_reconstruction_failed = None;
                     }
@@ -4723,9 +4853,9 @@ async fn serve_peer_loop(
                                     forget_transaction_requests(peers, transaction);
                                 }
                                 if handle_received_block(
-                                    node, peers, peer_id, block, requested, true,
+                                    node, peer_id, block, requested, true, false,
                                 )
-                                .await
+                                .await?
                                 {
                                     node.record_peer_block(peer_id, block_hash);
                                     if !was_stored {
@@ -4936,13 +5066,13 @@ async fn serve_peer_loop(
                         }
                         let accepted = handle_received_block(
                             node,
-                            peers,
                             peer_id,
                             block,
                             pending.requested,
                             true,
+                            false,
                         )
-                        .await;
+                        .await?;
                         if accepted {
                             if compact_reconstruction_failed == Some(block_hash) {
                                 compact_reconstruction_failed = None;
@@ -5602,67 +5732,80 @@ fn basic_filter_range(
 
 async fn handle_received_block(
     node: &Arc<Node>,
-    peers: &PeerRegistry,
     peer_id: usize,
     block: Block,
     requested: bool,
     enforce_unrequested_gate: bool,
-) -> bool {
+    disconnect_on_invalid: bool,
+) -> Result<bool> {
     let hash = block.block_hash();
     if enforce_unrequested_gate && !requested {
+        let header_work = {
+            let chain = node.chain.read();
+            chain
+                .chain_work_by_hash(&block.header.prev_blockhash)
+                .map(|work| work + block.header.work())
+        };
+        if header_work.is_none_or(|work| work < node.chain.read().minimum_chain_work()) {
+            debug!(
+                "AcceptBlockHeader: not adding new block header {hash}, missing anti-dos proof-of-work validation"
+            );
+            return Ok(false);
+        }
+        let header_inserted = {
+            let mut chain = node.chain.write();
+            if chain.block_height_by_hash(&hash).is_some() {
+                false
+            } else if let Err(error) = chain.accept_headers(std::slice::from_ref(&block.header)) {
+                debug!(%hash, %error, "rejected unrequested block header");
+                return Ok(false);
+            } else {
+                true
+            }
+        };
+        if header_inserted {
+            node.update_peer_best_known_block(peer_id, hash);
+        }
         let allowed = {
             let chain = node.chain.read();
             unrequested_block_is_allowed(&block, &chain)
         };
         if !allowed {
             debug!(%hash, "ignored unrequested low-work or distant peer block");
-            return false;
+            return Ok(false);
         }
     }
-    let (was_stored, previous_tip) = {
-        let chain = node.chain.read();
-        (chain.store.contains(&hash), chain.best_hash())
+    let result = if disconnect_on_invalid {
+        node.connect_block_from_peer(block)
+    } else {
+        node.connect_block(block)
     };
-    match node.connect_block(block) {
+    match result {
         Ok(tip) => {
             info!(%hash, height = tip.height, "accepted peer block");
             node.clear_peer_block_requests_for_hash(hash);
             node.update_peer_best_known_block(peer_id, hash);
-            // Active-tip updates are announced by the chain-event relay. A
-            // side-chain block has no tip event, so relay a newly accepted
-            // side-chain block here. Avoid announcing duplicate blocks.
-            if !was_stored
-                && tip.hash == previous_tip
-                && hash != previous_tip
-                && !node.chain.read().is_initial_block_download()
-            {
-                broadcast_inventory(
-                    node,
-                    peers,
-                    peer_id,
-                    node.config.network,
-                    Inventory {
-                        // Block announcements use MSG_BLOCK in Core even for
-                        // peers that negotiated witness relay.
-                        kind: InventoryType::Block,
-                        hash,
-                    },
-                )
-                .await;
-            }
-            true
+            Ok(true)
         }
         Err(error) => {
-            if error
-                .downcast_ref::<ValidationError>()
-                .is_some_and(ValidationError::should_mark_block_invalid)
+            if disconnect_on_invalid
+                && error
+                    .downcast_ref::<ValidationError>()
+                    .is_some_and(ValidationError::should_mark_block_invalid)
             {
                 if let Err(mark_error) = node.chain.write().mark_block_invalid(&hash) {
                     debug!(%hash, %mark_error, "failed to cache invalid peer block");
                 }
             }
+            if disconnect_on_invalid
+                && error
+                    .downcast_ref::<ValidationError>()
+                    .is_some_and(ValidationError::should_mark_block_invalid)
+            {
+                anyhow::bail!("invalid peer block {hash}: {error}");
+            }
             debug!(%hash, %error, "rejected peer block");
-            false
+            Ok(false)
         }
     }
 }
@@ -5795,8 +5938,9 @@ async fn flush_pending_block_requests(
     network: Network,
     pending: &mut Vec<Inventory>,
 ) -> Result<()> {
-    let available =
-        MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(node.peer_inflight_block_count(peer_id));
+    node.clear_peer_block_requests_for_stored_blocks(peer_id);
+    let inflight = node.peer_inflight_block_count(peer_id);
+    let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(inflight);
     if available == 0 || pending.is_empty() {
         return Ok(());
     }
@@ -5809,6 +5953,9 @@ async fn flush_pending_block_requests(
             || requests.len() >= available
         {
             remaining.push(request);
+            continue;
+        }
+        if node.block_request_in_flight(request.hash) {
             continue;
         }
         if node.track_peer_block_request(peer_id, request.hash) {
@@ -6409,16 +6556,6 @@ fn relay_address_message(
     }
 }
 
-async fn broadcast_inventory(
-    node: &Arc<Node>,
-    peers: &PeerRegistry,
-    excluded_peer: usize,
-    network: Network,
-    item: Inventory,
-) {
-    broadcast_inventory_excluding(node, peers, &[excluded_peer], network, false, item).await;
-}
-
 fn queue_peer_transaction_inventory(
     node: &Arc<Node>,
     peer_id: usize,
@@ -6761,6 +6898,10 @@ async fn send_block_relay_announcement(
     network: Network,
     hash: BlockHash,
 ) -> Result<()> {
+    node.process_peer_block_availability(peer_id);
+    if peer_knows_block_header(node, peer_state, peer_id, &hash) {
+        return Ok(());
+    }
     let compact_version = *peer_state.compact_block_version.lock();
     let announce_compact =
         *peer_state.compact_block_announce.lock() || node.peer_bip152_highbandwidth_to(peer_id);
@@ -6795,6 +6936,139 @@ async fn send_block_relay_announcement(
         &Message::Inv(vec![Inventory {
             kind: InventoryType::Block,
             hash,
+        }]),
+    )
+    .await
+}
+
+fn queue_block_relay_batch(peers: &PeerRegistry, hashes: &[BlockHash]) {
+    if hashes.is_empty() {
+        return;
+    }
+    let recipients = peers.lock().values().cloned().collect::<Vec<_>>();
+    for state in recipients {
+        let mut pending = state.pending_block_relay.lock();
+        for hash in hashes {
+            if !pending.contains(hash) {
+                pending.push(*hash);
+            }
+        }
+    }
+}
+
+async fn flush_pending_block_relay(
+    node: &Arc<Node>,
+    peer_id: usize,
+    state: &PeerState,
+    writer: &PeerWriter,
+    network: Network,
+) -> Result<()> {
+    node.process_peer_block_availability(peer_id);
+    if node.peer_inflight_block_count(peer_id) != 0 {
+        return Ok(());
+    }
+    let hashes = {
+        let mut pending = state.pending_block_relay.lock();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        std::mem::take(&mut *pending)
+    };
+    let tip = *hashes.last().expect("non-empty block relay batch");
+
+    let (headers, revert_to_inv, tip_known) = {
+        let (best_known, last_header_sent) = peer_header_state(node, state, peer_id);
+        let chain = node.chain.read();
+        let peer_knows = |hash: &BlockHash| {
+            [best_known, last_header_sent]
+                .into_iter()
+                .flatten()
+                .any(|known| chain_peer_has_header(&chain, &known, hash))
+        };
+        let mut headers = Vec::with_capacity(hashes.len());
+        let mut revert_to_inv = false;
+        let mut found_start = false;
+        for hash in &hashes {
+            let Some(header) = chain.header_by_hash(hash) else {
+                revert_to_inv = true;
+                break;
+            };
+            if !found_start {
+                if peer_knows(hash) {
+                    continue;
+                }
+                if !peer_knows(&header.prev_blockhash) {
+                    revert_to_inv = true;
+                    break;
+                }
+                found_start = true;
+            } else if headers.last().is_some_and(|previous: &BlockHeader| {
+                header.prev_blockhash != previous.block_hash()
+            }) {
+                revert_to_inv = true;
+                break;
+            }
+            headers.push(header);
+        }
+        (headers, revert_to_inv, peer_knows(&tip))
+    };
+    let compact_version = *state.compact_block_version.lock();
+    let announce_compact =
+        *state.compact_block_announce.lock() || node.peer_bip152_highbandwidth_to(peer_id);
+    if !tip_known
+        && announce_compact
+        && let Some(version) = compact_version
+        && let Some(compact) = compact_block_for_inventory(
+            node,
+            &Inventory {
+                kind: InventoryType::Block,
+                hash: tip,
+            },
+            version,
+        )?
+    {
+        send_message(
+            node,
+            peer_id,
+            writer,
+            network,
+            &Message::CompactBlock(compact),
+        )
+        .await?;
+        *state.last_header_sent.lock() = Some(tip);
+        return Ok(());
+    }
+    if !revert_to_inv
+        && !headers.is_empty()
+        && *state.send_headers.lock()
+        && hashes.len() <= MAX_BLOCKS_TO_ANNOUNCE
+    {
+        if send_message(
+            node,
+            peer_id,
+            writer,
+            network,
+            &Message::Headers(headers.clone()),
+        )
+        .await
+        .is_ok()
+        {
+            *state.last_header_sent.lock() = headers.last().map(BlockHeader::block_hash);
+        }
+        return Ok(());
+    }
+
+    if headers.is_empty() && !revert_to_inv || tip_known {
+        return Ok(());
+    }
+    send_message(
+        node,
+        peer_id,
+        writer,
+        network,
+        &Message::Inv(vec![Inventory {
+            kind: InventoryType::Block,
+            hash: tip,
         }]),
     )
     .await
@@ -6846,6 +7120,13 @@ async fn broadcast_inventory_excluding(
             item.kind,
             InventoryType::Block | InventoryType::WitnessBlock | InventoryType::CompactBlock
         ) {
+            // Core's block relay path consults PeerHasHeader before sending
+            // either headers or inventory.  A peer that announced this
+            // header (or learned it from an earlier relay) must not receive
+            // the same tip back through the chain-event broadcaster.
+            if peer_knows_block_header(node, state.as_ref(), peer_id, &item.hash) {
+                continue;
+            }
             let compact_version = *state.compact_block_version.lock();
             let announce_compact =
                 *state.compact_block_announce.lock() || node.peer_bip152_highbandwidth_to(peer_id);
@@ -6914,6 +7195,49 @@ async fn broadcast_inventory_excluding(
             node.record_peer_inv_sequence(peer_id, node.mempool.read().sequence());
         }
     }
+}
+
+fn peer_header_state(
+    node: &Arc<Node>,
+    state: &PeerState,
+    peer_id: usize,
+) -> (Option<BlockHash>, Option<BlockHash>) {
+    let best_known = node
+        .peer_infos()
+        .into_iter()
+        .find(|peer| peer.id == peer_id)
+        .and_then(|peer| peer.best_known_block);
+    let last_header_sent = *state.last_header_sent.lock();
+    (best_known, last_header_sent)
+}
+
+fn chain_peer_has_header(
+    chain: &crate::chain::ChainState,
+    known: &BlockHash,
+    hash: &BlockHash,
+) -> bool {
+    let Some(hash_height) = chain.block_height_by_hash(hash) else {
+        return false;
+    };
+    let Some(known_height) = chain.block_height_by_hash(known) else {
+        return false;
+    };
+    known_height >= hash_height && chain.ancestor_hash_at_height(known, hash_height) == Some(*hash)
+}
+
+fn peer_knows_block_header(
+    node: &Arc<Node>,
+    state: &PeerState,
+    peer_id: usize,
+    hash: &BlockHash,
+) -> bool {
+    let (best_known, last_header_sent) = peer_header_state(node, state, peer_id);
+    let chain = node.chain.read();
+    let known = [best_known, last_header_sent]
+        .into_iter()
+        .flatten()
+        .any(|known| chain_peer_has_header(&chain, &known, hash));
+    known
 }
 
 fn compact_block_for_inventory(
@@ -7246,6 +7570,23 @@ mod tests {
 
     use crate::config::OnlyNet;
     use crate::{Config, Node};
+
+    #[test]
+    fn block_relay_cursor_tracks_the_last_announced_block() {
+        let previous = BlockHash::from_byte_array([1; 32]);
+        let event_tip = BlockHash::from_byte_array([0x42; 32]);
+        let announced = (2..=MAX_BLOCKS_TO_ANNOUNCE + 2)
+            .map(|value| BlockHash::from_byte_array([value as u8; 32]))
+            .collect::<Vec<_>>();
+        let batch = &announced[..MAX_BLOCKS_TO_ANNOUNCE];
+
+        assert_eq!(
+            block_relay_cursor_after_batch(previous, batch),
+            batch[MAX_BLOCKS_TO_ANNOUNCE - 1]
+        );
+        assert_eq!(block_relay_cursor_after_batch(previous, &[]), previous);
+        assert_ne!(block_relay_cursor_after_batch(previous, batch), event_tip);
+    }
 
     #[test]
     fn getblocks_continuation_is_consumed_once() {
@@ -8466,6 +8807,8 @@ mod tests {
             wtxid_relay: parking_lot::Mutex::new(true),
             send_headers: parking_lot::Mutex::new(false),
             send_headers_sent: parking_lot::Mutex::new(false),
+            last_header_sent: parking_lot::Mutex::new(None),
+            pending_block_relay: parking_lot::Mutex::new(Vec::new()),
             last_headers_request: parking_lot::Mutex::new(None),
             last_headers_request_time: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),
@@ -10904,6 +11247,8 @@ mod tests {
             wtxid_relay: parking_lot::Mutex::new(false),
             send_headers: parking_lot::Mutex::new(false),
             send_headers_sent: parking_lot::Mutex::new(false),
+            last_header_sent: parking_lot::Mutex::new(None),
+            pending_block_relay: parking_lot::Mutex::new(Vec::new()),
             last_headers_request: parking_lot::Mutex::new(None),
             last_headers_request_time: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),

@@ -86,6 +86,7 @@ use crate::fee_estimator::{FeeEstimator, RawFeeEstimate};
 use crate::mempool::{
     Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
 };
+use crate::storage::BlockStoreReader;
 
 // Core assigns live peer IDs from zero. Address-manager entries use a
 // separate sentinel so peer 0 remains distinguishable from an unconnected
@@ -1431,6 +1432,7 @@ pub struct Node {
     _blocks_dir_lock: Option<File>,
     asmap: Option<Arc<AsMap>>,
     pub chain: Arc<RwLock<ChainState>>,
+    pub(crate) block_store_reader: BlockStoreReader,
     pub mempool: Arc<RwLock<Mempool>>,
     pub events: broadcast::Sender<ChainEvent>,
     pub mempool_events: broadcast::Sender<MempoolEvent>,
@@ -1670,6 +1672,7 @@ impl Node {
                 deployment_parameters,
             )
             .map_err(core_startup_chain_error)?;
+        let block_store_reader = chain.block_store_reader();
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
         chain.configure_script_cache_size_mib(config.max_sig_cache_mib);
@@ -1852,6 +1855,7 @@ impl Node {
             _blocks_dir_lock: blocks_dir_lock,
             asmap,
             chain: Arc::new(RwLock::new(chain)),
+            block_store_reader,
             mempool: Arc::new(RwLock::new(mempool)),
             events,
             mempool_events,

@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions, create_dir_all, remove_file, rename};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -20,7 +21,7 @@ use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use rand::random;
 use serde::{Deserialize, Serialize};
 
@@ -216,11 +217,60 @@ fn init_xor_key(directory: &Path, use_xor: bool) -> Result<XorKey> {
     Ok(key)
 }
 
+#[derive(Clone)]
+pub struct BlockStoreReader {
+    file: Arc<RwLock<File>>,
+    index: Arc<RwLock<HashMap<BlockHash, Record>>>,
+    xor_key: XorKey,
+}
+
+impl BlockStoreReader {
+    fn new(file: File, index: HashMap<BlockHash, Record>, xor_key: XorKey) -> Self {
+        Self {
+            file: Arc::new(RwLock::new(file)),
+            index: Arc::new(RwLock::new(index)),
+            xor_key,
+        }
+    }
+
+    pub fn get(&self, hash: &BlockHash) -> Result<Option<Block>> {
+        let Some(record) = self.index.read().get(hash).copied() else {
+            return Ok(None);
+        };
+        let file = self.file.read();
+        let mut length = [0u8; 4];
+        read_block_exact_at(&file, &mut length, record.offset)?;
+        self.xor_key.apply(&mut length, record.offset);
+        let actual = u32::from_le_bytes(length);
+        if actual != record.length {
+            bail!("block store index disagrees with record length");
+        }
+        let mut bytes = vec![0u8; record.length as usize];
+        read_block_exact_at(&file, &mut bytes, record.offset + 4)?;
+        self.xor_key.apply(&mut bytes, record.offset + 4);
+        let block: Block = deserialize(&bytes).context("decoding stored block")?;
+        if block.block_hash() != *hash {
+            bail!("stored block hash does not match block index");
+        }
+        Ok(Some(block))
+    }
+
+    fn insert(&self, hash: BlockHash, record: Record) {
+        self.index.write().insert(hash, record);
+    }
+
+    fn replace(&self, file: File, index: HashMap<BlockHash, Record>) {
+        *self.file.write() = file;
+        *self.index.write() = index;
+    }
+}
+
 pub struct BlockStore {
     path: PathBuf,
     file: File,
     index_file: File,
     index: HashMap<BlockHash, Record>,
+    serving_reader: BlockStoreReader,
     undo_file: File,
     undo_index_file: File,
     undo_index: HashMap<BlockHash, Record>,
@@ -295,11 +345,13 @@ impl BlockStore {
                 index
             }
         };
+        let serving_reader = BlockStoreReader::new(file.try_clone()?, index.clone(), xor_key);
         Ok(Self {
             path,
             file,
             index_file,
             index,
+            serving_reader,
             undo_file,
             undo_index_file,
             undo_index,
@@ -360,11 +412,13 @@ impl BlockStore {
                 .with_context(|| format!("scanning {}", undo_path.display()))?,
         };
 
+        let serving_reader = BlockStoreReader::new(file.try_clone()?, index.clone(), xor_key);
         Ok(Self {
             path,
             file,
             index_file,
             index,
+            serving_reader,
             undo_file,
             undo_index_file,
             undo_index,
@@ -462,6 +516,10 @@ impl BlockStore {
         self.index.contains_key(hash)
     }
 
+    pub fn reader(&self) -> BlockStoreReader {
+        self.serving_reader.clone()
+    }
+
     /// Return the record offset in the implementation's single block data
     /// file. This is exposed for the experimental getblocklocations RPC.
     pub fn block_location(&self, hash: &BlockHash) -> Option<u64> {
@@ -483,6 +541,18 @@ impl BlockStore {
     }
 
     pub fn insert(&mut self, block: &Block) -> Result<BlockHash> {
+        self.insert_with_sync(block, true)
+    }
+
+    /// Append a block without forcing a filesystem sync for every record.
+    /// Headers-first downloads can deliver thousands of tiny side-chain
+    /// blocks; the owning chainstate flushes the append-only stores at the
+    /// end of the reorg (and on shutdown), while keeping the hot path batched.
+    pub fn insert_unsynced(&mut self, block: &Block) -> Result<BlockHash> {
+        self.insert_with_sync(block, false)
+    }
+
+    fn insert_with_sync(&mut self, block: &Block, sync: bool) -> Result<BlockHash> {
         let hash = block.block_hash();
         if self.index.contains_key(&hash) {
             return Ok(hash);
@@ -498,16 +568,28 @@ impl BlockStore {
         record.extend_from_slice(&bytes);
         self.xor_key.apply(&mut record, offset);
         self.file.write_all(&record)?;
-        self.file.sync_data()?;
-        persist_index_entry(
+        if sync {
+            self.file.sync_data()?;
+        }
+        persist_index_entry_with_sync(
             &mut self.index_file,
             offset + 4 + bytes.len() as u64,
             hash,
             Record { offset, length },
+            sync,
         )?;
         self.index.insert(hash, Record { offset, length });
+        self.serving_reader.insert(hash, Record { offset, length });
         self.cache_block(hash, block.clone(), bytes.len());
         Ok(hash)
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        self.index_file.sync_data()?;
+        self.undo_file.sync_data()?;
+        self.undo_index_file.sync_data()?;
+        Ok(())
     }
 
     pub fn get(&mut self, hash: &BlockHash) -> Result<Option<Block>> {
@@ -535,6 +617,14 @@ impl BlockStore {
         }
         self.cache_block(*hash, block.clone(), record.length as usize);
         Ok(Some(block))
+    }
+
+    /// Read a block without touching the mutable LRU cache or the seek
+    /// cursor owned by the normal chain-state path. Peer uploads can use this
+    /// method while holding only a shared ChainState lock, so serving an old
+    /// branch cannot delay validation of a competing active candidate.
+    pub fn get_readonly(&self, hash: &BlockHash) -> Result<Option<Block>> {
+        self.serving_reader.get(hash)
     }
 
     pub fn get_undo(&mut self, hash: &BlockHash) -> Result<Option<Vec<Vec<TxOut>>>> {
@@ -615,6 +705,8 @@ impl BlockStore {
         self.file = file;
         self.index = index;
         rewrite_index(&mut self.index_file, data_len, &self.index)?;
+        self.serving_reader
+            .replace(self.file.try_clone()?, self.index.clone());
 
         let undo_path = self
             .path
@@ -641,6 +733,27 @@ impl BlockStore {
         rewrite_index(&mut self.undo_index_file, undo_data_len, &self.undo_index)?;
         self.clear_block_cache();
         Ok(())
+    }
+}
+
+fn read_block_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let read = file.read_at(bytes, offset)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "short positional read",
+            ));
+        }
+        bytes = &mut bytes[read..];
+        offset = offset.saturating_add(read as u64);
+    }
+    Ok(())
+}
+
+impl Drop for BlockStore {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -3087,6 +3200,14 @@ impl ElectrumBlockStore {
     }
 
     pub fn insert(&mut self, block: &Block) -> Result<BlockHash> {
+        self.insert_with_sync(block, true)
+    }
+
+    pub fn insert_unsynced(&mut self, block: &Block) -> Result<BlockHash> {
+        self.insert_with_sync(block, false)
+    }
+
+    fn insert_with_sync(&mut self, block: &Block, sync: bool) -> Result<BlockHash> {
         let hash = block.block_hash();
         if self.index.contains_key(&hash) {
             return Ok(hash);
@@ -3104,16 +3225,25 @@ impl ElectrumBlockStore {
             .context("Electrum transaction record length does not fit u32")?;
         self.file.write_all(&length.to_le_bytes())?;
         self.file.write_all(&bytes)?;
-        self.file.sync_data()?;
+        if sync {
+            self.file.sync_data()?;
+        }
         let record = Record { offset, length };
-        persist_index_entry(
+        persist_index_entry_with_sync(
             &mut self.index_file,
             offset + 4 + u64::from(length),
             hash,
             record,
+            sync,
         )?;
         self.index.insert(hash, record);
         Ok(hash)
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        self.index_file.sync_data()?;
+        Ok(())
     }
 
     pub fn transaction(
@@ -3169,6 +3299,12 @@ impl ElectrumBlockStore {
         let transactions: Vec<Transaction> =
             deserialize(&bytes[32..]).context("decoding stored Electrum transactions")?;
         Ok(Some(transactions))
+    }
+}
+
+impl Drop for ElectrumBlockStore {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }
 
@@ -3554,13 +3690,25 @@ fn persist_index_entry(
     hash: BlockHash,
     record: Record,
 ) -> Result<()> {
+    persist_index_entry_with_sync(file, data_len, hash, record, true)
+}
+
+fn persist_index_entry_with_sync(
+    file: &mut File,
+    data_len: u64,
+    hash: BlockHash,
+    record: Record,
+    sync: bool,
+) -> Result<()> {
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&data_len.to_le_bytes())?;
     file.seek(SeekFrom::End(0))?;
     file.write_all(&hash.to_byte_array())?;
     file.write_all(&record.offset.to_le_bytes())?;
     file.write_all(&record.length.to_le_bytes())?;
-    file.sync_data()?;
+    if sync {
+        file.sync_data()?;
+    }
     Ok(())
 }
 

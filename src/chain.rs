@@ -30,8 +30,8 @@ use sha2::{Digest, Sha256};
 use crate::config::{DEFAULT_SCRIPT_CHECK_THREADS, MAX_SCRIPT_CHECK_THREADS};
 use crate::muhash::MuHash3072;
 use crate::storage::{
-    BlockStore, ChainstateStore, CoinStatsRecord, CoinStatsStore, ElectrumBlockStore,
-    ElectrumHistoryStore, FilterStore, StoredUtxo, UtxoStore,
+    BlockStore, BlockStoreReader, ChainstateStore, CoinStatsRecord, CoinStatsStore,
+    ElectrumBlockStore, ElectrumHistoryStore, FilterStore, StoredUtxo, UtxoStore,
 };
 use crate::validation::{self, ValidationError};
 
@@ -502,6 +502,16 @@ struct BlockApplication {
     metrics: CoinStatsBlockMetrics,
 }
 
+/// Keep the most recently validated side-chain UTXO state so sequential
+/// headers-first downloads do not replay the whole fork from genesis for
+/// every body.  A single rolling entry is enough for the normal in-order
+/// download path; callers fall back to full replay when a branch arrives out
+/// of order.
+struct SideChainUtxoCache {
+    hash: BlockHash,
+    utxos: HashMap<OutPoint, UtxoEntry>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownChainTip {
     pub hash: BlockHash,
@@ -899,6 +909,7 @@ pub struct ChainState {
     fast_prune: bool,
     utxos: HashMap<OutPoint, UtxoEntry>,
     utxos_materialized: bool,
+    side_chain_utxos: Option<SideChainUtxoCache>,
     tx_index: HashMap<Txid, ActiveTxLocation>,
     // Most txids have one active-chain location. Keep duplicate locations
     // separately so the Core-style txindex remains a latest-location map
@@ -1339,6 +1350,7 @@ impl ChainState {
             fast_prune: false,
             utxos: HashMap::new(),
             utxos_materialized: true,
+            side_chain_utxos: None,
             tx_index: HashMap::new(),
             tx_index_duplicates: HashMap::new(),
             tx_index_all: HashMap::new(),
@@ -3454,6 +3466,14 @@ impl ChainState {
         self.store.get(hash)
     }
 
+    pub fn block_for_serving(&self, hash: &BlockHash) -> Result<Option<Block>> {
+        self.store.get_readonly(hash)
+    }
+
+    pub fn block_store_reader(&self) -> BlockStoreReader {
+        self.store.reader()
+    }
+
     pub fn active_blocks_after(&mut self, previous_tip: BlockHash) -> Result<Vec<Block>> {
         if previous_tip == self.best_hash() {
             return Ok(Vec::new());
@@ -4805,9 +4825,9 @@ impl ChainState {
                 height,
                 Amount::MAX_MONEY.to_sat(),
             )?;
-            self.store.insert(&block)?;
+            self.insert_side_chain_body(&block)?;
             if let Some(store) = self.electrum_store.as_mut() {
-                store.insert(&block)?;
+                store.insert_unsynced(&block)?;
             }
             self.index_all_transactions(&block, height);
             self.block_index.insert(
@@ -4820,7 +4840,6 @@ impl ChainState {
             );
             self.assign_header_sequence_id(hash);
             self.assign_block_sequence_id(hash);
-            self.persist_metadata()?;
             bail!("block {} has a parent whose full body is unavailable", hash)
         }
 
@@ -4839,52 +4858,106 @@ impl ChainState {
             self.median_time_past_for_parent(parent_hash),
         )?;
         self.validate_block_structure(&block, self.network, height, Amount::MAX_MONEY.to_sat())?;
-        let Some(parent_utxos) = self.utxos_for_block(parent_hash)? else {
-            // Preserve a validated side-chain body even when its ancestry is
-            // not connected to the active UTXO set. Core keeps this body
-            // available for getblock and later reprocessing after the missing
-            // ancestor arrives, while postponing script validation.
-            self.store.insert(&block)?;
-            if let Some(store) = self.electrum_store.as_mut() {
-                store.insert(&block)?;
-            }
-            self.index_all_transactions(&block, height);
-            self.block_index.insert(
-                hash,
-                BlockNode {
-                    header: block.header,
-                    height,
-                    chain_work: parent.chain_work + block.header.work(),
-                },
-            );
-            self.assign_header_sequence_id(hash);
-            self.assign_block_sequence_id(hash);
-            self.persist_metadata()?;
-            bail!("side-chain parent UTXO state is unavailable")
-        };
-        if let Err(error) = self.validate_block_transactions(
-            &block,
-            height,
-            &parent_utxos,
-            self.median_time_past_for_parent(parent_hash),
-        ) {
-            if retain_invalid_body
-                && error
-                    .downcast_ref::<ValidationError>()
-                    .is_some_and(ValidationError::should_mark_block_invalid)
-            {
-                self.store.insert(&block)?;
-                if let Some(store) = self.electrum_store.as_mut() {
-                    store.insert(&block)?;
+        // Once BIP34 is active, a coinbase-only block has no UTXO-dependent
+        // transaction validation: its height commits to a unique coinbase
+        // transaction ID, and there are no spends to look up.  Headers-first
+        // reorg tests (and ordinary mining bursts) commonly consist of such
+        // blocks; avoid rebuilding a side-chain UTXO map for each one while
+        // retaining the full path for mixed-transaction blocks.
+        let coinbase_only =
+            block.txdata.len() == 1 && height >= self.deployment_parameters.buried.bip34;
+        if coinbase_only {
+            self.side_chain_utxos = None;
+            let empty_utxos = HashMap::new();
+            if let Err(error) = self.validate_block_transactions(
+                &block,
+                height,
+                &empty_utxos,
+                self.median_time_past_for_parent(parent_hash),
+            ) {
+                if retain_invalid_body
+                    && error
+                        .downcast_ref::<ValidationError>()
+                        .is_some_and(ValidationError::should_mark_block_invalid)
+                {
+                    self.insert_side_chain_body(&block)?;
+                    if let Some(store) = self.electrum_store.as_mut() {
+                        store.insert_unsynced(&block)?;
+                    }
+                    self.assign_block_sequence_id(hash);
                 }
-                self.assign_block_sequence_id(hash);
-                self.persist_metadata()?;
+                return Err(error);
             }
-            return Err(error);
+        } else {
+            let parent_utxos = if self
+                .side_chain_utxos
+                .as_ref()
+                .is_some_and(|cache| cache.hash == parent_hash)
+            {
+                self.side_chain_utxos.take().map(|cache| cache.utxos)
+            } else {
+                self.utxos_for_block(parent_hash)?
+            };
+            let Some(mut parent_utxos) = parent_utxos else {
+                // Preserve a validated side-chain body even when its ancestry
+                // is not connected to the active UTXO set. Core keeps this
+                // body available for getblock and later reprocessing after
+                // the missing ancestor arrives, while postponing script
+                // validation.
+                self.insert_side_chain_body(&block)?;
+                if let Some(store) = self.electrum_store.as_mut() {
+                    store.insert_unsynced(&block)?;
+                }
+                self.index_all_transactions(&block, height);
+                self.block_index.insert(
+                    hash,
+                    BlockNode {
+                        header: block.header,
+                        height,
+                        chain_work: parent.chain_work + block.header.work(),
+                    },
+                );
+                self.assign_header_sequence_id(hash);
+                self.assign_block_sequence_id(hash);
+                bail!("side-chain parent UTXO state is unavailable")
+            };
+            let application = match self.validate_block_transactions(
+                &block,
+                height,
+                &parent_utxos,
+                self.median_time_past_for_parent(parent_hash),
+            ) {
+                Ok(application) => application,
+                Err(error) => {
+                    if retain_invalid_body
+                        && error
+                            .downcast_ref::<ValidationError>()
+                            .is_some_and(ValidationError::should_mark_block_invalid)
+                    {
+                        self.insert_side_chain_body(&block)?;
+                        if let Some(store) = self.electrum_store.as_mut() {
+                            store.insert_unsynced(&block)?;
+                        }
+                        self.assign_block_sequence_id(hash);
+                    }
+                    return Err(error);
+                }
+            };
+            apply_block_to_utxos(
+                &mut parent_utxos,
+                &block,
+                height,
+                self.median_time_past_for_parent(parent_hash),
+                application.spent_entries,
+            );
+            self.side_chain_utxos = Some(SideChainUtxoCache {
+                hash,
+                utxos: parent_utxos,
+            });
         }
-        self.store.insert(&block)?;
+        self.insert_side_chain_body(&block)?;
         if let Some(store) = self.electrum_store.as_mut() {
-            store.insert(&block)?;
+            store.insert_unsynced(&block)?;
         }
         self.index_all_transactions(&block, height);
         let chain_work = parent.chain_work + block.header.work();
@@ -4899,12 +4972,20 @@ impl ChainState {
         self.assign_header_sequence_id(hash);
         self.assign_block_sequence_id(hash);
         if chain_work > self.tip().work {
+            self.store.flush()?;
+            if let Some(store) = self.electrum_store.as_mut() {
+                store.flush()?;
+            }
             self.activate_chain(hash)?;
         }
         self.process_orphans(hash);
         self.process_known_children(hash);
         self.update_ibd_status();
         Ok(self.tip())
+    }
+
+    fn insert_side_chain_body(&mut self, block: &Block) -> Result<()> {
+        self.store.insert_unsynced(block).map(|_| ())
     }
 
     fn process_orphans(&mut self, parent_hash: BlockHash) {
@@ -6297,6 +6378,9 @@ impl ChainState {
     }
 
     fn has_invalid_ancestor(&self, hash: BlockHash) -> bool {
+        if self.invalid_blocks.is_empty() {
+            return false;
+        }
         let mut cursor = hash;
         loop {
             if self.invalid_blocks.contains(&cursor) {
@@ -7768,6 +7852,7 @@ fn open_background_replay_state(
         fast_prune: false,
         utxos: HashMap::new(),
         utxos_materialized: true,
+        side_chain_utxos: None,
         tx_index: HashMap::new(),
         tx_index_duplicates: HashMap::new(),
         tx_index_all: HashMap::new(),

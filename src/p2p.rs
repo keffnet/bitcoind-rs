@@ -48,6 +48,7 @@ use crate::validation::ValidationError;
 use crate::wire::{
     self, GetHeadersMessage, Inventory, InventoryType, Message, SendTxRcnclMessage, VersionMessage,
 };
+
 use crate::{
     AddrResponseCacheKey, MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, PRIVATE_BROADCAST_RETRY_SECS,
     PeerRegistrationOptions, StartupLatch, unix_time_seconds,
@@ -3755,7 +3756,7 @@ async fn serve_peer_loop(
                 .await?;
                 continue;
             }
-            _ = block_download_interval.tick(), if version_received && verack_received && !reader.has_partial_frame() => {
+            _ = block_download_interval.tick(), if version_received && verack_received => {
                 if handle_headers_download_timeout(node, peer_id, peer_state)? {
                     request_headers(node, peer_id, writer, peer_state).await?;
                     continue;
@@ -4230,11 +4231,14 @@ async fn serve_peer_loop(
                     .await?;
                     continue;
                 }
-                let headers = node.chain.read().headers_for_getheaders(
-                    &request.locator_hashes,
-                    request.stop_hash,
-                    STALE_RELAY_AGE_LIMIT_SECS,
-                );
+                let headers = {
+                    let chain = node.chain.read();
+                    chain.headers_for_getheaders(
+                        &request.locator_hashes,
+                        request.stop_hash,
+                        STALE_RELAY_AGE_LIMIT_SECS,
+                    )
+                };
                 if let Some(headers) = headers {
                     let last_header = headers
                         .last()
@@ -4309,6 +4313,14 @@ async fn serve_peer_loop(
                     anyhow::bail!("header with invalid proof of work");
                 }
 
+                // Any connecting headers response satisfies the outstanding
+                // request, including a short low-work response that Core
+                // discards after its anti-DoS check.  Clearing this before
+                // that check lets a subsequent block announcement trigger a
+                // fresh getheaders request immediately.
+                *peer_state.last_headers_request.lock() = None;
+                *peer_state.last_headers_request_time.lock() = None;
+
                 let mut headers_to_accept = headers;
                 let mut request_sync_locator = None;
                 let mut sync_finished = false;
@@ -4328,7 +4340,7 @@ async fn serve_peer_loop(
                         request_sync_locator = Some(locator);
                     }
                     sync_finished = result.finished;
-                } else if request_more_headers {
+                } else {
                     let low_work_state = {
                         let chain = node.chain.read();
                         let parent_hash = headers_to_accept[0].prev_blockhash;
@@ -4351,7 +4363,19 @@ async fn serve_peer_loop(
                     };
                     if let Some((parent_header, parent_work, claimed_work, threshold)) =
                         low_work_state
+                        && add_work_saturating(parent_work, claimed_work) < threshold
+                        && !peer_state.permissions.contains(PeerPermissions::DOWNLOAD)
                     {
+                        if !request_more_headers {
+                            let height = node
+                                .chain
+                                .read()
+                                .block_height_by_hash(&headers_to_accept[0].prev_blockhash)
+                                .unwrap_or_default()
+                                .saturating_add(headers_to_accept.len() as u32);
+                            debug!("[net] Ignoring low-work chain (height={height})");
+                            continue;
+                        }
                         if add_work_saturating(parent_work, claimed_work) < threshold {
                             let parent_hash = headers_to_accept[0].prev_blockhash;
                             let (parent_height, parent_mtp) = {
@@ -4448,6 +4472,15 @@ async fn serve_peer_loop(
                         .collect::<Vec<_>>();
                     (last_hash, hashes)
                 };
+                if !hashes.is_empty() {
+                    let chain = node.chain.read();
+                    if chain.is_initial_block_download()
+                        && let Some(hash) = last_hash
+                        && let Some(height) = chain.block_height_by_hash(&hash)
+                    {
+                        info!("Synchronizing blockheaders, height: {height}");
+                    }
+                }
                 if let Some(hash) = last_hash {
                     node.update_peer_best_known_block(peer_id, hash);
                 }
@@ -4462,12 +4495,20 @@ async fn serve_peer_loop(
                     let chain = node.chain.read();
                     let peer_best_height =
                         peer_best_known.and_then(|hash| chain.block_height_by_hash(&hash));
+                    let direct_fetch_allowed = chain.header(chain.height()).is_some_and(|header| {
+                        can_direct_fetch(
+                            header.time,
+                            crate::time::unix_time_i64(),
+                            chain.network.params().pow_target_spacing,
+                        )
+                    });
                     // Headers for a lower-work side chain are useful for
                     // getchaintips and later getblockfrompeer requests, but
                     // Core does not immediately download their bodies.  A
                     // body request is needed here only when this header
                     // batch can make the advertised chain the active one.
                     let request_candidate_bodies = request_block_bodies
+                        && direct_fetch_allowed
                         && hashes
                             .last()
                             .and_then(|hash| chain.chain_work_by_hash(hash))
@@ -4501,7 +4542,7 @@ async fn serve_peer_loop(
                             branch
                         }
                     } else {
-                        hashes.clone()
+                        Vec::new()
                     };
                     // Core uses a compact-block getdata request for a
                     // single direct-fetch candidate when the peer has
@@ -4511,13 +4552,7 @@ async fn serve_peer_loop(
                     let request_compact = request_hashes.len() == 1
                         && !node.config.blocksonly
                         && peer_state.compact_block_version.lock().is_some()
-                        && chain.header(chain.height()).is_some_and(|header| {
-                            can_direct_fetch(
-                                header.time,
-                                crate::time::unix_time_i64(),
-                                chain.network.params().pow_target_spacing,
-                            )
-                        });
+                        && direct_fetch_allowed;
                     request_hashes
                         .into_iter()
                         .filter(|hash| {
@@ -4564,7 +4599,14 @@ async fn serve_peer_loop(
                     request_headers_with_locator(node, peer_id, writer, peer_state, locator, true)
                         .await?;
                 } else if request_more_headers && headers_sync.is_none() {
-                    request_headers(node, peer_id, writer, peer_state).await?;
+                    if let Some(last_hash) = last_hash {
+                        request_headers_from_start_hash(
+                            node, peer_id, writer, peer_state, last_hash,
+                        )
+                        .await?;
+                    } else {
+                        request_headers(node, peer_id, writer, peer_state).await?;
+                    }
                 }
             }
             Message::Inv(items) => {
@@ -4765,20 +4807,36 @@ async fn serve_peer_loop(
                 for item in items {
                     match item.kind {
                         InventoryType::Block | InventoryType::WitnessBlock => {
-                            if !node
-                                .chain
-                                .read()
-                                .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
-                            {
+                            let eligible = {
+                                let chain = node.chain.read();
+                                if !chain
+                                    .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
+                                {
+                                    false
+                                } else {
+                                    let Some(height) = chain.block_height_by_hash(&item.hash)
+                                    else {
+                                        continue;
+                                    };
+                                    if network_limited_block_request_is_too_old(
+                                        chain.is_network_limited(),
+                                        chain.height(),
+                                        height,
+                                        peer_state.permissions,
+                                    ) {
+                                        anyhow::bail!(
+                                            "block is below the network-limited serving window"
+                                        );
+                                    }
+                                    true
+                                }
+                            };
+                            if !eligible {
                                 continue;
                             }
-                            if peer_requests_too_old_network_limited_block(
-                                node,
-                                &item.hash,
-                                peer_state.permissions,
-                            ) {
-                                anyhow::bail!("block is below the network-limited serving window");
-                            }
+                            let Some(block) = node.block_store_reader.get(&item.hash)? else {
+                                continue;
+                            };
                             if node.historical_block_serving_limit_reached(
                                 &item.hash,
                                 false,
@@ -4786,35 +4844,32 @@ async fn serve_peer_loop(
                             ) {
                                 anyhow::bail!("historical block serving limit reached");
                             }
-                            let block = node.chain.write().block(&item.hash)?;
-                            if let Some(block) = block {
-                                let block = if item.kind == InventoryType::Block {
-                                    block_without_witness(&block)
-                                } else {
-                                    block
-                                };
-                                send_message(
-                                    node,
-                                    peer_id,
-                                    writer,
-                                    node.config.network,
-                                    &Message::Block(block),
-                                )
-                                .await?;
-                                maybe_send_getblocks_continuation(
-                                    node,
-                                    peer_id,
-                                    writer,
-                                    node.config.network,
-                                    peer_state,
-                                    item.hash,
-                                )
-                                .await?;
-                            }
+                            let block = if item.kind == InventoryType::Block {
+                                block_without_witness(&block)
+                            } else {
+                                block
+                            };
+                            send_message(
+                                node,
+                                peer_id,
+                                writer,
+                                node.config.network,
+                                &Message::Block(block),
+                            )
+                            .await?;
+                            maybe_send_getblocks_continuation(
+                                node,
+                                peer_id,
+                                writer,
+                                node.config.network,
+                                peer_state,
+                                item.hash,
+                            )
+                            .await?;
                         }
                         InventoryType::CompactBlock => {
                             let (block, recent, direct_fetch_allowed) = {
-                                let mut chain = node.chain.write();
+                                let chain = node.chain.read();
                                 if !chain
                                     .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
                                 {
@@ -4832,7 +4887,7 @@ async fn serve_peer_loop(
                                             chain.network.params().pow_target_spacing,
                                         )
                                     });
-                                let Some(block) = chain.block(&item.hash)? else {
+                                let Some(block) = chain.block_for_serving(&item.hash)? else {
                                     continue;
                                 };
                                 (block, recent, direct_fetch_allowed)
@@ -4896,20 +4951,36 @@ async fn serve_peer_loop(
                             .await?;
                         }
                         InventoryType::FilteredBlock => {
-                            if !node
-                                .chain
-                                .read()
-                                .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
-                            {
+                            let eligible = {
+                                let chain = node.chain.read();
+                                if !chain
+                                    .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
+                                {
+                                    false
+                                } else {
+                                    let Some(height) = chain.block_height_by_hash(&item.hash)
+                                    else {
+                                        continue;
+                                    };
+                                    if network_limited_block_request_is_too_old(
+                                        chain.is_network_limited(),
+                                        chain.height(),
+                                        height,
+                                        peer_state.permissions,
+                                    ) {
+                                        anyhow::bail!(
+                                            "block is below the network-limited serving window"
+                                        );
+                                    }
+                                    true
+                                }
+                            };
+                            if !eligible {
                                 continue;
                             }
-                            if peer_requests_too_old_network_limited_block(
-                                node,
-                                &item.hash,
-                                peer_state.permissions,
-                            ) {
-                                anyhow::bail!("block is below the network-limited serving window");
-                            }
+                            let Some(block) = node.block_store_reader.get(&item.hash)? else {
+                                continue;
+                            };
                             if node.historical_block_serving_limit_reached(
                                 &item.hash,
                                 true,
@@ -4917,8 +4988,6 @@ async fn serve_peer_loop(
                             ) {
                                 anyhow::bail!("historical block serving limit reached");
                             }
-                            let block = node.chain.write().block(&item.hash)?;
-                            let Some(block) = block else { continue };
                             let matching = {
                                 let mut filter = bloom_filter.lock();
                                 let Some(filter) = filter.as_mut() else {
@@ -7046,6 +7115,17 @@ async fn request_initial_headers(
     request_headers_with_locator(node, peer_id, writer, peer_state, locator, false).await
 }
 
+async fn request_headers_from_start_hash(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    peer_state: &PeerState,
+    start_hash: BlockHash,
+) -> Result<()> {
+    let locator = node.chain.read().block_locator_hashes_from(start_hash);
+    request_headers_with_locator(node, peer_id, writer, peer_state, locator, false).await
+}
+
 async fn request_headers_with_locator(
     node: &Arc<Node>,
     peer_id: usize,
@@ -7994,7 +8074,7 @@ fn compact_block_for_inventory(
     ) {
         return Ok(None);
     }
-    let block = node.chain.write().block(&item.hash)?;
+    let block = node.chain.read().block_for_serving(&item.hash)?;
     block
         .map(|block| {
             HeaderAndShortIds::from_block(&block, random(), version as u32, &[]).map_err(Into::into)

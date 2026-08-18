@@ -10017,6 +10017,42 @@ mod tests {
     }
 
     #[test]
+    fn chain_header_merkle_proofs_follow_active_headers_and_tip_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=6 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+
+        for checkpoint in 0..=state.height() {
+            let hashes = state
+                .active_headers()
+                .iter()
+                .take(checkpoint as usize + 1)
+                .map(Header::block_hash)
+                .collect::<Vec<_>>();
+            for height in 0..=checkpoint {
+                assert_eq!(
+                    state.header_merkle_proof(height, checkpoint).unwrap(),
+                    header_merkle_proof_from_hashes(&hashes, height).unwrap(),
+                    "checkpoint {checkpoint}, height {height}"
+                );
+            }
+        }
+
+        state.connect_block(mine_block(&state, 7)).unwrap();
+        let _ = state.header_merkle_proof(0, 6).unwrap();
+        assert_eq!(
+            state
+                .header_merkle_cache
+                .lock()
+                .as_ref()
+                .map(|cache| cache.tip),
+            Some(state.best_hash())
+        );
+    }
+
+    #[test]
     fn legacy_chain_snapshot_defaults_duplicate_index() {
         let legacy = LegacyChainSnapshot {
             tip: String::new(),

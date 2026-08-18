@@ -890,8 +890,8 @@ pub struct ChainState {
     headers: Vec<bitcoin::block::Header>,
     // Electrum checkpoint proofs are requested repeatedly while a client
     // downloads a header chain. Cache the materialized tree for the current
-    // tip and checkpoint so each proof only walks the tree height instead of
-    // rebuilding every layer from genesis.
+    // header prefix and checkpoint so each proof only walks the tree height
+    // and extending the checkpoint only updates the new right-hand path.
     header_merkle_cache: Mutex<Option<HeaderMerkleCache>>,
     active_tx_counts: Vec<u32>,
     active_tx_totals: Vec<u64>,
@@ -952,13 +952,17 @@ pub struct ChainState {
 }
 
 struct HeaderMerkleCache {
-    tip: BlockHash,
+    checkpoint_hash: BlockHash,
     checkpoint: u32,
     levels: Vec<Vec<BlockHash>>,
 }
 
 impl HeaderMerkleCache {
-    fn from_hashes(tip: BlockHash, checkpoint: u32, hashes: Vec<BlockHash>) -> Result<Self> {
+    fn from_hashes(
+        checkpoint_hash: BlockHash,
+        checkpoint: u32,
+        hashes: Vec<BlockHash>,
+    ) -> Result<Self> {
         if hashes.is_empty() {
             bail!("cannot build an empty header proof");
         }
@@ -973,10 +977,46 @@ impl HeaderMerkleCache {
             levels.push(next);
         }
         Ok(Self {
-            tip,
+            checkpoint_hash,
             checkpoint,
             levels,
         })
+    }
+
+    fn append_hash(&mut self, hash: BlockHash) {
+        self.levels[0].push(hash);
+        let mut level = 1;
+        loop {
+            let lower = &self.levels[level - 1];
+            let lower_len = lower.len();
+            let parent = if lower_len % 2 == 0 {
+                combine_header_hashes(lower[lower_len - 2], lower[lower_len - 1])
+            } else {
+                combine_header_hashes(lower[lower_len - 1], lower[lower_len - 1])
+            };
+            let desired_len = lower_len.div_ceil(2);
+            if level == self.levels.len() {
+                self.levels.push(Vec::new());
+            }
+            let last_level = self.levels.len() - 1;
+            let is_root = {
+                let current = &mut self.levels[level];
+                if current.len() < desired_len {
+                    current.push(parent);
+                } else {
+                    *current
+                        .last_mut()
+                        .expect("header merkle layer has a parent") = parent;
+                }
+                level == last_level && current.len() == 1
+            };
+            if is_root {
+                break;
+            }
+            level += 1;
+        }
+        self.checkpoint = self.checkpoint.saturating_add(1);
+        self.checkpoint_hash = hash;
     }
 
     fn proof(&self, height: u32) -> Result<(Vec<BlockHash>, BlockHash)> {
@@ -3169,8 +3209,8 @@ impl ChainState {
     }
 
     /// Return an Electrum header checkpoint proof. The tree is built lazily
-    /// once for a `(tip, checkpoint)` pair and then reused for all requested
-    /// heights at that checkpoint.
+    /// once for a header prefix and then extended incrementally as a larger
+    /// checkpoint is requested. A reorg below the cached prefix rebuilds it.
     pub fn header_merkle_proof(
         &self,
         height: u32,
@@ -3181,12 +3221,23 @@ impl ChainState {
         }
         let checkpoint_index =
             usize::try_from(checkpoint).context("checkpoint height does not fit in memory")?;
-        let tip = self.best_hash();
+        let checkpoint_hash = self
+            .headers
+            .get(checkpoint_index)
+            .map(bitcoin::block::Header::block_hash)
+            .context("checkpoint height out of range")?;
         let mut cache = self.header_merkle_cache.lock();
-        let rebuild = cache
-            .as_ref()
-            .is_none_or(|cached| cached.tip != tip || cached.checkpoint != checkpoint);
-        if rebuild {
+        let can_extend = cache.as_ref().is_some_and(|cached| {
+            checkpoint > cached.checkpoint
+                && self
+                    .headers
+                    .get(cached.checkpoint as usize)
+                    .is_some_and(|header| header.block_hash() == cached.checkpoint_hash)
+        });
+        let reuse = cache.as_ref().is_some_and(|cached| {
+            cached.checkpoint == checkpoint && cached.checkpoint_hash == checkpoint_hash
+        });
+        if !reuse && !can_extend {
             let hashes = self
                 .headers
                 .get(..=checkpoint_index)
@@ -3194,7 +3245,23 @@ impl ChainState {
                 .iter()
                 .map(bitcoin::block::Header::block_hash)
                 .collect();
-            *cache = Some(HeaderMerkleCache::from_hashes(tip, checkpoint, hashes)?);
+            *cache = Some(HeaderMerkleCache::from_hashes(
+                checkpoint_hash,
+                checkpoint,
+                hashes,
+            )?);
+        } else if can_extend {
+            let cached = cache
+                .as_mut()
+                .expect("header merkle cache was checked for extension");
+            for height in cached.checkpoint.saturating_add(1)..=checkpoint {
+                let hash = self
+                    .headers
+                    .get(height as usize)
+                    .map(bitcoin::block::Header::block_hash)
+                    .expect("checkpoint extension height is in range");
+                cached.append_hash(hash);
+            }
         }
         cache
             .as_ref()
@@ -10013,6 +10080,19 @@ mod tests {
                     "length {len}, height {height}"
                 );
             }
+
+            let mut incremental =
+                HeaderMerkleCache::from_hashes(hashes[0], 0, vec![hashes[0]]).unwrap();
+            for checkpoint in 1..len {
+                incremental.append_hash(hashes[checkpoint]);
+                for height in 0..=checkpoint as u32 {
+                    assert_eq!(
+                        incremental.proof(height).unwrap(),
+                        header_merkle_proof_from_hashes(&hashes[..=checkpoint], height).unwrap(),
+                        "incremental length {checkpoint}, height {height}"
+                    );
+                }
+            }
         }
     }
 
@@ -10047,8 +10127,8 @@ mod tests {
                 .header_merkle_cache
                 .lock()
                 .as_ref()
-                .map(|cache| cache.tip),
-            Some(state.best_hash())
+                .map(|cache| cache.checkpoint_hash),
+            state.header(6).map(Header::block_hash)
         );
     }
 

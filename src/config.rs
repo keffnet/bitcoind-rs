@@ -68,6 +68,242 @@ fn parse_socket_addr(value: &str) -> std::result::Result<SocketAddr, String> {
         .ok_or_else(|| format!("could not resolve socket address '{value}'"))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProxyEndpoint {
+    Tcp(SocketAddr),
+    Disabled,
+    #[cfg(unix)]
+    Unix(PathBuf),
+}
+
+impl fmt::Display for ProxyEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tcp(address) => address.fmt(formatter),
+            Self::Disabled => formatter.write_str("0"),
+            #[cfg(unix)]
+            Self::Unix(path) => write!(formatter, "unix:{}", path.display()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProxyNetwork {
+    Ipv4,
+    Ipv6,
+    Onion,
+    Cjdns,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProxySettings {
+    default: Option<ProxyEndpoint>,
+    ipv4: Option<ProxyEndpoint>,
+    ipv6: Option<ProxyEndpoint>,
+    onion: Option<ProxyEndpoint>,
+    cjdns: Option<ProxyEndpoint>,
+    dns: Option<ProxyEndpoint>,
+}
+
+impl ProxySettings {
+    pub(crate) fn for_endpoint(&self, endpoint: &NetworkEndpoint) -> Option<ProxyEndpoint> {
+        match endpoint {
+            NetworkEndpoint::Ip(address) if address.is_ipv4() => self.ipv4.clone(),
+            NetworkEndpoint::Ip(_) => self.ipv6.clone(),
+            NetworkEndpoint::Dns { .. } => self.dns.clone(),
+            NetworkEndpoint::OnionV2 { .. } | NetworkEndpoint::OnionV3 { .. } => self.onion.clone(),
+            NetworkEndpoint::I2p { .. } => None,
+            NetworkEndpoint::Cjdns { .. } => self.cjdns.clone(),
+        }
+    }
+
+    pub(crate) fn for_network(&self, network: &str) -> Option<ProxyEndpoint> {
+        match network {
+            "ipv4" => self.ipv4.clone(),
+            "ipv6" => self.ipv6.clone(),
+            "onion" => self.onion.clone(),
+            "cjdns" => self.cjdns.clone(),
+            "not_publicly_routable" => self.dns.clone(),
+            _ => None,
+        }
+    }
+
+    fn set(&mut self, endpoint: ProxyEndpoint, network: Option<ProxyNetwork>) {
+        if network.is_none() {
+            self.default = Some(endpoint.clone());
+            self.ipv4 = Some(endpoint.clone());
+            self.ipv6 = Some(endpoint.clone());
+            self.onion = Some(endpoint.clone());
+            self.cjdns = Some(endpoint.clone());
+            self.dns = Some(endpoint);
+            return;
+        }
+        match network.expect("proxy network was checked above") {
+            ProxyNetwork::Ipv4 => {
+                self.ipv4 = Some(endpoint.clone());
+                self.dns = Some(endpoint);
+            }
+            ProxyNetwork::Ipv6 => {
+                self.ipv6 = Some(endpoint.clone());
+                self.dns = Some(endpoint);
+            }
+            ProxyNetwork::Onion => self.onion = Some(endpoint),
+            ProxyNetwork::Cjdns => self.cjdns = Some(endpoint),
+        }
+    }
+
+    fn clear(&mut self, network: Option<ProxyNetwork>) {
+        match network {
+            None => *self = Self::default(),
+            Some(ProxyNetwork::Ipv4) => {
+                self.ipv4 = None;
+                self.dns = None;
+            }
+            Some(ProxyNetwork::Ipv6) => {
+                self.ipv6 = None;
+                self.dns = None;
+            }
+            Some(ProxyNetwork::Onion) => self.onion = None,
+            Some(ProxyNetwork::Cjdns) => self.cjdns = None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.default.is_none()
+            && self.ipv4.is_none()
+            && self.ipv6.is_none()
+            && self.onion.is_none()
+            && self.cjdns.is_none()
+            && self.dns.is_none()
+    }
+}
+
+impl fmt::Display for ProxySettings {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.default {
+            Some(proxy) => proxy.fmt(formatter),
+            None => Ok(()),
+        }
+    }
+}
+
+impl std::str::FromStr for ProxySettings {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        parse_proxy_settings(&[value.to_owned()])
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "proxy is disabled".to_owned())
+    }
+}
+
+impl ProxyEndpoint {
+    pub(crate) fn is_unix(&self) -> bool {
+        #[cfg(unix)]
+        {
+            matches!(self, Self::Unix(_))
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+}
+
+impl std::str::FromStr for ProxyEndpoint {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        parse_proxy_endpoint(value)
+    }
+}
+
+fn parse_proxy_endpoint(value: &str) -> std::result::Result<ProxyEndpoint, String> {
+    if let Some(path) = value.strip_prefix("unix:") {
+        if path.is_empty() {
+            return Err("unix proxy path must not be empty".to_owned());
+        }
+        #[cfg(unix)]
+        if path.len() >= 108 {
+            return Err("unix proxy path is too long".to_owned());
+        }
+        #[cfg(unix)]
+        return Ok(ProxyEndpoint::Unix(PathBuf::from(path)));
+        #[cfg(not(unix))]
+        return Err("unix proxy endpoints are only supported on POSIX systems".to_owned());
+    }
+    parse_socket_addr(value).map(ProxyEndpoint::Tcp)
+}
+
+fn parse_onion_proxy_endpoint(value: &str) -> std::result::Result<ProxyEndpoint, String> {
+    if value == "0" {
+        Ok(ProxyEndpoint::Disabled)
+    } else {
+        parse_proxy_endpoint(value)
+    }
+}
+
+fn parse_proxy_settings(values: &[String]) -> Result<Option<ProxySettings>> {
+    let mut settings = ProxySettings::default();
+    for value in values {
+        let (proxy_value, network) = match value.rsplit_once('=') {
+            Some((_, _)) if value.ends_with('=') => {
+                bail!("Invalid -proxy address or hostname, ends with '=': '{value}'")
+            }
+            Some((proxy_value, network)) => {
+                let network = match network.to_ascii_lowercase().as_str() {
+                    "ipv4" => ProxyNetwork::Ipv4,
+                    "ipv6" => ProxyNetwork::Ipv6,
+                    "onion" | "tor" => ProxyNetwork::Onion,
+                    "cjdns" => ProxyNetwork::Cjdns,
+                    _ => bail!("Unrecognized network in -proxy='{value}': '{network}'"),
+                };
+                (proxy_value, Some(network))
+            }
+            None => (value.as_str(), None),
+        };
+        if proxy_value.is_empty() || proxy_value == "0" {
+            settings.clear(network);
+            continue;
+        }
+        let endpoint = parse_proxy_endpoint_with_default_port(proxy_value).map_err(|_| {
+            if !proxy_value.starts_with("unix:")
+                && proxy_value
+                    .rsplit_once(':')
+                    .is_some_and(|(_, port)| port.parse::<u16>().is_err())
+            {
+                anyhow!("Invalid port specified in -proxy: '{proxy_value}'")
+            } else {
+                anyhow!("Invalid -proxy address or hostname: '{proxy_value}'")
+            }
+        })?;
+        if matches!(&endpoint, ProxyEndpoint::Tcp(address) if address.port() == 0) {
+            bail!("--proxy must use a non-zero port");
+        }
+        settings.set(endpoint, network);
+    }
+    Ok((!settings.is_empty()).then_some(settings))
+}
+
+fn parse_proxy_endpoint_with_default_port(
+    value: &str,
+) -> std::result::Result<ProxyEndpoint, String> {
+    if value.starts_with("unix:") {
+        return parse_proxy_endpoint(value);
+    }
+    let value_with_port = if let Ok(address) = value.parse::<IpAddr>() {
+        match address {
+            IpAddr::V4(_) => format!("{value}:9050"),
+            IpAddr::V6(_) => format!("[{value}]:9050"),
+        }
+    } else if !value.contains(':') {
+        format!("{value}:9050")
+    } else {
+        value.to_owned()
+    };
+    parse_proxy_endpoint(&value_with_port)
+}
+
 fn default_data_dir() -> PathBuf {
     let home = env::var_os("HOME")
         .filter(|home| !home.is_empty())
@@ -1421,8 +1657,8 @@ pub struct Args {
     #[arg(long = "onlynet", value_enum, value_delimiter = ',')]
     pub onlynet: Vec<OnlyNet>,
 
-    #[arg(long, value_name = "IP:PORT", value_parser = parse_socket_addr)]
-    pub proxy: Option<SocketAddr>,
+    #[arg(long, value_name = "IP:PORT|unix:PATH[=network]")]
+    pub proxy: Vec<String>,
 
     /// I2P SAM v3.1 control service used for I2P peer connections.
     #[arg(
@@ -1442,8 +1678,12 @@ pub struct Args {
     pub i2p_accept_incoming: bool,
 
     /// SOCKS5 proxy used specifically for Tor onion endpoints.
-    #[arg(long = "onion", value_name = "IP:PORT", value_parser = parse_socket_addr)]
-    pub onion_proxy: Option<SocketAddr>,
+    #[arg(
+        long = "onion",
+        value_name = "IP:PORT|unix:PATH",
+        value_parser = parse_onion_proxy_endpoint
+    )]
+    pub onion_proxy: Option<ProxyEndpoint>,
 
     /// Tor control service used for automatic onion listening.
     #[arg(long = "torcontrol", default_value = "127.0.0.1:9051")]
@@ -2116,6 +2356,26 @@ impl Args {
 }
 
 fn core_cli_parse_error(args: &[OsString], error: &str) -> Option<String> {
+    if error.contains("invalid value") {
+        if let Some(value) = raw_cli_option_value(args, "onlynet") {
+            return Some(format!("Unknown network specified in -onlynet: '{value}'"));
+        }
+        for option in ["proxy", "onion", "i2psam"] {
+            let Some(value) = raw_cli_option_value(args, option) else {
+                continue;
+            };
+            let option_value = format!("-{option}");
+            let port_is_invalid = !value.starts_with("unix:")
+                && value
+                    .rsplit_once(':')
+                    .is_some_and(|(_, port)| port.parse::<u16>().is_err());
+            return Some(if port_is_invalid {
+                format!("Invalid port specified in {option_value}: '{value}'")
+            } else {
+                format!("Invalid {option_value} address or hostname: '{value}'")
+            });
+        }
+    }
     if error.contains("unexpected argument") {
         let argument = cli_argument_for_error(args, error)?;
         return Some(format!(
@@ -2129,6 +2389,30 @@ fn core_cli_parse_error(args: &[OsString], error: &str) -> Option<String> {
         ));
     }
     None
+}
+
+fn raw_cli_option_value(args: &[OsString], name: &str) -> Option<String> {
+    let prefix = format!("-{name}=");
+    let long_prefix = format!("--{name}=");
+    args.iter()
+        .skip(1)
+        .enumerate()
+        .find_map(|(index, argument)| {
+            let argument = argument.to_str()?;
+            if let Some(value) = argument
+                .strip_prefix(&prefix)
+                .or_else(|| argument.strip_prefix(&long_prefix))
+            {
+                return Some(value.to_owned());
+            }
+            if argument == format!("-{name}") || argument == format!("--{name}") {
+                return args
+                    .get(index + 2)
+                    .and_then(|value| value.to_str())
+                    .map(str::to_owned);
+            }
+            None
+        })
 }
 
 fn cli_argument_for_error(args: &[OsString], error: &str) -> Option<String> {
@@ -2731,6 +3015,7 @@ pub struct Config {
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
     pub listen_onion: bool,
+    pub onion_enabled: bool,
     pub natpmp: bool,
     pub rpc_bind: Option<SocketAddr>,
     pub rpc_binds: Vec<SocketAddr>,
@@ -2760,10 +3045,10 @@ pub struct Config {
     pub fixed_seeds: bool,
     pub force_dns_seed: bool,
     pub onlynet: Vec<OnlyNet>,
-    pub proxy: Option<SocketAddr>,
+    pub proxy: Option<ProxySettings>,
     pub i2p_sam: Option<SocketAddr>,
     pub i2p_accept_incoming: bool,
-    pub onion_proxy: Option<SocketAddr>,
+    pub onion_proxy: Option<ProxyEndpoint>,
     pub tor_control: SocketAddr,
     pub tor_password: Option<String>,
     pub proxy_randomize: bool,
@@ -2911,9 +3196,13 @@ impl Config {
         self.settings_path.as_deref()
     }
 
-    pub fn from_args(args: Args) -> Result<Self> {
+    pub fn from_args(mut args: Args) -> Result<Self> {
         if !args.disable_wallet {
             bail!("wallet support is disabled in this build; use --disablewallet=1");
+        }
+        if matches!(args.onion_proxy, Some(ProxyEndpoint::Disabled)) {
+            args.onion_proxy = None;
+            args.no_onion = true;
         }
         if args.prune < 0 {
             bail!("Prune cannot be configured with a negative value.");
@@ -2921,6 +3210,7 @@ impl Config {
         let prune = u64::try_from(args.prune).context("prune value is out of range")?;
         let logging = parse_logging_config(&args)?;
         let network = network_from_args(&args)?;
+        let proxy = parse_proxy_settings(&args.proxy)?;
         if args.datadir_explicit && !args.datadir.is_dir() {
             bail!(
                 "Specified data directory \"{}\" does not exist.",
@@ -3181,13 +3471,12 @@ impl Config {
         if args.accept_nonstd_txn && network == Network::Bitcoin {
             bail!("acceptnonstdtxn is not currently supported for main chain");
         }
-        if args.proxy.is_some_and(|proxy| proxy.port() == 0) {
-            bail!("--proxy must use a non-zero port");
-        }
         if args.i2p_sam.is_some_and(|address| address.port() == 0) {
             bail!("--i2psam must use a non-zero port");
         }
-        if args.onion_proxy.is_some_and(|address| address.port() == 0) {
+        if args.onion_proxy.as_ref().is_some_and(
+            |proxy| matches!(proxy, ProxyEndpoint::Tcp(address) if address.port() == 0),
+        ) {
             bail!("--onion must use a non-zero port");
         }
         let tor_control = parse_tor_control(&args.tor_control)?;
@@ -3198,7 +3487,7 @@ impl Config {
         let listen = args.listen.unwrap_or(
             !args.bind.is_empty()
                 || !args.whitebind.is_empty()
-                || (args.proxy.is_none() && !connect_configured && args.max_peers > 0),
+                || (proxy.is_none() && !connect_configured && args.max_peers > 0),
         ) && !args.no_listen;
         if !listen && (!args.bind.is_empty() || !args.whitebind.is_empty()) {
             bail!("Cannot set -bind or -whitebind together with -listen=0");
@@ -3208,9 +3497,12 @@ impl Config {
         }
         let listen_onion = args.listen_onion.unwrap_or(true) && listen && !args.no_onion;
         if args.privatebroadcast
-            && args.onion_proxy.is_none()
             && args.i2p_sam.is_none()
-            && args.proxy.is_none()
+            && (args.no_onion
+                || (args.onion_proxy.is_none()
+                    && proxy
+                        .as_ref()
+                        .is_none_or(|settings| settings.for_network("onion").is_none())))
             && args.listen_onion != Some(true)
         {
             bail!(
@@ -3224,32 +3516,32 @@ impl Config {
         }
         if args.privatebroadcast
             && !args.proxy_randomize
-            && (args.proxy.is_some() || args.onion_proxy.is_some() || listen_onion)
+            && (proxy.is_some() || args.onion_proxy.is_some() || listen_onion)
         {
             eprintln!(
                 "Warning: Private broadcast of own transactions requested (-privatebroadcast) and -proxyrandomize is disabled. Tor circuits for private broadcast connections may be correlated to other connections over Tor. For maximum privacy set -proxyrandomize=1."
             );
         }
-        if args.no_onion
-            && args.proxy.is_none()
-            && args.onion_proxy.is_none()
-            && args.onlynet.contains(&OnlyNet::Onion)
-        {
+        if args.no_onion && args.onlynet.contains(&OnlyNet::Onion) {
             bail!(
                 "Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching the Tor network is explicitly forbidden: -onion=0"
             );
         }
-        if args.proxy.is_none()
+        if proxy
+            .as_ref()
+            .is_none_or(|settings| settings.for_network("onion").is_none())
             && args.onion_proxy.is_none()
             && args.onlynet.contains(&OnlyNet::Onion)
             && !listen_onion
         {
             bail!(
-                "--onlynet=onion requires --proxy, --onion, or --listenonion for outbound connections"
+                "Outbound connections restricted to Tor (-onlynet=onion) but the proxy for reaching the Tor network is not provided: none of -proxy, -onion or -listenonion is given"
             );
         }
         if args.i2p_sam.is_none() && args.onlynet.contains(&OnlyNet::I2p) {
-            bail!("--onlynet=i2p requires --i2psam for outbound connections");
+            bail!(
+                "Outbound connections restricted to i2p (-onlynet=i2p) but -i2psam is not provided"
+            );
         }
         if args.onlynet.contains(&OnlyNet::Cjdns) && !args.cjdns_reachable {
             bail!(
@@ -3275,7 +3567,7 @@ impl Config {
         }
         let discover = args
             .discover
-            .unwrap_or(listen && args.externalip.is_empty() && args.proxy.is_none());
+            .unwrap_or(listen && args.externalip.is_empty() && proxy.is_none());
         let peer_permissions = PeerPermissionConfig::from_args(
             &args.whitelist,
             &args.whitebind,
@@ -3531,6 +3823,7 @@ impl Config {
             p2p_binds,
             listen,
             listen_onion,
+            onion_enabled: !args.no_onion,
             natpmp: args.natpmp,
             rpc_bind: rpc_binds.first().copied(),
             rpc_binds,
@@ -3564,7 +3857,7 @@ impl Config {
             fixed_seeds: args.fixed_seeds,
             force_dns_seed: args.force_dns_seed,
             onlynet: args.onlynet,
-            proxy: args.proxy,
+            proxy,
             i2p_sam: args.i2p_sam,
             i2p_accept_incoming,
             onion_proxy: args.onion_proxy,
@@ -3640,6 +3933,14 @@ impl Config {
         self.allows_network_endpoint(&NetworkEndpoint::from_socket(address))
     }
 
+    pub(crate) fn proxy_for_endpoint(&self, endpoint: &NetworkEndpoint) -> Option<ProxyEndpoint> {
+        self.proxy.as_ref()?.for_endpoint(endpoint)
+    }
+
+    pub(crate) fn proxy_for_network(&self, network: &str) -> Option<ProxyEndpoint> {
+        self.proxy.as_ref()?.for_network(network)
+    }
+
     pub fn allows_network_endpoint(&self, endpoint: &NetworkEndpoint) -> bool {
         if matches!(endpoint, NetworkEndpoint::Cjdns { .. }) && !self.cjdns_reachable {
             return false;
@@ -3661,7 +3962,12 @@ impl Config {
         }
         match endpoint.network_name() {
             "ipv4" | "ipv6" => true,
-            "onion" => self.onion_proxy.is_some() || self.listen_onion,
+            "onion" => {
+                self.onion_enabled
+                    && (self.proxy_for_network("onion").is_some()
+                        || self.onion_proxy.is_some()
+                        || self.listen_onion)
+            }
             "i2p" => self.i2p_sam.is_some(),
             "cjdns" => self.cjdns_reachable,
             _ => false,
@@ -4706,7 +5012,7 @@ mod tests {
 
         let expected_errors = [(
             "i2p",
-            "--onlynet=i2p requires --i2psam for outbound connections",
+            "Outbound connections restricted to i2p (-onlynet=i2p) but -i2psam is not provided",
         )];
         for (network, expected_error) in expected_errors {
             let args = Args::try_parse_from([
@@ -5404,6 +5710,69 @@ mod tests {
         assert_eq!(
             Config::from_args(args).unwrap().signet_challenge,
             Some(vec![0])
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parses_unix_socks_proxy_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let proxy_path = directory.path().join("proxy.sock");
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            &format!("--proxy=unix:{}", proxy_path.display()),
+            "--listen=false",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert_eq!(
+            config.proxy.as_ref().unwrap().for_network("ipv4"),
+            Some(ProxyEndpoint::Unix(proxy_path))
+        );
+
+        let onion_path = directory.path().join("onion.sock");
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            &format!("--onion=unix:{}", onion_path.display()),
+            "--listen=false",
+        ])
+        .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().onion_proxy,
+            Some(ProxyEndpoint::Unix(onion_path))
+        );
+    }
+
+    #[test]
+    fn proxy_settings_follow_core_network_scoping() {
+        let settings = parse_proxy_settings(&[
+            "127.1.1.1:1111".to_owned(),
+            "127.2.2.2:2222=ipv6".to_owned(),
+            "0=cjdns".to_owned(),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            settings.for_network("ipv4"),
+            Some("127.1.1.1:1111".parse().unwrap())
+        );
+        assert_eq!(
+            settings.for_network("ipv6"),
+            Some("127.2.2.2:2222".parse().unwrap())
+        );
+        assert_eq!(
+            settings.for_network("onion"),
+            Some("127.1.1.1:1111".parse().unwrap())
+        );
+        assert_eq!(settings.for_network("cjdns"), None);
+        assert_eq!(
+            settings.for_network("not_publicly_routable"),
+            Some("127.2.2.2:2222".parse().unwrap())
         );
     }
 

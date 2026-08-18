@@ -80,7 +80,8 @@ use crate::address::{NetworkEndpoint, is_core_routable_ip};
 use crate::asmap::AsMap;
 use crate::chain::ChainState;
 use crate::config::{
-    Config, PeerPermissions, RpcCookiePermissions, core_network_blocks_dir, network_data_dir_name,
+    Config, PeerPermissions, ProxyEndpoint, RpcCookiePermissions, core_network_blocks_dir,
+    network_data_dir_name,
 };
 use crate::fee_estimator::{FeeEstimator, RawFeeEstimate};
 use crate::mempool::{
@@ -2610,7 +2611,7 @@ impl Node {
         if !self.config.private_broadcast {
             bail!("private broadcast is disabled")
         }
-        if self.config.proxy.is_none() {
+        if self.config.proxy_for_network("ipv4").is_none() {
             bail!("--privatebroadcast requires --proxy for IPv4/IPv6 private connections")
         }
         let txid = transaction.compute_txid();
@@ -4764,10 +4765,18 @@ impl Node {
         }
     }
 
-    pub(crate) fn onion_proxy(&self) -> Option<SocketAddr> {
-        self.config
-            .onion_proxy
-            .or_else(|| self.tor_controller.as_ref()?.socks_proxy())
+    pub(crate) fn onion_proxy(&self) -> Option<ProxyEndpoint> {
+        if !self.config.onion_enabled {
+            return None;
+        }
+        self.config.onion_proxy.clone().or_else(|| {
+            self.config.proxy_for_network("onion").or_else(|| {
+                self.tor_controller
+                    .as_ref()?
+                    .socks_proxy()
+                    .map(ProxyEndpoint::Tcp)
+            })
+        })
     }
 
     pub(crate) fn record_mining_block(&self, block: &Block) {
@@ -7214,6 +7223,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,

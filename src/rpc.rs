@@ -3103,7 +3103,10 @@ fn local_addresses(node: &Arc<Node>) -> Value {
             addresses.push((address.ip().to_string(), address.port(), 3));
         }
     }
-    if node.config.discover && node.config.proxy.is_none() {
+    if node.config.discover
+        && node.config.proxy_for_network("ipv4").is_none()
+        && node.config.proxy_for_network("ipv6").is_none()
+    {
         for address in node
             .listen_addresses()
             .into_iter()
@@ -3139,30 +3142,45 @@ fn local_addresses(node: &Arc<Node>) -> Value {
 }
 
 fn network_info(node: &Arc<Node>) -> Value {
-    let proxy = node
+    let ipv4_proxy = node
         .config
-        .proxy
+        .proxy_for_network("ipv4")
         .map_or_else(String::new, |proxy| proxy.to_string());
-    let onion_proxy = node
-        .onion_proxy()
-        .map_or_else(|| proxy.clone(), |proxy| proxy.to_string());
-    let i2p_sam_configured = node.config.i2p_sam.is_some();
+    let ipv6_proxy = node
+        .config
+        .proxy_for_network("ipv6")
+        .map_or_else(String::new, |proxy| proxy.to_string());
+    let cjdns_proxy = node
+        .config
+        .proxy_for_network("cjdns")
+        .map_or_else(String::new, |proxy| proxy.to_string());
+    // `listen=0` disables inbound listening but does not disable outbound
+    // onion connections. `onion_enabled` tracks the separate `-noonion`
+    // switch.
+    let onion_enabled = node.config.onion_enabled;
+    let onion_proxy = if onion_enabled {
+        node.onion_proxy()
+            .map_or_else(String::new, |proxy| proxy.to_string())
+    } else {
+        String::new()
+    };
     let i2p_proxy = node
         .config
         .i2p_sam
-        .map_or_else(|| proxy.clone(), |proxy| proxy.to_string());
+        .map_or_else(String::new, |proxy| proxy.to_string());
     let networks = [
         ("ipv4", OnlyNet::Ipv4, true),
         ("ipv6", OnlyNet::Ipv6, true),
         (
             "onion",
             OnlyNet::Onion,
-            node.config.proxy.is_some()
-                || node.onion_proxy().is_some()
-                || node
-                    .tor_controller
-                    .as_ref()
-                    .is_some_and(|tor| tor.is_reachable()),
+            onion_enabled
+                && (node.config.proxy_for_network("onion").is_some()
+                    || node.onion_proxy().is_some()
+                    || node
+                        .tor_controller
+                        .as_ref()
+                        .is_some_and(|tor| tor.is_reachable())),
         ),
         ("i2p", OnlyNet::I2p, node.config.i2p_sam.is_some()),
         ("cjdns", OnlyNet::Cjdns, node.config.cjdns_reachable),
@@ -3180,17 +3198,24 @@ fn network_info(node: &Arc<Node>) -> Value {
                 onion_proxy.as_str()
             } else if name == "i2p" {
                 i2p_proxy.as_str()
-            } else if node.config.proxy.is_some() {
-                proxy.as_str()
             } else {
-                ""
+                match name {
+                    "ipv4" => ipv4_proxy.as_str(),
+                    "ipv6" => ipv6_proxy.as_str(),
+                    "cjdns" => cjdns_proxy.as_str(),
+                    _ => "",
+                }
             },
-            "proxy_randomize_credentials": (if name == "onion" {
-                node.config.proxy.is_some() || node.onion_proxy().is_some()
-            } else {
-                node.config.proxy.is_some()
-            }) && node.config.proxy_randomize
-                && (name != "i2p" || !i2p_sam_configured),
+            "proxy_randomize_credentials": match name {
+                "onion" => {
+                    onion_enabled && !onion_proxy.is_empty() && node.config.proxy_randomize
+                }
+                "i2p" => false,
+                "ipv4" => !ipv4_proxy.is_empty() && node.config.proxy_randomize,
+                "ipv6" => !ipv6_proxy.is_empty() && node.config.proxy_randomize,
+                "cjdns" => !cjdns_proxy.is_empty() && node.config.proxy_randomize,
+                _ => false,
+            },
         })
     })
     .collect::<Vec<_>>();
@@ -16709,6 +16734,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -17093,6 +17119,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -17269,6 +17296,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -17492,6 +17520,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -17641,6 +17670,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -17782,6 +17812,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -17966,6 +17997,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -18174,6 +18206,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -18638,6 +18671,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -18808,6 +18842,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -18961,6 +18996,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -19114,6 +19150,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -19263,6 +19300,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -19400,6 +19438,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -19545,6 +19584,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -19679,6 +19719,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -19901,6 +19942,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -20074,6 +20116,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -20243,6 +20286,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -20434,6 +20478,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -20589,6 +20634,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -20775,6 +20821,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -21127,6 +21174,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -21408,6 +21456,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -21543,6 +21592,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -21721,6 +21771,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -21863,6 +21914,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -22011,6 +22063,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -22201,6 +22254,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -22354,6 +22408,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -22566,6 +22621,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -22708,7 +22764,14 @@ mod tests {
                 .unwrap();
             assert_eq!(network["limited"], json!(true));
             assert_eq!(network["reachable"], json!(false));
-            assert_eq!(network["proxy"], json!("127.0.0.1:9050"));
+            assert_eq!(
+                network["proxy"],
+                json!(if name == "onion" {
+                    "127.0.0.1:9050"
+                } else {
+                    ""
+                })
+            );
         }
         let cjdns = networks["networks"]
             .as_array()
@@ -22836,6 +22899,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -22973,6 +23037,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -23334,6 +23399,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -23572,6 +23638,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -23778,6 +23845,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -24086,6 +24154,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -24473,6 +24542,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -24619,6 +24689,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -24891,6 +24962,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -25041,6 +25113,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -25577,6 +25650,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -25722,6 +25796,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -25906,6 +25981,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -26355,6 +26431,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -26883,6 +26960,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -27092,6 +27170,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -27332,6 +27411,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -27724,6 +27804,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -27872,6 +27953,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -28041,6 +28123,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,

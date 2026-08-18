@@ -28,12 +28,16 @@ use rand::random;
 use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
 use socket2::SockRef;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(all(test, unix))]
+use tokio::net::UnixListener;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::net::{
     TcpListener, TcpStream,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
@@ -41,7 +45,7 @@ use crate::address::{NetworkEndpoint, is_core_routable_ip};
 use crate::chain::BasicFilterRange;
 #[cfg(test)]
 use crate::config::DEFAULT_CONNECT_TIMEOUT_MS;
-use crate::config::{PeerPermissions, default_p2p_port};
+use crate::config::{PeerPermissions, ProxyEndpoint, default_p2p_port};
 use crate::mempool::MempoolError;
 use crate::script::{core_multisig_solution, is_core_p2pk};
 use crate::validation::ValidationError;
@@ -2511,7 +2515,7 @@ fn spawn_outbound_loop(
             }
             match connect_peer_endpoint_with_options_and_dns_with_i2p(
                 &endpoint,
-                node.config.proxy,
+                node.config.proxy_for_endpoint(&endpoint),
                 node.onion_proxy(),
                 false,
                 node.config.proxy_randomize,
@@ -2619,7 +2623,7 @@ fn spawn_private_broadcast_loop(
         }
         match connect_peer_endpoint_for_private_broadcast(
             &endpoint,
-            node.config.proxy,
+            node.config.proxy_for_endpoint(&endpoint),
             node.config.proxy_randomize,
             Duration::from_millis(node.config.connect_timeout_ms),
         )
@@ -2756,12 +2760,19 @@ async fn connect_peer_endpoint(
     endpoint: &NetworkEndpoint,
     proxy: Option<SocketAddr>,
 ) -> Result<TcpStream> {
-    connect_peer_endpoint_with_options_and_dns(endpoint, proxy, false, false, true).await
+    connect_peer_endpoint_with_options_and_dns(
+        endpoint,
+        proxy.map(ProxyEndpoint::Tcp),
+        false,
+        false,
+        true,
+    )
+    .await
 }
 
 async fn connect_peer_endpoint_for_private_broadcast(
     endpoint: &NetworkEndpoint,
-    proxy: Option<SocketAddr>,
+    proxy: Option<ProxyEndpoint>,
     proxy_randomize: bool,
     connect_timeout: Duration,
 ) -> Result<TcpStream> {
@@ -2783,14 +2794,20 @@ async fn connect_peer_endpoint_with_options(
     force_proxy: bool,
     proxy_randomize: bool,
 ) -> Result<TcpStream> {
-    connect_peer_endpoint_with_options_and_dns(endpoint, proxy, force_proxy, proxy_randomize, true)
-        .await
+    connect_peer_endpoint_with_options_and_dns(
+        endpoint,
+        proxy.map(ProxyEndpoint::Tcp),
+        force_proxy,
+        proxy_randomize,
+        true,
+    )
+    .await
 }
 
 #[cfg(test)]
 async fn connect_peer_endpoint_with_options_and_dns(
     endpoint: &NetworkEndpoint,
-    proxy: Option<SocketAddr>,
+    proxy: Option<ProxyEndpoint>,
     force_proxy: bool,
     proxy_randomize: bool,
     allow_dns_lookup: bool,
@@ -2808,7 +2825,7 @@ async fn connect_peer_endpoint_with_options_and_dns(
 
 async fn connect_peer_endpoint_with_options_and_dns_with_timeout(
     endpoint: &NetworkEndpoint,
-    proxy: Option<SocketAddr>,
+    proxy: Option<ProxyEndpoint>,
     force_proxy: bool,
     proxy_randomize: bool,
     allow_dns_lookup: bool,
@@ -2830,8 +2847,8 @@ async fn connect_peer_endpoint_with_options_and_dns_with_timeout(
 #[allow(clippy::too_many_arguments)]
 async fn connect_peer_endpoint_with_options_and_dns_with_i2p(
     endpoint: &NetworkEndpoint,
-    proxy: Option<SocketAddr>,
-    onion_proxy: Option<SocketAddr>,
+    proxy: Option<ProxyEndpoint>,
+    onion_proxy: Option<ProxyEndpoint>,
     force_proxy: bool,
     proxy_randomize: bool,
     allow_dns_lookup: bool,
@@ -2843,6 +2860,9 @@ async fn connect_peer_endpoint_with_options_and_dns_with_i2p(
     {
         return i2p_sam.connect(endpoint).await;
     }
+    if matches!(endpoint, NetworkEndpoint::I2p { .. }) {
+        bail!("endpoint {endpoint} requires an I2P SAM proxy");
+    }
     let proxy = if endpoint.is_onion() {
         onion_proxy.or(proxy)
     } else {
@@ -2852,9 +2872,12 @@ async fn connect_peer_endpoint_with_options_and_dns_with_i2p(
     if proxy.is_none() && endpoint.requires_proxy() {
         bail!("endpoint {endpoint} requires a SOCKS5 proxy");
     }
-    let mut stream = if let Some(proxy) = proxy {
-        connect_tcp_with_timeout(
+    let proxy_uses_unix = proxy.as_ref().is_some_and(ProxyEndpoint::is_unix);
+    let mut stream = if let Some(proxy) = proxy.as_ref() {
+        connect_proxy_with_timeout(
             proxy,
+            endpoint,
+            proxy_randomize,
             connect_timeout,
             format!("connecting to {endpoint} through proxy {proxy}"),
         )
@@ -2875,10 +2898,100 @@ async fn connect_peer_endpoint_with_options_and_dns_with_i2p(
         .await?
     };
     stream.set_nodelay(true)?;
-    if proxy.is_some() {
+    if proxy.is_some() && !proxy_uses_unix {
         socks5_connect_endpoint_with_options(&mut stream, endpoint, proxy_randomize).await?;
     }
     Ok(stream)
+}
+
+async fn connect_proxy_with_timeout(
+    proxy: &ProxyEndpoint,
+    endpoint: &NetworkEndpoint,
+    proxy_randomize: bool,
+    timeout: Duration,
+    context: String,
+) -> Result<TcpStream> {
+    match proxy {
+        ProxyEndpoint::Tcp(address) => connect_tcp_with_timeout(*address, timeout, context).await,
+        ProxyEndpoint::Disabled => bail!("proxy endpoint is disabled"),
+        #[cfg(unix)]
+        ProxyEndpoint::Unix(path) => {
+            connect_unix_proxy_tunnel(path, endpoint, proxy_randomize, timeout, context).await
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn connect_unix_proxy_tunnel(
+    path: &std::path::Path,
+    endpoint: &NetworkEndpoint,
+    proxy_randomize: bool,
+    timeout: Duration,
+    context: String,
+) -> Result<TcpStream> {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .with_context(|| format!("binding local SOCKS5 tunnel for {context}"))?;
+    let local_address = listener.local_addr()?;
+    let local_stream = connect_tcp_with_timeout(
+        local_address,
+        timeout,
+        format!("connecting to local SOCKS5 tunnel for {context}"),
+    )
+    .await?;
+    let (ready_sender, ready_receiver) = oneshot::channel();
+    let path = path.to_owned();
+    let endpoint = endpoint.clone();
+    let bridge = tokio::spawn(async move {
+        let result: Result<(TcpStream, UnixStream)> = async {
+            let (local_stream, _) = listener.accept().await?;
+            let mut proxy_stream =
+                match tokio::time::timeout(timeout, UnixStream::connect(&path)).await {
+                    Ok(result) => result.with_context(|| {
+                        format!("connecting to Unix SOCKS5 proxy {}", path.display())
+                    })?,
+                    Err(_) => bail!(
+                        "connecting to Unix SOCKS5 proxy {}; timed out after {} ms",
+                        path.display(),
+                        timeout.as_millis()
+                    ),
+                };
+            socks5_connect_endpoint_with_options(&mut proxy_stream, &endpoint, proxy_randomize)
+                .await
+                .with_context(|| {
+                    format!(
+                        "negotiating SOCKS5 proxy {path_display}",
+                        path_display = path.display()
+                    )
+                })?;
+            Ok((local_stream, proxy_stream))
+        }
+        .await;
+        match result {
+            Ok((mut local_stream, mut proxy_stream)) => {
+                let _ = ready_sender.send(Ok(()));
+                let _ = tokio::io::copy_bidirectional(&mut local_stream, &mut proxy_stream).await;
+            }
+            Err(error) => {
+                let _ = ready_sender.send(Err(error.to_string()));
+            }
+        }
+    });
+    match tokio::time::timeout(timeout, ready_receiver).await {
+        Ok(Ok(Ok(()))) => Ok(local_stream),
+        Ok(Ok(Err(error))) => {
+            bridge.abort();
+            bail!("{context}: {error}");
+        }
+        Ok(Err(_)) => {
+            bridge.abort();
+            bail!("{context}: proxy tunnel closed before SOCKS5 negotiation");
+        }
+        Err(_) => {
+            bridge.abort();
+            bail!("{context}; timed out after {} ms", timeout.as_millis());
+        }
+    }
 }
 
 async fn connect_tcp_with_timeout<A>(
@@ -2918,11 +3031,14 @@ fn proxy_credentials() -> String {
     format!("{prefix}{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-async fn socks5_connect_endpoint_with_options(
-    stream: &mut TcpStream,
+async fn socks5_connect_endpoint_with_options<S>(
+    stream: &mut S,
     endpoint: &NetworkEndpoint,
     proxy_randomize: bool,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     if proxy_randomize {
         stream.write_all(&[5, 2, 0, 2]).await?;
     } else {
@@ -3145,9 +3261,11 @@ fn endpoint_can_be_discovered(node: &Node, endpoint: &NetworkEndpoint) -> bool {
     match endpoint {
         NetworkEndpoint::Ip(_) | NetworkEndpoint::Cjdns { .. } => true,
         NetworkEndpoint::OnionV2 { .. } | NetworkEndpoint::OnionV3 { .. } => {
-            node.config.proxy.is_some() || node.onion_proxy().is_some()
+            node.config.onion_enabled
+                && (node.config.proxy_for_endpoint(endpoint).is_some()
+                    || node.onion_proxy().is_some())
         }
-        NetworkEndpoint::I2p { .. } => node.config.proxy.is_some() || node.i2p_sam.is_some(),
+        NetworkEndpoint::I2p { .. } => node.i2p_sam.is_some(),
         NetworkEndpoint::Dns { .. } => false,
     }
 }
@@ -3170,8 +3288,8 @@ fn has_empty_fixed_seed_network(node: &Node) -> bool {
 
 #[derive(Clone)]
 struct ProxyRoutingOptions {
-    proxy: Option<SocketAddr>,
-    onion_proxy: Option<SocketAddr>,
+    proxy: Option<ProxyEndpoint>,
+    onion_proxy: Option<ProxyEndpoint>,
     force_proxy: bool,
     randomize_credentials: bool,
     allow_dns_lookup: bool,
@@ -3521,7 +3639,7 @@ async fn serve_peer(
         options.transport_v2,
         node.config.logging.log_ips,
         ProxyRoutingOptions {
-            proxy: node.config.proxy,
+            proxy: node.config.proxy_for_endpoint(&endpoint),
             onion_proxy: node.onion_proxy(),
             force_proxy: options.connection_type == "private-broadcast",
             randomize_credentials: node.config.proxy_randomize,
@@ -9426,6 +9544,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -9965,6 +10084,54 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socks5_proxy_negotiation_routes_ipv4_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("proxy.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut greeting = [0; 3];
+            stream.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).await.unwrap();
+
+            let mut request = [0; 14];
+            stream.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..5], &[5, 1, 0, 3, 7]);
+            assert_eq!(&request[5..12], b"8.8.8.8");
+            assert_eq!(&request[12..], &18444u16.to_be_bytes());
+            stream
+                .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 1])
+                .await
+                .unwrap();
+
+            let mut request_data = [0; 1];
+            stream.read_exact(&mut request_data).await.unwrap();
+            stream.write_all(&[request_data[0] + 1]).await.unwrap();
+        });
+
+        let endpoint = NetworkEndpoint::Ip("8.8.8.8:18444".parse().unwrap());
+        let mut stream = connect_peer_endpoint_with_options_and_dns_with_i2p(
+            &endpoint,
+            Some(ProxyEndpoint::Unix(path)),
+            None,
+            false,
+            false,
+            true,
+            Duration::from_secs(1),
+            None,
+        )
+        .await
+        .unwrap();
+        stream.write_all(&[41]).await.unwrap();
+        let mut response = [0; 1];
+        stream.read_exact(&mut response).await.unwrap();
+        assert_eq!(response, [42]);
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn socks5_proxy_randomized_credentials_are_unique() {
         let endpoint = NetworkEndpoint::Ip("8.8.8.8:18444".parse().unwrap());
@@ -10116,8 +10283,8 @@ mod tests {
 
         let _stream = connect_peer_endpoint_with_options_and_dns_with_i2p(
             &endpoint,
-            Some(generic_address),
-            Some(onion_address),
+            Some(ProxyEndpoint::Tcp(generic_address)),
+            Some(ProxyEndpoint::Tcp(onion_address)),
             false,
             false,
             true,
@@ -10246,6 +10413,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -10465,6 +10633,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -11340,6 +11509,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -11557,6 +11727,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -11766,6 +11937,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -12065,6 +12237,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -12243,6 +12416,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -12406,6 +12580,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -12698,9 +12873,10 @@ mod tests {
             force_dns_seed: false,
             onlynet: Vec::new(),
             proxy: Some("127.0.0.1:9050".parse().unwrap()),
-            i2p_sam: None,
+            i2p_sam: Some("127.0.0.1:7656".parse().unwrap()),
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,
@@ -12912,6 +13088,7 @@ mod tests {
             i2p_sam: None,
             onion_proxy: None,
             listen_onion: false,
+            onion_enabled: true,
             tor_control: "127.0.0.1:9051".parse().unwrap(),
             tor_password: None,
             i2p_accept_incoming: false,

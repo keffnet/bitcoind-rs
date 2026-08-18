@@ -1196,6 +1196,26 @@ struct InflightBlock {
     requested_at: Instant,
 }
 
+#[derive(Clone, Copy)]
+struct BlockStallingMoment {
+    wall: Instant,
+    unix_time: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ChainSyncTimeoutState {
+    timeout: u64,
+    work_hash: Option<BlockHash>,
+    sent_getheaders: bool,
+    protect: bool,
+}
+
+pub(crate) enum OutboundEvictionAction {
+    None,
+    RequestHeaders(BlockHash),
+    Disconnect,
+}
+
 pub(crate) struct BlockDownloadSchedule {
     pub(crate) requests: Vec<wire::Inventory>,
     pub(crate) staller: Option<usize>,
@@ -1486,7 +1506,8 @@ pub struct Node {
     network_active: AtomicBool,
     block_stalling_timeout_secs: AtomicU64,
     mock_scheduler_elapsed_secs: AtomicU64,
-    block_stalling_since: parking_lot::RwLock<HashMap<usize, Instant>>,
+    block_stalling_since: parking_lot::RwLock<HashMap<usize, BlockStallingMoment>>,
+    chain_sync_states: parking_lot::RwLock<HashMap<usize, ChainSyncTimeoutState>>,
     rejected_block_bodies: parking_lot::RwLock<HashSet<BlockHash>>,
     shutdown_requested: AtomicBool,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
@@ -1976,6 +1997,7 @@ impl Node {
             block_stalling_timeout_secs: AtomicU64::new(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
             mock_scheduler_elapsed_secs: AtomicU64::new(0),
             block_stalling_since: parking_lot::RwLock::new(HashMap::new()),
+            chain_sync_states: parking_lot::RwLock::new(HashMap::new()),
             rejected_block_bodies: parking_lot::RwLock::new(HashSet::new()),
             shutdown_requested: AtomicBool::new(false),
             peers: parking_lot::RwLock::new(HashMap::new()),
@@ -3847,6 +3869,7 @@ impl Node {
         started.insert(peer_id);
         self.headers_sync_active.lock().insert(peer_id);
         self.headers_sync_peers.fetch_add(1, Ordering::Relaxed);
+        self.initialize_chain_sync_timeout(peer_id);
         true
     }
 
@@ -3873,8 +3896,22 @@ impl Node {
     }
 
     pub(crate) fn clear_inv_headers_sync_trigger(&self, peer_id: usize) {
-        self.inv_triggered_headers_sync.lock().remove(&peer_id);
+        let mut triggered = self.inv_triggered_headers_sync.lock();
+        if !triggered.remove(&peer_id) || !triggered.is_empty() {
+            return;
+        }
         self.last_block_inv_triggering_headers_sync.lock().take();
+    }
+
+    fn initialize_chain_sync_timeout(&self, peer_id: usize) {
+        let tip_hash = self.chain.read().tip().hash;
+        let mut states = self.chain_sync_states.write();
+        let state = states.entry(peer_id).or_default();
+        if state.timeout == 0 {
+            state.timeout = time::unix_time().saturating_add(20 * 60);
+            state.work_hash = Some(tip_hash);
+            state.sent_getheaders = false;
+        }
     }
 
     fn assign_headers_sync_replacement(
@@ -3897,6 +3934,7 @@ impl Node {
         started.insert(candidate);
         self.headers_sync_active.lock().insert(candidate);
         self.headers_sync_peers.fetch_add(1, Ordering::Relaxed);
+        self.initialize_chain_sync_timeout(candidate);
         Some(sender)
     }
 
@@ -3926,6 +3964,152 @@ impl Node {
 
     pub(crate) fn reset_initial_headers_sync_peer(&self, peer_id: usize) {
         self.headers_sync_active.lock().remove(&peer_id);
+    }
+
+    /// Release body requests that have aged past the short relay race window
+    /// when a peer continues making header progress without supplying them.
+    /// This only affects missing bodies; requests for bodies already present
+    /// in the native store are cleared by the normal completion path.
+    pub(crate) fn clear_stale_peer_block_requests_for_missing_bodies(
+        &self,
+        peer_id: usize,
+        minimum_age: Duration,
+    ) -> usize {
+        // This is a wall-clock relay-race guard.  Functional tests and RPC
+        // callers that advance mocktime expect the Core in-flight window to
+        // remain exact, so never age those requests using real elapsed time.
+        if time::mock_time() != 0 {
+            return 0;
+        }
+        let chain = self.chain.read();
+        let mut cleared = 0;
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.inflight_blocks.retain(|inflight| {
+                let stale = inflight.requested_at.elapsed() >= minimum_age;
+                let keep = !stale || chain.store.contains(&inflight.hash);
+                if !keep {
+                    cleared += 1;
+                }
+                keep
+            });
+        }
+        if cleared != 0 {
+            self.block_stalling_since.write().remove(&peer_id);
+        }
+        cleared
+    }
+
+    /// Apply Core's chain-sync timeout to outbound peers that started header
+    /// synchronization. A peer first gets a full chain-sync grace period. If
+    /// it still has not announced a chain with enough work, send one
+    /// getheaders request using the chain tip that established the timer and
+    /// then give it the shorter response window before disconnecting it.
+    pub(crate) fn consider_outbound_eviction(&self, peer_id: usize) -> OutboundEvictionAction {
+        let Some(peer) = self.peers.read().get(&peer_id).cloned() else {
+            return OutboundEvictionAction::None;
+        };
+        let eligible_connection = !peer.inbound
+            && matches!(
+                peer.connection_type,
+                "outbound-full" | "outbound-full-relay" | "block-relay-only"
+            );
+        let sync_active = self.headers_sync_active.lock().contains(&peer_id);
+        if !eligible_connection || !sync_active {
+            return OutboundEvictionAction::None;
+        }
+
+        let state_snapshot = self
+            .chain_sync_states
+            .read()
+            .get(&peer_id)
+            .copied()
+            .unwrap_or_default();
+        let (tip_hash, tip_work, peer_work, benchmark_work, benchmark_parent) = {
+            let chain = self.chain.read();
+            let tip = chain.tip();
+            let peer_work = peer
+                .best_known_block
+                .and_then(|hash| chain.chain_work_by_hash(&hash));
+            let benchmark_work = state_snapshot
+                .work_hash
+                .and_then(|hash| chain.chain_work_by_hash(&hash));
+            let benchmark_parent = state_snapshot.work_hash.and_then(|hash| {
+                chain
+                    .header_by_hash(&hash)
+                    .map(|header| header.prev_blockhash)
+            });
+            (
+                tip.hash,
+                tip.work,
+                peer_work,
+                benchmark_work,
+                benchmark_parent,
+            )
+        };
+
+        let now = time::unix_time();
+        let mut states = self.chain_sync_states.write();
+        let protected_count = states.values().filter(|state| state.protect).count();
+        let state = states.entry(peer_id).or_default();
+
+        // Core protects only full-relay outbound peers, and only while one of
+        // the four protection slots is still available. Block-relay peers are
+        // deliberately always subject to the timeout below.
+        if !state.protect
+            && matches!(
+                peer.connection_type,
+                "outbound-full" | "outbound-full-relay"
+            )
+            && peer_work.is_some_and(|work| work >= tip_work)
+            && protected_count < 4
+        {
+            state.protect = true;
+        }
+        if state.protect {
+            return OutboundEvictionAction::None;
+        }
+
+        if peer_work.is_some_and(|work| work >= tip_work) {
+            if state.timeout != 0 {
+                state.timeout = 0;
+                state.work_hash = None;
+                state.sent_getheaders = false;
+            }
+        } else if state.timeout == 0
+            || (state.work_hash.is_some()
+                && peer_work
+                    .zip(benchmark_work)
+                    .is_some_and(|(peer_work, benchmark_work)| peer_work >= benchmark_work))
+        {
+            state.timeout = now.saturating_add(20 * 60);
+            state.work_hash = Some(tip_hash);
+            state.sent_getheaders = false;
+            debug!(
+                "outbound eviction timer started peer={peer_id} timeout={} best_known={:?}",
+                state.timeout, peer.best_known_block
+            );
+        } else if state.timeout > 0 && now > state.timeout {
+            if state.sent_getheaders {
+                info!(
+                    "Outbound peer has old chain, best known block = {}, peer={peer_id}",
+                    peer.best_known_block
+                        .map_or_else(|| "<none>".to_owned(), |hash| hash.to_string())
+                );
+                return OutboundEvictionAction::Disconnect;
+            }
+            state.sent_getheaders = true;
+            state.timeout = now.saturating_add(2 * 60);
+            debug!(
+                "outbound eviction verification getheaders peer={peer_id} timeout={}",
+                state.timeout
+            );
+            if let Some(parent_hash) = benchmark_parent {
+                return OutboundEvictionAction::RequestHeaders(parent_hash);
+            }
+            return OutboundEvictionAction::RequestHeaders(tip_hash);
+        }
+
+        OutboundEvictionAction::None
     }
 
     pub(crate) fn update_peer_presynced_headers(&self, peer_id: usize, height: Option<i64>) {
@@ -4067,35 +4251,6 @@ impl Node {
         if cleared {
             self.block_stalling_since.write().remove(&peer_id);
         }
-    }
-
-    /// A headers-first peer can answer a getheaders request while the block
-    /// bodies that it just learned are still being connected. Core leaves
-    /// those getdata requests in flight, but a later headers response is a
-    /// useful progress signal for this implementation: release only old
-    /// requests whose bodies are still absent so the normal bounded scheduler
-    /// can retry them. Fresh requests remain protected from duplicate fetches.
-    pub(crate) fn clear_stale_peer_block_requests_for_missing_bodies(
-        &self,
-        peer_id: usize,
-        minimum_age: Duration,
-    ) -> usize {
-        let chain = self.chain.read();
-        let mut cleared = 0;
-        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
-            peer.inflight_blocks.retain(|inflight| {
-                let stale = inflight.requested_at.elapsed() >= minimum_age;
-                let keep = !stale || chain.store.contains(&inflight.hash);
-                if !keep {
-                    cleared += 1;
-                }
-                keep
-            });
-        }
-        if cleared != 0 {
-            self.block_stalling_since.write().remove(&peer_id);
-        }
-        cleared
     }
 
     pub(crate) fn compact_block_request_state(&self, hash: BlockHash) -> (usize, bool) {
@@ -4360,7 +4515,13 @@ impl Node {
             if stalling.contains_key(&peer_id) {
                 return false;
             }
-            stalling.insert(peer_id, since);
+            stalling.insert(
+                peer_id,
+                BlockStallingMoment {
+                    wall: since,
+                    unix_time: time::unix_time(),
+                },
+            );
             return true;
         }
         false
@@ -4378,7 +4539,10 @@ impl Node {
         );
         let mut stalled = self.block_stalling_since.write();
         let peer_id = stalled.iter().find_map(|(peer_id, since)| {
-            (now.duration_since(*since) > timeout).then_some(*peer_id)
+            let wall_expired = now.duration_since(since.wall) > timeout;
+            let mock_expired = time::mock_time() > 0
+                && time::unix_time().saturating_sub(since.unix_time) > timeout.as_secs();
+            (wall_expired || mock_expired).then_some(*peer_id)
         })?;
         stalled.remove(&peer_id);
         let current = self.block_stalling_timeout_secs.load(Ordering::Relaxed);
@@ -4702,6 +4866,9 @@ impl Node {
         };
         self.peers.write().insert(id, peer.clone());
         self.peer_commands.write().insert(id, commands);
+        self.chain_sync_states
+            .write()
+            .insert(id, ChainSyncTimeoutState::default());
         info!("Added connection peer={id}");
         let endpoint_is_addrman_candidate = match &endpoint {
             NetworkEndpoint::Ip(address) => is_core_routable_ip(address.ip()),
@@ -5092,6 +5259,7 @@ impl Node {
         self.headers_sync_active.lock().remove(&id);
         self.inv_triggered_headers_sync.lock().remove(&id);
         self.block_stalling_since.write().remove(&id);
+        self.chain_sync_states.write().remove(&id);
         if let Some(endpoint) = endpoint {
             if let Some(address) = endpoint.legacy_socket_addr()
                 && let Some(known) = self.known_addresses.write().get_mut(&address)

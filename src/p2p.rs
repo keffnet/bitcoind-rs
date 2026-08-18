@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -50,8 +50,8 @@ use crate::wire::{
 };
 
 use crate::{
-    AddrResponseCacheKey, MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, PRIVATE_BROADCAST_RETRY_SECS,
-    PeerRegistrationOptions, StartupLatch, unix_time_seconds,
+    AddrResponseCacheKey, MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, OutboundEvictionAction,
+    PRIVATE_BROADCAST_RETRY_SECS, PeerRegistrationOptions, StartupLatch, unix_time_seconds,
 };
 
 macro_rules! peer_log {
@@ -347,45 +347,60 @@ fn transaction_inventory_send_due(
     average_interval: Duration,
 ) -> bool {
     let mock_now = crate::time::mock_time();
+    let mut next_send = peer_state.next_tx_inventory_send.lock();
+    let mut next_send_mock = peer_state.next_tx_inventory_send_mock.lock();
     if mock_now == 0 {
-        *peer_state.next_tx_inventory_send_mock.lock() = None;
+        *next_send_mock = None;
     } else {
-        let mut next_send_mock = peer_state.next_tx_inventory_send_mock.lock();
-        if next_send_mock.is_none() {
-            // A mocktime jump supersedes a wall-clock deadline that was
-            // initialized before setmocktime. Core evaluates the existing
-            // inventory timer against the new clock and sends immediately
-            // when that deadline is already in the past.
-            *peer_state.next_tx_inventory_send.lock() = None;
-        } else if next_send_mock.is_some_and(|deadline| mock_now >= deadline) {
-            *peer_state.next_tx_inventory_send.lock() = None;
+        // Core evaluates this timer against mocktime. Preserve a wall-clock
+        // deadline created before setmocktime by carrying its remaining
+        // duration into the mocked clock, then use mocked microseconds so a
+        // sub-second delay does not collapse into an immediate broadcast.
+        if next_send_mock.is_none()
+            && let Some(deadline) = *next_send
+        {
+            let remaining = deadline.saturating_duration_since(now);
+            let remaining_micros = i64::try_from(remaining.as_micros()).unwrap_or(i64::MAX);
+            *next_send_mock = Some(
+                mock_now
+                    .saturating_mul(1_000_000)
+                    .saturating_add(remaining_micros),
+            );
+        }
+        let mock_now_micros = mock_now.saturating_mul(1_000_000);
+        if let Some(deadline) = *next_send_mock {
+            if mock_now_micros < deadline {
+                return false;
+            }
+            *next_send = None;
             *next_send_mock = None;
         }
     }
     if peer_state.connection_type == "inbound" {
-        if peer_state
-            .next_tx_inventory_send
-            .lock()
-            .is_some_and(|deadline| now < deadline)
-        {
+        if next_send.is_some_and(|deadline| now < deadline) {
             return false;
         }
         let delay = random_fee_filter_delay(average_interval);
         let deadline = now + delay;
-        *peer_state.next_tx_inventory_send_mock.lock() = (mock_now > 0)
-            .then(|| mock_now.saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)));
-        *peer_state.next_tx_inventory_send.lock() = Some(deadline);
+        *next_send_mock = (mock_now > 0).then(|| {
+            mock_now
+                .saturating_mul(1_000_000)
+                .saturating_add(i64::try_from(delay.as_micros()).unwrap_or(i64::MAX))
+        });
+        *next_send = Some(deadline);
         return true;
     }
 
-    let mut next_send = peer_state.next_tx_inventory_send.lock();
     if next_send.is_some_and(|deadline| now < deadline) {
         return false;
     }
     let delay = random_fee_filter_delay(average_interval);
     *next_send = Some(now + delay);
-    *peer_state.next_tx_inventory_send_mock.lock() = (mock_now > 0)
-        .then(|| mock_now.saturating_add(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX)));
+    *next_send_mock = (mock_now > 0).then(|| {
+        mock_now
+            .saturating_mul(1_000_000)
+            .saturating_add(i64::try_from(delay.as_micros()).unwrap_or(i64::MAX))
+    });
     true
 }
 
@@ -1049,6 +1064,7 @@ struct PeerState {
     next_fee_filter: parking_lot::Mutex<Option<Instant>>,
     next_tx_inventory_send: parking_lot::Mutex<Option<Instant>>,
     next_tx_inventory_send_mock: parking_lot::Mutex<Option<i64>>,
+    tx_relay_ready: AtomicBool,
     relay_transactions: parking_lot::Mutex<bool>,
     wtxid_relay: parking_lot::Mutex<bool>,
     send_headers: parking_lot::Mutex<bool>,
@@ -3585,6 +3601,7 @@ async fn serve_peer(
         next_fee_filter: parking_lot::Mutex::new(None),
         next_tx_inventory_send: parking_lot::Mutex::new(None),
         next_tx_inventory_send_mock: parking_lot::Mutex::new(None),
+        tx_relay_ready: AtomicBool::new(false),
         relay_transactions: parking_lot::Mutex::new(false),
         wtxid_relay: parking_lot::Mutex::new(false),
         send_headers: parking_lot::Mutex::new(false),
@@ -4122,9 +4139,28 @@ async fn serve_peer_loop(
                 continue;
             }
             _ = block_download_interval.tick(), if version_received && verack_received => {
-                if handle_headers_download_timeout(node, peer_id, peer_state)? {
+                let retry_headers = handle_headers_download_timeout(node, peer_id, peer_state)?;
+                if retry_headers {
                     request_headers(node, peer_id, writer, peer_state).await?;
                     continue;
+                }
+                match node.consider_outbound_eviction(peer_id) {
+                    OutboundEvictionAction::None => {}
+                    OutboundEvictionAction::RequestHeaders(start_hash) => {
+                        request_headers_from_start_hash(
+                            node,
+                            peer_id,
+                            writer,
+                            peer_state,
+                            start_hash,
+                            true,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    OutboundEvictionAction::Disconnect => {
+                        anyhow::bail!("outbound peer has old chain");
+                    }
                 }
                 if !peer_block_download_allowed_for_node(node, peer_id, peer_services) {
                     continue;
@@ -4240,6 +4276,10 @@ async fn serve_peer_loop(
                 }
                 version_received = true;
                 if version.version < MIN_PEER_PROTO_VERSION {
+                    debug!(
+                        "using obsolete version {}, disconnecting peer={peer_id}",
+                        version.version
+                    );
                     anyhow::bail!("peer protocol version is too old");
                 }
                 if peer_nonce_is_self_connection(outbound, version.nonce, local_nonce) {
@@ -4348,6 +4388,24 @@ async fn serve_peer_loop(
                 if !version_received {
                     continue;
                 }
+                // Core does not queue transaction announcements until the
+                // version handshake is complete. Otherwise a transaction
+                // received while a spy is still negotiating could be
+                // replayed immediately at VERACK and reveal its arrival
+                // time.
+                peer_state.tx_relay_ready.store(true, Ordering::Release);
+                if node.config.zmq.tx_reconciliation {
+                    let wtxid_relay = *peer_state.wtxid_relay.lock();
+                    let registered = *peer_state.tx_reconciliation_registered.lock();
+                    if !wtxid_relay || !registered {
+                        let mut salt = peer_state.tx_reconciliation_salt.lock();
+                        if salt.is_some() || registered {
+                            debug!("Forget txreconciliation state of peer={peer_id}");
+                        }
+                        *salt = None;
+                        *peer_state.tx_reconciliation_registered.lock() = false;
+                    }
+                }
                 node.setup_outbound_address_relay(peer_id);
                 send_peer_extensions(
                     node,
@@ -4450,26 +4508,45 @@ async fn serve_peer_loop(
                 if !node.config.zmq.tx_reconciliation {
                     // Core ignores the offer when reconciliation support is
                     // disabled, preserving compatibility with default nodes.
+                    debug!(
+                        "sendtxrcncl from peer={peer_id} ignored, as our node does not have txreconciliation enabled"
+                    );
                     continue;
                 }
                 if verack_received {
+                    debug!("sendtxrcncl received after verack, disconnecting peer={peer_id}");
                     anyhow::bail!("sendtxrcncl received after verack");
+                }
+                if !peer_state.local_relay_transactions {
+                    debug!(
+                        "sendtxrcncl received to which we indicated no tx relay, disconnecting peer={peer_id}"
+                    );
+                    anyhow::bail!("sendtxrcncl received on a non-relaying connection");
                 }
                 if peer_version < WTXID_RELAY_VERSION
                     || peer_state.tx_reconciliation_salt.lock().is_none()
                 {
+                    debug!("Ignore unexpected txreconciliation signal from peer={peer_id}");
                     continue;
                 }
                 if !*relay_transactions.lock() {
+                    debug!(
+                        "sendtxrcncl received which indicated no tx relay to us, disconnecting peer={peer_id}"
+                    );
                     anyhow::bail!("sendtxrcncl received from a non-relaying peer");
                 }
                 if message.version < TX_RECONCILIATION_VERSION {
+                    debug!("txreconciliation protocol violation, disconnecting peer={peer_id}");
                     anyhow::bail!("unsupported transaction reconciliation version");
                 }
                 let mut registered = peer_state.tx_reconciliation_registered.lock();
                 if *registered {
+                    debug!(
+                        "(sendtxrcncl received from already registered peer), disconnecting peer={peer_id}"
+                    );
                     anyhow::bail!("duplicate sendtxrcncl message");
                 }
+                debug!("Register peer={peer_id} (inbound={})", !outbound);
                 *registered = true;
             }
             Message::Ping(nonce) => {
@@ -4486,6 +4563,18 @@ async fn serve_peer_loop(
                 }
                 if retry_headers {
                     request_headers(node, peer_id, writer, peer_state).await?;
+                }
+                match node.consider_outbound_eviction(peer_id) {
+                    OutboundEvictionAction::None => {}
+                    OutboundEvictionAction::RequestHeaders(start_hash) => {
+                        request_headers_from_start_hash(
+                            node, peer_id, writer, peer_state, start_hash, true,
+                        )
+                        .await?;
+                    }
+                    OutboundEvictionAction::Disconnect => {
+                        anyhow::bail!("outbound peer has old chain");
+                    }
                 }
                 // Core's message-send pass also runs when the peer loop is
                 // woken by ordinary traffic. Functional tests use ping after
@@ -4655,11 +4744,19 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::Headers(headers) => {
-                node.clear_inv_headers_sync_trigger(peer_id);
                 let request_more_headers = headers.len() == 2_000;
                 if headers.is_empty() {
+                    let had_headers_request = peer_state.last_headers_request.lock().is_some();
                     *peer_state.last_headers_request.lock() = None;
                     *peer_state.last_headers_request_time.lock() = None;
+                    // An empty response to our getheaders completes the
+                    // inventory-triggered round.  An unsolicited empty
+                    // headers message, however, is the testable equivalent
+                    // of clearing a stale request before a new announcement
+                    // (Core keeps these two pieces of state separate).
+                    if !had_headers_request {
+                        node.clear_inv_headers_sync_trigger(peer_id);
+                    }
                     headers_sync = None;
                     node.update_peer_presynced_headers(peer_id, None);
                     continue;
@@ -4876,6 +4973,12 @@ async fn serve_peer_loop(
                             if error.to_string().contains("is on an invalidated branch")
                                 || error.to_string().contains("has an invalidated parent") =>
                         {
+                            if headers_to_accept
+                                .iter()
+                                .any(|header| !known.contains(&header.block_hash()))
+                            {
+                                return Err(error);
+                            }
                             // A peer can legitimately answer a headers
                             // request from a branch this node invalidated
                             // locally while the peer is still catching up.
@@ -5098,7 +5201,7 @@ async fn serve_peer_loop(
                 } else if request_more_headers && headers_sync.is_none() {
                     if let Some(last_hash) = last_hash {
                         request_headers_from_start_hash(
-                            node, peer_id, writer, peer_state, last_hash,
+                            node, peer_id, writer, peer_state, last_hash, false,
                         )
                         .await?;
                     } else {
@@ -5397,6 +5500,11 @@ async fn serve_peer_loop(
                                 continue;
                             }
                             let Some(block) = node.block_store_reader.get(&item.hash)? else {
+                                // The native store is populated asynchronously.  A block
+                                // header can therefore be known before its body is visible to
+                                // the serving reader.  Tell the requester to release its
+                                // in-flight marker so the regular download tick can retry.
+                                missing.push(item);
                                 continue;
                             };
                             if node.historical_block_serving_limit_reached(
@@ -5753,6 +5861,11 @@ async fn serve_peer_loop(
                             && !chain.store.contains(&parent_hash)
                     };
                     if parent_body_missing {
+                        // The parent was often part of the same request
+                        // window as this child. The serving peer may have
+                        // answered before it had stored the parent body, so
+                        // drop that stale marker before retrying it.
+                        node.clear_peer_block_request(peer_id, parent_hash);
                         request_full_block(
                             node,
                             peer_id,
@@ -6772,14 +6885,10 @@ async fn serve_peer_loop(
                         queue_block_requests(&mut pending_block_requests, [item]);
                     }
                 }
-                flush_pending_block_requests(
-                    node,
-                    peer_id,
-                    writer,
-                    node.config.network,
-                    &mut pending_block_requests,
-                )
-                .await?;
+                // Block NotFound responses are retried by the next bounded download tick.
+                // Do not immediately resend here: the serving peer may be reporting a
+                // transient native-store visibility race, which would otherwise spin the
+                // connection while the body is being indexed.
                 if let Some(transaction_items) = notfound_transaction_items(&items) {
                     for item in transaction_items {
                         peer_state.tx_requests.lock().remove_inventory(&item);
@@ -7886,9 +7995,10 @@ async fn request_headers_from_start_hash(
     writer: &PeerWriter,
     peer_state: &PeerState,
     start_hash: BlockHash,
+    force: bool,
 ) -> Result<()> {
     let locator = node.chain.read().block_locator_hashes_from(start_hash);
-    request_headers_with_locator(node, peer_id, writer, peer_state, locator, false).await
+    request_headers_with_locator(node, peer_id, writer, peer_state, locator, force).await
 }
 
 async fn request_headers_with_locator(
@@ -8794,6 +8904,9 @@ async fn broadcast_inventory_excluding(
             }
         }
         if item.kind.is_transaction() {
+            if !state.tx_relay_ready.load(Ordering::Acquire) {
+                continue;
+            }
             // `local_relay_transactions` controls whether this node accepts
             // transaction relay from the peer.  It must not suppress
             // announcements of transactions submitted locally via RPC: Core
@@ -10445,6 +10558,7 @@ mod tests {
             next_fee_filter: parking_lot::Mutex::new(None),
             next_tx_inventory_send: parking_lot::Mutex::new(None),
             next_tx_inventory_send_mock: parking_lot::Mutex::new(None),
+            tx_relay_ready: AtomicBool::new(false),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(true),
             send_headers: parking_lot::Mutex::new(false),
@@ -12891,6 +13005,7 @@ mod tests {
             next_fee_filter: parking_lot::Mutex::new(None),
             next_tx_inventory_send: parking_lot::Mutex::new(None),
             next_tx_inventory_send_mock: parking_lot::Mutex::new(None),
+            tx_relay_ready: AtomicBool::new(false),
             relay_transactions: parking_lot::Mutex::new(true),
             wtxid_relay: parking_lot::Mutex::new(false),
             send_headers: parking_lot::Mutex::new(false),

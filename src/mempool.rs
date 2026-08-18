@@ -487,6 +487,8 @@ pub enum MempoolError {
     },
     #[error("replacement transaction fee is too low")]
     ReplacementFee,
+    #[error("{0}")]
+    ReplacementFeeWithContext(String),
     #[error("replacement transaction spends an unconfirmed output outside the conflicts")]
     ReplacementUnconfirmedInput,
     #[error("package RBF failed: package must be 1-parent-1-child")]
@@ -555,6 +557,10 @@ impl MempoolError {
             Self::ReplacementFeerateDiagram => {
                 "insufficient feerate: does not improve feerate diagram".to_owned()
             }
+            Self::ReplacementFeeWithContext(message) => message
+                .split_once(", rejecting replacement")
+                .map(|(reason, _)| reason.to_owned())
+                .unwrap_or_else(|| message.clone()),
             Self::MissingInput(_) => "missing-inputs".to_owned(),
             Self::PrematureCoinbase => "bad-txns-premature-spend-of-coinbase".to_owned(),
             Self::DustWithFee => "dust".to_owned(),
@@ -572,7 +578,7 @@ impl MempoolError {
             Self::MinRelayFee => "min relay fee not met".to_owned(),
             Self::NonStandard(reason) => reason.clone(),
             Self::ClusterLimit => "too-large-cluster".to_owned(),
-            Self::Truc(reason) => format!("TRUC-violation, {reason}"),
+            Self::Truc(_) => "TRUC-violation".to_owned(),
             Self::Script(reason) if reason == "transaction locktime is not yet satisfied" => {
                 "non-final".to_owned()
             }
@@ -609,6 +615,7 @@ fn package_individual_retryable(error: &MempoolError) -> bool {
             | MempoolError::MinRelayFee
             | MempoolError::Full
             | MempoolError::ReplacementFee
+            | MempoolError::ReplacementFeeWithContext(_)
             | MempoolError::ReplacementFeerateDiagram
             | MempoolError::MissingInput(_)
     )
@@ -1135,7 +1142,7 @@ impl Mempool {
     /// enumeration APIs. With no practical weight limit this includes every
     /// entry while still placing ancestors before children.
     pub fn main_order(&self) -> Vec<Txid> {
-        self.mining_order(u64::MAX, 0)
+        self.mining_order_internal(u64::MAX, 0, false)
     }
 
     /// Return transactions in ancestor-package feerate order for block
@@ -1144,7 +1151,7 @@ impl Mempool {
     /// (including prioritisation deltas) per weight, while the returned list
     /// remains topologically ordered.
     pub fn mining_order(&self, max_weight: u64, reserved_weight: u64) -> Vec<Txid> {
-        self.mining_order_with_min_fee(max_weight, reserved_weight, 0)
+        self.mining_order_internal(max_weight, reserved_weight, true)
     }
 
     /// Return transactions in ancestor-package feerate order, excluding
@@ -1156,6 +1163,35 @@ impl Mempool {
         max_weight: u64,
         reserved_weight: u64,
         min_fee_sat_per_kvb: u64,
+    ) -> Vec<Txid> {
+        self.mining_order_internal_with_min_fee(
+            max_weight,
+            reserved_weight,
+            min_fee_sat_per_kvb,
+            true,
+        )
+    }
+
+    fn mining_order_internal(
+        &self,
+        max_weight: u64,
+        reserved_weight: u64,
+        enforce_nonnegative_fee: bool,
+    ) -> Vec<Txid> {
+        self.mining_order_internal_with_min_fee(
+            max_weight,
+            reserved_weight,
+            0,
+            enforce_nonnegative_fee,
+        )
+    }
+
+    fn mining_order_internal_with_min_fee(
+        &self,
+        max_weight: u64,
+        reserved_weight: u64,
+        min_fee_sat_per_kvb: u64,
+        enforce_nonnegative_fee: bool,
     ) -> Vec<Txid> {
         let weight_limit = max_weight.saturating_sub(reserved_weight);
         let mut selected = HashSet::new();
@@ -1209,6 +1245,7 @@ impl Mempool {
                 selected_weight,
                 weight_limit,
                 min_fee_sat_per_kvb,
+                enforce_nonnegative_fee,
             ) else {
                 break;
             };
@@ -1237,18 +1274,22 @@ impl Mempool {
                     .unwrap_or_default();
                 let weight = self.adjusted_weight(&selected_txid);
                 let mut descendants = vec![selected_txid];
+                let mut seen_descendants = HashSet::from([selected_txid]);
                 let mut index = 0;
                 while let Some(current) = descendants.get(index).copied() {
                     index += 1;
                     let Some(children) = self.children.get(&current) else {
                         continue;
                     };
-                    descendants.extend(
-                        children
-                            .iter()
-                            .copied()
-                            .filter(|child| self.entries.contains_key(child)),
-                    );
+                    for child in children
+                        .iter()
+                        .copied()
+                        .filter(|child| self.entries.contains_key(child))
+                    {
+                        if seen_descendants.insert(child) {
+                            descendants.push(child);
+                        }
+                    }
                 }
                 for descendant in descendants {
                     if selected.contains(&descendant) {
@@ -1534,7 +1575,15 @@ impl Mempool {
                 }
             }
             Err(error @ MempoolError::Truc(_)) if allow_sibling_eviction => {
-                if let Some(sibling) = self.truc_sibling_for(&transaction) {
+                let direct_conflicts = self.conflicts_for(&transaction);
+                if !direct_conflicts.is_empty() {
+                    // A reorg can temporarily leave a TRUC parent with more
+                    // than one child.  If the new transaction directly
+                    // replaces one of those children, removal of the direct
+                    // conflict must be considered before reporting the
+                    // descendant-limit violation.
+                    self.replace(transaction, chain, added_at)
+                } else if let Some(sibling) = self.truc_sibling_for(&transaction) {
                     self.replace_with_conflicts(transaction, chain, added_at, vec![sibling], true)
                 } else {
                     Err(error)
@@ -1887,8 +1936,21 @@ impl Mempool {
             let txid = match candidate.accept_at(transaction.clone(), chain, added_at) {
                 Ok(txid) => txid,
                 Err(error) => {
+                    // A TRUC violation caused solely by the pre-existing
+                    // mempool is a per-transaction result.  A violation that
+                    // appears only after staging package members is instead
+                    // a package-wide error, as in Core's
+                    // `testmempoolaccept` response.
+                    let standalone_truc_violation = matches!(&error, MempoolError::Truc(_)) && {
+                        let mut standalone = self.clone();
+                        matches!(
+                            standalone.accept_at(transaction.clone(), chain, added_at),
+                            Err(MempoolError::Truc(_))
+                        )
+                    };
                     let package_error = match &error {
                         MempoolError::ClusterLimit => Some("too-large-cluster".to_owned()),
+                        MempoolError::Truc(_) if standalone_truc_violation => None,
                         MempoolError::Truc(_) => Some(error.to_string()),
                         _ => None,
                     };
@@ -1955,6 +2017,7 @@ impl Mempool {
             return Err(MempoolError::Conflict(transaction.compute_txid()));
         }
         let direct_conflicts = self.conflicts_for(&transaction);
+        let replacement_id = transaction.compute_txid();
         self.check_replacement_cluster_limit(transaction.compute_txid(), &direct_conflicts)?;
         self.check_replacement_policy(&direct_conflicts)?;
         let removal = self.conflicts_and_descendants(&conflicts);
@@ -1967,7 +2030,19 @@ impl Mempool {
         for txid in &removal {
             candidate.remove(txid);
         }
-        let txid = candidate.accept_at(transaction, chain, added_at)?;
+        let allow_truc_descendant_replacement = direct_conflicts.iter().any(|conflict| {
+            transaction.input.iter().any(|input| {
+                let parent_id = input.previous_output.txid;
+                self.entries.contains_key(&parent_id)
+                    && self.descendants(&parent_id).contains(conflict)
+            })
+        });
+        let txid = candidate.accept_at_for_replacement(
+            transaction,
+            chain,
+            added_at,
+            allow_truc_descendant_replacement,
+        )?;
         let replacement_fee = candidate
             .get(&txid)
             .map(|entry| candidate.modified_fee_sat(&txid, entry.fee_sat))
@@ -1981,6 +2056,18 @@ impl Mempool {
             replacement_vsize,
         ));
         if replacement_fee < required_fee {
+            if sibling_eviction {
+                let message = if replacement_fee < conflict_fees {
+                    format!(
+                        "insufficient fee (including sibling eviction), rejecting replacement {replacement_id}, less fees than conflicting txs"
+                    )
+                } else {
+                    format!(
+                        "insufficient fee (including sibling eviction), rejecting replacement {replacement_id}, not enough additional fees to relay"
+                    )
+                };
+                return Err(MempoolError::ReplacementFeeWithContext(message));
+            }
             return Err(MempoolError::ReplacementFee);
         }
         if sibling_eviction {
@@ -1997,7 +2084,10 @@ impl Mempool {
                 let sibling_fee_rate = self.modified_fee_sat(sibling, sibling_entry.fee_sat)
                     * i128::from(replacement_vsize);
                 if replacement_fee_rate <= sibling_fee_rate {
-                    return Err(MempoolError::ReplacementFee);
+                    return Err(MempoolError::ReplacementFeeWithContext(format!(
+                        "insufficient fee (including sibling eviction), rejecting replacement {}",
+                        replacement_id
+                    )));
                 }
             }
         }
@@ -2168,8 +2258,10 @@ impl Mempool {
             added_at,
             enforce_fee_rate,
             true,
+            true,
             false,
             true,
+            false,
         )
     }
 
@@ -2181,8 +2273,17 @@ impl Mempool {
     ) -> Result<Txid, MempoolError> {
         // Core's reorg path bypasses fee-rate and rolling-size limits, but it
         // still applies structural mempool policy such as cluster limits.
-        let txid =
-            self.accept_at_with_sequence(transaction, chain, added_at, false, true, false, true)?;
+        let txid = self.accept_at_with_sequence(
+            transaction,
+            chain,
+            added_at,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+        )?;
         self.relay_sequences.insert(txid, 0);
         Ok(txid)
     }
@@ -2203,6 +2304,8 @@ impl Mempool {
             enforce_mempool_policy,
             true,
             true,
+            true,
+            false,
         )
     }
 
@@ -2212,7 +2315,37 @@ impl Mempool {
         chain: &ChainState,
         added_at: u64,
     ) -> Result<Txid, MempoolError> {
-        self.accept_at_with_sequence(transaction, chain, added_at, false, false, false, false)
+        self.accept_at_with_sequence(
+            transaction,
+            chain,
+            added_at,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+
+    fn accept_at_for_replacement(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
+        allow_truc_descendant_replacement: bool,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_at_with_sequence(
+            transaction,
+            chain,
+            added_at,
+            true,
+            true,
+            true,
+            true,
+            true,
+            allow_truc_descendant_replacement,
+        )
     }
 
     fn accept_at_with_sequence(
@@ -2222,8 +2355,10 @@ impl Mempool {
         added_at: u64,
         enforce_fee_rate: bool,
         enforce_mempool_policy: bool,
+        enforce_truc_policy: bool,
         check_ephemeral_spends: bool,
         record_sequence: bool,
+        allow_truc_descendant_replacement: bool,
     ) -> Result<Txid, MempoolError> {
         // During AssumeUTXO activation the snapshot chainstate serves UTXOs
         // at its base height while the background chainstate is still lower.
@@ -2386,10 +2521,7 @@ impl Mempool {
                     error,
                 ))
             })?;
-        let truc_min_fee_exempt =
-            self.policy.truc_policy == TrucPolicy::Enforce && transaction.version.0 == TRUC_VERSION;
         if enforce_fee_rate
-            && !truc_min_fee_exempt
             && !fee_rate_meets(
                 i128::from(modified_fee_sat),
                 vsize,
@@ -2414,12 +2546,16 @@ impl Mempool {
             // transaction.
             validate_ephemeral_spends(std::slice::from_ref(&transaction), self)?;
         }
-        if enforce_mempool_policy {
+        if enforce_mempool_policy && enforce_truc_policy {
             match self.policy.truc_policy {
                 TrucPolicy::Reject if transaction.version.0 == TRUC_VERSION => {
                     return Err(MempoolError::NonStandard("version".to_owned()));
                 }
-                TrucPolicy::Enforce => self.check_truc_policy(&transaction, vsize)?,
+                TrucPolicy::Enforce => self.check_truc_policy_with_replacement(
+                    &transaction,
+                    vsize,
+                    allow_truc_descendant_replacement,
+                )?,
                 TrucPolicy::Accept | TrucPolicy::Reject => {}
             }
         }
@@ -2578,7 +2714,17 @@ impl Mempool {
         }
     }
 
+    #[cfg(test)]
     fn check_truc_policy(&self, transaction: &Transaction, vsize: u64) -> Result<(), MempoolError> {
+        self.check_truc_policy_with_replacement(transaction, vsize, false)
+    }
+
+    fn check_truc_policy_with_replacement(
+        &self,
+        transaction: &Transaction,
+        vsize: u64,
+        allow_descendant_replacement: bool,
+    ) -> Result<(), MempoolError> {
         let transaction_id = transaction.compute_txid();
         let transaction_wtxid = transaction.compute_wtxid();
         let mut parent_ids = Vec::new();
@@ -2639,7 +2785,9 @@ impl Mempool {
                 "version=3 child tx {transaction_id} (wtxid={transaction_wtxid}) is too big: {vsize} > {TRUC_CHILD_MAX_VSIZE} virtual bytes"
             )));
         }
-        if self.descendants(parent_id).len().saturating_add(2) > TRUC_DESCENDANT_LIMIT {
+        if !allow_descendant_replacement
+            && self.descendants(parent_id).len().saturating_add(2) > TRUC_DESCENDANT_LIMIT
+        {
             return Err(MempoolError::Truc(format!(
                 "tx {parent_id} (wtxid={}) would exceed descendant count limit",
                 self.entries
@@ -2870,6 +3018,11 @@ impl Mempool {
     pub fn remove_confirmed(&mut self, block: &bitcoin::Block) {
         for transaction in &block.txdata {
             let txid = transaction.compute_txid();
+            if self.unbroadcast.contains(&txid) {
+                tracing::info!(
+                    "Removed {txid} from set of unbroadcast txns before confirmation that txn was sent out"
+                );
+            }
             self.remove_with_notification(&txid, false);
             // Core discards transaction-specific prioritisation once the
             // transaction is confirmed. If the block is later invalidated,
@@ -2888,7 +3041,8 @@ impl Mempool {
             .filter_map(|(txid, entry)| (entry.added_at < cutoff).then_some(*txid))
             .collect();
         for txid in expired {
-            self.remove(&txid);
+            // Expiring an ancestor invalidates every in-mempool descendant.
+            self.remove_recursive(&txid);
         }
     }
 
@@ -3960,6 +4114,9 @@ fn is_standard_output_script(script: &Script, permit_bare_multisig: bool) -> boo
         || script.is_p2wpkh()
         || script.is_p2wsh()
         || script.is_p2tr()
+        // Core treats valid future witness programs as standard outputs even
+        // though their spending rules are intentionally unknown here.
+        || script.is_witness_program()
         || is_p2a_script(script)
         || (permit_bare_multisig && is_standard_bare_multisig(script))
 }
@@ -4213,6 +4370,7 @@ fn next_mining_candidate(
     selected_weight: u64,
     weight_limit: u64,
     min_fee_sat_per_kvb: u64,
+    enforce_nonnegative_fee: bool,
 ) -> Option<MiningCandidate> {
     while let Some(candidate) = candidates.pop() {
         if selected.contains(&candidate.txid) {
@@ -4237,7 +4395,7 @@ fn next_mining_candidate(
         // negative, even when -blockmintxfee=0.  Core's FeePerVSize
         // comparison rejects such a package before the zero-fee floor is
         // applied.
-        if candidate.fee < 0 {
+        if enforce_nonnegative_fee && candidate.fee < 0 {
             continue;
         }
         if min_fee_sat_per_kvb != 0 {
@@ -5122,6 +5280,7 @@ mod tests {
             pool.mining_order_with_min_fee(4_000_000, 0, 0),
             vec![parent_id, child_id]
         );
+        assert_eq!(pool.main_order(), vec![parent_id, child_id, independent_id]);
     }
 
     #[test]
@@ -5730,9 +5889,9 @@ mod tests {
 
         nonstandard.output[0].value = Amount::from_sat(100_000);
         nonstandard.output[0].script_pubkey = ScriptBuf::from_bytes({
-            let mut bytes = vec![0x52, 0x20];
-            bytes.extend([0u8; 32]);
-            bytes
+            // A future witness program with a one-byte program is invalid;
+            // valid version-2+ programs are standard under Core policy.
+            vec![0x52, 0x01, 0x01]
         });
         assert!(matches!(
             validate_standard_policy(&nonstandard, std::slice::from_ref(&previous), 1),

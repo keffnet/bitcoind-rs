@@ -2737,7 +2737,11 @@ fn parse_rbf_policy(replacement: Option<&str>, full_rbf: Option<bool>) -> Result
 
 fn parse_truc_policy(value: Option<&str>) -> Result<TrucPolicy> {
     let Some(value) = value else {
-        return Ok(TrucPolicy::Accept);
+        // Version-3/TRUC transactions are accepted by default, with their
+        // topology and size limits enforced. `accept` remains available as
+        // an explicit compatibility mode for callers that need pre-TRUC
+        // policy behavior.
+        return Ok(TrucPolicy::Enforce);
     };
     if let Some(enabled) = parse_boolish_policy_value(value) {
         return Ok(if enabled {

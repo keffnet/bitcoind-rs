@@ -13357,6 +13357,7 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
 }
 
 pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    node.expire_mempool();
     let raw_transactions = params
         .get(0)
         .and_then(Value::as_array)
@@ -13468,19 +13469,23 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 &error,
                 MempoolError::NonStandard(reason) if reason == "unspent-dust"
             );
-        let failure_index =
-            if package_rbf_atomic || unspent_dust_failure || matches!(&error, MempoolError::Full) {
-                None
-            } else {
-                match (max_fee_failure, first_missing) {
-                    (Some(max_fee_index), Some(missing_index)) if max_fee_index < missing_index => {
-                        Some(max_fee_index)
-                    }
-                    (_, Some(missing_index)) => Some(missing_index),
-                    (Some(max_fee_index), None) => Some(max_fee_index),
-                    (None, None) => None,
+        let truc_failure = matches!(&error, MempoolError::Truc(_));
+        let failure_index = if package_rbf_atomic
+            || unspent_dust_failure
+            || truc_failure
+            || matches!(&error, MempoolError::Full)
+        {
+            None
+        } else {
+            match (max_fee_failure, first_missing) {
+                (Some(max_fee_index), Some(missing_index)) if max_fee_index < missing_index => {
+                    Some(max_fee_index)
                 }
-            };
+                (_, Some(missing_index)) => Some(missing_index),
+                (Some(max_fee_index), None) => Some(max_fee_index),
+                (None, None) => None,
+            }
+        };
         if let Some(failure_index) = failure_index {
             let accepted = transactions
                 .iter()
@@ -13535,8 +13540,11 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                 );
                 commit_submitted_package(node, candidate, before_transactions, accepted)
             };
+            let package_msg = matches!(&error, MempoolError::Truc(_))
+                .then_some(reason.clone())
+                .unwrap_or_else(|| "transaction failed".to_owned());
             return Ok(json!({
-                "package_msg": "transaction failed",
+                "package_msg": package_msg,
                 "tx-results": results,
                 "replaced-transactions": replaced_transactions,
             }));
@@ -13546,7 +13554,9 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
             .filter(|transaction| individually_accepted.contains(&transaction.compute_txid()))
             .cloned()
             .collect::<Vec<_>>();
-        let replaced_transactions = if package_rbf_atomic && !standalone_accepted.is_empty() {
+        let commit_individual_prefix =
+            package_rbf_atomic || (truc_failure && !standalone_accepted.is_empty());
+        let replaced_transactions = if commit_individual_prefix {
             // Core has already committed independently valid package members
             // before running the package-RBF retry.  Commit that prefix while
             // keeping the failed fallback package atomic.
@@ -13809,6 +13819,14 @@ fn commit_submitted_package(
     before_transactions: HashMap<Txid, Transaction>,
     accepted: Vec<Transaction>,
 ) -> Vec<String> {
+    // Some submitpackage validation probes temporarily disable the mempool
+    // size limit so they can classify individually valid members.  Restore
+    // the node's real limit before publishing that candidate; otherwise a
+    // failed package attempt could accidentally turn the live mempool into
+    // an unlimited pool.
+    let max_bytes = node.mempool.read().max_bytes();
+    candidate.set_max_bytes(max_bytes);
+    candidate.enforce_size_limit();
     for transaction in &accepted {
         candidate.add_unbroadcast(transaction.compute_txid());
     }
@@ -13920,6 +13938,9 @@ fn submit_package_failure_message_with_context(
     candidate: &Mempool,
     original_mempool: &Mempool,
 ) -> String {
+    if matches!(error, MempoolError::Truc(_)) {
+        return error.to_string();
+    }
     if matches!(
         error,
         MempoolError::NonStandard(reason) if reason == "unspent-dust"
@@ -15637,6 +15658,7 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "transaction fee rate is below the relay minimum"
         || lower.starts_with("transaction is non-standard:")
         || lower.starts_with("transaction script validation failed:")
+        || lower.starts_with("insufficient fee (including sibling eviction)")
         || lower.starts_with("replacement transaction fee is too low")
         || lower.starts_with("truc-violation,")
     {

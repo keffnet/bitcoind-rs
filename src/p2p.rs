@@ -1146,6 +1146,7 @@ fn peer_package_retryable_error(error: &anyhow::Error) -> bool {
                 | MempoolError::MinRelayFee
                 | MempoolError::Full
                 | MempoolError::ReplacementFee
+                | MempoolError::ReplacementFeeWithContext(_)
                 | MempoolError::ReplacementFeerateDiagram
                 | MempoolError::MissingInput(_)
         )

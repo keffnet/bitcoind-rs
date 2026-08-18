@@ -2572,6 +2572,7 @@ impl Node {
     }
 
     pub fn accept_transaction(&self, transaction: Transaction) -> Result<Txid> {
+        self.expire_mempool();
         let txid = transaction.compute_txid();
         if let Some(existing) = self
             .mempool
@@ -2812,6 +2813,7 @@ impl Node {
         peer_id: usize,
         transaction: Transaction,
     ) -> Result<Txid> {
+        self.expire_mempool();
         // Repeated announcements of the same orphan are common during relay
         // storms. The first admission already established that its inputs are
         // missing; rerunning full mempool validation for every announcer only
@@ -2886,6 +2888,7 @@ impl Node {
                 | MempoolError::MinRelayFee
                 | MempoolError::Full
                 | MempoolError::ReplacementFee
+                | MempoolError::ReplacementFeeWithContext(_)
                 | MempoolError::ReplacementFeerateDiagram
         );
         if retryable {
@@ -2949,6 +2952,7 @@ impl Node {
         peer_id: usize,
         transactions: &[Transaction],
     ) -> Result<Vec<Txid>> {
+        self.expire_mempool();
         let (result, changes, current_height) = {
             let chain = self.chain.read();
             let mut mempool = self.mempool.write();
@@ -3133,7 +3137,7 @@ impl Node {
         }
     }
 
-    fn expire_mempool(&self) {
+    pub(crate) fn expire_mempool(&self) {
         let changes = {
             let mut mempool = self.mempool.write();
             let expiry =

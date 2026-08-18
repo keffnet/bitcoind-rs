@@ -489,6 +489,8 @@ pub enum MempoolError {
     ReplacementFee,
     #[error("{0}")]
     ReplacementFeeWithContext(String),
+    #[error("bad-txns-spends-conflicting-tx, {txid} spends conflicting transaction {conflict}")]
+    SpendsConflictingTx { txid: Txid, conflict: Txid },
     #[error("replacement transaction spends an unconfirmed output outside the conflicts")]
     ReplacementUnconfirmedInput,
     #[error("package RBF failed: package must be 1-parent-1-child")]
@@ -561,6 +563,7 @@ impl MempoolError {
                 .split_once(", rejecting replacement")
                 .map(|(reason, _)| reason.to_owned())
                 .unwrap_or_else(|| message.clone()),
+            Self::SpendsConflictingTx { .. } => "bad-txns-spends-conflicting-tx".to_owned(),
             Self::MissingInput(_) => "missing-inputs".to_owned(),
             Self::PrematureCoinbase => "bad-txns-premature-spend-of-coinbase".to_owned(),
             Self::DustWithFee => "dust".to_owned(),
@@ -576,6 +579,7 @@ impl MempoolError {
             Self::NegativeFee => "bad-txns-in-belowout".to_owned(),
             Self::FeeRate => "mempool min fee not met".to_owned(),
             Self::MinRelayFee => "min relay fee not met".to_owned(),
+            Self::ReplacementFee => "insufficient fee".to_owned(),
             Self::NonStandard(reason) => reason.clone(),
             Self::ClusterLimit => "too-large-cluster".to_owned(),
             Self::Truc(_) => "TRUC-violation".to_owned(),
@@ -2020,6 +2024,11 @@ impl Mempool {
         let replacement_id = transaction.compute_txid();
         self.check_replacement_cluster_limit(transaction.compute_txid(), &direct_conflicts)?;
         self.check_replacement_policy(&direct_conflicts)?;
+        let conflicting_ancestor = self
+            .ancestors_for_transaction(&transaction)
+            .into_iter()
+            .filter(|ancestor| direct_conflicts.contains(ancestor))
+            .min();
         let removal = self.conflicts_and_descendants(&conflicts);
         let conflict_fees = removal
             .iter()
@@ -2037,12 +2046,20 @@ impl Mempool {
                     && self.descendants(&parent_id).contains(conflict)
             })
         });
-        let txid = candidate.accept_at_for_replacement(
+        let txid = match candidate.accept_at_for_replacement(
             transaction,
             chain,
             added_at,
             allow_truc_descendant_replacement,
-        )?;
+        ) {
+            Err(MempoolError::MissingInput(_)) if conflicting_ancestor.is_some() => {
+                return Err(MempoolError::SpendsConflictingTx {
+                    txid: replacement_id,
+                    conflict: conflicting_ancestor.expect("conflicting ancestor exists"),
+                });
+            }
+            result => result?,
+        };
         let replacement_fee = candidate
             .get(&txid)
             .map(|entry| candidate.modified_fee_sat(&txid, entry.fee_sat))
@@ -2051,10 +2068,11 @@ impl Mempool {
             .get(&txid)
             .map(|entry| entry.vsize)
             .unwrap_or_default();
-        let required_fee = conflict_fees.saturating_add(fee_for_rate(
+        let incremental_fee = fee_for_rate(
             candidate.policy.incremental_relay_fee_sat_per_kvb,
             replacement_vsize,
-        ));
+        );
+        let required_fee = conflict_fees.saturating_add(incremental_fee);
         if replacement_fee < required_fee {
             if sibling_eviction {
                 let message = if replacement_fee < conflict_fees {
@@ -2068,7 +2086,27 @@ impl Mempool {
                 };
                 return Err(MempoolError::ReplacementFeeWithContext(message));
             }
-            return Err(MempoolError::ReplacementFee);
+            let message = if replacement_fee < conflict_fees {
+                format!(
+                    "insufficient fee, rejecting replacement {replacement_id}, less fees than conflicting txs; {} < {}",
+                    format_sat_amount_mempool(replacement_fee),
+                    format_sat_amount_mempool(conflict_fees),
+                )
+            } else {
+                let additional_fee = replacement_fee.saturating_sub(conflict_fees);
+                format!(
+                    "insufficient fee, rejecting replacement {replacement_id}, not enough additional fees to relay; {} < {}",
+                    format_sat_amount_mempool(additional_fee),
+                    format_sat_amount_mempool(incremental_fee),
+                )
+            };
+            return Err(MempoolError::ReplacementFeeWithContext(message));
+        }
+        if let Some(conflict) = conflicting_ancestor {
+            return Err(MempoolError::SpendsConflictingTx {
+                txid: replacement_id,
+                conflict,
+            });
         }
         if sibling_eviction {
             let replacement_vsize = candidate
@@ -3303,6 +3341,24 @@ fn fee_rate_from_package(fee_sat: i128, vsize: u64) -> u64 {
 
 fn fee_for_rate(fee_rate_sat_per_kvb: u64, vsize: u64) -> i128 {
     (i128::from(fee_rate_sat_per_kvb) * i128::from(vsize) + 999) / 1_000
+}
+
+fn format_sat_amount_mempool(sat: i128) -> String {
+    let negative = sat < 0;
+    let magnitude = sat.unsigned_abs();
+    let whole = magnitude / 100_000_000;
+    let fractional = magnitude % 100_000_000;
+    let mut formatted = if negative {
+        format!("-{whole}.{fractional:08}")
+    } else {
+        format!("{whole}.{fractional:08}")
+    };
+    if let Some(dot) = formatted.find('.') {
+        while formatted.ends_with('0') && formatted.len() > dot + 3 {
+            formatted.pop();
+        }
+    }
+    formatted
 }
 
 fn append_feerate_chunk(chunks: &mut Vec<(i128, u64)>, fee: i128, size: u64) {

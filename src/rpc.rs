@@ -13889,10 +13889,7 @@ fn format_sat_amount(sat: i128) -> String {
 fn format_sat_amount_trimmed(sat: i128) -> String {
     let mut formatted = format_sat_amount(sat);
     if let Some(dot) = formatted.find('.') {
-        while formatted.ends_with('0') {
-            formatted.pop();
-        }
-        if formatted.len() == dot + 1 {
+        while formatted.ends_with('0') && formatted.len() > dot + 3 {
             formatted.pop();
         }
     }
@@ -15639,10 +15636,16 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "bad-txns-inputs-missingorspent" {
         return -25;
     }
+    if lower.starts_with("bad-txns-spends-conflicting-tx") {
+        return -26;
+    }
     if lower.starts_with("testblockvalidity failed:") {
         return -25;
     }
     if lower == "too-large-cluster" {
+        return -26;
+    }
+    if lower.starts_with("too many potential replacements") {
         return -26;
     }
     if lower == "bad-txns-premature-spend-of-coinbase"
@@ -15658,7 +15661,10 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "transaction fee rate is below the relay minimum"
         || lower.starts_with("transaction is non-standard:")
         || lower.starts_with("transaction script validation failed:")
+        || lower == "insufficient fee"
+        || lower.starts_with("insufficient fee,")
         || lower.starts_with("insufficient fee (including sibling eviction)")
+        || lower.starts_with("insufficient feerate:")
         || lower.starts_with("replacement transaction fee is too low")
         || lower.starts_with("truc-violation,")
     {

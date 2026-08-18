@@ -2386,6 +2386,7 @@ impl Mempool {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn accept_at_with_sequence(
         &mut self,
         transaction: Transaction,
@@ -3823,7 +3824,7 @@ fn future_witness_version_policy_failure(
         .zip(previous_outputs)
         .any(|(input, previous)| {
             let witness_script = if previous.script_pubkey.is_p2sh() {
-                push_only_stack_top(&input.script_sig).map(|redeem| ScriptBuf::from_bytes(redeem))
+                push_only_stack_top(&input.script_sig).map(ScriptBuf::from_bytes)
             } else {
                 None
             };
@@ -3859,7 +3860,7 @@ fn uncompressed_witness_pubkey_policy_failure(
                     .witness
                     .iter()
                     .nth(1)
-                    .is_some_and(|pubkey| is_uncompressed_pubkey(pubkey));
+                    .is_some_and(is_uncompressed_pubkey);
             }
             if !spending_script.is_p2wsh() {
                 return false;

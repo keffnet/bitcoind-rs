@@ -359,7 +359,7 @@ fn parse_abbreviated_ipv4(value: &str) -> Option<Ipv4Addr> {
         .map(|component| component.parse::<u32>().ok())
         .collect::<Option<Vec<_>>>()?;
     let (address, valid) = match numbers.as_slice() {
-        [value] => (*value, *value <= u32::MAX),
+        [value] => (*value, true),
         [first, last] => (
             (first << 24) | last,
             *first <= u8::MAX as u32 && *last <= 0x00ff_ffff,

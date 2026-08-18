@@ -672,7 +672,6 @@ fn log_v1_header_error_for_frame_with_magic(magic: [u8; 4], frame: &[u8]) {
             command: command.to_owned(),
             size: length,
         });
-        return;
     }
 }
 

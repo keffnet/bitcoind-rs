@@ -3099,10 +3099,8 @@ impl ChainState {
     /// Mutation failures are filtered by the caller before reaching this
     /// method.
     pub fn mark_block_invalid(&mut self, hash: &BlockHash) -> Result<()> {
-        if self.block_index.contains_key(hash) {
-            if self.invalid_blocks.insert(*hash) {
-                self.persist_metadata()?;
-            }
+        if self.block_index.contains_key(hash) && self.invalid_blocks.insert(*hash) {
+            self.persist_metadata()?;
         }
         Ok(())
     }

@@ -2112,7 +2112,6 @@ impl Args {
         let raw = original
             .iter()
             .cloned()
-            .map(Into::into)
             .map(normalize_core_style_argument)
             .collect::<Vec<_>>();
         let datadir_explicit = raw_option_value(&raw, "datadir").is_some();
@@ -3279,13 +3278,6 @@ impl Config {
         let debug_log_path = PathBuf::from(&args.debug_log_file);
         let debug_log_path = if debug_log_path.is_absolute() {
             debug_log_path
-        } else if args.debug_log_file == "debug.log" {
-            let network_dir = network_data_dir_name(network);
-            if network_dir.is_empty() {
-                args.datadir.join(debug_log_path)
-            } else {
-                args.datadir.join(network_dir).join(debug_log_path)
-            }
         } else {
             let network_dir = network_data_dir_name(network);
             if network_dir.is_empty() {

@@ -1794,13 +1794,7 @@ impl PeerManager {
                 };
                 let local_address = listener.local_addr()?;
                 info!("Bound to {local_address}");
-                let onion_port = self
-                    .node
-                    .config
-                    .p2p_bind
-                    .port()
-                    .checked_add(1)
-                    .unwrap_or(u16::MAX);
+                let onion_port = self.node.config.p2p_bind.port().saturating_add(1);
                 let is_default_onion_bind =
                     local_address.ip().is_loopback() && local_address.port() == onion_port;
                 if !is_default_onion_bind {
@@ -2009,25 +2003,23 @@ impl PeerManager {
         } else {
             Vec::new()
         };
-        if !configured_connect_nodes {
-            if deferred_seed_nodes.is_empty() && has_seed_nodes {
-                for endpoint in &self.node.config.seed_nodes_for_address_fetch {
-                    info!(
-                        "Empty addrman, adding seednode ({}) to addrfetch",
-                        endpoint.host_string()
-                    );
-                    spawn_outbound_loop(
-                        self.node.clone(),
-                        endpoint.clone(),
-                        outbound.clone(),
-                        false,
-                        None,
-                        "addr-fetch",
-                        true,
-                        false,
-                        None,
-                    );
-                }
+        if !configured_connect_nodes && deferred_seed_nodes.is_empty() && has_seed_nodes {
+            for endpoint in &self.node.config.seed_nodes_for_address_fetch {
+                info!(
+                    "Empty addrman, adding seednode ({}) to addrfetch",
+                    endpoint.host_string()
+                );
+                spawn_outbound_loop(
+                    self.node.clone(),
+                    endpoint.clone(),
+                    outbound.clone(),
+                    false,
+                    None,
+                    "addr-fetch",
+                    true,
+                    false,
+                    None,
+                );
             }
         }
         let should_query_dns = !configured_connect_nodes
@@ -2592,6 +2584,7 @@ fn complete_one_try(completion: &mut Option<oneshot::Sender<()>>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_outbound_loop(
     node: Arc<Node>,
     endpoint: NetworkEndpoint,
@@ -7171,15 +7164,15 @@ async fn serve_peer_loop(
                         let time =
                             normalize_peer_address_time(u64::from(address.time), address_time);
                         let reachable = node.config.network_endpoint_is_reachable(&endpoint);
-                        if reachable {
-                            if node.remember_network_address_from(
+                        if reachable
+                            && node.remember_network_address_from(
                                 endpoint.clone(),
                                 address.services,
                                 time,
                                 peer_state.endpoint.clone(),
-                            ) {
-                                added_addresses += 1;
-                            }
+                            )
+                        {
+                            added_addresses += 1;
                         }
                         debug!("{endpoint}");
                         relay_addresses.push((endpoint, address.services, time));
@@ -9445,11 +9438,10 @@ fn peer_knows_block_header(
 ) -> bool {
     let (best_known, last_header_sent) = peer_header_state(node, state, peer_id);
     let chain = node.chain.read();
-    let known = [best_known, last_header_sent]
+    [best_known, last_header_sent]
         .into_iter()
         .flatten()
-        .any(|known| chain_peer_has_header(&chain, &known, hash));
-    known
+        .any(|known| chain_peer_has_header(&chain, &known, hash))
 }
 
 fn compact_block_for_inventory(

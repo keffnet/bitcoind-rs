@@ -12346,7 +12346,11 @@ fn build_mining_block_with_transactions(
             bits,
             script_pubkey,
             transactions,
-            fees: include_fees.then_some(fees).unwrap_or_default(),
+            fees: if include_fees {
+                fees
+            } else {
+                Default::default()
+            },
             include_dummy_extranonce: true,
             version: Some(version),
         },
@@ -13520,6 +13524,7 @@ fn package_fee_calculation(
     let mut seen = HashSet::new();
     let mut ordered = Vec::new();
 
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         txid: Txid,
         by_txid: &HashMap<Txid, &Transaction>,

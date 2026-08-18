@@ -598,9 +598,10 @@ fn import_external_block_file(
     chain: &mut ChainState,
     path: &Path,
     network: Network,
+    signet_challenge: Option<&[u8]>,
 ) -> Result<usize> {
     let bytes = fs::read(path).with_context(|| format!("reading block file {}", path.display()))?;
-    let magic = wire::network_magic(network);
+    let magic = wire::network_magic_with_signet_challenge(network, signet_challenge);
     let mut offset = 0usize;
     let mut blocks = Vec::new();
     while offset < bytes.len() {
@@ -1548,6 +1549,13 @@ pub struct Node {
 }
 
 impl Node {
+    pub fn network_magic(&self) -> [u8; 4] {
+        wire::network_magic_with_signet_challenge(
+            self.config.network,
+            self.config.signet_challenge.as_deref(),
+        )
+    }
+
     pub fn open(config: Config) -> Result<Arc<Self>> {
         fs::create_dir_all(&config.datadir)
             .with_context(|| format!("creating data directory {}", config.datadir.display()))?;
@@ -1789,8 +1797,14 @@ impl Node {
             .configure_txospender_index(config.txospenderindex || config.electrum_bind.is_some())?;
         chain.configure_electrum_index(config.electrum_bind.is_some())?;
         chain.configure_coinstats_index(config.coinstatsindex)?;
+        let signet_challenge = chain.signet_challenge().map(|challenge| challenge.to_vec());
         for path in &config.load_blocks {
-            import_external_block_file(&mut chain, path, config.network)?;
+            import_external_block_file(
+                &mut chain,
+                path,
+                config.network,
+                signet_challenge.as_deref(),
+            )?;
         }
         chain.maybe_auto_prune()?;
         if config.check_blocks.is_some() || config.check_level.is_some() {
@@ -7747,7 +7761,7 @@ mod tests {
         fs::write(&path, framed).unwrap();
 
         assert_eq!(
-            import_external_block_file(&mut chain, &path, Network::Regtest).unwrap(),
+            import_external_block_file(&mut chain, &path, Network::Regtest, None).unwrap(),
             1
         );
         assert_eq!(chain.height(), 1);
@@ -7772,7 +7786,7 @@ mod tests {
         fs::write(&path, framed).unwrap();
 
         assert_eq!(
-            import_external_block_file(&mut chain, &path, Network::Regtest).unwrap(),
+            import_external_block_file(&mut chain, &path, Network::Regtest, None).unwrap(),
             1
         );
         assert!(chain.block(&block.block_hash()).unwrap().is_some());

@@ -4378,7 +4378,13 @@ impl ChainState {
 
     pub fn dump_utxo_set(&self, path: impl AsRef<Path>) -> Result<(u64, BlockHash, u32)> {
         let utxos = self.load_utxo_map_from_store()?;
-        write_core_utxo_snapshot(path.as_ref(), self.network, self.best_hash(), &utxos)?;
+        write_core_utxo_snapshot(
+            path.as_ref(),
+            self.network,
+            self.signet_challenge.as_deref(),
+            self.best_hash(),
+            &utxos,
+        )?;
         Ok((utxos.len() as u64, self.best_hash(), self.height()))
     }
 
@@ -4492,7 +4498,13 @@ impl ChainState {
             .chain_transaction_count(target_height)
             .unwrap_or(snapshot.tx_index.len() as u64) as usize;
         let path = path.as_ref();
-        write_core_utxo_snapshot(path, self.network, target_hash, &snapshot.utxos)?;
+        write_core_utxo_snapshot(
+            path,
+            self.network,
+            self.signet_challenge.as_deref(),
+            target_hash,
+            &snapshot.utxos,
+        )?;
         Ok((
             coins_written,
             target_hash,
@@ -4582,7 +4594,8 @@ impl ChainState {
         if strict_assumeutxo && self.snapshot_base.is_some() {
             bail!("Can't activate a snapshot-based chainstate more than once")
         }
-        let mut snapshot = read_core_utxo_snapshot(bytes, self.network)?;
+        let mut snapshot =
+            read_core_utxo_snapshot(bytes, self.network, self.signet_challenge.as_deref())?;
         let commitment = if strict_assumeutxo {
             Some(
                 self.assumeutxo_for_block(snapshot.base_hash)
@@ -9120,6 +9133,7 @@ struct CoreUtxoSnapshot {
 fn write_core_utxo_snapshot(
     path: &Path,
     network: Network,
+    signet_challenge: Option<&[u8]>,
     base_hash: BlockHash,
     utxos: &HashMap<OutPoint, UtxoEntry>,
 ) -> Result<()> {
@@ -9128,7 +9142,10 @@ fn write_core_utxo_snapshot(
         .with_context(|| format!("writing UTXO snapshot {}", temporary.display()))?;
     file.write_all(&CORE_UTXO_SNAPSHOT_MAGIC)?;
     file.write_all(&CORE_UTXO_SNAPSHOT_VERSION.to_le_bytes())?;
-    file.write_all(&crate::wire::network_magic(network))?;
+    file.write_all(&crate::wire::network_magic_with_signet_challenge(
+        network,
+        signet_challenge,
+    ))?;
     file.write_all(&base_hash.to_byte_array())?;
     file.write_all(&(utxos.len() as u64).to_le_bytes())?;
 
@@ -9233,7 +9250,11 @@ fn write_compressed_snapshot_script(writer: &mut impl Write, script: &Script) ->
     Ok(())
 }
 
-fn read_core_utxo_snapshot(bytes: &[u8], network: Network) -> Result<CoreUtxoSnapshot> {
+fn read_core_utxo_snapshot(
+    bytes: &[u8],
+    network: Network,
+    signet_challenge: Option<&[u8]>,
+) -> Result<CoreUtxoSnapshot> {
     let mut cursor = Cursor::new(bytes);
     let magic = read_snapshot_array::<5>(&mut cursor).map_err(|_| {
         anyhow!(
@@ -9260,7 +9281,8 @@ fn read_core_utxo_snapshot(bytes: &[u8], network: Network) -> Result<CoreUtxoSna
             "Unable to parse metadata: Invalid UTXO set snapshot metadata. Please check if this is indeed a snapshot file or if you are using an outdated snapshot format."
         )
     })?;
-    if network_magic != crate::wire::network_magic(network) {
+    if network_magic != crate::wire::network_magic_with_signet_challenge(network, signet_challenge)
+    {
         let snapshot_network = match network_magic {
             [0xf9, 0xbe, 0xb4, 0xd9] => Some("main"),
             [0x0b, 0x11, 0x09, 0x07] => Some("test"),
@@ -10533,7 +10555,7 @@ mod tests {
         state.dump_utxo_set(&path).unwrap();
         let valid = fs::read(&path).unwrap();
         assert_eq!(
-            read_core_utxo_snapshot(&valid, Network::Regtest)
+            read_core_utxo_snapshot(&valid, Network::Regtest, None)
                 .unwrap()
                 .coins_count,
             1
@@ -10541,11 +10563,11 @@ mod tests {
 
         let mut truncated = valid.clone();
         truncated.pop();
-        assert!(read_core_utxo_snapshot(&truncated, Network::Regtest).is_err());
+        assert!(read_core_utxo_snapshot(&truncated, Network::Regtest, None).is_err());
 
         let mut trailing = valid.clone();
         trailing.push(0);
-        assert!(read_core_utxo_snapshot(&trailing, Network::Regtest).is_err());
+        assert!(read_core_utxo_snapshot(&trailing, Network::Regtest, None).is_err());
 
         let metadata_len = CORE_UTXO_SNAPSHOT_MAGIC.len() + 2 + 4 + 32 + 8;
         let group_offset = metadata_len + 32;
@@ -10554,7 +10576,7 @@ mod tests {
         duplicate[metadata_len - 8..metadata_len].copy_from_slice(&2u64.to_le_bytes());
         duplicate[group_offset] = 2;
         duplicate.extend_from_slice(&valid[group_offset + 1..]);
-        assert!(read_core_utxo_snapshot(&duplicate, Network::Regtest).is_err());
+        assert!(read_core_utxo_snapshot(&duplicate, Network::Regtest, None).is_err());
     }
 
     #[test]

@@ -129,6 +129,12 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     } else {
         builder.init();
     }
+    if node.config.network == Network::Signet {
+        tracing::info!(
+            "Signet derived magic (message start): {}",
+            hex::encode(node.network_magic())
+        );
+    }
     let snapshot_chainstate = node.chain.read().snapshot_chainstate_path();
     if node.chain.read().snapshot_provenance().is_none() && snapshot_chainstate.is_dir() {
         fs::remove_dir_all(&snapshot_chainstate).with_context(|| {

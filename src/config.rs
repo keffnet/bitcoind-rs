@@ -6,7 +6,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::pow::Work;
 use bitcoin::{Amount, BlockHash, Denomination, Network};
 use clap::{CommandFactory, Parser, ValueEnum};
@@ -2082,6 +2082,9 @@ impl Args {
         merged.extend(config_args);
         merged.extend(raw.into_iter().skip(1));
         merged.extend(config_user_agent_args);
+        if raw_option_count(&merged, "signetchallenge") > 1 {
+            bail!("-signetchallenge cannot be multiple values.");
+        }
         let mut parsed = match Self::try_parse_from(merged) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -2210,6 +2213,32 @@ fn raw_option_value(args: &[OsString], name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn raw_option_count(args: &[OsString], name: &str) -> usize {
+    let exact = format!("--{name}");
+    let prefix = format!("{exact}=");
+    let mut count = 0;
+    let mut index = 1;
+    while index < args.len() {
+        let Some(argument) = args[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if argument.starts_with(&prefix) {
+            count += 1;
+        } else if argument == exact
+            && args
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .is_some()
+        {
+            count += 1;
+            index += 1;
+        }
+        index += 1;
+    }
+    count
 }
 
 fn is_true(value: &str) -> bool {
@@ -3374,7 +3403,8 @@ impl Config {
                 bail!("--signet-challenge requires --network signet")
             }
             Some(challenge) => Some(
-                hex::decode(&challenge).with_context(|| "decoding --signet-challenge as hex")?,
+                hex::decode(&challenge)
+                    .map_err(|_| anyhow!("-signetchallenge must be hex, not '{challenge}'."))?,
             ),
             None => None,
         };

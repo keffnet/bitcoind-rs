@@ -317,14 +317,39 @@ pub fn network_magic(network: Network) -> [u8; 4] {
     }
 }
 
+/// Return the message-start bytes for a chain instance.  Signet derives its
+/// message start from the serialized challenge, whereas the other networks
+/// use fixed constants.  Keeping the legacy `network_magic` helper intact
+/// preserves the public-network defaults used by file formats and unit tests.
+pub fn network_magic_with_signet_challenge(
+    network: Network,
+    signet_challenge: Option<&[u8]>,
+) -> [u8; 4] {
+    if network != Network::Signet {
+        return network_magic(network);
+    }
+    let challenge = signet_challenge
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(crate::validation::default_signet_challenge);
+    let serialized = serialize(&challenge);
+    let hash = bitcoin::hashes::sha256d::Hash::hash(&serialized).to_byte_array();
+    hash[..4]
+        .try_into()
+        .expect("sha256d is four-byte-prefix capable")
+}
+
 pub fn encode_message(network: Network, message: &Message) -> Result<Vec<u8>> {
+    encode_message_with_magic(network_magic(network), message)
+}
+
+pub fn encode_message_with_magic(magic: [u8; 4], message: &Message) -> Result<Vec<u8>> {
     let payload = encode_payload(message)?;
     validate_payload_size(payload.len())?;
     let command = message.command();
     validate_command(command)?;
     let command = command.as_bytes();
     let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
-    frame.extend_from_slice(&network_magic(network));
+    frame.extend_from_slice(&magic);
     let mut command_bytes = [0u8; 12];
     command_bytes[..command.len()].copy_from_slice(command);
     frame.extend_from_slice(&command_bytes);
@@ -335,13 +360,17 @@ pub fn encode_message(network: Network, message: &Message) -> Result<Vec<u8>> {
 }
 
 pub fn decode_message(network: Network, frame: &[u8]) -> Result<Message> {
+    decode_message_with_magic(network_magic(network), frame)
+}
+
+pub fn decode_message_with_magic(expected_magic: [u8; 4], frame: &[u8]) -> Result<Message> {
     if frame.len() < HEADER_SIZE {
         bail!("short Bitcoin message frame");
     }
-    let mut magic = [0u8; 4];
-    magic.copy_from_slice(&frame[..4]);
-    if magic != network_magic(network) {
-        return Err(WireError::Magic(magic).into());
+    let mut received_magic = [0u8; 4];
+    received_magic.copy_from_slice(&frame[..4]);
+    if received_magic != expected_magic {
+        return Err(WireError::Magic(received_magic).into());
     }
     let command = decode_command(&frame[4..16]).map_err(|_| WireError::InvalidMessageType)?;
     let length = u32::from_le_bytes(frame[16..20].try_into().expect("slice length")) as usize;
@@ -368,15 +397,29 @@ pub async fn read_message<R: AsyncRead + Unpin>(
     reader: &mut R,
     network: Network,
 ) -> Result<Message> {
-    Ok(read_message_with_size(reader, network).await?.0)
+    read_message_with_magic(reader, network_magic(network)).await
+}
+
+pub async fn read_message_with_magic<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    magic: [u8; 4],
+) -> Result<Message> {
+    Ok(read_message_with_size_with_magic(reader, magic).await?.0)
 }
 
 pub async fn read_message_with_size<R: AsyncRead + Unpin>(
     reader: &mut R,
     network: Network,
 ) -> Result<(Message, usize)> {
+    read_message_with_size_with_magic(reader, network_magic(network)).await
+}
+
+pub async fn read_message_with_size_with_magic<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    magic: [u8; 4],
+) -> Result<(Message, usize)> {
     let (frame, size) = read_frame_with_size(reader).await?;
-    Ok((decode_message(network, &frame)?, size))
+    Ok((decode_message_with_magic(magic, &frame)?, size))
 }
 
 /// A cancellation-safe v1 frame reader.  Peer processing uses `select!` to
@@ -411,13 +454,16 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
         &mut self,
         network: Network,
     ) -> Result<(Option<Message>, usize)> {
-        self.read_message_with_size_allow_reject_with_callback(network, &mut |_| {})
-            .await
+        self.read_message_with_size_allow_reject_with_magic_callback(
+            network_magic(network),
+            &mut |_| {},
+        )
+        .await
     }
 
-    pub(crate) async fn read_message_with_size_allow_reject_with_callback(
+    pub(crate) async fn read_message_with_size_allow_reject_with_magic_callback(
         &mut self,
-        network: Network,
+        magic: [u8; 4],
         on_bytes: &mut impl FnMut(usize),
     ) -> Result<(Option<Message>, usize)> {
         loop {
@@ -478,13 +524,15 @@ impl<R: AsyncRead + Unpin> MessageReader<R> {
                 if self.buffer.len() >= frame_size {
                     let remainder = self.buffer.split_off(frame_size);
                     let frame = std::mem::replace(&mut self.buffer, remainder);
-                    return match decode_message(network, &frame) {
+                    return match decode_message_with_magic(magic, &frame) {
                         Ok(message) => Ok((Some(message), frame.len())),
                         Err(error) => {
-                            log_v1_header_error_for_frame(network, &frame);
-                            if let Some(message) = recoverable_payload_message(network, &frame) {
+                            log_v1_header_error_for_frame_with_magic(magic, &frame);
+                            if let Some(message) =
+                                recoverable_payload_message_with_magic(magic, &frame)
+                            {
                                 Ok((Some(message), frame.len()))
-                            } else if frame_has_recoverable_error(network, &frame) {
+                            } else if frame_has_recoverable_error_with_magic(magic, &frame) {
                                 Ok((None, frame.len()))
                             } else {
                                 Err(error)
@@ -519,12 +567,14 @@ pub(crate) async fn read_message_with_size_allow_reject<R: AsyncRead + Unpin>(
     network: Network,
 ) -> Result<(Option<Message>, usize)> {
     let (frame, size) = read_frame_with_size(reader).await?;
-    match decode_message(network, &frame) {
+    match decode_message_with_magic(network_magic(network), &frame) {
         Ok(message) => Ok((Some(message), size)),
         Err(error) => {
-            if let Some(message) = recoverable_payload_message(network, &frame) {
+            if let Some(message) =
+                recoverable_payload_message_with_magic(network_magic(network), &frame)
+            {
                 Ok((Some(message), size))
-            } else if frame_has_recoverable_error(network, &frame) {
+            } else if frame_has_recoverable_error_with_magic(network_magic(network), &frame) {
                 Ok((None, size))
             } else {
                 Err(error)
@@ -587,14 +637,14 @@ fn log_v1_header_error(error: &WireError) {
     }
 }
 
-fn log_v1_header_error_for_frame(network: Network, frame: &[u8]) {
+fn log_v1_header_error_for_frame_with_magic(magic: [u8; 4], frame: &[u8]) {
     if frame.len() < HEADER_SIZE {
         return;
     }
-    if frame[..4] != network_magic(network) {
-        let mut magic = [0u8; 4];
-        magic.copy_from_slice(&frame[..4]);
-        log_v1_header_error(&WireError::Magic(magic));
+    if frame[..4] != magic {
+        let mut received_magic = [0u8; 4];
+        received_magic.copy_from_slice(&frame[..4]);
+        log_v1_header_error(&WireError::Magic(received_magic));
         return;
     }
     let length = u32::from_le_bytes(frame[16..20].try_into().expect("slice length")) as usize;
@@ -638,8 +688,8 @@ fn command_for_header_log(bytes: &[u8]) -> String {
     }
 }
 
-fn frame_has_recoverable_error(network: Network, frame: &[u8]) -> bool {
-    if frame.len() < HEADER_SIZE || frame[..4] != network_magic(network) {
+fn frame_has_recoverable_error_with_magic(magic: [u8; 4], frame: &[u8]) -> bool {
+    if frame.len() < HEADER_SIZE || frame[..4] != magic {
         return false;
     }
     let Ok(command) = decode_command(&frame[4..16]) else {
@@ -729,8 +779,8 @@ fn transaction_optional_data_error(payload: &[u8]) -> Option<&'static str> {
     (flags != 1).then_some("Unknown transaction optional data")
 }
 
-fn recoverable_payload_message(network: Network, frame: &[u8]) -> Option<Message> {
-    if frame.len() < HEADER_SIZE || frame[..4] != network_magic(network) {
+fn recoverable_payload_message_with_magic(magic: [u8; 4], frame: &[u8]) -> Option<Message> {
+    if frame.len() < HEADER_SIZE || frame[..4] != magic {
         return None;
     }
     let command = decode_command(&frame[4..16]).ok()?;
@@ -750,7 +800,7 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     network: Network,
     message: &Message,
 ) -> Result<()> {
-    write_message_with_size(writer, network, message)
+    write_message_with_magic(writer, network_magic(network), message)
         .await
         .map(|_| ())
 }
@@ -760,7 +810,23 @@ pub async fn write_message_with_size<W: AsyncWrite + Unpin>(
     network: Network,
     message: &Message,
 ) -> Result<usize> {
-    let frame = encode_message(network, message)?;
+    write_message_with_magic_size(writer, network_magic(network), message).await
+}
+
+pub async fn write_message_with_magic<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    magic: [u8; 4],
+    message: &Message,
+) -> Result<usize> {
+    write_message_with_magic_size(writer, magic, message).await
+}
+
+async fn write_message_with_magic_size<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    magic: [u8; 4],
+    message: &Message,
+) -> Result<usize> {
+    let frame = encode_message_with_magic(magic, message)?;
     let size = frame.len();
     writer.write_all(&frame).await?;
     writer.flush().await?;
@@ -1599,6 +1665,35 @@ fn chrono_like_unix_time() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signet_message_magic_is_derived_from_the_serialized_challenge() {
+        assert_eq!(
+            network_magic_with_signet_challenge(Network::Signet, None),
+            [0x0a, 0x03, 0xcf, 0x40]
+        );
+        assert_eq!(
+            network_magic_with_signet_challenge(Network::Signet, Some(&[0x51])),
+            [0x54, 0xd2, 0x6f, 0xbd]
+        );
+        assert_eq!(
+            network_magic_with_signet_challenge(Network::Regtest, Some(&[0x51])),
+            network_magic(Network::Regtest)
+        );
+    }
+
+    #[test]
+    fn custom_signet_frames_use_the_derived_message_start() {
+        let magic = network_magic_with_signet_challenge(Network::Signet, Some(&[0x51]));
+        let frame = encode_message_with_magic(magic, &Message::Ping(42)).unwrap();
+
+        assert_eq!(&frame[..4], &magic);
+        assert_eq!(
+            decode_message_with_magic(magic, &frame).unwrap(),
+            Message::Ping(42)
+        );
+        assert!(decode_message(Network::Signet, &frame).is_err());
+    }
 
     #[test]
     fn ping_round_trip() {

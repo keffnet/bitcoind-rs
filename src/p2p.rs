@@ -1635,15 +1635,15 @@ impl PeerReader {
         }
     }
 
-    async fn read_message(
+    async fn read_message_with_magic(
         &mut self,
-        network: Network,
+        magic: [u8; 4],
         on_bytes: &mut impl FnMut(usize),
     ) -> Result<(Option<Message>, usize, bool)> {
         match self {
             Self::V1(reader) => {
                 let (message, bytes) = reader
-                    .read_message_with_size_allow_reject_with_callback(network, on_bytes)
+                    .read_message_with_size_allow_reject_with_magic_callback(magic, on_bytes)
                     .await?;
                 Ok((message, bytes, true))
             }
@@ -3185,7 +3185,7 @@ async fn establish_transport(
     stream: TcpStream,
     endpoint: &NetworkEndpoint,
     outbound: bool,
-    network: Network,
+    _network: Network,
     transport_v2: Option<bool>,
     log_ips: bool,
     proxy_options: ProxyRoutingOptions,
@@ -3195,11 +3195,12 @@ async fn establish_transport(
     Option<SocketAddr>,
     Option<String>,
 )> {
+    let magic = node.network_magic();
     if outbound {
         if transport_v2 == Some(false) {
             return establish_v1(stream);
         }
-        match establish_v2_for_peer(node, peer_id, stream, network, Role::Initiator).await {
+        match establish_v2_for_peer(node, peer_id, stream, magic, Role::Initiator).await {
             Ok((reader, writer, local_address, session_id)) => {
                 return Ok((reader, writer, local_address, session_id));
             }
@@ -3251,7 +3252,7 @@ async fn establish_transport(
     }
 
     let mut v1_prefix = [0u8; 16];
-    v1_prefix[..4].copy_from_slice(&wire::network_magic(network));
+    v1_prefix[..4].copy_from_slice(&magic);
     v1_prefix[4..11].copy_from_slice(b"version");
     if prefix[4..11] == *b"version" && prefix[..4] != v1_prefix[..4] {
         anyhow::bail!("V1 peer with wrong MessageStart");
@@ -3259,7 +3260,7 @@ async fn establish_transport(
     if prefix == v1_prefix {
         establish_v1(stream)
     } else {
-        establish_v2_for_peer(node, peer_id, stream, network, Role::Responder).await
+        establish_v2_for_peer(node, peer_id, stream, magic, Role::Responder).await
     }
 }
 
@@ -3274,14 +3275,14 @@ async fn establish_v2(
     Option<SocketAddr>,
     Option<String>,
 )> {
-    establish_v2_with_accounting(stream, network, role, None, 0).await
+    establish_v2_with_accounting(stream, wire::network_magic(network), role, None, 0).await
 }
 
 async fn establish_v2_for_peer(
     node: &Arc<Node>,
     peer_id: usize,
     stream: TcpStream,
-    network: Network,
+    magic: [u8; 4],
     role: Role,
 ) -> Result<(
     PeerReader,
@@ -3295,7 +3296,7 @@ async fn establish_v2_for_peer(
         .find(|peer| peer.id == peer_id)
         .map_or_else(unix_time_seconds, |peer| peer.connected_at);
     tokio::select! {
-        result = establish_v2_with_accounting(stream, network, role, Some(node), peer_id) => result,
+        result = establish_v2_with_accounting(stream, magic, role, Some(node), peer_id) => result,
         _ = wait_for_v2_handshake_timeout(node, peer_id, connected_at) => {
             bail!("V2 handshake timeout")
         }
@@ -3316,7 +3317,7 @@ async fn wait_for_v2_handshake_timeout(node: &Arc<Node>, peer_id: usize, connect
 
 async fn establish_v2_with_accounting(
     stream: TcpStream,
-    network: Network,
+    magic: [u8; 4],
     role: Role,
     node: Option<&Arc<Node>>,
     peer_id: usize,
@@ -3330,7 +3331,7 @@ async fn establish_v2_with_accounting(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
-    let handshake = Handshake::new(wire::network_magic(network), role)?;
+    let handshake = Handshake::new(magic, role)?;
     let mut key_buffer = vec![0; Handshake::<bip324::Initialized>::send_key_len(None)];
     let handshake = handshake.send_key(None, &mut key_buffer)?;
     writer.write_all(&key_buffer).await?;
@@ -3818,8 +3819,8 @@ async fn serve_peer_loop(
         } else {
             tokio::select! {
             biased;
-            message = reader.read_message(
-                node.config.network,
+            message = reader.read_message_with_magic(
+                node.network_magic(),
                 &mut record_partial_bytes,
             ) => {
                 let (message, bytes, bytes_accounted) = message?;
@@ -8035,14 +8036,14 @@ async fn send_message(
     node: &Arc<Node>,
     peer_id: usize,
     writer: &PeerWriter,
-    network: Network,
+    _network: Network,
     message: &Message,
 ) -> Result<()> {
     let bytes = {
         let mut writer = writer.lock().await;
         match &mut *writer {
             PeerWriterKind::V1(writer) => {
-                wire::write_message_with_size(writer, network, message).await?
+                wire::write_message_with_magic(writer, node.network_magic(), message).await?
             }
             PeerWriterKind::V2(writer) => {
                 let contents = wire::encode_v2_message(message)?;

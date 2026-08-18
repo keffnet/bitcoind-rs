@@ -1667,8 +1667,21 @@ impl PeerReader {
                 if !wire::v2_message_type_is_valid(contents) {
                     break Ok((None, bytes, false));
                 }
-                let message = wire::decode_v2_message(contents)?;
-                break Ok((Some(message), bytes, false));
+                match wire::decode_v2_message(contents) {
+                    Ok(message) => break Ok((Some(message), bytes, false)),
+                    Err(error) => {
+                        // Core catches payload deserialization exceptions in
+                        // ProcessMessage after BIP324 has already authenticated
+                        // and framed the packet. Discard the malformed message
+                        // but keep the encrypted transport alive.
+                        if error.to_string().contains("non-minimal varint") {
+                            debug!("non-canonical ReadCompactSize()");
+                        } else {
+                            debug!(%error, "discarding malformed BIP324 application message");
+                        }
+                        break Ok((None, bytes, false));
+                    }
+                }
             },
         }
     }

@@ -902,6 +902,11 @@ pub struct ChainState {
     // persisted because Core resets the active chain to zero on restart.
     block_sequence_ids: HashMap<BlockHash, u64>,
     next_block_sequence_id: u64,
+    // Preserve the arrival order of bodies whose parent data is not yet
+    // available. Core replays these bodies in insertion order when the
+    // missing parent arrives, which determines equal-work chain selection.
+    unlinked_body_order: HashMap<BlockHash, u64>,
+    next_unlinked_body_order: u64,
     // Core keeps the first header seen at a given chainwork.  This arrival
     // order is runtime-only; restart initialization below provides neutral
     // values for headers whose original order was not persisted.
@@ -1419,6 +1424,8 @@ impl ChainState {
             block_index: HashMap::new(),
             block_sequence_ids: HashMap::new(),
             next_block_sequence_id: 1,
+            unlinked_body_order: HashMap::new(),
+            next_unlinked_body_order: 1,
             header_sequence_ids: HashMap::new(),
             next_header_sequence_id: 1,
             orphans: HashMap::new(),
@@ -5427,6 +5434,7 @@ impl ChainState {
                 height,
                 Amount::MAX_MONEY.to_sat(),
             )?;
+            self.record_unlinked_body(hash);
             self.insert_side_chain_body(&block)?;
             if let Some(store) = self.electrum_store.as_mut() {
                 store.insert_unsynced(&block)?;
@@ -5441,7 +5449,6 @@ impl ChainState {
                 },
             );
             self.assign_header_sequence_id(hash);
-            self.assign_block_sequence_id(hash);
             bail!("block {} has a parent whose full body is unavailable", hash)
         }
 
@@ -5570,6 +5577,7 @@ impl ChainState {
                 // body available for getblock and later reprocessing after
                 // the missing ancestor arrives, while postponing script
                 // validation.
+                self.record_unlinked_body(hash);
                 self.insert_side_chain_body(&block)?;
                 if let Some(store) = self.electrum_store.as_mut() {
                     store.insert_unsynced(&block)?;
@@ -5584,7 +5592,6 @@ impl ChainState {
                     },
                 );
                 self.assign_header_sequence_id(hash);
-                self.assign_block_sequence_id(hash);
                 bail!("side-chain parent UTXO state is unavailable")
             };
             let application = match self.validate_block_transactions(
@@ -5685,8 +5692,17 @@ impl ChainState {
         Ok(())
     }
 
+    fn record_unlinked_body(&mut self, hash: BlockHash) {
+        if self.unlinked_body_order.contains_key(&hash) {
+            return;
+        }
+        let order = self.next_unlinked_body_order;
+        self.unlinked_body_order.insert(hash, order);
+        self.next_unlinked_body_order = self.next_unlinked_body_order.saturating_add(1);
+    }
+
     fn process_known_children(&mut self, parent_hash: BlockHash) {
-        let children: Vec<BlockHash> = self
+        let mut children: Vec<BlockHash> = self
             .block_index
             .iter()
             .filter_map(|(hash, node)| {
@@ -5694,6 +5710,20 @@ impl ChainState {
                     .then_some(*hash)
             })
             .collect();
+        children.sort_by(|left, right| {
+            self.unlinked_body_order
+                .get(left)
+                .copied()
+                .unwrap_or(u64::MAX)
+                .cmp(
+                    &self
+                        .unlinked_body_order
+                        .get(right)
+                        .copied()
+                        .unwrap_or(u64::MAX),
+                )
+                .then_with(|| left.to_string().cmp(&right.to_string()))
+        });
         for child_hash in children {
             let Ok(Some(child)) = self.store.get(&child_hash) else {
                 continue;
@@ -7443,6 +7473,7 @@ impl ChainState {
         if self.block_sequence_ids.contains_key(&hash) {
             return;
         }
+        self.unlinked_body_order.remove(&hash);
         let sequence_id = self.next_block_sequence_id;
         self.block_sequence_ids.insert(hash, sequence_id);
         self.next_block_sequence_id = self.next_block_sequence_id.saturating_add(1);
@@ -8915,6 +8946,8 @@ fn open_background_replay_state(
         block_index: block_index.clone(),
         block_sequence_ids: HashMap::new(),
         next_block_sequence_id: 1,
+        unlinked_body_order: HashMap::new(),
+        next_unlinked_body_order: 1,
         header_sequence_ids: HashMap::new(),
         next_header_sequence_id: 1,
         orphans: HashMap::new(),

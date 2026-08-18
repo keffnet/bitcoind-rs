@@ -1554,7 +1554,7 @@ pub(crate) fn is_valid_der_signature(signature: &[u8]) -> bool {
     len_s != 0
         && signature[s_tag] == 0x02
         && signature[s_start] & 0x80 == 0
-        && !(len_s > 1 && signature[s_start + 1] == 0x00 && signature[s_start + 2] & 0x80 == 0)
+        && !(len_s > 1 && signature[s_start] == 0x00 && signature[s_start + 1] & 0x80 == 0)
 }
 
 fn script_interpreter_hint(script: &Script) -> Option<&'static str> {
@@ -2224,6 +2224,21 @@ mod tests {
             script_flags_for_block(Network::Regtest, 0, 0) & bitcoinconsensus::VERIFY_DERSIG,
             flags & bitcoinconsensus::VERIFY_DERSIG
         );
+    }
+
+    #[test]
+    fn der_signature_encoding_matches_core() {
+        // The second byte of S is zero. Core checks for a redundant leading
+        // zero at the first S byte, not at this position.
+        let signature = hex::decode(
+            "3045022100d4dc054081c69caccef36ed255657ba589f3f63289c4cb5d1172e5c028e6138e0220620060cdcde8f91924bc0570319cf3fa6cb42584e2c496fdba8910693a11eabf01",
+        )
+        .unwrap();
+        assert!(is_valid_der_signature(&signature));
+
+        let mut redundant_leading_zero = signature.clone();
+        redundant_leading_zero[39] = 0;
+        assert!(!is_valid_der_signature(&redundant_leading_zero));
     }
 
     #[test]

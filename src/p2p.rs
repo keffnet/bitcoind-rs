@@ -275,6 +275,7 @@ const MAX_GETDATA_BATCH: usize = 1_000;
 const MAX_BLOCKS_TO_ANNOUNCE: usize = 8;
 const DNS_SEED_OUTBOUND_THRESHOLD: usize = 2;
 const DNS_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(11);
+const SEEDNODE_FALLBACK_DELAY: u64 = 10;
 const FIXED_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(60);
 /// Core keeps manually added connections in a separate, bounded pool rather
 /// than consuming automatic `-maxconnections` slots.
@@ -1951,27 +1952,32 @@ impl PeerManager {
             && !self.node.config.dnsseed;
         let has_seed_nodes = !self.node.config.seed_nodes_for_address_fetch.is_empty();
         let has_add_nodes = !self.node.config.add_nodes.is_empty();
+        let has_known_network_addresses = !self.node.known_network_addresses().is_empty();
+        let mut deferred_seed_nodes = if !configured_connect_nodes && has_known_network_addresses {
+            self.node.config.seed_nodes_for_address_fetch.clone()
+        } else {
+            Vec::new()
+        };
         if !configured_connect_nodes {
-            for endpoint in self
-                .node
-                .config
-                .seed_nodes_for_address_fetch
-                .iter()
-                .cloned()
-            {
-                spawn_outbound_loop(
-                    self.node.clone(),
-                    endpoint,
-                    outbound.clone(),
-                    false,
-                    None,
-                    "addr-fetch",
-                    true,
-                    false,
-                );
+            if deferred_seed_nodes.is_empty() && has_seed_nodes {
+                for endpoint in &self.node.config.seed_nodes_for_address_fetch {
+                    info!(
+                        "Empty addrman, adding seednode ({}) to addrfetch",
+                        endpoint.host_string()
+                    );
+                    spawn_outbound_loop(
+                        self.node.clone(),
+                        endpoint.clone(),
+                        outbound.clone(),
+                        false,
+                        None,
+                        "addr-fetch",
+                        true,
+                        false,
+                    );
+                }
             }
         }
-        let has_known_network_addresses = !self.node.known_network_addresses().is_empty();
         let should_query_dns = !configured_connect_nodes
             && self.node.config.dnsseed
             && (self.node.config.force_dns_seed || !has_known_network_addresses);
@@ -2101,6 +2107,7 @@ impl PeerManager {
                 let mut ticker = tokio::time::interval(Duration::from_millis(500));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let discovery_started = Instant::now();
+                let seednode_fallback_started_at = unix_time_seconds();
                 let mut queried_delayed_dns_seed = false;
                 loop {
                     ticker.tick().await;
@@ -2112,6 +2119,28 @@ impl PeerManager {
                         .into_iter()
                         .filter(|peer| !peer.inbound && peer.connection_type == "outbound-full")
                         .count();
+                    if !deferred_seed_nodes.is_empty()
+                        && outbound_peer_count == 0
+                        && unix_time_seconds().saturating_sub(seednode_fallback_started_at)
+                            >= SEEDNODE_FALLBACK_DELAY
+                    {
+                        let endpoint = deferred_seed_nodes.remove(0);
+                        info!(
+                            "Couldn't connect to peers from addrman after {SEEDNODE_FALLBACK_DELAY} seconds. Adding seednode ({}) to addrfetch",
+                            endpoint.host_string()
+                        );
+                        spawn_outbound_loop(
+                            discovery_node.clone(),
+                            endpoint,
+                            discovery_outbound.clone(),
+                            false,
+                            None,
+                            "addr-fetch",
+                            true,
+                            false,
+                        );
+                        deferred_seed_nodes.clear();
+                    }
                     if !queried_delayed_dns_seed
                         && should_query_dns_seed_fallback_after(
                             delayed_dns_seed_fallback,
@@ -2228,6 +2257,7 @@ impl PeerManager {
                         );
                     }
                     _ = private_retry_interval.tick() => {
+                        dynamic_node.reattempt_stale_private_broadcasts();
                         dynamic_node.schedule_private_broadcasts();
                     }
                 }
@@ -2583,6 +2613,7 @@ fn spawn_outbound_loop(
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
+            log_outbound_connection_attempt(&endpoint, transport_v2, connection_type);
             match connect_peer_endpoint_with_options_and_dns_with_i2p(
                 &endpoint,
                 node.config.proxy_for_endpoint(&endpoint),
@@ -2691,6 +2722,7 @@ fn spawn_private_broadcast_loop(
         {
             return;
         }
+        log_outbound_connection_attempt(&endpoint, Some(false), "private-broadcast");
         match connect_peer_endpoint_for_private_broadcast(
             &endpoint,
             node.config.proxy_for_endpoint(&endpoint),
@@ -2732,6 +2764,27 @@ fn spawn_private_broadcast_loop(
             }
         }
     });
+}
+
+fn log_outbound_connection_attempt(
+    endpoint: &NetworkEndpoint,
+    transport_v2: Option<bool>,
+    connection_type: &str,
+) {
+    let transport = if transport_v2 == Some(false) {
+        "v1"
+    } else {
+        "v2"
+    };
+    let connection_type = match connection_type {
+        "outbound-full" => "outbound-full-relay",
+        other => other,
+    };
+    // Core includes the destination in this diagnostic even when `-logips` is
+    // disabled.  Besides being useful for operators, the destination is what
+    // lets the private-broadcast SOCKS test associate a proxy request with
+    // the connection type.
+    debug!("trying {transport} connection ({connection_type}) to {endpoint}, lastseen=0.0hrs");
 }
 
 fn select_discovery_endpoints(
@@ -6630,8 +6683,8 @@ async fn serve_peer_loop(
                 let privately_broadcast = node.mark_private_broadcast_received(&transaction);
                 if privately_broadcast {
                     debug!(
-                        txid = %transaction.compute_txid(),
-                        "received privately broadcast transaction back from the network"
+                        "Received our privately broadcast transaction (txid={}) from the network",
+                        transaction.compute_txid()
                     );
                 }
                 if !peer_state.local_relay_transactions {

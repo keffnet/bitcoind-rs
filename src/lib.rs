@@ -2642,15 +2642,39 @@ impl Node {
         if !self.config.private_broadcast {
             bail!("private broadcast is disabled")
         }
+        let tor_reachable = self.config.onion_enabled
+            && (self.config.onion_proxy.is_some()
+                || self.config.proxy_for_network("onion").is_some()
+                || self
+                    .tor_controller
+                    .as_ref()
+                    .is_some_and(|controller| controller.is_reachable()));
+        let i2p_reachable = self.i2p_sam.is_some();
+        if !tor_reachable && !i2p_reachable {
+            bail!(
+                "-privatebroadcast is enabled, but none of the Tor or I2P networks is reachable. Maybe the location of the Tor proxy couldn't be retrieved from the Tor daemon at startup. Check whether the Tor daemon is running and that -torcontrol, -torpassword and -i2psam are configured properly."
+            );
+        }
         if self.config.proxy_for_network("ipv4").is_none() {
             bail!("--privatebroadcast requires --proxy for IPv4/IPv6 private connections")
         }
         let txid = transaction.compute_txid();
         let wtxid = transaction.compute_wtxid();
+        // Core treats a transaction already in the mempool as a successful
+        // reannouncement request, without re-running admission for the
+        // submitted witness.  This is also how private broadcast switches
+        // back to a new private-broadcast attempt after the transaction was
+        // received from the network and entered our mempool.
+        let already_in_mempool = self.mempool.read().get(&txid).is_some();
+        if !already_in_mempool {
+            self.validate_private_broadcast_transaction(transaction.clone())?;
+        }
         if self.private_broadcasts.lock().contains_key(&wtxid) {
+            tracing::debug!(target: "bitcoind_rs::p2p",
+                "Ignoring unnecessary request to schedule an already scheduled transaction: txid={txid}, wtxid={wtxid}"
+            );
             return Ok(txid);
         }
-        self.validate_private_broadcast_transaction(transaction.clone())?;
         self.private_broadcasts.lock().insert(
             wtxid,
             PrivateBroadcastEntry {
@@ -2751,10 +2775,16 @@ impl Node {
         candidates.extend(self.known_addresses.read().keys().copied());
         candidates.sort_unstable();
         candidates.dedup();
+        let connected = self
+            .peer_infos()
+            .into_iter()
+            .filter_map(|peer| peer.endpoint.socket_addr())
+            .collect::<HashSet<_>>();
         candidates.retain(|address| {
             address.port() != 0
                 && !address.ip().is_unspecified()
                 && (address.is_ipv4() || address.is_ipv6())
+                && !connected.contains(address)
         });
         candidates.retain(|address| {
             self.config.allows_address(*address)
@@ -2768,6 +2798,14 @@ impl Node {
     }
 
     pub(crate) fn schedule_private_broadcasts(&self) {
+        self.schedule_private_broadcasts_with_limit(None, None);
+    }
+
+    fn schedule_private_broadcasts_with_limit(
+        &self,
+        per_entry_limit: Option<usize>,
+        only_entries: Option<&HashSet<Wtxid>>,
+    ) {
         if !self.config.private_broadcast {
             return;
         }
@@ -2779,6 +2817,9 @@ impl Node {
         {
             let mut broadcasts = self.private_broadcasts.lock();
             for (wtxid, entry) in broadcasts.iter_mut() {
+                if only_entries.is_some_and(|entries| !entries.contains(wtxid)) {
+                    continue;
+                }
                 let current = entry
                     .peers
                     .iter()
@@ -2791,6 +2832,7 @@ impl Node {
                 if needed == 0 {
                     continue;
                 }
+                let needed = per_entry_limit.map_or(needed, |limit| needed.min(limit));
                 for address in self
                     .private_broadcast_targets(entry, now)
                     .into_iter()
@@ -2817,6 +2859,64 @@ impl Node {
                     entry.peers.retain(|peer| peer.address != address);
                 }
             }
+        }
+    }
+
+    /// Reattempt private broadcasts whose recipients have not acknowledged
+    /// them recently.  Core opens one additional connection per stale
+    /// transaction; the normal scheduler is deliberately not used here
+    /// because it would refill all three initial slots at once.
+    pub(crate) fn reattempt_stale_private_broadcasts(&self) {
+        if !self.config.private_broadcast {
+            return;
+        }
+        let now = time::unix_time();
+        let stale = {
+            let broadcasts = self.private_broadcasts.lock();
+            broadcasts
+                .iter()
+                .filter_map(|(wtxid, entry)| {
+                    let last_confirmed = entry
+                        .peers
+                        .iter()
+                        .filter_map(|peer| peer.received)
+                        .max()
+                        .unwrap_or(0);
+                    (now.saturating_sub(last_confirmed) >= PRIVATE_BROADCAST_RETRY_SECS)
+                        .then_some((*wtxid, entry.transaction.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        if stale.is_empty() {
+            return;
+        }
+
+        let mut eligible = HashSet::new();
+        for (wtxid, transaction) in stale {
+            let txid = transaction.compute_txid();
+            if self.mempool.read().get(&txid).is_some() {
+                self.private_broadcasts.lock().remove(&wtxid);
+                continue;
+            }
+            match self.validate_private_broadcast_transaction(transaction.clone()) {
+                Ok(()) => {
+                    tracing::debug!(
+                        target: "bitcoind_rs::p2p",
+                        "Reattempting broadcast of stale txid={txid} wtxid={wtxid}"
+                    );
+                    eligible.insert(wtxid);
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        target: "bitcoind_rs::p2p",
+                        "Giving up broadcast attempts for txid={txid} wtxid={wtxid}: {error}"
+                    );
+                    self.private_broadcasts.lock().remove(&wtxid);
+                }
+            }
+        }
+        if !eligible.is_empty() {
+            self.schedule_private_broadcasts_with_limit(Some(1), Some(&eligible));
         }
     }
 
@@ -3292,6 +3392,7 @@ impl Node {
         if next / MAX_INITIAL_BROADCAST_DELAY_SECS > previous / MAX_INITIAL_BROADCAST_DELAY_SECS {
             self.reannounce_unbroadcast_transactions();
         }
+        self.reattempt_stale_private_broadcasts();
         if next / FEE_ESTIMATOR_FLUSH_INTERVAL.as_secs()
             > previous / FEE_ESTIMATOR_FLUSH_INTERVAL.as_secs()
         {

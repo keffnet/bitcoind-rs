@@ -4260,7 +4260,14 @@ fn add_peer_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .as_bool()
             .ok_or_else(|| json_type_error(value, "bool"))?,
     };
-    let endpoint = if let Ok(address) = parse_ip_address(&address) {
+    // Core accepts the bracketed IPv6 form used by ADDRv2/address-manager
+    // callers even though the port is supplied separately.  Strip brackets
+    // before classifying the literal so fc00::/8 is retained as CJDNS.
+    let ip_literal = address
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(&address);
+    let endpoint = if let Ok(address) = parse_ip_address(ip_literal) {
         NetworkEndpoint::from_socket(SocketAddr::new(address, port))
     } else if address.ends_with(".onion") {
         NetworkEndpoint::parse(Some("onion"), &address, Some(port))?

@@ -1569,7 +1569,13 @@ impl ChainState {
             || self.active_tx_counts.len() != self.active_chain.len()
             || self.active_tx_totals.len() != self.active_chain.len()
         {
-            bail!("chain active vectors have inconsistent lengths");
+            bail!(
+                "chain active vectors have inconsistent lengths (chain={}, headers={}, tx_counts={}, tx_totals={})",
+                self.active_chain.len(),
+                self.headers.len(),
+                self.active_tx_counts.len(),
+                self.active_tx_totals.len()
+            );
         }
 
         let mut cumulative_transactions = 0u64;
@@ -6448,9 +6454,15 @@ impl ChainState {
                 .flatten()
         });
         if let Some(common_height) = common_height {
-            let suffix_len =
+            let active_suffix_len =
                 usize::try_from(self.height().saturating_sub(common_height)).unwrap_or(usize::MAX);
-            if common_height < self.height()
+            let common_height_index = usize::try_from(common_height).unwrap_or(usize::MAX);
+            let candidate_suffix_len = path
+                .len()
+                .saturating_sub(common_height_index.saturating_add(1));
+            let suffix_len = active_suffix_len.max(candidate_suffix_len);
+            if (common_height < self.height()
+                || candidate_suffix_len >= MIN_SUFFIX_ACTIVATION_BLOCKS)
                 && (self.is_pruned() || suffix_len >= MIN_SUFFIX_ACTIVATION_BLOCKS)
                 && self.activate_chain_from_pruned_suffix(&path, common_height)?
             {
@@ -6716,19 +6728,21 @@ impl ChainState {
             );
         }
 
-        // The two maps above are already the exact common-ancestor and
-        // candidate UTXO states. Persist only their delta: replacing the
-        // entire UTXO log here is prohibitively expensive for pruning tests
-        // whose coinbase scripts are close to one megabyte each.
+        // The temporary maps above are the exact common-ancestor and
+        // candidate UTXO states. The durable store, however, still contains
+        // the old active tip. Persist only the delta from that old serving
+        // state to the candidate state: replacing the entire UTXO log here
+        // is prohibitively expensive for pruning tests whose coinbase
+        // scripts are close to one megabyte each.
         let mut utxo_removals = Vec::new();
-        for (outpoint, previous) in &disconnected_utxos {
+        for (outpoint, previous) in &self.utxos {
             if candidate_utxos.get(outpoint) != Some(previous) {
                 utxo_removals.push(*outpoint);
             }
         }
         let mut utxo_additions = Vec::new();
         for (outpoint, current) in &candidate_utxos {
-            if disconnected_utxos.get(outpoint) != Some(current) {
+            if self.utxos.get(outpoint) != Some(current) {
                 utxo_additions.push((*outpoint, Self::stored_utxo(current)));
             }
         }

@@ -3578,6 +3578,11 @@ async fn serve_peer_loop(
     let mut peer_services = 0u64;
     let mut compact_block_version = 2u64;
     let mut pending_compact = None;
+    // A compact announcement can arrive before its parent header is indexed.
+    // Remember its hash across the getheaders round trip so the subsequent
+    // header response still schedules the body instead of treating the
+    // already-indexed header as a duplicate and dropping it.
+    let mut pending_compact_body_request = None;
     // Core remembers a failed compact-block reconstruction until the
     // corresponding full block arrives. A second blocktxn response for that
     // attempt is a protocol error and disconnects the peer.
@@ -4701,6 +4706,13 @@ async fn serve_peer_loop(
                     {
                         hashes.push(hash);
                     }
+                    if let Some(hash) = pending_compact_body_request
+                        && chain.block_height_by_hash(&hash).is_some()
+                        && !chain.store.contains(&hash)
+                        && !hashes.contains(&hash)
+                    {
+                        hashes.push(hash);
+                    }
                     (last_hash, hashes)
                 };
                 if !hashes.is_empty() {
@@ -4738,8 +4750,18 @@ async fn serve_peer_loop(
                     // Core does not immediately download their bodies.  A
                     // body request is needed here only when this header
                     // batch can make the advertised chain the active one.
+                    // A recent one- or two-block extension is also fetched
+                    // when direct-fetch freshness is disabled: compact-block
+                    // announcements can race the headers response, and
+                    // dropping that body would leave synchronization stalled
+                    // until another announcement arrives.
+                    let candidate_is_near_tip = hashes.last().is_some_and(|hash| {
+                        chain
+                            .block_height_by_hash(hash)
+                            .is_some_and(|height| height <= chain.height().saturating_add(2))
+                    });
                     let request_candidate_bodies = request_block_bodies
-                        && direct_fetch_allowed
+                        && (direct_fetch_allowed || candidate_is_near_tip)
                         && hashes
                             .last()
                             .and_then(|hash| chain.chain_work_by_hash(hash))
@@ -4808,6 +4830,7 @@ async fn serve_peer_loop(
                         })
                         .collect::<Vec<_>>()
                 };
+                let forced_compact_body = pending_compact_body_request.take();
                 if !requests.is_empty() {
                     for request in &requests {
                         // A duplicate INV can race a connecting headers
@@ -4824,6 +4847,53 @@ async fn serve_peer_loop(
                         writer,
                         node.config.network,
                         &mut pending_block_requests,
+                    )
+                    .await?;
+                }
+                if let Some(hash) = forced_compact_body {
+                    // The compact announcement may have raced the first
+                    // body of the branch.  Request the missing ancestors as
+                    // well as the announced tip, otherwise the tip arrives
+                    // first and is rejected because its parent body is not
+                    // available yet.
+                    let forced_hashes = {
+                        let chain = node.chain.read();
+                        let mut missing = Vec::new();
+                        let mut cursor = Some(hash);
+                        while let Some(cursor_hash) = cursor {
+                            if chain.store.contains(&cursor_hash) {
+                                break;
+                            }
+                            if chain.block_height_by_hash(&cursor_hash).is_none() {
+                                break;
+                            }
+                            missing.push(cursor_hash);
+                            cursor = chain
+                                .header_by_hash(&cursor_hash)
+                                .map(|header| header.prev_blockhash);
+                        }
+                        missing.reverse();
+                        missing
+                    };
+                    let mut forced_requests = Vec::new();
+                    for hash in forced_hashes {
+                        if node.block_body_was_rejected(&hash) {
+                            continue;
+                        }
+                        node.clear_other_peer_block_requests(peer_id, hash);
+                        if node.track_manual_peer_block_request(peer_id, hash) {
+                            forced_requests.push(Inventory {
+                                kind: InventoryType::WitnessBlock,
+                                hash,
+                            });
+                        }
+                    }
+                    send_getdata_batches(
+                        node,
+                        peer_id,
+                        writer,
+                        node.config.network,
+                        &forced_requests,
                     )
                     .await?;
                 }
@@ -5500,12 +5570,13 @@ async fn serve_peer_loop(
                 };
                 node.clear_peer_block_request(peer_id, hash);
                 let Some((height, recent_work)) = compact_work else {
+                    pending_compact_body_request = Some(hash);
                     if !node.chain.read().is_initial_block_download() {
                         request_headers(node, peer_id, writer, peer_state).await?;
                     }
                     continue;
                 };
-                let (work_allowed, should_reconstruct) = {
+                let (work_allowed, should_reconstruct, active_height) = {
                     let chain = node.chain.read();
                     let active_height = chain.height();
                     let direct_fetch_allowed = chain.header(active_height).is_some_and(|header| {
@@ -5527,6 +5598,7 @@ async fn serve_peer_loop(
                             threshold,
                             direct_fetch_allowed,
                         ),
+                        active_height,
                     )
                 };
                 if !work_allowed {
@@ -5550,7 +5622,13 @@ async fn serve_peer_loop(
                 }
                 node.update_peer_best_known_block(peer_id, hash);
                 if !should_reconstruct {
-                    if requested {
+                    // An unsolicited compact announcement can arrive while
+                    // direct-fetch mode is disabled (for example when the
+                    // tip timestamp is outside Core's freshness window).
+                    // It is still a valid recent block announcement; fall
+                    // back to a full-body request instead of dropping it and
+                    // leaving block synchronization stalled.
+                    if requested || (work_allowed && height <= active_height.saturating_add(2)) {
                         request_full_block(
                             node,
                             peer_id,
@@ -5625,8 +5703,10 @@ async fn serve_peer_loop(
                         let first_in_flight = already_in_flight == 0 || requested;
                         let peer_is_inbound = node.peer_is_inbound(peer_id);
                         let high_bandwidth = node.peer_bip152_highbandwidth_to(peer_id);
+                        let recent_compact_download = height <= active_height.saturating_add(2);
                         let can_request =
-                            peer_block_download_allowed_for_node(node, peer_id, peer_services)
+                            (peer_block_download_allowed_for_node(node, peer_id, peer_services)
+                                || recent_compact_download)
                                 && ((already_in_flight < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK
                                     && peer_inflight_before < MAX_BLOCKS_IN_TRANSIT_PER_PEER)
                                     || requested)

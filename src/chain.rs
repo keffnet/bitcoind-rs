@@ -888,6 +888,11 @@ pub struct ChainState {
     active_chain: Vec<BlockHash>,
     segwit_validated_blocks: HashSet<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
+    // Electrum checkpoint proofs are requested repeatedly while a client
+    // downloads a header chain. Cache the materialized tree for the current
+    // tip and checkpoint so each proof only walks the tree height instead of
+    // rebuilding every layer from genesis.
+    header_merkle_cache: Mutex<Option<HeaderMerkleCache>>,
     active_tx_counts: Vec<u32>,
     active_tx_totals: Vec<u64>,
     initial_block_download: bool,
@@ -944,6 +949,102 @@ pub struct ChainState {
     basic_filter_cache: HashMap<BlockHash, (Vec<u8>, FilterHeader)>,
     block_undo_cache: HashMap<BlockHash, Vec<Vec<TxOut>>>,
     script_cache: Mutex<ScriptValidationCache>,
+}
+
+struct HeaderMerkleCache {
+    tip: BlockHash,
+    checkpoint: u32,
+    levels: Vec<Vec<BlockHash>>,
+}
+
+impl HeaderMerkleCache {
+    fn from_hashes(tip: BlockHash, checkpoint: u32, hashes: Vec<BlockHash>) -> Result<Self> {
+        if hashes.is_empty() {
+            bail!("cannot build an empty header proof");
+        }
+        let mut levels = vec![hashes];
+        while levels.last().is_some_and(|layer| layer.len() > 1) {
+            let layer = levels.last().expect("header merkle layer exists");
+            let mut next = Vec::with_capacity(layer.len().div_ceil(2));
+            for pair in layer.chunks(2) {
+                let right = *pair.get(1).unwrap_or(&pair[0]);
+                next.push(combine_header_hashes(pair[0], right));
+            }
+            levels.push(next);
+        }
+        Ok(Self {
+            tip,
+            checkpoint,
+            levels,
+        })
+    }
+
+    fn proof(&self, height: u32) -> Result<(Vec<BlockHash>, BlockHash)> {
+        let mut index =
+            usize::try_from(height).map_err(|_| anyhow!("header height is too large"))?;
+        let leaves = self
+            .levels
+            .first()
+            .context("header merkle cache has no leaves")?;
+        if index >= leaves.len() {
+            bail!("header height exceeds checkpoint")
+        }
+        let mut branch = Vec::with_capacity(self.levels.len().saturating_sub(1));
+        for layer in self.levels.iter().take_while(|layer| layer.len() > 1) {
+            let sibling = if index ^ 1 < layer.len() {
+                index ^ 1
+            } else {
+                index
+            };
+            branch.push(layer[sibling]);
+            index /= 2;
+        }
+        let root = *self
+            .levels
+            .last()
+            .and_then(|layer| layer.first())
+            .context("header merkle cache has no root")?;
+        Ok((branch, root))
+    }
+}
+
+pub(crate) fn combine_header_hashes(left: BlockHash, right: BlockHash) -> BlockHash {
+    let mut bytes = [0u8; 64];
+    bytes[..32].copy_from_slice(&left.to_byte_array());
+    bytes[32..].copy_from_slice(&right.to_byte_array());
+    BlockHash::from_raw_hash(bitcoin::hashes::sha256d::Hash::hash(&bytes))
+}
+
+#[cfg(test)]
+pub(crate) fn header_merkle_proof_from_hashes(
+    hashes: &[BlockHash],
+    height: u32,
+) -> Result<(Vec<BlockHash>, BlockHash)> {
+    if hashes.is_empty() {
+        bail!("cannot build an empty header proof");
+    }
+    let mut layer = hashes.to_vec();
+    let mut index = usize::try_from(height).map_err(|_| anyhow!("header height is too large"))?;
+    if index >= layer.len() {
+        bail!("header height exceeds checkpoint");
+    }
+    let mut branch = Vec::new();
+    while layer.len() > 1 {
+        let sibling = if index ^ 1 < layer.len() {
+            index ^ 1
+        } else {
+            index
+        };
+        branch.push(layer[sibling]);
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
+        for pair in layer.chunks(2) {
+            let right = *pair.get(1).unwrap_or(&pair[0]);
+            next.push(combine_header_hashes(pair[0], right));
+        }
+        layer = next;
+        index /= 2;
+    }
+    Ok((branch, layer[0]))
 }
 
 impl ChainState {
@@ -1405,6 +1506,7 @@ impl ChainState {
                 .clone()
                 .unwrap_or_default(),
             headers: Vec::new(),
+            header_merkle_cache: Mutex::new(None),
             active_tx_counts: persisted_tx_counts.unwrap_or_default(),
             active_tx_totals: persisted_tx_totals,
             initial_block_download: true,
@@ -3066,6 +3168,40 @@ impl ChainState {
 
     pub fn header(&self, height: u32) -> Option<&bitcoin::block::Header> {
         self.headers.get(height as usize)
+    }
+
+    /// Return an Electrum header checkpoint proof. The tree is built lazily
+    /// once for a `(tip, checkpoint)` pair and then reused for all requested
+    /// heights at that checkpoint.
+    pub fn header_merkle_proof(
+        &self,
+        height: u32,
+        checkpoint: u32,
+    ) -> Result<(Vec<BlockHash>, BlockHash)> {
+        if height > checkpoint {
+            bail!("checkpoint height must not precede requested height");
+        }
+        let checkpoint_index =
+            usize::try_from(checkpoint).context("checkpoint height does not fit in memory")?;
+        let tip = self.best_hash();
+        let mut cache = self.header_merkle_cache.lock();
+        let rebuild = cache
+            .as_ref()
+            .is_none_or(|cached| cached.tip != tip || cached.checkpoint != checkpoint);
+        if rebuild {
+            let hashes = self
+                .headers
+                .get(..=checkpoint_index)
+                .context("checkpoint height out of range")?
+                .iter()
+                .map(bitcoin::block::Header::block_hash)
+                .collect();
+            *cache = Some(HeaderMerkleCache::from_hashes(tip, checkpoint, hashes)?);
+        }
+        cache
+            .as_ref()
+            .expect("header merkle cache was initialized")
+            .proof(height)
     }
 
     pub fn active_headers(&self) -> &[bitcoin::block::Header] {
@@ -8935,6 +9071,7 @@ fn open_background_replay_state(
         active_chain: active_chain.to_vec(),
         segwit_validated_blocks: HashSet::new(),
         headers,
+        header_merkle_cache: Mutex::new(None),
         active_tx_counts: Vec::new(),
         active_tx_totals: Vec::new(),
         initial_block_download: true,
@@ -9851,6 +9988,34 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn header_merkle_cache_matches_reference_for_odd_and_even_lengths() {
+        for len in 1..=64usize {
+            let hashes = (0..len)
+                .map(|index| {
+                    let mut bytes = [0u8; 32];
+                    bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    bytes[8..16].copy_from_slice(&(len as u64).to_le_bytes());
+                    BlockHash::from_byte_array(bytes)
+                })
+                .collect::<Vec<_>>();
+            let cache = HeaderMerkleCache::from_hashes(
+                hashes.last().copied().unwrap(),
+                (len - 1) as u32,
+                hashes.clone(),
+            )
+            .unwrap();
+
+            for height in 0..len as u32 {
+                assert_eq!(
+                    cache.proof(height).unwrap(),
+                    header_merkle_proof_from_hashes(&hashes, height).unwrap(),
+                    "length {len}, height {height}"
+                );
+            }
+        }
     }
 
     #[test]

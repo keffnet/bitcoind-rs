@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
-use bitcoin::hashes::{Hash, sha256d};
 use bitcoin::{Address, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1204,7 +1203,7 @@ fn block_header(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if height > checkpoint {
         bail!("checkpoint height must not precede requested height")
     }
-    let (branch, root) = header_merkle_proof(&chain, height, checkpoint)?;
+    let (branch, root) = chain.header_merkle_proof(height, checkpoint)?;
     Ok(json!({
         "header": hex::encode(serialize(header)),
         "branch": branch.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -1249,7 +1248,7 @@ fn block_headers_for_protocol(
         && actual != 0
     {
         let last_height = start + actual - 1;
-        let (branch, root) = header_merkle_proof(&chain, last_height, checkpoint)?;
+        let (branch, root) = chain.header_merkle_proof(last_height, checkpoint)?;
         result["branch"] = json!(branch.iter().map(ToString::to_string).collect::<Vec<_>>());
         result["root"] = json!(root.to_string());
     }
@@ -1304,63 +1303,6 @@ fn mempool_recent(node: &Arc<Node>) -> Value {
             }))
             .collect::<Vec<_>>()
     )
-}
-
-fn header_merkle_proof(
-    chain: &crate::chain::ChainState,
-    height: u32,
-    checkpoint: u32,
-) -> Result<(Vec<BlockHash>, BlockHash)> {
-    if height > checkpoint {
-        bail!("header height exceeds checkpoint")
-    }
-    let hashes = (0..=checkpoint)
-        .map(|height| {
-            chain
-                .header(height)
-                .map(|header| header.block_hash())
-                .ok_or_else(|| anyhow!("checkpoint height out of range"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    header_merkle_proof_from_hashes(&hashes, height)
-}
-
-fn header_merkle_proof_from_hashes(
-    hashes: &[BlockHash],
-    height: u32,
-) -> Result<(Vec<BlockHash>, BlockHash)> {
-    if hashes.is_empty() {
-        bail!("cannot build an empty header proof")
-    }
-    let mut layer = hashes.to_vec();
-    let mut index = usize::try_from(height).map_err(|_| anyhow!("header height is too large"))?;
-    if index >= layer.len() {
-        bail!("header height exceeds checkpoint")
-    }
-    let mut branch = Vec::new();
-    while layer.len() > 1 {
-        let sibling = if index ^ 1 < layer.len() {
-            index ^ 1
-        } else {
-            index
-        };
-        branch.push(layer[sibling]);
-        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
-        for pair in layer.chunks(2) {
-            let right = *pair.get(1).unwrap_or(&pair[0]);
-            next.push(combine_header_hashes(pair[0], right));
-        }
-        layer = next;
-        index /= 2;
-    }
-    Ok((branch, layer[0]))
-}
-
-fn combine_header_hashes(left: BlockHash, right: BlockHash) -> BlockHash {
-    let mut bytes = [0u8; 64];
-    bytes[..32].copy_from_slice(&left.to_byte_array());
-    bytes[32..].copy_from_slice(&right.to_byte_array());
-    BlockHash::from_raw_hash(sha256d::Hash::hash(&bytes))
 }
 
 fn block_chunk(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -2609,17 +2551,17 @@ mod tests {
             BlockHash::from_byte_array([2; 32]),
             BlockHash::from_byte_array([3; 32]),
         ];
-        let (branch, root) = header_merkle_proof_from_hashes(&hashes, 2).unwrap();
+        let (branch, root) = chain::header_merkle_proof_from_hashes(&hashes, 2).unwrap();
         assert_eq!(branch.len(), 2);
         assert_eq!(branch[0], hashes[2]);
         assert_eq!(
             root,
-            combine_header_hashes(
-                combine_header_hashes(hashes[0], hashes[1]),
-                combine_header_hashes(hashes[2], hashes[2]),
+            chain::combine_header_hashes(
+                chain::combine_header_hashes(hashes[0], hashes[1]),
+                chain::combine_header_hashes(hashes[2], hashes[2]),
             )
         );
-        assert!(header_merkle_proof_from_hashes(&hashes, 3).is_err());
+        assert!(chain::header_merkle_proof_from_hashes(&hashes, 3).is_err());
     }
 
     #[test]

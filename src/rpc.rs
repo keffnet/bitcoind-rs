@@ -1862,6 +1862,7 @@ async fn dispatch_method_async_for_user(
         "waitfornewblock" => wait_for_new_block(node, &normalized_params).await,
         "waitforblock" => wait_for_block(node, &normalized_params).await,
         "waitforblockheight" => wait_for_block_height(node, &normalized_params).await,
+        "addnode" => add_node_async(node, &normalized_params).await,
         "getblocktemplate" => get_block_template_async(node, &normalized_params).await,
         "scantxoutset" | "scanblocks" => {
             let node = node.clone();
@@ -4571,7 +4572,10 @@ fn get_block_from_peer(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!({}))
 }
 
-fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
+fn parse_add_node_request(
+    node: &Arc<Node>,
+    params: &Value,
+) -> Result<(String, NetworkEndpoint, String, Option<bool>)> {
     let display_name = param::<String>(params, 0)?;
     let endpoint = parse_node_endpoint(node, &display_name)?;
     let command = param::<String>(params, 1)?;
@@ -4587,6 +4591,11 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if transport_v2 == Some(true) && !node.config.v2_transport {
         bail!("Error: v2transport requested but not enabled (see -v2transport)");
     }
+    Ok((display_name, endpoint, command, transport_v2))
+}
+
+fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let (display_name, endpoint, command, transport_v2) = parse_add_node_request(node, params)?;
     match command.as_str() {
         "add" => {
             if !node.add_node_endpoint_with_transport(endpoint, display_name, transport_v2) {
@@ -4600,6 +4609,35 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 transport_v2,
                 "outbound-full",
             );
+            Ok(Value::Null)
+        }
+        "remove" => {
+            if node.remove_node_endpoint(&endpoint) {
+                Ok(Value::Null)
+            } else {
+                bail!("Node could not be removed")
+            }
+        }
+        _ => bail!("addnode \"node\" \"command\""),
+    }
+}
+
+async fn add_node_async(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let (display_name, endpoint, command, transport_v2) = parse_add_node_request(node, params)?;
+    match command.as_str() {
+        "add" => {
+            if !node.add_node_endpoint_with_transport(endpoint, display_name, transport_v2) {
+                bail!("Node already added")
+            }
+            Ok(Value::Null)
+        }
+        "onetry" => {
+            node.request_one_try_endpoint_with_connection_type_and_wait(
+                endpoint,
+                transport_v2,
+                "outbound-full",
+            )
+            .await;
             Ok(Value::Null)
         }
         "remove" => {

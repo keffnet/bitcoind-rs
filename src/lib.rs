@@ -6113,6 +6113,30 @@ impl Node {
         );
     }
 
+    pub(crate) async fn request_one_try_endpoint_with_connection_type_and_wait(
+        &self,
+        endpoint: NetworkEndpoint,
+        transport_v2: Option<bool>,
+        connection_type: &'static str,
+    ) {
+        let Some(sender) = self.peer_manager_requests.read().as_ref().cloned() else {
+            return;
+        };
+        let (completion_sender, completion_receiver) = oneshot::channel();
+        if sender
+            .send(p2p::PeerManagerRequest::OneTry(
+                endpoint,
+                transport_v2,
+                connection_type,
+                false,
+                Some(completion_sender),
+            ))
+            .is_ok()
+        {
+            let _ = completion_receiver.await;
+        }
+    }
+
     pub(crate) fn request_add_connection_with_type(
         &self,
         address: SocketAddr,
@@ -6140,6 +6164,7 @@ impl Node {
                 transport_v2,
                 connection_type,
                 addconnection,
+                None,
             ));
         }
     }

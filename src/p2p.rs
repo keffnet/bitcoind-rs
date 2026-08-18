@@ -1732,7 +1732,13 @@ pub(crate) enum PeerCommand {
 #[derive(Debug)]
 pub(crate) enum PeerManagerRequest {
     Add(NetworkEndpoint, Option<bool>),
-    OneTry(NetworkEndpoint, Option<bool>, &'static str, bool),
+    OneTry(
+        NetworkEndpoint,
+        Option<bool>,
+        &'static str,
+        bool,
+        Option<oneshot::Sender<()>>,
+    ),
     PrivateBroadcast {
         address: SocketAddr,
         transaction: Transaction,
@@ -2019,6 +2025,7 @@ impl PeerManager {
                         "addr-fetch",
                         true,
                         false,
+                        None,
                     );
                 }
             }
@@ -2132,6 +2139,7 @@ impl PeerManager {
                 "outbound-full",
                 true,
                 false,
+                None,
             );
         }
         let discovery_node = self.node.clone();
@@ -2183,6 +2191,7 @@ impl PeerManager {
                             "addr-fetch",
                             true,
                             false,
+                            None,
                         );
                         deferred_seed_nodes.clear();
                     }
@@ -2259,6 +2268,7 @@ impl PeerManager {
                             "outbound-full",
                             false,
                             false,
+                            None,
                         );
                     }
                 }
@@ -2275,10 +2285,10 @@ impl PeerManager {
                         let Some(request) = request else {
                             break;
                         };
-                        let (endpoint, persistent, transport_v2, connection_type, manual, addconnection) = match request {
-                            PeerManagerRequest::Add(endpoint, transport_v2) => (endpoint, true, transport_v2, "outbound-full", true, false),
-                            PeerManagerRequest::OneTry(endpoint, transport_v2, connection_type, addconnection) => {
-                                (endpoint, false, transport_v2, connection_type, !addconnection, addconnection)
+                        let (endpoint, persistent, transport_v2, connection_type, manual, addconnection, completion) = match request {
+                            PeerManagerRequest::Add(endpoint, transport_v2) => (endpoint, true, transport_v2, "outbound-full", true, false, None),
+                            PeerManagerRequest::OneTry(endpoint, transport_v2, connection_type, addconnection, completion) => {
+                                (endpoint, false, transport_v2, connection_type, !addconnection, addconnection, completion)
                             }
                             PeerManagerRequest::PrivateBroadcast { address, transaction } => {
                                 spawn_private_broadcast_loop(
@@ -2299,6 +2309,7 @@ impl PeerManager {
                             connection_type,
                             manual,
                             addconnection,
+                            completion,
                         );
                     }
                     _ = private_retry_interval.tick() => {
@@ -2575,6 +2586,12 @@ async fn run_inbound_listener(
     }
 }
 
+fn complete_one_try(completion: &mut Option<oneshot::Sender<()>>) {
+    if let Some(completion) = completion.take() {
+        let _ = completion.send(());
+    }
+}
+
 fn spawn_outbound_loop(
     node: Arc<Node>,
     endpoint: NetworkEndpoint,
@@ -2584,10 +2601,14 @@ fn spawn_outbound_loop(
     connection_type: &'static str,
     manual: bool,
     addconnection: bool,
+    completion: Option<oneshot::Sender<()>>,
 ) {
     {
         let mut attempts = outbound.attempts.lock();
         if !attempts.insert(endpoint.clone()) {
+            if let Some(completion) = completion {
+                let _ = completion.send(());
+            }
             return;
         }
     }
@@ -2604,6 +2625,7 @@ fn spawn_outbound_loop(
         attempts: outbound_attempts,
         ..
     } = outbound;
+    let mut completion = completion;
     tokio::spawn(async move {
         struct AttemptGuard {
             endpoint: NetworkEndpoint,
@@ -2641,7 +2663,10 @@ fn spawn_outbound_loop(
         };
         let _permit = match _permit {
             Some(Ok(permit)) => Some(permit),
-            Some(Err(_)) => return,
+            Some(Err(_)) => {
+                complete_one_try(&mut completion);
+                return;
+            }
             None => None,
         };
         if !manual && !node.config.allows_network_endpoint(&endpoint) {
@@ -2651,13 +2676,19 @@ fn spawn_outbound_loop(
                 endpoint,
                 "skipping outbound peer outside onlynet policy"
             );
+            complete_one_try(&mut completion);
             return;
         }
         loop {
             if persistent && !node.is_node_added_endpoint(&endpoint) {
+                complete_one_try(&mut completion);
                 return;
             }
             if !node.network_active() || node.is_banned_for_endpoint(&endpoint) {
+                if !persistent {
+                    complete_one_try(&mut completion);
+                    return;
+                }
                 tokio::time::sleep(Duration::from_secs(1)).await;
                 continue;
             }
@@ -2667,6 +2698,7 @@ fn spawn_outbound_loop(
                 .any(|peer| peer.endpoint == endpoint)
             {
                 if !persistent {
+                    complete_one_try(&mut completion);
                     return;
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -2687,6 +2719,7 @@ fn spawn_outbound_loop(
             {
                 Ok(stream) => {
                     peer_log!(node, info, endpoint, "connected to configured peer");
+                    complete_one_try(&mut completion);
                     if let Err(error) = serve_peer(
                         node.clone(),
                         stream,
@@ -2720,6 +2753,7 @@ fn spawn_outbound_loop(
                             error,
                             "one-shot peer connection failed"
                         );
+                        complete_one_try(&mut completion);
                         return;
                     }
                     peer_log!(

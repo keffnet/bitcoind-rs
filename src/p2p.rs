@@ -2345,6 +2345,7 @@ async fn run_i2p_listener(
                 let node = node.clone();
                 let slots = slots.clone();
                 let peers = peers.clone();
+                let peer_id_allocator = next_peer_id.clone();
                 let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
                     let Some(_permit) = acquire_inbound_slot(&node, &slots).await else {
@@ -2371,6 +2372,7 @@ async fn run_i2p_listener(
                         },
                         peers,
                         peer_id,
+                        Some(peer_id_allocator),
                     )
                     .await
                     {
@@ -2490,6 +2492,7 @@ async fn run_inbound_listener(
         let node = node.clone();
         let slots = slots.clone();
         let peers = peers.clone();
+        let peer_id_allocator = next_peer_id.clone();
         let transport_v2 = (!node.config.v2_transport).then_some(false);
         let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
@@ -2516,6 +2519,7 @@ async fn run_inbound_listener(
                 },
                 peers,
                 peer_id,
+                Some(peer_id_allocator),
             )
             .await
             {
@@ -2551,6 +2555,7 @@ fn spawn_outbound_loop(
         addconnection_block_relay_slots,
         addconnection_feeler_slots,
         peers,
+        next_peer_id: peer_id_allocator,
         attempts: outbound_attempts,
         ..
     } = outbound;
@@ -2642,11 +2647,11 @@ fn spawn_outbound_loop(
                         },
                         peers.clone(),
                         peer_id,
+                        Some(peer_id_allocator.clone()),
                     )
                     .await
                     {
                         peer_log!(node, debug, endpoint, error, "outbound peer ended");
-                        debug!("Cleared nodestate for peer={peer_id}");
                     }
                     if !persistent {
                         return;
@@ -2694,6 +2699,7 @@ fn spawn_private_broadcast_loop(
     let OutboundContext {
         private_slots,
         peers,
+        next_peer_id: peer_id_allocator,
         attempts: outbound_attempts,
         ..
     } = outbound;
@@ -2747,6 +2753,7 @@ fn spawn_private_broadcast_loop(
                     },
                     peers,
                     peer_id,
+                    Some(peer_id_allocator.clone()),
                 )
                 .await
                 {
@@ -3424,27 +3431,12 @@ fn has_empty_fixed_seed_network(node: &Node) -> bool {
         .any(|endpoint| !known_networks.contains(endpoint.network_name()))
 }
 
-#[derive(Clone)]
-struct ProxyRoutingOptions {
-    proxy: Option<ProxyEndpoint>,
-    onion_proxy: Option<ProxyEndpoint>,
-    force_proxy: bool,
-    randomize_credentials: bool,
-    allow_dns_lookup: bool,
-    connect_timeout: Duration,
-    i2p_sam: Option<Arc<crate::i2p::I2pSam>>,
-}
-
 async fn establish_transport(
     node: &Arc<Node>,
     peer_id: usize,
     stream: TcpStream,
-    endpoint: &NetworkEndpoint,
     outbound: bool,
-    _network: Network,
     transport_v2: Option<bool>,
-    log_ips: bool,
-    proxy_options: ProxyRoutingOptions,
 ) -> Result<(
     PeerReader,
     PeerWriterKind,
@@ -3456,35 +3448,7 @@ async fn establish_transport(
         if transport_v2 == Some(false) {
             return establish_v1(stream);
         }
-        match establish_v2_for_peer(node, peer_id, stream, magic, Role::Initiator).await {
-            Ok((reader, writer, local_address, session_id)) => {
-                return Ok((reader, writer, local_address, session_id));
-            }
-            Err(error) => {
-                if log_ips {
-                    debug!(
-                        %endpoint,
-                        %error,
-                        "retrying with v1 transport protocol for peer"
-                    );
-                } else {
-                    debug!(%error, "retrying with v1 transport protocol for peer");
-                }
-                let fallback = connect_peer_endpoint_with_options_and_dns_with_i2p(
-                    endpoint,
-                    proxy_options.proxy,
-                    proxy_options.onion_proxy,
-                    proxy_options.force_proxy,
-                    proxy_options.randomize_credentials,
-                    proxy_options.allow_dns_lookup,
-                    proxy_options.connect_timeout,
-                    proxy_options.i2p_sam,
-                )
-                .await
-                .with_context(|| format!("reconnecting to {endpoint} with v1 transport"))?;
-                return establish_v1(fallback);
-            }
-        }
+        return establish_v2_for_peer(node, peer_id, stream, magic, Role::Initiator).await;
     }
 
     if transport_v2 == Some(false) {
@@ -3593,7 +3557,7 @@ async fn establish_v2_with_accounting(
     writer.write_all(&key_buffer).await?;
     writer.flush().await?;
     if let Some(node) = node {
-        node.record_bytes_sent(peer_id, key_buffer.len(), crate::P2P_MESSAGE_TYPE_OTHER);
+        node.record_transport_bytes_sent(peer_id, key_buffer.len());
     }
 
     let mut remote_key = [0; BIP324_ELLIGATOR_SWIFT_BYTES];
@@ -3609,7 +3573,7 @@ async fn establish_v2_with_accounting(
     writer.write_all(&version_buffer).await?;
     writer.flush().await?;
     if let Some(node) = node {
-        node.record_bytes_sent(peer_id, version_buffer.len(), crate::P2P_MESSAGE_TYPE_OTHER);
+        node.record_transport_bytes_sent(peer_id, version_buffer.len());
     }
 
     let mut garbage_buffer = vec![0; BIP324_GARBAGE_TERMINATOR_BYTES];
@@ -3738,22 +3702,25 @@ async fn serve_peer(
     options: PeerConnectionOptions,
     peers: PeerRegistry,
     peer_id: usize,
+    next_peer_id: Option<Arc<AtomicUsize>>,
 ) -> Result<()> {
     let _peer_count = PeerCountGuard::new(&node);
     stream.set_nodelay(true)?;
     let socket = SockRef::from(&stream);
     socket.set_recv_buffer_size(node.config.max_receive_buffer as usize)?;
     socket.set_send_buffer_size(node.config.max_send_buffer as usize)?;
+    let transport_v2_possible = options.transport_v2 != Some(false)
+        && (node.config.v2_transport || options.transport_v2 == Some(true));
     let detect_transport =
         !options.outbound && options.transport_v2.is_none() && node.config.v2_transport;
-    if detect_transport {
+    if transport_v2_possible {
         let (provisional_commands, _provisional_receiver) = mpsc::unbounded_channel();
         let permissions =
             resolved_peer_permissions(&node, &endpoint, options.outbound, options.permissions);
         node.register_peer_with_endpoint(
             peer_id,
             endpoint.clone(),
-            true,
+            !options.outbound,
             provisional_commands,
             PeerRegistrationOptions {
                 local_address: stream.local_addr().ok(),
@@ -3762,7 +3729,9 @@ async fn serve_peer(
                 manual: options.manual,
             },
         );
-        node.set_peer_transport_detecting(peer_id);
+        if detect_transport || options.outbound {
+            node.set_peer_transport_detecting(peer_id);
+        }
     }
     if options.outbound && options.transport_v2 != Some(false) && node.config.v2_transport {
         debug!("start sending v2 handshake to peer={peer_id}");
@@ -3771,28 +3740,54 @@ async fn serve_peer(
         &node,
         peer_id,
         stream,
-        &endpoint,
         options.outbound,
-        node.config.network,
         options.transport_v2,
-        node.config.logging.log_ips,
-        ProxyRoutingOptions {
-            proxy: node.config.proxy_for_endpoint(&endpoint),
-            onion_proxy: node.onion_proxy(),
-            force_proxy: options.connection_type == "private-broadcast",
-            randomize_credentials: node.config.proxy_randomize,
-            allow_dns_lookup: node.config.dns_lookup,
-            connect_timeout: Duration::from_millis(node.config.connect_timeout_ms),
-            i2p_sam: node.i2p_sam.clone(),
-        },
     )
     .await;
     let (mut reader, writer_half, local_address, session_id) = match transport {
         Ok(transport) => transport,
-        Err(error) => {
-            if detect_transport {
-                node.unregister_peer(peer_id);
+        Err(error) if options.outbound && transport_v2_possible => {
+            let error_text = error.to_string();
+            if node.config.logging.log_ips {
+                debug!(
+                    "retrying with v1 transport protocol for peer={peer_id} endpoint={endpoint} error={error_text}"
+                );
+            } else {
+                debug!("retrying with v1 transport protocol for peer={peer_id} error={error_text}");
             }
+            node.unregister_peer(peer_id);
+            debug!("Cleared nodestate for peer={peer_id}");
+            drop(_peer_count);
+            let fallback = connect_peer_endpoint_with_options_and_dns_with_i2p(
+                &endpoint,
+                node.config.proxy_for_endpoint(&endpoint),
+                node.onion_proxy(),
+                options.connection_type == "private-broadcast",
+                node.config.proxy_randomize,
+                node.config.dns_lookup,
+                Duration::from_millis(node.config.connect_timeout_ms),
+                node.i2p_sam.clone(),
+            )
+            .await
+            .with_context(|| format!("reconnecting to {endpoint} with v1 transport"))?;
+            let fallback_peer_id = next_peer_id.as_ref().map_or(peer_id, |next_peer_id| {
+                next_peer_id.fetch_add(1, Ordering::Relaxed)
+            });
+            let mut fallback_options = options;
+            fallback_options.transport_v2 = Some(false);
+            return Box::pin(serve_peer(
+                node,
+                fallback,
+                endpoint,
+                fallback_options,
+                peers,
+                fallback_peer_id,
+                next_peer_id,
+            ))
+            .await;
+        }
+        Err(error) => {
+            node.unregister_peer(peer_id);
             let error_text = error.to_string();
             if error_text.contains("NoGarbageTerminator")
                 || error_text.contains("More than 4095 bytes of garbage")
@@ -3812,6 +3807,9 @@ async fn serve_peer(
         }
     };
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
+    let transport_stats = transport_v2
+        .then(|| node.peer_transport_stats(peer_id))
+        .flatten();
     let peer_endpoint = endpoint.clone();
     let (commands, command_receiver) = mpsc::unbounded_channel();
     let permissions =
@@ -3828,6 +3826,9 @@ async fn serve_peer(
             manual: options.manual,
         },
     );
+    if let Some(transport_stats) = transport_stats {
+        node.restore_peer_transport_stats(peer_id, transport_stats);
+    }
     node.set_peer_transport_protocol(peer_id, transport_v2);
     node.set_peer_session_id(peer_id, session_id);
     node.set_peer_connection_type(peer_id, options.connection_type);
@@ -9852,6 +9853,7 @@ mod tests {
             },
             source_peers,
             1,
+            None,
         ));
         let target_task = tokio::spawn(serve_peer(
             target.clone(),
@@ -9867,6 +9869,7 @@ mod tests {
             },
             target_peers,
             1,
+            None,
         ));
 
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -9928,6 +9931,7 @@ mod tests {
             },
             Arc::new(parking_lot::Mutex::new(HashMap::new())),
             1,
+            None,
         ));
 
         let (mut reader, mut writer) = client.into_split();
@@ -10012,6 +10016,7 @@ mod tests {
             },
             Arc::new(parking_lot::Mutex::new(HashMap::new())),
             1,
+            None,
         ));
 
         let (mut reader, mut writer) = client.into_split();

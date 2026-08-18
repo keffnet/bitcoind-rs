@@ -1172,6 +1172,16 @@ pub(crate) struct PeerRegistrationOptions {
     pub(crate) manual: bool,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PeerTransportStats {
+    pub(crate) last_send: u64,
+    pub(crate) last_recv: u64,
+    pub(crate) bytes_sent: u64,
+    pub(crate) bytes_received: u64,
+    pub(crate) preaccounted_received_bytes: u64,
+    pub(crate) unread_detection_bytes: u64,
+}
+
 /// Address-manager metadata for an endpoint that may not be connected yet.
 #[derive(Clone, Debug)]
 pub struct KnownNetworkAddress {
@@ -3725,6 +3735,27 @@ impl Node {
         }
     }
 
+    /// Account bytes used by the BIP324 transport handshake. Core includes
+    /// these bytes in the peer totals and updates lastsend, but does not put
+    /// them in a decoded P2P message bucket.
+    pub(crate) fn record_transport_bytes_sent(&self, peer_id: usize, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.total_bytes_sent.fetch_add(bytes, Ordering::Relaxed);
+        let now = unix_time_seconds();
+        {
+            let mut usage = self.outbound_usage.lock();
+            if usage.cycle_start.saturating_add(MAX_UPLOAD_TIMEFRAME_SECS) < now {
+                usage.cycle_start = now;
+                usage.bytes = 0;
+            }
+            usage.bytes = usage.bytes.saturating_add(bytes);
+        }
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.bytes_sent = peer.bytes_sent.saturating_add(bytes);
+            peer.last_send = now;
+        }
+    }
+
     /// Append a decoded application-layer P2P message in Core's
     /// `-capturemessages` format. The transport envelope is deliberately not
     /// included, so v1 and BIP324 captures have the same record structure.
@@ -3839,11 +3870,20 @@ impl Node {
             })
             .unwrap_or(bytes);
         if fresh != 0 {
-            self.record_bytes_received(
+            self.record_transport_bytes_received(
                 peer_id,
                 usize::try_from(fresh).unwrap_or(usize::MAX),
-                P2P_MESSAGE_TYPE_OTHER,
             );
+        }
+    }
+
+    pub(crate) fn record_transport_bytes_received(&self, peer_id: usize, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        self.total_bytes_received
+            .fetch_add(bytes, Ordering::Relaxed);
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.bytes_received = peer.bytes_received.saturating_add(bytes);
+            peer.last_recv = unix_time_seconds();
         }
     }
 
@@ -5413,6 +5453,28 @@ impl Node {
     pub(crate) fn set_peer_transport_protocol(&self, id: usize, transport_v2: bool) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.transport_protocol_type = if transport_v2 { "v2" } else { "v1" };
+        }
+    }
+
+    pub(crate) fn peer_transport_stats(&self, id: usize) -> Option<PeerTransportStats> {
+        self.peers.read().get(&id).map(|peer| PeerTransportStats {
+            last_send: peer.last_send,
+            last_recv: peer.last_recv,
+            bytes_sent: peer.bytes_sent,
+            bytes_received: peer.bytes_received,
+            preaccounted_received_bytes: peer.preaccounted_received_bytes,
+            unread_detection_bytes: peer.unread_detection_bytes,
+        })
+    }
+
+    pub(crate) fn restore_peer_transport_stats(&self, id: usize, stats: PeerTransportStats) {
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.last_send = stats.last_send;
+            peer.last_recv = stats.last_recv;
+            peer.bytes_sent = stats.bytes_sent;
+            peer.bytes_received = stats.bytes_received;
+            peer.preaccounted_received_bytes = stats.preaccounted_received_bytes;
+            peer.unread_detection_bytes = stats.unread_detection_bytes;
         }
     }
 

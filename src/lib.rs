@@ -1570,6 +1570,40 @@ impl Node {
                 network_datadir.display()
             )
         })?;
+        // Core creates network-specific data directories and the wallet
+        // placeholder with owner-only permissions.  Wallet functionality is
+        // intentionally absent here, but keeping the directory preserves the
+        // normal datadir shape without introducing Core's blk*.dat/rev*.dat
+        // storage files.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&network_datadir, fs::Permissions::from_mode(0o700)).with_context(
+                || {
+                    format!(
+                        "setting permissions on network data directory {}",
+                        network_datadir.display()
+                    )
+                },
+            )?;
+        }
+        let wallets_dir = network_datadir.join("wallets");
+        fs::create_dir_all(&wallets_dir)
+            .with_context(|| format!("creating wallet directory {}", wallets_dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&wallets_dir, fs::Permissions::from_mode(0o700)).with_context(
+                || {
+                    format!(
+                        "setting permissions on wallet directory {}",
+                        wallets_dir.display()
+                    )
+                },
+            )?;
+        }
         let coinstats_unclean_startup = config.coinstatsindex && config.pid_path.exists();
         let lock_path = network_datadir.join(".lock");
         let data_dir_lock = OpenOptions::new()
@@ -7251,6 +7285,35 @@ mod tests {
         assert!(Node::open(test_config(directory.path())).is_err());
         drop(node);
         assert!(Node::open(test_config(directory.path())).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_and_wallet_directories_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let network_directory = directory.path().join("regtest");
+        let wallets_directory = network_directory.join("wallets");
+
+        assert_eq!(
+            fs::metadata(network_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(wallets_directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        drop(node);
     }
 
     #[test]

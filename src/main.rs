@@ -27,6 +27,13 @@ use bitcoind_rs::{
 };
 
 fn main() {
+    // Match Core's private data-file default.  This must be set before any
+    // configuration, directory, or log file is created so the process umask
+    // also protects paths opened by the storage and RPC subsystems.
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(0o077);
+    }
     if let Err(error) = run() {
         if error
             .downcast_ref::<bitcoind_rs::CoreStartupError>()

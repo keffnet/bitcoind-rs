@@ -16231,6 +16231,9 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "parameter 'txids' cannot be empty" {
         return -8;
     }
+    if lower == "verbose results cannot contain mempool sequence values." {
+        return -8;
+    }
     if lower == "querying specific block heights requires coinstatsindex" {
         return -8;
     }
@@ -16972,6 +16975,10 @@ mod tests {
             -28
         );
         assert_eq!(rpc_error_code("unknown mode foobar"), -8);
+        assert_eq!(
+            rpc_error_code("Verbose results cannot contain mempool sequence values."),
+            -8
+        );
         assert_eq!(rpc_error_code("mode must be a string"), -3);
         assert_eq!(
             rpc_error_code(

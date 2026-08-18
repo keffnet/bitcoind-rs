@@ -2154,16 +2154,20 @@ impl Node {
             self.reduce_block_stalling_timeout();
         }
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
+            // Core publishes disconnect notifications before it updates the
+            // mempool, while connect notifications follow the mempool
+            // removals caused by the newly active blocks.
+            self.announce_zmq_block_events(&disconnected_blocks, &[]);
             self.reconcile_mempool_after_chain_change(
                 &activated_blocks,
                 &disconnected_blocks,
                 false,
             );
+            self.announce_zmq_block_events(&[], &activated_blocks);
             let _ = self.events.send(tip.clone());
 
             self.log_ipc_wait_cancellation();
 
-            self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
         }
         if self.config.stop_at_height != 0 && tip.height >= self.config.stop_at_height {
@@ -2475,6 +2479,7 @@ impl Node {
             }
         }
         for block in activated_blocks {
+            mempool.remove_conflicts(block);
             mempool.remove_confirmed(block);
             if let Some(pool) = disconnected_pool.as_mut() {
                 pool.remove_for_block(block);
@@ -3374,7 +3379,7 @@ impl Node {
         if !self.config.zmq.is_enabled() || self.zmq_events.receiver_count() == 0 {
             return;
         }
-        for block in disconnected {
+        for block in disconnected.iter().rev() {
             let _ = self
                 .zmq_events
                 .send(zmq::Event::BlockDisconnected(Arc::new(block.clone())));
@@ -3383,6 +3388,13 @@ impl Node {
             let _ = self
                 .zmq_events
                 .send(zmq::Event::BlockConnected(Arc::new(block.clone())));
+        }
+        if (!self.config.zmq.pub_hash_block.is_empty() || !self.config.zmq.pub_raw_block.is_empty())
+            && let Some(block) = connected.last()
+        {
+            let _ = self
+                .zmq_events
+                .send(zmq::Event::BlockTip(Arc::new(block.clone())));
         }
     }
 
@@ -3525,12 +3537,13 @@ impl Node {
             (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
+            self.announce_zmq_block_events(&disconnected_blocks, &[]);
             self.reconcile_mempool_after_chain_change(
                 &activated_blocks,
                 &disconnected_blocks,
                 true,
             );
-            self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
+            self.announce_zmq_block_events(&[], &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
@@ -3563,12 +3576,13 @@ impl Node {
             (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
+            self.announce_zmq_block_events(&disconnected_blocks, &[]);
             self.reconcile_mempool_after_chain_change(
                 &activated_blocks,
                 &disconnected_blocks,
                 false,
             );
-            self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
+            self.announce_zmq_block_events(&[], &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
@@ -3600,12 +3614,13 @@ impl Node {
             (tip, changed, activated_blocks, disconnected_blocks)
         };
         if changed {
+            self.announce_zmq_block_events(&disconnected_blocks, &[]);
             self.reconcile_mempool_after_chain_change(
                 &activated_blocks,
                 &disconnected_blocks,
                 false,
             );
-            self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
+            self.announce_zmq_block_events(&[], &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }

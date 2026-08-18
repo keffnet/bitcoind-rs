@@ -3098,6 +3098,32 @@ impl Mempool {
         self.block_since_last_rolling_fee_bump = true;
     }
 
+    /// Remove mempool transactions that conflict with a newly connected
+    /// block. Core records these removals before the block's confirmed
+    /// transactions advance the mempool sequence, so keep the two operations
+    /// separate from the non-notifying confirmation removals above.
+    pub fn remove_conflicts(&mut self, block: &bitcoin::Block) {
+        let mut conflicts = Vec::new();
+        let mut seen = HashSet::new();
+        for transaction in &block.txdata {
+            let block_txid = transaction.compute_txid();
+            for input in &transaction.input {
+                let Some(txid) = self.spent.get(&input.previous_output).copied() else {
+                    continue;
+                };
+                if txid == block_txid {
+                    continue;
+                }
+                if seen.insert(txid) {
+                    conflicts.push(txid);
+                }
+            }
+        }
+        for txid in conflicts {
+            self.remove_recursive(&txid);
+        }
+    }
+
     pub fn clear_expired(&mut self, now: u64, age: Duration) {
         let cutoff = now.saturating_sub(age.as_secs());
         let expired: Vec<Txid> = self

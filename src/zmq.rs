@@ -31,6 +31,7 @@ pub(crate) enum Event {
     },
     BlockConnected(Arc<Block>),
     BlockDisconnected(Arc<Block>),
+    BlockTip(Arc<Block>),
 }
 
 #[derive(Default)]
@@ -75,14 +76,21 @@ pub(crate) async fn run_with_startup(
     let mut bound = HashSet::new();
     for notification in &notifications {
         if bound.insert(notification.address.clone()) {
-            socket
-                .bind(&notification.address)
-                .await
-                .with_context(|| format!("binding ZMQ publisher {}", notification.address))?;
+            if let Err(error) = socket.bind(&notification.address).await {
+                warn!(
+                    address = %notification.address,
+                    %error,
+                    "unable to bind ZMQ publisher; ignoring endpoint"
+                );
+                bound.remove(&notification.address);
+            }
         }
     }
     if let Some(startup) = startup.as_deref() {
         startup.service_ready();
+    }
+    if bound.is_empty() {
+        return std::future::pending::<Result<()>>().await;
     }
 
     let enabled_hash_tx = !config.pub_hash_tx.is_empty();
@@ -152,24 +160,6 @@ pub(crate) async fn run_with_startup(
                     enabled_raw_tx,
                 )
                 .await?;
-                if enabled_hash_block {
-                    publish(
-                        &mut socket,
-                        &mut sequences,
-                        "hashblock",
-                        display_hash_bytes(block.block_hash()),
-                    )
-                    .await?;
-                }
-                if enabled_raw_block {
-                    publish(
-                        &mut socket,
-                        &mut sequences,
-                        "rawblock",
-                        serialize(block.as_ref()),
-                    )
-                    .await?;
-                }
                 if enabled_sequence {
                     publish_sequence(&mut socket, &mut sequences, block.block_hash(), b'C', None)
                         .await?;
@@ -187,6 +177,26 @@ pub(crate) async fn run_with_startup(
                 if enabled_sequence {
                     publish_sequence(&mut socket, &mut sequences, block.block_hash(), b'D', None)
                         .await?;
+                }
+            }
+            Event::BlockTip(block) => {
+                if enabled_hash_block {
+                    publish(
+                        &mut socket,
+                        &mut sequences,
+                        "hashblock",
+                        display_hash_bytes(block.block_hash()),
+                    )
+                    .await?;
+                }
+                if enabled_raw_block {
+                    publish(
+                        &mut socket,
+                        &mut sequences,
+                        "rawblock",
+                        serialize(block.as_ref()),
+                    )
+                    .await?;
                 }
             }
         }

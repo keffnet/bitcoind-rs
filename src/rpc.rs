@@ -6025,7 +6025,7 @@ async fn wait_for_new_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         if tip.hash != current_tip {
             return Ok(json!({"hash": tip.hash.to_string(), "height": tip.height}));
         }
-        let Some(tip) = receive_chain_event(&mut events, timeout).await? else {
+        let Some(tip) = receive_chain_event(node, &mut events, timeout).await? else {
             return current_tip_json(node);
         };
         if tip.hash != current_tip {
@@ -6043,7 +6043,7 @@ async fn wait_for_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         return Ok(json!({"hash": current_tip.hash.to_string(), "height": current_tip.height}));
     }
     loop {
-        let Some(tip) = receive_chain_event(&mut events, timeout).await? else {
+        let Some(tip) = receive_chain_event(node, &mut events, timeout).await? else {
             return Ok(json!({
                 "hash": current_tip.hash.to_string(),
                 "height": current_tip.height,
@@ -6069,7 +6069,7 @@ async fn wait_for_block_height(node: &Arc<Node>, params: &Value) -> Result<Value
         }));
     }
     loop {
-        let Some(tip) = receive_chain_event(&mut events, timeout).await? else {
+        let Some(tip) = receive_chain_event(node, &mut events, timeout).await? else {
             return Ok(json!({
                 "hash": current_tip.hash.to_string(),
                 "height": current_tip.height,
@@ -6106,17 +6106,24 @@ fn rpc_timeout(params: &Value, index: usize) -> Result<Option<tokio::time::Insta
 }
 
 async fn receive_chain_event(
+    node: &Node,
     events: &mut broadcast::Receiver<chain::ChainTip>,
     deadline: Option<tokio::time::Instant>,
 ) -> Result<Option<chain::ChainTip>> {
     loop {
         let received = if let Some(deadline) = deadline {
-            match tokio::time::timeout_at(deadline, events.recv()).await {
+            match tokio::select! {
+                received = tokio::time::timeout_at(deadline, events.recv()) => received,
+                _ = node.wait_for_shutdown() => return Ok(None),
+            } {
                 Ok(received) => received,
                 Err(_) => return Ok(None),
             }
         } else {
-            events.recv().await
+            tokio::select! {
+                received = events.recv() => received,
+                _ = node.wait_for_shutdown() => return Ok(None),
+            }
         };
         match received {
             Ok(tip) => return Ok(Some(tip)),

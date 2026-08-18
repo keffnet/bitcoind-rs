@@ -1538,9 +1538,8 @@ fn transaction_id_from_pos(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("transaction position out of range"))?;
     let txid = transaction.compute_txid();
     if !include_merkle {
-        // electrs returns the same object envelope in both modes; the
-        // merkle flag only controls whether the proof member is included.
-        return Ok(json!({"tx_hash": txid.to_string()}));
+        // Electrum returns the bare hash unless a merkle proof was requested.
+        return Ok(json!(txid.to_string()));
     }
     let (branch, _, _) = chain
         .merkle_branch_at_height(&txid, height)?
@@ -3237,7 +3236,7 @@ mod tests {
         assert_eq!(merkle["block_height"], 0);
         assert!(transaction_merkle(&node, &json!([txid.to_string(), 1])).is_err());
         let id_from_pos = transaction_id_from_pos(&node, &json!([0, 0, false])).unwrap();
-        assert_eq!(id_from_pos, json!({"tx_hash": txid.to_string()}));
+        assert_eq!(id_from_pos, json!(txid.to_string()));
         let id_from_pos = transaction_id_from_pos(&node, &json!([0, 0, true])).unwrap();
         assert_eq!(id_from_pos["tx_hash"], json!(txid.to_string()));
         assert!(id_from_pos.get("pos").is_none());

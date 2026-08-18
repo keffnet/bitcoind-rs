@@ -1029,6 +1029,11 @@ pub struct Args {
     )]
     pub db_batch_size_bytes: i64,
 
+    /// Simulate a chainstate write crash at the requested one-in-N rate, as
+    /// used by Core's crash-recovery functional test.
+    #[arg(long = "dbcrashratio", value_name = "N", hide = true)]
+    pub db_crash_ratio: Option<u64>,
+
     /// Log modified fee rates while assembling mining templates.
     #[arg(
         long = "printpriority",
@@ -1679,10 +1684,22 @@ pub struct Args {
     )]
     pub stop_after_block_import: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub txindex: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
     pub txospenderindex: bool,
 
     #[arg(
@@ -2563,6 +2580,8 @@ pub struct Config {
     pub max_sig_cache_mib: i64,
     pub db_cache_mib: i64,
     pub db_batch_size_bytes: i64,
+    #[cfg(not(test))]
+    pub db_crash_ratio: Option<u64>,
     pub print_priority: bool,
     pub rpc_doc_check: bool,
     pub accept_stale_fee_estimates: bool,
@@ -3181,10 +3200,11 @@ impl Config {
         } else {
             DEFAULT_MAX_MEMPOOL_MB
         });
-        if max_mempool == 0 {
-            bail!("--maxmempool must be greater than zero");
-        }
-        if max_mempool < 5 {
+        // Core accepts zero as a special value used to disable mempool
+        // memory sharing with the database cache.  The mempool itself keeps
+        // the low-level one-byte floor, so only positive values are subject
+        // to the normal minimum-size check.
+        if max_mempool != 0 && max_mempool < 5 {
             bail!("-maxmempool must be at least 5 MB");
         }
         if args.mempoolexpiry == 0 {
@@ -3336,6 +3356,8 @@ impl Config {
             max_sig_cache_mib: args.max_sig_cache_mib,
             db_cache_mib: args.db_cache_mib,
             db_batch_size_bytes: args.db_batch_size_bytes,
+            #[cfg(not(test))]
+            db_crash_ratio: args.db_crash_ratio,
             print_priority: args.print_priority,
             rpc_doc_check: args.rpc_doc_check,
             accept_stale_fee_estimates: args.accept_stale_fee_estimates,
@@ -3420,7 +3442,11 @@ impl Config {
             accept_nonstd_txn: args.accept_nonstd_txn,
             prune,
             fast_prune: args.fast_prune,
-            reindex: args.reindex,
+            reindex: args.reindex
+                || args
+                    .test_options
+                    .iter()
+                    .any(|option| option == "reindex_after_failure_noninteractive_yes"),
             reindex_chainstate: args.reindex_chainstate,
             load_blocks: args.loadblock,
             stop_after_block_import: args.stop_after_block_import,
@@ -5575,7 +5601,7 @@ mod tests {
             "--maxmempool=0",
         ])
         .unwrap();
-        assert!(Config::from_args(args).is_err());
+        assert_eq!(Config::from_args(args).unwrap().max_mempool_mb, 0);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

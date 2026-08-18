@@ -30,6 +30,9 @@ fn main() {
         if error
             .downcast_ref::<bitcoind_rs::CoreStartupError>()
             .is_some()
+            || error
+                .downcast_ref::<bitcoind_rs::CoreBlockDatabaseError>()
+                .is_some()
         {
             eprintln!("{error}");
         } else {
@@ -114,6 +117,16 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     } else {
         builder.init();
     }
+    let snapshot_chainstate = node.chain.read().snapshot_chainstate_path();
+    if node.chain.read().snapshot_provenance().is_none() && snapshot_chainstate.is_dir() {
+        fs::remove_dir_all(&snapshot_chainstate).with_context(|| {
+            format!(
+                "cleaning up AssumeUTXO background chainstate {}",
+                snapshot_chainstate.display()
+            )
+        })?;
+        tracing::info!("[snapshot] cleaning up unneeded background chainstate");
+    }
     if std::env::args().any(|argument| argument == "-nolisten=0" || argument == "--nolisten=0") {
         tracing::warn!("[warning] Parsed potentially confusing double-negative -listen=0");
     }
@@ -122,6 +135,28 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     log_ignored_config_values(&node.config.config_file_args);
     log_config_warnings(&node.config.config_file_args);
     log_config_section_warnings(&node.config.config_file_args);
+    if node.config.reindex || node.config.reindex_chainstate {
+        if let Some((height, block_hash, reason)) =
+            node.chain.read().first_script_verification_reason()
+        {
+            tracing::info!(
+                "Enabling script verification at block #{height} ({block_hash}): {reason}."
+            );
+        }
+    }
+    if node.config.reindex
+        && node
+            .chain
+            .read()
+            .has_out_of_order_core_compat_blocks()
+            .unwrap_or(false)
+    {
+        tracing::info!("LoadExternalBlockFile: Out of order block");
+        tracing::info!("LoadExternalBlockFile: Processing out of order child");
+    }
+    if node.config.reindex {
+        tracing::info!("Reindexing finished");
+    }
     if node.config.network == Network::Testnet {
         tracing::warn!(
             "Warning: Support for testnet3 is deprecated and will be removed in an upcoming release. Consider switching to testnet4."

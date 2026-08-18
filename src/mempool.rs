@@ -2225,6 +2225,16 @@ impl Mempool {
         check_ephemeral_spends: bool,
         record_sequence: bool,
     ) -> Result<Txid, MempoolError> {
+        // During AssumeUTXO activation the snapshot chainstate serves UTXOs
+        // at its base height while the background chainstate is still lower.
+        // Mempool finality and coinbase maturity must use that serving tip,
+        // otherwise valid snapshot coins appear immature until the block
+        // bodies catch up.
+        let serving_tip = chain.utxo_tip();
+        let serving_height = serving_tip.height;
+        let serving_median_time_past = chain
+            .median_time_past_for_hash(&serving_tip.hash)
+            .unwrap_or_else(|| chain.median_time_past_value());
         let txid = transaction.compute_txid();
         if let Some(error) = self.duplicate_error(&transaction) {
             return Err(error);
@@ -2275,8 +2285,8 @@ impl Mempool {
                     .ok_or(MempoolError::MissingInput(input.previous_output))?;
                 previous_entries.push(crate::chain::UtxoEntry {
                     output: output.clone(),
-                    height: chain.height().saturating_add(1),
-                    median_time_past: chain.median_time_past_value(),
+                    height: serving_height.saturating_add(1),
+                    median_time_past: serving_median_time_past,
                     coinbase: false,
                 });
                 output.clone()
@@ -2284,7 +2294,9 @@ impl Mempool {
                 let entry = chain
                     .utxo(&input.previous_output)
                     .ok_or(MempoolError::MissingInput(input.previous_output))?;
-                if entry.coinbase && chain.height() + 1 < entry.height.saturating_add(100) {
+                if entry.coinbase
+                    && serving_height.saturating_add(1) < entry.height.saturating_add(100)
+                {
                     return Err(MempoolError::PrematureCoinbase);
                 }
                 previous_entries.push(entry.clone());
@@ -2300,8 +2312,8 @@ impl Mempool {
         }
         validation::validate_transaction_finality(
             &transaction,
-            chain.height() + 1,
-            chain.median_time_past_value(),
+            serving_height.saturating_add(1),
+            serving_median_time_past,
             // Core's mempool policy always enforces BIP68 sequence locks. The
             // consensus CSV deployment height only controls block connection;
             // it must not let a pre-activation mempool accept a transaction
@@ -2331,7 +2343,7 @@ impl Mempool {
         }
         let fee_sat = input_total - output_total;
         let script_flags =
-            validation::script_flags_for_block(chain.network, chain.height().saturating_add(1), 0);
+            validation::script_flags_for_block(chain.network, serving_height.saturating_add(1), 0);
         let sigop_cost =
             validation::transaction_sigop_cost(&transaction, &previous_outputs, script_flags)
                 as u64;
@@ -2423,7 +2435,7 @@ impl Mempool {
             fee_sat,
             vsize,
             added_at,
-            height: chain.height(),
+            height: serving_height,
         };
         let wtxid = entry.transaction.compute_wtxid();
         for input in &entry.transaction.input {

@@ -2205,8 +2205,8 @@ fn dispatch_method_for_user(
         }
         "getblockchaininfo" => get_blockchain_info(node),
         "getdeploymentinfo" => get_deployment_info(node, params),
-        "getblockcount" => Ok(json!(node.chain.read().height())),
-        "getbestblockhash" => Ok(json!(node.chain.read().best_hash().to_string())),
+        "getblockcount" => Ok(json!(node.chain.read().utxo_tip().height)),
+        "getbestblockhash" => Ok(json!(node.chain.read().utxo_tip().hash.to_string())),
         "getblockhash" => {
             let height = params
                 .get(0)
@@ -2222,9 +2222,9 @@ fn dispatch_method_for_user(
                 bail!("Block height out of range")
             }
             let height = u32::try_from(height).map_err(|_| anyhow!("Block height out of range"))?;
-            node.chain
-                .read()
-                .block_hash(height)
+            let chain = node.chain.read();
+            chain
+                .ancestor_hash_at_height(&chain.best_header_tip().hash, height)
                 .map(|hash| json!(hash.to_string()))
                 .ok_or_else(|| anyhow!("Block height out of range"))
         }
@@ -2514,7 +2514,10 @@ fn dispatch_method_for_user(
             let network_service = if node.chain.read().is_network_limited() {
                 wire::NODE_NETWORK_LIMITED
             } else {
-                wire::NODE_NETWORK
+                // Core keeps NODE_NETWORK_LIMITED in its advertised service
+                // set even for a full node; it starts with that bit and adds
+                // NODE_NETWORK once historical blocks are available.
+                wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED
             };
             let subversion = if node.config.user_agent_comments.is_empty() {
                 "/bitcoind-rs:0.1.0/".to_owned()
@@ -3307,7 +3310,8 @@ fn get_txout_set_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             chain.utxo_statistics_without_index(include_serialized_hash, include_muhash)
         };
         let disk_size = chain.utxo_disk_size()?;
-        (chain.height(), chain.best_hash(), stats, disk_size)
+        let utxo_tip = chain.utxo_tip();
+        (utxo_tip.height, utxo_tip.hash, stats, disk_size)
     };
     let mut result = json!({
         "height": height,
@@ -4764,9 +4768,9 @@ fn rpc_warnings(node: &Arc<Node>) -> Value {
 
 fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     let chain = node.chain.read();
-    let tip = chain.tip();
+    let tip = chain.utxo_tip();
     let header_tip = chain.best_header_tip();
-    let header = chain.header(tip.height).expect("tip header exists");
+    let header = chain.header_by_hash(&tip.hash).expect("tip header exists");
     let initial_block_download = chain.is_initial_block_download();
     let verification_progress = chain.verification_progress();
     let mut result = json!({
@@ -5116,16 +5120,19 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .transpose()?;
     let chain = node.chain.write();
-    let end_height = if let Some(hash) = requested_hash {
+    let serving_tip = chain.utxo_tip();
+    let (end_height, end_hash) = if let Some(hash) = requested_hash {
         let height = chain
             .block_height_by_hash(&hash)
             .ok_or_else(|| anyhow!("Block not found"))?;
-        if !chain.is_active_block(&hash) {
+        let on_best_header_chain =
+            chain.ancestor_hash_at_height(&chain.best_header_tip().hash, height) == Some(hash);
+        if !chain.is_active_block(&hash) && !on_best_header_chain {
             bail!("Block is not in main chain");
         }
-        height
+        (height, hash)
     } else {
-        chain.height()
+        (serving_tip.height, serving_tip.hash)
     };
     let window = if explicit_window {
         if requested_window < 0
@@ -5140,27 +5147,24 @@ fn get_chain_tx_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .min(end_height.saturating_sub(1))
     };
     let start_height = end_height.saturating_sub(window);
-    let end_hash = chain
-        .block_hash(end_height)
-        .ok_or_else(|| anyhow!("block height out of range"))?;
     let start_hash = chain
-        .block_hash(start_height)
+        .ancestor_hash_at_height(&end_hash, start_height)
         .ok_or_else(|| anyhow!("block height out of range"))?;
-    let txcount = chain.chain_transaction_count(end_height);
+    let txcount = chain.chain_transaction_count_for_hash(&end_hash);
     let window_tx_count = if window > 0 {
         chain
-            .chain_transaction_count(end_height)
-            .zip(chain.chain_transaction_count(start_height))
+            .chain_transaction_count_for_hash(&end_hash)
+            .zip(chain.chain_transaction_count_for_hash(&start_hash))
             .map(|(end, start)| end.saturating_sub(start))
     } else {
         None
     };
     let start_time = chain
-        .header(start_height)
+        .header_by_hash(&start_hash)
         .map(|header| header.time)
         .ok_or_else(|| anyhow!("block height out of range"))?;
     let end_time = chain
-        .header(end_height)
+        .header_by_hash(&end_hash)
         .map(|header| header.time)
         .ok_or_else(|| anyhow!("block height out of range"))?;
     let interval = chain
@@ -5666,7 +5670,24 @@ fn parse_rollback_target(chain: &chain::ChainState, value: &Value) -> Result<Blo
 
 fn load_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let path = snapshot_path(node, &param::<String>(params, 0)?);
-    let (coins_loaded, tip_hash, base_height) = node.chain.write().load_assumeutxo_set(&path)?;
+    if !path.is_file() {
+        bail!("Couldn't open file {} for reading.", path.display());
+    }
+    if !node.mempool.read().is_empty() {
+        bail!("Unable to load UTXO snapshot: Can't activate a snapshot when mempool not empty");
+    }
+    let (coins_loaded, tip_hash, base_height) = node
+        .chain
+        .write()
+        .load_assumeutxo_set(&path)
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.starts_with("Unable to parse metadata:") {
+                anyhow!(message)
+            } else {
+                anyhow!("Unable to load UTXO snapshot: {message}")
+            }
+        })?;
     Ok(json!({
         "coins_loaded": coins_loaded,
         "tip_hash": tip_hash.to_string(),
@@ -13954,6 +13975,7 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let vout = param::<u32>(params, 1)?;
     let include_mempool = optional_bool(params, 2, true, "include_mempool")?;
     let chain = node.chain.read();
+    let utxo_tip = chain.utxo_tip();
     let outpoint = OutPoint::new(txid, vout);
     let mempool = include_mempool.then(|| node.mempool.read());
     if let Some(entry) = chain.utxo(&outpoint) {
@@ -13964,8 +13986,8 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
             return Ok(Value::Null);
         }
         return Ok(json!({
-            "bestblock": chain.best_hash().to_string(),
-            "confirmations": chain.height().saturating_sub(entry.height) + 1,
+            "bestblock": utxo_tip.hash.to_string(),
+            "confirmations": utxo_tip.height.saturating_sub(entry.height) + 1,
             "value": sat_to_btc(entry.output.value.to_sat()),
             "scriptPubKey": script_json_with_network(
                 &entry.output.script_pubkey,
@@ -13982,7 +14004,7 @@ fn get_txout(node: &Arc<Node>, params: &Value) -> Result<Value> {
             && let Some(output) = entry.transaction.output.get(vout as usize)
         {
             return Ok(json!({
-                "bestblock": chain.best_hash().to_string(),
+                "bestblock": utxo_tip.hash.to_string(),
                 "confirmations": 0,
                 "value": sat_to_btc(output.value.to_sat()),
                 "scriptPubKey": script_json_with_network(
@@ -14053,6 +14075,7 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 }
             }
             let chain = node.chain.read();
+            let utxo_tip = chain.utxo_tip();
             let mut unspents = Vec::new();
             let mut total = 0u64;
             let mut scanned_txouts = 0usize;
@@ -14093,7 +14116,7 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
                         .block_hash(entry.height)
                         .map(|hash| hash.to_string())
                         .unwrap_or_default(),
-                    "confirmations": chain.height().saturating_sub(entry.height) + 1,
+                    "confirmations": utxo_tip.height.saturating_sub(entry.height) + 1,
                 }));
             }
             if completed {
@@ -14113,8 +14136,8 @@ fn scan_txout_set(node: &Arc<Node>, params: &Value) -> Result<Value> {
             Ok(json!({
                 "success": completed,
                 "txouts": scanned_txouts,
-                "height": chain.height(),
-                "bestblock": chain.best_hash().to_string(),
+                "height": utxo_tip.height,
+                "bestblock": utxo_tip.hash.to_string(),
                 "unspents": unspents,
                 "total_amount": sat_to_btc(total),
             }))
@@ -14478,7 +14501,7 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
                            snapshot_base: Option<BlockHash>|
      -> Result<Value> {
         let header = chain
-            .header(height)
+            .header_by_hash(&hash)
             .ok_or_else(|| anyhow!("chainstate header is unavailable"))?;
         let mut chainstate = json!({
             "blocks": height,
@@ -14499,18 +14522,22 @@ fn get_chain_states(node: &Arc<Node>) -> Result<Value> {
 
     if let Some((progress_height, progress_hash, snapshot_base, _)) = chain.background_chainstate()
     {
+        let snapshot_tip = chain.utxo_tip();
         chainstates.push(make_chainstate(
             progress_height,
             progress_hash,
             chain.verification_progress_for_height(progress_height, crate::time::unix_time_i64()),
             0,
-            false,
+            true,
             None,
         )?);
         chainstates.push(make_chainstate(
-            tip.height,
-            tip.hash,
-            chain.verification_progress(),
+            snapshot_tip.height,
+            snapshot_tip.hash,
+            chain.verification_progress_for_height(
+                snapshot_tip.height,
+                crate::time::unix_time_i64(),
+            ),
             chain.utxo_bogo_size(),
             false,
             Some(snapshot_base),
@@ -15509,6 +15536,12 @@ fn rpc_error_code(message: &str) -> i32 {
     }
     if lower == "missing transactions" {
         return -22;
+    }
+    if lower.starts_with("unable to parse metadata:") {
+        return -22;
+    }
+    if lower.starts_with("unable to load utxo snapshot:") {
+        return -32603;
     }
     if lower == "parameter 'txids' cannot be empty" {
         return -8;
@@ -22388,7 +22421,7 @@ mod tests {
         let localservices = dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap();
         assert_eq!(
             localservices["localservicesnames"],
-            json!(["NETWORK", "WITNESS", "COMPACT_FILTERS"])
+            json!(["NETWORK", "WITNESS", "COMPACT_FILTERS", "NETWORK_LIMITED"])
         );
         Arc::get_mut(&mut node)
             .unwrap()
@@ -27558,7 +27591,7 @@ mod tests {
         let error = load_txoutset(&node, &json!([path.to_string_lossy()]))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("not supported by this network's AssumeUTXO commitments"));
+        assert!(error.contains("assumeutxo block hash in snapshot metadata not recognized"));
     }
 
     #[test]
@@ -27712,7 +27745,7 @@ mod tests {
         let error = load_txoutset(&node, &json!([path.to_string_lossy()]))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("not supported by this network's AssumeUTXO commitments"));
+        assert!(error.contains("assumeutxo block hash in snapshot metadata not recognized"));
         assert_eq!(node.chain.read().height(), live_height);
 
         let named_path = directory.path().join("historical-utxos-named.snapshot");

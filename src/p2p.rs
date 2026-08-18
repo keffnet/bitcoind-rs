@@ -3517,6 +3517,11 @@ async fn serve_peer_loop(
         )
     };
     if peer_state.connection_type != "private-broadcast" {
+        version.services |= wire::NODE_NETWORK_LIMITED;
+        version.receiver_services |= wire::NODE_NETWORK_LIMITED;
+        version.sender_services |= wire::NODE_NETWORK_LIMITED;
+    }
+    if peer_state.connection_type != "private-broadcast" {
         if let Some(address) = advertised_local_address(node, peer_state, peer_id) {
             version.sender_address = socket_address_bytes(address);
             version.sender_port = address.port();
@@ -4097,13 +4102,16 @@ async fn serve_peer_loop(
                             approximate_best_block_depth(node),
                         );
                         let acceptable = version.services & expected == expected;
+                        let limited_with_witness = version.services
+                            & (wire::NODE_NETWORK_LIMITED | wire::NODE_WITNESS)
+                            == (wire::NODE_NETWORK_LIMITED | wire::NODE_WITNESS);
                         if !acceptable {
                             debug!(
                                 "does not offer the expected services ({:08x} offered, {:08x} expected)",
                                 version.services, expected
                             );
                         }
-                        !acceptable
+                        !acceptable && !limited_with_witness
                     }
                 {
                     anyhow::bail!("peer does not advertise the required services");
@@ -5474,6 +5482,7 @@ async fn serve_peer_loop(
             }
             Message::Block(block) => {
                 let hash = block.header.block_hash();
+                let parent_hash = block.header.prev_blockhash;
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
                 if node
                     .chain
@@ -5526,6 +5535,29 @@ async fn serve_peer_loop(
                     }
                 } else {
                     unsuppress_block_relay(peer_state, hash);
+                }
+                // A headers-first download can receive a later body before
+                // an earlier body from the same bounded request window. Keep
+                // the child indexed, then explicitly pull the missing parent
+                // instead of waiting for a new announcement that may never
+                // arrive.
+                if !accepted {
+                    let parent_body_missing = {
+                        let chain = node.chain.read();
+                        chain.block_height_by_hash(&parent_hash).is_some()
+                            && !chain.store.contains(&parent_hash)
+                    };
+                    if parent_body_missing {
+                        request_full_block(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            peer_services,
+                            parent_hash,
+                        )
+                        .await?;
+                    }
                 }
                 // Keep the completed request marked until after chain-event
                 // relays have observed the accepted block. This prevents a
@@ -6485,6 +6517,37 @@ async fn serve_peer_loop(
             }
             Message::Unknown { .. } => {}
             Message::NotFound(items) => {
+                let missing_blocks = items
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item.kind,
+                            InventoryType::Block
+                                | InventoryType::WitnessBlock
+                                | InventoryType::CompactBlock
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for item in missing_blocks {
+                    // A peer can answer NotFound while it is still catching
+                    // up with the requested header chain. Release the stale
+                    // in-flight marker and retry through the normal bounded
+                    // scheduler; otherwise the missing body is never
+                    // requested again if the peer later receives it.
+                    node.clear_peer_block_request(peer_id, item.hash);
+                    if !node.block_body_was_rejected(&item.hash) {
+                        queue_block_requests(&mut pending_block_requests, [item]);
+                    }
+                }
+                flush_pending_block_requests(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &mut pending_block_requests,
+                )
+                .await?;
                 if let Some(transaction_items) = notfound_transaction_items(&items) {
                     for item in transaction_items {
                         peer_state.tx_requests.lock().remove_inventory(&item);

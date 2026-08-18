@@ -1546,6 +1546,43 @@ impl Node {
             .blocks_dir
             .clone()
             .unwrap_or_else(|| config.datadir.join("blocks"));
+        let blocks_dir_was_present = blocks_dir.is_dir();
+        let network_datadir = if network_data_dir_name(config.network).is_empty() {
+            config.datadir.clone()
+        } else {
+            config.datadir.join(network_data_dir_name(config.network))
+        };
+        let snapshot_chainstate = network_datadir.join("chainstate_snapshot");
+        let snapshot_base_hash_path = snapshot_chainstate.join("base_blockhash");
+        if snapshot_base_hash_path.is_file() {
+            let bytes = fs::read(&snapshot_base_hash_path).with_context(|| {
+                format!(
+                    "reading AssumeUTXO base block hash {}",
+                    snapshot_base_hash_path.display()
+                )
+            })?;
+            let base_hash = bytes
+                .get(..32)
+                .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                .map(BlockHash::from_byte_array)
+                .context("invalid AssumeUTXO base block hash")?;
+            let message =
+                format!("Assumeutxo data not found for the given blockhash '{base_hash}'.");
+            if let Some(parent) = config.debug_log_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut debug_log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&config.debug_log_path)
+                .with_context(|| {
+                    format!("opening debug log {}", config.debug_log_path.display())
+                })?;
+            writeln!(debug_log, "{message}")?;
+            return Err(anyhow!(
+                "A fatal internal error occurred, see debug.log for details: {message}"
+            ));
+        }
         if config.blocks_dir_explicit && !blocks_dir.is_dir() {
             bail!(
                 "Specified blocks directory \"{}\" does not exist.",
@@ -1565,6 +1602,17 @@ impl Node {
         } else {
             core_network_blocks_dir(&config.datadir, config.network)
         };
+        let core_block_index_missing = core_blocks_dir.as_ref().is_some_and(|directory| {
+            !directory.join("index").exists()
+                && fs::read_dir(directory).is_ok_and(|entries| {
+                    entries
+                        .flatten()
+                        .any(|entry| entry.file_name().to_string_lossy().starts_with("blk"))
+                })
+        });
+        if core_block_index_missing && !config.reindex && !config.reindex_chainstate {
+            return Err(CoreBlockDatabaseError.into());
+        }
         if let Some(core_blocks_dir) = core_blocks_dir.as_ref() {
             fs::create_dir_all(&core_blocks_dir).with_context(|| {
                 format!(
@@ -1668,11 +1716,6 @@ impl Node {
         let deployment_parameters = config
             .deployment_parameters
             .unwrap_or_else(|| validation::DeploymentParameters::for_network(config.network));
-        let network_datadir = if network_data_dir_name(config.network).is_empty() {
-            config.datadir.clone()
-        } else {
-            config.datadir.join(network_data_dir_name(config.network))
-        };
         let chain_blocks_dir = if config.blocks_dir_explicit {
             if let Some(network_name) = (!network_data_dir_name(config.network).is_empty())
                 .then_some(network_data_dir_name(config.network))
@@ -1687,10 +1730,36 @@ impl Node {
             core_network_blocks_dir(&config.datadir, config.network)
                 .unwrap_or_else(|| blocks_dir.clone())
         };
-        let chain_data_dir = if matches!(config.network, Network::Bitcoin | Network::Regtest) {
-            config.datadir.clone()
+        // Core's pruned reindex starts a fresh flat-file sequence after the
+        // historical files have been discarded. The authoritative append-only
+        // store remains intact here; only the public blk/rev compatibility
+        // files are reset so the next genesis/body append uses index 00000.
+        if config.reindex && config.prune != 0 {
+            for entry in fs::read_dir(&chain_blocks_dir)? {
+                let entry = entry?;
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                let file_name_bytes = file_name.as_bytes();
+                let is_core_compat = (file_name.starts_with("blk") || file_name.starts_with("rev"))
+                    && file_name.ends_with(".dat")
+                    && file_name_bytes.len() == 12
+                    && file_name_bytes[3..8]
+                        .iter()
+                        .all(|byte| byte.is_ascii_digit());
+                if is_core_compat {
+                    fs::remove_file(entry.path())?;
+                }
+            }
+        }
+        let legacy_chain_data_dir = config.datadir.clone();
+        let network_chain_data_dir = network_datadir.clone();
+        let use_network_chain_data = !network_data_dir_name(config.network).is_empty()
+            && (network_chain_data_dir.join("chainstate.bin").exists()
+                || (legacy_chain_data_dir.join("chainstate.bin").exists()
+                    && !blocks_dir_was_present));
+        let chain_data_dir = if use_network_chain_data {
+            network_chain_data_dir
         } else {
-            network_datadir.clone()
+            legacy_chain_data_dir
         };
         let coinstats_clean_shutdown_height_path = chain_data_dir
             .join("indexes/coinstatsindex")
@@ -1716,18 +1785,36 @@ impl Node {
             )
             .map_err(core_startup_chain_error)?;
 
+        // Core places chainstate beneath the per-network directory. The
+        // append-only backend keeps its authoritative state at the datadir
+        // root for historical compatibility, so expose the network-relative
+        // path as a symlink for tooling that inspects or replaces it.
+        #[cfg(unix)]
+        if !network_data_dir_name(config.network).is_empty() {
+            let compatibility_chainstate = network_datadir.join("chainstate");
+            if fs::symlink_metadata(&compatibility_chainstate).is_err() {
+                std::os::unix::fs::symlink("../chainstate", &compatibility_chainstate)
+                    .with_context(|| {
+                        format!(
+                            "creating Core-compatible chainstate link {}",
+                            compatibility_chainstate.display()
+                        )
+                    })?;
+            }
+        }
+
         // Core creates the first flat block/undo files at startup. The chain
         // store appends exact Core-framed records to them as bodies arrive;
         // create only the initial pair here so linearize/loadblock sees no
         // spurious empty file after the first rotation.
         if let Some(core_blocks_dir) = core_blocks_dir.as_ref()
-            && !chain.is_pruned()
+            && (!chain.is_pruned() || (config.reindex && config.prune != 0))
         {
             for file_name in ["blk00000.dat", "rev00000.dat"] {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(core_blocks_dir.join(file_name))?;
+                let path = core_blocks_dir.join(file_name);
+                if !path.exists() {
+                    OpenOptions::new().create(true).append(true).open(path)?;
+                }
             }
         }
         let block_store_reader = chain.block_store_reader();
@@ -1736,6 +1823,10 @@ impl Node {
         chain.configure_script_cache_size_mib(config.max_sig_cache_mib);
         chain.configure_storage_cache_size_mib(config.db_cache_mib);
         chain.configure_storage_batch_size_bytes(config.db_batch_size_bytes);
+        #[cfg(not(test))]
+        chain.configure_storage_crash_ratio(config.db_crash_ratio);
+        #[cfg(not(test))]
+        chain.maybe_simulate_storage_recovery_crash()?;
         chain.configure_prune_after_height(config.network, config.fast_prune);
         chain.configure_pruning(config.prune)?;
         if !config.reindex && !config.reindex_chainstate {
@@ -6660,6 +6751,22 @@ impl std::fmt::Display for CoreStartupError {
 }
 
 impl std::error::Error for CoreStartupError {}
+
+/// Startup failure used when Core's block-index database is missing.  This
+/// has its own display type because Core prints this recovery hint without
+/// the generic `Error: ` prefix used for ordinary startup failures.
+#[derive(Debug)]
+pub struct CoreBlockDatabaseError;
+
+impl std::fmt::Display for CoreBlockDatabaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "Error initializing block database.\nPlease restart with -reindex or -reindex-chainstate to recover.",
+        )
+    }
+}
+
+impl std::error::Error for CoreBlockDatabaseError {}
 
 fn core_startup_chain_error(error: anyhow::Error) -> anyhow::Error {
     if error

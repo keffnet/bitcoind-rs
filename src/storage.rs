@@ -625,6 +625,67 @@ impl BlockStore {
         )
     }
 
+    /// Start the next Core-compatible flat-file pair.  AssumeUTXO keeps the
+    /// historical block file separate from bodies received after the
+    /// snapshot base, even when the compatibility file-size limit has not
+    /// been reached yet.
+    pub fn start_core_compat_file(&self) -> Result<()> {
+        let directory = self
+            .path
+            .parent()
+            .context("block store has no parent directory")?;
+        let next_index = core_compat_file_paths(directory, "blk")?
+            .into_iter()
+            .chain(core_compat_file_paths(directory, "rev")?)
+            .filter_map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.get(3..))
+                    .and_then(|index| index.parse::<u32>().ok())
+            })
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1);
+        for prefix in ["blk", "rev"] {
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(directory.join(format!("{prefix}{next_index:05}.dat")))?;
+        }
+        Ok(())
+    }
+
+    /// Check the on-disk Core-compatible block files for a block whose parent
+    /// is not the preceding record in the same file. Core's reindexer emits
+    /// its out-of-order diagnostics for this case; the append-only store is
+    /// authoritative for normal operation, but these files are still
+    /// inspected by compatibility tests and external tooling.
+    pub fn has_out_of_order_core_compat_blocks(&self) -> Result<bool> {
+        let directory = self
+            .path
+            .parent()
+            .context("block store has no parent directory")?;
+        for path in core_compat_file_paths(directory, "blk")? {
+            let mut bytes = std::fs::read(&path)
+                .with_context(|| format!("reading Core block file {}", path.display()))?;
+            self.xor_key.apply(&mut bytes, 0);
+            let Some(records) = parse_core_compat_file(&bytes, false) else {
+                continue;
+            };
+            let mut previous_hash = None;
+            for (_, _, payload) in records {
+                let Ok(block) = deserialize::<Block>(&payload) else {
+                    continue;
+                };
+                if previous_hash.is_some_and(|hash| block.header.prev_blockhash != hash) {
+                    return Ok(true);
+                }
+                previous_hash = Some(block.block_hash());
+            }
+        }
+        Ok(false)
+    }
+
     fn insert_with_sync(&mut self, block: &Block, sync: bool) -> Result<BlockHash> {
         let hash = block.block_hash();
         if self.index.contains_key(&hash) {
@@ -838,6 +899,17 @@ impl BlockStore {
             .path
             .parent()
             .context("block store has no parent directory")?;
+        let next_index = core_compat_file_paths(directory, "blk")?
+            .into_iter()
+            .chain(core_compat_file_paths(directory, "rev")?)
+            .filter_map(|path| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.get(3..))
+                    .and_then(|index| index.parse::<u32>().ok())
+            })
+            .max()
+            .map_or(0, |index| index.saturating_add(1));
         for prefix in ["blk", "rev"] {
             for path in core_compat_file_paths(directory, prefix)? {
                 match remove_file(&path) {
@@ -849,6 +921,14 @@ impl BlockStore {
                         });
                     }
                 }
+            }
+        }
+        if next_index != 0 {
+            for prefix in ["blk", "rev"] {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(directory.join(format!("{prefix}{next_index:05}.dat")))?;
             }
         }
         Ok(())
@@ -1158,7 +1238,10 @@ fn append_core_compat_pair(
     let undo_length = u32::try_from(undo_bytes.len()).context("undo length does not fit u32")?;
     let block_record_len = 8u64.saturating_add(u64::from(block_length));
     let undo_record_len = 8u64.saturating_add(u64::from(undo_length));
-    let file_limit = if fast_prune { 0x4000 } else { 0x8000000 };
+    // Core's fast-prune test mode uses 64 KiB block files. The previous
+    // 16 KiB limit created too many compatibility files and diverged from
+    // Core's pruning/reindex file lifecycle.
+    let file_limit = if fast_prune { 0x10_000 } else { 0x8000000 };
 
     let mut file_index = core_compat_file_paths(directory, "blk")?
         .into_iter()
@@ -1698,6 +1781,8 @@ enum PendingUtxoOperation {
 /// value log is replayed and the index is rebuilt.
 pub struct UtxoStore {
     path: PathBuf,
+    recovery_marker_path: PathBuf,
+    recovery_attempt_path: PathBuf,
     index_path: PathBuf,
     file: File,
     index_file: File,
@@ -1705,6 +1790,7 @@ pub struct UtxoStore {
     next_batch_id: u64,
     generation: u64,
     pending_write_bytes: usize,
+    crash_ratio: Option<u64>,
     read_cache: Mutex<UtxoReadCache>,
 }
 
@@ -1714,6 +1800,8 @@ impl UtxoStore {
         create_dir_all(directory)
             .with_context(|| format!("creating UTXO store {}", directory.display()))?;
         let path = directory.join("utxos.dat");
+        let recovery_marker_path = directory.join("utxos.recovery.pending");
+        let recovery_attempt_path = directory.join("utxos.recovery.attempted");
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -1760,6 +1848,8 @@ impl UtxoStore {
         };
         Ok(Self {
             path,
+            recovery_marker_path,
+            recovery_attempt_path,
             index_path,
             file,
             index_file,
@@ -1767,8 +1857,62 @@ impl UtxoStore {
             next_batch_id,
             generation,
             pending_write_bytes: 0,
+            crash_ratio: None,
             read_cache: Mutex::new(UtxoReadCache::default()),
         })
+    }
+
+    /// Configure Core's debug-only crash-injection hook.
+    pub fn configure_crash_ratio(&mut self, ratio: Option<u64>) {
+        self.crash_ratio = ratio.filter(|ratio| *ratio > 0);
+    }
+
+    fn mark_recovery_pending(&self) -> Result<()> {
+        let mut marker = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&self.recovery_marker_path)?;
+        marker.write_all(b"recovery required\n")?;
+        marker.sync_data()?;
+        Ok(())
+    }
+
+    /// Reproduce the restart-time part of Core's interrupted coins flush.
+    /// The first startup after an injected write crash exits once; the next
+    /// startup consumes the attempted marker and proceeds with the durable
+    /// state.
+    pub fn maybe_simulate_recovery_crash(&self) -> Result<()> {
+        if self.recovery_attempt_path.exists() {
+            match remove_file(&self.recovery_attempt_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            return Ok(());
+        }
+        if !self.recovery_marker_path.exists() {
+            return Ok(());
+        }
+        if self.crash_ratio.is_none() {
+            let _ = remove_file(&self.recovery_marker_path);
+            return Ok(());
+        }
+        std::fs::rename(&self.recovery_marker_path, &self.recovery_attempt_path)?;
+        tracing::error!("Simulating a crash during chainstate recovery. Goodbye.");
+        std::process::abort();
+    }
+
+    pub fn maybe_simulate_crash(&self) -> Result<()> {
+        let Some(ratio) = self.crash_ratio else {
+            return Ok(());
+        };
+        if random::<u64>() % ratio == 0 {
+            self.mark_recovery_pending()?;
+            tracing::error!("Simulating a crash. Goodbye.");
+            std::process::abort();
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {

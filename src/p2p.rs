@@ -4158,7 +4158,9 @@ async fn serve_peer_loop(
                     }
                     continue;
                 };
-                short_pong = bytes == 24 && matches!(&message, Message::Pong(0));
+                // An empty legacy PONG is a 24-byte frame; BIP324 carries the
+                // one-byte PONG type in a 21-byte accounted packet.
+                short_pong = matches!(&message, Message::Pong(0)) && (bytes == 24 || bytes == 21);
                 if let Some((command, count)) = oversized_vector_message(&message) {
                     debug!("Misbehaving peer={peer_id}: {command} message size = {count}");
                     anyhow::bail!("{command} message size = {count}");

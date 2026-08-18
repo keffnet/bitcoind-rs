@@ -12746,6 +12746,8 @@ fn get_orphan_transactions(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     "bytes": serialize(&transaction).len(),
                     "vsize": transaction.vsize(),
                     "weight": transaction.weight().to_wu(),
+                    "entry": orphan.entry_time,
+                    "expiration": orphan.expiration_time,
                     "from": orphan.peer_ids,
                 });
                 if verbosity == 2 {
@@ -16806,7 +16808,9 @@ mod tests {
         let transaction = proof_transaction(7);
         let txid = transaction.compute_txid().to_string();
         let raw = hex::encode(serialize(&transaction));
+        let before_entry = crate::time::unix_time();
         assert!(node.accept_peer_transaction_from(42, transaction).is_err());
+        let after_entry = crate::time::unix_time();
 
         assert_eq!(
             dispatch_method(&node, "getorphantxs", &json!([])).unwrap(),
@@ -16818,6 +16822,12 @@ mod tests {
         assert!(verbose[0]["bytes"].as_u64().unwrap() > 0);
         assert!(verbose[0]["vsize"].as_u64().unwrap() > 0);
         assert!(verbose[0]["weight"].as_u64().unwrap() > 0);
+        let entry = verbose[0]["entry"].as_u64().unwrap();
+        assert!((before_entry..=after_entry).contains(&entry));
+        assert_eq!(
+            verbose[0]["expiration"],
+            json!(entry.saturating_add(20 * 60))
+        );
         let detailed = dispatch_method(&node, "getorphantxs", &json!([2])).unwrap();
         assert_eq!(detailed[0]["hex"], raw);
         assert!(dispatch_method(&node, "getorphantxs", &json!([3])).is_err());

@@ -719,7 +719,11 @@ fn outbound_target_reached(
 
 struct OrphanEntry {
     transaction: Transaction,
-    added_at: Instant,
+    // Core records orphan entry and expiration timestamps against its node
+    // clock, including regtest mocktime. Keep the wall-clock Instant out of
+    // the authoritative timestamp so getorphantxs and expiration move with
+    // setmocktime.
+    added_at: u64,
     announcers: HashSet<usize>,
 }
 
@@ -735,7 +739,7 @@ impl OrphanPool {
         let announcers = peer_id.into_iter().collect();
         self.add_entry(OrphanEntry {
             transaction,
-            added_at: Instant::now(),
+            added_at: crate::time::unix_time(),
             announcers,
         })
     }
@@ -750,7 +754,10 @@ impl OrphanPool {
             return false;
         }
         if entry.transaction.weight().to_wu() > MAX_ORPHAN_TRANSACTION_WEIGHT
-            || entry.added_at.elapsed() >= ORPHAN_TRANSACTION_EXPIRY
+            || entry
+                .added_at
+                .saturating_add(ORPHAN_TRANSACTION_EXPIRY.as_secs())
+                <= crate::time::unix_time()
         {
             return false;
         }
@@ -915,6 +922,10 @@ impl OrphanPool {
                 OrphanTransaction {
                     transaction: entry.transaction.clone(),
                     peer_ids,
+                    entry_time: entry.added_at,
+                    expiration_time: entry
+                        .added_at
+                        .saturating_add(ORPHAN_TRANSACTION_EXPIRY.as_secs()),
                 }
             })
             .collect::<Vec<_>>();
@@ -973,10 +984,13 @@ impl OrphanPool {
     }
 
     fn prune_expired(&mut self) {
-        let now = Instant::now();
+        let now = crate::time::unix_time();
         while let Some(txid) = self.insertion_order.front().copied() {
             let expired = self.entries.get(&txid).is_none_or(|entry| {
-                now.duration_since(entry.added_at) >= ORPHAN_TRANSACTION_EXPIRY
+                entry
+                    .added_at
+                    .saturating_add(ORPHAN_TRANSACTION_EXPIRY.as_secs())
+                    <= now
             });
             if !expired {
                 break;
@@ -1106,6 +1120,8 @@ struct NodeWarning {
 pub struct OrphanTransaction {
     pub transaction: Transaction,
     pub peer_ids: Vec<usize>,
+    pub entry_time: u64,
+    pub expiration_time: u64,
 }
 
 #[derive(Clone, Debug)]

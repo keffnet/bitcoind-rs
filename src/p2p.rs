@@ -89,11 +89,11 @@ type PeerWriter = Arc<Mutex<PeerWriterKind>>;
 
 const BIP324_ELLIGATOR_SWIFT_BYTES: usize = 64;
 const BIP324_GARBAGE_TERMINATOR_BYTES: usize = 16;
-// Core limits the application payload to 4,000,000 bytes, but a BIP324
-// extension command adds one type marker and twelve command bytes before the
-// payload. The reader's length includes the three-byte length descriptor and
-// sixteen-byte authentication tag as well.
-const BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION: usize = wire::MAX_MESSAGE_SIZE + 1 + 12 + 3 + 16;
+// Core limits the BIP324 contents to one type marker, twelve command bytes,
+// and a 4,000,000-byte application payload. V2Reader's packet length excludes
+// the three-byte encrypted length descriptor but includes the one-byte packet
+// header and sixteen-byte authentication tag.
+const BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION: usize = wire::MAX_MESSAGE_SIZE + 1 + 12 + 1 + 16;
 
 struct V2BufferedReader {
     reader: BufReader<OwnedReadHalf>,
@@ -175,7 +175,7 @@ impl V2Reader {
         }
     }
 
-    async fn read(&mut self) -> Result<V2Payload> {
+    async fn read(&mut self, on_bytes: &mut impl FnMut(usize)) -> Result<V2Payload> {
         while self.length_read < NUM_LENGTH_BYTES {
             let count = self
                 .reader
@@ -184,12 +184,15 @@ impl V2Reader {
             if count == 0 {
                 bail!("peer closed the BIP324 transport");
             }
+            on_bytes(count);
             self.length_read += count;
         }
 
         let packet_len = self.cipher.decrypt_packet_len(self.length_bytes);
         if packet_len > BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION {
-            bail!("BIP324 packet exceeds the allocation limit");
+            let contents_len = packet_len.saturating_sub(1 + 16);
+            debug!("V2 transport error: packet too large ({contents_len} bytes)");
+            bail!("BIP324 packet too large ({contents_len} bytes)");
         }
         self.packet_bytes.resize(packet_len, 0);
         while self.packet_read < packet_len {
@@ -200,6 +203,7 @@ impl V2Reader {
             if count == 0 {
                 bail!("peer closed the BIP324 transport");
             }
+            on_bytes(count);
             self.packet_read += count;
         }
 
@@ -1658,18 +1662,41 @@ impl PeerReader {
                 Ok((message, bytes, true))
             }
             Self::V2(reader) => loop {
-                let payload = reader.read().await?;
+                let payload = reader.read(on_bytes).await?;
                 if payload.packet_type() == PacketType::Decoy {
                     continue;
                 }
                 let contents = payload.contents();
                 let bytes = contents.len().saturating_add(20);
                 if !wire::v2_message_type_is_valid(contents) {
-                    break Ok((None, bytes, false));
+                    debug!("V2 transport error: invalid message type");
+                    break Ok((None, bytes, true));
                 }
                 match wire::decode_v2_message(contents) {
-                    Ok(message) => break Ok((Some(message), bytes, false)),
+                    Ok(message) => break Ok((Some(message), bytes, true)),
                     Err(error) => {
+                        if let Some((command, count)) = oversized_v2_locator_message(contents) {
+                            debug!("{command} locator size = {count}");
+                            anyhow::bail!("{command} locator size = {count}");
+                        }
+                        if let Some((command, count)) = oversized_v2_vector_message(contents) {
+                            debug!("Misbehaving: {command} message size = {count}");
+                            anyhow::bail!("{command} message size = {count}");
+                        }
+                        if let Some((command, count)) = oversized_v2_address_message(contents) {
+                            debug!("{command} message size = {count}");
+                            anyhow::bail!("{command} message size = {count}");
+                        }
+                        if let Some(command) = v2_address_command(contents) {
+                            break Ok((
+                                Some(Message::Unknown {
+                                    command: command.to_owned(),
+                                    payload: contents.get(1..).unwrap_or_default().to_vec(),
+                                }),
+                                bytes,
+                                true,
+                            ));
+                        }
                         // Core catches payload deserialization exceptions in
                         // ProcessMessage after BIP324 has already authenticated
                         // and framed the packet. Discard the malformed message
@@ -1679,7 +1706,7 @@ impl PeerReader {
                         } else {
                             debug!(%error, "discarding malformed BIP324 application message");
                         }
-                        break Ok((None, bytes, false));
+                        break Ok((None, bytes, true));
                     }
                 }
             },
@@ -3634,7 +3661,9 @@ async fn establish_v2_with_accounting(
         session_reader.read_exact(&mut length_bytes).await?;
         let packet_len = handshake.decrypt_packet_len(length_bytes)?;
         if packet_len > BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION {
-            bail!("BIP324 packet exceeds the allocation limit");
+            let contents_len = packet_len.saturating_sub(1 + 16);
+            debug!("V2 transport error: packet too large ({contents_len} bytes)");
+            bail!("BIP324 packet too large ({contents_len} bytes)");
         }
         let mut packet_bytes = vec![0; packet_len];
         session_reader.read_exact(&mut packet_bytes).await?;
@@ -8410,38 +8439,71 @@ fn oversized_address_message(message: &Message) -> Option<(&str, usize)> {
     let Message::Unknown { command, payload } = message else {
         return None;
     };
+    oversized_address_payload(command, payload)
+}
+
+fn oversized_v2_address_message(payload: &[u8]) -> Option<(&'static str, usize)> {
+    let command = v2_address_command(payload)?;
+    oversized_address_payload(command, payload.get(1..)?).map(|(_, count)| (command, count))
+}
+
+fn v2_address_command(payload: &[u8]) -> Option<&'static str> {
+    match payload.first().copied() {
+        Some(1) => Some("addr"),
+        Some(28) => Some("addrv2"),
+        _ => None,
+    }
+}
+
+fn oversized_address_payload<'a>(command: &'a str, payload: &[u8]) -> Option<(&'a str, usize)> {
     if command != "addr" && command != "addrv2" {
         return None;
     }
-    let first = *payload.first()?;
-    let (count, _) = match first {
-        0..=252 => (u64::from(first), 1),
-        253 => (
-            u64::from(u16::from_le_bytes(payload.get(1..3)?.try_into().ok()?)),
-            3,
-        ),
-        254 => (
-            u64::from(u32::from_le_bytes(payload.get(1..5)?.try_into().ok()?)),
-            5,
-        ),
-        255 => (u64::from_le_bytes(payload.get(1..9)?.try_into().ok()?), 9),
-    };
+    let mut cursor = 0;
+    let count = read_compact_size_from_slice(payload, &mut cursor)?;
     let count = usize::try_from(count).ok()?;
-    address_message_is_oversized(count).then_some((command.as_str(), count))
+    address_message_is_oversized(count).then_some((command, count))
 }
 
 fn oversized_vector_message(message: &Message) -> Option<(&str, usize)> {
     let Message::Unknown { command, payload } = message else {
         return None;
     };
-    let limit = match command.as_str() {
+    oversized_vector_payload(command, payload)
+}
+
+fn oversized_v2_vector_message(payload: &[u8]) -> Option<(&'static str, usize)> {
+    let command = match payload.first().copied() {
+        Some(11) => "getdata",
+        Some(13) => "headers",
+        Some(14) => "inv",
+        _ => return None,
+    };
+    oversized_vector_payload(command, payload.get(1..)?).map(|(_, count)| (command, count))
+}
+
+fn oversized_v2_locator_message(payload: &[u8]) -> Option<(&'static str, usize)> {
+    let command = match payload.first().copied() {
+        Some(9) => "getblocks",
+        Some(12) => "getheaders",
+        _ => return None,
+    };
+    let locator_payload = payload.get(1 + std::mem::size_of::<i32>()..)?;
+    let mut cursor = 0;
+    let count =
+        usize::try_from(read_compact_size_from_slice(locator_payload, &mut cursor)?).ok()?;
+    (count > wire::MAX_LOCATOR_HASHES).then_some((command, count))
+}
+
+fn oversized_vector_payload<'a>(command: &'a str, payload: &[u8]) -> Option<(&'a str, usize)> {
+    let limit = match command {
         "inv" | "getdata" => 50_000,
         "headers" => 2_000,
         _ => return None,
     };
     let mut cursor = 0;
     let count = usize::try_from(read_compact_size_from_slice(payload, &mut cursor)?).ok()?;
-    (count > limit).then_some((command.as_str(), count))
+    (count > limit).then_some((command, count))
 }
 
 fn oversized_addrv2_address_length(payload: &[u8]) -> Option<usize> {
@@ -11905,6 +11967,24 @@ mod tests {
     }
 
     #[test]
+    fn oversized_v2_locators_are_detected_before_payload_decoding() {
+        let mut within_limit = vec![12, 0, 0, 0, 0, wire::MAX_LOCATOR_HASHES as u8];
+        assert_eq!(oversized_v2_locator_message(&within_limit), None);
+
+        within_limit[5] = (wire::MAX_LOCATOR_HASHES + 1) as u8;
+        assert_eq!(
+            oversized_v2_locator_message(&within_limit),
+            Some(("getheaders", wire::MAX_LOCATOR_HASHES + 1))
+        );
+
+        within_limit[0] = 9;
+        assert_eq!(
+            oversized_v2_locator_message(&within_limit),
+            Some(("getblocks", wire::MAX_LOCATOR_HASHES + 1))
+        );
+    }
+
+    #[test]
     fn getaddr_response_matches_core_percentage_limit() {
         assert_eq!(getaddr_response_limit(0), 0);
         assert_eq!(getaddr_response_limit(4), 0);
@@ -13249,7 +13329,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        let payload = server_reader.read().await.unwrap();
+        let mut on_bytes = |_count: usize| {};
+        let payload = server_reader.read(&mut on_bytes).await.unwrap();
         assert_eq!(
             wire::decode_v2_message(payload.contents()).unwrap(),
             client_message
@@ -13262,7 +13343,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        let payload = client_reader.read().await.unwrap();
+        let mut on_bytes = |_count: usize| {};
+        let payload = client_reader.read(&mut on_bytes).await.unwrap();
         assert_eq!(
             wire::decode_v2_message(payload.contents()).unwrap(),
             server_message

@@ -23,7 +23,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 pub const MAX_MESSAGE_SIZE: usize = 4_000_000;
 const HEADER_SIZE: usize = 24;
 const MAX_INVENTORY_ITEMS: usize = 50_000;
-const MAX_LOCATOR_HASHES: usize = 101;
+pub(crate) const MAX_LOCATOR_HASHES: usize = 101;
 const MAX_USER_AGENT_LENGTH: usize = 256;
 
 pub const NODE_NETWORK: u64 = 1;

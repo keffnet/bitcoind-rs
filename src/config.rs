@@ -3309,7 +3309,7 @@ impl Config {
                 character.is_ascii_alphanumeric() || " .,;-_?@".contains(character)
             })
         }) {
-            bail!("user agent comment contains unsafe characters: {comment}");
+            bail!("User Agent comment ({comment}) contains unsafe characters.");
         }
         let comments = user_agent_comments.join("; ");
         let user_agent_length = "/bitcoind-rs:0.1.0/".len()
@@ -3320,7 +3320,7 @@ impl Config {
             };
         if user_agent_length > MAX_SUBVERSION_LENGTH {
             bail!(
-                "total user agent length {user_agent_length} exceeds maximum {MAX_SUBVERSION_LENGTH}"
+                "Total length of network version string ({user_agent_length}) exceeds maximum length ({MAX_SUBVERSION_LENGTH}). Reduce the number or size of uacomments."
             );
         }
         std::fs::create_dir_all(&args.datadir)

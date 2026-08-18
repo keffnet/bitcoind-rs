@@ -49,9 +49,7 @@ use tracing::{debug, info, warn};
 
 use crate::address::NetworkEndpoint;
 use crate::chain;
-use crate::config::{
-    OnlyNet, RpcAuth, core_network_blocks_dir, default_network_endpoint_port, network_data_dir_name,
-};
+use crate::config::{OnlyNet, RpcAuth, default_network_endpoint_port, network_data_dir_name};
 use crate::fee_estimator::{EstimatorBucket, RawFeeEstimate};
 use crate::mempool::{
     MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool, MempoolError, MempoolLoadOptions,
@@ -1030,13 +1028,6 @@ fn rest_block(
         .ok_or_else(|| anyhow!("invalid block path"))?;
     let hash = parse_rest_block_hash(hash_text)?;
     let mut chain = node.chain.write();
-    if !chain.is_pruned()
-        && chain.is_active_block(&hash)
-        && core_network_blocks_dir(&node.config.datadir, node.config.network)
-            .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
-    {
-        bail!("I/O error reading {hash}")
-    }
     let block = match chain.block(&hash)? {
         Some(block) => block,
         None if chain.block_height_by_hash(&hash).is_some() => {
@@ -1102,13 +1093,6 @@ fn rest_block_part(
         bail!("block part offset/size is outside the block")
     }
     let mut chain = node.chain.write();
-    if !chain.is_pruned()
-        && chain.is_active_block(&hash)
-        && core_network_blocks_dir(&node.config.datadir, node.config.network)
-            .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
-    {
-        bail!("I/O error reading {hash}")
-    }
     let bytes = match chain.block(&hash)? {
         Some(block) => block,
         None if chain.block_height_by_hash(&hash).is_some() => {
@@ -2225,7 +2209,7 @@ fn dispatch_method_for_user(
             let height = u32::try_from(height).map_err(|_| anyhow!("Block height out of range"))?;
             let chain = node.chain.read();
             chain
-                .ancestor_hash_at_height(&chain.best_header_tip().hash, height)
+                .block_hash(height)
                 .map(|hash| json!(hash.to_string()))
                 .ok_or_else(|| anyhow!("Block height out of range"))
         }
@@ -5364,13 +5348,6 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = chain
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
-    if !chain.is_pruned()
-        && chain.is_active_block(&hash)
-        && core_network_blocks_dir(&node.config.datadir, node.config.network)
-            .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
-    {
-        bail!("Block not found on disk");
-    }
     let block = chain
         .block(&hash)?
         .ok_or_else(|| missing_block_data_error(&chain, &hash))?;
@@ -5383,15 +5360,6 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         -1
     };
     let undo = if verbosity >= 2 {
-        if !chain.is_pruned()
-            && chain.is_active_block(&hash)
-            && core_network_blocks_dir(&node.config.datadir, node.config.network)
-                .is_some_and(|directory| !directory.join("rev00000.dat").is_file())
-        {
-            bail!(
-                "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event."
-            );
-        }
         chain.spent_outputs_by_transaction(&hash)?
     } else {
         None
@@ -5599,15 +5567,6 @@ fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }
     };
     if let Some(target) = target {
-        // The Core-compatible reverse block files are also the observable
-        // rollback prerequisite.  The functional suite deliberately removes
-        // one of them to ensure a failed rollback does not suspend the node.
-        if !node.chain.read().is_pruned()
-            && core_network_blocks_dir(&node.config.datadir, node.config.network)
-                .is_some_and(|directory| !directory.join("rev00000.dat").is_file())
-        {
-            bail!("Could not roll back to requested height.")
-        }
         let (coins_written, base_hash, base_height, txoutset_hash, nchaintx) = node
             .chain
             .write()
@@ -6547,13 +6506,6 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = chain
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
-    if !chain.is_pruned()
-        && chain.is_active_block(&hash)
-        && core_network_blocks_dir(&node.config.datadir, node.config.network)
-            .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
-    {
-        bail!("Block not found on disk");
-    }
     let block = chain
         .block(&hash)?
         .ok_or_else(|| missing_block_data_error(&chain, &hash))?;
@@ -11435,9 +11387,18 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         Err(error) => {
             debug!(%hash, %error, "submitblock rejected");
             let message = error.to_string();
-            if message.contains("unknown parent")
-                || message.contains("parent whose full body is unavailable")
-            {
+            if message.contains("unknown parent") {
+                let parent_known = node
+                    .chain
+                    .read()
+                    .header_by_hash(&block_header.prev_blockhash)
+                    .is_some();
+                Ok(json!(if parent_known {
+                    "inconclusive"
+                } else {
+                    "prev-blk-not-found"
+                }))
+            } else if message.contains("parent whose full body is unavailable") {
                 Ok(json!("inconclusive"))
             } else if message.contains("invalidated branch") {
                 Ok(json!("duplicate-invalid"))
@@ -11445,7 +11406,16 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 error.downcast_ref::<validation::ValidationError>(),
                 Some(validation::ValidationError::WrongPreviousBlock)
             ) {
-                Ok(json!("inconclusive"))
+                let parent_known = node
+                    .chain
+                    .read()
+                    .header_by_hash(&block_header.prev_blockhash)
+                    .is_some();
+                Ok(json!(if parent_known {
+                    "inconclusive"
+                } else {
+                    "prev-blk-not-found"
+                }))
             } else if let Some(reason) = bip22_validation_result(&error) {
                 // Core records a header as failed-validation when a known
                 // header is later rejected with a block body, but a bad
@@ -12150,8 +12120,8 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .get("data")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("proposal mode requires a data string"))?;
-        let bytes = hex::decode(data).context("block decode failed")?;
-        let block: Block = deserialize(&bytes).context("block decode failed")?;
+        let bytes = hex::decode(data).context("Block decode failed")?;
+        let block: Block = deserialize(&bytes).context("Block decode failed")?;
         let chain = node.chain.read();
         if let Some(status) = chain.proposal_duplicate_status(&block.block_hash()) {
             return Ok(json!(status));

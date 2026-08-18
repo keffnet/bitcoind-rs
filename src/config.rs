@@ -340,7 +340,7 @@ impl PeerPermissions {
         self.0 & permission.0 == permission.0
     }
 
-    const fn union(self, permission: Self) -> Self {
+    pub(crate) const fn union(self, permission: Self) -> Self {
         Self(self.0 | permission.0)
     }
 
@@ -391,13 +391,13 @@ impl PeerPermissions {
                 "all" => flags = flags.union(Self::ALL),
                 "in" => incoming = true,
                 "out" => outgoing = true,
-                name => bail!("invalid P2P permission: '{name}'"),
+                name => bail!("Invalid P2P permission: '{name}'"),
             }
         }
         if !incoming && !outgoing {
             incoming = true;
         } else if flags == Self::empty() {
-            bail!("only direction was set, no permissions: '{value}'");
+            bail!("Only direction was set, no permissions: '{value}'");
         }
         Ok((flags, incoming, outgoing))
     }
@@ -521,7 +521,7 @@ impl WhiteBind {
             });
         let address = address_text
             .parse::<SocketAddr>()
-            .with_context(|| format!("parsing --whitebind address '{address_text}'"))?;
+            .map_err(|_| anyhow::anyhow!("Cannot resolve -whitebind address '{address_text}'"))?;
         if address.port() == 0 {
             bail!("--whitebind must use a non-zero port");
         }
@@ -551,7 +551,7 @@ impl WhitelistRule {
                 (Some(permissions), subnet)
             });
         let subnet = WhitelistSubnet::parse(subnet_text)
-            .with_context(|| format!("parsing --whitelist subnet '{subnet_text}'"))?;
+            .map_err(|_| anyhow::anyhow!("Invalid netmask specified in '{subnet_text}'"))?;
         let (permissions, incoming, outgoing) = match permission_text {
             Some(permissions) => PeerPermissions::parse_flags(permissions)?,
             None => (PeerPermissions::implicit(), true, false),
@@ -662,6 +662,7 @@ impl From<NetworkName> for Network {
 #[command(
     name = "bitcoind-rs",
     version = "31.1.0",
+    long_version = "version 31.1.0",
     about = "Wallet-free Bitcoin node and Electrum server",
     args_override_self = true
 )]
@@ -943,7 +944,14 @@ pub struct Args {
 
     /// Skip `includeconf=` directives from the selected configuration file.
     /// Core permits this negated option on the command line only.
-    #[arg(long = "noincludeconf", default_value_t = false, hide = true)]
+    #[arg(
+        long = "noincludeconf",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
     pub no_include_conf: bool,
 
     #[arg(
@@ -1850,7 +1858,43 @@ impl Args {
             .map(normalize_core_style_argument)
             .collect::<Vec<_>>();
         let datadir_explicit = raw_option_value(&raw, "datadir").is_some();
+        let command_line_include = raw
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find_map(|(index, argument)| {
+                let argument = argument.to_str()?;
+                if let Some(value) = argument.strip_prefix("--includeconf=") {
+                    return Some(value.to_owned());
+                }
+                if argument == "--includeconf" {
+                    return Some(
+                        raw.get(index + 1)
+                            .and_then(|value| value.to_str())
+                            .filter(|value| !value.starts_with('-'))
+                            .unwrap_or_default()
+                            .to_owned(),
+                    );
+                }
+                None
+            });
+        if let Some(value) = command_line_include {
+            bail!(
+                "Error parsing command line arguments: -includeconf cannot be used from commandline; -includeconf=\"{value}\""
+            );
+        }
+        if raw_option_value(&raw, "noincludeconf").is_some_and(|value| !is_true(&value)) {
+            bail!(
+                "Error parsing command line arguments: -includeconf cannot be used from commandline; -includeconf=true"
+            );
+        }
         if let Err(error) = Self::try_parse_from(raw.clone()) {
+            if matches!(
+                error.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                return Err(error.into());
+            }
             let error_text = error.to_string();
             if let Some(message) = core_cli_parse_error(&original, &error_text) {
                 bail!("{message}");
@@ -2005,7 +2049,21 @@ impl Args {
             })
             .flatten()
             .collect::<Vec<_>>();
+        // Core places command-line `-uacomment` values before comments read
+        // from bitcoin.conf, even though scalar configuration values retain
+        // the normal config-then-command-line precedence. Keep the argument
+        // order explicit so repeated comments have the same subversion.
         let mut config_args = config_args;
+        let mut config_user_agent_args = Vec::new();
+        config_args.retain(|argument| {
+            let is_user_agent_comment = argument.to_str().is_some_and(|argument| {
+                argument == "--uacomment" || argument.starts_with("--uacomment=")
+            });
+            if is_user_agent_comment {
+                config_user_agent_args.push(argument.clone());
+            }
+            !is_user_agent_comment
+        });
         if !datadir_explicit {
             config_args.insert(
                 0,
@@ -2015,6 +2073,7 @@ impl Args {
         if !cli_network_selector {
             config_args.push(OsString::from(format!("--network={selected_network}")));
         }
+        let cli_settings_override = raw_settings_override(&raw);
 
         let mut merged = Vec::with_capacity(raw.len().saturating_add(config_args.len()));
         if let Some(program) = raw.first() {
@@ -2022,6 +2081,7 @@ impl Args {
         }
         merged.extend(config_args);
         merged.extend(raw.into_iter().skip(1));
+        merged.extend(config_user_agent_args);
         let mut parsed = match Self::try_parse_from(merged) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -2045,6 +2105,9 @@ impl Args {
         parsed.config_file_args = config_file_args;
         parsed.datadir_explicit = datadir_explicit;
         parsed.config_loaded = true;
+        if let Some(settings_enabled) = cli_settings_override {
+            parsed.no_settings = !settings_enabled;
+        }
         Ok(parsed)
     }
 }
@@ -2110,6 +2173,12 @@ fn normalize_core_style_argument(argument: OsString) -> OsString {
     };
     if matches!(value, "-noblocksonly" | "--noblocksonly") {
         return OsString::from("--blocksonly=false");
+    }
+    if matches!(value, "-noserver" | "--noserver") {
+        return OsString::from("--server=false");
+    }
+    if matches!(value, "-nopersistmempool" | "--nopersistmempool") {
+        return OsString::from("--persistmempool=false");
     }
     if matches!(value, "-nodebug" | "--nodebug") {
         return OsString::from("--debug=0");
@@ -2182,6 +2251,32 @@ fn raw_bool_option(args: &[OsString], name: &str) -> bool {
         );
     }
     selected.unwrap_or(false)
+}
+
+fn raw_settings_override(args: &[OsString]) -> Option<bool> {
+    let mut selected = None;
+    for (index, argument) in args.iter().enumerate().skip(1) {
+        let Some(value) = argument.to_str() else {
+            continue;
+        };
+        if value == "--settings" || value.starts_with("--settings=") {
+            selected = Some(true);
+            continue;
+        }
+        if let Some(value) = value.strip_prefix("--nosettings=") {
+            selected = Some(!is_true(value));
+            continue;
+        }
+        if value == "--nosettings" {
+            let value = args
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.starts_with('-'))
+                .unwrap_or("1");
+            selected = Some(!is_true(value));
+        }
+    }
+    selected
 }
 
 fn is_network_selector_key(key: &str) -> bool {
@@ -2296,14 +2391,23 @@ fn read_config_file(
                 line_number + 1
             );
         }
-        if key == "includeconf" && allow_includes {
+        if key == "includeconf" && allow_includes && stack.len() == 1 {
             let include_path = PathBuf::from(&value);
             let include_path = if include_path.is_absolute() {
                 include_path
             } else {
                 datadir.join(include_path)
             };
+            if !include_path.exists() {
+                bail!(
+                    "Error reading configuration file: Failed to include configuration file {value}"
+                );
+            }
             read_config_file(&include_path, datadir, entries, stack, allow_includes)?;
+        } else if key == "includeconf" && allow_includes {
+            eprintln!(
+                "warning: -includeconf cannot be used from included files; ignoring -includeconf={value}"
+            );
         } else if key != "includeconf" {
             entries.push(ConfigFileEntry {
                 section: section.clone(),
@@ -2774,6 +2878,10 @@ fn parse_truc_policy(value: Option<&str>) -> Result<TrucPolicy> {
 }
 
 impl Config {
+    pub fn settings_path(&self) -> Option<&Path> {
+        self.settings_path.as_deref()
+    }
+
     pub fn from_args(args: Args) -> Result<Self> {
         if !args.disable_wallet {
             bail!("wallet support is disabled in this build; use --disablewallet=1");
@@ -2830,7 +2938,12 @@ impl Config {
         let pid_path = if args.pid_file.is_absolute() {
             args.pid_file.clone()
         } else {
-            args.datadir.join(&args.pid_file)
+            let network_dir = network_data_dir_name(network);
+            if network_dir.is_empty() {
+                args.datadir.join(&args.pid_file)
+            } else {
+                args.datadir.join(network_dir).join(&args.pid_file)
+            }
         };
         let settings_path = if args.no_settings {
             None
@@ -2845,7 +2958,12 @@ impl Config {
             Some(if path.is_absolute() {
                 path
             } else {
-                args.datadir.join(path)
+                let network_dir = network_data_dir_name(network);
+                if network_dir.is_empty() {
+                    args.datadir.join(path)
+                } else {
+                    args.datadir.join(network_dir).join(path)
+                }
             })
         };
         let minimum_chain_work = args
@@ -3054,7 +3172,7 @@ impl Config {
                 || (args.proxy.is_none() && !connect_configured && args.max_peers > 0),
         ) && !args.no_listen;
         if !listen && (!args.bind.is_empty() || !args.whitebind.is_empty()) {
-            bail!("--bind/--whitebind cannot be used with --listen=false");
+            bail!("Cannot set -bind or -whitebind together with -listen=0");
         }
         if !listen && args.listen_onion == Some(true) {
             bail!("--listen=false cannot be combined with --listenonion=true");

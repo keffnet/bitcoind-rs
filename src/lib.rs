@@ -108,6 +108,7 @@ const ADDRMAN_TRIED_BUCKET_COUNT: usize = 256;
 const ADDRMAN_BUCKET_SIZE: usize = 64;
 const ADDRMAN_SECRET_FILE: &str = "addrman.key";
 const COINSTATS_CLEAN_SHUTDOWN_HEIGHT_FILE: &str = "clean_shutdown_height";
+const LARGE_WORK_INVALID_CHAIN_WARNING: &str = "Warning: Found invalid chain more than 6 blocks longer than our best chain. This could be due to database corruption or consensus incompatibility with peers.";
 
 fn addrman_append_compact_size(input: &mut Vec<u8>, value: usize) {
     let value = u64::try_from(value).expect("address-manager vector length fits u64");
@@ -1127,6 +1128,10 @@ pub struct PeerInfo {
     pub last_recv: u64,
     pub bytes_sent: u64,
     pub bytes_received: u64,
+    // Bytes observed during transport detection are visible immediately in
+    // getpeerinfo, then excluded when the eventual v1 frame is accounted.
+    preaccounted_received_bytes: u64,
+    unread_detection_bytes: u64,
     pub bytes_sent_per_msg: HashMap<String, u64>,
     pub bytes_received_per_msg: HashMap<String, u64>,
     pub last_inv_sequence: u64,
@@ -1525,8 +1530,19 @@ impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
         fs::create_dir_all(&config.datadir)
             .with_context(|| format!("creating data directory {}", config.datadir.display()))?;
+        let network_datadir = if network_data_dir_name(config.network).is_empty() {
+            config.datadir.clone()
+        } else {
+            config.datadir.join(network_data_dir_name(config.network))
+        };
+        fs::create_dir_all(&network_datadir).with_context(|| {
+            format!(
+                "creating network data directory {}",
+                network_datadir.display()
+            )
+        })?;
         let coinstats_unclean_startup = config.coinstatsindex && config.pid_path.exists();
-        let lock_path = config.datadir.join(".lock");
+        let lock_path = network_datadir.join(".lock");
         let data_dir_lock = OpenOptions::new()
             .create(true)
             .read(true)
@@ -1534,10 +1550,10 @@ impl Node {
             .truncate(false)
             .open(&lock_path)
             .with_context(|| format!("opening data directory lock {}", lock_path.display()))?;
-        data_dir_lock.try_lock_exclusive().with_context(|| {
-            format!(
-                "data directory is already in use: {}",
-                config.datadir.display()
+        data_dir_lock.try_lock_exclusive().map_err(|_| {
+            anyhow!(
+                "Cannot obtain a lock on directory {}. bitcoind-rs is probably already running.",
+                network_datadir.display()
             )
         })?;
         let mut addrman_key = load_addrman_key(&config.datadir)?;
@@ -1547,16 +1563,17 @@ impl Node {
             addrman_key = [0; 32];
             addrman_key[0] = 1;
         }
-        let blocks_dir = config
+        let configured_blocks_dir = config
             .blocks_dir
             .clone()
             .unwrap_or_else(|| config.datadir.join("blocks"));
-        let blocks_dir_was_present = blocks_dir.is_dir();
-        let network_datadir = if network_data_dir_name(config.network).is_empty() {
-            config.datadir.clone()
+        let blocks_dir = if config.blocks_dir_explicit {
+            core_network_blocks_dir(&configured_blocks_dir, config.network)
+                .unwrap_or_else(|| configured_blocks_dir.clone())
         } else {
-            config.datadir.join(network_data_dir_name(config.network))
+            configured_blocks_dir.clone()
         };
+        let blocks_dir_was_present = blocks_dir.is_dir();
         let snapshot_chainstate = network_datadir.join("chainstate_snapshot");
         let snapshot_base_hash_path = snapshot_chainstate.join("base_blockhash");
         if snapshot_base_hash_path.is_file() {
@@ -1588,13 +1605,13 @@ impl Node {
                 "A fatal internal error occurred, see debug.log for details: {message}"
             ));
         }
-        if config.blocks_dir_explicit && !blocks_dir.is_dir() {
+        if config.blocks_dir_explicit && !configured_blocks_dir.is_dir() {
             bail!(
                 "Specified blocks directory \"{}\" does not exist.",
-                blocks_dir.display()
+                configured_blocks_dir.display()
             );
         }
-        if !config.blocks_dir_explicit {
+        if !blocks_dir.is_dir() {
             fs::create_dir_all(&blocks_dir)
                 .with_context(|| format!("creating blocks directory {}", blocks_dir.display()))?;
         }
@@ -1611,9 +1628,9 @@ impl Node {
                 .with_context(|| {
                     format!("opening blocks directory lock {}", lock_path.display())
                 })?;
-            lock.try_lock_exclusive().with_context(|| {
-                format!(
-                    "blocks directory is already in use: {}",
+            lock.try_lock_exclusive().map_err(|_| {
+                anyhow!(
+                    "Cannot obtain a lock on directory {}. bitcoind-rs is probably already running.",
                     blocks_dir.display()
                 )
             })?;
@@ -1680,20 +1697,6 @@ impl Node {
         let deployment_parameters = config
             .deployment_parameters
             .unwrap_or_else(|| validation::DeploymentParameters::for_network(config.network));
-        let chain_blocks_dir = if config.blocks_dir_explicit {
-            if let Some(network_name) = (!network_data_dir_name(config.network).is_empty())
-                .then_some(network_data_dir_name(config.network))
-            {
-                blocks_dir.join(network_name).join("blocks")
-            } else {
-                blocks_dir.clone()
-            }
-        } else if matches!(config.network, Network::Bitcoin | Network::Regtest) {
-            blocks_dir.clone()
-        } else {
-            core_network_blocks_dir(&config.datadir, config.network)
-                .unwrap_or_else(|| blocks_dir.clone())
-        };
         let legacy_chain_data_dir = config.datadir.clone();
         let network_chain_data_dir = network_datadir.clone();
         let use_network_chain_data = !network_data_dir_name(config.network).is_empty()
@@ -1716,7 +1719,7 @@ impl Node {
             ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters(
                 config.network,
                 &chain_data_dir,
-                chain_blocks_dir,
+                blocks_dir,
                 config.signet_challenge.as_deref(),
                 config.blockfilterindex,
                 config.reindex,
@@ -3308,12 +3311,7 @@ impl Node {
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
-        if self.chain.read().has_large_work_invalid_chain() {
-            self.set_warning(
-                NodeWarningKind::LargeWorkInvalidChain,
-                "Warning: Found invalid chain more than 6 blocks longer than our best chain. This could be due to database corruption or consensus incompatibility with peers.".to_owned(),
-            );
-        }
+        self.refresh_large_work_invalid_chain_warning();
         self.refresh_versionbits_warning();
         self.maybe_check_block_index();
         Ok(tip)
@@ -3584,10 +3582,61 @@ impl Node {
     /// Account bytes as soon as they arrive from a v1 socket. The frame may
     /// still be incomplete, so there is no message bucket to update yet.
     pub(crate) fn record_partial_bytes_received(&self, peer_id: usize, bytes: usize) {
-        let _ = peer_id;
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let skipped = self
+            .peers
+            .write()
+            .get_mut(&peer_id)
+            .map(|peer| {
+                let skipped = peer.unread_detection_bytes.min(bytes);
+                peer.unread_detection_bytes -= skipped;
+                skipped
+            })
+            .unwrap_or(0);
+        self.total_bytes_received
+            .fetch_add(bytes.saturating_sub(skipped), Ordering::Relaxed);
+    }
+
+    /// Account bytes observed with MSG_PEEK while an inbound transport is
+    /// still being identified. They are exposed immediately in getpeerinfo;
+    /// the corresponding consumed bytes are reconciled by the handshake or
+    /// completed v1-frame accounting paths.
+    pub(crate) fn record_transport_detection_bytes(&self, peer_id: usize, bytes: usize) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         self.total_bytes_received
             .fetch_add(bytes, Ordering::Relaxed);
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.bytes_received = peer.bytes_received.saturating_add(bytes);
+            peer.preaccounted_received_bytes =
+                peer.preaccounted_received_bytes.saturating_add(bytes);
+            peer.unread_detection_bytes = peer.unread_detection_bytes.saturating_add(bytes);
+            peer.last_recv = unix_time_seconds();
+        }
+    }
+
+    /// Account bytes consumed by the BIP324 handshake, excluding any prefix
+    /// bytes already counted during transport detection.
+    pub(crate) fn record_handshake_bytes_received(&self, peer_id: usize, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let fresh = self
+            .peers
+            .write()
+            .get_mut(&peer_id)
+            .map(|peer| {
+                let skipped = peer.unread_detection_bytes.min(bytes);
+                peer.unread_detection_bytes -= skipped;
+                peer.preaccounted_received_bytes =
+                    peer.preaccounted_received_bytes.saturating_sub(skipped);
+                bytes.saturating_sub(skipped)
+            })
+            .unwrap_or(bytes);
+        if fresh != 0 {
+            self.record_bytes_received(
+                peer_id,
+                usize::try_from(fresh).unwrap_or(usize::MAX),
+                P2P_MESSAGE_TYPE_OTHER,
+            );
+        }
     }
 
     /// Update the per-message byte bucket after a complete frame has been
@@ -3604,7 +3653,11 @@ impl Node {
             self.peers.write()
         };
         if let Some(peer) = peers.get_mut(&peer_id) {
-            peer.bytes_received = peer.bytes_received.saturating_add(bytes);
+            let preaccounted = peer.preaccounted_received_bytes.min(bytes);
+            peer.preaccounted_received_bytes -= preaccounted;
+            peer.bytes_received = peer
+                .bytes_received
+                .saturating_add(bytes.saturating_sub(preaccounted));
             peer.last_recv = unix_time_seconds();
             let command = received_p2p_message_type(command);
             let total = peer
@@ -3817,6 +3870,11 @@ impl Node {
         triggered.insert(peer_id);
         *last_block = Some(block_hash);
         true
+    }
+
+    pub(crate) fn clear_inv_headers_sync_trigger(&self, peer_id: usize) {
+        self.inv_triggered_headers_sync.lock().remove(&peer_id);
+        self.last_block_inv_triggering_headers_sync.lock().take();
     }
 
     fn assign_headers_sync_replacement(
@@ -4190,6 +4248,7 @@ impl Node {
             let peer_best_height = peer_best_known
                 .and_then(|hash| chain.block_height_by_hash(&hash))
                 .unwrap_or_else(|| chain.height());
+            let segwit_height = chain.deployment_parameters().buried.segwit;
             let headers = chain
                 .headers_to_hash(&target_hash)
                 .into_iter()
@@ -4223,6 +4282,11 @@ impl Node {
                     !limited_peer
                         || peer_best_height.saturating_sub(*height)
                             < NODE_NETWORK_LIMITED_MIN_BLOCKS.saturating_sub(2)
+                })
+                .filter(|(_, height)| {
+                    peer_id.is_none()
+                        || peer_services & wire::NODE_WITNESS != 0
+                        || *height < segwit_height
                 })
                 // Keep the first missing block beyond the window so the
                 // caller can distinguish a true staller from a peer that is
@@ -4605,6 +4669,8 @@ impl Node {
             last_recv: 0,
             bytes_sent: 0,
             bytes_received: 0,
+            preaccounted_received_bytes: 0,
+            unread_detection_bytes: 0,
             bytes_sent_per_msg: HashMap::new(),
             bytes_received_per_msg: HashMap::new(),
             last_inv_sequence: 0,
@@ -4845,6 +4911,15 @@ impl Node {
         }
     }
 
+    pub(crate) fn refresh_large_work_invalid_chain_warning(&self) {
+        if self.chain.read().has_large_work_invalid_chain() {
+            self.set_warning(
+                NodeWarningKind::LargeWorkInvalidChain,
+                LARGE_WORK_INVALID_CHAIN_WARNING.to_owned(),
+            );
+        }
+    }
+
     pub(crate) fn unset_warning(&self, kind: NodeWarningKind) {
         self.warnings.write().retain(|warning| warning.kind != kind);
     }
@@ -4977,6 +5052,12 @@ impl Node {
     pub(crate) fn set_peer_transport_protocol(&self, id: usize, transport_v2: bool) {
         if let Some(peer) = self.peers.write().get_mut(&id) {
             peer.transport_protocol_type = if transport_v2 { "v2" } else { "v1" };
+        }
+    }
+
+    pub(crate) fn set_peer_transport_detecting(&self, id: usize) {
+        if let Some(peer) = self.peers.write().get_mut(&id) {
+            peer.transport_protocol_type = "detecting";
         }
     }
 
@@ -5376,6 +5457,8 @@ impl Node {
                 last_recv: now,
                 bytes_sent: 0,
                 bytes_received: 0,
+                preaccounted_received_bytes: 0,
+                unread_detection_bytes: 0,
                 bytes_sent_per_msg: HashMap::new(),
                 bytes_received_per_msg: HashMap::new(),
                 last_inv_sequence: 0,
@@ -5445,6 +5528,8 @@ impl Node {
             last_recv: time,
             bytes_sent: 0,
             bytes_received: 0,
+            preaccounted_received_bytes: 0,
+            unread_detection_bytes: 0,
             bytes_sent_per_msg: HashMap::new(),
             bytes_received_per_msg: HashMap::new(),
             last_inv_sequence: 0,
@@ -6403,11 +6488,23 @@ fn quarantine_persistent_file(path: &Path, error: &anyhow::Error) {
 
 struct SettingsObjectVisitor;
 
+const SETTINGS_WARNING: &str = "This file is automatically generated and updated by bitcoind-rs. Please do not edit this file while the node is running, as any changes might be ignored or overwritten.";
+
 impl<'de> Visitor<'de> for SettingsObjectVisitor {
     type Value = serde_json::Value;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("a JSON object")
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Err(E::custom(format!(
+            "non-object value {}",
+            serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+        )))
     }
 
     fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
@@ -6433,30 +6530,69 @@ fn initialize_settings_file(path: &Path) -> Result<()> {
         let value = deserializer
             .deserialize_any(SettingsObjectVisitor)
             .map_err(|error| {
-                anyhow::anyhow!("settings file {} is invalid: {error}", path.display())
+                let error = error.to_string();
+                if let Some(key) = error
+                    .strip_prefix("duplicate key ")
+                    .map(|key| key.split_once(" at line ").map_or(key, |(key, _)| key))
+                {
+                    anyhow::anyhow!(
+                        "Found duplicate key {key} in settings file {}",
+                        path.display()
+                    )
+                } else if let Some(value) = error
+                    .strip_prefix("non-object value ")
+                    .map(|value| value.split_once(" at line ").map_or(value, |(value, _)| value))
+                {
+                    anyhow::anyhow!(
+                        "Found non-object value {value} in settings file {}",
+                        path.display()
+                    )
+                } else {
+                    anyhow::anyhow!(
+                        "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error: {error}",
+                        path.display()
+                    )
+                }
             })?;
         deserializer.end().map_err(|error| {
-            anyhow::anyhow!("settings file {} is invalid: {error}", path.display())
+            anyhow::anyhow!(
+                "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error: {error}",
+                path.display()
+            )
         })?;
-        if !value.is_object() {
+        let serde_json::Value::Object(object) = value else {
             bail!(
                 "settings file {} must contain a JSON object",
                 path.display()
             );
+        };
+        if !object.contains_key("_warning_") {
+            let mut settings = serde_json::Map::new();
+            settings.insert(
+                "_warning_".to_owned(),
+                serde_json::Value::String(SETTINGS_WARNING.to_owned()),
+            );
+            settings.extend(object);
+            write_settings_file(path, &serde_json::Value::Object(settings))?;
         }
         return Ok(());
     }
 
     let warning = serde_json::json!({
-        "_warning_": "This file is automatically generated and updated by bitcoind-rs. Please do not edit this file while the node is running, as changes might be ignored or overwritten."
+        "_warning_": SETTINGS_WARNING
     });
+    write_settings_file(path, &warning)?;
+    Ok(())
+}
+
+fn write_settings_file(path: &Path, settings: &serde_json::Value) -> Result<()> {
     let temporary = path.with_file_name(format!(
         ".{}.tmp",
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("settings.json")
     ));
-    fs::write(&temporary, serde_json::to_vec_pretty(&warning)?)
+    fs::write(&temporary, serde_json::to_vec_pretty(settings)?)
         .with_context(|| format!("writing settings file {}", path.display()))?;
     fs::rename(&temporary, path)
         .with_context(|| format!("installing settings file {}", path.display()))?;
@@ -6583,6 +6719,8 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                         last_recv: entry.time,
                         bytes_sent: 0,
                         bytes_received: 0,
+                        preaccounted_received_bytes: 0,
+                        unread_detection_bytes: 0,
                         bytes_sent_per_msg: HashMap::new(),
                         bytes_received_per_msg: HashMap::new(),
                         last_inv_sequence: 0,

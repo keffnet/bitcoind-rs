@@ -169,8 +169,6 @@ dependencies = [
 [[package]]
 name = "bip324"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a03c45ad0d13f5df3aff10b7fdf6897dba1e9fc819cf932589d48ddba2536c94"
 dependencies = [
  "bitcoin_hashes 0.16.0",
  "chacha20-poly1305",

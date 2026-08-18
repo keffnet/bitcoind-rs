@@ -3164,6 +3164,8 @@ struct ProxyRoutingOptions {
 }
 
 async fn establish_transport(
+    node: &Arc<Node>,
+    peer_id: usize,
     stream: TcpStream,
     endpoint: &NetworkEndpoint,
     outbound: bool,
@@ -3181,18 +3183,19 @@ async fn establish_transport(
         if transport_v2 == Some(false) {
             return establish_v1(stream);
         }
-        if transport_v2 == Some(true) {
-            return establish_v2(stream, network, Role::Initiator).await;
-        }
-        match establish_v2(stream, network, Role::Initiator).await {
+        match establish_v2_for_peer(node, peer_id, stream, network, Role::Initiator).await {
             Ok((reader, writer, local_address, session_id)) => {
                 return Ok((reader, writer, local_address, session_id));
             }
             Err(error) => {
                 if log_ips {
-                    debug!(%endpoint, %error, "BIP324 handshake failed; retrying with v1");
+                    debug!(
+                        %endpoint,
+                        %error,
+                        "retrying with v1 transport protocol for peer"
+                    );
                 } else {
-                    debug!(%error, "BIP324 handshake failed; retrying with v1");
+                    debug!(%error, "retrying with v1 transport protocol for peer");
                 }
                 let fallback = connect_peer_endpoint_with_options_and_dns_with_i2p(
                     endpoint,
@@ -3216,29 +3219,91 @@ async fn establish_transport(
     }
 
     let mut prefix = [0u8; 16];
-    let mut received = 0;
-    while received < prefix.len() {
-        let count = stream.peek(&mut prefix[received..]).await?;
+    let mut detected_bytes = 0;
+    loop {
+        let count = stream.peek(&mut prefix).await?;
         if count == 0 {
             anyhow::bail!("peer closed before transport negotiation");
         }
-        received += count;
+        if count > detected_bytes {
+            node.record_transport_detection_bytes(peer_id, count - detected_bytes);
+            detected_bytes = count;
+        }
+        if count >= prefix.len() {
+            break;
+        }
     }
 
     let mut v1_prefix = [0u8; 16];
     v1_prefix[..4].copy_from_slice(&wire::network_magic(network));
     v1_prefix[4..11].copy_from_slice(b"version");
+    if prefix[4..11] == *b"version" && prefix[..4] != v1_prefix[..4] {
+        anyhow::bail!("V1 peer with wrong MessageStart");
+    }
     if prefix == v1_prefix {
         establish_v1(stream)
     } else {
-        establish_v2(stream, network, Role::Responder).await
+        establish_v2_for_peer(node, peer_id, stream, network, Role::Responder).await
     }
 }
 
+#[cfg(test)]
 async fn establish_v2(
     stream: TcpStream,
     network: Network,
     role: Role,
+) -> Result<(
+    PeerReader,
+    PeerWriterKind,
+    Option<SocketAddr>,
+    Option<String>,
+)> {
+    establish_v2_with_accounting(stream, network, role, None, 0).await
+}
+
+async fn establish_v2_for_peer(
+    node: &Arc<Node>,
+    peer_id: usize,
+    stream: TcpStream,
+    network: Network,
+    role: Role,
+) -> Result<(
+    PeerReader,
+    PeerWriterKind,
+    Option<SocketAddr>,
+    Option<String>,
+)> {
+    let connected_at = node
+        .peer_infos()
+        .into_iter()
+        .find(|peer| peer.id == peer_id)
+        .map_or_else(unix_time_seconds, |peer| peer.connected_at);
+    tokio::select! {
+        result = establish_v2_with_accounting(stream, network, role, Some(node), peer_id) => result,
+        _ = wait_for_v2_handshake_timeout(node, peer_id, connected_at) => {
+            bail!("V2 handshake timeout")
+        }
+    }
+}
+
+async fn wait_for_v2_handshake_timeout(node: &Arc<Node>, peer_id: usize, connected_at: u64) {
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if unix_time_seconds().saturating_sub(connected_at) >= node.config.peer_timeout_secs {
+            debug!("V2 handshake timeout, disconnecting peer={peer_id}");
+            return;
+        }
+    }
+}
+
+async fn establish_v2_with_accounting(
+    stream: TcpStream,
+    network: Network,
+    role: Role,
+    node: Option<&Arc<Node>>,
+    peer_id: usize,
 ) -> Result<(
     PeerReader,
     PeerWriterKind,
@@ -3254,18 +3319,28 @@ async fn establish_v2(
     let handshake = handshake.send_key(None, &mut key_buffer)?;
     writer.write_all(&key_buffer).await?;
     writer.flush().await?;
+    if let Some(node) = node {
+        node.record_bytes_sent(peer_id, key_buffer.len(), crate::P2P_MESSAGE_TYPE_OTHER);
+    }
 
     let mut remote_key = [0; BIP324_ELLIGATOR_SWIFT_BYTES];
-    reader.read_exact(&mut remote_key).await?;
-    let handshake = handshake.receive_key(remote_key)?;
+    read_exact_counted(&mut reader, &mut remote_key, node, peer_id).await?;
+    // Transport detection already consumed and classified the exact v1
+    // preface. A valid v2 ElligatorSwift key may still begin with the four
+    // network-magic bytes, so do not apply the crate's legacy four-byte
+    // shortcut here.
+    let handshake = handshake.receive_key_without_v1_check(remote_key)?;
 
     let mut version_buffer = vec![0; Handshake::<bip324::ReceivedKey<'_>>::send_version_len(None)];
     let handshake = handshake.send_version(&mut version_buffer, None)?;
     writer.write_all(&version_buffer).await?;
     writer.flush().await?;
+    if let Some(node) = node {
+        node.record_bytes_sent(peer_id, version_buffer.len(), crate::P2P_MESSAGE_TYPE_OTHER);
+    }
 
     let mut garbage_buffer = vec![0; BIP324_GARBAGE_TERMINATOR_BYTES];
-    reader.read_exact(&mut garbage_buffer).await?;
+    read_exact_counted(&mut reader, &mut garbage_buffer, node, peer_id).await?;
     let mut garbage_handshake = handshake;
     let (mut handshake, garbage_bytes) = loop {
         match garbage_handshake.receive_garbage(&garbage_buffer)? {
@@ -3278,6 +3353,9 @@ async fn establish_v2(
                 let count = reader.read(&mut temp).await?;
                 if count == 0 {
                     bail!("peer closed during BIP324 garbage negotiation");
+                }
+                if let Some(node) = node {
+                    node.record_handshake_bytes_received(peer_id, count);
                 }
                 garbage_buffer.extend_from_slice(&temp[..count]);
                 garbage_handshake = next_handshake;
@@ -3314,6 +3392,29 @@ async fn establish_v2(
     ))
 }
 
+async fn read_exact_counted(
+    reader: &mut BufReader<OwnedReadHalf>,
+    buffer: &mut [u8],
+    node: Option<&Arc<Node>>,
+    peer_id: usize,
+) -> std::io::Result<()> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let count = reader.read(&mut buffer[offset..]).await?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "peer closed during BIP324 transport handshake",
+            ));
+        }
+        if let Some(node) = node {
+            node.record_handshake_bytes_received(peer_id, count);
+        }
+        offset += count;
+    }
+    Ok(())
+}
+
 fn establish_v1(
     stream: TcpStream,
 ) -> Result<(
@@ -3341,6 +3442,22 @@ struct PeerConnectionOptions {
     private_broadcast_transaction: Option<Transaction>,
 }
 
+fn resolved_peer_permissions(
+    node: &Arc<Node>,
+    endpoint: &NetworkEndpoint,
+    outbound: bool,
+    listener_permissions: Option<PeerPermissions>,
+) -> PeerPermissions {
+    match (listener_permissions, endpoint.socket_addr()) {
+        (Some(listener_permissions), Some(address)) => {
+            listener_permissions.union(node.permissions_for_peer(address, !outbound))
+        }
+        (Some(listener_permissions), None) => listener_permissions,
+        (None, Some(address)) => node.permissions_for_peer(address, !outbound),
+        (None, None) => PeerPermissions::empty(),
+    }
+}
+
 async fn serve_peer(
     node: Arc<Node>,
     stream: TcpStream,
@@ -3354,7 +3471,32 @@ async fn serve_peer(
     let socket = SockRef::from(&stream);
     socket.set_recv_buffer_size(node.config.max_receive_buffer as usize)?;
     socket.set_send_buffer_size(node.config.max_send_buffer as usize)?;
-    let (mut reader, writer_half, local_address, session_id) = establish_transport(
+    let detect_transport =
+        !options.outbound && options.transport_v2.is_none() && node.config.v2_transport;
+    if detect_transport {
+        let (provisional_commands, _provisional_receiver) = mpsc::unbounded_channel();
+        let permissions =
+            resolved_peer_permissions(&node, &endpoint, options.outbound, options.permissions);
+        node.register_peer_with_endpoint(
+            peer_id,
+            endpoint.clone(),
+            true,
+            provisional_commands,
+            PeerRegistrationOptions {
+                local_address: stream.local_addr().ok(),
+                permissions,
+                connection_type: options.connection_type,
+                manual: options.manual,
+            },
+        );
+        node.set_peer_transport_detecting(peer_id);
+    }
+    if options.outbound && options.transport_v2 != Some(false) && node.config.v2_transport {
+        debug!("start sending v2 handshake to peer={peer_id}");
+    }
+    let transport = establish_transport(
+        &node,
+        peer_id,
         stream,
         &endpoint,
         options.outbound,
@@ -3371,17 +3513,36 @@ async fn serve_peer(
             i2p_sam: node.i2p_sam.clone(),
         },
     )
-    .await?;
+    .await;
+    let (mut reader, writer_half, local_address, session_id) = match transport {
+        Ok(transport) => transport,
+        Err(error) => {
+            if detect_transport {
+                node.unregister_peer(peer_id);
+            }
+            let error_text = error.to_string();
+            if error_text.contains("NoGarbageTerminator")
+                || error_text.contains("More than 4095 bytes of garbage")
+            {
+                debug!("V2 transport error: missing garbage terminator");
+            } else if error_text.contains("Decryption error")
+                || error_text.contains("packet decryption")
+            {
+                debug!("V2 transport error: packet decryption failure");
+            } else if error_text.contains("wrong MessageStart")
+                || error_text.contains("V1Protocol")
+                || error_text.contains("remote peer is communicating on the V1 protocol")
+            {
+                debug!("V2 transport error: V1 peer with wrong MessageStart");
+            }
+            return Err(error);
+        }
+    };
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
     let peer_endpoint = endpoint.clone();
     let (commands, command_receiver) = mpsc::unbounded_channel();
-    let permissions = options.permissions.unwrap_or_else(|| {
-        endpoint
-            .socket_addr()
-            .map_or(PeerPermissions::empty(), |address| {
-                node.permissions_for_peer(address, !options.outbound)
-            })
-    });
+    let permissions =
+        resolved_peer_permissions(&node, &endpoint, options.outbound, options.permissions);
     node.register_peer_with_endpoint(
         peer_id,
         endpoint,
@@ -4494,6 +4655,7 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::Headers(headers) => {
+                node.clear_inv_headers_sync_trigger(peer_id);
                 let request_more_headers = headers.len() == 2_000;
                 if headers.is_empty() {
                     *peer_state.last_headers_request.lock() = None;
@@ -4841,6 +5003,10 @@ async fn serve_peer_loop(
                             !chain.store.contains(hash)
                                 && !node.block_body_was_rejected(hash)
                                 && (request_candidate_bodies || chain.is_active_block(hash))
+                                && (peer_services & wire::NODE_WITNESS != 0
+                                    || !chain.block_height_by_hash(hash).is_some_and(|height| {
+                                        height >= chain.deployment_parameters().buried.segwit
+                                    }))
                                 && chain.block_height_by_hash(hash).is_some_and(|height| {
                                     network_limited_block_download_allowed(
                                         peer_services,
@@ -4996,9 +5162,11 @@ async fn serve_peer_loop(
                     let chain = node.chain.read();
                     let mempool = node.mempool.read();
                     let initial_block_download = chain.is_initial_block_download();
+                    let segwit_active =
+                        chain.height() >= chain.deployment_parameters().buried.segwit;
                     items
                         .into_iter()
-                        .filter_map(|item| match item.kind {
+                        .filter_map(|mut item| match item.kind {
                             InventoryType::Block
                             | InventoryType::WitnessBlock
                             | InventoryType::CompactBlock => {
@@ -5039,6 +5207,17 @@ async fn serve_peer_loop(
                                     || (!wtxid_relay && item.kind.uses_wtxid())
                                 {
                                     return None;
+                                }
+                                if segwit_active
+                                    && !wtxid_relay
+                                    && item.kind == InventoryType::Transaction
+                                    && !*peer_state.private_broadcast_peer.lock()
+                                {
+                                    // A legacy relay peer announces by txid,
+                                    // but Core still requests the witness
+                                    // serialization when fetching a
+                                    // transaction (MSG_TX | MSG_WITNESS_FLAG).
+                                    item.kind = InventoryType::LegacyWitnessTransaction;
                                 }
                                 if item.kind.uses_wtxid() {
                                     mempool
@@ -5435,7 +5614,8 @@ async fn serve_peer_loop(
                                 *relay_transactions.lock(),
                                 node.config.peer_bloom_filters,
                                 peer_state.permissions,
-                            ) {
+                            ) && !*peer_state.private_broadcast_peer.lock()
+                            {
                                 continue;
                             }
                             let last_inv_sequence = node
@@ -6194,8 +6374,17 @@ async fn serve_peer_loop(
                         debug!(%txid, "accepted peer transaction");
                     }
                     Err(error) => {
+                        let error_message = error
+                            .downcast_ref::<MempoolError>()
+                            .map(|error| match error {
+                                MempoolError::MissingInput(_) => {
+                                    "bad-txns-inputs-missingorspent".to_owned()
+                                }
+                                _ => error.reject_reason(),
+                            })
+                            .unwrap_or_else(|| error.to_string());
                         info!(
-                            "{} (wtxid={}) from peer={peer_id} was not accepted: {error}",
+                            "{} (wtxid={}) from peer={peer_id} was not accepted: {error_message}",
                             txid,
                             transaction.compute_wtxid()
                         );
@@ -6265,12 +6454,28 @@ async fn serve_peer_loop(
                         if peer_state
                             .permissions
                             .contains(PeerPermissions::FORCE_RELAY)
-                            && node.mempool.read().get(&txid).is_some()
                         {
-                            node.notify_mempool_transaction_force_from_peer(
-                                transaction_for_force_relay,
-                                peer_id,
-                            );
+                            if node.mempool.read().get(&txid).is_some() {
+                                info!(
+                                    "Force relaying tx {} (wtxid={}) from peer={peer_id}",
+                                    txid,
+                                    transaction_for_force_relay.compute_wtxid()
+                                );
+                                node.notify_mempool_transaction_force_from_peer(
+                                    transaction_for_force_relay,
+                                    peer_id,
+                                );
+                            } else if node.recently_rejected_transaction(BlockHash::from_raw_hash(
+                                txid.to_raw_hash(),
+                            )) || node.recently_rejected_transaction(
+                                BlockHash::from_raw_hash(transaction.compute_wtxid().to_raw_hash()),
+                            ) {
+                                info!(
+                                    "Not relaying non-mempool transaction {} (wtxid={}) from forcerelay peer={peer_id}",
+                                    txid,
+                                    transaction.compute_wtxid()
+                                );
+                            }
                         }
                         if error
                             .downcast_ref::<MempoolError>()
@@ -6846,6 +7051,7 @@ async fn handle_received_block(
                 if let Err(mark_error) = node.chain.write().mark_block_invalid(&hash) {
                     debug!(%hash, %mark_error, "failed to cache invalid peer block");
                 }
+                node.refresh_large_work_invalid_chain_warning();
             }
             if rejected_body {
                 node.remember_rejected_block_body(hash);

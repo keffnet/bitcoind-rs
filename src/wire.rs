@@ -650,12 +650,83 @@ fn frame_has_recoverable_error(network: Network, frame: &[u8]) -> bool {
     }
     if command == "block"
         && let Err(WireError::Payload(reason)) = decode_payload(command, &frame[24..])
-        && reason.contains("non-minimal varint")
     {
-        tracing::debug!(target: "bitcoind_rs::p2p", "non-canonical ReadCompactSize()");
+        if reason.contains("non-minimal varint") {
+            tracing::debug!(target: "bitcoind_rs::p2p", "non-canonical ReadCompactSize()");
+        } else {
+            // Core catches block deserialization exceptions in
+            // ProcessMessages, logs the exception, and continues reading
+            // from the peer. In particular this keeps malformed witness
+            // vector tests from turning a recoverable payload error into a
+            // transport disconnect.
+            tracing::debug!(
+                target: "bitcoind_rs::p2p",
+                "Exception 'DataStream::read(): end of data' (std::ios_base::failure) caught"
+            );
+        }
+        return true;
+    }
+    if command == "tx"
+        && let Err(WireError::Payload(reason)) = decode_payload(command, &frame[24..])
+    {
+        if let Some(transaction_reason) = transaction_optional_data_error(&frame[24..]) {
+            tracing::debug!(target: "bitcoind_rs::p2p", "{transaction_reason}");
+        } else if reason.contains("non-minimal varint") {
+            tracing::debug!(target: "bitcoind_rs::p2p", "non-canonical ReadCompactSize()");
+        } else {
+            // Core catches transaction deserialization exceptions in
+            // ProcessMessages and keeps the peer connected after discarding
+            // the complete frame.
+            tracing::debug!(
+                target: "bitcoind_rs::p2p",
+                "Exception 'DataStream::read(): end of data' (std::ios_base::failure) caught"
+            );
+        }
         return true;
     }
     false
+}
+
+fn transaction_optional_data_error(payload: &[u8]) -> Option<&'static str> {
+    let mut reader = Reader::new(payload);
+    reader.bytes(4).ok()?;
+    if reader.u8().ok()? != 0 {
+        return None;
+    }
+    let flags = reader.u8().ok()?;
+    if flags == 0 {
+        return None;
+    }
+
+    let input_count = bounded_count(reader.compact_size().ok()?).ok()?;
+    for _ in 0..input_count {
+        reader.bytes(36).ok()?;
+        let script_len = bounded_count(reader.compact_size().ok()?).ok()?;
+        reader.bytes(script_len).ok()?;
+        reader.bytes(4).ok()?;
+    }
+    let output_count = bounded_count(reader.compact_size().ok()?).ok()?;
+    for _ in 0..output_count {
+        reader.bytes(8).ok()?;
+        let script_len = bounded_count(reader.compact_size().ok()?).ok()?;
+        reader.bytes(script_len).ok()?;
+    }
+
+    if flags & 1 != 0 {
+        let mut has_witness = false;
+        for _ in 0..input_count {
+            let item_count = bounded_count(reader.compact_size().ok()?).ok()?;
+            for _ in 0..item_count {
+                let item_len = bounded_count(reader.compact_size().ok()?).ok()?;
+                has_witness |= item_len != 0;
+                reader.bytes(item_len).ok()?;
+            }
+        }
+        if !has_witness {
+            return Some("Superfluous witness record");
+        }
+    }
+    (flags != 1).then_some("Unknown transaction optional data")
 }
 
 fn recoverable_payload_message(network: Network, frame: &[u8]) -> Option<Message> {
@@ -1022,6 +1093,22 @@ fn decode_block_core_compatible(payload: &[u8]) -> Result<Block, WireError> {
         }
     }
     if offset != payload.len() {
+        // Core's block deserializer does not require the stream to be
+        // exhausted after the transaction vector. This matters for a
+        // malformed SegWit transaction whose witness vector has more
+        // records than inputs: Core parses the transaction up to its
+        // locktime, then lets normal block validation report the resulting
+        // merkle-root mismatch instead of disconnecting the peer.
+        if offset < payload.len()
+            && txdata.last().is_some_and(|transaction| {
+                transaction
+                    .input
+                    .iter()
+                    .any(|input| !input.witness.is_empty())
+            })
+        {
+            return Ok(Block { header, txdata });
+        }
         return Err(WireError::Payload(
             "block contains trailing transaction bytes".to_owned(),
         ));

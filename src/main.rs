@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::bail;
 use anyhow::{Context, Result};
 use bitcoin::Network;
+use clap::error::ErrorKind as ClapErrorKind;
 use time::{OffsetDateTime, macros::format_description};
 use tracing::Metadata;
 use tracing_subscriber::EnvFilter;
@@ -40,7 +41,21 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args = Args::parse_with_config()?;
+    let args = match Args::parse_with_config() {
+        Ok(args) => args,
+        Err(error) => {
+            if let Some(clap_error) = error.downcast_ref::<clap::Error>()
+                && matches!(
+                    clap_error.kind(),
+                    ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
+                )
+            {
+                clap_error.print()?;
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
     let daemon = args.daemon || args.daemon_wait;
     let daemon_wait = args.daemon_wait;
     let config = Config::from_args(args)?;
@@ -129,6 +144,7 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     }
     log_config_file_path(&node.config.config_file_args);
     log_startup_arguments(&node.config.config_file_args);
+    log_settings_file(node.config.settings_path());
     log_ignored_config_values(&node.config.config_file_args);
     log_config_warnings(&node.config.config_file_args);
     log_config_section_warnings(&node.config.config_file_args);
@@ -175,6 +191,34 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
 fn log_config_file_path(config_file_args: &[ConfigFileArg]) {
     if let Some(path) = config_file_args.first().map(|entry| &entry.path) {
         tracing::info!("Config file: {}", path.display());
+    }
+}
+
+fn log_settings_file(path: Option<&std::path::Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(serde_json::Value::Object(settings)) = serde_json::from_str(&contents) else {
+        return;
+    };
+
+    let mut unknown = settings
+        .keys()
+        .filter(|key| key.as_str() != "_warning_" && !is_known_config_option(key))
+        .collect::<Vec<_>>();
+    unknown.sort_unstable();
+    for key in unknown {
+        tracing::warn!("Ignoring unknown rw_settings value {key}");
+    }
+    for (key, value) in settings {
+        if key == "_warning_" {
+            continue;
+        }
+        let value = serde_json::to_string(&value).unwrap_or_else(|_| "null".to_owned());
+        tracing::info!("Setting file arg: {key} = {value}");
     }
 }
 
@@ -241,7 +285,12 @@ fn log_startup_arguments(config_file_args: &[ConfigFileArg]) {
             continue;
         };
         let (key, value) = argument.split_once('=').unwrap_or((argument, "1"));
-        let key = key.to_ascii_lowercase();
+        let mut key = key.to_ascii_lowercase();
+        let mut value = value.to_owned();
+        if key == "nosettings" && (value == "1" || value.eq_ignore_ascii_case("true")) {
+            key = "settings".to_owned();
+            value = "false".to_owned();
+        }
         if matches!(key.as_str(), "rpcbind" | "rpcallowip") {
             continue;
         }
@@ -251,6 +300,8 @@ fn log_startup_arguments(config_file_args: &[ConfigFileArg]) {
         );
         if redacted {
             tracing::info!("Command-line arg: {key}=****");
+        } else if key == "settings" && value == "false" {
+            tracing::info!("Command-line arg: {key}={value}");
         } else {
             tracing::info!("Command-line arg: {key}=\"{value}\"");
         }
@@ -260,18 +311,30 @@ fn log_startup_arguments(config_file_args: &[ConfigFileArg]) {
         if entry.key.is_empty() {
             continue;
         }
-        let value = if matches!(
+        let (key, value, unquoted) = if entry.key == "nosettings"
+            && (entry.value == "1" || entry.value.eq_ignore_ascii_case("true"))
+        {
+            ("settings", "false", true)
+        } else if matches!(
             entry.key.as_str(),
             "rpcauth" | "rpcpassword" | "rpcuser" | "torpassword"
         ) {
-            "****"
+            (&*entry.key, "****", false)
         } else {
-            entry.value.as_str()
+            (&*entry.key, entry.value.as_str(), false)
         };
         if let Some(section) = &entry.section {
-            tracing::info!("Config file arg: [{section}] {}=\"{value}\"", entry.key);
+            if unquoted {
+                tracing::info!("Config file arg: [{section}] {key}={value}");
+            } else {
+                tracing::info!("Config file arg: [{section}] {key}=\"{value}\"");
+            }
         } else {
-            tracing::info!("Config file arg: {}=\"{value}\"", entry.key);
+            if unquoted {
+                tracing::info!("Config file arg: {key}={value}");
+            } else {
+                tracing::info!("Config file arg: {key}=\"{value}\"");
+            }
         }
     }
 }

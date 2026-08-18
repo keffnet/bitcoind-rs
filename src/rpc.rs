@@ -2599,7 +2599,11 @@ fn dispatch_method_for_user(
                         "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
                         "bytessent_per_msg": peer.bytes_sent_per_msg,
                         "bytesrecv_per_msg": peer.bytes_received_per_msg,
-                        "connection_type": rpc_connection_type(peer.connection_type),
+                        "connection_type": if peer.manual {
+                            "manual"
+                        } else {
+                            rpc_connection_type(peer.connection_type)
+                        },
                         "transport_protocol_type": peer.transport_protocol_type,
                         "session_id": peer.session_id,
                     });
@@ -4466,7 +4470,7 @@ fn add_connection(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     let transport_v2 = param::<bool>(params, 2)?;
     if transport_v2 && !node.config.v2_transport {
-        bail!("v2transport requested but not enabled (see --v2transport)");
+        bail!("Error: v2transport requested but not enabled (see -v2transport)");
     }
     let connection_type = match requested_connection_type.as_str() {
         "outbound-full-relay" => "outbound-full",
@@ -4520,7 +4524,7 @@ fn add_node(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .transpose()?;
     if transport_v2 == Some(true) && !node.config.v2_transport {
-        bail!("v2transport requested but not enabled (see --v2transport)");
+        bail!("Error: v2transport requested but not enabled (see -v2transport)");
     }
     match command.as_str() {
         "add" => {
@@ -11359,8 +11363,18 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     // Core's BIP22 block decoder accepts trailing bytes and can report a
     // cheap proof-of-work failure before fully validating the body.
-    let (mut block, _) =
-        deserialize_partial::<bitcoin::Block>(&bytes).context("Block decode failed")?;
+    let (mut block, _) = match deserialize_partial::<bitcoin::Block>(&bytes) {
+        Ok(decoded) => decoded,
+        Err(_error) if oversized_coinbase_witness_nonce(&bytes) => {
+            // Core decodes oversized witness vectors and lets contextual block
+            // validation report the reserved-value-size rule. The bitcoin
+            // crate intentionally rejects allocations above its consensus
+            // vector bound, so recognize this narrow structure without
+            // allocating the hostile witness element.
+            return Ok(json!("bad-witness-nonce-size"));
+        }
+        Err(error) => return Err(anyhow::Error::new(error).context("Block decode failed")),
+    };
     node.chain
         .read()
         .update_uncommitted_block_structures(&mut block);
@@ -11426,19 +11440,142 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 let should_mark_invalid = error
                     .downcast_ref::<validation::ValidationError>()
                     .is_some_and(validation::ValidationError::should_mark_block_invalid);
-                let mut chain = node.chain.write();
-                if chain.header_by_hash(&hash).is_none()
-                    && let Err(header_error) = chain.accept_headers(&[block_header])
                 {
-                    debug!(%hash, %header_error, "could not retain rejected block header");
+                    let mut chain = node.chain.write();
+                    if chain.header_by_hash(&hash).is_none()
+                        && let Err(header_error) = chain.accept_headers(&[block_header])
+                    {
+                        debug!(%hash, %header_error, "could not retain rejected block header");
+                    }
+                    if should_mark_invalid && let Err(mark_error) = chain.invalidate_block(&hash) {
+                        debug!(%hash, %mark_error, "could not mark rejected block invalid");
+                    }
                 }
-                if should_mark_invalid && let Err(mark_error) = chain.invalidate_block(&hash) {
-                    debug!(%hash, %mark_error, "could not mark rejected block invalid");
+                if should_mark_invalid {
+                    node.refresh_large_work_invalid_chain_warning();
                 }
                 Ok(reason)
             } else {
                 Ok(json!(message))
             }
+        }
+    }
+}
+
+fn oversized_coinbase_witness_nonce(bytes: &[u8]) -> bool {
+    let mut offset = 80usize;
+    let Some(transaction_count) = read_compact_size_at(bytes, &mut offset) else {
+        return false;
+    };
+    if transaction_count == 0 || offset.checked_add(4).is_none_or(|end| end > bytes.len()) {
+        return false;
+    }
+    offset += 4;
+
+    let segwit = bytes.get(offset) == Some(&0) && bytes.get(offset + 1) == Some(&1);
+    if segwit {
+        offset += 2;
+    }
+    let Some(input_count) = read_compact_size_at(bytes, &mut offset) else {
+        return false;
+    };
+    if input_count == 0 {
+        return false;
+    }
+    for _ in 0..input_count {
+        if offset.checked_add(36).is_none_or(|end| end > bytes.len()) {
+            return false;
+        }
+        offset += 36;
+        let Some(script_size) = read_compact_size_at(bytes, &mut offset) else {
+            return false;
+        };
+        let Ok(script_size) = usize::try_from(script_size) else {
+            return false;
+        };
+        if offset
+            .checked_add(script_size)
+            .and_then(|end| end.checked_add(4))
+            .is_none_or(|end| end > bytes.len())
+        {
+            return false;
+        }
+        offset += script_size + 4;
+    }
+
+    let Some(output_count) = read_compact_size_at(bytes, &mut offset) else {
+        return false;
+    };
+    for _ in 0..output_count {
+        if offset.checked_add(8).is_none_or(|end| end > bytes.len()) {
+            return false;
+        }
+        offset += 8;
+        let Some(script_size) = read_compact_size_at(bytes, &mut offset) else {
+            return false;
+        };
+        let Ok(script_size) = usize::try_from(script_size) else {
+            return false;
+        };
+        if offset
+            .checked_add(script_size)
+            .is_none_or(|end| end > bytes.len())
+        {
+            return false;
+        }
+        offset += script_size;
+    }
+    if !segwit {
+        return false;
+    }
+
+    let Some(witness_item_count) = read_compact_size_at(bytes, &mut offset) else {
+        return false;
+    };
+    let mut first_item_size = None;
+    for item_index in 0..witness_item_count {
+        let Some(item_size) = read_compact_size_at(bytes, &mut offset) else {
+            return false;
+        };
+        let Ok(item_size) = usize::try_from(item_size) else {
+            return false;
+        };
+        if item_index == 0 {
+            first_item_size = Some(item_size);
+        }
+        if offset
+            .checked_add(item_size)
+            .is_none_or(|end| end > bytes.len())
+        {
+            return false;
+        }
+        offset += item_size;
+    }
+    witness_item_count != 1 || first_item_size != Some(32)
+}
+
+fn read_compact_size_at(bytes: &[u8], offset: &mut usize) -> Option<u64> {
+    let prefix = *bytes.get(*offset)?;
+    *offset = offset.checked_add(1)?;
+    match prefix {
+        0..=252 => Some(u64::from(prefix)),
+        253 => {
+            let end = offset.checked_add(2)?;
+            let value = u16::from_le_bytes(bytes.get(*offset..end)?.try_into().ok()?);
+            *offset = end;
+            Some(u64::from(value))
+        }
+        254 => {
+            let end = offset.checked_add(4)?;
+            let value = u32::from_le_bytes(bytes.get(*offset..end)?.try_into().ok()?);
+            *offset = end;
+            Some(u64::from(value))
+        }
+        255 => {
+            let end = offset.checked_add(8)?;
+            let value = u64::from_le_bytes(bytes.get(*offset..end)?.try_into().ok()?);
+            *offset = end;
+            Some(value)
         }
     }
 }
@@ -11556,7 +11693,11 @@ fn generate_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .collect::<Result<Vec<Transaction>>>()?;
     drop(mempool);
 
-    let block = build_mining_block_with_transactions(node, output_script, transactions)?;
+    // Core's generateblock creates a no-mempool template, whose coinbase
+    // contains the subsidy only, and appends the explicitly supplied
+    // transactions afterward. Their fees are therefore not paid to the
+    // miner by this RPC.
+    let block = build_mining_block_with_transactions(node, output_script, transactions, false)?;
     let Some(block) = mine_block(block, 1_000_000) else {
         bail!("failed to make block")
     };
@@ -11611,13 +11752,14 @@ fn build_mining_block(node: &Arc<Node>, script_pubkey: ScriptBuf) -> Result<Bloc
     }
     drop(mempool);
     drop(chain);
-    build_mining_block_with_transactions(node, script_pubkey, transactions)
+    build_mining_block_with_transactions(node, script_pubkey, transactions, true)
 }
 
 fn build_mining_block_with_transactions(
     node: &Arc<Node>,
     script_pubkey: ScriptBuf,
     transactions: Vec<Transaction>,
+    include_fees: bool,
 ) -> Result<Block> {
     let chain = node.chain.read();
     let tip = chain.tip();
@@ -11708,7 +11850,7 @@ fn build_mining_block_with_transactions(
             bits,
             script_pubkey,
             transactions,
-            fees,
+            fees: include_fees.then_some(fees).unwrap_or_default(),
             include_dummy_extranonce: true,
             version: Some(version),
         },
@@ -12452,16 +12594,33 @@ fn minimum_block_time(
 }
 
 fn prioritise_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
-    let txid: Txid = param::<String>(params, 0)?.parse()?;
+    let values = params
+        .as_array()
+        .ok_or_else(|| anyhow!("prioritisetransaction txid dummy fee_delta"))?;
+    let txid_value = values
+        .first()
+        .filter(|value| !value.is_null())
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("prioritisetransaction txid dummy fee_delta"))?;
+    let txid = parse_core_txid(txid_value)?;
     if let Some(dummy) = params.get(1).filter(|value| !value.is_null()) {
         let dummy = dummy
             .as_f64()
-            .ok_or_else(|| anyhow!("dummy priority argument must be numeric"))?;
+            .ok_or_else(|| json_type_error(dummy, "number"))?;
         if dummy != 0.0 {
-            bail!("priority is no longer supported; dummy argument must be 0")
+            bail!(
+                "Priority is no longer supported, dummy argument to prioritisetransaction must be 0."
+            )
         }
     }
-    let fee_delta = param::<i64>(params, 2)?;
+    let fee_delta_value = values
+        .get(2)
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| anyhow!("prioritisetransaction txid dummy fee_delta"))?;
+    let fee_delta = fee_delta_value
+        .as_i64()
+        .ok_or_else(|| json_type_error(fee_delta_value, "number"))?;
     let mut mempool = node.mempool.write();
     if mempool.has_dust_outputs(&txid) {
         bail!("Priority is not supported for transactions with dust outputs.")
@@ -12625,11 +12784,28 @@ fn mempool_cluster_chunks(mempool: &Mempool, txid: &Txid) -> Option<(u64, Vec<Me
     let transaction_ids = mempool_cluster_transaction_ids(mempool, txid)?;
     let cluster = transaction_ids.iter().copied().collect::<HashSet<_>>();
     let mut chunks = Vec::new();
+    let mut included = HashSet::new();
     for candidate in mempool.mining_order(u64::MAX, 0) {
         if !cluster.contains(&candidate) {
             continue;
         }
         if mempool.get(&candidate).is_none() {
+            continue;
+        }
+        included.insert(candidate);
+        append_mempool_chunk(
+            &mut chunks,
+            candidate,
+            mempool.adjusted_weight(&candidate),
+            modified_mempool_fee_sat(mempool, &candidate),
+        );
+    }
+    // `mining_order` intentionally leaves packages with a negative effective
+    // fee out of block assembly.  They are still real mempool entries and
+    // Core includes them in verbose mempool/cluster responses, so append any
+    // such entries in the topology-aware order used to define the cluster.
+    for candidate in transaction_ids {
+        if !included.insert(candidate) || mempool.get(&candidate).is_none() {
             continue;
         }
         append_mempool_chunk(
@@ -12727,12 +12903,12 @@ fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
     let (ancestor_size, ancestor_modified_fee) = aggregate(&ancestor_ids);
     let (descendant_size, descendant_modified_fee) = aggregate(&descendant_ids);
     let modified_fee = modified_mempool_fee_sat(mempool, txid);
-    let (_, chunks) =
-        mempool_cluster_chunks(mempool, txid).expect("mempool entry must have a cluster");
+    let (_, chunks) = mempool_cluster_chunks(mempool, txid)
+        .ok_or_else(|| anyhow!("Transaction not in mempool"))?;
     let chunk = chunks
         .iter()
         .find(|chunk| chunk.txids.contains(txid))
-        .expect("mempool entry must have a chunk");
+        .ok_or_else(|| anyhow!("Transaction mempool cluster has no chunk"))?;
     let parents = mempool_dependency_ids(mempool, txid);
     let mut children = mempool.children(txid).into_iter().collect::<Vec<_>>();
     // Core's GetChildren sorts by the raw transaction hash. The public
@@ -15559,6 +15735,10 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "priority is not supported for transactions with dust outputs." {
         return -8;
     }
+    if lower.starts_with("priority is no longer supported, dummy argument to prioritisetransaction")
+    {
+        return -8;
+    }
     if lower.starts_with("getblocktemplate must be called with the ") {
         return -8;
     }
@@ -15595,6 +15775,9 @@ fn rpc_error_code(message: &str) -> i32 {
         return -5;
     }
     if lower == "error: absolute timestamp is in the past" {
+        return -8;
+    }
+    if lower == "error: v2transport requested but not enabled (see -v2transport)" {
         return -8;
     }
     if lower == "only one of address and nodeid should be provided." {

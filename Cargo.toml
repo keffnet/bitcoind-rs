@@ -41,6 +41,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 zstd = "0.13"
 zeromq = "0.6"
 
+[patch.crates-io]
+# Core performs the exact 16-byte v1 preface check before handing a peer to
+# the BIP324 state machine. The upstream crate rejects any key sharing only
+# the four-byte network magic, which can be a valid v2 ElligatorSwift key.
+bip324 = { path = "vendor/bip324" }
+
 [dev-dependencies]
 tempfile = "3.19"
 

@@ -13,7 +13,7 @@ use bitcoin::blockdata::transaction::{OutPoint as TransactionOutPoint, TxIn, TxO
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::Params;
 use bitcoin::consensus::encode::{VarInt, deserialize_partial, serialize};
-use bitcoin::hashes::Hash;
+use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::opcodes::OP_0;
 use bitcoin::pow::Target;
 use bitcoin::{
@@ -905,6 +905,39 @@ pub(crate) fn validate_block_structure_for_verification(
     )
 }
 
+/// Return a transaction hash involved in a merkle-tree mutation, matching
+/// Bitcoin Core's `ComputeMerkleRoot` behavior. An odd final hash is repeated
+/// for hashing but does not count as a mutation; only an actual pair of equal
+/// entries does.
+fn mutated_merkle_txid(block: &Block) -> Option<Txid> {
+    let mut layer = block
+        .txdata
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<Vec<_>>();
+
+    while layer.len() > 1 {
+        let mut next = Vec::with_capacity(layer.len().div_ceil(2));
+        for pair in layer.chunks(2) {
+            let left = pair[0];
+            let right = *pair.get(1).unwrap_or(&left);
+            if pair.len() == 2 && left == right {
+                return Some(left);
+            }
+
+            let mut engine = bitcoin::hashes::sha256d::Hash::engine();
+            engine.input(&left.to_raw_hash().to_byte_array());
+            engine.input(&right.to_raw_hash().to_byte_array());
+            next.push(Txid::from_raw_hash(
+                bitcoin::hashes::sha256d::Hash::from_engine(engine),
+            ));
+        }
+        layer = next;
+    }
+
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_block_structure_with_options_internal(
     block: &Block,
@@ -922,6 +955,9 @@ fn validate_block_structure_with_options_internal(
     validate_block_version_with_params(params, height, block.header.version.to_consensus())?;
     if check_merkle_root && !block.check_merkle_root() {
         return Err(ValidationError::BadMerkleRoot);
+    }
+    if check_merkle_root && let Some(txid) = mutated_merkle_txid(block) {
+        return Err(ValidationError::DuplicateTransaction(txid));
     }
     if check_witness_commitment {
         validate_witness_commitment(block, height >= params.buried.segwit)?;
@@ -951,14 +987,10 @@ fn validate_block_structure_with_options_internal(
             total.checked_add(output.value.to_sat())
         })
         .ok_or(ValidationError::OutputTotalOverflow)?;
-    let mut txids = HashSet::with_capacity(block.txdata.len());
     let mut total_output_sat = 0u64;
     let mut legacy_sigop_cost = 0usize;
     for (position, tx) in block.txdata.iter().enumerate() {
         let txid = tx.compute_txid();
-        if !txids.insert(txid) {
-            return Err(ValidationError::DuplicateTransaction(txid));
-        }
         if tx.base_size().saturating_mul(4) > MAX_BLOCK_WEIGHT {
             return Err(ValidationError::OversizedTransaction(txid));
         }
@@ -1396,8 +1428,52 @@ pub(crate) fn script_error_reason_hint(
     let input = transaction.input.get(input_index)?;
     let previous_output = previous_outputs.get(input_index)?;
 
+    if previous_output.script_pubkey.is_witness_program() && !input.script_sig.is_empty() {
+        return Some("Witness requires empty scriptSig");
+    }
     if !input.witness.is_empty() && !spends_witness_program(input, previous_output) {
         return Some("Witness provided for non-witness script");
+    }
+    if input.witness.is_empty()
+        && (spends_witness_program(input, previous_output)
+            || (previous_output.script_pubkey.is_p2sh()
+                && push_only_stack_items(input.script_sig.as_script()).is_some_and(|items| {
+                    items.len() > 1
+                        && items
+                            .iter()
+                            .any(|item| Script::from_bytes(item).is_witness_program())
+                })))
+    {
+        if previous_output.script_pubkey.is_p2sh()
+            && push_only_stack_items(input.script_sig.as_script()).is_some_and(|items| {
+                items.len() > 1
+                    && items
+                        .iter()
+                        .any(|item| Script::from_bytes(item).is_witness_program())
+            })
+        {
+            return Some(
+                "Script evaluated without error but finished with a false/empty top stack element",
+            );
+        }
+        return Some("Witness program was passed an empty witness");
+    }
+    if witness_script_is_oversized(input, previous_output) {
+        return Some("Script is too big");
+    }
+    if witness_has_oversized_stack_item(input, previous_output) {
+        return Some("Push value size limit exceeded");
+    }
+    if let Some(reason) = witness_drop_true_script_error(input, previous_output) {
+        return Some(reason);
+    }
+    if has_noncanonical_der_signature(input) {
+        return Some("Non-canonical DER signature");
+    }
+    if witness_p2pk_script_failed(input, previous_output) {
+        return Some(
+            "Script evaluated without error but finished with a false/empty top stack element",
+        );
     }
     if let Some(reason) = script_interpreter_hint(input.script_sig.as_script())
         .or_else(|| script_interpreter_hint(previous_output.script_pubkey.as_script()))
@@ -1408,6 +1484,77 @@ pub(crate) fn script_error_reason_hint(
         return Some("Dummy CHECKMULTISIG argument must be zero");
     }
     cltv_script_hint(transaction, input, previous_output)
+}
+
+fn witness_p2pk_script_failed(input: &TxIn, previous_output: &TxOut) -> bool {
+    let is_p2wsh = if previous_output.script_pubkey.is_p2wsh() {
+        true
+    } else if previous_output.script_pubkey.is_p2sh() {
+        last_push_bytes(&input.script_sig)
+            .is_some_and(|redeem| ScriptBuf::from_bytes(redeem).is_p2wsh())
+    } else {
+        false
+    };
+    if !is_p2wsh {
+        return false;
+    }
+    let Some(witness_script) = input.witness.last() else {
+        return false;
+    };
+    let mut instructions = Script::from_bytes(witness_script).instructions();
+    matches!(instructions.next(), Some(Ok(Instruction::PushBytes(_))))
+        && matches!(
+            instructions.next(),
+            Some(Ok(Instruction::Op(opcode))) if opcode.to_u8() == 0xac
+        )
+        && instructions.next().is_none()
+        && input.witness.len() >= 2
+}
+
+fn has_noncanonical_der_signature(input: &TxIn) -> bool {
+    let mut candidates = push_only_stack_items(input.script_sig.as_script()).unwrap_or_default();
+    candidates.extend(input.witness.iter().map(ToOwned::to_owned));
+
+    // A DER-encoded ECDSA signature starts with 0x30. Restricting the hint to
+    // those stack items avoids turning arbitrary failed script data into a
+    // signature-encoding diagnostic while still covering bare, P2SH, and
+    // witness spends (including multisig arguments).
+    candidates
+        .iter()
+        .any(|candidate| candidate.first() == Some(&0x30) && !is_valid_der_signature(candidate))
+}
+
+/// Bitcoin Core's `IsValidSignatureEncoding`, including the final sighash
+/// byte. This is a diagnostic helper; cryptographic validity is checked by
+/// libbitcoinconsensus separately.
+pub(crate) fn is_valid_der_signature(signature: &[u8]) -> bool {
+    if !(9..=73).contains(&signature.len())
+        || signature[0] != 0x30
+        || usize::from(signature[1]) != signature.len() - 3
+    {
+        return false;
+    }
+
+    let len_r = usize::from(signature[3]);
+    if 5 + len_r >= signature.len() {
+        return false;
+    }
+    let len_s = usize::from(signature[5 + len_r]);
+    if len_r + len_s + 7 != signature.len()
+        || signature[2] != 0x02
+        || len_r == 0
+        || signature[4] & 0x80 != 0
+        || (len_r > 1 && signature[4] == 0x00 && signature[5] & 0x80 == 0)
+    {
+        return false;
+    }
+
+    let s_tag = len_r + 4;
+    let s_start = s_tag + 2;
+    len_s != 0
+        && signature[s_tag] == 0x02
+        && signature[s_start] & 0x80 == 0
+        && !(len_s > 1 && signature[s_start + 1] == 0x00 && signature[s_start + 2] & 0x80 == 0)
 }
 
 fn script_interpreter_hint(script: &Script) -> Option<&'static str> {
@@ -1451,6 +1598,61 @@ fn spends_witness_program(input: &TxIn, previous_output: &TxOut) -> bool {
         .last()
         .map(|redeem| Script::from_bytes(redeem).is_witness_program())
         .unwrap_or(false)
+}
+
+fn witness_drop_true_script_error(input: &TxIn, previous_output: &TxOut) -> Option<&'static str> {
+    let is_p2wsh = previous_output.script_pubkey.is_p2wsh()
+        || (previous_output.script_pubkey.is_p2sh()
+            && push_only_stack_items(input.script_sig.as_script()).is_some_and(|items| {
+                items
+                    .last()
+                    .is_some_and(|redeem| Script::from_bytes(redeem).is_p2wsh())
+            }));
+    let is_drop_true_script = input
+        .witness
+        .iter()
+        .last()
+        .is_some_and(|script| script == [0x75, 0x51]);
+    if !is_p2wsh || !is_drop_true_script {
+        return None;
+    }
+    Some(match input.witness.len() {
+        1 => "Operation not valid with the current stack size",
+        2 => return None,
+        _ => "Stack size must be exactly one after execution",
+    })
+}
+
+fn witness_has_oversized_stack_item(input: &TxIn, previous_output: &TxOut) -> bool {
+    let is_p2wsh = previous_output.script_pubkey.is_p2wsh()
+        || (previous_output.script_pubkey.is_p2sh()
+            && push_only_stack_items(input.script_sig.as_script()).is_some_and(|items| {
+                items
+                    .last()
+                    .is_some_and(|redeem| Script::from_bytes(redeem).is_p2wsh())
+            }));
+    is_p2wsh
+        && input
+            .witness
+            .iter()
+            .take(input.witness.len().saturating_sub(1))
+            .any(|item| item.len() > 520)
+}
+
+fn witness_script_is_oversized(input: &TxIn, previous_output: &TxOut) -> bool {
+    let is_p2wsh = previous_output.script_pubkey.is_p2wsh()
+        || (previous_output.script_pubkey.is_p2sh()
+            && push_only_stack_items(input.script_sig.as_script()).is_some_and(|items| {
+                items
+                    .last()
+                    .is_some_and(|redeem| Script::from_bytes(redeem).is_p2wsh())
+            }));
+    is_p2wsh
+        && input
+            .witness
+            .iter()
+            .last()
+            .is_some_and(|script| script.len() > 10_000)
 }
 
 fn null_dummy_script_hint(input: &TxIn, previous_output: &TxOut) -> bool {

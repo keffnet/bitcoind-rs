@@ -2439,6 +2439,16 @@ impl Mempool {
         if transaction.base_size().saturating_mul(4) > validation::MAX_BLOCK_WEIGHT {
             return Err(MempoolError::Oversized);
         }
+        // Core's PreChecks runs IsStandardTx before consulting the UTXO set.
+        // Preserve that fail-fast ordering for oversized witness-bearing
+        // transactions, whose inputs may be unavailable at the receiving
+        // peer but whose policy result is already deterministic.
+        if enforce_mempool_policy
+            && self.policy.require_standard
+            && transaction.weight().to_wu() > MAX_STANDARD_TX_WEIGHT
+        {
+            return Err(MempoolError::NonStandard("tx-size".to_owned()));
+        }
         let mut seen = HashSet::with_capacity(transaction.input.len());
         let mut input_total = 0u64;
         let mut previous_outputs = Vec::with_capacity(transaction.input.len());
@@ -2543,6 +2553,22 @@ impl Mempool {
                 modified_fee_sat,
                 &self.policy,
             )?;
+        }
+        if future_witness_version_policy_failure(&transaction, &previous_outputs) {
+            return Err(MempoolError::Script(
+                "Witness version reserved for soft-fork upgrades".to_owned(),
+            ));
+        }
+        // Core's policy script flags always include SCRIPT_VERIFY_WITNESS_PUBKEYTYPE,
+        // even when -acceptnonstdtxn disables the other standardness checks. The
+        // consensus library intentionally does not expose that policy-only flag,
+        // so recover this deterministic witness-v0 diagnostic before running the
+        // consensus script verifier.
+        if uncompressed_witness_pubkey_policy_failure(&transaction, &previous_outputs) {
+            return Err(MempoolError::Script(
+                "mempool-script-verify-flag-failed (Using non-compressed keys in segwit)"
+                    .to_owned(),
+            ));
         }
         // Core checks this after ordinary standardness so a short
         // transaction with a non-standard script reports that script
@@ -3787,6 +3813,70 @@ fn validate_standard_inputs(
     Ok(())
 }
 
+fn future_witness_version_policy_failure(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+) -> bool {
+    transaction
+        .input
+        .iter()
+        .zip(previous_outputs)
+        .any(|(input, previous)| {
+            let witness_script = if previous.script_pubkey.is_p2sh() {
+                push_only_stack_top(&input.script_sig).map(|redeem| ScriptBuf::from_bytes(redeem))
+            } else {
+                None
+            };
+            let script = witness_script
+                .as_deref()
+                .unwrap_or(previous.script_pubkey.as_script());
+            script
+                .witness_version()
+                .is_some_and(|version| version.to_num() > 1)
+        })
+}
+
+fn uncompressed_witness_pubkey_policy_failure(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+) -> bool {
+    transaction
+        .input
+        .iter()
+        .zip(previous_outputs)
+        .any(|(input, previous)| {
+            let redeem_script = if previous.script_pubkey.is_p2sh() {
+                push_only_stack_top(&input.script_sig).map(ScriptBuf::from_bytes)
+            } else {
+                None
+            };
+            let spending_script = redeem_script
+                .as_deref()
+                .unwrap_or(previous.script_pubkey.as_script());
+
+            if spending_script.is_p2wpkh() {
+                return input
+                    .witness
+                    .iter()
+                    .nth(1)
+                    .is_some_and(|pubkey| is_uncompressed_pubkey(pubkey));
+            }
+            if !spending_script.is_p2wsh() {
+                return false;
+            }
+
+            input
+                .witness
+                .last()
+                .and_then(|witness_script| p2pk_pubkey_bytes(Script::from_bytes(witness_script)))
+                .is_some_and(|pubkey| is_uncompressed_pubkey(&pubkey))
+        })
+}
+
+fn is_uncompressed_pubkey(pubkey: &[u8]) -> bool {
+    pubkey.len() == 65 && pubkey.first() == Some(&0x04)
+}
+
 fn validate_standard_witnesses(
     transaction: &Transaction,
     previous_outputs: &[TxOut],
@@ -3922,13 +4012,25 @@ fn mempool_script_reject_reason(
     let ValidationError::Script { input, reason, .. } = &error else {
         return error.to_string();
     };
-    if reason != "ERR_SCRIPT" {
-        return format!("mempool-script-verify-flag-failed ({reason})");
-    }
-
     let Some(transaction_input) = transaction.input.get(*input) else {
         return format!("mempool-script-verify-flag-failed ({reason})");
     };
+    // Core's mempool path reports the non-witness OP_CODESEPARATOR policy
+    // diagnostic before a later OP_RETURN execution failure. Block
+    // validation retains the execution reason, so keep this precedence
+    // local to the mempool projection.
+    let code_separator_in_non_witness_script = transaction_input.witness.is_empty()
+        && (contains_opcode(transaction_input.script_sig.as_script(), 0xab)
+            || previous_outputs
+                .get(*input)
+                .is_some_and(|output| contains_opcode(output.script_pubkey.as_script(), 0xab)));
+    if code_separator_in_non_witness_script {
+        return "mempool-script-verify-flag-failed (Using OP_CODESEPARATOR in non-witness script)"
+            .to_owned();
+    }
+    if reason != "ERR_SCRIPT" {
+        return format!("mempool-script-verify-flag-failed ({reason})");
+    }
     let script_reason = validation::script_error_reason_hint(transaction, previous_outputs, *input)
         .or_else(|| script_interpreter_hint(&transaction_input.script_sig))
         .or_else(|| {
@@ -4097,33 +4199,7 @@ fn validate_standard_ecdsa_signature(signature: &[u8]) -> Result<(), &'static st
 
 /// Bitcoin Core's IsValidSignatureEncoding, including the final sighash byte.
 fn is_valid_der_signature(signature: &[u8]) -> bool {
-    if !(9..=73).contains(&signature.len())
-        || signature[0] != 0x30
-        || usize::from(signature[1]) != signature.len() - 3
-    {
-        return false;
-    }
-
-    let len_r = usize::from(signature[3]);
-    if 5 + len_r >= signature.len() {
-        return false;
-    }
-    let len_s = usize::from(signature[5 + len_r]);
-    if len_r + len_s + 7 != signature.len()
-        || signature[2] != 0x02
-        || len_r == 0
-        || signature[4] & 0x80 != 0
-        || (len_r > 1 && signature[4] == 0x00 && signature[5] & 0x80 == 0)
-    {
-        return false;
-    }
-
-    let s_tag = len_r + 4;
-    let s_start = s_tag + 2;
-    len_s != 0
-        && signature[s_tag] == 0x02
-        && signature[s_start] & 0x80 == 0
-        && !(len_s > 1 && signature[s_start + 1] == 0x00 && signature[s_start + 2] & 0x80 == 0)
+    validation::is_valid_der_signature(signature)
 }
 
 fn is_strict_pubkey_encoding(pubkey: &[u8]) -> bool {

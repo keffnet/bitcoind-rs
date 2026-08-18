@@ -19,10 +19,9 @@ use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{Decodable, VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::ecdsa::Signature as EcdsaSignature;
-use bitcoin::hashes::{Hash, sha256, sha256d};
-use bitcoin::key::{CompressedPublicKey, TapTweak};
+use bitcoin::hashes::{Hash, sha256d};
+use bitcoin::key::TapTweak;
 use bitcoin::merkle_tree::PartialMerkleTree;
-use bitcoin::opcodes::OP_0;
 use bitcoin::psbt::{GetKey, Input as PsbtInput, KeyRequest, Psbt};
 use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
@@ -10851,128 +10850,6 @@ fn sign_message_with_private_key(params: &Value) -> Result<Value> {
     )))
 }
 
-#[derive(Clone, Copy)]
-enum LegacyMessageOutputType {
-    Legacy,
-    P2shSegwit,
-    Bech32,
-}
-
-fn bip322_message_hash(message: &str) -> sha256::Hash {
-    let tag = Sha256::digest(b"BIP0322-signed-message");
-    let mut hasher = Sha256::new();
-    hasher.update(&tag);
-    hasher.update(&tag);
-    hasher.update(message.as_bytes());
-    sha256::Hash::from_slice(&hasher.finalize()).expect("SHA256 always produces 32 bytes")
-}
-
-fn bip322_to_spend(address: &Address, message: &str) -> Transaction {
-    let message_hash = bip322_message_hash(message);
-    let script_sig = Builder::new()
-        .push_opcode(OP_0)
-        .push_slice(message_hash.to_byte_array())
-        .into_script();
-    Transaction {
-        version: Version::non_standard(0),
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::new(Txid::all_zeros(), u32::MAX),
-            script_sig,
-            sequence: bitcoin::Sequence::ZERO,
-            witness: Witness::default(),
-        }],
-        output: vec![TxOut {
-            value: Amount::ZERO,
-            script_pubkey: address.script_pubkey(),
-        }],
-    }
-}
-
-fn decode_bip322_to_sign(signature_bytes: &[u8], to_spend: &Transaction) -> Option<Transaction> {
-    if let Ok(transaction) = deserialize::<Transaction>(signature_bytes) {
-        return Some(transaction);
-    }
-    let witness = deserialize::<Witness>(signature_bytes).ok()?;
-    Some(Transaction {
-        version: Version::non_standard(0),
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::new(to_spend.compute_txid(), 0),
-            script_sig: ScriptBuf::new(),
-            sequence: bitcoin::Sequence::ZERO,
-            witness,
-        }],
-        output: vec![TxOut {
-            value: Amount::ZERO,
-            script_pubkey: ScriptBuf::from_bytes(vec![OP_RETURN.to_u8()]),
-        }],
-    })
-}
-
-/// Verify a BIP-322 Simple signature. `None` means the bytes do not encode a
-/// BIP-322 transaction or witness stack and lets the legacy caller preserve
-/// Core's address/signature error distinction.
-fn verify_bip322_signature(
-    address: &Address,
-    signature_bytes: &[u8],
-    message: &str,
-) -> Result<Option<bool>> {
-    let to_spend = bip322_to_spend(address, message);
-    let Some(to_sign) = decode_bip322_to_sign(signature_bytes, &to_spend) else {
-        return Ok(None);
-    };
-    if to_sign.input.len() != 1
-        || to_sign.output.len() != 1
-        || to_sign.input[0].previous_output != OutPoint::new(to_spend.compute_txid(), 0)
-        || to_sign.output[0].value != Amount::ZERO
-        || to_sign.output[0].script_pubkey != ScriptBuf::from_bytes(vec![OP_RETURN.to_u8()])
-    {
-        return Ok(None);
-    }
-
-    let serialized = serialize(&to_sign);
-    let spent_outputs = [bitcoinconsensus::Utxo {
-        script_pubkey: to_spend.output[0].script_pubkey.as_bytes().as_ptr(),
-        script_pubkey_len: to_spend.output[0].script_pubkey.len() as u32,
-        value: 0,
-    }];
-    let flags = bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT;
-    let verified = bitcoinconsensus::verify_with_flags(
-        to_spend.output[0].script_pubkey.as_bytes(),
-        0,
-        &serialized,
-        Some(&spent_outputs),
-        0,
-        flags,
-    )
-    .is_ok();
-    if !verified {
-        return Ok(Some(false));
-    }
-    if !matches!(to_sign.version.0, 0 | 2) {
-        bail!("This signature is not yet supported");
-    }
-    Ok(Some(true))
-}
-
-fn recovered_legacy_message_address(
-    public_key: bitcoin::PublicKey,
-    output_type: LegacyMessageOutputType,
-    network: Network,
-) -> Address {
-    if !public_key.compressed {
-        return Address::p2pkh(public_key, network);
-    }
-    let compressed = CompressedPublicKey::try_from(public_key)
-        .expect("a compressed recovered public key converts losslessly");
-    match output_type {
-        LegacyMessageOutputType::Legacy => Address::p2pkh(public_key, network),
-        LegacyMessageOutputType::P2shSegwit => Address::p2shwpkh(&compressed, network),
-        LegacyMessageOutputType::Bech32 => Address::p2wpkh(&compressed, network),
-    }
-}
-
 fn verify_message(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if (0..3).any(|index| params.get(index).is_none_or(Value::is_null)) {
         bail!("verifymessage")
@@ -10982,72 +10859,25 @@ fn verify_message(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .map_err(|_| anyhow!("Invalid address"))?
         .require_network(node.config.network)
         .map_err(|_| anyhow!("Invalid address"))?;
+    // Core's legacy message RPC only accepts P2PKH destinations. SegWit and
+    // Taproot addresses are valid Bitcoin addresses, but they do not refer to
+    // a key in the compact-message format used by signmessagewithprivkey.
+    if address.address_type() != Some(AddressType::P2pkh) {
+        bail!("Address does not refer to key");
+    }
     let signature_bytes = base64::engine::general_purpose::STANDARD
         .decode(param::<String>(params, 1)?)
         .map_err(|_| anyhow!("Malformed base64 encoding"))?;
     let message = param::<String>(params, 2)?;
-    if signature_bytes.is_empty() {
-        bail!("Malformed base64 encoding");
-    }
-
-    let Some(address_type) = address.address_type() else {
-        return match verify_bip322_signature(&address, &signature_bytes, &message)? {
-            Some(verified) => Ok(json!(verified)),
-            None => bail!("Address does not refer to key"),
-        };
-    };
-    let mut output_type = match address_type {
-        AddressType::P2pkh => LegacyMessageOutputType::Legacy,
-        AddressType::P2sh => LegacyMessageOutputType::P2shSegwit,
-        AddressType::P2wpkh => LegacyMessageOutputType::Bech32,
-        AddressType::P2wsh | AddressType::P2tr => {
-            return match verify_bip322_signature(&address, &signature_bytes, &message)? {
-                Some(verified) => Ok(json!(verified)),
-                None => bail!("Address does not refer to key"),
-            };
-        }
-        _ => {
-            return match verify_bip322_signature(&address, &signature_bytes, &message)? {
-                Some(verified) => Ok(json!(verified)),
-                None => bail!("Address does not refer to key"),
-            };
-        }
-    };
-
-    let mut legacy_signature_bytes = signature_bytes.clone();
-    let header = legacy_signature_bytes[0];
-    let legacy_verified = if (27..=42).contains(&header) && legacy_signature_bytes.len() == 65 {
-        let signature_type = (header - 27) >> 2;
-        if signature_type == 3 {
-            legacy_signature_bytes[0] -= 8;
-            output_type = LegacyMessageOutputType::Bech32;
-        } else if signature_type == 2 {
-            legacy_signature_bytes[0] -= 4;
-            output_type = LegacyMessageOutputType::P2shSegwit;
-        }
-        let signature = MessageSignature::from_slice(&legacy_signature_bytes).ok();
-        signature
-            .and_then(|signature| {
-                signature
-                    .recover_pubkey(&Secp256k1::new(), signed_msg_hash(&message))
-                    .ok()
-            })
-            .is_some_and(|public_key| {
-                recovered_legacy_message_address(public_key, output_type, node.config.network)
-                    == address
-            })
-    } else {
-        false
-    };
-    if legacy_verified {
-        return Ok(json!(true));
-    }
-
-    match verify_bip322_signature(&address, &signature_bytes, &message)? {
-        Some(verified) => Ok(json!(verified)),
-        None if (27..=42).contains(&header) && signature_bytes.len() == 65 => Ok(json!(false)),
-        None => bail!("Malformed base64 encoding"),
-    }
+    let verified = MessageSignature::from_slice(&signature_bytes)
+        .ok()
+        .and_then(|signature| {
+            signature
+                .recover_pubkey(&Secp256k1::new(), signed_msg_hash(&message))
+                .ok()
+        })
+        .is_some_and(|public_key| Address::p2pkh(public_key, node.config.network) == address);
+    Ok(json!(verified))
 }
 
 fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -21759,7 +21589,7 @@ mod tests {
             pre_segwit_block.txdata[0].input[0]
                 .sequence
                 .to_consensus_u32(),
-            0xffff_fffe
+            0xffff_ffff
         );
         assert_eq!(pre_segwit_block.txdata[0].output.len(), 1);
         assert!(get_block_template(&node, &json!([{}])).is_err());
@@ -26203,31 +26033,16 @@ mod tests {
             verify_message(&node, &json!([address.to_string(), signature, message]),).unwrap(),
             true
         );
-        let bip322_p2wpkh = "AkcwRAIgCu7IrN3jCvBdp5myPZHCKiOW5o3EToYG2xgPbjiw6JsCIFwaZMcYQj9FmWcNtZk3qTp2UDBm77cbFmxQ3WVnVxrCASEDonFDI6fuQ05yUfeQIsOs599XHZnpaTxaqD13g4sXYRY=";
-        assert_eq!(
+        assert!(
             verify_message(
                 &node,
                 &json!([
                     "bcrt1q00cc7f4m04f5mjdcm9g6c5y2a3wnvfvflljety",
-                    bip322_p2wpkh,
-                    "This is just a test message"
+                    signature,
+                    message
                 ])
             )
-            .unwrap(),
-            true
-        );
-        let bip322_p2tr = "AUFdYU3dZCSmTxWnl5ja/Jo096VAaKtdaYs8b4ikF2iuQ2fiy7YSFHBWcD40a1oBKTVWUrXqOC0pXoDjTFKqM/ObAQ==";
-        assert_eq!(
-            verify_message(
-                &node,
-                &json!([
-                    "bcrt1p5t6gmtfkd4q8jfgz40auxqgtll895n85amlgvgsz0jwxvfw9qltss6wfve",
-                    bip322_p2tr,
-                    "This is just a test message"
-                ])
-            )
-            .unwrap(),
-            true
+            .is_err()
         );
         assert_eq!(
             verify_message(&node, &json!([address.to_string(), signature, "tampered"]),).unwrap(),

@@ -1077,6 +1077,7 @@ struct PeerState {
     last_header_sent: parking_lot::Mutex<Option<BlockHash>>,
     pending_block_relay: parking_lot::Mutex<Vec<BlockHash>>,
     suppressed_block_relay: parking_lot::Mutex<HashSet<BlockHash>>,
+    pending_block_serves: parking_lot::Mutex<Vec<Inventory>>,
     last_headers_request: parking_lot::Mutex<Option<Instant>>,
     last_headers_request_time: parking_lot::Mutex<Option<u64>>,
     continuation_block: parking_lot::Mutex<Option<BlockHash>>,
@@ -3867,6 +3868,7 @@ async fn serve_peer(
         last_header_sent: parking_lot::Mutex::new(None),
         pending_block_relay: parking_lot::Mutex::new(Vec::new()),
         suppressed_block_relay: parking_lot::Mutex::new(HashSet::new()),
+        pending_block_serves: parking_lot::Mutex::new(Vec::new()),
         last_headers_request: parking_lot::Mutex::new(None),
         last_headers_request_time: parking_lot::Mutex::new(None),
         continuation_block: parking_lot::Mutex::new(None),
@@ -5745,16 +5747,25 @@ async fn serve_peer_loop(
                                 }
                             };
                             if !eligible {
+                                let body_missing = {
+                                    let chain = node.chain.read();
+                                    chain.block_height_by_hash(&item.hash).is_some()
+                                        && !chain.store.contains(&item.hash)
+                                };
+                                if body_missing {
+                                    queue_pending_block_serve(peer_state, item.clone());
+                                }
                                 continue;
                             }
                             let Some(block) = node.block_store_reader.get(&item.hash)? else {
-                                // The native store is populated asynchronously.  A block
-                                // header can therefore be known before its body is visible to
-                                // the serving reader.  Tell the requester to release its
-                                // in-flight marker so the regular download tick can retry.
-                                missing.push(item);
+                                // Core keeps a request quiet while a known header is still
+                                // waiting for its body. Remember the request so the response
+                                // can be sent as soon as the body is accepted, rather than
+                                // losing the request to the native store visibility race.
+                                queue_pending_block_serve(peer_state, item);
                                 continue;
                             };
+                            forget_pending_block_serve(peer_state, item.hash);
                             if node.historical_block_serving_limit_reached(
                                 &item.hash,
                                 false,
@@ -6077,6 +6088,7 @@ async fn serve_peer_loop(
                     if compact_reconstruction_failed == Some(hash) {
                         compact_reconstruction_failed = None;
                     }
+                    flush_pending_block_serves(node, peers, hash).await?;
                     node.record_peer_block(peer_id, hash);
                     if !was_stored {
                         maybe_select_peer_bip152_highbandwidth(
@@ -6262,6 +6274,7 @@ async fn serve_peer_loop(
                                 )
                                 .await?
                                 {
+                                    flush_pending_block_serves(node, peers, block_hash).await?;
                                     node.record_peer_block(peer_id, block_hash);
                                     if !was_stored {
                                         maybe_select_peer_bip152_highbandwidth(
@@ -6520,6 +6533,7 @@ async fn serve_peer_loop(
                             if compact_reconstruction_failed == Some(block_hash) {
                                 compact_reconstruction_failed = None;
                             }
+                            flush_pending_block_serves(node, peers, block_hash).await?;
                             node.record_peer_block(peer_id, block_hash);
                             if !was_stored {
                                 maybe_select_peer_bip152_highbandwidth(
@@ -8907,6 +8921,75 @@ async fn send_block_relay_announcement(
     .await
 }
 
+fn queue_pending_block_serve(state: &PeerState, request: Inventory) {
+    let mut pending = state.pending_block_serves.lock();
+    if !pending.iter().any(|queued| queued.hash == request.hash) {
+        pending.push(request);
+    }
+}
+
+fn forget_pending_block_serve(state: &PeerState, hash: BlockHash) {
+    state
+        .pending_block_serves
+        .lock()
+        .retain(|request| request.hash != hash);
+}
+
+async fn flush_pending_block_serves(
+    node: &Arc<Node>,
+    peers: &PeerRegistry,
+    hash: BlockHash,
+) -> Result<()> {
+    let recipients = peers
+        .lock()
+        .iter()
+        .map(|(peer_id, state)| (*peer_id, state.clone()))
+        .collect::<Vec<_>>();
+    for (peer_id, state) in recipients {
+        let requests = {
+            let mut pending = state.pending_block_serves.lock();
+            let mut requests = Vec::new();
+            pending.retain(|request| {
+                if request.hash == hash {
+                    requests.push(request.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            requests
+        };
+        if requests.is_empty() {
+            continue;
+        }
+        let Some(block) = node.block_store_reader.get(&hash)? else {
+            let mut pending = state.pending_block_serves.lock();
+            for request in requests {
+                if !pending.iter().any(|queued| queued.hash == request.hash) {
+                    pending.push(request);
+                }
+            }
+            continue;
+        };
+        for request in requests {
+            let block = if request.kind == InventoryType::Block {
+                block_without_witness(&block)
+            } else {
+                block.clone()
+            };
+            send_message(
+                node,
+                peer_id,
+                &state.writer,
+                node.config.network,
+                &Message::Block(block),
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 fn queue_block_relay_batch(peers: &PeerRegistry, hashes: &[BlockHash]) {
     if hashes.is_empty() {
         return;
@@ -10869,6 +10952,7 @@ mod tests {
             last_header_sent: parking_lot::Mutex::new(None),
             pending_block_relay: parking_lot::Mutex::new(Vec::new()),
             suppressed_block_relay: parking_lot::Mutex::new(HashSet::new()),
+            pending_block_serves: parking_lot::Mutex::new(Vec::new()),
             last_headers_request: parking_lot::Mutex::new(None),
             last_headers_request_time: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),
@@ -13324,6 +13408,7 @@ mod tests {
             last_header_sent: parking_lot::Mutex::new(None),
             pending_block_relay: parking_lot::Mutex::new(Vec::new()),
             suppressed_block_relay: parking_lot::Mutex::new(HashSet::new()),
+            pending_block_serves: parking_lot::Mutex::new(Vec::new()),
             last_headers_request: parking_lot::Mutex::new(None),
             last_headers_request_time: parking_lot::Mutex::new(None),
             continuation_block: parking_lot::Mutex::new(None),

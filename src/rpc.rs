@@ -1,7 +1,7 @@
 //! Wallet-free Bitcoin Core-style JSON-RPC over HTTP/1.1.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
+use std::io::{Cursor, IoSlice};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock, atomic::Ordering};
@@ -587,8 +587,26 @@ impl HttpConnection {
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n",
             body.len()
         );
-        self.stream.write_all(header.as_bytes()).await?;
-        self.stream.write_all(body).await?;
+        let header = header.into_bytes();
+        let mut header_offset = 0;
+        let mut body_offset = 0;
+        while header_offset < header.len() || body_offset < body.len() {
+            let buffers = [
+                IoSlice::new(&header[header_offset..]),
+                IoSlice::new(&body[body_offset..]),
+            ];
+            let written = self.stream.write_vectored(&buffers).await?;
+            if written == 0 {
+                bail!("RPC client closed the connection while writing a response");
+            }
+            let header_remaining = header.len().saturating_sub(header_offset);
+            if written < header_remaining {
+                header_offset += written;
+            } else {
+                header_offset = header.len();
+                body_offset = body_offset.saturating_add(written - header_remaining);
+            }
+        }
         self.stream.flush().await?;
         if !keep_alive {
             self.stream.shutdown().await?;

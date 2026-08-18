@@ -23796,14 +23796,20 @@ mod tests {
         assert!(
             dispatch_method(&node, "getblockfrompeer", &json!([genesis.to_string(), 7]),).is_err()
         );
-        assert!(
+        let unknown_hash = BlockHash::all_zeros();
+        assert_eq!(
             dispatch_method(
                 &node,
                 "getblockfrompeer",
-                &json!([BlockHash::all_zeros().to_string(), 7]),
+                &json!([unknown_hash.to_string(), 7]),
             )
-            .is_err()
+            .unwrap(),
+            json!({})
         );
+        let crate::p2p::PeerCommand::RequestBlock(hash) = receiver.try_recv().unwrap() else {
+            panic!("expected unknown block request command");
+        };
+        assert_eq!(hash, unknown_hash);
     }
 
     #[test]

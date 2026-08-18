@@ -6213,20 +6213,16 @@ impl Node {
     }
 
     pub fn request_block_from_peer(&self, peer_id: usize, hash: bitcoin::BlockHash) -> Result<()> {
-        {
+        let known_header = {
             let chain = self.chain.read();
-            let height = chain
+            if chain
                 .block_height_by_hash(&hash)
-                .ok_or_else(|| anyhow::anyhow!("Block header missing"))?;
-            if chain.is_pruned() && height > chain.height() {
-                bail!(
-                    "In prune mode, only blocks that the node has already synced previously can be fetched from a peer"
-                );
-            }
-            if chain.store.contains(&hash) {
+                .is_some_and(|_| chain.store.contains(&hash))
+            {
                 bail!("Block already downloaded");
             }
-        }
+            chain.block_height_by_hash(&hash).is_some()
+        };
         let sender = self
             .peer_commands
             .read()
@@ -6241,8 +6237,11 @@ impl Node {
         {
             bail!("Pre-SegWit peer");
         }
+        if self.peer_has_inflight_block_request(peer_id, hash) {
+            bail!("Already requested from this peer");
+        }
         self.clear_peer_block_requests_for_hash(hash);
-        if !self.track_manual_peer_block_request(peer_id, hash) {
+        if known_header && !self.track_manual_peer_block_request(peer_id, hash) {
             bail!("block request limit reached for peer {peer_id}");
         }
         if sender.send(p2p::PeerCommand::RequestBlock(hash)).is_err() {

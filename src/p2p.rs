@@ -4135,26 +4135,19 @@ async fn serve_peer_loop(
                             kind: InventoryType::WitnessBlock,
                             hash,
                         };
-                        if node.peer_has_inflight_block_request(peer_id, hash) {
-                            send_getdata_batches(
-                                node,
-                                peer_id,
-                                writer,
-                                node.config.network,
-                                std::slice::from_ref(&request),
-                            )
-                            .await?;
-                        } else {
-                            queue_block_requests(&mut pending_block_requests, [request]);
-                            flush_pending_block_requests(
-                                node,
-                                peer_id,
-                                writer,
-                                node.config.network,
-                                &mut pending_block_requests,
-                            )
-                            .await?;
-                        }
+                        // getblockfrompeer is a manual fetch. Core sends the
+                        // request even when the hash is not in the local
+                        // block index, so it must not go through the
+                        // headers-first scheduler (which requires a known
+                        // height before it can track an in-flight body).
+                        send_getdata_batches(
+                            node,
+                            peer_id,
+                            writer,
+                            node.config.network,
+                            std::slice::from_ref(&request),
+                        )
+                        .await?;
                         continue;
                     }
                     Some(PeerCommand::Ping(nonce)) if peer_version > BIP31_VERSION => {

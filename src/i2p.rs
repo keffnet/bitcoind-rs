@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tracing::debug;
 
 use crate::address::NetworkEndpoint;
 
@@ -78,7 +79,13 @@ impl I2pSam {
     }
 
     pub(crate) async fn connect(&self, endpoint: &NetworkEndpoint) -> Result<TcpStream> {
-        let result = self.connect_inner(endpoint).await;
+        let result = self.connect_inner(endpoint).await.map_err(|error| {
+            if error.to_string().starts_with("Cannot connect to ") {
+                anyhow::anyhow!("Error connecting to {endpoint}: {error}")
+            } else {
+                error
+            }
+        });
         if result.is_err() && self.persistent {
             self.reset().await;
         }
@@ -90,7 +97,7 @@ impl I2pSam {
             bail!("I2P SAM can only connect to I2P endpoints")
         };
         if *port != 0 && *port != I2P_SAM_PORT {
-            bail!("I2P SAM v3.1 only supports port 0 or {I2P_SAM_PORT}, not {port}")
+            bail!("Error connecting to {endpoint}, connection refused due to arbitrary port {port}")
         }
 
         if self.persistent {
@@ -159,6 +166,12 @@ impl I2pSam {
     }
 
     async fn create_session(&self, persistent: bool) -> Result<SamSession> {
+        let session_type = if persistent {
+            "persistent"
+        } else {
+            "transient"
+        };
+        debug!("Creating {session_type} I2P SAM session");
         let mut control = self.open_control().await?;
         self.hello(&mut control).await?;
         let session_id = format!("bitcoin-rs-{}", hex::encode(random::<[u8; 8]>()));
@@ -261,23 +274,14 @@ impl I2pSam {
     }
 
     async fn open_control(&self) -> Result<TcpStream> {
-        tokio::time::timeout(
+        let stream = tokio::time::timeout(
             self.connect_timeout,
             TcpStream::connect(self.control_address),
         )
         .await
-        .with_context(|| {
-            format!(
-                "connecting to I2P SAM control service {}",
-                self.control_address
-            )
-        })?
-        .with_context(|| {
-            format!(
-                "connecting to I2P SAM control service {}",
-                self.control_address
-            )
-        })
+        .map_err(|_| anyhow::anyhow!("Cannot connect to {}", self.control_address))?
+        .map_err(|_| anyhow::anyhow!("Cannot connect to {}", self.control_address))?;
+        Ok(stream)
     }
 
     async fn hello(&self, stream: &mut TcpStream) -> Result<()> {

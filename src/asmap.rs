@@ -21,9 +21,9 @@ pub struct AsMap {
 impl AsMap {
     pub fn from_file(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)
-            .with_context(|| format!("Could not find asmap file {}", path.display()))?;
+            .with_context(|| format!("Could not find asmap file \"{}\"", path.display()))?;
         Self::from_bytes(&data)
-            .with_context(|| format!("Could not parse asmap file {}", path.display()))
+            .with_context(|| format!("Could not parse asmap file \"{}\"", path.display()))
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self> {

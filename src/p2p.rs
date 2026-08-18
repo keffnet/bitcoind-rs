@@ -1914,8 +1914,9 @@ impl PeerManager {
                 .await;
             }
         });
-        let configured_connect_nodes =
-            self.node.config.connect_disabled || !self.node.config.seed_nodes.is_empty();
+        let configured_connect_nodes = (self.node.config.connect_disabled
+            || !self.node.config.seed_nodes.is_empty())
+            && !self.node.config.dnsseed;
         let has_seed_nodes = !self.node.config.seed_nodes_for_address_fetch.is_empty();
         let has_add_nodes = !self.node.config.add_nodes.is_empty();
         if !configured_connect_nodes {
@@ -1946,6 +1947,11 @@ impl PeerManager {
             && self.node.config.dnsseed
             && !self.node.config.force_dns_seed
             && has_known_network_addresses;
+        let dns_seed_fallback_delay = if self.node.known_network_addresses().len() >= 1_000 {
+            Duration::from_secs(5 * 60)
+        } else {
+            DNS_SEED_FALLBACK_DELAY
+        };
         let fixed_seed_fallback_started_at = unix_time_seconds();
         let mut fixed_seeds_added = false;
         if !self.node.config.dnsseed {
@@ -1994,7 +2000,7 @@ impl PeerManager {
             if remembered != 0 {
                 info!(remembered, "added bootstrap peer addresses");
             }
-            Vec::new()
+            self.node.config.seed_nodes.clone()
         } else {
             let elapsed = Duration::from_secs(
                 unix_time_seconds().saturating_sub(fixed_seed_fallback_started_at),
@@ -2051,6 +2057,12 @@ impl PeerManager {
             info!("addcon thread start");
         } else {
             info!("opencon thread start");
+            if delayed_dns_seed_fallback {
+                info!(
+                    "Waiting {} seconds before querying DNS seeds.",
+                    dns_seed_fallback_delay.as_secs()
+                );
+            }
             tokio::spawn(async move {
                 // Core's open-connection thread wakes frequently enough for
                 // mocktime-driven fixed-seed fallback and address discovery.
@@ -2066,13 +2078,14 @@ impl PeerManager {
                     let outbound_peer_count = discovery_node
                         .peer_infos()
                         .into_iter()
-                        .filter(|peer| !peer.inbound)
+                        .filter(|peer| !peer.inbound && peer.connection_type == "outbound-full")
                         .count();
                     if !queried_delayed_dns_seed
-                        && should_query_dns_seed_fallback(
+                        && should_query_dns_seed_fallback_after(
                             delayed_dns_seed_fallback,
                             discovery_started.elapsed(),
                             outbound_peer_count,
+                            dns_seed_fallback_delay,
                         )
                     {
                         queried_delayed_dns_seed = true;
@@ -2090,6 +2103,13 @@ impl PeerManager {
                                 );
                             }
                         }
+                    } else if !queried_delayed_dns_seed
+                        && delayed_dns_seed_fallback
+                        && discovery_started.elapsed() >= dns_seed_fallback_delay
+                        && outbound_peer_count >= DNS_SEED_OUTBOUND_THRESHOLD
+                    {
+                        queried_delayed_dns_seed = true;
+                        info!("P2P peers available. Skipped DNS seeding.");
                     }
                     if !fixed_seeds_added
                         && should_add_fixed_seed_fallback(
@@ -2722,14 +2742,27 @@ fn select_discovery_endpoints(
     selected
 }
 
+#[cfg(test)]
 fn should_query_dns_seed_fallback(
     enabled: bool,
     elapsed: Duration,
     outbound_peer_count: usize,
 ) -> bool {
-    enabled
-        && elapsed >= DNS_SEED_FALLBACK_DELAY
-        && outbound_peer_count < DNS_SEED_OUTBOUND_THRESHOLD
+    should_query_dns_seed_fallback_after(
+        enabled,
+        elapsed,
+        outbound_peer_count,
+        DNS_SEED_FALLBACK_DELAY,
+    )
+}
+
+fn should_query_dns_seed_fallback_after(
+    enabled: bool,
+    elapsed: Duration,
+    outbound_peer_count: usize,
+    delay: Duration,
+) -> bool {
+    enabled && elapsed >= delay && outbound_peer_count < DNS_SEED_OUTBOUND_THRESHOLD
 }
 
 fn should_add_fixed_seed_fallback(
@@ -3128,11 +3161,12 @@ async fn discover_dns_seeds(
         Network::Testnet => 18333,
         Network::Testnet4 => 48333,
         Network::Signet => 38333,
-        Network::Regtest => return Vec::new(),
+        Network::Regtest => 18444,
     };
     let mut addresses = Vec::new();
     for host in hosts {
         let (host, port) = dns_seed_target(&host, default_port);
+        info!("Loading addresses from DNS seed {host}");
         if let Ok(resolved) = tokio::net::lookup_host((host, port)).await {
             addresses.extend(resolved.take(16));
         }
@@ -3184,7 +3218,8 @@ fn dns_seed_hosts(network: Network, signet_seed_nodes: &[String]) -> Vec<String>
             "seed.signet.bitcoin.sprovoost.nl",
             "seed.signet.achownodes.xyz",
         ],
-        Network::Testnet4 | Network::Regtest => &[],
+        Network::Testnet4 => &[],
+        Network::Regtest => &["dummySeed.invalid."],
     };
     hosts.iter().map(|host| (*host).to_owned()).collect()
 }
@@ -4424,16 +4459,13 @@ async fn serve_peer_loop(
                             approximate_best_block_depth(node),
                         );
                         let acceptable = version.services & expected == expected;
-                        let limited_with_witness = version.services
-                            & (wire::NODE_NETWORK_LIMITED | wire::NODE_WITNESS)
-                            == (wire::NODE_NETWORK_LIMITED | wire::NODE_WITNESS);
                         if !acceptable {
                             debug!(
                                 "does not offer the expected services ({:08x} offered, {:08x} expected)",
                                 version.services, expected
                             );
                         }
-                        !acceptable && !limited_with_witness
+                        !acceptable
                     }
                 {
                     anyhow::bail!("peer does not advertise the required services");

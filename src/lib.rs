@@ -1250,9 +1250,14 @@ pub(crate) struct IpSubnet {
 impl IpSubnet {
     pub(crate) fn parse(value: &str) -> Result<Self> {
         let mut parts = value.split('/');
-        let address = parts
+        let address_value = parts
             .next()
-            .ok_or_else(|| anyhow::anyhow!("invalid IP/Subnet"))?
+            .ok_or_else(|| anyhow::anyhow!("invalid IP/Subnet"))?;
+        let address_value = address_value
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .unwrap_or(address_value);
+        let address = address_value
             .parse::<IpAddr>()
             .map_err(|_| anyhow::anyhow!("invalid IP/Subnet"))?;
         let prefix = match parts.next() {
@@ -1709,12 +1714,6 @@ impl Node {
             .map(AsMap::from_file)
             .transpose()?
             .map(Arc::new);
-        if let Some(asmap) = &asmap {
-            info!(
-                version = %asmap.version_hex(),
-                "Using ASMap for IP bucketing"
-            );
-        }
         if let Some(mock_time) = config.mock_time {
             time::set_mock_time(mock_time);
         }
@@ -2320,6 +2319,17 @@ impl Node {
             .iter()
             .map(|(id, peer)| (*id, peer.endpoint.clone()))
             .collect::<HashMap<_, _>>();
+        let new_count = known_addresses
+            .iter()
+            .filter(|(address, _, _)| !tried_addresses.contains(address))
+            .count()
+            + network_addresses
+                .iter()
+                .filter(|(endpoint, _)| !network_tried_addresses.contains(endpoint))
+                .count();
+        let tried_count = tried_addresses.len() + network_tried_addresses.len();
+        let total_count = new_count.saturating_add(tried_count);
+        info!("CheckAddrman: new {new_count}, tried {tried_count}, total {total_count} started");
 
         if known_addresses.len() > MAX_KNOWN_ADDRESSES
             || network_addresses.len() > MAX_KNOWN_ADDRESSES
@@ -2356,6 +2366,7 @@ impl Node {
                 bail!("tried network address {endpoint} is absent from the known tables");
             }
         }
+        info!("CheckAddrman: completed");
         Ok(())
     }
 
@@ -2389,6 +2400,26 @@ impl Node {
             "ASMap Health Check: {clearnet_peers} clearnet peers are mapped to {} ASNs with {unmapped_peers} peers being unmapped",
             mapped_asns.len()
         );
+    }
+
+    pub fn log_asmap_configuration(&self) {
+        if let Some(asmap) = &self.asmap {
+            if let Some(path) = self.config.asmap.as_deref() {
+                let size = fs::metadata(path).map_or(0, |metadata| metadata.len());
+                info!(
+                    "Opened asmap file \"{}\" ({} bytes) from disk",
+                    path.display(),
+                    size
+                );
+            }
+            info!(
+                "Using asmap version {} for IP bucketing",
+                asmap.version_hex()
+            );
+        } else {
+            info!("Using /16 prefix for IP bucketing");
+        }
+        self.log_asmap_health();
     }
 
     fn reconcile_mempool_after_chain_change(
@@ -3621,9 +3652,14 @@ impl Node {
         let payload = wire::encode_message_payload(message)?;
         let payload_len = u32::try_from(payload.len())
             .context("P2P capture payload exceeds the on-disk length field")?;
-        let directory = self
-            .config
-            .datadir
+        let network_datadir = if network_data_dir_name(self.config.network).is_empty() {
+            self.config.datadir.clone()
+        } else {
+            self.config
+                .datadir
+                .join(network_data_dir_name(self.config.network))
+        };
+        let directory = network_datadir
             .join("message_capture")
             .join(endpoint.to_string().replace(':', "_"));
         fs::create_dir_all(&directory)
@@ -7385,7 +7421,7 @@ mod tests {
 
         let path = directory
             .path()
-            .join("message_capture/192.0.2.1_18444/msgs_sent.dat");
+            .join("regtest/message_capture/192.0.2.1_18444/msgs_sent.dat");
         let bytes = fs::read(path).unwrap();
         assert_eq!(bytes.len(), 8 + 12 + 4 + 8);
         assert_ne!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 0);

@@ -68,6 +68,14 @@ fn parse_socket_addr(value: &str) -> std::result::Result<SocketAddr, String> {
         .ok_or_else(|| format!("could not resolve socket address '{value}'"))
 }
 
+fn parse_electrum_arg(value: &str) -> std::result::Result<String, String> {
+    if value == "0" {
+        Ok(value.to_owned())
+    } else {
+        parse_socket_addr(value).map(|_| value.to_owned())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProxyEndpoint {
     Tcp(SocketAddr),
@@ -1575,8 +1583,12 @@ pub struct Args {
     )]
     pub rpc_whitelist_default: Option<bool>,
 
-    #[arg(long, default_value = "127.0.0.1:30001")]
-    pub electrum: SocketAddr,
+    #[arg(
+        long,
+        default_value = "127.0.0.1:30001",
+        value_parser = parse_electrum_arg
+    )]
+    pub electrum: String,
 
     #[arg(long, default_value_t = false)]
     pub rest: bool,
@@ -3211,6 +3223,10 @@ impl Config {
         let logging = parse_logging_config(&args)?;
         let network = network_from_args(&args)?;
         let proxy = parse_proxy_settings(&args.proxy)?;
+        let electrum_bind = (args.electrum != "0")
+            .then(|| parse_socket_addr(&args.electrum))
+            .transpose()
+            .map_err(|error| anyhow!("Invalid Electrum address: {error}"))?;
         if args.datadir_explicit && !args.datadir.is_dir() {
             bail!(
                 "Specified data directory \"{}\" does not exist.",
@@ -3319,7 +3335,12 @@ impl Config {
                     Some(if path.is_absolute() {
                         path
                     } else {
-                        args.datadir.join(path)
+                        let network_datadir = network_data_dir_name(network);
+                        if network_datadir.is_empty() {
+                            args.datadir.join(path)
+                        } else {
+                            args.datadir.join(network_datadir).join(path)
+                        }
                     })
                 }
             }
@@ -3372,6 +3393,13 @@ impl Config {
                     .with_context(|| format!("parsing --rpcallowip subnet '{value}'"))
             })
             .collect::<Result<Vec<_>>>()?;
+        if args.cjdns_reachable
+            && rpc_allow_ips.iter().any(|subnet| {
+                matches!(subnet.address(), IpAddr::V6(address) if address.octets()[0] == 0xfc)
+            })
+        {
+            bail!("Invalid -rpcallowip subnet specification");
+        }
         let rpc_binds = if !args.server {
             Vec::new()
         } else if !args.rpc_binds.is_empty() && !rpc_allow_ips.is_empty() {
@@ -3563,7 +3591,7 @@ impl Config {
             );
         }
         if args.force_dns_seed && !dnsseed {
-            bail!("Cannot set --forcednsseed=true when setting --dnsseed=false");
+            bail!("Cannot set -forcednsseed to true when setting -dnsseed to false.");
         }
         let discover = args
             .discover
@@ -3841,7 +3869,7 @@ impl Config {
             rpc_server_timeout_secs,
             rpc_threads,
             rpc_work_queue,
-            electrum_bind: Some(args.electrum),
+            electrum_bind,
             rest: args.rest,
             ipc_bind: args.ipc_bind,
             seed_nodes,
@@ -4206,7 +4234,32 @@ fn parse_rpc_binds(values: &[String], default_port: u16) -> Result<Vec<SocketAdd
         .iter()
         .map(|value| {
             if let Ok(address) = value.parse::<SocketAddr>() {
+                if address.port() == 0 {
+                    bail!("Invalid port specified in -rpcbind: '{value}'");
+                }
                 return Ok(address);
+            }
+            if let Some((host, port)) = value
+                .strip_prefix('[')
+                .and_then(|value| value.split_once("]:"))
+                && let Ok(ip) = host.parse::<IpAddr>()
+            {
+                let port = port
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port != 0)
+                    .ok_or_else(|| anyhow!("Invalid port specified in -rpcbind: '{value}'"))?;
+                return Ok(SocketAddr::new(ip, port));
+            }
+            if let Some((host, port)) = value.rsplit_once(':')
+                && let Ok(ip) = host.parse::<IpAddr>()
+            {
+                let port = port
+                    .parse::<u16>()
+                    .ok()
+                    .filter(|port| *port != 0)
+                    .ok_or_else(|| anyhow!("Invalid port specified in -rpcbind: '{value}'"))?;
+                return Ok(SocketAddr::new(ip, port));
             }
             if let Ok(ip) = value.parse::<IpAddr>() {
                 return Ok(SocketAddr::new(ip, default_port));
@@ -5745,6 +5798,15 @@ mod tests {
             Config::from_args(args).unwrap().onion_proxy,
             Some(ProxyEndpoint::Unix(onion_path))
         );
+    }
+
+    #[test]
+    fn electrum_zero_disables_the_default_listener() {
+        let args = Args::try_parse_from(["bitcoind-rs", "--electrum=0"]).unwrap();
+        assert_eq!(args.electrum, "0");
+
+        let args = Args::try_parse_from(["bitcoind-rs"]).unwrap();
+        assert_eq!(args.electrum, "127.0.0.1:30001");
     }
 
     #[test]

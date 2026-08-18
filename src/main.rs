@@ -136,6 +136,7 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     } else {
         builder.init();
     }
+    node.log_asmap_configuration();
     if node.config.network == Network::Signet {
         tracing::info!(
             "Signet derived magic (message start): {}",
@@ -356,8 +357,6 @@ fn log_parameter_interactions(config_file_args: &[ConfigFileArg]) {
     let mut connect_enabled = false;
     let mut connect_disabled = false;
     let mut seednode = false;
-    let mut dnsseed = false;
-    let mut proxy = false;
     let mut explicit_dnsseed = false;
     for argument in std::env::args().skip(1) {
         let Some(argument) = argument
@@ -377,17 +376,12 @@ fn log_parameter_interactions(config_file_args: &[ConfigFileArg]) {
             "seednode" => seednode = true,
             "dnsseed" => {
                 explicit_dnsseed = true;
-                dnsseed = value == "1" || value.eq_ignore_ascii_case("true");
             }
-            "proxy" => proxy = true,
             _ => {}
         }
     }
     if connect_enabled && seednode {
         tracing::warn!("-seednode is ignored when -connect is used");
-    }
-    if (connect_enabled || connect_disabled) && dnsseed && proxy {
-        tracing::warn!("-dnsseed is ignored when -connect is used and -proxy is specified");
     }
     let config_has = |key: &str| config_file_args.iter().any(|entry| entry.key == key);
     if connect_disabled && !explicit_dnsseed && !config_has("dnsseed") {

@@ -4140,6 +4140,10 @@ fn get_node_addresses(node: &Arc<Node>, params: &Value) -> Result<Value> {
     const ADDRMAN_HORIZON_SECS: u64 = 30 * 24 * 60 * 60;
     const ADDRMAN_MAX_FUTURE_SECS: u64 = 10 * 60;
 
+    if node.config.check_addrman != 0 {
+        node.check_addrman_consistency()?;
+    }
+
     let count = match params.get(0) {
         None | Some(Value::Null) => Some(1usize),
         Some(value) => {

@@ -1600,7 +1600,7 @@ pub struct Args {
     pub rest: bool,
 
     /// Bind the Core multiprocess Cap'n Proto interface to one or more Unix
-    /// socket addresses.  `unix` uses `<datadir>/node.sock` and `unix:<path>`
+    /// socket addresses.  `unix` uses `<network data directory>/node.sock` and `unix:<path>`
     /// accepts an explicit path.
     #[arg(long = "ipcbind", value_name = "ADDRESS")]
     pub ipc_bind: Vec<String>,
@@ -2902,9 +2902,10 @@ fn logging_category_target(category: &str) -> Option<&'static str> {
         "zmq" => "bitcoind_rs::zmq",
         "reindex" | "prune" | "coindb" | "leveldb" | "validation" | "blockstorage" | "scan"
         | "kernel" => "bitcoind_rs::chain",
+        "ipc" => "bitcoind_rs::ipc",
         // These categories are valid Core settings but have no distinct
         // Rust subsystem in the wallet-free build.
-        "bench" | "walletdb" | "selectcoins" | "rand" | "libevent" | "qt" | "ipc" => return None,
+        "bench" | "walletdb" | "selectcoins" | "rand" | "libevent" | "qt" => return None,
         _ => return None,
     })
 }

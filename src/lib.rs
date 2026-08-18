@@ -1577,6 +1577,7 @@ pub struct Node {
     coinstats_unclean_startup_height: Option<u32>,
     pub started_at: Instant,
     pub(crate) network_nonce: u64,
+    ipc_wait_cancellation: AtomicBool,
     shutdown: Notify,
 }
 
@@ -2090,6 +2091,7 @@ impl Node {
             coinstats_unclean_startup_height,
             started_at: Instant::now(),
             network_nonce: random(),
+            ipc_wait_cancellation: AtomicBool::new(false),
             shutdown: Notify::new(),
         });
         if node.config.check_addrman != 0 {
@@ -2106,6 +2108,16 @@ impl Node {
 
     pub fn connect_block(&self, block: Block) -> Result<ChainEvent> {
         self.connect_block_with_policy(block, false)
+    }
+
+    pub(crate) fn note_ipc_wait_cancellation(&self) {
+        self.ipc_wait_cancellation.store(true, Ordering::Release);
+    }
+
+    fn log_ipc_wait_cancellation(&self) {
+        if self.ipc_wait_cancellation.swap(false, Ordering::AcqRel) {
+            debug!(target: "bitcoind_rs::ipc", "interrupted (canceled)");
+        }
     }
 
     pub(crate) fn connect_block_from_peer(&self, block: Block) -> Result<ChainEvent> {
@@ -2148,6 +2160,8 @@ impl Node {
                 false,
             );
             let _ = self.events.send(tip.clone());
+
+            self.log_ipc_wait_cancellation();
 
             self.announce_zmq_block_events(&disconnected_blocks, &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);

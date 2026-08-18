@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ use tracing::{debug, warn};
 use std::os::unix::fs::FileTypeExt;
 
 use crate::Node;
+use crate::config::network_data_dir_name;
 
 const DEFAULT_SOCKET_NAME: &str = "node.sock";
 const MAX_UNIX_SOCKET_PATH: usize = 107;
@@ -38,6 +39,7 @@ const MAX_UNIX_SOCKET_PATH: usize = 107;
 #[derive(Clone, Default)]
 struct InterruptHandle {
     generation: Arc<AtomicU64>,
+    pending: Arc<AtomicBool>,
     notify: Arc<Notify>,
 }
 
@@ -46,13 +48,25 @@ impl InterruptHandle {
         self.generation.load(Ordering::Acquire)
     }
 
+    fn begin(&self) -> (u64, bool) {
+        (
+            self.generation(),
+            self.pending.swap(false, Ordering::AcqRel),
+        )
+    }
+
     fn interrupt(&self) {
+        self.pending.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.notify.notify_waiters();
     }
 
     fn was_interrupted(&self, generation: u64) -> bool {
-        self.generation() != generation
+        let interrupted = self.generation() != generation;
+        if interrupted {
+            self.pending.store(false, Ordering::Release);
+        }
+        interrupted
     }
 }
 
@@ -176,6 +190,34 @@ struct BlockTemplateService {
     data: Arc<Mutex<BlockTemplateData>>,
     options: crate::rpc::IpcBlockCreateOptions,
     interrupt: InterruptHandle,
+}
+
+struct WaitNextCancellationGuard {
+    node: Arc<Node>,
+    completed: bool,
+}
+
+impl WaitNextCancellationGuard {
+    fn new(node: Arc<Node>) -> Self {
+        Self {
+            node,
+            completed: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for WaitNextCancellationGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            debug!("IPC server: socket disconnected");
+            debug!("IPC server request canceled while executing");
+            self.node.note_ipc_wait_cancellation();
+        }
+    }
 }
 
 fn set_block_ref(
@@ -352,11 +394,17 @@ impl crate::mining_capnp::mining::Server for MiningService {
         params: crate::mining_capnp::mining::WaitTipChangedParams,
         mut results: crate::mining_capnp::mining::WaitTipChangedResults,
     ) -> Result<(), capnp::Error> {
+        debug!("Mining.waitTipChanged");
         let params = params.get()?;
         let current_tip = params.get_current_tip()?.to_vec();
         let timeout = timeout_duration(params.get_timeout());
         let mut chain_events = self.node.subscribe_chain();
-        let interrupt_generation = self.interrupt.generation();
+        let (interrupt_generation, interrupted_before_wait) = self.interrupt.begin();
+
+        if interrupted_before_wait {
+            set_empty_block_ref(results.get().init_result());
+            return Ok(());
+        }
 
         let current_hash = bitcoin::BlockHash::from_slice(&current_tip).ok();
         let already_changed = {
@@ -424,9 +472,13 @@ impl crate::mining_capnp::mining::Server for MiningService {
         params: crate::mining_capnp::mining::CreateNewBlockParams,
         mut results: crate::mining_capnp::mining::CreateNewBlockResults,
     ) -> Result<(), capnp::Error> {
+        debug!("Mining.createNewBlock");
         let params = params.get()?;
         let options = ipc_block_create_options(params.get_options()?);
-        let interrupt_generation = self.interrupt.generation();
+        let (interrupt_generation, interrupted_before_start) = self.interrupt.begin();
+        if interrupted_before_start {
+            return Ok(());
+        }
         if params.get_cooldown() {
             let mut chain_events = self.node.subscribe_chain();
             while self.node.chain.read().is_initial_block_download() {
@@ -450,6 +502,10 @@ impl crate::mining_capnp::mining::Server for MiningService {
                     break;
                 };
                 let cooldown_seconds = u64::from(blocks_ahead.clamp(3, 20));
+                debug!(
+                    blocks_ahead,
+                    cooldown_seconds, "Mining.createNewBlock cooldown"
+                );
                 let deadline = tokio::time::Instant::now() + Duration::from_secs(cooldown_seconds);
                 let last_tip = self.node.chain.read().best_hash();
                 loop {
@@ -477,13 +533,15 @@ impl crate::mining_capnp::mining::Server for MiningService {
                         _ = tokio::time::sleep(remaining) => break,
                     }
                 }
+                break 'cooldown;
             }
         }
+        debug!("Mining.createNewBlock template");
         if self.interrupt.was_interrupted(interrupt_generation) {
             return Ok(());
         }
         let template = crate::rpc::create_ipc_block_template(&self.node, options)
-            .map_err(|error| capnp::Error::failed(error.to_string()))?;
+            .map_err(|error| capnp::Error::failed(format!("std::exception: {error}")))?;
         results
             .get()
             .set_result(block_template_client(self.node.clone(), template, options));
@@ -534,6 +592,7 @@ impl crate::mining_capnp::mining::Server for MiningService {
         _params: crate::mining_capnp::mining::InterruptParams,
         _results: crate::mining_capnp::mining::InterruptResults,
     ) -> Result<(), capnp::Error> {
+        debug!("Mining.interrupt");
         self.interrupt.interrupt();
         Ok(())
     }
@@ -690,29 +749,45 @@ impl crate::mining_capnp::block_template::Server for BlockTemplateService {
         params: crate::mining_capnp::block_template::WaitNextParams,
         mut results: crate::mining_capnp::block_template::WaitNextResults,
     ) -> Result<(), capnp::Error> {
+        debug!("BlockTemplate.waitNext");
+        debug!("IPC server post request");
         let params = params.get()?;
         let wait_options = params.get_options()?;
         let timeout = timeout_duration(wait_options.get_timeout());
         let fee_threshold =
             u64::try_from(wait_options.get_fee_threshold().max(0)).unwrap_or(u64::MAX);
         let current = self.data.lock().template.clone();
-        let generation = self.interrupt.generation();
+        let (generation, interrupted_before_wait) = self.interrupt.begin();
+        let mut cancellation = WaitNextCancellationGuard::new(self.node.clone());
+        if interrupted_before_wait {
+            cancellation.complete();
+            return Ok(());
+        }
         let mut chain_events = self.node.subscribe_chain();
         let mut mempool_events = self.node.subscribe_mempool();
         let deadline = timeout.map(|duration| tokio::time::Instant::now() + duration);
 
         loop {
             if self.interrupt.was_interrupted(generation) {
+                cancellation.complete();
                 return Ok(());
             }
             if ipc_template_tip_requires_refresh(&self.node, current.block.header.prev_blockhash) {
-                let template = crate::rpc::create_ipc_block_template(&self.node, self.options)
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let template = match crate::rpc::create_ipc_block_template(&self.node, self.options)
+                {
+                    Ok(template) => template,
+                    Err(error) => {
+                        cancellation.complete();
+                        return Err(capnp::Error::failed(error.to_string()));
+                    }
+                };
+                debug!("IPC server send response");
                 results.get().set_result(block_template_client(
                     self.node.clone(),
                     template,
                     self.options,
                 ));
+                cancellation.complete();
                 return Ok(());
             }
 
@@ -729,6 +804,7 @@ impl crate::mining_capnp::block_template::Server for BlockTemplateService {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                     if remaining.is_zero() {
+                        cancellation.complete();
                         return Ok(());
                     }
                     tokio::time::timeout(remaining, wait).await.ok()
@@ -736,29 +812,48 @@ impl crate::mining_capnp::block_template::Server for BlockTemplateService {
                 None => Some(wait.await),
             };
             match event {
-                None | Some(WaitEvent::Shutdown | WaitEvent::Interrupt) => return Ok(()),
+                None | Some(WaitEvent::Shutdown | WaitEvent::Interrupt) => {
+                    cancellation.complete();
+                    return Ok(());
+                }
                 Some(WaitEvent::Chain | WaitEvent::Mempool | WaitEvent::Tick) => {}
             }
 
             if ipc_template_tip_requires_refresh(&self.node, current.block.header.prev_blockhash) {
-                let template = crate::rpc::create_ipc_block_template(&self.node, self.options)
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let template = match crate::rpc::create_ipc_block_template(&self.node, self.options)
+                {
+                    Ok(template) => template,
+                    Err(error) => {
+                        cancellation.complete();
+                        return Err(capnp::Error::failed(error.to_string()));
+                    }
+                };
+                debug!("IPC server send response");
                 results.get().set_result(block_template_client(
                     self.node.clone(),
                     template,
                     self.options,
                 ));
+                cancellation.complete();
                 return Ok(());
             }
             if fee_threshold < crate::mining_capnp::MAX_MONEY as u64 {
-                let template = crate::rpc::create_ipc_block_template(&self.node, self.options)
-                    .map_err(|error| capnp::Error::failed(error.to_string()))?;
+                let template = match crate::rpc::create_ipc_block_template(&self.node, self.options)
+                {
+                    Ok(template) => template,
+                    Err(error) => {
+                        cancellation.complete();
+                        return Err(capnp::Error::failed(error.to_string()));
+                    }
+                };
                 if template.total_fees_sat >= current.total_fees_sat.saturating_add(fee_threshold) {
+                    debug!("IPC server send response");
                     results.get().set_result(block_template_client(
                         self.node.clone(),
                         template,
                         self.options,
                     ));
+                    cancellation.complete();
                     return Ok(());
                 }
             }
@@ -827,7 +922,7 @@ impl IpcServer {
             let mut listeners = Vec::with_capacity(node.config.ipc_bind.len());
             let mut paths = Vec::with_capacity(node.config.ipc_bind.len());
             for address in &node.config.ipc_bind {
-                let path = parse_socket_path(address, &node.config.datadir)?;
+                let path = parse_socket_path(address, &node.config.datadir, node.config.network)?;
                 if path.as_os_str().is_empty() {
                     bail!("IPC socket path must not be empty");
                 }
@@ -911,7 +1006,7 @@ async fn serve_connection(stream: UnixStream, node: Arc<Node>) -> Result<()> {
     Ok(())
 }
 
-fn parse_socket_path(address: &str, datadir: &Path) -> Result<PathBuf> {
+fn parse_socket_path(address: &str, datadir: &Path, network: bitcoin::Network) -> Result<PathBuf> {
     let path = if address == "unix" {
         PathBuf::from(DEFAULT_SOCKET_NAME)
     } else if let Some(path) = address.strip_prefix("unix:") {
@@ -925,7 +1020,7 @@ fn parse_socket_path(address: &str, datadir: &Path) -> Result<PathBuf> {
     Ok(if path.is_absolute() {
         path
     } else {
-        datadir.join(path)
+        datadir.join(network_data_dir_name(network)).join(path)
     })
 }
 
@@ -933,6 +1028,7 @@ fn parse_socket_path(address: &str, datadir: &Path) -> Result<PathBuf> {
 mod tests {
     use super::IpcServer;
     use super::parse_socket_path;
+    use bitcoin::Network;
     use bitcoin::consensus::encode::deserialize;
     use bitcoin::hashes::Hash as _;
     use bitcoin::script::Builder;
@@ -949,18 +1045,30 @@ mod tests {
     #[test]
     fn parses_core_unix_socket_addresses() {
         assert_eq!(
-            parse_socket_path("unix", Path::new("/tmp/node")).unwrap(),
-            Path::new("/tmp/node/node.sock")
+            parse_socket_path("unix", Path::new("/tmp/node"), Network::Regtest).unwrap(),
+            Path::new("/tmp/node/regtest/node.sock")
         );
         assert_eq!(
-            parse_socket_path("unix:custom/node.sock", Path::new("/tmp/node")).unwrap(),
-            Path::new("/tmp/node/custom/node.sock")
+            parse_socket_path(
+                "unix:custom/node.sock",
+                Path::new("/tmp/node"),
+                Network::Regtest,
+            )
+            .unwrap(),
+            Path::new("/tmp/node/regtest/custom/node.sock")
         );
         assert_eq!(
-            parse_socket_path("unix:/tmp/custom.sock", Path::new("/tmp/node")).unwrap(),
+            parse_socket_path(
+                "unix:/tmp/custom.sock",
+                Path::new("/tmp/node"),
+                Network::Regtest,
+            )
+            .unwrap(),
             Path::new("/tmp/custom.sock")
         );
-        assert!(parse_socket_path("tcp:127.0.0.1:1", Path::new("/tmp/node")).is_err());
+        assert!(
+            parse_socket_path("tcp:127.0.0.1:1", Path::new("/tmp/node"), Network::Regtest).is_err()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1027,6 +1135,42 @@ mod tests {
                 let waited = wait_request.send().promise.await.unwrap();
                 assert_eq!(waited.get().unwrap().get_result().unwrap().get_height(), 0);
 
+                // Core may enqueue interrupt() before the corresponding wait
+                // request is dispatched.  The next interruptible request must
+                // consume that pending interruption rather than wait for its
+                // timeout.
+                mining.interrupt_request().send().promise.await.unwrap();
+                let mut pre_interrupted_wait = mining.wait_tip_changed_request();
+                pre_interrupted_wait.get().set_current_tip(&current_hash);
+                pre_interrupted_wait.get().set_timeout(60_000.0);
+                let pre_interrupted = pre_interrupted_wait.send().promise.await.unwrap();
+                assert_eq!(
+                    pre_interrupted
+                        .get()
+                        .unwrap()
+                        .get_result()
+                        .unwrap()
+                        .get_height(),
+                    -1
+                );
+
+                let mut interruptible_wait = mining.wait_tip_changed_request();
+                interruptible_wait.get().set_current_tip(&current_hash);
+                interruptible_wait.get().set_timeout(60_000.0);
+                let wait_task = tokio::task::spawn_local(interruptible_wait.send().promise);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                mining.interrupt_request().send().promise.await.unwrap();
+                let interrupted = wait_task.await.unwrap().unwrap();
+                assert_eq!(
+                    interrupted
+                        .get()
+                        .unwrap()
+                        .get_result()
+                        .unwrap()
+                        .get_height(),
+                    -1
+                );
+
                 // Make the active tip eligible for mining, then index a
                 // valid header-only descendant. Core's cooldown must remain
                 // pending while those headers are ahead of the tip and must
@@ -1060,6 +1204,15 @@ mod tests {
                     .accept_headers(&[header_one, header_two])
                     .unwrap();
                 assert_eq!(node.chain.read().blocks_ahead_of_tip(), Some(2));
+
+                let normal_cooldown = mining.create_new_block_request().send().promise;
+                let normal_response =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), normal_cooldown)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert!(normal_response.get().unwrap().get_result().is_ok());
+
                 let cooldown_request = mining.create_new_block_request();
                 let cooldown_task = tokio::task::spawn_local(cooldown_request.send().promise);
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;

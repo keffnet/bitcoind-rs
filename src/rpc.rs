@@ -12589,7 +12589,7 @@ fn mining_block_with_deployment_parameters(
         // Core's CMutableTransaction default is version 2, including for
         // coinbase transactions assembled by generatetoaddress.
         version: Version::TWO,
-        lock_time: LockTime::from_consensus(height.saturating_sub(1)),
+        lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: {
@@ -12599,10 +12599,10 @@ fn mining_block_with_deployment_parameters(
                 }
                 builder.into_script()
             },
-            // Match Core's CTxIn::MAX_SEQUENCE_NONFINAL.  Although the
-            // coinbase input cannot be spent in the block, miners and RPC
-            // clients observe this transaction field directly.
-            sequence: bitcoin::Sequence::from_consensus(0xffff_fffe),
+            // CTxIn's default sequence is final. Although the coinbase input
+            // cannot be spent in the block, miners and RPC clients observe
+            // this transaction field directly.
+            sequence: bitcoin::Sequence::MAX,
             witness: Witness::default(),
         }],
         output: vec![TxOut {

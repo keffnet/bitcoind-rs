@@ -19,15 +19,17 @@ use bitcoin::blockdata::transaction::{TxIn, Version};
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::encode::{Decodable, VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::ecdsa::Signature as EcdsaSignature;
-use bitcoin::hashes::{Hash, sha256d};
-use bitcoin::key::TapTweak;
+use bitcoin::hashes::{Hash, sha256, sha256d};
+use bitcoin::key::{CompressedPublicKey, TapTweak};
+use bitcoin::merkle_tree::PartialMerkleTree;
+use bitcoin::opcodes::OP_0;
 use bitcoin::psbt::{GetKey, Input as PsbtInput, KeyRequest, Psbt};
 use bitcoin::secp256k1::{Message, Secp256k1};
 use bitcoin::sighash::{EcdsaSighashType, Prevouts, SighashCache, TapSighashType};
 use bitcoin::sign_message::{MessageSignature, signed_msg_hash};
 use bitcoin::{
     Address, Amount, Block, BlockHash, Denomination, Network, OutPoint, ScriptBuf, Transaction,
-    TxOut, Txid,
+    TxOut, Txid, Wtxid,
 };
 use miniscript::descriptor::DescriptorType as MiniscriptDescriptorType;
 use miniscript::psbt::PsbtExt;
@@ -2012,6 +2014,10 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
             json!({name: value})
         } else if method == "scanblocks" && name == "filter_false_positives" {
             json!({"filter_false_positives": value})
+        } else if method == "gettxoutproof" && name == "prove_witness" {
+            json!({"prove_witness": value})
+        } else if method == "verifytxoutproof" && name == "verify_witness" {
+            json!({"verify_witness": value})
         } else {
             value.clone()
         };
@@ -2026,6 +2032,8 @@ fn rpc_parameter_alias(method: &str, name: &str) -> Option<&'static str> {
         ("dumptxoutset", "rollback") => Some("options"),
         ("gettxspendingprevout", "mempool_only" | "return_spending_tx") => Some("options"),
         ("scanblocks", "filter_false_positives") => Some("options"),
+        ("gettxoutproof", "prove_witness") => Some("options"),
+        ("verifytxoutproof", "verify_witness") => Some("options"),
         _ => None,
     }
 }
@@ -2045,8 +2053,8 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "getblocklocations" => Some(&["blockhash", "nblocks"]),
         "getchaintxstats" => Some(&["nblocks", "blockhash"]),
         "getnetworkhashps" => Some(&["nblocks", "height"]),
-        "gettxoutproof" => Some(&["txids", "blockhash"]),
-        "verifytxoutproof" => Some(&["proof"]),
+        "gettxoutproof" => Some(&["txids", "blockhash", "options"]),
+        "verifytxoutproof" => Some(&["proof", "options"]),
         "submitheader" => Some(&["hexdata"]),
         "getblockfrompeer" => Some(&["blockhash", "peer_id"]),
         "invalidateblock" | "reconsiderblock" | "preciousblock" => Some(&["blockhash"]),
@@ -6188,11 +6196,65 @@ fn get_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if txids.iter().any(|txid| !block_txids.contains_key(txid)) {
         bail!("Not all transactions found in specified or retrieved block");
     }
-    let proof = serialize_merkle_proof(&block, &txids)?;
-    Ok(json!(hex::encode(proof)))
+    let prove_witness = params
+        .get(2)
+        .filter(|value| !value.is_null())
+        .and_then(|value| value.get("prove_witness"))
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("prove_witness must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if !prove_witness {
+        let proof = serialize_merkle_proof(&block, &txids)?;
+        return Ok(json!(hex::encode(proof)));
+    }
+
+    let block_height = chain
+        .block_height_by_hash(&block_hash)
+        .ok_or_else(|| anyhow!("Block not found"))?;
+    let requested: HashSet<Txid> = txids.iter().copied().collect();
+    let proven_txs = block
+        .txdata
+        .iter()
+        .enumerate()
+        .filter(|(_, transaction)| requested.contains(&transaction.compute_txid()))
+        .map(|(blockindex, transaction)| {
+            json!({
+                "txid": transaction.compute_txid().to_string(),
+                "wtxid": transaction.compute_wtxid().to_string(),
+                "blockindex": blockindex,
+            })
+        })
+        .collect::<Vec<_>>();
+    let proof = serialize_witness_merkle_proof(&block, &requested)?;
+    Ok(json!({
+        "proof": hex::encode(proof),
+        "proven": {
+            "blockhash": block_hash.to_string(),
+            "blockheight": block_height,
+            "tx": proven_txs,
+        },
+    }))
 }
 
 fn verify_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let verify_witness = params
+        .get(1)
+        .filter(|value| !value.is_null())
+        .and_then(|value| value.get("verify_witness"))
+        .map(|value| {
+            value
+                .as_bool()
+                .ok_or_else(|| anyhow!("verify_witness must be a boolean"))
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if verify_witness {
+        return verify_witness_txout_proof(node, params);
+    }
     let Some((header, matches, total)) = parse_merkle_proof(params)? else {
         return Ok(json!([]));
     };
@@ -6213,6 +6275,214 @@ fn verify_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .map(|txid| txid.to_string())
             .collect::<Vec<_>>()
     ))
+}
+
+fn witness_commitment_index(coinbase: &Transaction) -> Option<usize> {
+    const MAGIC: [u8; 6] = [0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    coinbase.output.iter().rposition(|output| {
+        output.script_pubkey.len() >= 38 && output.script_pubkey.as_bytes()[..6] == MAGIC
+    })
+}
+
+fn serialize_witness_merkle_proof(block: &Block, requested: &HashSet<Txid>) -> Result<Vec<u8>> {
+    let Some(coinbase) = block.txdata.first() else {
+        bail!("block contains no transactions");
+    };
+    let txids = block
+        .txdata
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<Vec<_>>();
+    let requested_matches = txids
+        .iter()
+        .map(|txid| requested.contains(txid))
+        .collect::<Vec<_>>();
+    let has_witness_commitment = witness_commitment_index(coinbase).is_some();
+
+    // Core always proves the generation transaction in the txid tree so that
+    // a verifier can authenticate the witness commitment (or prove that the
+    // block has no commitment).
+    let mut txid_matches = requested_matches.clone();
+    txid_matches[0] = true;
+    let txid_tree = PartialMerkleTree::from_txids(&txids, &txid_matches);
+
+    let witness_version = if has_witness_commitment {
+        -2_i32
+    } else {
+        -1_i32
+    };
+    let mut proof = serialize(&witness_version);
+    proof.extend(serialize(&block.header));
+    proof.extend(serialize(&txid_tree));
+    proof.extend(serialize(coinbase));
+
+    if has_witness_commitment {
+        let witness_txids = block
+            .txdata
+            .iter()
+            .enumerate()
+            .map(|(index, transaction)| {
+                if index == 0 {
+                    Txid::all_zeros()
+                } else {
+                    Txid::from_byte_array(transaction.compute_wtxid().to_byte_array())
+                }
+            })
+            .collect::<Vec<_>>();
+        let witness_tree = PartialMerkleTree::from_txids(&witness_txids, &requested_matches);
+        proof.extend(serialize(&witness_tree));
+    } else {
+        // `m_prove_gentx` records whether the caller requested the coinbase.
+        // The txid tree still includes it, but the witness verifier removes it
+        // from the result when it was only included for authentication.
+        proof.extend(serialize(&requested_matches[0]));
+    }
+    Ok(proof)
+}
+
+struct WitnessMerkleProof {
+    header: Header,
+    txid_tree: PartialMerkleTree,
+    coinbase: Transaction,
+    witness_tree: Option<PartialMerkleTree>,
+    prove_coinbase: bool,
+}
+
+fn parse_witness_merkle_proof(params: &Value) -> Result<WitnessMerkleProof> {
+    let bytes = hex::decode(param::<String>(params, 0)?).context("Block decode failed")?;
+    let (version, mut consumed) =
+        deserialize_partial::<i32>(&bytes).context("invalid witness merkle proof version")?;
+    if !matches!(version, -1 | -2) {
+        bail!("invalid witness merkle proof version");
+    }
+    let (header, header_size) = deserialize_partial::<Header>(&bytes[consumed..])
+        .context("invalid witness merkle proof header")?;
+    consumed = consumed.saturating_add(header_size);
+    let (txid_tree, txid_tree_size) = deserialize_partial::<PartialMerkleTree>(&bytes[consumed..])
+        .context("invalid witness merkle proof txid tree")?;
+    consumed = consumed.saturating_add(txid_tree_size);
+    let (coinbase, coinbase_size) = deserialize_partial::<Transaction>(&bytes[consumed..])
+        .context("invalid witness merkle proof coinbase")?;
+    consumed = consumed.saturating_add(coinbase_size);
+
+    let (witness_tree, prove_coinbase) = if version == -2 {
+        let (tree, tree_size) = deserialize_partial::<PartialMerkleTree>(&bytes[consumed..])
+            .context("invalid witness merkle proof witness tree")?;
+        consumed = consumed.saturating_add(tree_size);
+        (Some(tree), false)
+    } else {
+        let (prove, prove_size) = deserialize_partial::<bool>(&bytes[consumed..])
+            .context("invalid witness merkle proof coinbase flag")?;
+        consumed = consumed.saturating_add(prove_size);
+        (None, prove)
+    };
+    if consumed != bytes.len() {
+        bail!("invalid witness merkle proof trailing data");
+    }
+    Ok(WitnessMerkleProof {
+        header,
+        txid_tree,
+        coinbase,
+        witness_tree,
+        prove_coinbase,
+    })
+}
+
+fn verify_witness_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let proof = parse_witness_merkle_proof(params)?;
+    let mut txid_matches = Vec::new();
+    let mut txid_indexes = Vec::new();
+    let Ok(txid_root) = proof
+        .txid_tree
+        .extract_matches(&mut txid_matches, &mut txid_indexes)
+    else {
+        return Ok(json!({}));
+    };
+    if txid_root != proof.header.merkle_root
+        || txid_matches.is_empty()
+        || txid_indexes.first().copied() != Some(0)
+        || proof.coinbase.compute_txid() != txid_matches[0]
+        || !proof.coinbase.is_coinbase()
+    {
+        return Ok(json!({}));
+    }
+
+    let (mut witness_matches, witness_indexes) = if let Some(witness_tree) = &proof.witness_tree {
+        let mut matches = Vec::new();
+        let mut indexes = Vec::new();
+        let Ok(witness_root) = witness_tree.extract_matches(&mut matches, &mut indexes) else {
+            return Ok(json!({}));
+        };
+        if matches.is_empty() {
+            return Ok(json!({}));
+        }
+        let Some(commitment_index) = witness_commitment_index(&proof.coinbase) else {
+            return Ok(json!({}));
+        };
+        let Some(coinbase_input) = proof.coinbase.input.first() else {
+            return Ok(json!({}));
+        };
+        let witness_stack = coinbase_input.witness.to_vec();
+        if witness_stack.len() != 1 || witness_stack[0].len() != 32 {
+            return Ok(json!({}));
+        }
+        let expected = Block::compute_witness_commitment(
+            &bitcoin::WitnessMerkleNode::from_byte_array(witness_root.to_byte_array()),
+            &witness_stack[0],
+        );
+        let commitment = proof.coinbase.output[commitment_index]
+            .script_pubkey
+            .as_bytes()
+            .get(6..38);
+        if commitment != Some(expected.as_byte_array()) {
+            return Ok(json!({}));
+        }
+        if indexes.first().copied() == Some(0) {
+            if matches[0] != Txid::all_zeros() {
+                return Ok(json!({}));
+            }
+            matches[0] = proof.coinbase.compute_txid();
+        }
+        (matches, indexes)
+    } else {
+        if !proof.prove_coinbase {
+            txid_matches.remove(0);
+            txid_indexes.remove(0);
+        }
+        (txid_matches, txid_indexes)
+    };
+
+    let block_hash = proof.header.block_hash();
+    let mut chain = node.chain.write();
+    if !chain.is_active_block(&block_hash) {
+        bail!("Block not found in chain");
+    }
+    let transaction_count = chain
+        .block_transaction_count(&block_hash)?
+        .ok_or_else(|| anyhow!("Block not found in chain"))?;
+    if transaction_count != proof.txid_tree.num_transactions() as usize {
+        return Ok(json!({}));
+    }
+    let block_height = chain
+        .block_height_by_hash(&block_hash)
+        .ok_or_else(|| anyhow!("Block not found in chain"))?;
+    let tip_height = chain.utxo_tip().height;
+    let transactions = witness_matches
+        .drain(..)
+        .zip(witness_indexes)
+        .map(|(wtxid, blockindex)| {
+            json!({
+                "wtxid": Wtxid::from_byte_array(wtxid.to_byte_array()).to_string(),
+                "blockindex": blockindex,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "blockheight": block_height,
+        "confirmations": tip_height.saturating_sub(block_height).saturating_add(1),
+        "blockhash": block_hash.to_string(),
+        "tx": transactions,
+    }))
 }
 
 fn parse_merkle_proof(params: &Value) -> Result<Option<(Header, Vec<Txid>, usize)>> {
@@ -10581,6 +10851,128 @@ fn sign_message_with_private_key(params: &Value) -> Result<Value> {
     )))
 }
 
+#[derive(Clone, Copy)]
+enum LegacyMessageOutputType {
+    Legacy,
+    P2shSegwit,
+    Bech32,
+}
+
+fn bip322_message_hash(message: &str) -> sha256::Hash {
+    let tag = Sha256::digest(b"BIP0322-signed-message");
+    let mut hasher = Sha256::new();
+    hasher.update(&tag);
+    hasher.update(&tag);
+    hasher.update(message.as_bytes());
+    sha256::Hash::from_slice(&hasher.finalize()).expect("SHA256 always produces 32 bytes")
+}
+
+fn bip322_to_spend(address: &Address, message: &str) -> Transaction {
+    let message_hash = bip322_message_hash(message);
+    let script_sig = Builder::new()
+        .push_opcode(OP_0)
+        .push_slice(message_hash.to_byte_array())
+        .into_script();
+    Transaction {
+        version: Version::non_standard(0),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::all_zeros(), u32::MAX),
+            script_sig,
+            sequence: bitcoin::Sequence::ZERO,
+            witness: Witness::default(),
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: address.script_pubkey(),
+        }],
+    }
+}
+
+fn decode_bip322_to_sign(signature_bytes: &[u8], to_spend: &Transaction) -> Option<Transaction> {
+    if let Ok(transaction) = deserialize::<Transaction>(signature_bytes) {
+        return Some(transaction);
+    }
+    let witness = deserialize::<Witness>(signature_bytes).ok()?;
+    Some(Transaction {
+        version: Version::non_standard(0),
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(to_spend.compute_txid(), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::ZERO,
+            witness,
+        }],
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![OP_RETURN.to_u8()]),
+        }],
+    })
+}
+
+/// Verify a BIP-322 Simple signature. `None` means the bytes do not encode a
+/// BIP-322 transaction or witness stack and lets the legacy caller preserve
+/// Core's address/signature error distinction.
+fn verify_bip322_signature(
+    address: &Address,
+    signature_bytes: &[u8],
+    message: &str,
+) -> Result<Option<bool>> {
+    let to_spend = bip322_to_spend(address, message);
+    let Some(to_sign) = decode_bip322_to_sign(signature_bytes, &to_spend) else {
+        return Ok(None);
+    };
+    if to_sign.input.len() != 1
+        || to_sign.output.len() != 1
+        || to_sign.input[0].previous_output != OutPoint::new(to_spend.compute_txid(), 0)
+        || to_sign.output[0].value != Amount::ZERO
+        || to_sign.output[0].script_pubkey != ScriptBuf::from_bytes(vec![OP_RETURN.to_u8()])
+    {
+        return Ok(None);
+    }
+
+    let serialized = serialize(&to_sign);
+    let spent_outputs = [bitcoinconsensus::Utxo {
+        script_pubkey: to_spend.output[0].script_pubkey.as_bytes().as_ptr(),
+        script_pubkey_len: to_spend.output[0].script_pubkey.len() as u32,
+        value: 0,
+    }];
+    let flags = bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT;
+    let verified = bitcoinconsensus::verify_with_flags(
+        to_spend.output[0].script_pubkey.as_bytes(),
+        0,
+        &serialized,
+        Some(&spent_outputs),
+        0,
+        flags,
+    )
+    .is_ok();
+    if !verified {
+        return Ok(Some(false));
+    }
+    if !matches!(to_sign.version.0, 0 | 2) {
+        bail!("This signature is not yet supported");
+    }
+    Ok(Some(true))
+}
+
+fn recovered_legacy_message_address(
+    public_key: bitcoin::PublicKey,
+    output_type: LegacyMessageOutputType,
+    network: Network,
+) -> Address {
+    if !public_key.compressed {
+        return Address::p2pkh(public_key, network);
+    }
+    let compressed = CompressedPublicKey::try_from(public_key)
+        .expect("a compressed recovered public key converts losslessly");
+    match output_type {
+        LegacyMessageOutputType::Legacy => Address::p2pkh(public_key, network),
+        LegacyMessageOutputType::P2shSegwit => Address::p2shwpkh(&compressed, network),
+        LegacyMessageOutputType::Bech32 => Address::p2wpkh(&compressed, network),
+    }
+}
+
 fn verify_message(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if (0..3).any(|index| params.get(index).is_none_or(Value::is_null)) {
         bail!("verifymessage")
@@ -10590,18 +10982,72 @@ fn verify_message(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .map_err(|_| anyhow!("Invalid address"))?
         .require_network(node.config.network)
         .map_err(|_| anyhow!("Invalid address"))?;
-    if address.address_type() != Some(AddressType::P2pkh) {
-        bail!("Address does not refer to key")
-    }
     let signature_bytes = base64::engine::general_purpose::STANDARD
         .decode(param::<String>(params, 1)?)
         .map_err(|_| anyhow!("Malformed base64 encoding"))?;
-    let signature = MessageSignature::from_slice(&signature_bytes)
-        .map_err(|_| anyhow!("Malformed base64 encoding"))?;
     let message = param::<String>(params, 2)?;
-    let verified =
-        signature.is_signed_by_address(&Secp256k1::new(), &address, signed_msg_hash(&message))?;
-    Ok(json!(verified))
+    if signature_bytes.is_empty() {
+        bail!("Malformed base64 encoding");
+    }
+
+    let Some(address_type) = address.address_type() else {
+        return match verify_bip322_signature(&address, &signature_bytes, &message)? {
+            Some(verified) => Ok(json!(verified)),
+            None => bail!("Address does not refer to key"),
+        };
+    };
+    let mut output_type = match address_type {
+        AddressType::P2pkh => LegacyMessageOutputType::Legacy,
+        AddressType::P2sh => LegacyMessageOutputType::P2shSegwit,
+        AddressType::P2wpkh => LegacyMessageOutputType::Bech32,
+        AddressType::P2wsh | AddressType::P2tr => {
+            return match verify_bip322_signature(&address, &signature_bytes, &message)? {
+                Some(verified) => Ok(json!(verified)),
+                None => bail!("Address does not refer to key"),
+            };
+        }
+        _ => {
+            return match verify_bip322_signature(&address, &signature_bytes, &message)? {
+                Some(verified) => Ok(json!(verified)),
+                None => bail!("Address does not refer to key"),
+            };
+        }
+    };
+
+    let mut legacy_signature_bytes = signature_bytes.clone();
+    let header = legacy_signature_bytes[0];
+    let legacy_verified = if (27..=42).contains(&header) && legacy_signature_bytes.len() == 65 {
+        let signature_type = (header - 27) >> 2;
+        if signature_type == 3 {
+            legacy_signature_bytes[0] -= 8;
+            output_type = LegacyMessageOutputType::Bech32;
+        } else if signature_type == 2 {
+            legacy_signature_bytes[0] -= 4;
+            output_type = LegacyMessageOutputType::P2shSegwit;
+        }
+        let signature = MessageSignature::from_slice(&legacy_signature_bytes).ok();
+        signature
+            .and_then(|signature| {
+                signature
+                    .recover_pubkey(&Secp256k1::new(), signed_msg_hash(&message))
+                    .ok()
+            })
+            .is_some_and(|public_key| {
+                recovered_legacy_message_address(public_key, output_type, node.config.network)
+                    == address
+            })
+    } else {
+        false
+    };
+    if legacy_verified {
+        return Ok(json!(true));
+    }
+
+    match verify_bip322_signature(&address, &signature_bytes, &message)? {
+        Some(verified) => Ok(json!(verified)),
+        None if (27..=42).contains(&header) && signature_bytes.len() == 65 => Ok(json!(false)),
+        None => bail!("Malformed base64 encoding"),
+    }
 }
 
 fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -18500,6 +18946,18 @@ mod tests {
 
         let normalized = normalize_rpc_params("gettxout", &json!({"txid": "00", "n": 1})).unwrap();
         assert_eq!(normalized, json!(["00", 1, null]));
+        let normalized = normalize_rpc_params(
+            "gettxoutproof",
+            &json!({"txids": [], "prove_witness": true}),
+        )
+        .unwrap();
+        assert_eq!(normalized, json!([[], null, {"prove_witness": true}]));
+        let normalized = normalize_rpc_params(
+            "verifytxoutproof",
+            &json!({"proof": "00", "verify_witness": true}),
+        )
+        .unwrap();
+        assert_eq!(normalized, json!(["00", {"verify_witness": true}]));
         let normalized = normalize_rpc_params("getorphantxs", &json!({"verbosity": 2})).unwrap();
         assert_eq!(normalized, json!([2]));
         let normalized =
@@ -25737,6 +26195,32 @@ mod tests {
         let signature = sign_message_with_private_key(&json!([private.to_wif(), message])).unwrap();
         assert_eq!(
             verify_message(&node, &json!([address.to_string(), signature, message]),).unwrap(),
+            true
+        );
+        let bip322_p2wpkh = "AkcwRAIgCu7IrN3jCvBdp5myPZHCKiOW5o3EToYG2xgPbjiw6JsCIFwaZMcYQj9FmWcNtZk3qTp2UDBm77cbFmxQ3WVnVxrCASEDonFDI6fuQ05yUfeQIsOs599XHZnpaTxaqD13g4sXYRY=";
+        assert_eq!(
+            verify_message(
+                &node,
+                &json!([
+                    "bcrt1q00cc7f4m04f5mjdcm9g6c5y2a3wnvfvflljety",
+                    bip322_p2wpkh,
+                    "This is just a test message"
+                ])
+            )
+            .unwrap(),
+            true
+        );
+        let bip322_p2tr = "AUFdYU3dZCSmTxWnl5ja/Jo096VAaKtdaYs8b4ikF2iuQ2fiy7YSFHBWcD40a1oBKTVWUrXqOC0pXoDjTFKqM/ObAQ==";
+        assert_eq!(
+            verify_message(
+                &node,
+                &json!([
+                    "bcrt1p5t6gmtfkd4q8jfgz40auxqgtll895n85amlgvgsz0jwxvfw9qltss6wfve",
+                    bip322_p2tr,
+                    "This is just a test message"
+                ])
+            )
+            .unwrap(),
             true
         );
         assert_eq!(

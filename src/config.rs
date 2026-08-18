@@ -1606,7 +1606,7 @@ pub struct Args {
     pub accept_nonstd_txn: bool,
 
     #[arg(long, default_value_t = 0)]
-    pub prune: u64,
+    pub prune: i64,
 
     /// Use Core's smaller-file/lower-height pruning test mode.
     #[arg(
@@ -2010,10 +2010,9 @@ impl Args {
             Err(error) => {
                 let error_text = error.to_string();
                 let error_head = error_text.lines().next().unwrap_or(&error_text);
-                if let Some(entry) = config_file_args
-                    .iter()
-                    .find(|entry| error_head.contains(&format!("--{}", entry.key)))
-                {
+                if let Some(entry) = config_file_args.iter().find(|entry| {
+                    !entry.key.is_empty() && error_head.contains(&format!("--{}", entry.key))
+                }) {
                     bail!(
                         "Error reading configuration file: parse error on line {}: {}",
                         entry.line,
@@ -2094,6 +2093,9 @@ fn normalize_core_style_argument(argument: OsString) -> OsString {
     };
     if matches!(value, "-noblocksonly" | "--noblocksonly") {
         return OsString::from("--blocksonly=false");
+    }
+    if matches!(value, "-nodebug" | "--nodebug") {
+        return OsString::from("--debug=0");
     }
     if value.len() <= 2
         || !value.starts_with('-')
@@ -2463,7 +2465,7 @@ fn parse_logging_config(args: &Args) -> Result<ParsedLoggingConfig> {
             continue;
         }
         if !CORE_LOG_CATEGORIES.contains(&category.as_str()) {
-            bail!("unsupported logging category --debug={category}");
+            bail!("Unsupported logging category -debug={category}.");
         }
         if seen.insert(category.clone()) {
             categories.push(category);
@@ -2479,7 +2481,7 @@ fn parse_logging_config(args: &Args) -> Result<ParsedLoggingConfig> {
             continue;
         }
         if !CORE_LOG_CATEGORIES.contains(&category.as_str()) {
-            bail!("unsupported logging category --debugexclude={category}");
+            bail!("Unsupported logging category -debugexclude={category}.");
         }
         if debug_all {
             // Expand `all` lazily so exclusions remain visible to the
@@ -2509,15 +2511,17 @@ fn parse_logging_config(args: &Args) -> Result<ParsedLoggingConfig> {
         let value = value.to_ascii_lowercase();
         if let Some((category, level_value)) = value.split_once(':') {
             if !CORE_LOG_CATEGORIES.contains(&category) {
-                bail!("unsupported logging category in --loglevel={value}");
+                bail!("Unsupported category-specific logging level -loglevel={value}.");
             }
             let Some(parsed) = LogLevel::parse(level_value) else {
-                bail!("unsupported logging level in --loglevel={value}");
+                bail!("Unsupported category-specific logging level -loglevel={value}.");
             };
             category_levels.insert(category.to_owned(), parsed);
         } else {
             let Some(parsed) = LogLevel::parse(&value) else {
-                bail!("unsupported global logging level --loglevel={value}");
+                bail!(
+                    "Unsupported global logging level -loglevel={value}. Valid values: info, debug, trace."
+                );
             };
             level = parsed;
         }
@@ -2751,6 +2755,10 @@ impl Config {
         if !args.disable_wallet {
             bail!("wallet support is disabled in this build; use --disablewallet=1");
         }
+        if args.prune < 0 {
+            bail!("Prune cannot be configured with a negative value.");
+        }
+        let prune = u64::try_from(args.prune).context("prune value is out of range")?;
         let logging = parse_logging_config(&args)?;
         let network = network_from_args(&args)?;
         if args.datadir_explicit && !args.datadir.is_dir() {
@@ -2760,7 +2768,10 @@ impl Config {
             );
         }
         let blocks_dir = args.blocks_dir.as_ref().map_or_else(
-            || args.datadir.join("blocks"),
+            || {
+                core_network_blocks_dir(&args.datadir, network)
+                    .unwrap_or_else(|| args.datadir.join("blocks"))
+            },
             |path| {
                 if path.is_absolute() {
                     path.clone()
@@ -2783,20 +2794,13 @@ impl Config {
                 args.datadir.join(network_dir).join(debug_log_path)
             }
         } else {
-            args.datadir.join(debug_log_path)
-        };
-        if !args.no_debug_log_file {
-            if let Some(parent) = debug_log_path.parent() {
-                fs::create_dir_all(parent).with_context(|| {
-                    format!("creating debug log directory {}", parent.display())
-                })?;
+            let network_dir = network_data_dir_name(network);
+            if network_dir.is_empty() {
+                args.datadir.join(debug_log_path)
+            } else {
+                args.datadir.join(network_dir).join(debug_log_path)
             }
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&debug_log_path)
-                .with_context(|| format!("opening debug log {}", debug_log_path.display()))?;
-        }
+        };
         if args.pid_file.as_os_str().is_empty() {
             bail!("--pid must not be empty");
         }
@@ -2834,7 +2838,11 @@ impl Config {
                             .or_else(|| value.strip_prefix("0X"))
                             .unwrap_or(value),
                     )
-                    .with_context(|| format!("decoding --minimumchainwork as hex: {value}"))
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Invalid minimum work specified ({value}), must be up to 64 hex digits"
+                        )
+                    })
                 }
             })
             .transpose()?;
@@ -2981,6 +2989,22 @@ impl Config {
                 Network::Regtest => None,
             };
             if let Some(chain_name) = chain_name {
+                // Core creates the selected network's debug-log path before
+                // rejecting this deprecated compatibility option.  The
+                // functional config test relies on that path remaining
+                // available when it switches the same datadir to testnet3.
+                if !args.no_debug_log_file {
+                    if let Some(parent) = debug_log_path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&debug_log_path)
+                        .with_context(|| {
+                            format!("Could not open debug log file {}", debug_log_path.display())
+                        })?;
+                }
                 bail!("acceptstalefeeestimates is not supported on {chain_name} chain.");
             }
         }
@@ -3135,12 +3159,22 @@ impl Config {
         if !args.fast_prune
             && args.prune != 0
             && args.prune != 1
-            && args.prune < MIN_AUTO_PRUNE_TARGET_MIB
+            && args.prune < MIN_AUTO_PRUNE_TARGET_MIB as i64
         {
-            bail!("--prune automatic target must be at least {MIN_AUTO_PRUNE_TARGET_MIB} MiB");
+            bail!(
+                "Prune configured below the minimum of {MIN_AUTO_PRUNE_TARGET_MIB} MiB.  Please use a higher number."
+            );
         }
-        if (args.txindex || args.txospenderindex) && args.prune != 0 {
-            bail!("Prune mode is incompatible with transaction indexes.");
+        if args.txindex && args.prune != 0 {
+            bail!("Prune mode is incompatible with -txindex.");
+        }
+        if args.txospenderindex && args.prune != 0 {
+            bail!("Prune mode is incompatible with -txospenderindex.");
+        }
+        if args.reindex_chainstate && args.prune != 0 {
+            bail!(
+                "Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."
+            );
         }
         let max_mempool = args.max_mempool.unwrap_or(if args.blocksonly {
             DEFAULT_BLOCKSONLY_MAX_MEMPOOL_MB
@@ -3166,7 +3200,7 @@ impl Config {
         let max_upload_target =
             parse_byte_units(&args.max_upload_target, 1 << 20).with_context(|| {
                 format!(
-                    "unable to parse --maxuploadtarget: '{}'",
+                    "Unable to parse -maxuploadtarget: '{}'",
                     args.max_upload_target
                 )
             })?;
@@ -3384,7 +3418,7 @@ impl Config {
             blocksonly: args.blocksonly,
             private_broadcast: args.privatebroadcast,
             accept_nonstd_txn: args.accept_nonstd_txn,
-            prune: args.prune,
+            prune,
             fast_prune: args.fast_prune,
             reindex: args.reindex,
             reindex_chainstate: args.reindex_chainstate,

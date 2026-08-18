@@ -573,8 +573,14 @@ impl MempoolError {
             Self::NonStandard(reason) => reason.clone(),
             Self::ClusterLimit => "too-large-cluster".to_owned(),
             Self::Truc(reason) => format!("TRUC-violation, {reason}"),
-            Self::Script(reason) if reason.contains("sequence") => "non-BIP68-final".to_owned(),
-            Self::Script(reason) if reason.contains("locktime") => "non-final".to_owned(),
+            Self::Script(reason) if reason == "transaction locktime is not yet satisfied" => {
+                "non-final".to_owned()
+            }
+            Self::Script(reason)
+                if reason == "transaction locktime/sequence locks are not yet satisfied" =>
+            {
+                "non-BIP68-final".to_owned()
+            }
             Self::Script(reason) => reason.clone(),
             _ => self.to_string(),
         }
@@ -3701,7 +3707,8 @@ fn mempool_script_reject_reason(
     let Some(transaction_input) = transaction.input.get(*input) else {
         return format!("mempool-script-verify-flag-failed ({reason})");
     };
-    let script_reason = script_interpreter_hint(&transaction_input.script_sig)
+    let script_reason = validation::script_error_reason_hint(transaction, previous_outputs, *input)
+        .or_else(|| script_interpreter_hint(&transaction_input.script_sig))
         .or_else(|| {
             previous_outputs
                 .get(*input)

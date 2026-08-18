@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
-use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, TxOut, Txid};
 use parking_lot::{Mutex, RwLock};
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -192,11 +192,16 @@ fn init_xor_key(directory: &Path, use_xor: bool) -> Result<XorKey> {
     let key = if path.exists() {
         read_xor_key(&path)?
     } else {
-        let first_run = std::fs::read_dir(directory)?.try_fold(true, |first_run, entry| {
-            let entry = entry?;
-            let hidden = entry.file_name().to_string_lossy().starts_with('.');
-            Ok::<_, std::io::Error>(first_run && hidden)
-        })?;
+        let entries = std::fs::read_dir(directory)?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let first_run = entries.iter().all(|name| {
+            name.starts_with('.')
+                // Core creates the block-index directory before the block store
+                // gets its obfuscation key. It is metadata, not existing block
+                // data, and must not turn a first run into an all-zero key.
+                || name == "index"
+        });
         let key = if use_xor && first_run {
             XorKey(random())
         } else {
@@ -212,7 +217,7 @@ fn init_xor_key(directory: &Path, use_xor: bool) -> Result<XorKey> {
         key
     };
     if !use_xor && key.0.iter().any(|byte| *byte != 0) {
-        bail!("the blocksdir XOR key cannot be disabled when a random key is already stored");
+        bail!("The blocksdir XOR-key can not be disabled when a random key was already stored!");
     }
     Ok(key)
 }
@@ -255,6 +260,13 @@ impl BlockStoreReader {
         Ok(Some(block))
     }
 
+    pub fn transaction_count(&self, hash: &BlockHash) -> Result<Option<usize>> {
+        let Some(record) = self.index.read().get(hash).copied() else {
+            return Ok(None);
+        };
+        read_block_transaction_count(&self.file.read(), record, self.xor_key).map(Some)
+    }
+
     fn insert(&self, hash: BlockHash, record: Record) {
         self.index.write().insert(hash, record);
     }
@@ -294,6 +306,8 @@ impl BlockStore {
         let directory = directory.as_ref();
         create_dir_all(directory)
             .with_context(|| format!("creating block directory {}", directory.display()))?;
+        let xor_key_path = directory.join("xor.dat");
+        let key_was_missing = !xor_key_path.exists();
         let xor_key = init_xor_key(directory, use_xor)?;
         let path = directory.join("blocks.dat");
         let mut file = OpenOptions::new()
@@ -310,14 +324,37 @@ impl BlockStore {
             .write(true)
             .open(&index_path)
             .with_context(|| format!("opening block index {}", index_path.display()))?;
-        let data_len = file.metadata()?.len();
-        let index = match load_index(&mut index_file, data_len)? {
-            Some(index) => index,
-            None => {
-                let index = scan_index(&mut file, xor_key)
-                    .with_context(|| format!("scanning {}", path.display()))?;
-                rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
-                index
+        let mut data_len = file.metadata()?.len();
+        // Core's blocksxor test deliberately removes xor.dat after manually
+        // restoring the visible blk*.dat/rev*.dat files to clear bytes. The
+        // implementation store is a separate append-only format, so rebuild
+        // it from those files before attempting to interpret its old records
+        // with the newly recreated zero key.
+        let recovered_compat = if key_was_missing && !use_xor && data_len > 0 {
+            recover_core_compat_records(directory)?
+        } else {
+            None
+        };
+        let recovered_undo = recovered_compat
+            .as_ref()
+            .map(|(_, undo_records)| undo_records.clone());
+        let index = if let Some((block_records, _)) = recovered_compat {
+            drop(file);
+            let (recovered_file, index, recovered_len) =
+                rewrite_record_file(&path, &block_records, xor_key)?;
+            file = recovered_file;
+            data_len = recovered_len;
+            rewrite_index(&mut index_file, data_len, &index)?;
+            index
+        } else {
+            match load_index(&mut index_file, data_len)? {
+                Some(index) => index,
+                None => {
+                    let index = scan_index(&mut file, xor_key)
+                        .with_context(|| format!("scanning {}", path.display()))?;
+                    rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
+                    index
+                }
             }
         };
         let undo_path = directory.join("undo.dat");
@@ -335,14 +372,24 @@ impl BlockStore {
             .write(true)
             .open(&undo_index_path)
             .with_context(|| format!("opening undo index {}", undo_index_path.display()))?;
-        let undo_data_len = undo_file.metadata()?.len();
-        let undo_index = match load_index(&mut undo_index_file, undo_data_len)? {
-            Some(index) => index,
-            None => {
-                let index = scan_undo_index(&mut undo_file, xor_key)
-                    .with_context(|| format!("scanning {}", undo_path.display()))?;
-                rewrite_index(&mut undo_index_file, undo_file.metadata()?.len(), &index)?;
-                index
+        let mut undo_data_len = undo_file.metadata()?.len();
+        let undo_index = if let Some(undo_records) = recovered_undo {
+            drop(undo_file);
+            let (recovered_file, index, recovered_len) =
+                rewrite_record_file(&undo_path, &undo_records, xor_key)?;
+            undo_file = recovered_file;
+            undo_data_len = recovered_len;
+            rewrite_index(&mut undo_index_file, undo_data_len, &index)?;
+            index
+        } else {
+            match load_index(&mut undo_index_file, undo_data_len)? {
+                Some(index) => index,
+                None => {
+                    let index = scan_undo_index(&mut undo_file, xor_key)
+                        .with_context(|| format!("scanning {}", undo_path.display()))?;
+                    rewrite_index(&mut undo_index_file, undo_file.metadata()?.len(), &index)?;
+                    index
+                }
             }
         };
         let serving_reader = BlockStoreReader::new(file.try_clone()?, index.clone(), xor_key);
@@ -552,6 +599,32 @@ impl BlockStore {
         self.insert_with_sync(block, false)
     }
 
+    /// Append a Core-format compatibility record for tools which inspect the
+    /// public blk*.dat/rev*.dat files directly. The chainstate's authoritative
+    /// records remain in blocks.dat/undo.dat; these files carry the same XOR
+    /// key and are deliberately framed exactly as Core's flat files are.
+    pub fn append_core_compat(
+        &mut self,
+        block: &Block,
+        undo: &[Vec<TxOut>],
+        network: Network,
+        fast_prune: bool,
+    ) -> Result<()> {
+        let block_bytes = serialize(block);
+        let undo_bytes = encode_undo_record(block.block_hash(), undo)?;
+        let magic = crate::wire::network_magic(network);
+        append_core_compat_pair(
+            self.path
+                .parent()
+                .context("block store has no parent directory")?,
+            magic,
+            &block_bytes,
+            &undo_bytes,
+            self.xor_key,
+            fast_prune,
+        )
+    }
+
     fn insert_with_sync(&mut self, block: &Block, sync: bool) -> Result<BlockHash> {
         let hash = block.block_hash();
         if self.index.contains_key(&hash) {
@@ -617,6 +690,13 @@ impl BlockStore {
         }
         self.cache_block(*hash, block.clone(), record.length as usize);
         Ok(Some(block))
+    }
+
+    pub fn transaction_count(&mut self, hash: &BlockHash) -> Result<Option<usize>> {
+        let Some(record) = self.index.get(hash).copied() else {
+            return Ok(None);
+        };
+        read_block_transaction_count(&self.file, record, self.xor_key).map(Some)
     }
 
     /// Read a block without touching the mutable LRU cache or the seek
@@ -687,6 +767,19 @@ impl BlockStore {
         retained_blocks: &HashSet<BlockHash>,
         retained_undo: &HashSet<BlockHash>,
     ) -> Result<()> {
+        self.prune_with_core_compat(retained_blocks, retained_undo, false)
+    }
+
+    /// Rewrite the append-only files and optionally remove the auxiliary
+    /// Core-format copies. Automatic size-based pruning uses the latter mode:
+    /// `blocks.dat` is authoritative here, while the flat files exist only
+    /// for compatibility with tools which inspect a Core blocksdir.
+    pub fn prune_with_core_compat(
+        &mut self,
+        retained_blocks: &HashSet<BlockHash>,
+        retained_undo: &HashSet<BlockHash>,
+        remove_core_compat: bool,
+    ) -> Result<()> {
         let block_hashes = self
             .index
             .keys()
@@ -731,9 +824,107 @@ impl BlockStore {
         self.undo_file = undo_file;
         self.undo_index = undo_index;
         rewrite_index(&mut self.undo_index_file, undo_data_len, &self.undo_index)?;
+        if remove_core_compat {
+            self.remove_core_compat_files()?;
+        } else {
+            self.prune_core_compat_files(retained_blocks, retained_undo)?;
+        }
         self.clear_block_cache();
         Ok(())
     }
+
+    fn remove_core_compat_files(&self) -> Result<()> {
+        let directory = self
+            .path
+            .parent()
+            .context("block store has no parent directory")?;
+        for prefix in ["blk", "rev"] {
+            for path in core_compat_file_paths(directory, prefix)? {
+                match remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("removing Core compatibility file {}", path.display())
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_core_compat_files(
+        &self,
+        retained_blocks: &HashSet<BlockHash>,
+        retained_undo: &HashSet<BlockHash>,
+    ) -> Result<()> {
+        let directory = self
+            .path
+            .parent()
+            .context("block store has no parent directory")?;
+        let block_paths = core_compat_file_paths(directory, "blk")?;
+        let mut genesis_hashes = HashSet::new();
+
+        for path in block_paths {
+            let mut bytes = std::fs::read(&path)
+                .with_context(|| format!("reading Core block file {}", path.display()))?;
+            self.xor_key.apply(&mut bytes, 0);
+            let records = parse_core_compat_file(&bytes, false).with_context(|| {
+                format!("decoding Core block file {} during pruning", path.display())
+            })?;
+            let mut kept = Vec::with_capacity(records.len());
+            for (magic, hash, payload) in records {
+                let is_genesis = deserialize::<Block>(&payload)
+                    .ok()
+                    .is_some_and(|block| block.header.prev_blockhash == BlockHash::all_zeros());
+                if is_genesis {
+                    genesis_hashes.insert(hash);
+                }
+                if retained_blocks.contains(&hash) && !is_genesis {
+                    kept.push((magic, payload));
+                }
+            }
+            rewrite_core_compat_file(&path, &kept, self.xor_key)?;
+        }
+
+        for path in core_compat_file_paths(directory, "rev")? {
+            let mut bytes = std::fs::read(&path)
+                .with_context(|| format!("reading Core undo file {}", path.display()))?;
+            self.xor_key.apply(&mut bytes, 0);
+            let records = parse_core_compat_file(&bytes, true).with_context(|| {
+                format!("decoding Core undo file {} during pruning", path.display())
+            })?;
+            let kept = records
+                .into_iter()
+                .filter(|(_, hash, _)| {
+                    retained_undo.contains(hash) && !genesis_hashes.contains(hash)
+                })
+                .map(|(magic, _, payload)| (magic, payload))
+                .collect::<Vec<_>>();
+            rewrite_core_compat_file(&path, &kept, self.xor_key)?;
+        }
+        Ok(())
+    }
+}
+
+fn read_block_transaction_count(file: &File, record: Record, xor_key: XorKey) -> Result<usize> {
+    const BLOCK_HEADER_BYTES: usize = 80;
+    const MAX_VARINT_BYTES: usize = 9;
+    let length = usize::try_from(record.length).context("block length does not fit usize")?;
+    let prefix_length = length.min(BLOCK_HEADER_BYTES + MAX_VARINT_BYTES);
+    if prefix_length <= BLOCK_HEADER_BYTES {
+        bail!("stored block is shorter than its header");
+    }
+    let mut prefix = vec![0u8; prefix_length];
+    read_block_exact_at(file, &mut prefix, record.offset + 4)
+        .context("reading stored block transaction count")?;
+    xor_key.apply(&mut prefix, record.offset + 4);
+    let (_, header_bytes) = deserialize_partial::<bitcoin::block::Header>(&prefix)
+        .context("decoding stored block header")?;
+    let (count, _) = deserialize_partial::<VarInt>(&prefix[header_bytes..])
+        .context("decoding stored block transaction count")?;
+    usize::try_from(count.0).context("stored block transaction count is too large")
 }
 
 fn read_block_exact_at(file: &File, mut bytes: &mut [u8], mut offset: u64) -> std::io::Result<()> {
@@ -755,6 +946,295 @@ impl Drop for BlockStore {
     fn drop(&mut self) {
         let _ = self.flush();
     }
+}
+
+fn core_compat_file_paths(directory: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
+    let mut paths = std::fs::read_dir(directory)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            name.starts_with(prefix)
+                && name.ends_with(".dat")
+                && name.len() == prefix.len() + 9
+                && name[prefix.len()..prefix.len() + 5]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+        })
+        .collect::<Vec<_>>();
+    paths.sort_unstable();
+    Ok(paths)
+}
+
+fn parse_core_block_file(bytes: &[u8]) -> Option<Vec<(BlockHash, Vec<u8>)>> {
+    let mut offset = 0usize;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        let header_end = offset.checked_add(8)?;
+        if header_end > bytes.len() {
+            return None;
+        }
+        let length = u32::from_le_bytes(bytes[offset + 4..header_end].try_into().ok()?) as usize;
+        if !(80..=MAX_STORED_BLOCK_SIZE).contains(&length) {
+            return None;
+        }
+        let end = header_end.checked_add(length)?;
+        if end > bytes.len() {
+            return None;
+        }
+        let payload = bytes[header_end..end].to_vec();
+        let block = deserialize::<Block>(&payload).ok()?;
+        if serialize(&block) != payload {
+            return None;
+        }
+        records.push((block.block_hash(), payload));
+        offset = end;
+    }
+    Some(records)
+}
+
+fn parse_core_undo_file(bytes: &[u8]) -> Option<Vec<(BlockHash, Vec<u8>)>> {
+    let mut offset = 0usize;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        let header_end = offset.checked_add(8)?;
+        if header_end > bytes.len() {
+            return None;
+        }
+        let length = u32::from_le_bytes(bytes[offset + 4..header_end].try_into().ok()?) as usize;
+        if length == 0 || length > MAX_STORED_UNDO_SIZE {
+            return None;
+        }
+        let end = header_end.checked_add(length)?;
+        if end > bytes.len() {
+            return None;
+        }
+        let payload = bytes[header_end..end].to_vec();
+        let (hash, _) = decode_undo_record(&payload).ok()?;
+        records.push((hash, payload));
+        offset = end;
+    }
+    Some(records)
+}
+
+fn parse_core_compat_file(bytes: &[u8], undo: bool) -> Option<Vec<([u8; 4], BlockHash, Vec<u8>)>> {
+    let mut offset = 0usize;
+    let mut records = Vec::new();
+    while offset < bytes.len() {
+        let header_end = offset.checked_add(8)?;
+        if header_end > bytes.len() {
+            return None;
+        }
+        let magic = bytes[offset..offset + 4].try_into().ok()?;
+        let length = u32::from_le_bytes(bytes[offset + 4..header_end].try_into().ok()?) as usize;
+        let maximum = if undo {
+            MAX_STORED_UNDO_SIZE
+        } else {
+            MAX_STORED_BLOCK_SIZE
+        };
+        if length == 0 || length > maximum {
+            return None;
+        }
+        let end = header_end.checked_add(length)?;
+        if end > bytes.len() {
+            return None;
+        }
+        let payload = bytes[header_end..end].to_vec();
+        let hash = if undo {
+            decode_undo_record(&payload).ok()?.0
+        } else {
+            let block = deserialize::<Block>(&payload).ok()?;
+            if serialize(&block) != payload {
+                return None;
+            }
+            block.block_hash()
+        };
+        records.push((magic, hash, payload));
+        offset = end;
+    }
+    Some(records)
+}
+
+fn rewrite_core_compat_file(
+    path: &Path,
+    records: &[([u8; 4], Vec<u8>)],
+    xor_key: XorKey,
+) -> Result<()> {
+    if records.is_empty() {
+        match remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(());
+    }
+    let temp_path = path.with_file_name(format!(
+        "{}.prune.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let result = (|| -> Result<()> {
+        let mut temp = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)
+            .with_context(|| format!("opening temporary Core file {}", temp_path.display()))?;
+        let mut offset = 0u64;
+        for (magic, payload) in records {
+            let length = u32::try_from(payload.len())
+                .context("Core compatibility record length does not fit u32")?;
+            let mut record = Vec::with_capacity(8 + payload.len());
+            record.extend_from_slice(magic);
+            record.extend_from_slice(&length.to_le_bytes());
+            record.extend_from_slice(payload);
+            xor_key.apply(&mut record, offset);
+            temp.write_all(&record)?;
+            offset = offset.saturating_add(record.len() as u64);
+        }
+        temp.sync_all()?;
+        drop(temp);
+        rename(&temp_path, path)
+            .with_context(|| format!("installing pruned Core file {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = remove_file(&temp_path);
+    }
+    result
+}
+
+fn recover_core_compat_records(
+    directory: &Path,
+) -> Result<Option<(Vec<(BlockHash, Vec<u8>)>, Vec<(BlockHash, Vec<u8>)>)>> {
+    let block_paths = core_compat_file_paths(directory, "blk")?;
+    let undo_paths = core_compat_file_paths(directory, "rev")?;
+    if block_paths.is_empty() || undo_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let mut block_records = Vec::new();
+    for path in block_paths {
+        let bytes = std::fs::read(path)?;
+        let Some(records) = parse_core_block_file(&bytes) else {
+            return Ok(None);
+        };
+        block_records.extend(records);
+    }
+    let mut undo_records = Vec::new();
+    for path in undo_paths {
+        let bytes = std::fs::read(path)?;
+        let Some(records) = parse_core_undo_file(&bytes) else {
+            return Ok(None);
+        };
+        undo_records.extend(records);
+    }
+    if block_records.is_empty() || undo_records.is_empty() {
+        return Ok(None);
+    }
+    let mut block_hashes = HashSet::new();
+    let mut undo_hashes = HashSet::new();
+    if block_records
+        .iter()
+        .any(|(hash, _)| !block_hashes.insert(*hash))
+        || undo_records
+            .iter()
+            .any(|(hash, _)| !undo_hashes.insert(*hash))
+    {
+        return Ok(None);
+    }
+    Ok(Some((block_records, undo_records)))
+}
+
+fn append_core_compat_pair(
+    directory: &Path,
+    magic: [u8; 4],
+    block_bytes: &[u8],
+    undo_bytes: &[u8],
+    xor_key: XorKey,
+    fast_prune: bool,
+) -> Result<()> {
+    let block_length = u32::try_from(block_bytes.len()).context("block length does not fit u32")?;
+    let undo_length = u32::try_from(undo_bytes.len()).context("undo length does not fit u32")?;
+    let block_record_len = 8u64.saturating_add(u64::from(block_length));
+    let undo_record_len = 8u64.saturating_add(u64::from(undo_length));
+    let file_limit = if fast_prune { 0x4000 } else { 0x8000000 };
+
+    let mut file_index = core_compat_file_paths(directory, "blk")?
+        .into_iter()
+        .chain(core_compat_file_paths(directory, "rev")?)
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.get(3..))
+                .and_then(|index| index.parse::<u32>().ok())
+        })
+        .max()
+        .unwrap_or_default();
+    loop {
+        let block_path = directory.join(format!("blk{file_index:05}.dat"));
+        let undo_path = directory.join(format!("rev{file_index:05}.dat"));
+        let mut block_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&block_path)
+            .with_context(|| format!("opening Core block file {}", block_path.display()))?;
+        let mut undo_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&undo_path)
+            .with_context(|| format!("opening Core undo file {}", undo_path.display()))?;
+        let block_offset = block_file.metadata()?.len();
+        let undo_offset = undo_file.metadata()?.len();
+        let block_would_overflow = block_offset > 0
+            && block_offset
+                .saturating_add(block_record_len)
+                .gt(&file_limit);
+        let undo_would_overflow =
+            undo_offset > 0 && undo_offset.saturating_add(undo_record_len).gt(&file_limit);
+        if block_would_overflow || undo_would_overflow {
+            file_index = file_index.saturating_add(1);
+            continue;
+        }
+
+        write_core_compat_record(
+            &mut block_file,
+            magic,
+            block_length,
+            block_bytes,
+            xor_key,
+            block_offset,
+        )?;
+        write_core_compat_record(
+            &mut undo_file,
+            magic,
+            undo_length,
+            undo_bytes,
+            xor_key,
+            undo_offset,
+        )?;
+        return Ok(());
+    }
+}
+
+fn write_core_compat_record(
+    file: &mut File,
+    magic: [u8; 4],
+    length: u32,
+    payload: &[u8],
+    xor_key: XorKey,
+    offset: u64,
+) -> Result<()> {
+    let mut record = Vec::with_capacity(8 + payload.len());
+    record.extend_from_slice(&magic);
+    record.extend_from_slice(&length.to_le_bytes());
+    record.extend_from_slice(payload);
+    xor_key.apply(&mut record, offset);
+    file.write_all(&record)?;
+    file.sync_data()?;
+    Ok(())
 }
 
 fn rewrite_record_file(

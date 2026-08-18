@@ -14,11 +14,11 @@ use std::time::{Duration, SystemTime};
 use anyhow::{Context, Result};
 use bitcoin::{Transaction, Txid};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{info, warn};
 
 const CURRENT_FILE_VERSION: u32 = 1;
 const MAX_FILE_AGE: Duration = Duration::from_secs(60 * 60 * 60);
-const MIN_BUCKET_FEERATE: f64 = 1_000.0;
+const MIN_BUCKET_FEERATE: f64 = 100.0;
 const MAX_BUCKET_FEERATE: f64 = 10_000_000.0;
 const INF_BUCKET_FEERATE: f64 = 1e99;
 const FEE_SPACING: f64 = 1.05;
@@ -850,6 +850,7 @@ impl FeeEstimator {
         fs::write(&temp, bytes).with_context(|| format!("writing {}", temp.display()))?;
         fs::rename(&temp, &self.path)
             .with_context(|| format!("replacing {}", self.path.display()))?;
+        info!("Flushed fee estimates to {}.", self.path.display());
         Ok(())
     }
 

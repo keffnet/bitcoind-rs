@@ -495,6 +495,14 @@ fn normalize_peer_address_time(timestamp: u64, now: u64) -> u64 {
 fn approximate_best_block_depth(node: &Arc<Node>) -> i64 {
     let chain = node.chain.read();
     let tip = chain.tip();
+    // Core's peer manager starts with a current best-block timestamp before
+    // the first chain notification.  A fresh regtest node otherwise appears
+    // to be decades behind because its genesis timestamp is historical, and
+    // it would reject a pruned peer's NODE_NETWORK_LIMITED service during
+    // startup.
+    if tip.height == 0 {
+        return 0;
+    }
     let tip_time = i64::from(chain.header(tip.height).map_or(0, |header| header.time));
     let now = i64::try_from(crate::time::unix_time()).unwrap_or(i64::MAX);
     let spacing = i64::try_from(chain.network.params().pow_target_spacing)
@@ -4637,6 +4645,20 @@ async fn serve_peer_loop(
                     node.update_peer_presynced_headers(peer_id, Some(sync.presync_height()));
                 }
 
+                // A later announcement of the tip header may carry a
+                // different body for the same hash (the merkle-tree
+                // malleability tests rely on this). Allow that body to be
+                // requested again, while keeping rejected intermediate
+                // headers suppressed when they are only being used as
+                // parents for a new tip.
+                let reannounced_rejected_body = headers_to_accept
+                    .last()
+                    .map(BlockHeader::block_hash)
+                    .filter(|hash| node.block_body_was_rejected(hash));
+                if let Some(hash) = reannounced_rejected_body {
+                    node.forget_rejected_block_body(&hash);
+                }
+
                 let (last_hash, hashes) = {
                     let mut chain = node.chain.write();
                     // A headers response can repeat headers that are already
@@ -4652,11 +4674,33 @@ async fn serve_peer_loop(
                         })
                         .collect::<HashSet<_>>();
                     let last_hash = headers_to_accept.last().map(|header| header.block_hash());
-                    let accepted = chain.accept_headers(&headers_to_accept)?;
-                    let hashes = accepted
+                    let accepted = match chain.accept_headers(&headers_to_accept) {
+                        Ok(accepted) => accepted,
+                        Err(error)
+                            if error.to_string().contains("is on an invalidated branch")
+                                || error.to_string().contains("has an invalidated parent") =>
+                        {
+                            // A peer can legitimately answer a headers
+                            // request from a branch this node invalidated
+                            // locally while the peer is still catching up.
+                            // Core ignores that response; it does not punish
+                            // or disconnect the peer for repeating known
+                            // invalid history.
+                            debug!(%error, "ignoring headers from an invalidated branch");
+                            Vec::new()
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let mut hashes = accepted
                         .into_iter()
                         .filter(|hash| !known.contains(hash))
                         .collect::<Vec<_>>();
+                    if let Some(hash) = reannounced_rejected_body
+                        && !chain.store.contains(&hash)
+                        && !hashes.contains(&hash)
+                    {
+                        hashes.push(hash);
+                    }
                     (last_hash, hashes)
                 };
                 if !hashes.is_empty() {
@@ -4744,6 +4788,7 @@ async fn serve_peer_loop(
                         .into_iter()
                         .filter(|hash| {
                             !chain.store.contains(hash)
+                                && !node.block_body_was_rejected(hash)
                                 && (request_candidate_bodies || chain.is_active_block(hash))
                                 && chain.block_height_by_hash(hash).is_some_and(|height| {
                                     network_limited_block_download_allowed(
@@ -5077,6 +5122,9 @@ async fn serve_peer_loop(
                                 false,
                                 peer_state.permissions,
                             ) {
+                                debug!(
+                                    "historical block serving limit reached, disconnecting peer={peer_id}"
+                                );
                                 anyhow::bail!("historical block serving limit reached");
                             }
                             let block = if item.kind == InventoryType::Block {
@@ -5132,6 +5180,9 @@ async fn serve_peer_loop(
                                 false,
                                 peer_state.permissions,
                             ) {
+                                debug!(
+                                    "historical block serving limit reached, disconnecting peer={peer_id}"
+                                );
                                 anyhow::bail!("historical block serving limit reached");
                             }
                             if peer_requests_too_old_network_limited_block(
@@ -5221,6 +5272,9 @@ async fn serve_peer_loop(
                                 true,
                                 peer_state.permissions,
                             ) {
+                                debug!(
+                                    "historical block serving limit reached, disconnecting peer={peer_id}"
+                                );
                                 anyhow::bail!("historical block serving limit reached");
                             }
                             let matching = {
@@ -5663,6 +5717,9 @@ async fn serve_peer_loop(
                         false,
                         peer_state.permissions,
                     ) {
+                        debug!(
+                            "historical block serving limit reached, disconnecting peer={peer_id}"
+                        );
                         anyhow::bail!("historical block serving limit reached");
                     }
                     send_message(
@@ -6427,6 +6484,9 @@ async fn serve_peer_loop(
                     peer_state.permissions,
                 ) {
                     if !peer_state.permissions.contains(PeerPermissions::NO_BAN) {
+                        debug!(
+                            "mempool request with bandwidth limit reached, disconnecting peer={peer_id}"
+                        );
                         anyhow::bail!("mempool request with bandwidth limit reached");
                     }
                     // Core ignores this request for a noban peer instead of
@@ -6529,7 +6589,21 @@ async fn handle_received_block(
                     .downcast_ref::<ValidationError>()
                     .map(ValidationError::bip22_reject_reason)
                     .unwrap_or_default();
+                debug!("{hash}, {reject_reason}");
                 debug!(%hash, %error, reject_reason, "rejected unrequested block header");
+                let disconnect_for_header = matches!(
+                    error.downcast_ref::<ValidationError>(),
+                    Some(
+                        ValidationError::BadTarget
+                            | ValidationError::BadProofOfWork
+                            | ValidationError::TargetAboveLimit
+                            | ValidationError::TimeTooOld
+                            | ValidationError::BadBlockVersion { .. }
+                    )
+                );
+                if disconnect_on_invalid && disconnect_for_header {
+                    anyhow::bail!("invalid peer block {hash}: {error}");
+                }
                 return Ok(false);
             } else {
                 true
@@ -6560,9 +6634,40 @@ async fn handle_received_block(
             Ok(true)
         }
         Err(error) => {
+            if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
+                debug!(
+                    "Block validation error: {}",
+                    validation_error.bip22_reject_reason()
+                );
+            }
             let should_mark_invalid = error
                 .downcast_ref::<ValidationError>()
                 .is_some_and(ValidationError::should_mark_block_invalid);
+            let rejected_body = error
+                .downcast_ref::<ValidationError>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        ValidationError::EmptyBlock
+                            | ValidationError::OversizedBlockBase
+                            | ValidationError::OversizedTransaction(_)
+                            | ValidationError::TooManySigops
+                            | ValidationError::BadCoinbase
+                            | ValidationError::FirstTransactionNotCoinbase
+                            | ValidationError::ExtraCoinbase(_)
+                            | ValidationError::NullPrevout(_)
+                            | ValidationError::EmptyInputs(_)
+                            | ValidationError::EmptyOutputs(_)
+                            | ValidationError::DuplicateInput(_)
+                            | ValidationError::DuplicateTransaction(_)
+                            | ValidationError::NegativeOutputValue(_)
+                            | ValidationError::BadOutputValue(_)
+                            | ValidationError::OutputTotalOverflow
+                            | ValidationError::BadMerkleRoot
+                            | ValidationError::BadWitnessNonceSize
+                            | ValidationError::BadWitnessMerkleMatch
+                    )
+                });
             let is_mutated = error
                 .downcast_ref::<ValidationError>()
                 .is_some_and(|error| {
@@ -6578,6 +6683,9 @@ async fn handle_received_block(
                     debug!(%hash, %mark_error, "failed to cache invalid peer block");
                 }
             }
+            if rejected_body {
+                node.remember_rejected_block_body(hash);
+            }
             if disconnect_on_invalid && is_mutated {
                 if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
                     let reason = validation_error.bip22_reject_reason();
@@ -6590,13 +6698,14 @@ async fn handle_received_block(
                 }
                 anyhow::bail!("invalid peer block {hash}: {error}");
             }
-            if disconnect_on_invalid && should_mark_invalid {
+            if disconnect_on_invalid && (should_mark_invalid || rejected_body) {
                 anyhow::bail!("invalid peer block {hash}: {error}");
             }
             let reject_reason = error
                 .downcast_ref::<ValidationError>()
                 .map(ValidationError::bip22_reject_reason)
                 .unwrap_or_default();
+            debug!("{hash}, {reject_reason}");
             debug!(%hash, %error, reject_reason, "rejected peer block");
             Ok(false)
         }

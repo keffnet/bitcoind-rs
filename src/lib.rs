@@ -107,6 +107,7 @@ const MAX_KNOWN_ADDRESSES: usize = 10_000;
 const ADDRMAN_TRIED_BUCKET_COUNT: usize = 256;
 const ADDRMAN_BUCKET_SIZE: usize = 64;
 const ADDRMAN_SECRET_FILE: &str = "addrman.key";
+const COINSTATS_CLEAN_SHUTDOWN_HEIGHT_FILE: &str = "clean_shutdown_height";
 
 fn addrman_append_compact_size(input: &mut Vec<u8>, value: usize) {
     let value = u64::try_from(value).expect("address-manager vector length fits u64");
@@ -1088,6 +1089,7 @@ struct PrivateBroadcastEntry {
 pub(crate) enum NodeWarningKind {
     UnknownRulesActive,
     ClockOutOfSync,
+    LargeWorkInvalidChain,
     FatalInternal,
 }
 
@@ -1475,6 +1477,7 @@ pub struct Node {
     block_stalling_timeout_secs: AtomicU64,
     mock_scheduler_elapsed_secs: AtomicU64,
     block_stalling_since: parking_lot::RwLock<HashMap<usize, Instant>>,
+    rejected_block_bodies: parking_lot::RwLock<HashSet<BlockHash>>,
     shutdown_requested: AtomicBool,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
     peer_commands:
@@ -1506,6 +1509,8 @@ pub struct Node {
     warnings: parking_lot::RwLock<Vec<NodeWarning>>,
     versionbits_warning_scanned: AtomicBool,
     fee_estimator: Mutex<FeeEstimator>,
+    coinstats_clean_shutdown_height_path: std::path::PathBuf,
+    coinstats_unclean_startup_height: Option<u32>,
     pub started_at: Instant,
     pub(crate) network_nonce: u64,
     shutdown: Notify,
@@ -1515,6 +1520,7 @@ impl Node {
     pub fn open(config: Config) -> Result<Arc<Self>> {
         fs::create_dir_all(&config.datadir)
             .with_context(|| format!("creating data directory {}", config.datadir.display()))?;
+        let coinstats_unclean_startup = config.coinstatsindex && config.pid_path.exists();
         let lock_path = config.datadir.join(".lock");
         let data_dir_lock = OpenOptions::new()
             .create(true)
@@ -1542,7 +1548,7 @@ impl Node {
             .unwrap_or_else(|| config.datadir.join("blocks"));
         if config.blocks_dir_explicit && !blocks_dir.is_dir() {
             bail!(
-                "specified blocks directory does not exist: {}",
+                "Specified blocks directory \"{}\" does not exist.",
                 blocks_dir.display()
             );
         }
@@ -1550,18 +1556,34 @@ impl Node {
             fs::create_dir_all(&blocks_dir)
                 .with_context(|| format!("creating blocks directory {}", blocks_dir.display()))?;
         }
-        if let Some(core_blocks_dir) = core_network_blocks_dir(&config.datadir, config.network) {
+        let core_blocks_dir = if config.blocks_dir_explicit {
+            (!network_data_dir_name(config.network).is_empty()).then(|| {
+                blocks_dir
+                    .join(network_data_dir_name(config.network))
+                    .join("blocks")
+            })
+        } else {
+            core_network_blocks_dir(&config.datadir, config.network)
+        };
+        if let Some(core_blocks_dir) = core_blocks_dir.as_ref() {
             fs::create_dir_all(&core_blocks_dir).with_context(|| {
                 format!(
                     "creating Core-compatible blocks directory {}",
                     core_blocks_dir.display()
                 )
             })?;
-            for file_name in ["blk00000.dat", "rev00000.dat"] {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(core_blocks_dir.join(file_name))?;
+            fs::create_dir_all(core_blocks_dir.join("index"))?;
+            if config.blocks_dir_explicit
+                && let Some(network_name) = (!network_data_dir_name(config.network).is_empty())
+                    .then_some(network_data_dir_name(config.network))
+            {
+                fs::create_dir_all(
+                    config
+                        .datadir
+                        .join(network_name)
+                        .join("blocks")
+                        .join("index"),
+                )?;
             }
         }
         let blocks_dir_lock = if blocks_dir == config.datadir {
@@ -1652,7 +1674,13 @@ impl Node {
             config.datadir.join(network_data_dir_name(config.network))
         };
         let chain_blocks_dir = if config.blocks_dir_explicit {
-            blocks_dir.clone()
+            if let Some(network_name) = (!network_data_dir_name(config.network).is_empty())
+                .then_some(network_data_dir_name(config.network))
+            {
+                blocks_dir.join(network_name).join("blocks")
+            } else {
+                blocks_dir.clone()
+            }
         } else if matches!(config.network, Network::Bitcoin | Network::Regtest) {
             blocks_dir.clone()
         } else {
@@ -1664,6 +1692,13 @@ impl Node {
         } else {
             network_datadir.clone()
         };
+        let coinstats_clean_shutdown_height_path = chain_data_dir
+            .join("indexes/coinstatsindex")
+            .join(COINSTATS_CLEAN_SHUTDOWN_HEIGHT_FILE);
+        let coinstats_unclean_startup_height = coinstats_unclean_startup
+            .then(|| fs::read_to_string(&coinstats_clean_shutdown_height_path).ok())
+            .flatten()
+            .and_then(|height| height.trim().parse().ok());
         let mut chain =
             ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters(
                 config.network,
@@ -1680,6 +1715,21 @@ impl Node {
                 deployment_parameters,
             )
             .map_err(core_startup_chain_error)?;
+
+        // Core creates the first flat block/undo files at startup. The chain
+        // store appends exact Core-framed records to them as bodies arrive;
+        // create only the initial pair here so linearize/loadblock sees no
+        // spurious empty file after the first rotation.
+        if let Some(core_blocks_dir) = core_blocks_dir.as_ref()
+            && !chain.is_pruned()
+        {
+            for file_name in ["blk00000.dat", "rev00000.dat"] {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(core_blocks_dir.join(file_name))?;
+            }
+        }
         let block_store_reader = chain.block_store_reader();
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
@@ -1688,6 +1738,15 @@ impl Node {
         chain.configure_storage_batch_size_bytes(config.db_batch_size_bytes);
         chain.configure_prune_after_height(config.network, config.fast_prune);
         chain.configure_pruning(config.prune)?;
+        if !config.reindex && !config.reindex_chainstate {
+            chain
+                .validate_persisted_indices_against_pruning(config.coinstatsindex)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "{error}\nError: A fatal internal error occurred, see debug.log for details: Failed to start indexes, shutting down…"
+                    )
+                })?;
+        }
         // Electrum 1.7 outpoint status needs confirmed spender lookups even
         // when the standalone Core-style txospenderindex RPC option is off.
         // Keep this internal index enabled for Electrum without changing the
@@ -1903,6 +1962,7 @@ impl Node {
             block_stalling_timeout_secs: AtomicU64::new(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
             mock_scheduler_elapsed_secs: AtomicU64::new(0),
             block_stalling_since: parking_lot::RwLock::new(HashMap::new()),
+            rejected_block_bodies: parking_lot::RwLock::new(HashSet::new()),
             shutdown_requested: AtomicBool::new(false),
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
@@ -1936,6 +1996,8 @@ impl Node {
             warnings: parking_lot::RwLock::new(Vec::new()),
             versionbits_warning_scanned: AtomicBool::new(false),
             fee_estimator: Mutex::new(fee_estimator),
+            coinstats_clean_shutdown_height_path,
+            coinstats_unclean_startup_height,
             started_at: Instant::now(),
             network_nonce: random(),
             shutdown: Notify::new(),
@@ -2388,6 +2450,12 @@ impl Node {
                 }
             }
         }
+    }
+
+    fn chain_change_needs_block_bodies(&self) -> bool {
+        !self.mempool.read().is_empty()
+            || self.orphan_count() != 0
+            || (self.config.zmq.is_enabled() && self.zmq_events.receiver_count() != 0)
     }
 
     fn reduce_block_stalling_timeout(&self) {
@@ -3199,12 +3267,16 @@ impl Node {
             let previous = chain.best_hash();
             let tip = chain.invalidate_block(&hash)?;
             let changed = previous != chain.best_hash();
-            let activated_blocks = if changed {
+            let disconnected_has_transactions =
+                changed && chain.disconnected_suffix_has_non_coinbase_transactions(previous)?;
+            let load_block_bodies = changed
+                && (disconnected_has_transactions || self.chain_change_needs_block_bodies());
+            let activated_blocks = if load_block_bodies {
                 chain.active_blocks_after(previous)?
             } else {
                 Vec::new()
             };
-            let disconnected_blocks = if changed {
+            let disconnected_blocks = if load_block_bodies {
                 chain.disconnected_blocks_after(previous)?
             } else {
                 Vec::new()
@@ -3221,6 +3293,12 @@ impl Node {
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
             let _ = self.events.send(tip.clone());
         }
+        if self.chain.read().has_large_work_invalid_chain() {
+            self.set_warning(
+                NodeWarningKind::LargeWorkInvalidChain,
+                "Warning: Found invalid chain more than 6 blocks longer than our best chain. This could be due to database corruption or consensus incompatibility with peers.".to_owned(),
+            );
+        }
         self.refresh_versionbits_warning();
         self.maybe_check_block_index();
         Ok(tip)
@@ -3232,12 +3310,16 @@ impl Node {
             let previous = chain.best_hash();
             let tip = chain.reconsider_block(&hash)?;
             let changed = previous != chain.best_hash();
-            let activated_blocks = if changed {
+            let disconnected_has_transactions =
+                changed && chain.disconnected_suffix_has_non_coinbase_transactions(previous)?;
+            let load_block_bodies = changed
+                && (disconnected_has_transactions || self.chain_change_needs_block_bodies());
+            let activated_blocks = if load_block_bodies {
                 chain.active_blocks_after(previous)?
             } else {
                 Vec::new()
             };
-            let disconnected_blocks = if changed {
+            let disconnected_blocks = if load_block_bodies {
                 chain.disconnected_blocks_after(previous)?
             } else {
                 Vec::new()
@@ -3265,12 +3347,16 @@ impl Node {
             let previous = chain.best_hash();
             let tip = chain.precious_block(&hash)?;
             let changed = previous != chain.best_hash();
-            let activated_blocks = if changed {
+            let disconnected_has_transactions =
+                changed && chain.disconnected_suffix_has_non_coinbase_transactions(previous)?;
+            let load_block_bodies = changed
+                && (disconnected_has_transactions || self.chain_change_needs_block_bodies());
+            let activated_blocks = if load_block_bodies {
                 chain.active_blocks_after(previous)?
             } else {
                 Vec::new()
             };
-            let disconnected_blocks = if changed {
+            let disconnected_blocks = if load_block_bodies {
                 chain.disconnected_blocks_after(previous)?
             } else {
                 Vec::new()
@@ -3844,6 +3930,23 @@ impl Node {
     }
 
     pub(crate) fn track_peer_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
+        self.track_peer_block_request_with_limit(peer_id, hash, true)
+    }
+
+    /// Record a request made by the `getblockfrompeer` RPC. Core's manual
+    /// fetch path intentionally does not apply the automatic download window
+    /// limit; callers may queue a range of previously-pruned blocks from one
+    /// peer at once.
+    pub(crate) fn track_manual_peer_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
+        self.track_peer_block_request_with_limit(peer_id, hash, false)
+    }
+
+    fn track_peer_block_request_with_limit(
+        &self,
+        peer_id: usize,
+        hash: BlockHash,
+        enforce_limit: bool,
+    ) -> bool {
         let Some(height) = self.chain.read().block_height_by_hash(&hash) else {
             return false;
         };
@@ -3853,7 +3956,7 @@ impl Node {
                 .iter()
                 .any(|inflight| inflight.hash == hash)
         {
-            if peer.inflight_blocks.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER {
+            if enforce_limit && peer.inflight_blocks.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER {
                 return false;
             }
             peer.inflight_blocks.push(InflightBlock {
@@ -3971,6 +4074,18 @@ impl Node {
         self.next_block_download_schedule_for(Some(peer_id), limit, peer_services)
     }
 
+    pub(crate) fn remember_rejected_block_body(&self, hash: BlockHash) {
+        self.rejected_block_bodies.write().insert(hash);
+    }
+
+    pub(crate) fn forget_rejected_block_body(&self, hash: &BlockHash) {
+        self.rejected_block_bodies.write().remove(hash);
+    }
+
+    pub(crate) fn block_body_was_rejected(&self, hash: &BlockHash) -> bool {
+        self.rejected_block_bodies.read().contains(hash)
+    }
+
     fn next_block_download_schedule_for(
         &self,
         peer_id: Option<usize>,
@@ -4052,6 +4167,7 @@ impl Node {
                     )
                 })
                 .filter(|(hash, _)| !chain.store.contains(hash))
+                .filter(|(hash, _)| !self.block_body_was_rejected(hash))
                 .filter(|(hash, _)| !chain.is_block_pruned(hash))
                 .filter(|(_, height)| {
                     !limited_peer
@@ -5572,7 +5688,7 @@ impl Node {
             bail!("Pre-SegWit peer");
         }
         self.clear_peer_block_requests_for_hash(hash);
-        if !self.track_peer_block_request(peer_id, hash) {
+        if !self.track_manual_peer_block_request(peer_id, hash) {
             bail!("block request limit reached for peer {peer_id}");
         }
         if sender.send(p2p::PeerCommand::RequestBlock(hash)).is_err() {
@@ -5991,6 +6107,9 @@ impl Node {
         if self.config.persist_mempool {
             self.persist_mempool()?;
         }
+        if run_result.is_ok() && self.config.coinstatsindex {
+            self.persist_coinstats_clean_shutdown_height()?;
+        }
         self.persist_known_addresses()?;
         self.remove_rpc_cookie();
         run_result
@@ -6020,6 +6139,28 @@ impl Node {
             .read()
             .save_to_file_with_format(&self.mempool_path, self.config.persist_mempool_v1)
             .with_context(|| "Unable to dump mempool to disk")
+    }
+
+    fn persist_coinstats_clean_shutdown_height(&self) -> Result<()> {
+        let height = self.chain.read().height();
+        let path = &self.coinstats_clean_shutdown_height_path;
+        let temporary_path = std::path::PathBuf::from(format!("{}.tmp", path.display()));
+        fs::write(&temporary_path, format!("{height}\n"))
+            .with_context(|| format!("writing {}", path.display()))?;
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&temporary_path)
+            .with_context(|| format!("opening {} for synchronization", temporary_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("flushing {}", temporary_path.display()))?;
+        fs::rename(&temporary_path, path)
+            .with_context(|| format!("installing {}", path.display()))?;
+        Ok(())
+    }
+
+    pub(crate) fn coinstats_best_block_height(&self) -> u32 {
+        self.coinstats_unclean_startup_height
+            .unwrap_or_else(|| self.chain.read().height())
     }
 
     pub(crate) fn mempool_path(&self) -> &Path {
@@ -7152,8 +7293,18 @@ mod tests {
         ])
         .unwrap();
         let _node = Node::open(Config::from_args(args).unwrap()).unwrap();
-        assert!(directory.path().join("external-blocks/blocks.dat").exists());
-        assert!(directory.path().join("external-blocks/xor.dat").exists());
+        assert!(
+            directory
+                .path()
+                .join("external-blocks/regtest/blocks/blocks.dat")
+                .exists()
+        );
+        assert!(
+            directory
+                .path()
+                .join("external-blocks/regtest/blocks/xor.dat")
+                .exists()
+        );
         assert!(directory.path().join("chainstate.bin").exists());
         assert!(!directory.path().join("blocks/blocks.dat").exists());
     }

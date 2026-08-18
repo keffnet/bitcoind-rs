@@ -1030,7 +1030,8 @@ fn rest_block(
         .ok_or_else(|| anyhow!("invalid block path"))?;
     let hash = parse_rest_block_hash(hash_text)?;
     let mut chain = node.chain.write();
-    if chain.is_active_block(&hash)
+    if !chain.is_pruned()
+        && chain.is_active_block(&hash)
         && core_network_blocks_dir(&node.config.datadir, node.config.network)
             .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
     {
@@ -1101,7 +1102,8 @@ fn rest_block_part(
         bail!("block part offset/size is outside the block")
     }
     let mut chain = node.chain.write();
-    if chain.is_active_block(&hash)
+    if !chain.is_pruned()
+        && chain.is_active_block(&hash)
         && core_network_blocks_dir(&node.config.datadir, node.config.network)
             .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
     {
@@ -2823,6 +2825,7 @@ fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         return Ok(json!({}));
     }
     let height = node.chain.read().height();
+    let coinstats_height = node.coinstats_best_block_height();
     let mut result = json!({});
     if node.config.txindex && requested.is_none_or(|name| name == TX_INDEX) {
         result[TX_INDEX] = json!({
@@ -2839,7 +2842,7 @@ fn get_index_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if node.config.coinstatsindex && requested.is_none_or(|name| name == COIN_STATS_INDEX) {
         result[COIN_STATS_INDEX] = json!({
             "synced": true,
-            "best_block_height": height,
+            "best_block_height": coinstats_height,
         });
     }
     if node.config.blockfilterindex && requested.is_none_or(|name| name == BASIC_FILTER_INDEX) {
@@ -5360,7 +5363,8 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = chain
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
-    if chain.is_active_block(&hash)
+    if !chain.is_pruned()
+        && chain.is_active_block(&hash)
         && core_network_blocks_dir(&node.config.datadir, node.config.network)
             .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
     {
@@ -5378,7 +5382,8 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
         -1
     };
     let undo = if verbosity >= 2 {
-        if chain.is_active_block(&hash)
+        if !chain.is_pruned()
+            && chain.is_active_block(&hash)
             && core_network_blocks_dir(&node.config.datadir, node.config.network)
                 .is_some_and(|directory| !directory.join("rev00000.dat").is_file())
         {
@@ -5596,8 +5601,9 @@ fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
         // The Core-compatible reverse block files are also the observable
         // rollback prerequisite.  The functional suite deliberately removes
         // one of them to ensure a failed rollback does not suspend the node.
-        if core_network_blocks_dir(&node.config.datadir, node.config.network)
-            .is_some_and(|directory| !directory.join("rev00000.dat").is_file())
+        if !node.chain.read().is_pruned()
+            && core_network_blocks_dir(&node.config.datadir, node.config.network)
+                .is_some_and(|directory| !directory.join("rev00000.dat").is_file())
         {
             bail!("Could not roll back to requested height.")
         }
@@ -6523,7 +6529,8 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = chain
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
-    if chain.is_active_block(&hash)
+    if !chain.is_pruned()
+        && chain.is_active_block(&hash)
         && core_network_blocks_dir(&node.config.datadir, node.config.network)
             .is_some_and(|directory| !directory.join("blk00000.dat").is_file())
     {
@@ -11397,7 +11404,8 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     }
     let result = node.connect_block(block);
     match result {
-        Ok(_) => Ok(Value::Null),
+        Ok(tip) if tip.hash == hash => Ok(Value::Null),
+        Ok(_) => Ok(json!("inconclusive")),
         Err(error) => {
             debug!(%hash, %error, "submitblock rejected");
             let message = error.to_string();
@@ -11407,6 +11415,11 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 Ok(json!("inconclusive"))
             } else if message.contains("invalidated branch") {
                 Ok(json!("duplicate-invalid"))
+            } else if matches!(
+                error.downcast_ref::<validation::ValidationError>(),
+                Some(validation::ValidationError::WrongPreviousBlock)
+            ) {
+                Ok(json!("inconclusive"))
             } else if let Some(reason) = bip22_validation_result(&error) {
                 // Core records a header as failed-validation when a known
                 // header is later rejected with a block body.  Preserve that
@@ -13045,6 +13058,9 @@ fn rejected_transaction_json(transaction: &Transaction, error: &MempoolError) ->
     // TxValidationState::ToString().
     let reject_details = match error {
         MempoolError::NonStandard(reason) => reason.clone(),
+        MempoolError::Script(reason) if reason.starts_with("mempool-script-verify-flag-failed") => {
+            reason.clone()
+        }
         _ => error.to_string(),
     };
     let reject_details = if reject_details.starts_with("mempool-script-verify-flag-failed") {
@@ -15497,6 +15513,12 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "parameter 'txids' cannot be empty" {
         return -8;
     }
+    if lower == "querying specific block heights requires coinstatsindex" {
+        return -8;
+    }
+    if lower == "hash_serialized_3 hash type cannot be queried for a specific block" {
+        return -8;
+    }
     if lower == "priority is not supported for transactions with dust outputs." {
         return -8;
     }
@@ -15682,6 +15704,9 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "block is not in main chain"
         || lower == "block height out of range"
         || lower == "block does not exist at specified height"
+        || lower == "blockchain is shorter than the attempted prune height."
+        || lower == "negative block height."
+        || lower == "could not find block with at least the specified timestamp."
         || lower.starts_with("invalid block count:")
         || lower.starts_with("invalid blockhash:")
         || lower.starts_with("invalid snapshot type ")

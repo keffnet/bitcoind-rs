@@ -12,12 +12,13 @@ use bitcoin::blockdata::script::{Instruction, PushBytesBuf, ScriptBuf};
 use bitcoin::blockdata::transaction::{OutPoint as TransactionOutPoint, TxIn, TxOut, Version};
 use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::Params;
-use bitcoin::consensus::encode::{deserialize_partial, serialize};
+use bitcoin::consensus::encode::{VarInt, deserialize_partial, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::opcodes::OP_0;
 use bitcoin::pow::Target;
 use bitcoin::{
-    Amount, Block, BlockHash, Network, OutPoint, Sequence, Transaction, Txid, WitnessCommitment,
+    Amount, Block, BlockHash, Network, OutPoint, Script, Sequence, Transaction, Txid,
+    WitnessCommitment,
 };
 
 use crate::time;
@@ -109,12 +110,16 @@ pub enum ValidationError {
     UnexpectedWitness,
     #[error("block signet solution is invalid")]
     BadSignetSolution,
+    #[error("block non-witness size exceeds the consensus limit")]
+    OversizedBlockBase,
     #[error("block weight exceeds the consensus limit")]
     OversizedBlock,
     #[error("transaction {0} exceeds the consensus size limit")]
     OversizedTransaction(Txid),
     #[error("block sigop cost exceeds the consensus limit")]
     TooManySigops,
+    #[error("block sigop cost exceeds the consensus limit while connecting")]
+    TooManySigopsInConnect,
     #[error("block version {actual} is below the required version {required}")]
     BadBlockVersion { actual: i32, required: i32 },
     #[error("coinbase transaction is missing or malformed")]
@@ -133,6 +138,8 @@ pub enum ValidationError {
     DuplicateInput(Txid),
     #[error("block contains duplicate transaction {0}")]
     DuplicateTransaction(Txid),
+    #[error("transaction {0} output value is negative")]
+    NegativeOutputValue(Txid),
     #[error("transaction {0} output value is out of range")]
     BadOutputValue(Txid),
     #[error("block output total exceeds MAX_MONEY")]
@@ -177,7 +184,9 @@ impl ValidationError {
     pub(crate) fn should_mark_block_invalid(&self) -> bool {
         matches!(
             self,
-            Self::BadCoinbaseHeight
+            Self::OversizedBlock
+                | Self::TooManySigopsInConnect
+                | Self::BadCoinbaseHeight
                 | Self::MissingInput { .. }
                 | Self::ImmatureCoinbase { .. }
                 | Self::InputTotalOverflow
@@ -210,8 +219,10 @@ impl ValidationError {
             Self::UnexpectedWitness => "unexpected-witness".to_owned(),
             Self::BadSignetSolution => "bad-signet-blksig".to_owned(),
             Self::OversizedBlock => "bad-blk-weight".to_owned(),
+            Self::OversizedBlockBase => "bad-blk-length".to_owned(),
             Self::OversizedTransaction(_) => "bad-txns-oversize".to_owned(),
-            Self::TooManySigops => "bad-blk-sigops".to_owned(),
+            Self::TooManySigops => "bad-blk-sigops, out-of-bounds SigOpCount".to_owned(),
+            Self::TooManySigopsInConnect => "bad-blk-sigops, out-of-bounds SigOpCount".to_owned(),
             Self::BadBlockVersion { actual, .. } => {
                 format!("bad-version(0x{:08x})", *actual as u32)
             }
@@ -223,6 +234,7 @@ impl ValidationError {
             Self::EmptyOutputs(_) => "bad-txns-vout-empty".to_owned(),
             Self::DuplicateInput(_) => "bad-txns-inputs-duplicate".to_owned(),
             Self::DuplicateTransaction(_) => "bad-txns-duplicate".to_owned(),
+            Self::NegativeOutputValue(_) => "bad-txns-vout-negative".to_owned(),
             Self::BadOutputValue(_) => "bad-txns-vout-toolarge".to_owned(),
             Self::OutputTotalOverflow => "bad-txns-txouttotal-toolarge".to_owned(),
             Self::SubsidyOverflow => "bad-txns-fee-outofrange".to_owned(),
@@ -903,6 +915,16 @@ fn validate_block_structure_with_options_internal(
     if check_witness_commitment {
         validate_witness_commitment(block, height >= params.buried.segwit)?;
     }
+    let base_size = serialize(&block.header).len()
+        + VarInt::from(block.txdata.len()).size()
+        + block
+            .txdata
+            .iter()
+            .map(|transaction| transaction.base_size())
+            .sum::<usize>();
+    if base_size.saturating_mul(4) > MAX_BLOCK_WEIGHT {
+        return Err(ValidationError::OversizedBlockBase);
+    }
     if block.weight().to_wu() > MAX_BLOCK_WEIGHT as u64 {
         return Err(ValidationError::OversizedBlock);
     }
@@ -941,6 +963,9 @@ fn validate_block_structure_with_options_internal(
         let mut tx_total = 0u64;
         for output in &tx.output {
             let value = output.value.to_sat();
+            if output.value.to_sat() > i64::MAX as u64 {
+                return Err(ValidationError::NegativeOutputValue(txid));
+            }
             if output.value > Amount::MAX_MONEY {
                 return Err(ValidationError::BadOutputValue(txid));
             }
@@ -1339,11 +1364,234 @@ pub(crate) fn validate_transaction_scripts_with_flags(
             return Err(ValidationError::Script {
                 txid: transaction.compute_txid(),
                 input,
-                reason: format!("{error:?}"),
+                reason: script_error_reason_hint(transaction, previous_outputs, input)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("{error:?}")),
             });
         }
     }
     Ok(())
+}
+
+/// libbitcoinconsensus exposes only the coarse `ERR_SCRIPT` result, while
+/// Core's RPC and block rejection paths retain the script interpreter's
+/// human-readable reason. Recover the consensus reasons that can be inferred
+/// safely from the transaction's executed script shape.
+pub(crate) fn script_error_reason_hint(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+    input_index: usize,
+) -> Option<&'static str> {
+    let input = transaction.input.get(input_index)?;
+    let previous_output = previous_outputs.get(input_index)?;
+
+    if !input.witness.is_empty() && !spends_witness_program(input, previous_output) {
+        return Some("Witness provided for non-witness script");
+    }
+    if let Some(reason) = script_interpreter_hint(input.script_sig.as_script())
+        .or_else(|| script_interpreter_hint(previous_output.script_pubkey.as_script()))
+    {
+        return Some(reason);
+    }
+    if null_dummy_script_hint(input, previous_output) {
+        return Some("Dummy CHECKMULTISIG argument must be zero");
+    }
+    cltv_script_hint(transaction, input, previous_output)
+}
+
+fn script_interpreter_hint(script: &Script) -> Option<&'static str> {
+    let mut conditional_depth = 0usize;
+    let mut code_separator = false;
+    for instruction in script.instructions() {
+        let Ok(Instruction::Op(opcode)) = instruction else {
+            continue;
+        };
+        match opcode.to_u8() {
+            0x7e..=0x81 | 0x83..=0x86 | 0x8d..=0x8e | 0x95..=0x99 => {
+                return Some("disabled opcode");
+            }
+            0x6a => return Some("OP_RETURN was encountered"),
+            0xab => code_separator = true,
+            0x63 | 0x64 => conditional_depth = conditional_depth.saturating_add(1),
+            0x67 | 0x68 if conditional_depth == 0 => {
+                return Some("Invalid OP_IF construction");
+            }
+            0x67 | 0x68 => conditional_depth = conditional_depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    if conditional_depth != 0 {
+        return Some("Invalid OP_IF construction");
+    }
+    code_separator.then_some("Using OP_CODESEPARATOR in non-witness script")
+}
+
+fn spends_witness_program(input: &TxIn, previous_output: &TxOut) -> bool {
+    if previous_output.script_pubkey.is_witness_program() {
+        return true;
+    }
+    if !previous_output.script_pubkey.is_p2sh() {
+        return false;
+    }
+    let Some(items) = push_only_stack_items(input.script_sig.as_script()) else {
+        return false;
+    };
+    items
+        .last()
+        .map(|redeem| Script::from_bytes(redeem).is_witness_program())
+        .unwrap_or(false)
+}
+
+fn null_dummy_script_hint(input: &TxIn, previous_output: &TxOut) -> bool {
+    let script_sig_items = push_only_stack_items(input.script_sig.as_script());
+    if previous_output.script_pubkey.is_p2sh()
+        && let Some(items) = script_sig_items.as_ref()
+        && let Some(redeem_script) = items.last()
+        && !items.first().is_none_or(Vec::is_empty)
+        && script_contains_checkmultisig(redeem_script)
+    {
+        return true;
+    }
+
+    let witness_script = if previous_output.script_pubkey.is_witness_program() {
+        input.witness.iter().last().map(|script| script.to_vec())
+    } else if previous_output.script_pubkey.is_p2sh() {
+        script_sig_items
+            .as_ref()
+            .and_then(|items| items.last())
+            .and_then(|redeem| {
+                let redeem = Script::from_bytes(redeem);
+                redeem
+                    .is_witness_program()
+                    .then(|| input.witness.iter().last().map(|script| script.to_vec()))
+            })
+            .flatten()
+    } else {
+        None
+    };
+    let Some(witness_script) = witness_script else {
+        return false;
+    };
+    !input.witness.is_empty()
+        && !input
+            .witness
+            .iter()
+            .next()
+            .is_none_or(|dummy| dummy.is_empty())
+        && script_contains_checkmultisig(&witness_script)
+}
+
+fn cltv_script_hint(
+    transaction: &Transaction,
+    input: &TxIn,
+    previous_output: &TxOut,
+) -> Option<&'static str> {
+    let mut stack = Vec::new();
+    if let Some(reason) =
+        cltv_script_hint_for_script(transaction, input, input.script_sig.as_script(), &mut stack)
+    {
+        return Some(reason);
+    }
+    cltv_script_hint_for_script(
+        transaction,
+        input,
+        previous_output.script_pubkey.as_script(),
+        &mut stack,
+    )
+}
+
+fn cltv_script_hint_for_script(
+    transaction: &Transaction,
+    input: &TxIn,
+    script: &Script,
+    stack: &mut Vec<Vec<u8>>,
+) -> Option<&'static str> {
+    for instruction in script.instructions() {
+        match instruction.ok()? {
+            Instruction::PushBytes(bytes) => stack.push(bytes.as_bytes().to_vec()),
+            Instruction::Op(opcode) => match opcode.to_u8() {
+                0x00 => stack.push(Vec::new()),
+                0x4f => stack.push(vec![0x81]),
+                0x51..=0x60 => stack.push(vec![opcode.to_u8() - 0x50]),
+                0xb1 | 0xb2 => {
+                    let Some(value) = stack.last().and_then(|item| script_num_value(item)) else {
+                        return Some("Operation not valid with the current stack size");
+                    };
+                    if value < 0 {
+                        return Some("Negative locktime");
+                    }
+                    if opcode.to_u8() == 0xb2 {
+                        let sequence = input.sequence.to_consensus_u32();
+                        let required = value as u32;
+                        if transaction.version.0 < 2
+                            || sequence & 0x8000_0000 != 0
+                            || required & 0x8000_0000 == 0
+                                && ((required ^ sequence) & 0x0040_0000 != 0
+                                    || (required & 0x0000_ffff) > (sequence & 0x0000_ffff))
+                        {
+                            return Some("Locktime requirement not satisfied");
+                        }
+                        continue;
+                    }
+                    let tx_lock_time = transaction.lock_time.to_consensus_u32();
+                    let script_is_time = value as u32 >= LOCK_TIME_THRESHOLD;
+                    let tx_is_time = tx_lock_time >= LOCK_TIME_THRESHOLD;
+                    if script_is_time != tx_is_time
+                        || value as u64 > u64::from(tx_lock_time)
+                        || input.sequence == Sequence::MAX
+                    {
+                        return Some("Locktime requirement not satisfied");
+                    }
+                }
+                0x75 => {
+                    stack.pop()?;
+                }
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+fn script_contains_checkmultisig(script: &[u8]) -> bool {
+    Script::from_bytes(script)
+        .instructions()
+        .any(|instruction| {
+            matches!(
+                instruction,
+                Ok(Instruction::Op(opcode)) if matches!(opcode.to_u8(), 0xae | 0xaf)
+            )
+        })
+}
+
+fn push_only_stack_items(script: &Script) -> Option<Vec<Vec<u8>>> {
+    script
+        .instructions()
+        .map(|instruction| match instruction {
+            Ok(Instruction::PushBytes(bytes)) => Some(bytes.as_bytes().to_vec()),
+            Ok(Instruction::Op(opcode)) => match opcode.to_u8() {
+                0x00 => Some(Vec::new()),
+                0x4f => Some(vec![0x81]),
+                0x51..=0x60 => Some(vec![opcode.to_u8() - 0x50]),
+                _ => None,
+            },
+            Err(_) => None,
+        })
+        .collect()
+}
+
+fn script_num_value(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() > 5 {
+        return None;
+    }
+    let mut value = bytes.iter().enumerate().fold(0i64, |value, (index, byte)| {
+        value | (i64::from(*byte) << (8 * index))
+    });
+    if bytes.last().is_some_and(|byte| byte & 0x80 != 0) {
+        value &= !(0x80i64 << (8 * (bytes.len().saturating_sub(1))));
+        value = -value;
+    }
+    Some(value)
 }
 
 pub(crate) const MAX_BLOCK_SERIALIZED_SIZE: usize = 4_000_000;

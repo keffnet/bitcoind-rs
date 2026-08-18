@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use bitcoin::absolute::LockTime;
 use bitcoin::bip152::{BlockTransactions, BlockTransactionsRequest, HeaderAndShortIds};
 use bitcoin::blockdata::transaction::Version;
-use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::p2p::message_bloom::{FilterAdd, FilterLoad};
 use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock, GetBlockTxn};
@@ -642,10 +642,20 @@ fn frame_has_recoverable_error(network: Network, frame: &[u8]) -> bool {
     if frame.len() < HEADER_SIZE || frame[..4] != network_magic(network) {
         return false;
     }
-    if decode_command(&frame[4..16]).is_err() {
+    let Ok(command) = decode_command(&frame[4..16]) else {
+        return true;
+    };
+    if frame[20..24] != checksum(&frame[24..]) {
         return true;
     }
-    frame[20..24] != checksum(&frame[24..])
+    if command == "block"
+        && let Err(WireError::Payload(reason)) = decode_payload(command, &frame[24..])
+        && reason.contains("non-minimal varint")
+    {
+        tracing::debug!(target: "bitcoind_rs::p2p", "non-canonical ReadCompactSize()");
+        return true;
+    }
+    false
 }
 
 fn recoverable_payload_message(network: Network, frame: &[u8]) -> Option<Message> {
@@ -976,6 +986,107 @@ fn decode_transaction_core_compatible(payload: &[u8]) -> Result<Transaction, Wir
     deserialize(payload).map_err(payload_error)
 }
 
+fn decode_block_core_compatible(payload: &[u8]) -> Result<Block, WireError> {
+    if let Ok(block) = deserialize(payload) {
+        return Ok(block);
+    }
+
+    let (header, header_consumed) =
+        deserialize_partial::<bitcoin::block::Header>(payload).map_err(payload_error)?;
+    let (transaction_count, count_consumed) =
+        deserialize_partial::<VarInt>(&payload[header_consumed..]).map_err(payload_error)?;
+    let transaction_count = usize::try_from(transaction_count.0)
+        .map_err(|_| WireError::Payload("block transaction count is too large".to_owned()))?;
+    if transaction_count > 1_000_000 {
+        return Err(WireError::Payload(
+            "block transaction count is too large".to_owned(),
+        ));
+    }
+
+    let mut offset = header_consumed.saturating_add(count_consumed);
+    let mut txdata = Vec::with_capacity(transaction_count);
+    for _ in 0..transaction_count {
+        let remaining = payload
+            .get(offset..)
+            .ok_or_else(|| WireError::Payload("truncated block transaction".to_owned()))?;
+        match deserialize_partial::<Transaction>(remaining) {
+            Ok((transaction, consumed)) => {
+                txdata.push(transaction);
+                offset = offset.saturating_add(consumed);
+            }
+            Err(_) => {
+                let (transaction, consumed) = decode_empty_input_transaction(remaining)?;
+                txdata.push(transaction);
+                offset = offset.saturating_add(consumed);
+            }
+        }
+    }
+    if offset != payload.len() {
+        return Err(WireError::Payload(
+            "block contains trailing transaction bytes".to_owned(),
+        ));
+    }
+    Ok(Block { header, txdata })
+}
+
+fn decode_empty_input_transaction(payload: &[u8]) -> Result<(Transaction, usize), WireError> {
+    let (version, version_consumed) =
+        deserialize_partial::<Version>(payload).map_err(payload_error)?;
+    let (input_count, input_count_consumed) = deserialize_partial::<VarInt>(
+        payload
+            .get(version_consumed..)
+            .ok_or_else(|| WireError::Payload("truncated transaction inputs".to_owned()))?,
+    )
+    .map_err(payload_error)?;
+    if input_count.0 != 0 {
+        return Err(WireError::Payload(
+            "transaction decoder could not recover an empty-input transaction".to_owned(),
+        ));
+    }
+    let output_offset = version_consumed.saturating_add(input_count_consumed);
+    let (output_count, output_count_consumed) = deserialize_partial::<VarInt>(
+        payload
+            .get(output_offset..)
+            .ok_or_else(|| WireError::Payload("truncated transaction outputs".to_owned()))?,
+    )
+    .map_err(payload_error)?;
+    let output_count = usize::try_from(output_count.0)
+        .map_err(|_| WireError::Payload("transaction output count is too large".to_owned()))?;
+    if output_count > 1_000_000 {
+        return Err(WireError::Payload(
+            "transaction output count is too large".to_owned(),
+        ));
+    }
+    let mut offset = output_offset.saturating_add(output_count_consumed);
+    let mut output = Vec::with_capacity(output_count);
+    for _ in 0..output_count {
+        let (txout, consumed) = deserialize_partial::<bitcoin::TxOut>(
+            payload
+                .get(offset..)
+                .ok_or_else(|| WireError::Payload("truncated transaction output".to_owned()))?,
+        )
+        .map_err(payload_error)?;
+        output.push(txout);
+        offset = offset.saturating_add(consumed);
+    }
+    let (lock_time, lock_time_consumed) = deserialize_partial::<LockTime>(
+        payload
+            .get(offset..)
+            .ok_or_else(|| WireError::Payload("truncated transaction locktime".to_owned()))?,
+    )
+    .map_err(payload_error)?;
+    offset = offset.saturating_add(lock_time_consumed);
+    Ok((
+        Transaction {
+            version,
+            lock_time,
+            input: Vec::new(),
+            output,
+        },
+        offset,
+    ))
+}
+
 fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
     let mut reader = Reader::new(payload);
     let message = match command {
@@ -1016,7 +1127,7 @@ fn decode_payload(command: &str, payload: &[u8]) -> Result<Message, WireError> {
         "inv" => Message::Inv(decode_inventory(&mut reader)?),
         "getdata" => Message::GetData(decode_inventory(&mut reader)?),
         "notfound" => Message::NotFound(decode_inventory(&mut reader)?),
-        "block" => Message::Block(deserialize(payload).map_err(payload_error)?),
+        "block" => Message::Block(decode_block_core_compatible(payload)?),
         "merkleblock" => Message::MerkleBlock(deserialize(payload).map_err(payload_error)?),
         "tx" => Message::Transaction(decode_transaction_core_compatible(payload)?),
         "filterload" => Message::FilterLoad(deserialize(payload).map_err(payload_error)?),

@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tracing::debug;
 
 use crate::config::{DEFAULT_SCRIPT_CHECK_THREADS, MAX_SCRIPT_CHECK_THREADS};
 use crate::muhash::MuHash3072;
@@ -46,6 +47,7 @@ const MAX_MISSING_UTXO_CACHE_ENTRIES: usize = 8_192;
 // hash-table/deque bookkeeping is accounted for as roughly 64 bytes here.
 const DEFAULT_SCRIPT_CACHE_ENTRIES: usize = (32 * 1024 * 1024) / 64;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
+const MIN_SUFFIX_ACTIVATION_BLOCKS: usize = 32;
 const FAST_PRUNE_BLOCKFILE_SIZE: usize = 0x10_000;
 const MAX_ORPHAN_BLOCKS: usize = 128;
 const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
@@ -880,6 +882,7 @@ pub struct ChainState {
     active_tx_counts: Vec<u32>,
     active_tx_totals: Vec<u64>,
     initial_block_download: bool,
+    max_tip_age_configured: bool,
     snapshot_base: Option<BlockHash>,
     snapshot_validated: bool,
     snapshot_validation_error: Option<String>,
@@ -1152,6 +1155,7 @@ impl ChainState {
         let genesis_hash = genesis.block_hash();
         if !store.contains(&genesis_hash) {
             store.insert(&genesis)?;
+            store.append_core_compat(&genesis, &[Vec::new()], network, false)?;
         }
 
         let metadata_path = data_dir.join("chainstate.bin");
@@ -1175,9 +1179,11 @@ impl ChainState {
         let electrum_history_store =
             ElectrumHistoryStore::open(data_dir.join("indexes/electrum-history"))?;
         if rebuild_chainstate {
+            // Reindex rebuilds the UTXO/chainstate data, but Core keeps the
+            // block-index headers that describe pruned ancestors.  Preserve
+            // our equivalent metadata so a pruned block store can still
+            // connect newly supplied bodies after the rebuild.
             for path in [
-                metadata_path.clone(),
-                legacy_metadata_path.clone(),
                 data_dir.join("chainstate.snapshot"),
                 data_dir.join("chainstate.snapshot.sha256"),
                 data_dir.join("chainstate.txcounters"),
@@ -1200,7 +1206,7 @@ impl ChainState {
             prune_height,
             prune_locks,
             prune_protected_blocks,
-        ) = if !rebuild_chainstate && (metadata_path.exists() || legacy_metadata_path.exists()) {
+        ) = if metadata_path.exists() || legacy_metadata_path.exists() {
             let metadata = if metadata_path.exists() {
                 let bytes = fs::read(&metadata_path)
                     .with_context(|| format!("reading {}", metadata_path.display()))?;
@@ -1320,6 +1326,7 @@ impl ChainState {
             active_tx_counts: persisted_tx_counts.unwrap_or_default(),
             active_tx_totals: persisted_tx_totals,
             initial_block_download: true,
+            max_tip_age_configured: false,
             snapshot_base: persisted_snapshot_provenance
                 .as_ref()
                 .map(|provenance| provenance.base_hash.parse())
@@ -1373,6 +1380,7 @@ impl ChainState {
         let snapshot_verified = snapshot.as_ref().is_some_and(|(_, verified)| *verified);
         if rebuild_chainstate {
             state.initialize_genesis(&genesis)?;
+            state.index_persisted_headers(&persisted_headers)?;
             state.rebuild_block_index()?;
             let best = state
                 .best_valid_tip_hash()
@@ -1824,6 +1832,7 @@ impl ChainState {
         self.coinstats_index_enabled = enabled;
         if !enabled {
             self.coin_stats = None;
+            self.prune_locks.remove("coinstatsindex");
             return Ok(());
         }
         let utxos = if self.utxos_materialized {
@@ -1832,7 +1841,9 @@ impl ChainState {
             self.load_utxo_map_from_store()?
         };
         self.coin_stats = Some(CoinStatsState::from_utxos(&utxos));
-        self.rebuild_coinstats_index()
+        self.rebuild_coinstats_index()?;
+        self.update_index_prune_locks(self.height());
+        Ok(())
     }
 
     pub fn coinstats_at(
@@ -1915,7 +1926,92 @@ impl ChainState {
         } else {
             None
         };
+        if !self.blockfilter_index_enabled {
+            self.prune_locks.remove("basic block filter index");
+        }
+        if !self.coinstats_index_enabled {
+            self.prune_locks.remove("coinstatsindex");
+        }
+        self.update_index_prune_locks(self.height());
         Ok(())
+    }
+
+    pub fn validate_persisted_indices_against_pruning(
+        &mut self,
+        coinstats_index_enabled: bool,
+    ) -> Result<()> {
+        let Some(prune_height) = self.prune_height else {
+            return Ok(());
+        };
+        if self.blockfilter_index_enabled {
+            let best_height = self
+                .active_chain
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(height, hash)| {
+                    self.filter_store
+                        .get(hash)
+                        .ok()
+                        .flatten()
+                        .map(|_| u32::try_from(height).unwrap_or(u32::MAX))
+                })
+                .unwrap_or_default();
+            if best_height < prune_height {
+                bail!(
+                    "basic block filter index best block of the index goes beyond pruned data (including undo data). Please disable the index or reindex (which will download the whole blockchain again)"
+                );
+            }
+        }
+        if coinstats_index_enabled {
+            let best_height = self
+                .active_chain
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(height, hash)| {
+                    self.coinstats_store
+                        .get(hash)
+                        .ok()
+                        .flatten()
+                        .map(|_| u32::try_from(height).unwrap_or(u32::MAX))
+                })
+                .unwrap_or_default();
+            if best_height < prune_height {
+                bail!(
+                    "coinstatsindex best block of the index goes beyond pruned data (including undo data). Please disable the index or reindex (which will download the whole blockchain again)"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn update_index_prune_locks(&mut self, height: u32) {
+        if !self.prune_mode {
+            return;
+        }
+        if self.blockfilter_index_enabled {
+            self.prune_locks.insert(
+                "basic block filter index".to_owned(),
+                PruneLock {
+                    desc: "basic block filter index".to_owned(),
+                    height_first: u64::from(height),
+                    height_last: u64::MAX,
+                    temporary: false,
+                },
+            );
+        }
+        if self.coinstats_index_enabled {
+            self.prune_locks.insert(
+                "coinstatsindex".to_owned(),
+                PruneLock {
+                    desc: "coinstatsindex".to_owned(),
+                    height_first: u64::from(height),
+                    height_last: u64::MAX,
+                    temporary: false,
+                },
+            );
+        }
     }
 
     /// Prune automatically when the configured block/undo target is
@@ -1985,9 +2081,15 @@ impl ChainState {
         }
         let mut target_height = requested_height.min(tip_height - MIN_BLOCKS_TO_KEEP);
         for lock in self.prune_locks.values() {
-            if lock.height_first < u64::from(target_height) {
-                target_height =
-                    target_height.min(u32::try_from(lock.height_first).unwrap_or(u32::MAX));
+            if lock.height_first == u64::MAX {
+                continue;
+            }
+            let lock_height = u32::try_from(lock.height_first.saturating_sub(11))
+                .unwrap_or(u32::MAX)
+                .max(1);
+            if lock_height < tip_height {
+                debug!("{} limited pruning to height {lock_height}", lock.desc);
+                target_height = target_height.min(lock_height);
             }
         }
         if self.fast_prune {
@@ -2020,7 +2122,11 @@ impl ChainState {
                     .then_some(*hash)
             })
             .collect::<HashSet<_>>();
-        self.store.prune(&retained_blocks, &retained_blocks)?;
+        self.store.prune_with_core_compat(
+            &retained_blocks,
+            &retained_blocks,
+            self.prune_target_size.is_some(),
+        )?;
         self.prune_height = Some(target_height);
         self.prune_protected_blocks
             .retain(|hash, height| *height >= target_height && retained_blocks.contains(hash));
@@ -2358,6 +2464,14 @@ impl ChainState {
 
     /// Configure Core's IBD tip-age boundary and refresh the latched state.
     pub fn configure_max_tip_age(&mut self, max_tip_age_secs: u64) {
+        if !self.max_tip_age_configured {
+            // ChainState evaluates IBD once while opening with Core's default
+            // 24-hour boundary. Apply the user-supplied boundary to that
+            // initial decision instead of treating the already-false value
+            // as the runtime latch.
+            self.initial_block_download = true;
+            self.max_tip_age_configured = true;
+        }
         self.max_tip_age_secs = max_tip_age_secs;
         self.update_ibd_status();
     }
@@ -2513,6 +2627,15 @@ impl ChainState {
             .is_some_and(|active_hash| active_hash == hash)
     }
 
+    pub fn has_large_work_invalid_chain(&self) -> bool {
+        let active_height = self.height();
+        self.invalid_blocks.iter().any(|hash| {
+            self.block_index
+                .get(hash)
+                .is_some_and(|node| node.height > active_height.saturating_add(6))
+        })
+    }
+
     /// Return the BIP22 proposal result for a block already known to the
     /// node. Full blocks that passed validation are duplicates; headers that
     /// have not received a body yet are inconclusive.
@@ -2527,8 +2650,18 @@ impl ChainState {
         // is pruned. Core's proposal path uses the block-index validation
         // status rather than requiring the body to remain available, so a
         // pruned active block is still an exact duplicate.
-        if self.is_active_block(hash) || self.store.contains(hash) {
+        if self.is_active_block(hash) {
             Some("duplicate")
+        } else if self.store.contains(hash) {
+            // A body fetched before a restart can be present without having
+            // been connected. Allow submitblock to retry it once its parent
+            // is the active tip; side-chain bodies remain ordinary
+            // duplicates.
+            let reconnectable = self
+                .block_index
+                .get(hash)
+                .is_some_and(|node| node.header.prev_blockhash == self.best_hash());
+            (!reconnectable).then_some("duplicate")
         } else {
             Some("duplicate-inconclusive")
         }
@@ -2579,10 +2712,12 @@ impl ChainState {
         let best_valid = self
             .best_valid_tip_hash()
             .context("invalidated chain has no valid alternative")?;
-        if best_valid != self.best_hash() {
+        let activated = best_valid != self.best_hash();
+        if activated {
             self.activate_chain(best_valid)?;
+        } else {
+            self.persist_metadata()?;
         }
-        self.persist_metadata()?;
         Ok(self.tip())
     }
 
@@ -3070,6 +3205,11 @@ impl ChainState {
             })
             .collect::<Vec<_>>();
         self.filter_store.insert_batch(&filter_records)?;
+        if let Some((hash, _, _)) = filters.last()
+            && let Some(node) = self.block_index.get(hash)
+        {
+            self.update_index_prune_locks(node.height);
+        }
         Ok(Some(filters))
     }
 
@@ -3472,6 +3612,30 @@ impl ChainState {
 
     pub fn block_store_reader(&self) -> BlockStoreReader {
         self.store.reader()
+    }
+
+    pub fn disconnected_suffix_has_non_coinbase_transactions(
+        &mut self,
+        previous_tip: BlockHash,
+    ) -> Result<bool> {
+        let active = self.active_chain.iter().copied().collect::<HashSet<_>>();
+        let mut cursor = previous_tip;
+        while !active.contains(&cursor) {
+            if self
+                .store
+                .transaction_count(&cursor)?
+                .is_none_or(|count| count > 1)
+            {
+                return Ok(true);
+            }
+            cursor = self
+                .block_index
+                .get(&cursor)
+                .context("previous active tip is not indexed")?
+                .header
+                .prev_blockhash;
+        }
+        Ok(false)
     }
 
     pub fn active_blocks_after(&mut self, previous_tip: BlockHash) -> Result<Vec<Block>> {
@@ -4420,10 +4584,16 @@ impl ChainState {
                 .block_index
                 .get(&hash)
                 .with_context(|| format!("active block {hash} is not indexed"))?;
-            let block = self
-                .store
-                .get(&hash)?
-                .with_context(|| format!("active block {hash} is missing from block store"))?;
+            let block = match self.store.get(&hash)? {
+                Some(block) => block,
+                None if self.is_pruned() => {
+                    tracing::info!(
+                        "Block verification stopping at height {height} (no data). This could be due to pruning or use of an assumeutxo snapshot."
+                    );
+                    bail!("active block {hash} is missing from block store")
+                }
+                None => bail!("active block {hash} is missing from block store"),
+            };
             if block.header != node.header {
                 bail!("stored block header does not match active index at height {height}")
             }
@@ -4763,11 +4933,20 @@ impl ChainState {
             }
             return Ok(self.tip());
         }
-        // Core's AcceptBlock returns immediately for a block body that is
-        // already present, including a side-chain body. Avoid repeating
-        // validation and appending a duplicate record to the block store.
+        // Core's AcceptBlock returns immediately for an already-stored body
+        // in the ordinary duplicate/side-chain cases. A block fetched into a
+        // pruned node is different: its header may be indexed, its body may
+        // already be present, and the node may have restarted just before it
+        // could connect that body. Let a sequential submitblock or peer
+        // response finish that active-chain candidate when its parent is the
+        // current tip.
         if self.store.contains(&hash) && !allow_existing_body {
-            return Ok(self.tip());
+            let reconnectable_active_candidate = self.block_index.get(&hash).is_some_and(|node| {
+                !self.active_chain.contains(&hash) && node.header.prev_blockhash == self.best_hash()
+            });
+            if !reconnectable_active_candidate {
+                return Ok(self.tip());
+            }
         }
         let parent_hash = block.header.prev_blockhash;
         let Some(parent) = self.block_index.get(&parent_hash).copied() else {
@@ -4858,6 +5037,42 @@ impl ChainState {
             self.median_time_past_for_parent(parent_hash),
         )?;
         self.validate_block_structure(&block, self.network, height, Amount::MAX_MONEY.to_sat())?;
+        if retain_invalid_body {
+            // Core's peer path accepts and stores a structurally valid
+            // side-chain body without checking its UTXO-dependent rules. The
+            // branch is validated only if it later becomes the best-chain
+            // candidate; this keeps a same-height invalid fork from
+            // disconnecting the announcing peer before it can announce a
+            // longer descendant.
+            self.side_chain_utxos = None;
+            self.insert_side_chain_body(&block)?;
+            if let Some(store) = self.electrum_store.as_mut() {
+                store.insert_unsynced(&block)?;
+            }
+            self.index_all_transactions(&block, height);
+            let chain_work = parent.chain_work + block.header.work();
+            self.block_index.insert(
+                hash,
+                BlockNode {
+                    header: block.header,
+                    height,
+                    chain_work,
+                },
+            );
+            self.assign_header_sequence_id(hash);
+            self.assign_block_sequence_id(hash);
+            if chain_work > self.tip().work {
+                self.store.flush()?;
+                if let Some(store) = self.electrum_store.as_mut() {
+                    store.flush()?;
+                }
+                self.activate_chain(hash)?;
+            }
+            self.process_orphans(hash);
+            self.process_known_children(hash);
+            self.update_ibd_status();
+            return Ok(self.tip());
+        }
         // Once BIP34 is active, a coinbase-only block has no UTXO-dependent
         // transaction validation: its height commits to a unique coinbase
         // transaction ID, and there are no spends to look up.  Headers-first
@@ -4867,26 +5082,54 @@ impl ChainState {
         let coinbase_only =
             block.txdata.len() == 1 && height >= self.deployment_parameters.buried.bip34;
         if coinbase_only {
-            self.side_chain_utxos = None;
             let empty_utxos = HashMap::new();
-            if let Err(error) = self.validate_block_transactions(
+            let application = match self.validate_block_transactions(
                 &block,
                 height,
                 &empty_utxos,
                 self.median_time_past_for_parent(parent_hash),
             ) {
-                if retain_invalid_body
-                    && error
-                        .downcast_ref::<ValidationError>()
-                        .is_some_and(ValidationError::should_mark_block_invalid)
-                {
-                    self.insert_side_chain_body(&block)?;
-                    if let Some(store) = self.electrum_store.as_mut() {
-                        store.insert_unsynced(&block)?;
+                Ok(application) => application,
+                Err(error) => {
+                    if retain_invalid_body
+                        && error
+                            .downcast_ref::<ValidationError>()
+                            .is_some_and(ValidationError::should_mark_block_invalid)
+                    {
+                        self.insert_side_chain_body(&block)?;
+                        if let Some(store) = self.electrum_store.as_mut() {
+                            store.insert_unsynced(&block)?;
+                        }
+                        self.assign_block_sequence_id(hash);
                     }
-                    self.assign_block_sequence_id(hash);
+                    return Err(error);
                 }
-                return Err(error);
+            };
+            // Keep a UTXO snapshot for a run of coinbase-only side-chain
+            // blocks.  The blocks themselves do not spend anything, but
+            // their coinbase outputs still become available to descendants.
+            if let Some(mut parent_utxos) = if self
+                .side_chain_utxos
+                .as_ref()
+                .is_some_and(|cache| cache.hash == parent_hash)
+            {
+                self.side_chain_utxos.take().map(|cache| cache.utxos)
+            } else {
+                self.utxos_for_block(parent_hash)?
+            } {
+                apply_block_to_utxos(
+                    &mut parent_utxos,
+                    &block,
+                    height,
+                    self.median_time_past_for_parent(parent_hash),
+                    application.spent_entries,
+                );
+                self.side_chain_utxos = Some(SideChainUtxoCache {
+                    hash,
+                    utxos: parent_utxos,
+                });
+            } else {
+                self.side_chain_utxos = None;
             }
         } else {
             let parent_utxos = if self
@@ -4985,7 +5228,12 @@ impl ChainState {
     }
 
     fn insert_side_chain_body(&mut self, block: &Block) -> Result<()> {
-        self.store.insert_unsynced(block).map(|_| ())
+        self.store.insert_unsynced(block)?;
+        if self.prune_height.is_some() {
+            self.prune_protected_blocks
+                .insert(block.block_hash(), self.height());
+        }
+        Ok(())
     }
 
     fn process_orphans(&mut self, parent_hash: BlockHash) {
@@ -5371,8 +5619,8 @@ impl ChainState {
                 }
             }
         }
-        let mut spent = HashSet::new();
         let mut spent_entries = Vec::new();
+        let mut spent = HashSet::new();
         let mut created = HashMap::new();
         let mut total_fees = 0u64;
         let mut metrics = CoinStatsBlockMetrics {
@@ -5401,17 +5649,21 @@ impl ChainState {
         )?;
         let mut sigop_cost = validation::transaction_sigop_cost(&block.txdata[0], &[], sigop_flags);
         if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
-            return Err(ValidationError::TooManySigops.into());
+            return Err(ValidationError::TooManySigopsInConnect.into());
         }
         for (transaction_index, transaction) in block.txdata.iter().enumerate().skip(1) {
             let txid = transaction.compute_txid();
+            let mut transaction_spent = HashSet::new();
             let mut input_total = 0u64;
             let mut previous_outputs = Vec::with_capacity(transaction.input.len());
             let mut previous_entries = Vec::with_capacity(transaction.input.len());
             for input in &transaction.input {
                 let outpoint = input.previous_output;
-                if !spent.insert(outpoint) {
+                if !transaction_spent.insert(outpoint) {
                     return Err(ValidationError::DuplicateInput(txid).into());
+                }
+                if !spent.insert(outpoint) {
+                    return Err(ValidationError::MissingInput { outpoint }.into());
                 }
                 let entry = if let Some(entry) = created.get(&outpoint).cloned() {
                     entry
@@ -5442,7 +5694,7 @@ impl ChainState {
                 sigop_flags,
             ));
             if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
-                return Err(ValidationError::TooManySigops.into());
+                return Err(ValidationError::TooManySigopsInConnect.into());
             }
             validation::validate_transaction_finality(
                 transaction,
@@ -5766,6 +6018,20 @@ impl ChainState {
             application.spent_entries.iter().cloned().collect();
         if persist {
             self.store.insert(block)?;
+            if self.prune_height.is_some() {
+                // Bodies received after pruning are written to the current
+                // block file. Protect them from the next height-based
+                // compaction even when their header is older than the normal
+                // reorg window.
+                self.prune_protected_blocks.insert(hash, self.height());
+            }
+            let write_core_compat = !(self.prune_mode
+                && self.prune_target_size.is_some()
+                && self.prune_height.is_some());
+            if write_core_compat && let Some(undo) = self.block_undo_cache.get(&hash).cloned() {
+                self.store
+                    .append_core_compat(block, &undo, self.network, self.fast_prune)?;
+            }
         }
         if let Some(store) = self.electrum_store.as_mut() {
             store.insert(block)?;
@@ -5788,10 +6054,14 @@ impl ChainState {
             .map(|(outpoint, _)| *outpoint)
             .collect::<Vec<_>>();
         for (outpoint, entry) in &application.spent_entries {
-            if self.utxos_materialized {
-                self.utxos.remove(outpoint);
+            let was_in_utxo_set = if self.utxos_materialized {
+                self.utxos.remove(outpoint).is_some()
+            } else {
+                self.utxo_store.get(outpoint)?.is_some()
+            };
+            if was_in_utxo_set {
+                self.remove_utxo_entry(outpoint, entry);
             }
-            self.remove_utxo_entry(outpoint, entry);
         }
         let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
         let mut history_updates = HashMap::new();
@@ -5889,6 +6159,7 @@ impl ChainState {
                 chain_work: parent_work + block.header.work(),
             },
         );
+        self.update_index_prune_locks(height);
         self.assign_header_sequence_id(hash);
         self.assign_block_sequence_id(hash);
         if persist {
@@ -6020,7 +6291,9 @@ impl ChainState {
             .coin_stats
             .as_ref()
             .context("coinstats accumulator is not initialized")?;
-        self.coinstats_store.insert(&stats.record(hash, height))
+        self.coinstats_store.insert(&stats.record(hash, height))?;
+        self.update_index_prune_locks(height);
+        Ok(())
     }
 
     fn rebuild_block_index(&mut self) -> Result<()> {
@@ -6070,26 +6343,65 @@ impl ChainState {
     }
 
     fn rebuild_coinstats_index(&mut self) -> Result<()> {
-        let tip_hash = self.best_hash();
-        if let Some(record) = self.coinstats_store.get(&tip_hash)? {
-            if record.total_subsidy_sat != 0 {
-                self.coin_stats
-                    .as_mut()
-                    .context("coinstats accumulator is not initialized")?
-                    .load_cumulative_from_record(&record);
-                return Ok(());
-            }
-        }
-        let mut stats = CoinStatsState::default();
-        let mut utxos = HashMap::new();
         let active_chain = self.active_chain.clone();
-        for (height, hash) in active_chain.into_iter().enumerate() {
+        let tip_height = self.height();
+        let current_utxos = if self.utxos_materialized {
+            self.utxos.clone()
+        } else {
+            self.load_utxo_map_from_store()?
+        };
+        let indexed_base = active_chain
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(height, hash)| {
+                self.coinstats_store
+                    .get(hash)
+                    .ok()
+                    .flatten()
+                    .filter(|record| {
+                        record.height == u32::try_from(height).unwrap_or(u32::MAX)
+                            && record.total_subsidy_sat != 0
+                    })
+                    .map(|record| (u32::try_from(height).unwrap_or(u32::MAX), record))
+            });
+
+        let (mut utxos, mut stats, first_height) = if let Some((base_height, record)) = indexed_base
+        {
+            let mut utxos = current_utxos;
+            for height in (base_height.saturating_add(1)..=tip_height).rev() {
+                let hash = active_chain
+                    .get(usize::try_from(height).unwrap_or(usize::MAX))
+                    .copied()
+                    .context("coinstats active chain height is out of range")?;
+                let block = self
+                    .store
+                    .get(&hash)?
+                    .with_context(|| format!("coinstats index is missing block {hash}"))?;
+                let undo = self
+                    .store
+                    .get_undo(&hash)?
+                    .with_context(|| format!("coinstats undo is missing block {hash}"))?;
+                self.disconnect_block_from_utxos(&mut utxos, &block, height, &undo)?;
+            }
+            let mut stats = CoinStatsState::from_utxos(&utxos);
+            stats.load_cumulative_from_record(&record);
+            (utxos, stats, base_height.saturating_add(1))
+        } else {
+            (HashMap::new(), CoinStatsState::default(), 0)
+        };
+
+        for height in first_height..=tip_height {
+            let hash = active_chain
+                .get(usize::try_from(height).unwrap_or(usize::MAX))
+                .copied()
+                .context("coinstats active chain height is out of range")?;
             let block = self
                 .store
                 .get(&hash)?
                 .with_context(|| format!("coinstats index is missing block {hash}"))?;
-            apply_block_to_coin_stats(self.network, &mut utxos, &mut stats, &block, height as u32);
-            let record = stats.record(hash, height as u32);
+            apply_block_to_coin_stats(self.network, &mut utxos, &mut stats, &block, height);
+            let record = stats.record(hash, height);
             self.coinstats_store.insert(&record)?;
         }
         self.coin_stats = Some(stats);
@@ -6128,6 +6440,36 @@ impl ChainState {
         let replay_start = replay_snapshot
             .as_ref()
             .map_or(0, |snapshot| snapshot.headers.len());
+        let common_height = path.iter().enumerate().rev().find_map(|(height, hash)| {
+            self.active_chain
+                .get(height)
+                .is_some_and(|active_hash| active_hash == hash)
+                .then_some(u32::try_from(height).ok())
+                .flatten()
+        });
+        if let Some(common_height) = common_height {
+            let suffix_len =
+                usize::try_from(self.height().saturating_sub(common_height)).unwrap_or(usize::MAX);
+            if common_height < self.height()
+                && (self.is_pruned() || suffix_len >= MIN_SUFFIX_ACTIVATION_BLOCKS)
+                && self.activate_chain_from_pruned_suffix(&path, common_height)?
+            {
+                return Ok(());
+            }
+        }
+        let missing_block = {
+            let mut missing = None;
+            for hash in path.iter().skip(replay_start) {
+                if self.store.get(hash)?.is_none() {
+                    missing = Some(*hash);
+                    break;
+                }
+            }
+            missing
+        };
+        if let Some(missing_hash) = missing_block {
+            bail!("candidate block {missing_hash} is missing");
+        }
         let blocks = path
             .iter()
             .skip(replay_start)
@@ -6287,6 +6629,234 @@ impl ChainState {
         Ok(())
     }
 
+    /// Activate a fork without replaying the pruned prefix of the active
+    /// chain. Core's normal reorg path disconnects the old active suffix with
+    /// undo data and then connects the candidate suffix; doing the same here
+    /// keeps a pruned node able to reorganize without requiring block one.
+    ///
+    /// The method returns `Ok(false)` when the required old-branch bodies or
+    /// undo records are unavailable. In that case the caller retains the
+    /// ordinary full-replay error, which is more useful for callers that are
+    /// not operating on a pruned chain.
+    fn activate_chain_from_pruned_suffix(
+        &mut self,
+        path: &[BlockHash],
+        common_height: u32,
+    ) -> Result<bool> {
+        let old_tip_height = self.height();
+        let common_height_usize =
+            usize::try_from(common_height).context("common chain height does not fit in memory")?;
+        if common_height_usize >= self.active_chain.len()
+            || path.get(common_height_usize) != self.active_chain.get(common_height_usize)
+        {
+            return Ok(false);
+        }
+
+        let mut disconnected = Vec::new();
+        for height in (common_height.saturating_add(1)..=old_tip_height).rev() {
+            let Some(hash) = self.active_chain.get(height as usize).copied() else {
+                return Ok(false);
+            };
+            let Some(block) = self.store.get(&hash)? else {
+                return Ok(false);
+            };
+            let undo = if let Some(undo) = self.block_undo_cache.get(&hash) {
+                undo.clone()
+            } else {
+                let Some(undo) = self.store.get_undo(&hash)? else {
+                    return Ok(false);
+                };
+                undo
+            };
+            disconnected.push((height, block, undo));
+        }
+
+        let candidate_blocks = path
+            .iter()
+            .skip(common_height_usize.saturating_add(1))
+            .map(|hash| self.store.get(hash))
+            .collect::<Result<Vec<Option<Block>>>>()?
+            .into_iter()
+            .enumerate()
+            .map(|(offset, block)| {
+                block.with_context(|| {
+                    format!(
+                        "candidate block {} is missing",
+                        path[common_height_usize.saturating_add(1) + offset]
+                    )
+                })
+            })
+            .collect::<Result<Vec<Block>>>()?;
+
+        // Validate the whole transition against a temporary UTXO map before
+        // changing any active-chain indexes. This keeps malformed candidate
+        // blocks from leaving the live chain half-disconnected.
+        let mut disconnected_utxos = self.utxos.clone();
+        for (height, block, undo) in &disconnected {
+            self.disconnect_block_from_utxos(&mut disconnected_utxos, block, *height, undo)?;
+        }
+        let mut candidate_utxos = disconnected_utxos.clone();
+        for (offset, block) in candidate_blocks.iter().enumerate() {
+            let height = common_height
+                .saturating_add(1)
+                .saturating_add(u32::try_from(offset).context("candidate chain is too long")?);
+            let parent_hash = block.header.prev_blockhash;
+            let application = self.validate_block_transactions(
+                block,
+                height,
+                &candidate_utxos,
+                self.median_time_past_for_parent(parent_hash),
+            )?;
+            apply_block_to_utxos(
+                &mut candidate_utxos,
+                block,
+                height,
+                self.median_time_past_for_parent(parent_hash),
+                application.spent_entries,
+            );
+        }
+
+        // The two maps above are already the exact common-ancestor and
+        // candidate UTXO states. Persist only their delta: replacing the
+        // entire UTXO log here is prohibitively expensive for pruning tests
+        // whose coinbase scripts are close to one megabyte each.
+        let mut utxo_removals = Vec::new();
+        for (outpoint, previous) in &disconnected_utxos {
+            if candidate_utxos.get(outpoint) != Some(previous) {
+                utxo_removals.push(*outpoint);
+            }
+        }
+        let mut utxo_additions = Vec::new();
+        for (outpoint, current) in &candidate_utxos {
+            if disconnected_utxos.get(outpoint) != Some(current) {
+                utxo_additions.push((*outpoint, Self::stored_utxo(current)));
+            }
+        }
+
+        if !self.history_materialized {
+            self.history = self.load_history_map_from_store()?;
+            self.history_materialized = true;
+        }
+
+        let snapshot_invalidated = self.snapshot_base.is_some_and(|base| !path.contains(&base));
+
+        for (height, _, _) in &disconnected {
+            self.move_index_prune_locks_back(height.saturating_sub(1));
+        }
+        self.active_chain.truncate(common_height_usize + 1);
+        self.headers.truncate(common_height_usize + 1);
+        self.active_tx_counts.truncate(common_height_usize + 1);
+        self.active_tx_totals.truncate(common_height_usize + 1);
+        // The live map must start at the common ancestor. The candidate map
+        // above was advanced only as a validation dry run; the normal block
+        // connector will apply that suffix again while updating all indexes.
+        self.utxos = disconnected_utxos;
+        self.utxos_materialized = true;
+        self.side_chain_utxos = None;
+
+        self.history.retain(|_, entries| {
+            entries.retain(|entry| entry.height <= common_height);
+            !entries.is_empty()
+        });
+        self.rebuild_active_transaction_index_through(common_height);
+        if self.txospender_index_enabled {
+            self.spent_by.retain(|_, (_, _, block_hash, height)| {
+                *height <= common_height && self.active_chain.contains(block_hash)
+            });
+        } else {
+            self.spent_by.clear();
+        }
+
+        if self.coinstats_index_enabled {
+            let mut stats = CoinStatsState::from_utxos(&self.utxos);
+            if let Some(common_hash) = path.get(common_height_usize)
+                && let Some(record) = self.coinstats_store.get(common_hash)?
+            {
+                stats.load_cumulative_from_record(&record);
+            }
+            self.coin_stats = Some(stats);
+        } else {
+            self.coin_stats = None;
+        }
+
+        let mut tx_index_all_changes = HashMap::new();
+        for block in &candidate_blocks {
+            self.connect_block_internal_with_index_journal(
+                block,
+                false,
+                Some(&mut tx_index_all_changes),
+            )?;
+        }
+
+        self.utxo_store
+            .apply_batch(&utxo_removals, &utxo_additions)?;
+        self.persist_utxo_store_tip()?;
+        self.sync_electrum_history_store()?;
+        self.persist_electrum_history_store_tip()?;
+        self.persist_metadata()?;
+
+        if snapshot_invalidated {
+            if let Some(background) = self.background_validation.take() {
+                background.cancel.store(true, Ordering::Release);
+            }
+            self.snapshot_base = None;
+            self.snapshot_validated = true;
+            self.snapshot_validation_error = None;
+            self.remove_snapshot_provenance_file()?;
+            self.remove_assumeutxo_artifacts()?;
+        }
+        self.release_materialized_utxos();
+        self.release_materialized_history();
+        self.update_ibd_status();
+        Ok(true)
+    }
+
+    fn move_index_prune_locks_back(&mut self, max_height_first: u32) {
+        if !self.prune_mode {
+            return;
+        }
+        for lock in self.prune_locks.values_mut() {
+            if lock.height_first <= u64::from(max_height_first) {
+                continue;
+            }
+            lock.height_first = u64::from(max_height_first);
+            debug!(
+                "{} prune lock moved back to {}",
+                lock.desc, max_height_first
+            );
+        }
+    }
+
+    fn rebuild_active_transaction_index_through(&mut self, max_height: u32) {
+        let mut locations: HashMap<Txid, Vec<ActiveTxLocation>> = HashMap::new();
+        for (txid, location) in &self.tx_index {
+            if location.height <= max_height {
+                locations.entry(*txid).or_default().push(*location);
+            }
+        }
+        for (txid, tx_locations) in &self.tx_index_duplicates {
+            let retained = tx_locations
+                .iter()
+                .copied()
+                .filter(|location| location.height <= max_height);
+            locations.entry(*txid).or_default().extend(retained);
+        }
+
+        self.tx_index.clear();
+        self.tx_index_duplicates.clear();
+        for (txid, mut tx_locations) in locations {
+            tx_locations.sort_by_key(|location| (location.height, location.transaction_index));
+            tx_locations.dedup();
+            let Some(latest) = tx_locations.last().copied() else {
+                continue;
+            };
+            self.tx_index.insert(txid, latest);
+            if tx_locations.len() > 1 {
+                self.tx_index_duplicates.insert(txid, tx_locations);
+            }
+        }
+    }
+
     fn cache_basic_filter_for_block(
         &mut self,
         block: &Block,
@@ -6318,6 +6888,9 @@ impl ChainState {
         self.filter_store
             .insert(block.block_hash(), &filter.content, filter_header)?;
         self.cache_basic_filter(block.block_hash(), filter.content, filter_header);
+        if let Some(node) = self.block_index.get(&block.block_hash()) {
+            self.update_index_prune_locks(node.height);
+        }
         Ok(())
     }
 
@@ -7610,7 +8183,25 @@ impl ChainState {
                     continue;
                 }
                 if self.block_index.contains_key(&header.prev_blockhash) {
-                    self.accept_headers_internal(&[header])?;
+                    if self.has_invalid_ancestor(header.prev_blockhash) {
+                        let parent = self
+                            .block_index
+                            .get(&header.prev_blockhash)
+                            .copied()
+                            .expect("persisted header parent is indexed");
+                        let hash = header.block_hash();
+                        self.block_index.insert(
+                            hash,
+                            BlockNode {
+                                header,
+                                height: parent.height.saturating_add(1),
+                                chain_work: parent.chain_work + header.work(),
+                            },
+                        );
+                        self.assign_header_sequence_id(hash);
+                    } else {
+                        self.accept_headers_internal(&[header])?;
+                    }
                 } else {
                     remaining.push(header);
                 }
@@ -7832,6 +8423,7 @@ fn open_background_replay_state(
         active_tx_counts: Vec::new(),
         active_tx_totals: Vec::new(),
         initial_block_download: true,
+        max_tip_age_configured: false,
         snapshot_base: None,
         snapshot_validated: true,
         snapshot_validation_error: None,

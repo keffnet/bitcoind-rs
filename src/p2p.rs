@@ -1285,15 +1285,15 @@ impl TxRequestState {
         !self.pending.is_empty() || !self.in_flight.is_empty()
     }
 
-    fn has_live_in_flight(&self, key: TxRequestKey, now: Instant) -> bool {
+    fn has_live_in_flight_hash(&self, hash: BlockHash, now: Instant) -> bool {
         self.in_flight
-            .get(&key)
-            .is_some_and(|requested_at| !requested_at.expired(now))
+            .iter()
+            .any(|(key, requested_at)| key.hash == hash && !requested_at.expired(now))
     }
 
-    fn has_ready_pending_key(&self, key: TxRequestKey, now: Instant) -> bool {
+    fn has_ready_pending_hash(&self, hash: BlockHash, now: Instant) -> bool {
         self.pending.iter().any(|request| {
-            request.key == key
+            request.key.hash == hash
                 && TxRequestMoment {
                     wall: request.ready_at,
                     mock: request.ready_at_mock,
@@ -5257,7 +5257,11 @@ async fn serve_peer_loop(
                         && in_flight >= MAX_PEER_TX_REQUEST_IN_FLIGHT;
                     let delay = transaction_request_delay(
                         peer_is_preferred_tx_download(peer_state),
-                        item.kind.is_witness_transaction(),
+                        // `LegacyWitnessTransaction` requests witness bytes
+                        // but is still keyed by a legacy txid.  Core applies
+                        // the txid-relay delay based on the announced
+                        // inventory hash, not on the eventual GETDATA type.
+                        item.kind.uses_wtxid(),
                         has_wtxid_peer,
                         overloaded,
                     );
@@ -6426,14 +6430,16 @@ async fn serve_peer_loop(
                                     }
                                 }
                             }
+                            // Keep a missing-input transaction available for
+                            // opportunistic 1p1c evaluation when its parent
+                            // arrives. A standalone low-fee parent must not
+                            // be retained: if its child arrives later Core
+                            // re-requests the parent and only then evaluates
+                            // the package.
                             if !accepted_as_package
                                 && matches!(
                                     error.downcast_ref::<MempoolError>(),
-                                    Some(
-                                        MempoolError::MissingInput(_)
-                                            | MempoolError::FeeRate
-                                            | MempoolError::MinRelayFee
-                                    )
+                                    Some(MempoolError::MissingInput(_))
                                 )
                             {
                                 remember_peer_package_transaction(peer_state, transaction.clone());
@@ -8178,7 +8184,11 @@ fn tx_request_owned_by_other_peer(
     now: Instant,
 ) -> bool {
     peers.lock().iter().any(|(other_id, state)| {
-        *other_id != peer_id && state.tx_requests.lock().has_live_in_flight(key, now)
+        *other_id != peer_id
+            && state
+                .tx_requests
+                .lock()
+                .has_live_in_flight_hash(key.hash, now)
     })
 }
 
@@ -8191,7 +8201,10 @@ fn preferred_peer_has_pending_request(
     peers.lock().iter().any(|(other_id, state)| {
         *other_id != peer_id
             && peer_is_preferred_tx_download(state)
-            && state.tx_requests.lock().has_ready_pending_key(key, now)
+            && state
+                .tx_requests
+                .lock()
+                .has_ready_pending_hash(key.hash, now)
     })
 }
 

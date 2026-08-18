@@ -1522,6 +1522,12 @@ pub struct Args {
     )]
     pub unsafe_sqlite_sync: Option<bool>,
 
+    /// Command used by the wallet-free external-signer discovery RPC. The
+    /// signer owns all device and key state; this node only invokes its
+    /// stateless `enumerate` subcommand.
+    #[arg(long = "signer", value_name = "COMMAND", hide = true)]
+    pub signer: Option<String>,
+
     #[arg(long = "rpcservertimeout", default_value_t = DEFAULT_RPC_SERVER_TIMEOUT_SECS)]
     pub rpc_server_timeout: u64,
 
@@ -3030,6 +3036,8 @@ pub struct Config {
     pub db_batch_size_bytes: i64,
     #[cfg(not(test))]
     pub db_crash_ratio: Option<u64>,
+    #[cfg(not(test))]
+    pub signer: Option<String>,
     pub print_priority: bool,
     pub rpc_doc_check: bool,
     pub accept_stale_fee_estimates: bool,
@@ -3895,6 +3903,8 @@ impl Config {
             db_batch_size_bytes: args.db_batch_size_bytes,
             #[cfg(not(test))]
             db_crash_ratio: args.db_crash_ratio,
+            #[cfg(not(test))]
+            signer: args.signer,
             print_priority: args.print_priority,
             rpc_doc_check: args.rpc_doc_check,
             accept_stale_fee_estimates: args.accept_stale_fee_estimates,

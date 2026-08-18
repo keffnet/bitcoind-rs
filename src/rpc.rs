@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, IoSlice};
 use std::net::{IpAddr, SocketAddr};
+use std::process::Command;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock, atomic::Ordering};
 use std::time::Duration;
@@ -2161,6 +2162,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "validateaddress" => Some(&["address"]),
         "deriveaddresses" => Some(&["descriptor", "range"]),
         "getdescriptorinfo" => Some(&["descriptor"]),
+        "enumeratesigners" => Some(&[]),
         "getblockchaininfo"
         | "getblockcount"
         | "getbestblockhash"
@@ -2744,8 +2746,127 @@ fn dispatch_method_for_user(
         "validateaddress" => validate_address(node, params),
         "deriveaddresses" => derive_addresses(node, params),
         "getdescriptorinfo" => get_descriptor_info(node, params),
+        "enumeratesigners" => enumerate_signers(node),
         _ => bail!("Method not found"),
     }
+}
+
+fn enumerate_signers(node: &Arc<Node>) -> Result<Value> {
+    let command = {
+        #[cfg(not(test))]
+        {
+            node.config.signer.as_deref()
+        }
+        #[cfg(test)]
+        {
+            let _ = node;
+            None
+        }
+    }
+    .ok_or_else(|| anyhow!("Error: restart bitcoind with -signer=<cmd>"))?;
+    let command_parts = split_external_signer_command(command)?;
+    let output = Command::new(&command_parts[0])
+        .args(&command_parts[1..])
+        .arg("enumerate")
+        .output()
+        .map_err(|error| anyhow!("execve failed: {error}"))?;
+    if !output.status.success() {
+        bail!("RunCommandParseJSON error")
+    }
+    let result: Value =
+        serde_json::from_slice(&output.stdout).map_err(|_| anyhow!("RunCommandParseJSON error"))?;
+    parse_external_signer_result(command, result)
+}
+
+fn parse_external_signer_result(command: &str, result: Value) -> Result<Value> {
+    let signers = result.as_array().ok_or_else(|| {
+        anyhow!("'{command}' received invalid response, expected array of signers")
+    })?;
+    let mut parsed = Vec::with_capacity(signers.len());
+    for signer in signers {
+        let object = signer.as_object();
+        if let Some(error) = object.and_then(|object| object.get("error"))
+            && !error.is_null()
+        {
+            if let Some(error) = error.as_str() {
+                bail!("'{command}' error: {error}")
+            }
+            bail!("'{command}' error")
+        }
+        let Some(fingerprint) = object
+            .and_then(|object| object.get("fingerprint"))
+            .and_then(Value::as_str)
+        else {
+            bail!("'{command}' received invalid response, missing signer fingerprint")
+        };
+        if parsed
+            .iter()
+            .any(|signer: &Value| signer["fingerprint"] == fingerprint)
+        {
+            // Match Core's enumeration behavior: a repeated fingerprint ends
+            // the result walk rather than yielding duplicate devices.
+            break;
+        }
+        let name = object
+            .and_then(|object| object.get("model"))
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .unwrap_or_default();
+        parsed.push(json!({"fingerprint": fingerprint, "name": name}));
+    }
+    Ok(json!({"signers": parsed}))
+}
+
+fn split_external_signer_command(command: &str) -> Result<Vec<String>> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    let mut in_single_quotes = false;
+    let mut in_double_quotes = false;
+    let mut started = false;
+
+    for character in command.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            started = true;
+            continue;
+        }
+        if character == '\\' && !in_single_quotes {
+            escaped = true;
+            started = true;
+            continue;
+        }
+        if character == '\'' && !in_double_quotes {
+            in_single_quotes = !in_single_quotes;
+            started = true;
+            continue;
+        }
+        if character == '"' && !in_single_quotes {
+            in_double_quotes = !in_double_quotes;
+            started = true;
+            continue;
+        }
+        if character.is_whitespace() && !in_single_quotes && !in_double_quotes {
+            if started {
+                arguments.push(std::mem::take(&mut current));
+                started = false;
+            }
+        } else {
+            current.push(character);
+            started = true;
+        }
+    }
+    if escaped || in_single_quotes || in_double_quotes {
+        bail!("invalid external signer command")
+    }
+    if started {
+        arguments.push(current);
+    }
+    if arguments.is_empty() {
+        bail!("external signer command is empty")
+    }
+    Ok(arguments)
 }
 
 fn set_mock_time(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -16552,6 +16673,7 @@ fn rpc_help(method: &str) -> String {
         "validateaddress",
         "deriveaddresses",
         "getdescriptorinfo",
+        "enumeratesigners",
     ];
     if method.is_empty() {
         let mut result = String::new();
@@ -16632,6 +16754,64 @@ mod tests {
             "X-Authorization: Basic secret\r\n",
             "Basic secret"
         ));
+    }
+
+    #[test]
+    fn external_signer_command_parser_handles_core_style_quoting() {
+        assert_eq!(
+            split_external_signer_command(
+                r#"python3 'signer script.py' --label "device one" empty=''"#
+            )
+            .unwrap(),
+            vec![
+                "python3",
+                "signer script.py",
+                "--label",
+                "device one",
+                "empty="
+            ]
+        );
+        assert_eq!(
+            split_external_signer_command(r#"signer\ command --path=/tmp/a\ b"#).unwrap(),
+            vec!["signer command", "--path=/tmp/a b"]
+        );
+        assert!(split_external_signer_command("").is_err());
+        assert!(split_external_signer_command("'unterminated").is_err());
+    }
+
+    #[test]
+    fn external_signer_results_match_core_shape_and_duplicate_handling() {
+        let result = parse_external_signer_result(
+            "mock-signer",
+            json!([
+                {"fingerprint": "00000001", "model": "trezor_t"},
+                {"fingerprint": "00000002"},
+                {"fingerprint": "00000001", "model": "duplicate"},
+                {"fingerprint": "00000003", "model": "ignored"}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            json!({
+                "signers": [
+                    {"fingerprint": "00000001", "name": "trezor_t"},
+                    {"fingerprint": "00000002", "name": ""}
+                ]
+            })
+        );
+        assert_eq!(
+            parse_external_signer_result("mock-signer", json!([{"error": "offline"}]))
+                .unwrap_err()
+                .to_string(),
+            "'mock-signer' error: offline"
+        );
+        assert_eq!(
+            parse_external_signer_result("mock-signer", json!([{"model": "unknown"}]))
+                .unwrap_err()
+                .to_string(),
+            "'mock-signer' received invalid response, missing signer fingerprint"
+        );
     }
 
     #[tokio::test]

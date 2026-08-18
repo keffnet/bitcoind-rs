@@ -52,6 +52,8 @@ JSON-RPC is enabled by default for this daemon and allows loopback clients using
 
 RPC request handling uses Core-compatible defaults of 16 worker slots, 64 queued requests, and a 30-second HTTP timeout. These can be tuned with `--rpcthreads`, `--rpcworkqueue`, and `--rpcservertimeout`.
 
+Wallet-free external-signer discovery is available through `enumeratesigners` when `--signer=<command>` is configured. The daemon invokes only the signer's stateless `enumerate` subcommand and returns device fingerprints and models; signer devices retain all key material and wallet state.
+
 Consensus script checks use a bounded successful-validation cache; its approximate size defaults to Core's 32 MiB and can be changed with the hidden compatibility option `--maxsigcachesize=<MiB>`.
 
 The append-only backend also honors Core's hidden `--dbcache=<MiB>` and `--dbbatchsize=<bytes>` settings. Because this implementation keeps the active UTXO state in memory, `dbcache` maps to a bounded decoded historical-block cache; its default is 450 MiB, or 1 GiB on 64-bit systems with at least 4 GiB of RAM, and values below Core's 4 MiB minimum are clamped. `dbbatchsize` controls how much chainstate data is accumulated between durable data-file syncs, with a flush when the store is dropped.

@@ -1716,7 +1716,7 @@ impl PeerManager {
 
     pub(crate) async fn run_with_startup(self, startup: Option<Arc<StartupLatch>>) -> Result<()> {
         info!(
-            "Loaded {} addresses from peers.dat",
+            "Loaded {} addresses from peers.json",
             self.node.known_network_addresses().len()
         );
         let listeners = if self.node.config.listen {

@@ -1496,7 +1496,6 @@ pub struct Node {
     pub(crate) tor_controller: Option<Arc<tor::TorController>>,
     mempool_path: std::path::PathBuf,
     banlist_recreated: bool,
-    peers_dat_created: bool,
     /// Serialize RPC mining operations so a block template cannot become
     /// stale between reading the active tip and connecting the mined block.
     pub(crate) mining_lock: Mutex<()>,
@@ -1941,19 +1940,6 @@ impl Node {
                 .with_context(|| format!("creating {}", banlist_path.display()))?;
         }
         let peers_path = config.datadir.join("peers.json");
-        let peers_dat_path = config
-            .datadir
-            .join(network_data_dir_name(config.network))
-            .join("peers.dat");
-        let peers_dat_missing = !peers_dat_path.exists();
-        if peers_dat_missing {
-            info!(
-                "Creating peers.dat because the file was not found (\"{}\")",
-                peers_dat_path.display()
-            );
-            fs::write(&peers_dat_path, [])
-                .with_context(|| format!("creating {}", peers_dat_path.display()))?;
-        }
         let (
             known_addresses,
             tried_addresses,
@@ -1961,14 +1947,7 @@ impl Node {
             network_tried_addresses,
             network_address_sources,
         ) = match load_known_addresses(&config.datadir) {
-            Ok(state) if !peers_dat_missing => state,
-            Ok(_) => (
-                HashMap::new(),
-                HashSet::new(),
-                HashMap::new(),
-                HashSet::new(),
-                HashMap::new(),
-            ),
+            Ok(state) => state,
             Err(error) => {
                 quarantine_persistent_file(&peers_path, &error);
                 (
@@ -2033,7 +2012,6 @@ impl Node {
             tor_controller,
             mempool_path,
             banlist_recreated: !banlist_exists,
-            peers_dat_created: peers_dat_missing,
             mining_lock: Mutex::new(()),
             peer_count: AtomicUsize::new(0),
             mempool_check_operations: AtomicUsize::new(0),
@@ -6524,17 +6502,6 @@ impl Node {
         if self.banlist_recreated {
             info!("Recreating the banlist database");
         }
-        if self.peers_dat_created {
-            let peers_dat_path = self
-                .config
-                .datadir
-                .join(network_data_dir_name(self.config.network))
-                .join("peers.dat");
-            info!(
-                "Creating peers.dat because the file was not found (\"{}\")",
-                peers_dat_path.display()
-            );
-        }
         let ipc = ipc::IpcServer::bind(self.clone()).await?;
         if ipc.is_some()
             && let Some(startup) = startup.as_ref()
@@ -7525,6 +7492,7 @@ mod tests {
         let network_directory = directory.path().join("regtest");
         let wallets_directory = network_directory.join("wallets");
 
+        assert!(!network_directory.join("peers.dat").exists());
         assert_eq!(
             fs::metadata(network_directory)
                 .unwrap()

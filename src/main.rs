@@ -358,6 +358,7 @@ fn log_parameter_interactions(config_file_args: &[ConfigFileArg]) {
     let mut connect_disabled = false;
     let mut seednode = false;
     let mut explicit_dnsseed = false;
+    let mut proxy = false;
     for argument in std::env::args().skip(1) {
         let Some(argument) = argument
             .strip_prefix("--")
@@ -377,11 +378,15 @@ fn log_parameter_interactions(config_file_args: &[ConfigFileArg]) {
             "dnsseed" => {
                 explicit_dnsseed = true;
             }
+            "proxy" => proxy = true,
             _ => {}
         }
     }
     if connect_enabled && seednode {
         tracing::warn!("-seednode is ignored when -connect is used");
+    }
+    if (connect_enabled || connect_disabled) && explicit_dnsseed && proxy {
+        tracing::warn!("-dnsseed is ignored when -connect is used and -proxy is specified");
     }
     let config_has = |key: &str| config_file_args.iter().any(|entry| entry.key == key);
     if connect_disabled && !explicit_dnsseed && !config_has("dnsseed") {

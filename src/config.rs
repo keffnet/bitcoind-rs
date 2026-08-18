@@ -3,7 +3,7 @@ use std::env;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -2345,6 +2345,14 @@ impl Args {
                 if let Some(entry) = config_file_args.iter().find(|entry| {
                     !entry.key.is_empty() && error_head.contains(&format!("--{}", entry.key))
                 }) {
+                    if entry.key == "port"
+                        && entry
+                            .value
+                            .parse::<u32>()
+                            .map_or(true, |port| port == 0 || port > u32::from(u16::MAX))
+                    {
+                        bail!("Invalid port specified in -port: '{}'", entry.value);
+                    }
                     bail!(
                         "Error reading configuration file: parse error on line {}: {}",
                         entry.line,
@@ -2371,6 +2379,17 @@ fn core_cli_parse_error(args: &[OsString], error: &str) -> Option<String> {
     if error.contains("invalid value") {
         if let Some(value) = raw_cli_option_value(args, "onlynet") {
             return Some(format!("Unknown network specified in -onlynet: '{value}'"));
+        }
+        for option in ["port", "rpcport"] {
+            let Some(value) = raw_cli_option_value(args, option) else {
+                continue;
+            };
+            if value
+                .parse::<u32>()
+                .map_or(true, |port| port == 0 || port > u32::from(u16::MAX))
+            {
+                return Some(format!("Invalid port specified in -{option}: '{value}'"));
+            }
         }
         for option in ["proxy", "onion", "i2psam"] {
             let Some(value) = raw_cli_option_value(args, option) else {
@@ -3356,19 +3375,40 @@ impl Config {
             .check_mempool
             .unwrap_or(default_consistency_checks as usize);
         let check_addrman = args.check_addrman.unwrap_or_default();
-        let p2p = args.p2p.unwrap_or_else(|| {
-            SocketAddr::from((
-                [127, 0, 0, 1],
-                args.port.unwrap_or_else(|| default_p2p_port(network)),
-            ))
-        });
+        let p2p_port = args.port.unwrap_or_else(|| default_p2p_port(network));
+        if p2p_port == 0 {
+            bail!("Invalid port specified in -port: '0'");
+        }
+        let p2p = args
+            .p2p
+            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, p2p_port)));
         if args.p2p.is_some() && !args.bind.is_empty() {
             bail!("--p2p cannot be combined with --bind");
         }
         let p2p_binds = if args.bind.is_empty() {
-            vec![p2p]
+            if args.p2p.is_some() {
+                vec![p2p]
+            } else if args.whitebind.is_empty() {
+                vec![
+                    SocketAddr::from((Ipv6Addr::UNSPECIFIED, p2p_port)),
+                    SocketAddr::from((Ipv4Addr::UNSPECIFIED, p2p_port)),
+                    SocketAddr::from((
+                        Ipv4Addr::LOCALHOST,
+                        p2p_port.checked_add(1).ok_or_else(|| {
+                            anyhow!("Invalid port specified in -port: '{p2p_port}'")
+                        })?,
+                    )),
+                ]
+            } else {
+                vec![SocketAddr::from((
+                    Ipv4Addr::LOCALHOST,
+                    p2p_port
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("Invalid port specified in -port: '{p2p_port}'"))?,
+                ))]
+            }
         } else {
-            parse_p2p_binds(&args.bind, p2p.port())?
+            parse_p2p_binds(&args.bind, p2p_port)?
         };
         let rpc = args.rpc.unwrap_or_else(|| {
             SocketAddr::from((
@@ -3603,6 +3643,16 @@ impl Config {
             args.whitelistforcerelay,
             args.blocksonly,
         )?;
+        let mut seen_bindings = HashSet::new();
+        for address in p2p_binds
+            .iter()
+            .copied()
+            .chain(peer_permissions.whitebind.iter().map(|bind| bind.address))
+        {
+            if !seen_bindings.insert(address) {
+                bail!("Duplicate binding configuration");
+            }
+        }
         if args.blockmaxweight > DEFAULT_BLOCK_MAX_WEIGHT {
             bail!(
                 "Specified -blockmaxweight ({}) exceeds consensus maximum block weight ({DEFAULT_BLOCK_MAX_WEIGHT})",
@@ -3764,7 +3814,17 @@ impl Config {
         let add_nodes = parse_manual_endpoints(&args.addnode, network, "addnode")?;
         let seed_nodes_for_address_fetch =
             parse_manual_endpoints(&args.seednode, network, "seednode")?;
-        let primary_p2p_bind = p2p_binds[0];
+        let primary_p2p_bind = if !args.bind.is_empty() {
+            p2p_binds.first().copied().unwrap_or(p2p)
+        } else if args.p2p.is_some() {
+            p2p
+        } else {
+            peer_permissions
+                .whitebind
+                .first()
+                .map(|bind| bind.address)
+                .unwrap_or(p2p)
+        };
         let external_port = if primary_p2p_bind.port() == 0 {
             default_p2p_port(network)
         } else {
@@ -4279,32 +4339,46 @@ fn parse_rpc_binds(values: &[String], default_port: u16) -> Result<Vec<SocketAdd
 }
 
 fn parse_p2p_binds(values: &[String], default_port: u16) -> Result<Vec<SocketAddr>> {
-    values
-        .iter()
-        .map(|raw| {
-            // Core permits an optional =onion suffix to classify a listener
-            // for Tor address advertisement. The compact listener model used
-            // here has a separate onion transport, so retain the endpoint
-            // while accepting the spelling for configuration compatibility.
-            let value = raw.strip_suffix("=onion").unwrap_or(raw);
-            if let Ok(address) = value.parse::<SocketAddr>() {
-                return Ok(address);
-            }
-            if let Ok(ip) = value.parse::<IpAddr>() {
-                return Ok(SocketAddr::new(ip, default_port));
-            }
-            if let Some(host) = value
-                .strip_prefix('[')
-                .and_then(|value| value.strip_suffix(']'))
-                && let Ok(ip) = host.parse::<IpAddr>()
-            {
-                return Ok(SocketAddr::new(ip, default_port));
-            }
-            Err(anyhow::anyhow!(
+    let mut normal = Vec::new();
+    let mut onion = Vec::new();
+    for raw in values {
+        // Core permits an optional =onion suffix to classify a listener for
+        // Tor address advertisement. The compact listener model used here
+        // keeps both listener kinds in the same socket set, but the onion
+        // spelling still uses Core's port+1 default.
+        let (value, port) = if raw.ends_with("=onion") {
+            (
+                raw.strip_suffix("=onion").unwrap_or(raw),
+                default_port
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("Invalid port specified in -port: '{default_port}'"))?,
+            )
+        } else {
+            (raw.as_str(), default_port)
+        };
+        let address = if let Ok(address) = value.parse::<SocketAddr>() {
+            address
+        } else if let Ok(ip) = value.parse::<IpAddr>() {
+            SocketAddr::new(ip, port)
+        } else if let Some(host) = value
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            && let Ok(ip) = host.parse::<IpAddr>()
+        {
+            SocketAddr::new(ip, port)
+        } else {
+            return Err(anyhow::anyhow!(
                 "invalid --bind address '{raw}'; expected IP[:PORT][=onion]"
-            ))
-        })
-        .collect()
+            ));
+        };
+        if raw.ends_with("=onion") {
+            onion.push(address);
+        } else {
+            normal.push(address);
+        }
+    }
+    normal.extend(onion);
+    Ok(normal)
 }
 
 fn parse_rpc_auth(
@@ -5388,7 +5462,7 @@ mod tests {
                 NetworkEndpoint::from_socket("192.0.2.2:18444".parse().unwrap()),
             ]
         );
-        assert_eq!(config.p2p_bind, "127.0.0.1:18444".parse().unwrap());
+        assert_eq!(config.p2p_bind, "0.0.0.0:18444".parse().unwrap());
         assert_eq!(config.rpc_bind, Some("127.0.0.1:18443".parse().unwrap()));
         assert!(config.listen);
         assert!(config.dnsseed);
@@ -5403,7 +5477,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             Config::from_args(args).unwrap().p2p_bind,
-            "127.0.0.1:18445".parse().unwrap()
+            "0.0.0.0:18445".parse().unwrap()
         );
 
         let args = Args::try_parse_from([
@@ -5573,8 +5647,8 @@ mod tests {
         assert_eq!(
             config.p2p_binds,
             vec![
-                "127.0.0.1:18446".parse().unwrap(),
                 "127.0.0.1:18444".parse().unwrap(),
+                "127.0.0.1:18446".parse().unwrap(),
             ]
         );
 

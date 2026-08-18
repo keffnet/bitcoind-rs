@@ -27,7 +27,7 @@ use bitcoin::{Amount, Block, BlockHash, MerkleBlock, Network, Transaction, Txid,
 use rand::random;
 use rand::seq::SliceRandom;
 use sha2::{Digest, Sha256};
-use socket2::SockRef;
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(all(test, unix))]
 use tokio::net::UnixListener;
@@ -1726,14 +1726,37 @@ impl PeerManager {
             };
             let mut listeners = Vec::with_capacity(binds.len());
             for bind in binds {
-                let listener = TcpListener::bind(bind)
-                    .await
-                    .with_context(|| format!("binding P2P listener {bind}"))?;
+                let listener = match bind_p2p_listener(bind).await {
+                    Ok(listener) => listener,
+                    Err(error)
+                        if bind.ip().is_unspecified()
+                            && bind.ip().is_ipv6()
+                            && self.node.config.p2p_binds.len() > 1 =>
+                    {
+                        debug!(%bind, error = %error, "unable to bind optional IPv6 wildcard P2P listener");
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| format!("binding P2P listener {bind}"));
+                    }
+                };
                 let local_address = listener.local_addr()?;
-                if self.node.listen_address().is_none() {
-                    self.node.set_listen_address(local_address);
-                } else {
-                    self.node.add_listen_address(local_address);
+                info!("Bound to {local_address}");
+                let onion_port = self
+                    .node
+                    .config
+                    .p2p_bind
+                    .port()
+                    .checked_add(1)
+                    .unwrap_or(u16::MAX);
+                let is_default_onion_bind =
+                    local_address.ip().is_loopback() && local_address.port() == onion_port;
+                if !is_default_onion_bind {
+                    if self.node.listen_address().is_none() {
+                        self.node.set_listen_address(local_address);
+                    } else {
+                        self.node.add_listen_address(local_address);
+                    }
                 }
                 listeners.push(listener);
             }
@@ -1742,8 +1765,17 @@ impl PeerManager {
             Vec::new()
         };
         let tor_target = listeners
-            .first()
-            .and_then(|listener| listener.local_addr().ok())
+            .iter()
+            .filter_map(|listener| listener.local_addr().ok())
+            .find(|address| {
+                address.ip().is_loopback()
+                    && address.port() == self.node.config.p2p_bind.port().saturating_add(1)
+            })
+            .or_else(|| {
+                listeners
+                    .first()
+                    .and_then(|listener| listener.local_addr().ok())
+            })
             .map(tor_service_target);
         let whitebind_listeners = if self.node.config.listen {
             let mut listeners = Vec::new();
@@ -2356,6 +2388,24 @@ fn tor_service_target(address: SocketAddr) -> SocketAddr {
         }
         address => address,
     }
+}
+
+async fn bind_p2p_listener(address: SocketAddr) -> Result<TcpListener> {
+    let domain = if address.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    if address.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&address.into())?;
+    socket.listen(128)?;
+    let listener: std::net::TcpListener = socket.into();
+    Ok(TcpListener::from_std(listener)?)
 }
 
 async fn run_tor_service(

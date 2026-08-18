@@ -7095,17 +7095,36 @@ fn rpc_cookie_compat_path(config: &Config, primary_path: &Path) -> Option<std::p
 }
 
 #[derive(Debug)]
-pub struct CoreStartupError;
+pub struct CoreStartupError {
+    message: String,
+}
+
+impl CoreStartupError {
+    fn future() -> Self {
+        Self {
+            message: concat!(
+                "The block database contains a block which appears to be from the future. ",
+                "This may be due to your computer's date and time being set incorrectly. ",
+                "Only rebuild the block database if you are sure that your computer's date ",
+                "and time are correct.\nPlease restart with -reindex or ",
+                "-reindex-chainstate to recover.",
+            )
+            .to_owned(),
+        }
+    }
+
+    pub(crate) fn witness(height: u32) -> Self {
+        Self {
+            message: format!(
+                "Witness data for blocks after height {height} requires validation. Please restart with -reindex..\nPlease restart with -reindex or -reindex-chainstate to recover."
+            ),
+        }
+    }
+}
 
 impl std::fmt::Display for CoreStartupError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(concat!(
-            "The block database contains a block which appears to be from the future. ",
-            "This may be due to your computer's date and time being set incorrectly. ",
-            "Only rebuild the block database if you are sure that your computer's date ",
-            "and time are correct.\nPlease restart with -reindex or ",
-            "-reindex-chainstate to recover.",
-        ))
+        formatter.write_str(&self.message)
     }
 }
 
@@ -7116,7 +7135,7 @@ fn core_startup_chain_error(error: anyhow::Error) -> anyhow::Error {
         .downcast_ref::<validation::ValidationError>()
         .is_some_and(|error| matches!(error, validation::ValidationError::TimeTooNew))
     {
-        CoreStartupError.into()
+        CoreStartupError::future().into()
     } else {
         error
     }

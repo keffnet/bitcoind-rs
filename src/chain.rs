@@ -544,6 +544,12 @@ struct ChainMetadata {
     prune_locks: HashMap<String, PruneLock>,
     #[serde(default)]
     prune_protected_blocks: HashMap<String, u32>,
+    /// Active-chain bodies that were accepted while SegWit consensus rules
+    /// were enabled.  Core stores the equivalent BLOCK_OPT_WITNESS bit in
+    /// each block-index entry; keeping the hashes here preserves that state
+    /// without adopting Core's block-index database format.
+    #[serde(default)]
+    segwit_validated_blocks: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -568,6 +574,7 @@ impl From<LegacyChainMetadata> for ChainMetadata {
             prune_height: metadata.prune_height,
             prune_locks: metadata.prune_locks,
             prune_protected_blocks: HashMap::new(),
+            segwit_validated_blocks: None,
         }
     }
 }
@@ -879,6 +886,7 @@ pub struct ChainState {
     coinstats_index_enabled: bool,
     coin_stats: Option<CoinStatsState>,
     active_chain: Vec<BlockHash>,
+    segwit_validated_blocks: HashSet<BlockHash>,
     headers: Vec<bitcoin::block::Header>,
     active_tx_counts: Vec<u32>,
     active_tx_totals: Vec<u64>,
@@ -1206,6 +1214,7 @@ impl ChainState {
             prune_height,
             prune_locks,
             prune_protected_blocks,
+            persisted_segwit_validated_blocks,
         ) = if metadata_path.exists() || legacy_metadata_path.exists() {
             let metadata = if metadata_path.exists() {
                 let bytes = fs::read(&metadata_path)
@@ -1255,6 +1264,19 @@ impl ChainState {
                         .with_context(|| format!("invalid protected pruned block hash {hash}"))
                 })
                 .collect::<Result<HashMap<BlockHash, u32>>>()?;
+            let persisted_segwit_validated_blocks = metadata
+                .segwit_validated_blocks
+                .map(|blocks| {
+                    blocks
+                        .into_iter()
+                        .map(|hash| {
+                            hash.parse().with_context(|| {
+                                format!("invalid SegWit-validated block hash {hash}")
+                            })
+                        })
+                        .collect::<Result<HashSet<BlockHash>>>()
+                })
+                .transpose()?;
             (
                 active_chain,
                 metadata.headers,
@@ -1262,6 +1284,7 @@ impl ChainState {
                 metadata.prune_height,
                 metadata.prune_locks,
                 prune_protected_blocks,
+                persisted_segwit_validated_blocks,
             )
         } else {
             (
@@ -1271,6 +1294,7 @@ impl ChainState {
                 None,
                 HashMap::new(),
                 HashMap::new(),
+                None,
             )
         };
         let persisted_tx_counts = if rebuild_chainstate {
@@ -1291,6 +1315,56 @@ impl ChainState {
         if active_chain.first().copied() != Some(genesis_hash) {
             bail!("chainstate does not start at the configured network genesis block");
         }
+
+        // Core refuses to start when the active chain contains blocks at or
+        // above a newly enabled SegWit height that were previously accepted
+        // by a pre-SegWit validation path.  The block-index database carries
+        // this information in BLOCK_OPT_WITNESS; native storage keeps the
+        // equivalent set in chainstate metadata.
+        if !rebuild_chainstate
+            && let Some(validated_blocks) = persisted_segwit_validated_blocks.as_ref()
+            && active_chain
+                .iter()
+                .enumerate()
+                .skip(
+                    usize::try_from(deployment_parameters.buried.segwit)
+                        .unwrap_or(usize::MAX)
+                        .max(1),
+                )
+                .any(|(_, hash)| !validated_blocks.contains(hash))
+        {
+            return Err(
+                crate::CoreStartupError::witness(deployment_parameters.buried.segwit).into(),
+            );
+        }
+
+        // A full reindex rebuilds the block index from bodies that may have
+        // been stored before SegWit was enabled.  Those bodies remain on
+        // disk, but Core deliberately leaves the first insufficiently
+        // witnessed suffix disconnected so it can be redownloaded.  Keep
+        // the same boundary while retaining all native block records.
+        let reindex_witness_tip = if rebuild_chainstate {
+            persisted_segwit_validated_blocks
+                .as_ref()
+                .and_then(|validated| {
+                    active_chain
+                        .iter()
+                        .enumerate()
+                        .skip(
+                            usize::try_from(deployment_parameters.buried.segwit)
+                                .unwrap_or(usize::MAX)
+                                .max(1),
+                        )
+                        .find_map(|(height, hash)| {
+                            (!validated.contains(hash))
+                                .then(|| height.checked_sub(1))
+                                .flatten()
+                                .and_then(|height| active_chain.get(height).copied())
+                        })
+                })
+        } else {
+            None
+        };
 
         let mut state = Self {
             network,
@@ -1322,6 +1396,9 @@ impl ChainState {
             coinstats_index_enabled: false,
             coin_stats: None,
             active_chain: Vec::new(),
+            segwit_validated_blocks: persisted_segwit_validated_blocks
+                .clone()
+                .unwrap_or_default(),
             headers: Vec::new(),
             active_tx_counts: persisted_tx_counts.unwrap_or_default(),
             active_tx_totals: persisted_tx_totals,
@@ -1385,6 +1462,9 @@ impl ChainState {
             let best = state
                 .best_valid_tip_hash()
                 .context("reindex found no valid chain tip")?;
+            let best = reindex_witness_tip
+                .filter(|hash| state.block_index.contains_key(hash))
+                .unwrap_or(best);
             if best != state.network_genesis_hash() {
                 state.activate_chain(best)?;
             }
@@ -6474,6 +6554,9 @@ impl ChainState {
             self.index_block_spends(block, height);
         }
         self.active_chain.push(hash);
+        if height >= self.deployment_parameters.buried.segwit {
+            self.segwit_validated_blocks.insert(hash);
+        }
         self.headers.push(block.header);
         let count =
             u32::try_from(block.txdata.len()).context("transaction count does not fit u32")?;
@@ -6841,6 +6924,7 @@ impl ChainState {
             .collect::<Result<Vec<Block>>>()?;
 
         let old_active_chain = std::mem::take(&mut self.active_chain);
+        let old_segwit_validated_blocks = self.segwit_validated_blocks.clone();
         let old_headers = std::mem::take(&mut self.headers);
         let old_active_tx_counts = std::mem::take(&mut self.active_tx_counts);
         let old_active_tx_totals = std::mem::take(&mut self.active_tx_totals);
@@ -6940,6 +7024,7 @@ impl ChainState {
         })();
         if let Err(error) = replay {
             self.active_chain = old_active_chain;
+            self.segwit_validated_blocks = old_segwit_validated_blocks;
             self.headers = old_headers;
             self.active_tx_counts = old_active_tx_counts;
             self.active_tx_totals = old_active_tx_totals;
@@ -8061,6 +8146,13 @@ impl ChainState {
                 .iter()
                 .map(|(hash, height)| (hash.to_string(), *height))
                 .collect(),
+            segwit_validated_blocks: Some(
+                self.active_chain
+                    .iter()
+                    .filter(|hash| self.segwit_validated_blocks.contains(*hash))
+                    .map(ToString::to_string)
+                    .collect(),
+            ),
         };
         let bytes = serialize_internal(CHAIN_METADATA_MAGIC, &metadata)?;
         let path = self.data_dir.join("chainstate.bin");
@@ -8810,6 +8902,7 @@ fn open_background_replay_state(
         coinstats_index_enabled: false,
         coin_stats: None,
         active_chain: active_chain.to_vec(),
+        segwit_validated_blocks: HashSet::new(),
         headers,
         active_tx_counts: Vec::new(),
         active_tx_totals: Vec::new(),
@@ -10150,6 +10243,7 @@ mod tests {
             prune_height: state.prune_height,
             prune_locks: HashMap::new(),
             prune_protected_blocks: HashMap::new(),
+            segwit_validated_blocks: None,
         };
         let snapshot = state.current_snapshot().unwrap();
         let metadata_json = serde_json::to_vec_pretty(&metadata).unwrap();

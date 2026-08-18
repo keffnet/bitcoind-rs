@@ -20,7 +20,7 @@ use anyhow::{Context, Result, bail};
 use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
-use bitcoin::{Block, BlockHash, Network, OutPoint, Transaction, TxOut, Txid};
+use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
 use parking_lot::{Mutex, RwLock};
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,10 @@ const MIN_UTXO_COMPACTION_STALE_SIZE: u64 = 8 * 1024 * 1024;
 const MIN_ELECTRUM_HISTORY_COMPACTION_DATA_SIZE: u64 = 16 * 1024 * 1024;
 const MIN_ELECTRUM_HISTORY_COMPACTION_STALE_SIZE: u64 = 8 * 1024 * 1024;
 const XOR_KEY_SIZE: usize = 8;
+const STORAGE_COMPRESSION_MAGIC: &[u8] = b"bitcoind-rs-zstd-v1\0";
+const STORAGE_COMPRESSION_HEADER_SIZE: usize = STORAGE_COMPRESSION_MAGIC.len() + 4;
+const STORAGE_COMPRESSION_LEVEL: i32 = 6;
+const STORAGE_COMPRESSION_MIN_SIZE: usize = 256;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
 const UTXO_DATA_MAGIC: &[u8] = b"bitcoind-rs-utxo-v1\0";
@@ -178,6 +182,74 @@ impl XorKey {
     }
 }
 
+/// Encode one authoritative append-only payload with the storage codec.
+///
+/// The outer record framing remains four-byte-length-prefixed so indexes can
+/// still address records directly.  Compression is therefore applied before
+/// XOR obfuscation and independently for each record, which preserves random
+/// reads and makes a torn tail recoverable without a global decompression
+/// stream.  Small or incompressible values stay raw; the decoder accepts both
+/// forms so existing stores upgrade in place as new records are appended.
+fn encode_storage_payload(payload: &[u8], max_size: usize) -> Result<Vec<u8>> {
+    if payload.len() > max_size {
+        bail!("storage payload is too large: {} bytes", payload.len());
+    }
+    if payload.len() < STORAGE_COMPRESSION_MIN_SIZE {
+        return Ok(payload.to_vec());
+    }
+    let compressed = zstd::bulk::compress(payload, STORAGE_COMPRESSION_LEVEL)
+        .context("compressing storage record with zstd")?;
+    if compressed
+        .len()
+        .saturating_add(STORAGE_COMPRESSION_HEADER_SIZE)
+        >= payload.len()
+    {
+        return Ok(payload.to_vec());
+    }
+    let uncompressed_length = u32::try_from(payload.len())
+        .context("uncompressed storage payload length does not fit u32")?;
+    let mut encoded = Vec::with_capacity(STORAGE_COMPRESSION_HEADER_SIZE + compressed.len());
+    encoded.extend_from_slice(STORAGE_COMPRESSION_MAGIC);
+    encoded.extend_from_slice(&uncompressed_length.to_le_bytes());
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
+fn decode_storage_payload(encoded: &[u8], max_size: usize) -> Result<Vec<u8>> {
+    if !encoded.starts_with(STORAGE_COMPRESSION_MAGIC) {
+        if encoded.len() > max_size {
+            bail!("stored payload is too large: {} bytes", encoded.len());
+        }
+        return Ok(encoded.to_vec());
+    }
+    if encoded.len() < STORAGE_COMPRESSION_HEADER_SIZE {
+        bail!("truncated zstd storage record header");
+    }
+    let length_start = STORAGE_COMPRESSION_MAGIC.len();
+    let expected_length = u32::from_le_bytes(
+        encoded[length_start..STORAGE_COMPRESSION_HEADER_SIZE]
+            .try_into()
+            .expect("zstd storage length has fixed width"),
+    ) as usize;
+    if expected_length > max_size {
+        bail!(
+            "decompressed storage payload is too large: {} bytes",
+            expected_length
+        );
+    }
+    let decoded =
+        zstd::bulk::decompress(&encoded[STORAGE_COMPRESSION_HEADER_SIZE..], expected_length)
+            .context("decompressing storage record with zstd")?;
+    if decoded.len() != expected_length {
+        bail!(
+            "zstd storage record decoded to {} bytes, expected {}",
+            decoded.len(),
+            expected_length
+        );
+    }
+    Ok(decoded)
+}
+
 fn read_xor_key(path: &Path) -> Result<XorKey> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading blocksdir XOR key {}", path.display()))?;
@@ -243,16 +315,8 @@ impl BlockStoreReader {
             return Ok(None);
         };
         let file = self.file.read();
-        let mut length = [0u8; 4];
-        read_block_exact_at(&file, &mut length, record.offset)?;
-        self.xor_key.apply(&mut length, record.offset);
-        let actual = u32::from_le_bytes(length);
-        if actual != record.length {
-            bail!("block store index disagrees with record length");
-        }
-        let mut bytes = vec![0u8; record.length as usize];
-        read_block_exact_at(&file, &mut bytes, record.offset + 4)?;
-        self.xor_key.apply(&mut bytes, record.offset + 4);
+        let bytes =
+            read_storage_record(&file, record, self.xor_key, MAX_STORED_BLOCK_SIZE, "block")?;
         let block: Block = deserialize(&bytes).context("decoding stored block")?;
         if block.block_hash() != *hash {
             bail!("stored block hash does not match block index");
@@ -298,16 +362,14 @@ impl BlockStore {
         Self::open_with_xor(directory, false)
     }
 
-    /// Open the block and undo stores with Core-compatible blocksdir
-    /// obfuscation.  The key is persisted in `xor.dat`; a fresh directory gets
-    /// a random key when enabled, while an existing clear directory gets a
-    /// zero key so upgrading does not rewrite historical data.
+    /// Open the block and undo stores with optional cyclic XOR obfuscation.
+    /// The key is persisted in `xor.dat`; a fresh directory gets a random key
+    /// when enabled, while an existing clear directory gets a zero key so
+    /// upgrading does not rewrite historical data.
     pub fn open_with_xor(directory: impl AsRef<Path>, use_xor: bool) -> Result<Self> {
         let directory = directory.as_ref();
         create_dir_all(directory)
             .with_context(|| format!("creating block directory {}", directory.display()))?;
-        let xor_key_path = directory.join("xor.dat");
-        let key_was_missing = !xor_key_path.exists();
         let xor_key = init_xor_key(directory, use_xor)?;
         let path = directory.join("blocks.dat");
         let mut file = OpenOptions::new()
@@ -324,37 +386,14 @@ impl BlockStore {
             .write(true)
             .open(&index_path)
             .with_context(|| format!("opening block index {}", index_path.display()))?;
-        let mut data_len = file.metadata()?.len();
-        // Core's blocksxor test deliberately removes xor.dat after manually
-        // restoring the visible blk*.dat/rev*.dat files to clear bytes. The
-        // implementation store is a separate append-only format, so rebuild
-        // it from those files before attempting to interpret its old records
-        // with the newly recreated zero key.
-        let recovered_compat = if key_was_missing && !use_xor && data_len > 0 {
-            recover_core_compat_records(directory)?
-        } else {
-            None
-        };
-        let recovered_undo = recovered_compat
-            .as_ref()
-            .map(|(_, undo_records)| undo_records.clone());
-        let index = if let Some((block_records, _)) = recovered_compat {
-            drop(file);
-            let (recovered_file, index, recovered_len) =
-                rewrite_record_file(&path, &block_records, xor_key)?;
-            file = recovered_file;
-            data_len = recovered_len;
-            rewrite_index(&mut index_file, data_len, &index)?;
-            index
-        } else {
-            match load_index(&mut index_file, data_len)? {
-                Some(index) => index,
-                None => {
-                    let index = scan_index(&mut file, xor_key)
-                        .with_context(|| format!("scanning {}", path.display()))?;
-                    rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
-                    index
-                }
+        let data_len = file.metadata()?.len();
+        let index = match load_index(&mut index_file, data_len)? {
+            Some(index) => index,
+            None => {
+                let index = scan_index(&mut file, xor_key)
+                    .with_context(|| format!("scanning {}", path.display()))?;
+                rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
+                index
             }
         };
         let undo_path = directory.join("undo.dat");
@@ -372,24 +411,14 @@ impl BlockStore {
             .write(true)
             .open(&undo_index_path)
             .with_context(|| format!("opening undo index {}", undo_index_path.display()))?;
-        let mut undo_data_len = undo_file.metadata()?.len();
-        let undo_index = if let Some(undo_records) = recovered_undo {
-            drop(undo_file);
-            let (recovered_file, index, recovered_len) =
-                rewrite_record_file(&undo_path, &undo_records, xor_key)?;
-            undo_file = recovered_file;
-            undo_data_len = recovered_len;
-            rewrite_index(&mut undo_index_file, undo_data_len, &index)?;
-            index
-        } else {
-            match load_index(&mut undo_index_file, undo_data_len)? {
-                Some(index) => index,
-                None => {
-                    let index = scan_undo_index(&mut undo_file, xor_key)
-                        .with_context(|| format!("scanning {}", undo_path.display()))?;
-                    rewrite_index(&mut undo_index_file, undo_file.metadata()?.len(), &index)?;
-                    index
-                }
+        let undo_data_len = undo_file.metadata()?.len();
+        let undo_index = match load_index(&mut undo_index_file, undo_data_len)? {
+            Some(index) => index,
+            None => {
+                let index = scan_undo_index(&mut undo_file, xor_key)
+                    .with_context(|| format!("scanning {}", undo_path.display()))?;
+                rewrite_index(&mut undo_index_file, undo_file.metadata()?.len(), &index)?;
+                index
             }
         };
         let serving_reader = BlockStoreReader::new(file.try_clone()?, index.clone(), xor_key);
@@ -599,102 +628,13 @@ impl BlockStore {
         self.insert_with_sync(block, false)
     }
 
-    /// Append a Core-format compatibility record for tools which inspect the
-    /// public blk*.dat/rev*.dat files directly. The chainstate's authoritative
-    /// records remain in blocks.dat/undo.dat; these files carry the same XOR
-    /// key and are deliberately framed exactly as Core's flat files are.
-    pub fn append_core_compat(
-        &mut self,
-        block: &Block,
-        undo: &[Vec<TxOut>],
-        network: Network,
-        fast_prune: bool,
-    ) -> Result<()> {
-        let block_bytes = serialize(block);
-        let undo_bytes = encode_undo_record(block.block_hash(), undo)?;
-        let magic = crate::wire::network_magic(network);
-        append_core_compat_pair(
-            self.path
-                .parent()
-                .context("block store has no parent directory")?,
-            magic,
-            &block_bytes,
-            &undo_bytes,
-            self.xor_key,
-            fast_prune,
-        )
-    }
-
-    /// Start the next Core-compatible flat-file pair.  AssumeUTXO keeps the
-    /// historical block file separate from bodies received after the
-    /// snapshot base, even when the compatibility file-size limit has not
-    /// been reached yet.
-    pub fn start_core_compat_file(&self) -> Result<()> {
-        let directory = self
-            .path
-            .parent()
-            .context("block store has no parent directory")?;
-        let next_index = core_compat_file_paths(directory, "blk")?
-            .into_iter()
-            .chain(core_compat_file_paths(directory, "rev")?)
-            .filter_map(|path| {
-                path.file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|stem| stem.get(3..))
-                    .and_then(|index| index.parse::<u32>().ok())
-            })
-            .max()
-            .unwrap_or_default()
-            .saturating_add(1);
-        for prefix in ["blk", "rev"] {
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(directory.join(format!("{prefix}{next_index:05}.dat")))?;
-        }
-        Ok(())
-    }
-
-    /// Check the on-disk Core-compatible block files for a block whose parent
-    /// is not the preceding record in the same file. Core's reindexer emits
-    /// its out-of-order diagnostics for this case; the append-only store is
-    /// authoritative for normal operation, but these files are still
-    /// inspected by compatibility tests and external tooling.
-    pub fn has_out_of_order_core_compat_blocks(&self) -> Result<bool> {
-        let directory = self
-            .path
-            .parent()
-            .context("block store has no parent directory")?;
-        for path in core_compat_file_paths(directory, "blk")? {
-            let mut bytes = std::fs::read(&path)
-                .with_context(|| format!("reading Core block file {}", path.display()))?;
-            self.xor_key.apply(&mut bytes, 0);
-            let Some(records) = parse_core_compat_file(&bytes, false) else {
-                continue;
-            };
-            let mut previous_hash = None;
-            for (_, _, payload) in records {
-                let Ok(block) = deserialize::<Block>(&payload) else {
-                    continue;
-                };
-                if previous_hash.is_some_and(|hash| block.header.prev_blockhash != hash) {
-                    return Ok(true);
-                }
-                previous_hash = Some(block.block_hash());
-            }
-        }
-        Ok(false)
-    }
-
     fn insert_with_sync(&mut self, block: &Block, sync: bool) -> Result<BlockHash> {
         let hash = block.block_hash();
         if self.index.contains_key(&hash) {
             return Ok(hash);
         }
-        let bytes = serialize(block);
-        if bytes.len() > MAX_STORED_BLOCK_SIZE {
-            bail!("block is too large: {} bytes", bytes.len());
-        }
+        let raw_bytes = serialize(block);
+        let bytes = encode_storage_payload(&raw_bytes, MAX_STORED_BLOCK_SIZE)?;
         let offset = self.file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("block length does not fit u32")?;
         let mut record = Vec::with_capacity(4 + bytes.len());
@@ -714,7 +654,7 @@ impl BlockStore {
         )?;
         self.index.insert(hash, Record { offset, length });
         self.serving_reader.insert(hash, Record { offset, length });
-        self.cache_block(hash, block.clone(), bytes.len());
+        self.cache_block(hash, block.clone(), raw_bytes.len());
         Ok(hash)
     }
 
@@ -734,22 +674,18 @@ impl BlockStore {
         let Some(record) = self.index.get(hash).copied() else {
             return Ok(None);
         };
-        self.file.seek(SeekFrom::Start(record.offset))?;
-        let mut length = [0u8; 4];
-        self.file.read_exact(&mut length)?;
-        self.xor_key.apply(&mut length, record.offset);
-        let actual = u32::from_le_bytes(length);
-        if actual != record.length {
-            bail!("block store index disagrees with record length");
-        }
-        let mut bytes = vec![0u8; record.length as usize];
-        self.file.read_exact(&mut bytes)?;
-        self.xor_key.apply(&mut bytes, record.offset + 4);
+        let bytes = read_storage_record(
+            &self.file,
+            record,
+            self.xor_key,
+            MAX_STORED_BLOCK_SIZE,
+            "block",
+        )?;
         let block: Block = deserialize(&bytes).context("decoding stored block")?;
         if block.block_hash() != *hash {
             bail!("stored block hash does not match block index");
         }
-        self.cache_block(*hash, block.clone(), record.length as usize);
+        self.cache_block(*hash, block.clone(), bytes.len());
         Ok(Some(block))
     }
 
@@ -772,17 +708,13 @@ impl BlockStore {
         let Some(record) = self.undo_index.get(hash).copied() else {
             return Ok(None);
         };
-        self.undo_file.seek(SeekFrom::Start(record.offset))?;
-        let mut length = [0u8; 4];
-        self.undo_file.read_exact(&mut length)?;
-        self.xor_key.apply(&mut length, record.offset);
-        let actual = u32::from_le_bytes(length);
-        if actual != record.length {
-            bail!("undo store index disagrees with record length");
-        }
-        let mut bytes = vec![0u8; record.length as usize];
-        self.undo_file.read_exact(&mut bytes)?;
-        self.xor_key.apply(&mut bytes, record.offset + 4);
+        let bytes = read_storage_record(
+            &self.undo_file,
+            record,
+            self.xor_key,
+            MAX_STORED_UNDO_SIZE,
+            "undo",
+        )?;
         let (stored_hash, undo) = decode_undo_record(&bytes)?;
         if stored_hash != *hash {
             bail!("stored block undo hash does not match undo index");
@@ -794,10 +726,8 @@ impl BlockStore {
         if self.undo_index.contains_key(&hash) {
             return Ok(());
         }
-        let bytes = encode_undo_record(hash, undo)?;
-        if bytes.len() > MAX_STORED_UNDO_SIZE {
-            bail!("block undo is too large: {} bytes", bytes.len());
-        }
+        let raw_bytes = encode_undo_record(hash, undo)?;
+        let bytes = encode_storage_payload(&raw_bytes, MAX_STORED_UNDO_SIZE)?;
         let offset = self.undo_file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("undo length does not fit u32")?;
         let mut record = Vec::with_capacity(4 + bytes.len());
@@ -828,20 +758,6 @@ impl BlockStore {
         retained_blocks: &HashSet<BlockHash>,
         retained_undo: &HashSet<BlockHash>,
     ) -> Result<()> {
-        self.prune_with_core_compat(retained_blocks, retained_undo, false, false)
-    }
-
-    /// Rewrite the append-only files and optionally remove the auxiliary
-    /// Core-format copies. Automatic size-based pruning uses the latter mode:
-    /// `blocks.dat` is authoritative here, while the flat files exist only
-    /// for compatibility with tools which inspect a Core blocksdir.
-    pub fn prune_with_core_compat(
-        &mut self,
-        retained_blocks: &HashSet<BlockHash>,
-        retained_undo: &HashSet<BlockHash>,
-        remove_core_compat: bool,
-        whole_core_files: bool,
-    ) -> Result<()> {
         let block_hashes = self
             .index
             .keys()
@@ -855,8 +771,12 @@ impl BlockStore {
                 .with_context(|| format!("block {hash} disappeared during pruning"))?;
             block_records.push((hash, serialize(&block)));
         }
-        let (file, index, data_len) =
-            rewrite_record_file(&self.path, &block_records, self.xor_key)?;
+        let (file, index, data_len) = rewrite_record_file(
+            &self.path,
+            &block_records,
+            self.xor_key,
+            MAX_STORED_BLOCK_SIZE,
+        )?;
         self.file = file;
         self.index = index;
         rewrite_index(&mut self.index_file, data_len, &self.index)?;
@@ -881,153 +801,51 @@ impl BlockStore {
                 .with_context(|| format!("undo for block {hash} disappeared during pruning"))?;
             undo_records.push((hash, encode_undo_record(hash, &undo)?));
         }
-        let (undo_file, undo_index, undo_data_len) =
-            rewrite_record_file(&undo_path, &undo_records, self.xor_key)?;
+        let (undo_file, undo_index, undo_data_len) = rewrite_record_file(
+            &undo_path,
+            &undo_records,
+            self.xor_key,
+            MAX_STORED_UNDO_SIZE,
+        )?;
         self.undo_file = undo_file;
         self.undo_index = undo_index;
         rewrite_index(&mut self.undo_index_file, undo_data_len, &self.undo_index)?;
-        if remove_core_compat {
-            self.remove_core_compat_files()?;
-        } else {
-            self.prune_core_compat_files(retained_blocks, retained_undo, whole_core_files)?;
-        }
         self.clear_block_cache();
-        Ok(())
-    }
-
-    fn remove_core_compat_files(&self) -> Result<()> {
-        let directory = self
-            .path
-            .parent()
-            .context("block store has no parent directory")?;
-        let next_index = core_compat_file_paths(directory, "blk")?
-            .into_iter()
-            .chain(core_compat_file_paths(directory, "rev")?)
-            .filter_map(|path| {
-                path.file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .and_then(|stem| stem.get(3..))
-                    .and_then(|index| index.parse::<u32>().ok())
-            })
-            .max()
-            .map_or(0, |index| index.saturating_add(1));
-        for prefix in ["blk", "rev"] {
-            for path in core_compat_file_paths(directory, prefix)? {
-                match remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("removing Core compatibility file {}", path.display())
-                        });
-                    }
-                }
-            }
-        }
-        if next_index != 0 {
-            for prefix in ["blk", "rev"] {
-                OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(directory.join(format!("{prefix}{next_index:05}.dat")))?;
-            }
-        }
-        Ok(())
-    }
-
-    fn prune_core_compat_files(
-        &self,
-        retained_blocks: &HashSet<BlockHash>,
-        retained_undo: &HashSet<BlockHash>,
-        whole_core_files: bool,
-    ) -> Result<()> {
-        let directory = self
-            .path
-            .parent()
-            .context("block store has no parent directory")?;
-        let block_paths = core_compat_file_paths(directory, "blk")?;
-        let mut genesis_hashes = HashSet::new();
-        let mut removed_file_indices = HashSet::new();
-
-        for path in block_paths {
-            let mut bytes = std::fs::read(&path)
-                .with_context(|| format!("reading Core block file {}", path.display()))?;
-            self.xor_key.apply(&mut bytes, 0);
-            let records = parse_core_compat_file(&bytes, false).with_context(|| {
-                format!("decoding Core block file {} during pruning", path.display())
-            })?;
-            let mut kept = Vec::with_capacity(records.len());
-            let mut all_non_genesis_retained = true;
-            for (magic, hash, payload) in records {
-                let is_genesis = deserialize::<Block>(&payload)
-                    .ok()
-                    .is_some_and(|block| block.header.prev_blockhash == BlockHash::all_zeros());
-                if is_genesis {
-                    genesis_hashes.insert(hash);
-                } else if !retained_blocks.contains(&hash) {
-                    all_non_genesis_retained = false;
-                }
-                if retained_blocks.contains(&hash) && !is_genesis {
-                    kept.push((magic, payload));
-                }
-            }
-            // Core prunes complete blk/rev file pairs.  The compatibility
-            // cache can begin with a partial historical file when it was
-            // restored from the compact authoritative store, so in the
-            // fast-prune test mode discard that whole file as soon as it
-            // contains any pruned body rather than leaving a rewritten mixed
-            // file behind.
-            if whole_core_files && !all_non_genesis_retained {
-                kept.clear();
-                if let Some(index) = core_compat_file_index(&path, "blk") {
-                    removed_file_indices.insert(index);
-                }
-            }
-            rewrite_core_compat_file(&path, &kept, self.xor_key)?;
-        }
-
-        for path in core_compat_file_paths(directory, "rev")? {
-            let mut bytes = std::fs::read(&path)
-                .with_context(|| format!("reading Core undo file {}", path.display()))?;
-            self.xor_key.apply(&mut bytes, 0);
-            let records = parse_core_compat_file(&bytes, true).with_context(|| {
-                format!("decoding Core undo file {} during pruning", path.display())
-            })?;
-            let remove_whole = whole_core_files
-                && core_compat_file_index(&path, "rev")
-                    .is_some_and(|index| removed_file_indices.contains(&index));
-            let kept = if remove_whole {
-                Vec::new()
-            } else {
-                records
-                    .into_iter()
-                    .filter(|(_, hash, _)| {
-                        retained_undo.contains(hash) && !genesis_hashes.contains(hash)
-                    })
-                    .map(|(magic, _, payload)| (magic, payload))
-                    .collect::<Vec<_>>()
-            };
-            rewrite_core_compat_file(&path, &kept, self.xor_key)?;
-        }
         Ok(())
     }
 }
 
-fn read_block_transaction_count(file: &File, record: Record, xor_key: XorKey) -> Result<usize> {
-    const BLOCK_HEADER_BYTES: usize = 80;
-    const MAX_VARINT_BYTES: usize = 9;
-    let length = usize::try_from(record.length).context("block length does not fit usize")?;
-    let prefix_length = length.min(BLOCK_HEADER_BYTES + MAX_VARINT_BYTES);
-    if prefix_length <= BLOCK_HEADER_BYTES {
-        bail!("stored block is shorter than its header");
+fn read_storage_record(
+    file: &File,
+    record: Record,
+    xor_key: XorKey,
+    max_size: usize,
+    kind: &str,
+) -> Result<Vec<u8>> {
+    let stored_length =
+        usize::try_from(record.length).context("record length does not fit usize")?;
+    if stored_length == 0 || stored_length > max_size {
+        bail!("stored {kind} record is too large: {stored_length} bytes");
     }
-    let mut prefix = vec![0u8; prefix_length];
-    read_block_exact_at(file, &mut prefix, record.offset + 4)
-        .context("reading stored block transaction count")?;
-    xor_key.apply(&mut prefix, record.offset + 4);
-    let (_, header_bytes) = deserialize_partial::<bitcoin::block::Header>(&prefix)
+    let mut length = [0u8; 4];
+    read_block_exact_at(file, &mut length, record.offset)?;
+    xor_key.apply(&mut length, record.offset);
+    let actual = u32::from_le_bytes(length);
+    if actual != record.length {
+        bail!("{kind} store index disagrees with record length");
+    }
+    let mut encoded = vec![0u8; stored_length];
+    read_block_exact_at(file, &mut encoded, record.offset + 4)?;
+    xor_key.apply(&mut encoded, record.offset + 4);
+    decode_storage_payload(&encoded, max_size)
+        .with_context(|| format!("decoding stored {kind} record"))
+}
+
+fn read_block_transaction_count(file: &File, record: Record, xor_key: XorKey) -> Result<usize> {
+    let bytes = read_storage_record(file, record, xor_key, MAX_STORED_BLOCK_SIZE, "block")?;
+    let (_, header_bytes) = deserialize_partial::<bitcoin::block::Header>(&bytes)
         .context("decoding stored block header")?;
-    let (count, _) = deserialize_partial::<VarInt>(&prefix[header_bytes..])
+    let (count, _) = deserialize_partial::<VarInt>(&bytes[header_bytes..])
         .context("decoding stored block transaction count")?;
     usize::try_from(count.0).context("stored block transaction count is too large")
 }
@@ -1053,309 +871,11 @@ impl Drop for BlockStore {
     }
 }
 
-fn core_compat_file_paths(directory: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
-    let mut paths = std::fs::read_dir(directory)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                return false;
-            };
-            name.starts_with(prefix)
-                && name.ends_with(".dat")
-                && name.len() == prefix.len() + 9
-                && name[prefix.len()..prefix.len() + 5]
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit())
-        })
-        .collect::<Vec<_>>();
-    paths.sort_unstable();
-    Ok(paths)
-}
-
-fn core_compat_file_index(path: &Path, prefix: &str) -> Option<u32> {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .and_then(|stem| stem.strip_prefix(prefix))
-        .and_then(|index| index.parse::<u32>().ok())
-}
-
-fn parse_core_block_file(bytes: &[u8]) -> Option<Vec<(BlockHash, Vec<u8>)>> {
-    let mut offset = 0usize;
-    let mut records = Vec::new();
-    while offset < bytes.len() {
-        let header_end = offset.checked_add(8)?;
-        if header_end > bytes.len() {
-            return None;
-        }
-        let length = u32::from_le_bytes(bytes[offset + 4..header_end].try_into().ok()?) as usize;
-        if !(80..=MAX_STORED_BLOCK_SIZE).contains(&length) {
-            return None;
-        }
-        let end = header_end.checked_add(length)?;
-        if end > bytes.len() {
-            return None;
-        }
-        let payload = bytes[header_end..end].to_vec();
-        let block = deserialize::<Block>(&payload).ok()?;
-        if serialize(&block) != payload {
-            return None;
-        }
-        records.push((block.block_hash(), payload));
-        offset = end;
-    }
-    Some(records)
-}
-
-fn parse_core_undo_file(bytes: &[u8]) -> Option<Vec<(BlockHash, Vec<u8>)>> {
-    let mut offset = 0usize;
-    let mut records = Vec::new();
-    while offset < bytes.len() {
-        let header_end = offset.checked_add(8)?;
-        if header_end > bytes.len() {
-            return None;
-        }
-        let length = u32::from_le_bytes(bytes[offset + 4..header_end].try_into().ok()?) as usize;
-        if length == 0 || length > MAX_STORED_UNDO_SIZE {
-            return None;
-        }
-        let end = header_end.checked_add(length)?;
-        if end > bytes.len() {
-            return None;
-        }
-        let payload = bytes[header_end..end].to_vec();
-        let (hash, _) = decode_undo_record(&payload).ok()?;
-        records.push((hash, payload));
-        offset = end;
-    }
-    Some(records)
-}
-
-fn parse_core_compat_file(bytes: &[u8], undo: bool) -> Option<Vec<([u8; 4], BlockHash, Vec<u8>)>> {
-    let mut offset = 0usize;
-    let mut records = Vec::new();
-    while offset < bytes.len() {
-        let header_end = offset.checked_add(8)?;
-        if header_end > bytes.len() {
-            return None;
-        }
-        let magic = bytes[offset..offset + 4].try_into().ok()?;
-        let length = u32::from_le_bytes(bytes[offset + 4..header_end].try_into().ok()?) as usize;
-        let maximum = if undo {
-            MAX_STORED_UNDO_SIZE
-        } else {
-            MAX_STORED_BLOCK_SIZE
-        };
-        if length == 0 || length > maximum {
-            return None;
-        }
-        let end = header_end.checked_add(length)?;
-        if end > bytes.len() {
-            return None;
-        }
-        let payload = bytes[header_end..end].to_vec();
-        let hash = if undo {
-            decode_undo_record(&payload).ok()?.0
-        } else {
-            let block = deserialize::<Block>(&payload).ok()?;
-            if serialize(&block) != payload {
-                return None;
-            }
-            block.block_hash()
-        };
-        records.push((magic, hash, payload));
-        offset = end;
-    }
-    Some(records)
-}
-
-fn rewrite_core_compat_file(
-    path: &Path,
-    records: &[([u8; 4], Vec<u8>)],
-    xor_key: XorKey,
-) -> Result<()> {
-    if records.is_empty() {
-        match remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-        return Ok(());
-    }
-    let temp_path = path.with_file_name(format!(
-        "{}.prune.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ));
-    let result = (|| -> Result<()> {
-        let mut temp = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp_path)
-            .with_context(|| format!("opening temporary Core file {}", temp_path.display()))?;
-        let mut offset = 0u64;
-        for (magic, payload) in records {
-            let length = u32::try_from(payload.len())
-                .context("Core compatibility record length does not fit u32")?;
-            let mut record = Vec::with_capacity(8 + payload.len());
-            record.extend_from_slice(magic);
-            record.extend_from_slice(&length.to_le_bytes());
-            record.extend_from_slice(payload);
-            xor_key.apply(&mut record, offset);
-            temp.write_all(&record)?;
-            offset = offset.saturating_add(record.len() as u64);
-        }
-        temp.sync_all()?;
-        drop(temp);
-        rename(&temp_path, path)
-            .with_context(|| format!("installing pruned Core file {}", path.display()))?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = remove_file(&temp_path);
-    }
-    result
-}
-
-fn recover_core_compat_records(
-    directory: &Path,
-) -> Result<Option<(Vec<(BlockHash, Vec<u8>)>, Vec<(BlockHash, Vec<u8>)>)>> {
-    let block_paths = core_compat_file_paths(directory, "blk")?;
-    let undo_paths = core_compat_file_paths(directory, "rev")?;
-    if block_paths.is_empty() || undo_paths.is_empty() {
-        return Ok(None);
-    }
-
-    let mut block_records = Vec::new();
-    for path in block_paths {
-        let bytes = std::fs::read(path)?;
-        let Some(records) = parse_core_block_file(&bytes) else {
-            return Ok(None);
-        };
-        block_records.extend(records);
-    }
-    let mut undo_records = Vec::new();
-    for path in undo_paths {
-        let bytes = std::fs::read(path)?;
-        let Some(records) = parse_core_undo_file(&bytes) else {
-            return Ok(None);
-        };
-        undo_records.extend(records);
-    }
-    if block_records.is_empty() || undo_records.is_empty() {
-        return Ok(None);
-    }
-    let mut block_hashes = HashSet::new();
-    let mut undo_hashes = HashSet::new();
-    if block_records
-        .iter()
-        .any(|(hash, _)| !block_hashes.insert(*hash))
-        || undo_records
-            .iter()
-            .any(|(hash, _)| !undo_hashes.insert(*hash))
-    {
-        return Ok(None);
-    }
-    Ok(Some((block_records, undo_records)))
-}
-
-fn append_core_compat_pair(
-    directory: &Path,
-    magic: [u8; 4],
-    block_bytes: &[u8],
-    undo_bytes: &[u8],
-    xor_key: XorKey,
-    fast_prune: bool,
-) -> Result<()> {
-    let block_length = u32::try_from(block_bytes.len()).context("block length does not fit u32")?;
-    let undo_length = u32::try_from(undo_bytes.len()).context("undo length does not fit u32")?;
-    let block_record_len = 8u64.saturating_add(u64::from(block_length));
-    let undo_record_len = 8u64.saturating_add(u64::from(undo_length));
-    // Core's fast-prune test mode uses 64 KiB block files. The previous
-    // 16 KiB limit created too many compatibility files and diverged from
-    // Core's pruning/reindex file lifecycle.
-    let file_limit = if fast_prune { 0x10_000 } else { 0x8000000 };
-
-    let mut file_index = core_compat_file_paths(directory, "blk")?
-        .into_iter()
-        .chain(core_compat_file_paths(directory, "rev")?)
-        .filter_map(|path| {
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .and_then(|stem| stem.get(3..))
-                .and_then(|index| index.parse::<u32>().ok())
-        })
-        .max()
-        .unwrap_or_default();
-    loop {
-        let block_path = directory.join(format!("blk{file_index:05}.dat"));
-        let undo_path = directory.join(format!("rev{file_index:05}.dat"));
-        let mut block_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&block_path)
-            .with_context(|| format!("opening Core block file {}", block_path.display()))?;
-        let mut undo_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&undo_path)
-            .with_context(|| format!("opening Core undo file {}", undo_path.display()))?;
-        let block_offset = block_file.metadata()?.len();
-        let undo_offset = undo_file.metadata()?.len();
-        let block_would_overflow = block_offset > 0
-            && block_offset
-                .saturating_add(block_record_len)
-                .gt(&file_limit);
-        let undo_would_overflow =
-            undo_offset > 0 && undo_offset.saturating_add(undo_record_len).gt(&file_limit);
-        if block_would_overflow || undo_would_overflow {
-            file_index = file_index.saturating_add(1);
-            continue;
-        }
-
-        write_core_compat_record(
-            &mut block_file,
-            magic,
-            block_length,
-            block_bytes,
-            xor_key,
-            block_offset,
-        )?;
-        write_core_compat_record(
-            &mut undo_file,
-            magic,
-            undo_length,
-            undo_bytes,
-            xor_key,
-            undo_offset,
-        )?;
-        return Ok(());
-    }
-}
-
-fn write_core_compat_record(
-    file: &mut File,
-    magic: [u8; 4],
-    length: u32,
-    payload: &[u8],
-    xor_key: XorKey,
-    offset: u64,
-) -> Result<()> {
-    let mut record = Vec::with_capacity(8 + payload.len());
-    record.extend_from_slice(&magic);
-    record.extend_from_slice(&length.to_le_bytes());
-    record.extend_from_slice(payload);
-    xor_key.apply(&mut record, offset);
-    file.write_all(&record)?;
-    file.sync_data()?;
-    Ok(())
-}
-
 fn rewrite_record_file(
     path: &Path,
     records: &[(BlockHash, Vec<u8>)],
     xor_key: XorKey,
+    max_size: usize,
 ) -> Result<(File, HashMap<BlockHash, Record>, u64)> {
     let temp_path = path.with_file_name(format!(
         "{}.prune.tmp",
@@ -1369,12 +889,13 @@ fn rewrite_record_file(
         .open(&temp_path)
         .with_context(|| format!("opening temporary store {}", temp_path.display()))?;
     let mut index = HashMap::with_capacity(records.len());
-    for (hash, bytes) in records {
+    for (hash, raw_bytes) in records {
+        let bytes = encode_storage_payload(raw_bytes, max_size)?;
         let offset = temp.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("record length does not fit u32")?;
         let mut record = Vec::with_capacity(4 + bytes.len());
         record.extend_from_slice(&length.to_le_bytes());
-        record.extend_from_slice(bytes);
+        record.extend_from_slice(&bytes);
         xor_key.apply(&mut record, offset);
         temp.write_all(&record)?;
         index.insert(*hash, Record { offset, length });
@@ -1451,18 +972,13 @@ impl FilterStore {
         let Some(record) = self.index.get(hash).copied() else {
             return Ok(None);
         };
-        self.file.seek(SeekFrom::Start(record.offset))?;
-        let mut length = [0u8; 4];
-        self.file.read_exact(&mut length)?;
-        let actual = u32::from_le_bytes(length);
-        if actual != record.length {
-            bail!("filter store index disagrees with record length");
-        }
-        if actual as usize > MAX_STORED_FILTER_SIZE + 64 {
-            bail!("stored filter record is too large");
-        }
-        let mut bytes = vec![0u8; record.length as usize];
-        self.file.read_exact(&mut bytes)?;
+        let bytes = read_storage_record(
+            &self.file,
+            record,
+            XorKey::default(),
+            MAX_STORED_FILTER_SIZE + 64,
+            "filter",
+        )?;
         if bytes.len() < 64 {
             bail!("stored filter record is truncated");
         }
@@ -1483,37 +999,7 @@ impl FilterStore {
     }
 
     pub fn get_header(&mut self, hash: &BlockHash) -> Result<Option<FilterHeader>> {
-        let Some(record) = self.index.get(hash).copied() else {
-            return Ok(None);
-        };
-        if record.length < 64 {
-            bail!("stored filter record is truncated");
-        }
-        if record.length as usize > MAX_STORED_FILTER_SIZE + 64 {
-            bail!("stored filter record is too large");
-        }
-        self.file.seek(SeekFrom::Start(record.offset))?;
-        let mut length = [0u8; 4];
-        self.file.read_exact(&mut length)?;
-        let actual = u32::from_le_bytes(length);
-        if actual != record.length {
-            bail!("filter store index disagrees with record length");
-        }
-        let mut prefix = [0u8; 64];
-        self.file.read_exact(&mut prefix)?;
-        let stored_hash = BlockHash::from_byte_array(
-            prefix[..32]
-                .try_into()
-                .expect("filter block hash has fixed width"),
-        );
-        if stored_hash != *hash {
-            bail!("stored filter hash does not match filter index");
-        }
-        Ok(Some(FilterHeader::from_byte_array(
-            prefix[32..64]
-                .try_into()
-                .expect("filter header has fixed width"),
-        )))
+        Ok(self.get(hash)?.map(|(_, header)| header))
     }
 
     pub fn insert(&mut self, hash: BlockHash, content: &[u8], header: FilterHeader) -> Result<()> {
@@ -1536,15 +1022,17 @@ impl FilterStore {
             if content.len() > MAX_STORED_FILTER_SIZE {
                 bail!("basic filter is too large: {} bytes", content.len());
             }
-            let bytes_len = 64usize
-                .checked_add(content.len())
-                .context("filter record length overflow")?;
-            let length = u32::try_from(bytes_len).context("filter length does not fit u32")?;
+            let mut raw_bytes = Vec::with_capacity(64 + content.len());
+            raw_bytes.extend_from_slice(&hash.to_byte_array());
+            raw_bytes.extend_from_slice(&header.to_byte_array());
+            raw_bytes.extend_from_slice(content);
+            let bytes = encode_storage_payload(&raw_bytes, MAX_STORED_FILTER_SIZE + 64)?;
+            let length = u32::try_from(bytes.len()).context("filter length does not fit u32")?;
             let record_end = data_len
                 .checked_add(4)
                 .and_then(|offset| offset.checked_add(u64::from(length)))
                 .context("filter store size overflow")?;
-            pending.push((*hash, *content, *header, data_len, length));
+            pending.push((*hash, bytes, data_len, length));
             data_len = record_end;
         }
 
@@ -1553,11 +1041,7 @@ impl FilterStore {
         }
 
         let mut records = Vec::with_capacity(pending.len());
-        for (hash, content, header, offset, length) in pending {
-            let mut bytes = Vec::with_capacity(usize::try_from(length).expect("u32 fits usize"));
-            bytes.extend_from_slice(&hash.to_byte_array());
-            bytes.extend_from_slice(&header.to_byte_array());
-            bytes.extend_from_slice(content);
+        for (hash, bytes, offset, length) in pending {
             debug_assert_eq!(
                 bytes.len(),
                 usize::try_from(length).expect("u32 fits usize")
@@ -1718,21 +1202,16 @@ impl ChainstateStore {
         let Some(record) = self.index.get(hash).copied() else {
             return Ok(None);
         };
-        if record.length < 32 {
+        let bytes = read_storage_record(
+            &self.file,
+            record,
+            XorKey::default(),
+            MAX_STORED_CHAINSTATE_DELTA_SIZE + 32,
+            "chainstate delta",
+        )?;
+        if bytes.len() < 32 {
             bail!("stored chainstate delta is truncated");
         }
-        if record.length as usize > MAX_STORED_CHAINSTATE_DELTA_SIZE + 32 {
-            bail!("stored chainstate delta is too large");
-        }
-        self.file.seek(SeekFrom::Start(record.offset))?;
-        let mut length = [0u8; 4];
-        self.file.read_exact(&mut length)?;
-        let actual = u32::from_le_bytes(length);
-        if actual != record.length {
-            bail!("chainstate delta index disagrees with record length");
-        }
-        let mut bytes = vec![0u8; record.length as usize];
-        self.file.read_exact(&mut bytes)?;
         let stored_hash = BlockHash::from_byte_array(
             bytes[..32]
                 .try_into()
@@ -1741,7 +1220,9 @@ impl ChainstateStore {
         if stored_hash != *hash {
             bail!("stored chainstate delta hash does not match its index");
         }
-        Ok(Some(bytes[32..].to_vec()))
+        let payload = decode_storage_payload(&bytes[32..], MAX_STORED_CHAINSTATE_DELTA_SIZE)
+            .context("decoding compressed chainstate delta")?;
+        Ok(Some(payload))
     }
 
     pub fn insert(&mut self, hash: BlockHash, payload: &[u8]) -> Result<()> {
@@ -1751,14 +1232,15 @@ impl ChainstateStore {
         if payload.len() > MAX_STORED_CHAINSTATE_DELTA_SIZE {
             bail!("chainstate delta is too large: {} bytes", payload.len());
         }
+        let encoded_payload = encode_storage_payload(payload, MAX_STORED_CHAINSTATE_DELTA_SIZE)?;
         let length = 32usize
-            .checked_add(payload.len())
+            .checked_add(encoded_payload.len())
             .context("chainstate delta length overflow")?;
         let length = u32::try_from(length).context("chainstate delta length does not fit u32")?;
         let offset = self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(&length.to_le_bytes())?;
         self.file.write_all(&hash.to_byte_array())?;
-        self.file.write_all(payload)?;
+        self.file.write_all(&encoded_payload)?;
         self.pending_write_bytes = self
             .pending_write_bytes
             .saturating_add(4usize.saturating_add(usize::try_from(length).unwrap_or(usize::MAX)));
@@ -2759,33 +2241,26 @@ fn append_history_data_record(file: &mut File, body: &[u8]) -> Result<HistoryLoc
     if body.is_empty() || body.len() > MAX_STORED_ELECTRUM_HISTORY_SIZE {
         bail!("Electrum history log record is too large");
     }
+    let encoded_body = encode_storage_payload(body, MAX_STORED_ELECTRUM_HISTORY_SIZE)?;
     let offset = data_len_after(file)?;
-    let length = u32::try_from(body.len()).context("Electrum history record is too large")?;
+    let length =
+        u32::try_from(encoded_body.len()).context("Electrum history record is too large")?;
     file.write_all(&length.to_le_bytes())?;
-    file.write_all(body)?;
+    file.write_all(&encoded_body)?;
     Ok(HistoryLocation { offset, length })
 }
 
 fn read_history_data_record(file: &File, location: HistoryLocation) -> Result<Vec<u8>> {
-    if location.length as usize > MAX_STORED_ELECTRUM_HISTORY_SIZE {
-        bail!("stored Electrum history record is too large");
-    }
-    let mut length = [0u8; 4];
-    read_exact_at(file, &mut length, location.offset)?;
-    let actual = u32::from_le_bytes(length);
-    if actual != location.length {
-        bail!("Electrum history index disagrees with record length");
-    }
-    let mut body = vec![0u8; location.length as usize];
-    read_exact_at(
+    read_storage_record(
         file,
-        &mut body,
-        location
-            .offset
-            .checked_add(4)
-            .context("Electrum history value offset overflowed")?,
-    )?;
-    Ok(body)
+        Record {
+            offset: location.offset,
+            length: location.length,
+        },
+        XorKey::default(),
+        MAX_STORED_ELECTRUM_HISTORY_SIZE,
+        "Electrum history",
+    )
 }
 
 fn decode_history_value(body: &[u8], expected_script_hash: [u8; 32]) -> Result<Vec<(Txid, u32)>> {
@@ -2874,6 +2349,8 @@ fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocati
         }
         let mut body = vec![0u8; length as usize];
         file.read_exact(&mut body)?;
+        let body = decode_storage_payload(&body, MAX_STORED_ELECTRUM_HISTORY_SIZE)
+            .context("decoding compressed Electrum history record")?;
         match body.first().copied() {
             Some(HISTORY_PUT) => {
                 if body.len() < 1 + 8 + 32 + 4 {
@@ -3060,33 +2537,15 @@ fn validate_history_data_header(
     location: HistoryLocation,
     expected_script_hash: [u8; 32],
 ) -> Result<()> {
-    if (location.length as usize) < 1 + 8 + 32 + 4
-        || (location.length as usize) > MAX_STORED_ELECTRUM_HISTORY_SIZE
-    {
-        bail!("stored Electrum history value is too large or truncated");
-    }
-    let mut length = [0u8; 4];
-    read_exact_at(file, &mut length, location.offset)?;
-    if u32::from_le_bytes(length) != location.length {
-        bail!("Electrum history index disagrees with value record length");
-    }
-    let mut header = [0u8; 45];
-    read_exact_at(
-        file,
-        &mut header,
-        location
-            .offset
-            .checked_add(4)
-            .context("Electrum history value offset overflowed")?,
-    )?;
-    if header[0] != HISTORY_PUT {
+    let body = read_history_data_record(file, location)?;
+    if body.len() < 1 + 8 + 32 + 4 || body[0] != HISTORY_PUT {
         bail!("Electrum history index points to a non-value record");
     }
-    if header[9..41] != expected_script_hash {
+    if body[9..41] != expected_script_hash {
         bail!("Electrum history value key does not match its index");
     }
     let count = usize::try_from(u32::from_le_bytes(
-        header[41..45]
+        body[41..45]
             .try_into()
             .expect("Electrum history count has fixed width"),
     ))
@@ -3098,7 +2557,7 @@ fn validate_history_data_header(
                 .context("Electrum history count overflowed")?,
         )
         .context("Electrum history value length overflowed")?;
-    if expected_length != location.length as usize {
+    if expected_length != body.len() {
         bail!("Electrum history count does not match value length");
     }
     Ok(())
@@ -3242,62 +2701,26 @@ fn append_utxo_data_record(file: &mut File, body: &[u8]) -> Result<UtxoLocation>
     if body.is_empty() || body.len() > MAX_STORED_UTXO_SIZE + 64 {
         bail!("UTXO log record is too large");
     }
+    let encoded_body = encode_storage_payload(body, MAX_STORED_UTXO_SIZE + 64)?;
     let offset = data_len_after(file)?;
-    let length = u32::try_from(body.len()).context("UTXO log record length does not fit u32")?;
+    let length =
+        u32::try_from(encoded_body.len()).context("UTXO log record length does not fit u32")?;
     file.write_all(&length.to_le_bytes())?;
-    file.write_all(body)?;
+    file.write_all(&encoded_body)?;
     Ok(UtxoLocation { offset, length })
 }
 
-fn read_file_at(file: &File, bytes: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    #[cfg(unix)]
-    {
-        file.read_at(bytes, offset)
-    }
-    #[cfg(windows)]
-    {
-        file.seek_read(bytes, offset)
-    }
-}
-
-fn read_exact_at(file: &File, bytes: &mut [u8], offset: u64) -> Result<()> {
-    let mut consumed = 0usize;
-    while consumed < bytes.len() {
-        let read = read_file_at(
-            file,
-            &mut bytes[consumed..],
-            offset
-                .checked_add(consumed as u64)
-                .context("UTXO read offset overflowed")?,
-        )?;
-        if read == 0 {
-            bail!("unexpected end of UTXO value log");
-        }
-        consumed += read;
-    }
-    Ok(())
-}
-
 fn read_utxo_data_record(file: &File, location: UtxoLocation) -> Result<Vec<u8>> {
-    if location.length as usize > MAX_STORED_UTXO_SIZE + 64 {
-        bail!("stored UTXO log record is too large");
-    }
-    let mut length = [0u8; 4];
-    read_exact_at(file, &mut length, location.offset)?;
-    let actual = u32::from_le_bytes(length);
-    if actual != location.length {
-        bail!("UTXO index disagrees with value record length");
-    }
-    let mut body = vec![0u8; location.length as usize];
-    read_exact_at(
+    read_storage_record(
         file,
-        &mut body,
-        location
-            .offset
-            .checked_add(4)
-            .context("UTXO value offset overflowed")?,
-    )?;
-    Ok(body)
+        Record {
+            offset: location.offset,
+            length: location.length,
+        },
+        XorKey::default(),
+        MAX_STORED_UTXO_SIZE + 64,
+        "UTXO",
+    )
 }
 
 fn scan_utxo_data(file: &mut File) -> Result<(HashMap<OutPoint, UtxoLocation>, u64)> {
@@ -3340,6 +2763,8 @@ fn scan_utxo_data(file: &mut File) -> Result<(HashMap<OutPoint, UtxoLocation>, u
         }
         let mut body = vec![0u8; length as usize];
         file.read_exact(&mut body)?;
+        let body = decode_storage_payload(&body, MAX_STORED_UTXO_SIZE + 64)
+            .context("decoding compressed UTXO log record")?;
         let operation = body.first().copied().context("UTXO log record is empty")?;
         match operation {
             UTXO_PUT => {
@@ -3584,34 +3009,17 @@ fn validate_utxo_data_header(
     location: UtxoLocation,
     expected_outpoint: OutPoint,
 ) -> Result<()> {
-    if (location.length as usize) < 1 + 8 + 36 + 13
-        || (location.length as usize) > MAX_STORED_UTXO_SIZE + 64
-    {
-        bail!("stored UTXO value is too large or truncated");
-    }
-    let mut length = [0u8; 4];
-    read_exact_at(file, &mut length, location.offset)?;
-    if u32::from_le_bytes(length) != location.length {
-        bail!("UTXO index disagrees with value record length");
-    }
-    let mut header = [0u8; 45];
-    read_exact_at(
-        file,
-        &mut header,
-        location
-            .offset
-            .checked_add(4)
-            .context("UTXO value offset overflowed")?,
-    )?;
-    if header[0] != UTXO_PUT {
+    let body = read_utxo_data_record(file, location)?;
+    if body.len() < 1 + 8 + 36 + 13 || body[0] != UTXO_PUT {
         bail!("UTXO index points to a non-value record");
     }
-    if u64::from_le_bytes(header[1..9].try_into().expect("UTXO batch has fixed width")) == 0 {
+    if u64::from_le_bytes(body[1..9].try_into().expect("UTXO batch has fixed width")) == 0 {
         bail!("UTXO value batch identifier is invalid");
     }
-    if decode_outpoint(&header[9..45])? != expected_outpoint {
+    if decode_outpoint(&body[9..45])? != expected_outpoint {
         bail!("UTXO value key does not match its index");
     }
+    decode_stored_utxo(&body[45..])?;
     Ok(())
 }
 
@@ -3734,10 +3142,8 @@ impl CoinStatsStore {
         if self.index.contains_key(&record.block_hash) {
             return Ok(());
         }
-        let bytes = serde_json::to_vec(record).context("encoding coinstats record")?;
-        if bytes.len() > MAX_STORED_COINSTATS_SIZE {
-            bail!("coinstats record is too large: {} bytes", bytes.len());
-        }
+        let raw_bytes = serde_json::to_vec(record).context("encoding coinstats record")?;
+        let bytes = encode_storage_payload(&raw_bytes, MAX_STORED_COINSTATS_SIZE)?;
         let offset = self.file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("coinstats length does not fit u32")?;
         self.file.write_all(&length.to_le_bytes())?;
@@ -3758,18 +3164,13 @@ impl CoinStatsStore {
         let Some(record) = self.index.get(hash).copied() else {
             return Ok(None);
         };
-        if record.length as usize > MAX_STORED_COINSTATS_SIZE {
-            bail!("stored coinstats record is too large");
-        }
-        self.file.seek(SeekFrom::Start(record.offset))?;
-        let mut length = [0u8; 4];
-        self.file.read_exact(&mut length)?;
-        let actual = u32::from_le_bytes(length);
-        if actual != record.length {
-            bail!("coinstats store index disagrees with record length");
-        }
-        let mut bytes = vec![0u8; record.length as usize];
-        self.file.read_exact(&mut bytes)?;
+        let bytes = read_storage_record(
+            &self.file,
+            record,
+            XorKey::default(),
+            MAX_STORED_COINSTATS_SIZE,
+            "coinstats",
+        )?;
         let decoded: CoinStatsRecord =
             serde_json::from_slice(&bytes).context("decoding stored coinstats record")?;
         if decoded.block_hash != *hash {
@@ -3870,12 +3271,7 @@ impl ElectrumBlockStore {
         }
         let mut bytes = hash.to_byte_array().to_vec();
         bytes.extend_from_slice(&serialize(&block.txdata));
-        if bytes.len() > MAX_STORED_ELECTRUM_BLOCK_SIZE + 32 {
-            bail!(
-                "Electrum transaction record is too large: {} bytes",
-                bytes.len()
-            );
-        }
+        let bytes = encode_storage_payload(&bytes, MAX_STORED_ELECTRUM_BLOCK_SIZE + 32)?;
         let offset = self.file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len())
             .context("Electrum transaction record length does not fit u32")?;
@@ -3932,18 +3328,16 @@ impl ElectrumBlockStore {
         let Some(record) = self.index.get(block_hash).copied() else {
             return Ok(None);
         };
-        if record.length < 32 || record.length as usize > MAX_STORED_ELECTRUM_BLOCK_SIZE + 32 {
-            bail!("stored Electrum transaction record is too large or truncated")
+        let bytes = read_storage_record(
+            &self.file,
+            record,
+            XorKey::default(),
+            MAX_STORED_ELECTRUM_BLOCK_SIZE + 32,
+            "Electrum transaction",
+        )?;
+        if bytes.len() < 32 {
+            bail!("stored Electrum transaction record is truncated")
         }
-        self.file.seek(SeekFrom::Start(record.offset))?;
-        let mut length = [0u8; 4];
-        self.file.read_exact(&mut length)?;
-        let actual = u32::from_le_bytes(length);
-        if actual != record.length {
-            bail!("Electrum transaction store index disagrees with record length")
-        }
-        let mut bytes = vec![0u8; record.length as usize];
-        self.file.read_exact(&mut bytes)?;
         let stored_hash = BlockHash::from_byte_array(
             bytes[..32]
                 .try_into()
@@ -3987,24 +3381,19 @@ fn validate_electrum_data_header(
     record: Record,
     expected_hash: BlockHash,
 ) -> Result<()> {
-    if record.length < 32 || record.length as usize > MAX_STORED_ELECTRUM_BLOCK_SIZE + 32 {
-        bail!("stored Electrum transaction record is too large or truncated");
-    }
-    let mut length = [0u8; 4];
-    read_exact_at(file, &mut length, record.offset)?;
-    if u32::from_le_bytes(length) != record.length {
-        bail!("Electrum transaction index disagrees with record length");
-    }
-    let mut hash = [0u8; 32];
-    read_exact_at(
+    let bytes = read_storage_record(
         file,
-        &mut hash,
-        record
-            .offset
-            .checked_add(4)
-            .context("Electrum transaction value offset overflowed")?,
+        record,
+        XorKey::default(),
+        MAX_STORED_ELECTRUM_BLOCK_SIZE + 32,
+        "Electrum transaction",
     )?;
-    if BlockHash::from_byte_array(hash) != expected_hash {
+    if bytes.len() < 32 {
+        bail!("stored Electrum transaction record is truncated");
+    }
+    if BlockHash::from_byte_array(bytes[..32].try_into().expect("fixed block hash width"))
+        != expected_hash
+    {
         bail!("Electrum transaction value key does not match its index");
     }
     Ok(())
@@ -4062,7 +3451,7 @@ fn scan_electrum_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
             file.set_len(offset)?;
             break;
         }
-        if length < 32 || length as usize > MAX_STORED_ELECTRUM_BLOCK_SIZE + 32 {
+        if length == 0 || length as usize > MAX_STORED_ELECTRUM_BLOCK_SIZE + 32 {
             bail!(
                 "invalid Electrum transaction record length {} at offset {}",
                 length,
@@ -4077,6 +3466,14 @@ fn scan_electrum_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
                 error
             )
         })?;
+        let bytes = decode_storage_payload(&bytes, MAX_STORED_ELECTRUM_BLOCK_SIZE + 32)
+            .context("decoding compressed Electrum transaction record")?;
+        if bytes.len() < 32 {
+            bail!(
+                "Electrum transaction record is truncated at offset {}",
+                offset
+            );
+        }
         let hash = BlockHash::from_byte_array(
             bytes[..32]
                 .try_into()
@@ -4124,6 +3521,8 @@ fn scan_coinstats_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
         file.read_exact(&mut bytes).map_err(|error| {
             anyhow::anyhow!("truncated coinstats record at offset {}: {}", offset, error)
         })?;
+        let bytes = decode_storage_payload(&bytes, MAX_STORED_COINSTATS_SIZE)
+            .context("decoding compressed coinstats record")?;
         let record: CoinStatsRecord = serde_json::from_slice(&bytes)
             .with_context(|| format!("decoding coinstats record at offset {offset}"))?;
         if index
@@ -4161,7 +3560,7 @@ fn load_filter_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<Bl
             offset: u64::from_le_bytes(offset_bytes),
             length: u32::from_le_bytes(length_bytes),
         };
-        if record.length < 64
+        if record.length == 0
             || record.length as usize > MAX_STORED_FILTER_SIZE + 64
             || record
                 .offset
@@ -4203,7 +3602,7 @@ fn scan_filter_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
             file.set_len(offset)?;
             break;
         }
-        if length < 64 || length as usize > MAX_STORED_FILTER_SIZE + 64 {
+        if length == 0 || length as usize > MAX_STORED_FILTER_SIZE + 64 {
             bail!(
                 "invalid filter record length {} at offset {}",
                 length,
@@ -4214,6 +3613,11 @@ fn scan_filter_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
         file.read_exact(&mut bytes).map_err(|error| {
             anyhow::anyhow!("truncated filter record at offset {}: {}", offset, error)
         })?;
+        let bytes = decode_storage_payload(&bytes, MAX_STORED_FILTER_SIZE + 64)
+            .context("decoding compressed filter record")?;
+        if bytes.len() < 64 {
+            bail!("filter record is truncated at offset {}", offset);
+        }
         let hash = BlockHash::from_byte_array(
             bytes[..32]
                 .try_into()
@@ -4301,7 +3705,7 @@ fn scan_chainstate_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> 
             file.set_len(offset)?;
             break;
         }
-        if length < 32 || length as usize > MAX_STORED_CHAINSTATE_DELTA_SIZE + 32 {
+        if length == 0 || length as usize > MAX_STORED_CHAINSTATE_DELTA_SIZE + 32 {
             bail!(
                 "invalid chainstate delta length {} at offset {}",
                 length,
@@ -4312,11 +3716,16 @@ fn scan_chainstate_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> 
         file.read_exact(&mut bytes).map_err(|error| {
             anyhow::anyhow!("truncated chainstate delta at offset {}: {}", offset, error)
         })?;
+        if bytes.len() < 32 {
+            bail!("chainstate delta is truncated at offset {}", offset);
+        }
         let hash = BlockHash::from_byte_array(
             bytes[..32]
                 .try_into()
                 .expect("chainstate delta hash has fixed width"),
         );
+        decode_storage_payload(&bytes[32..], MAX_STORED_CHAINSTATE_DELTA_SIZE)
+            .context("decoding compressed chainstate delta")?;
         if index.insert(hash, Record { offset, length }).is_some() {
             bail!("duplicate block hash in chainstate delta store");
         }
@@ -4422,6 +3831,8 @@ fn scan_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash, Rec
             anyhow::anyhow!("truncated block record at offset {}: {}", offset, error)
         })?;
         xor_key.apply(&mut bytes, offset + 4);
+        let bytes = decode_storage_payload(&bytes, MAX_STORED_BLOCK_SIZE)
+            .context("decoding compressed block record")?;
         let block: Block = deserialize(&bytes).context("decoding block record")?;
         if index
             .insert(block.block_hash(), Record { offset, length })
@@ -4465,6 +3876,8 @@ fn scan_undo_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash
             anyhow::anyhow!("truncated undo record at offset {}: {}", offset, error)
         })?;
         xor_key.apply(&mut bytes, offset + 4);
+        let bytes = decode_storage_payload(&bytes, MAX_STORED_UNDO_SIZE)
+            .context("decoding compressed undo record")?;
         let (hash, _) = decode_undo_record(&bytes)?;
         if index.insert(hash, Record { offset, length }).is_some() {
             bail!("duplicate block hash in undo store")
@@ -4532,6 +3945,26 @@ mod tests {
     use bitcoin::blockdata::constants::genesis_block;
     use bitcoin::hashes::Hash;
     use std::collections::HashSet;
+
+    #[test]
+    fn zstd_storage_records_round_trip_and_skip_incompressible_payloads() {
+        let payload = vec![0x42; 8 * 1024];
+        let encoded = encode_storage_payload(&payload, MAX_STORED_BLOCK_SIZE).unwrap();
+        assert!(encoded.starts_with(STORAGE_COMPRESSION_MAGIC));
+        assert!(encoded.len() < payload.len());
+        assert_eq!(
+            decode_storage_payload(&encoded, MAX_STORED_BLOCK_SIZE).unwrap(),
+            payload
+        );
+
+        let small = vec![0x42; STORAGE_COMPRESSION_MIN_SIZE - 1];
+        let raw = encode_storage_payload(&small, MAX_STORED_BLOCK_SIZE).unwrap();
+        assert!(!raw.starts_with(STORAGE_COMPRESSION_MAGIC));
+        assert_eq!(
+            decode_storage_payload(&raw, MAX_STORED_BLOCK_SIZE).unwrap(),
+            small
+        );
+    }
 
     #[test]
     fn persists_and_reopens_genesis() {
@@ -4950,6 +4383,8 @@ mod tests {
             assert_eq!(store.get(&hash).unwrap(), Some(block.clone()));
             assert_eq!(store.get_undo(&hash).unwrap(), Some(undo.clone()));
         }
+        assert!(!directory.path().join("blk00000.dat").exists());
+        assert!(!directory.path().join("rev00000.dat").exists());
 
         let key = read_xor_key(&directory.path().join("xor.dat")).unwrap();
         assert_eq!(
@@ -4960,8 +4395,9 @@ mod tests {
         );
         let mut raw = std::fs::read(directory.path().join("blocks.dat")).unwrap();
         key.apply(&mut raw, 0);
-        let mut expected = (serialize(&block).len() as u32).to_le_bytes().to_vec();
-        expected.extend_from_slice(&serialize(&block));
+        let payload = encode_storage_payload(&serialize(&block), MAX_STORED_BLOCK_SIZE).unwrap();
+        let mut expected = (payload.len() as u32).to_le_bytes().to_vec();
+        expected.extend_from_slice(&payload);
         assert_eq!(raw, expected);
 
         std::fs::write(directory.path().join("blocks.index"), b"corrupt").unwrap();

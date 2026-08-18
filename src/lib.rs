@@ -1598,47 +1598,6 @@ impl Node {
             fs::create_dir_all(&blocks_dir)
                 .with_context(|| format!("creating blocks directory {}", blocks_dir.display()))?;
         }
-        let core_blocks_dir = if config.blocks_dir_explicit {
-            (!network_data_dir_name(config.network).is_empty()).then(|| {
-                blocks_dir
-                    .join(network_data_dir_name(config.network))
-                    .join("blocks")
-            })
-        } else {
-            core_network_blocks_dir(&config.datadir, config.network)
-        };
-        let core_block_index_missing = core_blocks_dir.as_ref().is_some_and(|directory| {
-            !directory.join("index").exists()
-                && fs::read_dir(directory).is_ok_and(|entries| {
-                    entries
-                        .flatten()
-                        .any(|entry| entry.file_name().to_string_lossy().starts_with("blk"))
-                })
-        });
-        if core_block_index_missing && !config.reindex && !config.reindex_chainstate {
-            return Err(CoreBlockDatabaseError.into());
-        }
-        if let Some(core_blocks_dir) = core_blocks_dir.as_ref() {
-            fs::create_dir_all(&core_blocks_dir).with_context(|| {
-                format!(
-                    "creating Core-compatible blocks directory {}",
-                    core_blocks_dir.display()
-                )
-            })?;
-            fs::create_dir_all(core_blocks_dir.join("index"))?;
-            if config.blocks_dir_explicit
-                && let Some(network_name) = (!network_data_dir_name(config.network).is_empty())
-                    .then_some(network_data_dir_name(config.network))
-            {
-                fs::create_dir_all(
-                    config
-                        .datadir
-                        .join(network_name)
-                        .join("blocks")
-                        .join("index"),
-                )?;
-            }
-        }
         let blocks_dir_lock = if blocks_dir == config.datadir {
             None
         } else {
@@ -1735,26 +1694,6 @@ impl Node {
             core_network_blocks_dir(&config.datadir, config.network)
                 .unwrap_or_else(|| blocks_dir.clone())
         };
-        // Core's pruned reindex starts a fresh flat-file sequence after the
-        // historical files have been discarded. The authoritative append-only
-        // store remains intact here; only the public blk/rev compatibility
-        // files are reset so the next genesis/body append uses index 00000.
-        if config.reindex && config.prune != 0 {
-            for entry in fs::read_dir(&chain_blocks_dir)? {
-                let entry = entry?;
-                let file_name = entry.file_name().to_string_lossy().into_owned();
-                let file_name_bytes = file_name.as_bytes();
-                let is_core_compat = (file_name.starts_with("blk") || file_name.starts_with("rev"))
-                    && file_name.ends_with(".dat")
-                    && file_name_bytes.len() == 12
-                    && file_name_bytes[3..8]
-                        .iter()
-                        .all(|byte| byte.is_ascii_digit());
-                if is_core_compat {
-                    fs::remove_file(entry.path())?;
-                }
-            }
-        }
         let legacy_chain_data_dir = config.datadir.clone();
         let network_chain_data_dir = network_datadir.clone();
         let use_network_chain_data = !network_data_dir_name(config.network).is_empty()
@@ -1790,38 +1729,13 @@ impl Node {
             )
             .map_err(core_startup_chain_error)?;
 
-        // Core places chainstate beneath the per-network directory. The
-        // append-only backend keeps its authoritative state at the datadir
-        // root for historical compatibility, so expose the network-relative
-        // path as a symlink for tooling that inspects or replaces it.
-        #[cfg(unix)]
-        if !network_data_dir_name(config.network).is_empty() {
-            let compatibility_chainstate = network_datadir.join("chainstate");
-            if fs::symlink_metadata(&compatibility_chainstate).is_err() {
-                std::os::unix::fs::symlink("../chainstate", &compatibility_chainstate)
-                    .with_context(|| {
-                        format!(
-                            "creating Core-compatible chainstate link {}",
-                            compatibility_chainstate.display()
-                        )
-                    })?;
-            }
-        }
+        fs::create_dir_all(&network_datadir).with_context(|| {
+            format!(
+                "creating network data directory {}",
+                network_datadir.display()
+            )
+        })?;
 
-        // Core creates the first flat block/undo files at startup. The chain
-        // store appends exact Core-framed records to them as bodies arrive;
-        // create only the initial pair here so linearize/loadblock sees no
-        // spurious empty file after the first rotation.
-        if let Some(core_blocks_dir) = core_blocks_dir.as_ref()
-            && (!chain.is_pruned() || (config.reindex && config.prune != 0))
-        {
-            for file_name in ["blk00000.dat", "rev00000.dat"] {
-                let path = core_blocks_dir.join(file_name);
-                if !path.exists() {
-                    OpenOptions::new().create(true).append(true).open(path)?;
-                }
-            }
-        }
         let block_store_reader = chain.block_store_reader();
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
@@ -6797,22 +6711,6 @@ impl std::fmt::Display for CoreStartupError {
 }
 
 impl std::error::Error for CoreStartupError {}
-
-/// Startup failure used when Core's block-index database is missing.  This
-/// has its own display type because Core prints this recovery hint without
-/// the generic `Error: ` prefix used for ordinary startup failures.
-#[derive(Debug)]
-pub struct CoreBlockDatabaseError;
-
-impl std::fmt::Display for CoreBlockDatabaseError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(
-            "Error initializing block database.\nPlease restart with -reindex or -reindex-chainstate to recover.",
-        )
-    }
-}
-
-impl std::error::Error for CoreBlockDatabaseError {}
 
 fn core_startup_chain_error(error: anyhow::Error) -> anyhow::Error {
     if error

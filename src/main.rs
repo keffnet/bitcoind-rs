@@ -30,9 +30,6 @@ fn main() {
         if error
             .downcast_ref::<bitcoind_rs::CoreStartupError>()
             .is_some()
-            || error
-                .downcast_ref::<bitcoind_rs::CoreBlockDatabaseError>()
-                .is_some()
         {
             eprintln!("{error}");
         } else {
@@ -143,16 +140,6 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
                 "Enabling script verification at block #{height} ({block_hash}): {reason}."
             );
         }
-    }
-    if node.config.reindex
-        && node
-            .chain
-            .read()
-            .has_out_of_order_core_compat_blocks()
-            .unwrap_or(false)
-    {
-        tracing::info!("LoadExternalBlockFile: Out of order block");
-        tracing::info!("LoadExternalBlockFile: Processing out of order child");
     }
     if node.config.reindex {
         tracing::info!("Reindexing finished");

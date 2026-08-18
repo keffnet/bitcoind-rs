@@ -1156,7 +1156,6 @@ impl ChainState {
         let genesis_hash = genesis.block_hash();
         if !store.contains(&genesis_hash) {
             store.insert(&genesis)?;
-            store.append_core_compat(&genesis, &[Vec::new()], network, false)?;
         }
 
         let metadata_path = data_dir.join("chainstate.bin");
@@ -1633,9 +1632,6 @@ impl ChainState {
         self.active_tx_totals = cumulative_tx_counts(&self.active_tx_counts);
         self.persist_metadata()?;
         self.persist_snapshot()?;
-        if self.fast_prune {
-            self.store.start_core_compat_file()?;
-        }
         self.update_ibd_status();
         Ok(())
     }
@@ -1899,12 +1895,6 @@ impl ChainState {
             }
         }
         None
-    }
-
-    /// Whether the public Core-compatible block files contain a swapped or
-    /// otherwise out-of-order record sequence.
-    pub fn has_out_of_order_core_compat_blocks(&self) -> Result<bool> {
-        self.store.has_out_of_order_core_compat_blocks()
     }
 
     pub fn blockfilter_index_enabled(&self) -> bool {
@@ -2259,12 +2249,7 @@ impl ChainState {
                     .then_some(*hash)
             })
             .collect::<HashSet<_>>();
-        self.store.prune_with_core_compat(
-            &retained_blocks,
-            &retained_blocks,
-            self.prune_target_size.is_some(),
-            self.fast_prune,
-        )?;
+        self.store.prune(&retained_blocks, &retained_blocks)?;
         self.prune_height = Some(target_height);
         self.prune_protected_blocks
             .retain(|hash, height| *height >= target_height && retained_blocks.contains(hash));
@@ -6373,10 +6358,6 @@ impl ChainState {
             application.spent_entries.iter().cloned().collect();
         if persist {
             self.store.insert(block)?;
-            if let Some(undo) = self.block_undo_cache.get(&hash).cloned() {
-                self.store
-                    .append_core_compat(block, &undo, self.network, self.fast_prune)?;
-            }
         }
         if let Some(store) = self.electrum_store.as_mut() {
             store.insert(block)?;
@@ -10765,9 +10746,9 @@ mod tests {
         assert_eq!(state.prune_height(), None);
 
         state.snapshot_validated = true;
-        // Fast-prune follows Core's flat-file granularity. These synthetic
-        // blocks do not fill a 64 KiB file, so validation becoming complete
-        // still leaves the chain unchanged until a file boundary exists.
+        // Fast-prune follows the implementation's 64 KiB record-batch
+        // granularity. These synthetic blocks do not fill a batch, so
+        // validation becoming complete still leaves the chain unchanged.
         assert_eq!(state.prune(50).unwrap(), 0);
         assert!(state.store.contains(&old_block_hash.unwrap()));
     }

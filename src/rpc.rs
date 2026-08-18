@@ -23633,13 +23633,10 @@ mod tests {
                 "getblockfrompeer",
                 &json!([unknown_hash.to_string(), 7]),
             )
-            .unwrap(),
-            json!({})
+            .unwrap_err()
+            .to_string(),
+            "Block header missing"
         );
-        let crate::p2p::PeerCommand::RequestBlock(hash) = receiver.try_recv().unwrap() else {
-            panic!("expected unknown block request command");
-        };
-        assert_eq!(hash, unknown_hash);
     }
 
     #[test]

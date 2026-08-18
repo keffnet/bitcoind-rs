@@ -1510,6 +1510,7 @@ pub struct Node {
     pub rpc_cookie: Option<String>,
     pub(crate) i2p_sam: Option<Arc<i2p::I2pSam>>,
     pub(crate) tor_controller: Option<Arc<tor::TorController>>,
+    outbound_tor_ok_at_least_once: AtomicBool,
     mempool_path: std::path::PathBuf,
     banlist_recreated: bool,
     /// Serialize RPC mining operations so a block template cannot become
@@ -2026,6 +2027,7 @@ impl Node {
             rpc_cookie,
             i2p_sam,
             tor_controller,
+            outbound_tor_ok_at_least_once: AtomicBool::new(false),
             mempool_path,
             banlist_recreated: !banlist_exists,
             mining_lock: Mutex::new(()),
@@ -4948,6 +4950,25 @@ impl Node {
                     .map(ProxyEndpoint::Tcp)
             })
         })
+    }
+
+    pub(crate) fn mark_outbound_tor_success(&self) {
+        self.outbound_tor_ok_at_least_once
+            .store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn private_broadcast_proxy(
+        &self,
+        endpoint: &NetworkEndpoint,
+    ) -> Option<ProxyEndpoint> {
+        if matches!(endpoint, NetworkEndpoint::Ip(_))
+            && self.outbound_tor_ok_at_least_once.load(Ordering::Relaxed)
+        {
+            self.onion_proxy()
+                .or_else(|| self.config.proxy_for_endpoint(endpoint))
+        } else {
+            self.config.proxy_for_endpoint(endpoint)
+        }
     }
 
     pub(crate) fn record_mining_block(&self, block: &Block) {

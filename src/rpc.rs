@@ -21591,7 +21591,7 @@ mod tests {
             pre_segwit_block.txdata[0].input[0]
                 .sequence
                 .to_consensus_u32(),
-            0xffff_ffff
+            0xffff_fffe
         );
         assert_eq!(pre_segwit_block.txdata[0].output.len(), 1);
         assert!(get_block_template(&node, &json!([{}])).is_err());

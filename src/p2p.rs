@@ -89,7 +89,11 @@ type PeerWriter = Arc<Mutex<PeerWriterKind>>;
 
 const BIP324_ELLIGATOR_SWIFT_BYTES: usize = 64;
 const BIP324_GARBAGE_TERMINATOR_BYTES: usize = 16;
-const BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION: usize = 4_000_014;
+// Core limits the application payload to 4,000,000 bytes, but a BIP324
+// extension command adds one type marker and twelve command bytes before the
+// payload. The reader's length includes the three-byte length descriptor and
+// sixteen-byte authentication tag as well.
+const BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION: usize = wire::MAX_MESSAGE_SIZE + 1 + 12 + 3 + 16;
 
 struct V2BufferedReader {
     reader: BufReader<OwnedReadHalf>,
@@ -2576,20 +2580,29 @@ fn spawn_outbound_loop(
             endpoint: endpoint.clone(),
             attempts: outbound_attempts,
         };
-        let permit = if addconnection {
+        // Core's RPC `addnode ... onetry` opens a manual connection directly
+        // and does not consume the semaphore reserved for persistent
+        // addnode entries. Keep that one-shot path unlimited here as well;
+        // persistent addnode and automatic connections retain their normal
+        // slot accounting.
+        let _permit = if addconnection {
             match connection_type {
-                "outbound-full" => addconnection_full_slots.acquire_owned().await,
-                "block-relay-only" => addconnection_block_relay_slots.acquire_owned().await,
-                "feeler" => addconnection_feeler_slots.acquire_owned().await,
-                _ => slots.acquire_owned().await,
+                "outbound-full" => Some(addconnection_full_slots.acquire_owned().await),
+                "block-relay-only" => Some(addconnection_block_relay_slots.acquire_owned().await),
+                "feeler" => Some(addconnection_feeler_slots.acquire_owned().await),
+                _ => Some(slots.acquire_owned().await),
             }
+        } else if manual && persistent {
+            Some(manual_slots.acquire_owned().await)
         } else if manual {
-            manual_slots.acquire_owned().await
+            None
         } else {
-            slots.acquire_owned().await
+            Some(slots.acquire_owned().await)
         };
-        let Ok(_permit) = permit else {
-            return;
+        let _permit = match _permit {
+            Some(Ok(permit)) => Some(permit),
+            Some(Err(_)) => return,
+            None => None,
         };
         if !manual && !node.config.allows_network_endpoint(&endpoint) {
             peer_log!(
@@ -2732,7 +2745,7 @@ fn spawn_private_broadcast_loop(
         log_outbound_connection_attempt(&endpoint, Some(false), "private-broadcast");
         match connect_peer_endpoint_for_private_broadcast(
             &endpoint,
-            node.config.proxy_for_endpoint(&endpoint),
+            node.private_broadcast_proxy(&endpoint),
             node.config.proxy_randomize,
             Duration::from_millis(node.config.connect_timeout_ms),
         )
@@ -3759,9 +3772,14 @@ async fn serve_peer(
             node.unregister_peer(peer_id);
             debug!("Cleared nodestate for peer={peer_id}");
             drop(_peer_count);
+            let proxy = if options.connection_type == "private-broadcast" {
+                node.private_broadcast_proxy(&endpoint)
+            } else {
+                node.config.proxy_for_endpoint(&endpoint)
+            };
             let fallback = connect_peer_endpoint_with_options_and_dns_with_i2p(
                 &endpoint,
-                node.config.proxy_for_endpoint(&endpoint),
+                proxy,
                 node.onion_proxy(),
                 options.connection_type == "private-broadcast",
                 node.config.proxy_randomize,
@@ -3807,6 +3825,9 @@ async fn serve_peer(
             return Err(error);
         }
     };
+    if options.outbound && endpoint.is_onion() {
+        node.mark_outbound_tor_success();
+    }
     let transport_v2 = matches!(&reader, PeerReader::V2(_));
     let transport_stats = transport_v2
         .then(|| node.peer_transport_stats(peer_id))

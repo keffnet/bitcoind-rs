@@ -1077,7 +1077,9 @@ fn server_add_peer(
 fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
     // Electrum servers conventionally expose logarithmic fee bands.  The
     // label is the upper bound of a band, expressed as 2^n - 1 sat/vbyte;
-    // the second value is the vsize in that band, not a cumulative total.
+    // the second value is the cumulative vsize at that fee level.  Bands are
+    // emitted from highest to lowest fee, so the cumulative total grows as
+    // the fee threshold decreases.
     const BINS: usize = 65;
     let mut vsizes = [0u64; BINS];
     for txid in mempool.transaction_order() {
@@ -1095,8 +1097,15 @@ fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
     let Some(first_bin) = vsizes.iter().position(|vsize| *vsize != 0) else {
         return json!([]);
     };
+    let mut cumulative_vsize = 0u64;
     let histogram = (first_bin..BINS)
-        .map(|bin| json!([u64::MAX.checked_shr(bin as u32).unwrap_or(0), vsizes[bin]]))
+        .map(|bin| {
+            cumulative_vsize = cumulative_vsize.saturating_add(vsizes[bin]);
+            json!([
+                u64::MAX.checked_shr(bin as u32).unwrap_or(0),
+                cumulative_vsize
+            ])
+        })
         .collect::<Vec<_>>();
     json!(histogram)
 }
@@ -2050,7 +2059,7 @@ mod tests {
 
         assert_eq!(
             fee_histogram(&mempool),
-            json!([[7, 10], [3, 0], [1, 1], [0, 2]])
+            json!([[7, 10], [3, 10], [1, 11], [0, 13]])
         );
     }
 

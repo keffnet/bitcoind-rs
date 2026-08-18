@@ -1844,6 +1844,7 @@ async fn dispatch_method_async_for_user(
     auth_user: Option<String>,
 ) -> Result<Value> {
     let normalized_params = normalize_rpc_params(method, params)?;
+    debug!("ThreadRPCServer method={method}");
     let command_id = node.begin_rpc_command(method);
     let result = match method {
         "stop" => match stop_wait(&normalized_params) {
@@ -5243,15 +5244,11 @@ fn get_network_hash_ps(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let mut lookup = if nblocks == -1 {
         // Core v31.1 uses a one-day (144-block) retarget interval on regtest;
         // the upstream bitcoin crate retains the older two-week parameter.
-        let interval = if node.config.network == Network::Regtest {
-            144
-        } else {
-            node.config
-                .network
-                .params()
-                .difficulty_adjustment_interval()
-        };
-        u64::from(end_height) % interval + 1
+        u64::from(end_height)
+            % u64::from(validation::difficulty_adjustment_interval(
+                node.config.network,
+            ))
+            + 1
     } else {
         u64::try_from(nblocks).map_err(|_| anyhow!("nblocks is out of range"))?
     };
@@ -6220,7 +6217,7 @@ fn verify_txout_proof(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn parse_merkle_proof(params: &Value) -> Result<Option<(Header, Vec<Txid>, usize)>> {
-    let bytes = hex::decode(param::<String>(params, 0)?)?;
+    let bytes = hex::decode(param::<String>(params, 0)?).context("Block decode failed")?;
     if bytes.len() < 84 {
         bail!("invalid merkle proof");
     }
@@ -11410,15 +11407,23 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let bytes = hex::decode(param::<String>(params, 0)?)?;
     // Core's BIP22 block decoder accepts trailing bytes and can report a
     // cheap proof-of-work failure before fully validating the body.
-    let (mut block, _) = deserialize_partial::<bitcoin::Block>(&bytes)?;
+    let (mut block, _) =
+        deserialize_partial::<bitcoin::Block>(&bytes).context("Block decode failed")?;
     node.chain
         .read()
         .update_uncommitted_block_structures(&mut block);
     let hash = block.block_hash();
-    if let Some(status) = node.chain.read().proposal_duplicate_status(&hash)
-        && status != "duplicate-inconclusive"
+    let block_header = block.header;
     {
-        return Ok(json!(status));
+        let chain = node.chain.read();
+        let status = chain.proposal_duplicate_status(&hash);
+        let pruned_active_body = status == Some("duplicate") && chain.is_block_pruned(&hash);
+        if let Some(status) = status
+            && status != "duplicate-inconclusive"
+            && !pruned_active_body
+        {
+            return Ok(json!(status));
+        }
     }
     if let Err(error) = validation::validate_proof_of_work(node.config.network, &block.header) {
         return Ok(json!(error.bip22_reject_reason()));
@@ -11443,10 +11448,21 @@ fn submit_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
                 Ok(json!("inconclusive"))
             } else if let Some(reason) = bip22_validation_result(&error) {
                 // Core records a header as failed-validation when a known
-                // header is later rejected with a block body.  Preserve that
-                // state so getchaintips reports the branch as invalid rather
-                // than leaving it in headers-only/valid-fork status.
-                if let Err(mark_error) = node.invalidate_block(hash) {
+                // header is later rejected with a block body, but a bad
+                // merkle root or witness commitment can be a mismatched body
+                // for an otherwise valid header.  Preserve only the failures
+                // which prove the block itself is invalid; Core must be able
+                // to return the same body error on a repeated submitblock.
+                let should_mark_invalid = error
+                    .downcast_ref::<validation::ValidationError>()
+                    .is_some_and(validation::ValidationError::should_mark_block_invalid);
+                let mut chain = node.chain.write();
+                if chain.header_by_hash(&hash).is_none()
+                    && let Err(header_error) = chain.accept_headers(&[block_header])
+                {
+                    debug!(%hash, %header_error, "could not retain rejected block header");
+                }
+                if should_mark_invalid && let Err(mark_error) = chain.invalidate_block(&hash) {
                     debug!(%hash, %mark_error, "could not mark rejected block invalid");
                 }
                 Ok(reason)
@@ -12458,8 +12474,8 @@ fn minimum_block_time(
     median_time_past: u32,
 ) -> u32 {
     let mut minimum = median_time_past.saturating_add(1);
-    let interval = network.params().difficulty_adjustment_interval();
-    if u64::from(height) % interval == 0 {
+    let interval = validation::difficulty_adjustment_interval(network);
+    if height % interval == 0 {
         minimum = minimum.max(parent.time.saturating_sub(600));
     }
     minimum
@@ -15555,6 +15571,9 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower == "priority is not supported for transactions with dust outputs." {
         return -8;
     }
+    if lower.starts_with("getblocktemplate must be called with the ") {
+        return -8;
+    }
     if lower == "verbosity was boolean but only integer allowed" {
         return -3;
     }
@@ -16209,6 +16228,12 @@ mod tests {
         );
         assert_eq!(rpc_error_code("unknown mode foobar"), -8);
         assert_eq!(rpc_error_code("mode must be a string"), -3);
+        assert_eq!(
+            rpc_error_code(
+                "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"
+            ),
+            -8
+        );
         assert_eq!(
             rpc_error_code("failed to parse hex digit: invalid character 'z' at position 0"),
             -8

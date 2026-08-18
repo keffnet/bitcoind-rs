@@ -3134,16 +3134,21 @@ impl Config {
         )?;
         if args.blockmaxweight > DEFAULT_BLOCK_MAX_WEIGHT {
             bail!(
-                "--blockmaxweight must not exceed the consensus maximum of {DEFAULT_BLOCK_MAX_WEIGHT}"
+                "Specified -blockmaxweight ({}) exceeds consensus maximum block weight ({DEFAULT_BLOCK_MAX_WEIGHT})",
+                args.blockmaxweight
             );
         }
         if args.blockreservedweight > DEFAULT_BLOCK_MAX_WEIGHT {
             bail!(
-                "--blockreservedweight must not exceed the consensus maximum of {DEFAULT_BLOCK_MAX_WEIGHT}"
+                "Specified -blockreservedweight ({}) exceeds consensus maximum block weight ({DEFAULT_BLOCK_MAX_WEIGHT})",
+                args.blockreservedweight
             );
         }
         if args.blockreservedweight < MINIMUM_BLOCK_RESERVED_WEIGHT {
-            bail!("--blockreservedweight must be at least {MINIMUM_BLOCK_RESERVED_WEIGHT}");
+            bail!(
+                "Specified -blockreservedweight ({}) is lower than minimum safety value of ({MINIMUM_BLOCK_RESERVED_WEIGHT})",
+                args.blockreservedweight
+            );
         }
         let block_min_tx_fee_sat_per_kvb =
             Amount::from_str_in(&args.blockmintxfee, Denomination::Bitcoin)

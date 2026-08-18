@@ -39,7 +39,6 @@ use crate::storage::{
 use crate::validation::{self, ValidationError};
 
 const COINBASE_MATURITY: u32 = 100;
-const DIFFICULTY_INTERVAL: u32 = 2016;
 const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
 const SNAPSHOT_INTERVAL: u32 = 1_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
@@ -2264,6 +2263,7 @@ impl ChainState {
             &retained_blocks,
             &retained_blocks,
             self.prune_target_size.is_some(),
+            self.fast_prune,
         )?;
         self.prune_height = Some(target_height);
         self.prune_protected_blocks
@@ -7951,10 +7951,11 @@ impl ChainState {
         let height = parent_node.height.saturating_add(1);
         let previous = &parent_node.header;
         let params = self.network.params();
+        let difficulty_interval = validation::difficulty_adjustment_interval(self.network);
         if params.no_pow_retargeting {
             return previous.target();
         }
-        if height % DIFFICULTY_INTERVAL != 0 {
+        if height % difficulty_interval != 0 {
             if params.allow_min_difficulty_blocks
                 && candidate_time
                     > previous
@@ -7968,7 +7969,7 @@ impl ChainState {
             {
                 let mut cursor = parent_hash;
                 while let Some(node) = self.block_index.get(&cursor) {
-                    if node.height % DIFFICULTY_INTERVAL == 0
+                    if node.height % difficulty_interval == 0
                         || node.header.target() != params.max_attainable_target
                     {
                         return node.header.target();
@@ -7979,7 +7980,7 @@ impl ChainState {
             return previous.target();
         }
         let first_hash = self
-            .ancestor_hash(parent_hash, height - DIFFICULTY_INTERVAL)
+            .ancestor_hash(parent_hash, height - difficulty_interval)
             .expect("difficulty interval ancestor exists");
         let first = &self
             .block_index

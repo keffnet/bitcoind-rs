@@ -828,7 +828,7 @@ impl BlockStore {
         retained_blocks: &HashSet<BlockHash>,
         retained_undo: &HashSet<BlockHash>,
     ) -> Result<()> {
-        self.prune_with_core_compat(retained_blocks, retained_undo, false)
+        self.prune_with_core_compat(retained_blocks, retained_undo, false, false)
     }
 
     /// Rewrite the append-only files and optionally remove the auxiliary
@@ -840,6 +840,7 @@ impl BlockStore {
         retained_blocks: &HashSet<BlockHash>,
         retained_undo: &HashSet<BlockHash>,
         remove_core_compat: bool,
+        whole_core_files: bool,
     ) -> Result<()> {
         let block_hashes = self
             .index
@@ -888,7 +889,7 @@ impl BlockStore {
         if remove_core_compat {
             self.remove_core_compat_files()?;
         } else {
-            self.prune_core_compat_files(retained_blocks, retained_undo)?;
+            self.prune_core_compat_files(retained_blocks, retained_undo, whole_core_files)?;
         }
         self.clear_block_cache();
         Ok(())
@@ -938,6 +939,7 @@ impl BlockStore {
         &self,
         retained_blocks: &HashSet<BlockHash>,
         retained_undo: &HashSet<BlockHash>,
+        whole_core_files: bool,
     ) -> Result<()> {
         let directory = self
             .path
@@ -945,6 +947,7 @@ impl BlockStore {
             .context("block store has no parent directory")?;
         let block_paths = core_compat_file_paths(directory, "blk")?;
         let mut genesis_hashes = HashSet::new();
+        let mut removed_file_indices = HashSet::new();
 
         for path in block_paths {
             let mut bytes = std::fs::read(&path)
@@ -954,15 +957,30 @@ impl BlockStore {
                 format!("decoding Core block file {} during pruning", path.display())
             })?;
             let mut kept = Vec::with_capacity(records.len());
+            let mut all_non_genesis_retained = true;
             for (magic, hash, payload) in records {
                 let is_genesis = deserialize::<Block>(&payload)
                     .ok()
                     .is_some_and(|block| block.header.prev_blockhash == BlockHash::all_zeros());
                 if is_genesis {
                     genesis_hashes.insert(hash);
+                } else if !retained_blocks.contains(&hash) {
+                    all_non_genesis_retained = false;
                 }
                 if retained_blocks.contains(&hash) && !is_genesis {
                     kept.push((magic, payload));
+                }
+            }
+            // Core prunes complete blk/rev file pairs.  The compatibility
+            // cache can begin with a partial historical file when it was
+            // restored from the compact authoritative store, so in the
+            // fast-prune test mode discard that whole file as soon as it
+            // contains any pruned body rather than leaving a rewritten mixed
+            // file behind.
+            if whole_core_files && !all_non_genesis_retained {
+                kept.clear();
+                if let Some(index) = core_compat_file_index(&path, "blk") {
+                    removed_file_indices.insert(index);
                 }
             }
             rewrite_core_compat_file(&path, &kept, self.xor_key)?;
@@ -975,13 +993,20 @@ impl BlockStore {
             let records = parse_core_compat_file(&bytes, true).with_context(|| {
                 format!("decoding Core undo file {} during pruning", path.display())
             })?;
-            let kept = records
-                .into_iter()
-                .filter(|(_, hash, _)| {
-                    retained_undo.contains(hash) && !genesis_hashes.contains(hash)
-                })
-                .map(|(magic, _, payload)| (magic, payload))
-                .collect::<Vec<_>>();
+            let remove_whole = whole_core_files
+                && core_compat_file_index(&path, "rev")
+                    .is_some_and(|index| removed_file_indices.contains(&index));
+            let kept = if remove_whole {
+                Vec::new()
+            } else {
+                records
+                    .into_iter()
+                    .filter(|(_, hash, _)| {
+                        retained_undo.contains(hash) && !genesis_hashes.contains(hash)
+                    })
+                    .map(|(magic, _, payload)| (magic, payload))
+                    .collect::<Vec<_>>()
+            };
             rewrite_core_compat_file(&path, &kept, self.xor_key)?;
         }
         Ok(())
@@ -1045,6 +1070,13 @@ fn core_compat_file_paths(directory: &Path, prefix: &str) -> Result<Vec<PathBuf>
         .collect::<Vec<_>>();
     paths.sort_unstable();
     Ok(paths)
+}
+
+fn core_compat_file_index(path: &Path, prefix: &str) -> Option<u32> {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix(prefix))
+        .and_then(|index| index.parse::<u32>().ok())
 }
 
 fn parse_core_block_file(bytes: &[u8]) -> Option<Vec<(BlockHash, Vec<u8>)>> {

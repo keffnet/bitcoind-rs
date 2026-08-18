@@ -576,6 +576,7 @@ fn handle_headers_download_timeout(
         *peer_state.last_headers_request.lock() = None;
         *peer_state.last_headers_request_time.lock() = None;
         node.clear_headers_sync_peer(peer_id);
+        node.reset_initial_headers_sync_peer(peer_id);
         return Ok(true);
     }
     if replacement_available {
@@ -989,7 +990,7 @@ fn permitted_difficulty_transition(
     if params.allow_min_difficulty_blocks {
         return true;
     }
-    let interval = params.difficulty_adjustment_interval() as u32;
+    let interval = crate::validation::difficulty_adjustment_interval(network);
     if height % interval != 0 {
         return old_bits == new_bits;
     }
@@ -4501,6 +4502,18 @@ async fn serve_peer_loop(
                     continue;
                 }
 
+                let retried = node.clear_stale_peer_block_requests_for_missing_bodies(
+                    peer_id,
+                    Duration::from_millis(500),
+                );
+                if retried != 0 {
+                    debug!(
+                        peer = peer_id,
+                        count = retried,
+                        "retrying stale block body requests after header progress"
+                    );
+                }
+
                 // Core rejects a batch whose headers do not link to one
                 // another before entering either headers sync or the global
                 // block index. A short batch can otherwise bypass the
@@ -4573,6 +4586,7 @@ async fn serve_peer_loop(
                         low_work_state
                         && add_work_saturating(parent_work, claimed_work) < threshold
                         && !peer_state.permissions.contains(PeerPermissions::DOWNLOAD)
+                        && !peer_state.permissions.contains(PeerPermissions::NO_BAN)
                     {
                         if !request_more_headers {
                             let height = node
@@ -4656,6 +4670,12 @@ async fn serve_peer_loop(
                     node.update_peer_presynced_headers(peer_id, None);
                 } else if let Some(sync) = headers_sync.as_ref() {
                     node.update_peer_presynced_headers(peer_id, Some(sync.presync_height()));
+                }
+                if sync_finished || !request_more_headers {
+                    // A non-full headers response is the end of this
+                    // initial synchronization round.  Release the global
+                    // claim so a later peer can receive its own getheaders.
+                    node.clear_headers_sync_peer(peer_id);
                 }
 
                 // A later announcement of the tip header may carry a

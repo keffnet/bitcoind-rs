@@ -1468,6 +1468,11 @@ pub struct Node {
     rpc_commands: parking_lot::RwLock<HashMap<usize, (String, Instant)>>,
     headers_sync_peers: AtomicUsize,
     headers_sync_started: parking_lot::Mutex<HashSet<usize>>,
+    // Core's per-peer fSyncStarted state survives release of the single
+    // global initial-sync slot. Keep it separate from the current slot claim
+    // so a peer can continue reacting to announcements while another peer
+    // temporarily owns the slot.
+    headers_sync_active: parking_lot::Mutex<HashSet<usize>>,
     inv_triggered_headers_sync: parking_lot::Mutex<HashSet<usize>>,
     last_block_inv_triggering_headers_sync: parking_lot::Mutex<Option<BlockHash>>,
     total_bytes_sent: AtomicU64,
@@ -2044,6 +2049,7 @@ impl Node {
             rpc_commands: parking_lot::RwLock::new(HashMap::new()),
             headers_sync_peers: AtomicUsize::new(0),
             headers_sync_started: parking_lot::Mutex::new(HashSet::new()),
+            headers_sync_active: parking_lot::Mutex::new(HashSet::new()),
             inv_triggered_headers_sync: parking_lot::Mutex::new(HashSet::new()),
             last_block_inv_triggering_headers_sync: parking_lot::Mutex::new(None),
             total_bytes_sent: AtomicU64::new(0),
@@ -3868,6 +3874,7 @@ impl Node {
             return false;
         }
         started.insert(peer_id);
+        self.headers_sync_active.lock().insert(peer_id);
         self.headers_sync_peers.fetch_add(1, Ordering::Relaxed);
         true
     }
@@ -3878,14 +3885,14 @@ impl Node {
         peer_id: usize,
         block_hash: BlockHash,
     ) -> bool {
-        if self.headers_sync_started.lock().contains(&peer_id) {
+        if self.headers_sync_active.lock().contains(&peer_id) {
             return true;
         }
         let mut triggered = self.inv_triggered_headers_sync.lock();
+        let mut last_block = self.last_block_inv_triggering_headers_sync.lock();
         if triggered.contains(&peer_id) {
             return false;
         }
-        let mut last_block = self.last_block_inv_triggering_headers_sync.lock();
         if *last_block == Some(block_hash) {
             return false;
         }
@@ -3912,6 +3919,7 @@ impl Node {
             .map(|peer| peer.id)?;
         let sender = self.peer_commands.read().get(&candidate).cloned()?;
         started.insert(candidate);
+        self.headers_sync_active.lock().insert(candidate);
         self.headers_sync_peers.fetch_add(1, Ordering::Relaxed);
         Some(sender)
     }
@@ -3938,6 +3946,10 @@ impl Node {
             self.headers_sync_peers.fetch_sub(1, Ordering::Relaxed);
         }
         removed
+    }
+
+    pub(crate) fn reset_initial_headers_sync_peer(&self, peer_id: usize) {
+        self.headers_sync_active.lock().remove(&peer_id);
     }
 
     pub(crate) fn update_peer_presynced_headers(&self, peer_id: usize, height: Option<i64>) {
@@ -4079,6 +4091,35 @@ impl Node {
         if cleared {
             self.block_stalling_since.write().remove(&peer_id);
         }
+    }
+
+    /// A headers-first peer can answer a getheaders request while the block
+    /// bodies that it just learned are still being connected. Core leaves
+    /// those getdata requests in flight, but a later headers response is a
+    /// useful progress signal for this implementation: release only old
+    /// requests whose bodies are still absent so the normal bounded scheduler
+    /// can retry them. Fresh requests remain protected from duplicate fetches.
+    pub(crate) fn clear_stale_peer_block_requests_for_missing_bodies(
+        &self,
+        peer_id: usize,
+        minimum_age: Duration,
+    ) -> usize {
+        let chain = self.chain.read();
+        let mut cleared = 0;
+        if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+            peer.inflight_blocks.retain(|inflight| {
+                let stale = inflight.requested_at.elapsed() >= minimum_age;
+                let keep = !stale || chain.store.contains(&inflight.hash);
+                if !keep {
+                    cleared += 1;
+                }
+                keep
+            });
+        }
+        if cleared != 0 {
+            self.block_stalling_since.write().remove(&peer_id);
+        }
+        cleared
     }
 
     pub(crate) fn compact_block_request_state(&self, hash: BlockHash) -> (usize, bool) {
@@ -5049,6 +5090,7 @@ impl Node {
         debug!("Cleared nodestate for peer={id}");
         self.peer_commands.write().remove(&id);
         let replacement = self.release_headers_sync_peer(id);
+        self.headers_sync_active.lock().remove(&id);
         self.inv_triggered_headers_sync.lock().remove(&id);
         self.block_stalling_since.write().remove(&id);
         if let Some(endpoint) = endpoint {

@@ -4233,6 +4233,13 @@ fn next_mining_candidate(
             // entry through the descendant update path.
             continue;
         }
+        // Block assembly never includes a package whose modified fee is
+        // negative, even when -blockmintxfee=0.  Core's FeePerVSize
+        // comparison rejects such a package before the zero-fee floor is
+        // applied.
+        if candidate.fee < 0 {
+            continue;
+        }
         if min_fee_sat_per_kvb != 0 {
             let package_vsize = candidate.weight.saturating_add(3) / 4;
             if candidate.fee.saturating_mul(1_000)
@@ -5107,6 +5114,12 @@ mod tests {
         assert_eq!(pool.main_order(), vec![parent_id, child_id, independent_id]);
         assert_eq!(
             pool.mining_order_with_min_fee(4_000_000, 0, 1_000),
+            vec![parent_id, child_id]
+        );
+
+        pool.prioritise(independent_id, -21);
+        assert_eq!(
+            pool.mining_order_with_min_fee(4_000_000, 0, 0),
             vec![parent_id, child_id]
         );
     }

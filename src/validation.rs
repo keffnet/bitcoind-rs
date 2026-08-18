@@ -259,6 +259,19 @@ pub fn network_params(network: Network) -> &'static Params {
     network.params()
 }
 
+/// Return Core's difficulty-adjustment interval for the selected network.
+///
+/// Core's regtest chain parameters intentionally use a one-day interval
+/// (144 blocks), while the bitcoin crate's generic regtest parameters retain
+/// the two-week mainnet-style interval.
+pub fn difficulty_adjustment_interval(network: Network) -> u32 {
+    if network == Network::Regtest {
+        144
+    } else {
+        network_params(network).difficulty_adjustment_interval() as u32
+    }
+}
+
 /// Validate only the proof-of-work claim in a block header.
 ///
 /// Core performs this cheap check before attempting to connect a submitted
@@ -662,9 +675,7 @@ pub fn validate_bip94_timewarp_with_params(
     if !params.bip94 {
         return Ok(());
     }
-    let network_params = network_params(params.network);
-    let difficulty_interval =
-        (network_params.pow_target_timespan / network_params.pow_target_spacing) as u32;
+    let difficulty_interval = difficulty_adjustment_interval(params.network);
     if height % difficulty_interval == 0 && block_time < previous_block_time.saturating_sub(600) {
         return Err(ValidationError::Bip94TimeWarp);
     }

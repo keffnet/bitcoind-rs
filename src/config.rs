@@ -567,6 +567,10 @@ impl PeerPermissions {
     pub const MEMPOOL: Self = Self(1 << 4);
     pub const DOWNLOAD: Self = Self(1 << 5);
     pub const ADDR: Self = Self(1 << 6);
+    /// Allow this peer to request compact block filters even when the node's
+    /// global `-peerblockfilters` setting is disabled.
+    pub const BLOCK_FILTERS: Self = Self(1 << 7);
+    const BLOCK_FILTERS_EXPLICIT: Self = Self(1 << 9);
     /// When inbound slots are full, allow this peer to force eviction of an
     /// otherwise protected inbound connection. Core also implies `noban`.
     pub const FORCE_INBOUND: Self = Self((1 << 10) | Self::NO_BAN.0);
@@ -578,6 +582,7 @@ impl PeerPermissions {
             | Self::NO_BAN.0
             | Self::MEMPOOL.0
             | Self::ADDR.0
+            | Self::BLOCK_FILTERS.0
             | Self::FORCE_INBOUND.0,
     );
 
@@ -599,6 +604,9 @@ impl PeerPermissions {
 
     pub fn to_strings(self) -> Vec<&'static str> {
         let mut permissions = Vec::new();
+        if self.contains(Self::BLOCK_FILTERS) {
+            permissions.push("blockfilters");
+        }
         if self.contains(Self::BLOOM_FILTER) {
             permissions.push("bloomfilter");
         }
@@ -637,6 +645,11 @@ impl PeerPermissions {
                 "mempool" => flags = flags.union(Self::MEMPOOL),
                 "download" => flags = flags.union(Self::DOWNLOAD),
                 "addr" => flags = flags.union(Self::ADDR),
+                "blockfilters" | "compactfilters" | "cfilters" => {
+                    flags = flags
+                        .union(Self::BLOCK_FILTERS)
+                        .union(Self::BLOCK_FILTERS_EXPLICIT)
+                }
                 "forceinbound" => flags = flags.union(Self::FORCE_INBOUND),
                 "all" => flags = flags.union(Self::ALL),
                 "in" => incoming = true,
@@ -667,7 +680,10 @@ impl PeerPermissions {
         if whitelist_relay {
             resolved = resolved.union(Self::RELAY);
         }
-        resolved.union(Self::MEMPOOL).union(Self::NO_BAN)
+        resolved
+            .union(Self::MEMPOOL)
+            .union(Self::NO_BAN)
+            .union(Self::ADDR)
     }
 }
 
@@ -1852,12 +1868,11 @@ pub struct Args {
     #[arg(
         long,
         visible_alias = "peerbloomfilters",
-        default_value_t = false,
         num_args = 0..=1,
         default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    pub peer_bloom_filters: bool,
+    pub peer_bloom_filters: Option<bool>,
 
     #[arg(
         long,
@@ -3669,6 +3684,24 @@ impl Config {
             args.whitelistforcerelay,
             args.blocksonly,
         )?;
+        let mut peer_permissions = peer_permissions;
+        // Core enables bloom-filter permission for localhost by default when
+        // -peerbloomfilters was not specified. An explicit false disables
+        // even that localhost exception.
+        if args.peer_bloom_filters.is_none() {
+            peer_permissions.whitelist.push(WhitelistRule {
+                subnet: WhitelistSubnet::parse("127.0.0.0/8")?,
+                permissions: PeerPermissions::BLOOM_FILTER,
+                incoming: true,
+                outgoing: true,
+            });
+            peer_permissions.whitelist.push(WhitelistRule {
+                subnet: WhitelistSubnet::parse("::1/128")?,
+                permissions: PeerPermissions::BLOOM_FILTER,
+                incoming: true,
+                outgoing: true,
+            });
+        }
         let mut seen_bindings = HashSet::new();
         for address in p2p_binds
             .iter()
@@ -3827,6 +3860,16 @@ impl Config {
         };
         if args.peerblockfilters && !blockfilterindex {
             bail!("Cannot set -peerblockfilters without -blockfilterindex.");
+        }
+        let explicit_block_filters = peer_permissions.whitelist.iter().any(|rule| {
+            rule.permissions
+                .contains(PeerPermissions::BLOCK_FILTERS_EXPLICIT)
+        }) || peer_permissions.whitebind.iter().any(|bind| {
+            bind.permissions
+                .contains(PeerPermissions::BLOCK_FILTERS_EXPLICIT)
+        });
+        if !blockfilterindex && explicit_block_filters {
+            bail!("Cannot grant blockfilters permission without -blockfilterindex.");
         }
         let connect_disabled = args.no_connect
             || (args.connect.len() == 1 && args.connect.first().is_some_and(|value| value == "0"));
@@ -4004,7 +4047,7 @@ impl Config {
             bytes_per_sigop: args.bytes_per_sigop,
             max_datacarrier_bytes,
             permit_bare_multisig: args.permitbaremultisig,
-            peer_bloom_filters: args.peer_bloom_filters,
+            peer_bloom_filters: args.peer_bloom_filters.unwrap_or(false),
             blocksonly: args.blocksonly,
             private_broadcast: args.privatebroadcast,
             accept_nonstd_txn: args.accept_nonstd_txn,

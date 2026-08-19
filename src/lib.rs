@@ -5951,15 +5951,7 @@ impl Node {
         address: SocketAddr,
         inbound: bool,
     ) -> PeerPermissions {
-        let permissions = self.config.peer_permissions(address.ip(), inbound);
-        // Core grants the bloom-filter permission to localhost by default
-        // when -peerbloomfilters is not enabled globally. This is represented
-        // as a whitelist permission rather than as a local service bit.
-        if !self.config.peer_bloom_filters && address.ip().is_loopback() {
-            permissions.union(PeerPermissions::BLOOM_FILTER)
-        } else {
-            permissions
-        }
+        self.config.peer_permissions(address.ip(), inbound)
     }
 
     pub fn unregister_peer(&self, id: usize) {

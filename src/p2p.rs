@@ -4286,7 +4286,11 @@ async fn serve_peer_loop(
         version.sender_services &= !wire::NODE_P2P_V2;
     }
     if peer_state.connection_type != "private-broadcast"
-        && !(node.config.blockfilterindex && node.config.peer_block_filters)
+        && !(node.config.blockfilterindex
+            && (node.config.peer_block_filters
+                || peer_state
+                    .permissions
+                    .contains(PeerPermissions::BLOCK_FILTERS)))
     {
         version.services &= !wire::NODE_COMPACT_FILTERS;
         version.receiver_services &= !wire::NODE_COMPACT_FILTERS;
@@ -6899,6 +6903,7 @@ async fn serve_peer_loop(
                     request.start_height,
                     request.stop_hash,
                     1_000,
+                    peer_state.permissions,
                 )?;
                 let Some(range) =
                     basic_filter_range(node, request.start_height, request.stop_hash, 1_000)?
@@ -6927,6 +6932,7 @@ async fn serve_peer_loop(
                     request.start_height,
                     request.stop_hash,
                     2_000,
+                    peer_state.permissions,
                 )?;
                 let Some(range) =
                     basic_filter_range(node, request.start_height, request.stop_hash, 2_000)?
@@ -6964,6 +6970,7 @@ async fn serve_peer_loop(
                     0,
                     request.stop_hash,
                     u32::MAX,
+                    peer_state.permissions,
                 )?;
                 let (stop_hash, filter_headers) = {
                     let mut chain = node.chain.write();
@@ -7570,8 +7577,12 @@ fn validate_basic_filter_request(
     start_height: u32,
     stop_hash: BlockHash,
     max_height_diff: u32,
+    permissions: PeerPermissions,
 ) -> Result<()> {
-    if !(node.config.blockfilterindex && node.config.peer_block_filters) || filter_type != 0 {
+    if !(node.config.blockfilterindex
+        && (node.config.peer_block_filters || permissions.contains(PeerPermissions::BLOCK_FILTERS)))
+        || filter_type != 0
+    {
         anyhow::bail!("peer requested unsupported block filter type")
     }
     let chain = node.chain.read();
@@ -12425,11 +12436,17 @@ mod tests {
         .unwrap();
         let stop_hash = node.chain.read().best_hash();
 
-        assert!(validate_basic_filter_request(&node, 255, 0, stop_hash, 1_000).is_err());
-        assert!(validate_basic_filter_request(&node, 0, 0, BlockHash::all_zeros(), 1_000).is_err());
-        assert!(validate_basic_filter_request(&node, 0, 1, stop_hash, 1_000).is_err());
-        assert!(validate_basic_filter_request(&node, 0, 0, stop_hash, 0).is_err());
-        assert!(validate_basic_filter_request(&node, 0, 0, stop_hash, 1_000).is_ok());
+        let permissions = PeerPermissions::empty();
+        assert!(
+            validate_basic_filter_request(&node, 255, 0, stop_hash, 1_000, permissions).is_err()
+        );
+        assert!(
+            validate_basic_filter_request(&node, 0, 0, BlockHash::all_zeros(), 1_000, permissions,)
+                .is_err()
+        );
+        assert!(validate_basic_filter_request(&node, 0, 1, stop_hash, 1_000, permissions).is_err());
+        assert!(validate_basic_filter_request(&node, 0, 0, stop_hash, 0, permissions).is_err());
+        assert!(validate_basic_filter_request(&node, 0, 0, stop_hash, 1_000, permissions).is_ok());
     }
 
     #[test]

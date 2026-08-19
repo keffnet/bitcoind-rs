@@ -38,6 +38,7 @@ pub const DEFAULT_ACCEPT_DATACARRIER: bool = true;
 pub const DEFAULT_PERMIT_BARE_MULTISIG: bool = true;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 pub const DEFAULT_PERSIST_MEMPOOL: bool = true;
+pub const DEFAULT_STATS_MAX_MEMORY_TARGET: u64 = 10 * 1024 * 1024;
 pub const DEFAULT_BLOCKFILTERINDEX: &str = "0";
 pub const DEFAULT_RPC_THREADS: usize = 16;
 pub const DEFAULT_RPC_WORK_QUEUE: usize = 64;
@@ -2004,6 +2005,23 @@ pub struct Args {
     )]
     pub coinstatsindex: bool,
 
+    /// Collect the in-memory mempool samples exposed by getmempoolstats.
+    #[arg(
+        long = "statsenable",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub stats_enable: bool,
+
+    /// Maximum memory target for collected mempool statistics.
+    #[arg(
+        long = "statsmaxmemorytarget",
+        default_value_t = DEFAULT_STATS_MAX_MEMORY_TARGET
+    )]
+    pub stats_max_memory_target: u64,
+
     #[arg(
         long,
         default_value = DEFAULT_BLOCKFILTERINDEX,
@@ -3159,6 +3177,8 @@ pub struct Config {
     pub txindex: bool,
     pub txospenderindex: bool,
     pub coinstatsindex: bool,
+    pub stats_enable: bool,
+    pub stats_max_memory_target: usize,
     pub blockfilterindex: bool,
     pub peer_block_filters: bool,
     /// Maximum mempool size in decimal megabytes, matching Core's option.
@@ -4064,6 +4084,9 @@ impl Config {
             txindex: args.txindex,
             txospenderindex: args.txospenderindex,
             coinstatsindex: args.coinstatsindex,
+            stats_enable: args.stats_enable,
+            stats_max_memory_target: usize::try_from(args.stats_max_memory_target)
+                .context("--statsmaxmemorytarget does not fit usize")?,
             blockfilterindex,
             peer_block_filters: args.peerblockfilters,
             max_mempool_mb: max_mempool,
@@ -6334,6 +6357,18 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).unwrap().coinstatsindex);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--statsenable=1",
+            "--statsmaxmemorytarget=4096",
+        ])
+        .unwrap();
+        let config = Config::from_args(args).unwrap();
+        assert!(config.stats_enable);
+        assert_eq!(config.stats_max_memory_target, 4096);
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

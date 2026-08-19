@@ -1606,6 +1606,92 @@ impl Default for ScanState {
     }
 }
 
+const MEMPOOL_STATS_SAMPLE_MIN_DELTA_SECS: u64 = 2;
+const MEMPOOL_STATS_CLEANUP_THRESHOLD: usize = 100;
+
+/// A single non-interpolated mempool statistics sample, matching Core's
+/// `CStatsMempoolSample` layout and JSON representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MempoolStatsSample {
+    pub(crate) time_delta: u32,
+    pub(crate) tx_count: i64,
+    pub(crate) dynamic_memory_usage: i64,
+    pub(crate) min_fee_per_k: i64,
+}
+
+#[derive(Debug)]
+struct MempoolStats {
+    enabled: bool,
+    max_memory_target: usize,
+    start_time: u64,
+    samples: Vec<MempoolStatsSample>,
+    cleanup_counter: usize,
+}
+
+impl MempoolStats {
+    fn new(enabled: bool, max_memory_target: usize) -> Self {
+        Self {
+            enabled: enabled && max_memory_target > 0,
+            max_memory_target,
+            start_time: 0,
+            samples: Vec::new(),
+            cleanup_counter: 0,
+        }
+    }
+
+    fn add_sample(&mut self, tx_count: usize, dynamic_memory_usage: usize, min_fee_per_k: u64) {
+        if !self.enabled {
+            return;
+        }
+        let now = time::unix_time();
+        if self.start_time == 0 {
+            self.start_time = now;
+        }
+        if self.samples.last().is_some_and(|sample| {
+            self.start_time
+                .saturating_add(u64::from(sample.time_delta))
+                .saturating_add(MEMPOOL_STATS_SAMPLE_MIN_DELTA_SECS)
+                >= now
+        }) {
+            return;
+        }
+        self.samples.push(MempoolStatsSample {
+            time_delta: now.saturating_sub(self.start_time).min(u64::from(u32::MAX)) as u32,
+            tx_count: i64::try_from(tx_count).unwrap_or(i64::MAX),
+            dynamic_memory_usage: i64::try_from(dynamic_memory_usage).unwrap_or(i64::MAX),
+            min_fee_per_k: i64::try_from(min_fee_per_k).unwrap_or(i64::MAX),
+        });
+        self.cleanup_counter = self.cleanup_counter.saturating_add(1);
+        if self.cleanup_counter >= MEMPOOL_STATS_CLEANUP_THRESHOLD {
+            self.samples.shrink_to_fit();
+            let sample_bytes = std::mem::size_of::<MempoolStatsSample>();
+            let memory_usage = self.samples.capacity().saturating_mul(sample_bytes);
+            if memory_usage > self.max_memory_target && self.samples.len() > 1 {
+                let items_to_remove = (memory_usage
+                    .saturating_sub(self.max_memory_target)
+                    .saturating_add(sample_bytes.saturating_sub(1))
+                    / sample_bytes)
+                    .min(self.samples.len().saturating_sub(1));
+                self.samples.drain(..items_to_remove);
+            }
+            self.samples.shrink_to_fit();
+            self.cleanup_counter = 0;
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64, Vec<MempoolStatsSample>) {
+        let Some(first) = self.samples.first() else {
+            return (0, 0, Vec::new());
+        };
+        let last = self.samples.last().unwrap_or(first);
+        (
+            self.start_time.saturating_add(u64::from(first.time_delta)),
+            self.start_time.saturating_add(u64::from(last.time_delta)),
+            self.samples.clone(),
+        )
+    }
+}
+
 /// The wallet-free node facade shared by the network and RPC services.
 pub struct Node {
     pub config: Config,
@@ -1615,6 +1701,7 @@ pub struct Node {
     pub chain: Arc<RwLock<ChainState>>,
     pub(crate) block_store_reader: BlockStoreReader,
     pub mempool: Arc<RwLock<Mempool>>,
+    mempool_stats: Mutex<MempoolStats>,
     pub events: broadcast::Sender<ChainEvent>,
     pub mempool_events: broadcast::Sender<MempoolEvent>,
     peer_mempool_events: broadcast::Sender<PeerMempoolEvent>,
@@ -2168,6 +2255,7 @@ impl Node {
         } else {
             config.logging.debug_categories.iter().cloned().collect()
         };
+        let mempool_stats = MempoolStats::new(config.stats_enable, config.stats_max_memory_target);
         let node = Arc::new(Self {
             config,
             _data_dir_lock: data_dir_lock,
@@ -2176,6 +2264,7 @@ impl Node {
             chain: Arc::new(RwLock::new(chain)),
             block_store_reader,
             mempool: Arc::new(RwLock::new(mempool)),
+            mempool_stats: Mutex::new(mempool_stats),
             events,
             mempool_events,
             peer_mempool_events,
@@ -2369,6 +2458,30 @@ impl Node {
         if let Err(error) = self.mempool.read().check_consistency() {
             panic!("mempool consistency check failed: {error:#}");
         }
+    }
+
+    /// Record the current mempool state when statistics collection is
+    /// enabled. The mempool lock is released before taking the statistics
+    /// lock so RPC snapshots cannot create a lock-order cycle.
+    pub(crate) fn record_mempool_stats(&self) {
+        if !self.config.stats_enable || self.config.stats_max_memory_target == 0 {
+            return;
+        }
+        let (tx_count, dynamic_memory_usage, min_fee_per_k) = {
+            let mut mempool = self.mempool.write();
+            (
+                mempool.len(),
+                mempool.dynamic_memory_usage(),
+                mempool.mempool_min_fee_sat_per_kvb(),
+            )
+        };
+        self.mempool_stats
+            .lock()
+            .add_sample(tx_count, dynamic_memory_usage, min_fee_per_k);
+    }
+
+    pub(crate) fn mempool_stats_snapshot(&self) -> (u64, u64, Vec<MempoolStatsSample>) {
+        self.mempool_stats.lock().snapshot()
     }
 
     pub(crate) fn update_fee_estimator_for_changes(
@@ -2733,6 +2846,7 @@ impl Node {
         );
         self.announce_mempool_diff(mempool_before, mempool_after);
         self.notify_zmq_mempool_changes(mempool_changes);
+        self.record_mempool_stats();
     }
 
     fn promote_orphans_after_chain_change(
@@ -3299,6 +3413,7 @@ impl Node {
         self.announce_mempool_changes(removed_ids);
         self.notify_zmq_mempool_changes(changes);
         self.maybe_check_mempool();
+        self.record_mempool_stats();
 
         // A child that arrived before its replacement parent may already be
         // in the orphan pool. Remove both package members before publishing
@@ -3420,7 +3535,11 @@ impl Node {
         self.announce_mempool_changes(removed_ids);
         self.notify_zmq_mempool_changes(changes.clone());
         self.maybe_check_mempool();
-        result.map(|txid| (txid, changes))
+        let accepted = result.map(|txid| (txid, changes));
+        if accepted.is_ok() {
+            self.record_mempool_stats();
+        }
+        accepted
     }
 
     fn announce_mempool_transaction(&self, txid: Txid) {
@@ -3476,6 +3595,7 @@ impl Node {
         self.announce_mempool_changes(removed);
         self.notify_zmq_mempool_changes(changes);
         self.maybe_check_mempool();
+        self.record_mempool_stats();
     }
 
     #[cfg(test)]
@@ -7369,6 +7489,7 @@ impl Node {
             self.update_fee_estimator_for_changes(&changes, current_height);
             self.maybe_check_mempool();
             self.notify_zmq_mempool_changes(changes);
+            self.record_mempool_stats();
             let mut changed = changed;
             changed.sort_by_key(ToString::to_string);
             for txid in &changed {
@@ -7567,14 +7688,14 @@ fn initialize_settings_file(path: &Path) -> Result<()> {
                     )
                 } else {
                     anyhow::anyhow!(
-                        "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error: {error}",
+                        "Settings file {} does not contain valid JSON. This is probably caused by disk corruption or a crash, and can be fixed by removing the file, which will reset settings to default values.",
                         path.display()
                     )
                 }
             })?;
-        deserializer.end().map_err(|error| {
+        deserializer.end().map_err(|_error| {
             anyhow::anyhow!(
-                "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error: {error}",
+                "Settings file {} does not contain valid JSON. This is probably caused by disk corruption or a crash, and can be fixed by removing the file, which will reset settings to default values.",
                 path.display()
             )
         })?;
@@ -7938,6 +8059,40 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn mempool_stats_follow_core_sampling_boundaries() {
+        let _guard = time::mock_time_test_guard();
+        time::set_mock_time(1_000_000);
+        let mut stats = MempoolStats::new(true, 10 * 1024 * 1024);
+
+        stats.add_sample(1, 2, 3);
+        time::set_mock_time(1_000_001);
+        stats.add_sample(4, 5, 6);
+        time::set_mock_time(1_000_005);
+        stats.add_sample(7, 8, 9);
+
+        let (from, to, samples) = stats.snapshot();
+        assert_eq!(from, 1_000_000);
+        assert_eq!(to, 1_000_005);
+        assert_eq!(
+            samples,
+            vec![
+                MempoolStatsSample {
+                    time_delta: 0,
+                    tx_count: 1,
+                    dynamic_memory_usage: 2,
+                    min_fee_per_k: 3,
+                },
+                MempoolStatsSample {
+                    time_delta: 5,
+                    tx_count: 7,
+                    dynamic_memory_usage: 8,
+                    min_fee_per_k: 9,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn notification_commands_expand_tip_hash_placeholders() {
         assert_eq!(
             expand_notify_command("echo %s >> /tmp/tips", Some("abc123")),
@@ -8088,6 +8243,8 @@ mod tests {
             cluster_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
+            stats_enable: false,
+            stats_max_memory_target: 10 * 1024 * 1024,
             blockfilterindex: true,
             peer_block_filters: true,
             persist_mempool: true,

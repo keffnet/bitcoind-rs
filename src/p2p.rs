@@ -1177,6 +1177,7 @@ fn peer_package_retryable_error(error: &anyhow::Error) -> bool {
             error,
             MempoolError::FeeRate
                 | MempoolError::MinRelayFee
+                | MempoolError::MinRelayFeeWithContext(_)
                 | MempoolError::Full
                 | MempoolError::ReplacementFee
                 | MempoolError::ReplacementFeeWithContext(_)
@@ -7123,18 +7124,14 @@ async fn serve_peer_loop(
                                     }
                                 }
                             }
-                            // Keep a missing-input transaction available for
-                            // opportunistic 1p1c evaluation when its parent
-                            // arrives. A standalone low-fee parent must not
-                            // be retained: if its child arrives later Core
-                            // re-requests the parent and only then evaluates
-                            // the package.
-                            if !accepted_as_package
-                                && matches!(
-                                    error.downcast_ref::<MempoolError>(),
-                                    Some(MempoolError::MissingInput(_))
-                                )
-                            {
+                            // Keep retryable policy failures available for
+                            // opportunistic 1p1c evaluation. In particular,
+                            // package relay can deliver a low-fee parent
+                            // before its high-fee child; dropping the parent
+                            // here would make the later child look like an
+                            // ordinary missing-input orphan instead of a
+                            // package candidate.
+                            if !accepted_as_package {
                                 remember_peer_package_transaction(peer_state, transaction.clone());
                             }
                         }

@@ -2101,7 +2101,20 @@ impl Node {
             incremental_relay_fee_sat_per_kvb: config.incremental_relay_fee_sat_per_kvb,
             dust_relay_fee_sat_per_kvb: config.dust_relay_fee_sat_per_kvb,
             bytes_per_sigop: config.bytes_per_sigop,
+            #[cfg(not(test))]
+            max_tx_legacy_sigops: config.max_tx_legacy_sigops,
+            #[cfg(test)]
+            max_tx_legacy_sigops: usize::try_from(crate::config::DEFAULT_MAX_TX_LEGACY_SIGOPS)
+                .expect("constant fits usize"),
             max_datacarrier_bytes: config.max_datacarrier_bytes,
+            #[cfg(not(test))]
+            datacarrier_fullcount: config.datacarrier_fullcount,
+            #[cfg(not(test))]
+            accept_nonstd_datacarrier: config.accept_nonstd_datacarrier,
+            #[cfg(test)]
+            datacarrier_fullcount: true,
+            #[cfg(test)]
+            accept_nonstd_datacarrier: false,
             permit_bare_datacarrier: true,
             permit_bare_multisig: config.permit_bare_multisig,
             require_standard: !config.accept_nonstd_txn,

@@ -36,7 +36,8 @@ pub const DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB: u64 = 100;
 pub const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 100;
 pub const DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB: u64 = 3_000;
 pub const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
-pub const DEFAULT_MAX_DATACARRIER_BYTES: u64 = 100_000;
+pub const DEFAULT_MAX_TX_LEGACY_SIGOPS: u64 = 2_500;
+pub const DEFAULT_MAX_DATACARRIER_BYTES: u64 = 83;
 pub const DEFAULT_ACCEPT_DATACARRIER: bool = true;
 pub const DEFAULT_PERMIT_BARE_MULTISIG: bool = true;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
@@ -1848,6 +1849,9 @@ pub struct Args {
     #[arg(long = "bytespersigop", default_value_t = DEFAULT_BYTES_PER_SIGOP)]
     pub bytes_per_sigop: u64,
 
+    #[arg(long = "maxtxlegacysigops", default_value_t = DEFAULT_MAX_TX_LEGACY_SIGOPS)]
+    pub max_tx_legacy_sigops: u64,
+
     #[arg(
         long,
         default_value_t = DEFAULT_ACCEPT_DATACARRIER,
@@ -1859,6 +1863,24 @@ pub struct Args {
 
     #[arg(long, default_value_t = DEFAULT_MAX_DATACARRIER_BYTES)]
     pub datacarriersize: u64,
+
+    #[arg(
+        long = "datacarrierfullcount",
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub datacarrier_fullcount: bool,
+
+    #[arg(
+        long = "acceptnonstddatacarrier",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub accept_nonstd_datacarrier: bool,
 
     #[arg(
         long,
@@ -3161,7 +3183,13 @@ pub struct Config {
     pub incremental_relay_fee_sat_per_kvb: u64,
     pub dust_relay_fee_sat_per_kvb: u64,
     pub bytes_per_sigop: u64,
+    #[cfg(not(test))]
+    pub max_tx_legacy_sigops: usize,
     pub max_datacarrier_bytes: Option<usize>,
+    #[cfg(not(test))]
+    pub datacarrier_fullcount: bool,
+    #[cfg(not(test))]
+    pub accept_nonstd_datacarrier: bool,
     pub permit_bare_multisig: bool,
     pub peer_bloom_filters: bool,
     pub blocksonly: bool,
@@ -4097,7 +4125,14 @@ impl Config {
             incremental_relay_fee_sat_per_kvb,
             dust_relay_fee_sat_per_kvb,
             bytes_per_sigop: args.bytes_per_sigop,
+            #[cfg(not(test))]
+            max_tx_legacy_sigops: usize::try_from(args.max_tx_legacy_sigops)
+                .context("--maxtxlegacysigops does not fit usize")?,
             max_datacarrier_bytes,
+            #[cfg(not(test))]
+            datacarrier_fullcount: args.datacarrier_fullcount,
+            #[cfg(not(test))]
+            accept_nonstd_datacarrier: args.accept_nonstd_datacarrier,
             permit_bare_multisig: args.permitbaremultisig,
             peer_bloom_filters: args.peer_bloom_filters.unwrap_or(false),
             blocksonly: args.blocksonly,

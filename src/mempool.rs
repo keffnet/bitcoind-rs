@@ -21,7 +21,8 @@ use crate::config::{
     DEFAULT_ACCEPT_DATACARRIER, DEFAULT_BYTES_PER_SIGOP, DEFAULT_CLUSTER_COUNT,
     DEFAULT_CLUSTER_SIZE_KVB, DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
     DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB, DEFAULT_MAX_DATACARRIER_BYTES,
-    DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB, DEFAULT_PERMIT_BARE_MULTISIG, MAX_CLUSTER_COUNT_LIMIT,
+    DEFAULT_MAX_TX_LEGACY_SIGOPS, DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB,
+    DEFAULT_PERMIT_BARE_MULTISIG, MAX_CLUSTER_COUNT_LIMIT,
 };
 use crate::script::core_multisig_solution;
 use crate::time;
@@ -37,7 +38,6 @@ const MAX_CORE_MEMPOOL_FILE_SIZE: usize = 2 * 1024 * 1024 * 1024;
 const ROLLING_FEE_HALFLIFE_SECS: f64 = 12.0 * 60.0 * 60.0;
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
-const MAX_TX_LEGACY_SIGOPS: usize = 2_500;
 const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
 const MAX_SCRIPT_SIZE: usize = 10_000;
@@ -90,7 +90,10 @@ pub struct MempoolPolicy {
     pub incremental_relay_fee_sat_per_kvb: u64,
     pub dust_relay_fee_sat_per_kvb: u64,
     pub bytes_per_sigop: u64,
+    pub max_tx_legacy_sigops: usize,
     pub max_datacarrier_bytes: Option<usize>,
+    pub datacarrier_fullcount: bool,
+    pub accept_nonstd_datacarrier: bool,
     pub permit_bare_datacarrier: bool,
     pub permit_bare_multisig: bool,
     pub require_standard: bool,
@@ -111,11 +114,14 @@ impl Default for MempoolPolicy {
             incremental_relay_fee_sat_per_kvb: DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
             dust_relay_fee_sat_per_kvb: DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
             bytes_per_sigop: DEFAULT_BYTES_PER_SIGOP,
+            max_tx_legacy_sigops: usize::try_from(DEFAULT_MAX_TX_LEGACY_SIGOPS)
+                .expect("constant fits usize"),
             max_datacarrier_bytes: DEFAULT_ACCEPT_DATACARRIER
                 .then_some(usize::try_from(DEFAULT_MAX_DATACARRIER_BYTES).expect("constant fits")),
-            // The functional Core compatibility mode enables bare data
-            // carrier transactions; keep that behavior until the explicit
-            // corepolicy argument is wired through Config.
+            datacarrier_fullcount: true,
+            accept_nonstd_datacarrier: false,
+            // Core's functional compatibility mode enables bare data carrier
+            // transactions; the daemon wiring may override this per network.
             permit_bare_datacarrier: true,
             permit_bare_multisig: DEFAULT_PERMIT_BARE_MULTISIG,
             require_standard: true,
@@ -1754,7 +1760,22 @@ impl Mempool {
                     first_retryable_error.get_or_insert(error);
                     package_fallback.push(transaction.clone());
                 }
-                Err(error) => return (candidate, Err(error), false),
+                Err(error) => {
+                    // Core checks aggregate package limits before exposing a
+                    // later member's script-policy failure. Keep the valid
+                    // individual prefix in `candidate`, but surface the
+                    // package limit when the complete package is too large.
+                    if let Some(package_error) =
+                        self.package_size_limit_error(transactions, chain, time::unix_time())
+                    {
+                        return (
+                            candidate,
+                            Err(MempoolError::MempoolLimits(package_error)),
+                            false,
+                        );
+                    }
+                    return (candidate, Err(error), false);
+                }
             }
         }
         if package_fallback.is_empty() {
@@ -1984,6 +2005,124 @@ impl Mempool {
     /// Validate a package for testmempoolaccept. Package feerates and
     /// replacement are intentionally disabled for this dry-run path, just as
     /// in Core's PackageTestAccept arguments.
+    fn package_vsize_for_test(
+        &self,
+        transactions: &[Transaction],
+        chain: &ChainState,
+        _added_at: u64,
+    ) -> Result<u64, MempoolError> {
+        // Core checks package ancestor/descendant limits before running the
+        // per-transaction script checks. Calculate the sigop-adjusted size
+        // from the package's available prevouts directly, so a later member
+        // with an invalid script cannot hide an aggregate package-limit
+        // failure behind its script error.
+        let serving_height = chain.utxo_tip().height;
+        let script_flags =
+            validation::script_flags_for_block(chain.network, serving_height.saturating_add(1), 0);
+        let mut package_outputs = HashMap::<OutPoint, TxOut>::new();
+        let mut total_vsize = 0u64;
+        for transaction in transactions {
+            let mut previous_outputs = Vec::with_capacity(transaction.input.len());
+            for input in &transaction.input {
+                let output = package_outputs
+                    .get(&input.previous_output)
+                    .cloned()
+                    .or_else(|| {
+                        self.entries
+                            .get(&input.previous_output.txid)
+                            .and_then(|entry| {
+                                entry
+                                    .transaction
+                                    .output
+                                    .get(input.previous_output.vout as usize)
+                                    .cloned()
+                            })
+                    })
+                    .or_else(|| {
+                        chain
+                            .utxo(&input.previous_output)
+                            .map(|entry| entry.output.clone())
+                    })
+                    .ok_or(MempoolError::MissingInput(input.previous_output))?;
+                previous_outputs.push(output);
+            }
+            let sigop_cost =
+                validation::transaction_sigop_cost(transaction, &previous_outputs, script_flags)
+                    as u64;
+            let adjusted_weight = transaction
+                .weight()
+                .to_wu()
+                .max(sigop_cost.saturating_mul(self.policy.bytes_per_sigop));
+            total_vsize = total_vsize.saturating_add(adjusted_weight.saturating_add(3) / 4);
+            let txid = transaction.compute_txid();
+            for (vout, output) in transaction.output.iter().enumerate() {
+                package_outputs.insert(OutPoint::new(txid, vout as u32), output.clone());
+            }
+        }
+        Ok(total_vsize)
+    }
+
+    fn package_mempool_limit_error(
+        &self,
+        transactions: &[Transaction],
+        chain: &ChainState,
+        added_at: u64,
+        fallback: &str,
+    ) -> String {
+        let package_count = transactions.len();
+        if package_count > self.policy.ancestor_count_limit {
+            return format!(
+                "package count {package_count} exceeds ancestor count limit [limit: {}]",
+                self.policy.ancestor_count_limit
+            );
+        }
+        if package_count > self.policy.descendant_count_limit {
+            return format!(
+                "package count {package_count} exceeds descendant count limit [limit: {}]",
+                self.policy.descendant_count_limit
+            );
+        }
+        if let Ok(total_vsize) = self.package_vsize_for_test(transactions, chain, added_at) {
+            if total_vsize > self.policy.ancestor_size_limit_vbytes {
+                return format!(
+                    "package size {total_vsize} exceeds ancestor size limit [limit: {}]",
+                    self.policy.ancestor_size_limit_vbytes
+                );
+            }
+            if total_vsize > self.policy.descendant_size_limit_vbytes {
+                return format!(
+                    "package size {total_vsize} exceeds descendant size limit [limit: {}]",
+                    self.policy.descendant_size_limit_vbytes
+                );
+            }
+        }
+        fallback.to_owned()
+    }
+
+    fn package_size_limit_error(
+        &self,
+        transactions: &[Transaction],
+        chain: &ChainState,
+        added_at: u64,
+    ) -> Option<String> {
+        let total_vsize = self
+            .package_vsize_for_test(transactions, chain, added_at)
+            .ok()?;
+        if total_vsize > self.policy.ancestor_size_limit_vbytes {
+            Some(format!(
+                "package size {total_vsize} exceeds ancestor size limit [limit: {}]",
+                self.policy.ancestor_size_limit_vbytes
+            ))
+        } else if total_vsize > self.policy.descendant_size_limit_vbytes {
+            Some(format!(
+                "package size {total_vsize} exceeds descendant size limit [limit: {}]",
+                self.policy.descendant_size_limit_vbytes
+            ))
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn accept_package_for_test(
         &self,
         transactions: &[Transaction],
@@ -2008,6 +2147,14 @@ impl Mempool {
             );
         }
         let added_at = time::unix_time();
+        if let Some(error) = self.package_size_limit_error(transactions, chain, added_at) {
+            return (
+                self.clone(),
+                Err(PackageTestAcceptFailure::Package {
+                    error: format!("package-mempool-limits, {error}"),
+                }),
+            );
+        }
         let mut candidate = self.clone();
         let mut accepted = Vec::with_capacity(transactions.len());
         for (index, transaction) in transactions.iter().enumerate() {
@@ -2043,7 +2190,7 @@ impl Mempool {
                     }),
                 );
             }
-            let txid = match candidate.accept_at(transaction.clone(), chain, added_at) {
+            let txid = match candidate.accept_at_for_test(transaction.clone(), chain, added_at) {
                 Ok(txid) => txid,
                 Err(error) => {
                     // A TRUC violation caused solely by the pre-existing
@@ -2060,6 +2207,10 @@ impl Mempool {
                     };
                     let package_error = match &error {
                         MempoolError::ClusterLimit => Some("too-large-cluster".to_owned()),
+                        MempoolError::MempoolLimits(debug) => Some(format!(
+                            "package-mempool-limits, {}",
+                            self.package_mempool_limit_error(transactions, chain, added_at, debug,)
+                        )),
                         MempoolError::Truc(_) if standalone_truc_violation => None,
                         MempoolError::Truc(_) => Some(error.to_string()),
                         _ => None,
@@ -2508,6 +2659,31 @@ impl Mempool {
         self.accept_at_with_options(transaction, chain, added_at, true, true)
     }
 
+    fn accept_at_for_test(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+        added_at: u64,
+    ) -> Result<Txid, MempoolError> {
+        // Core's multi-transaction testmempoolaccept path does not apply
+        // package feerates. Keep the individual TRUC min-relay floor visible
+        // in this dry-run, while submitpackage can still use its package
+        // feerate carve-out.
+        self.accept_at_with_sequence(
+            transaction,
+            chain,
+            added_at,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            true,
+            true,
+        )
+    }
+
     fn accept_at_with_policy(
         &mut self,
         transaction: Transaction,
@@ -2529,6 +2705,7 @@ impl Mempool {
             true,
             false,
             enforce_min_relay,
+            false,
         )
     }
 
@@ -2547,8 +2724,9 @@ impl Mempool {
             false,
             true,
             false,
-            false,
             true,
+            true,
+            false,
             false,
             false,
         )?;
@@ -2575,6 +2753,7 @@ impl Mempool {
             true,
             false,
             true,
+            true,
         )
     }
 
@@ -2591,10 +2770,11 @@ impl Mempool {
             false,
             false,
             false,
+            true,
             false,
             false,
             false,
-            false,
+            true,
         )
     }
 
@@ -2616,6 +2796,7 @@ impl Mempool {
             true,
             allow_truc_descendant_replacement,
             true,
+            true,
         )
     }
 
@@ -2632,6 +2813,7 @@ impl Mempool {
         record_sequence: bool,
         allow_truc_descendant_replacement: bool,
         enforce_min_relay: bool,
+        force_truc_min_relay: bool,
     ) -> Result<Txid, MempoolError> {
         // During AssumeUTXO activation the snapshot chainstate serves UTXOs
         // at its base height while the background chainstate is still lower.
@@ -2810,6 +2992,22 @@ impl Mempool {
                 &self.policy,
             )?;
         }
+        let (standard_datacarrier_bytes, nonstandard_datacarrier_bytes) =
+            datacarrier_bytes(&transaction, &previous_outputs);
+        if nonstandard_datacarrier_bytes > 0 && !self.policy.accept_nonstd_datacarrier {
+            return Err(MempoolError::NonStandard(
+                "txn-datacarrier-nonstandard".to_owned(),
+            ));
+        }
+        if self.policy.datacarrier_fullcount
+            && self.policy.max_datacarrier_bytes.is_none_or(|max| {
+                standard_datacarrier_bytes.saturating_add(nonstandard_datacarrier_bytes) > max
+            })
+        {
+            return Err(MempoolError::NonStandard(
+                "txn-datacarrier-exceeded".to_owned(),
+            ));
+        }
         if future_witness_version_policy_failure(&transaction, &previous_outputs) {
             return Err(MempoolError::Script(
                 "Witness version reserved for soft-fork upgrades".to_owned(),
@@ -2841,8 +3039,9 @@ impl Mempool {
                     error,
                 ))
             })?;
-        let truc_min_relay_exception =
-            transaction.version.0 == TRUC_VERSION && self.policy.truc_policy == TrucPolicy::Enforce;
+        let truc_min_relay_exception = transaction.version.0 == TRUC_VERSION
+            && self.policy.truc_policy == TrucPolicy::Enforce
+            && !force_truc_min_relay;
         if enforce_min_relay
             && self.policy.truc_policy == TrucPolicy::Enforce
             && !truc_min_relay_exception
@@ -4107,6 +4306,91 @@ fn validate_standard_policy_with_modified_fee(
     )
 }
 
+/// Return the bytes Core accounts as ordinary and non-standard data carriers.
+/// The output-side OP_RETURN accounting is handled by `IsStandardTx`; this
+/// companion scan covers carrier formats hidden in inputs, such as OP_NET
+/// taproot witnesses, and lets the policy apply `-datacarrierfullcount` even
+/// when the rest of standard-transaction policy is disabled.
+fn datacarrier_bytes(transaction: &Transaction, previous_outputs: &[TxOut]) -> (usize, usize) {
+    let standard = transaction
+        .output
+        .iter()
+        .filter(|output| is_core_nulldata(&output.script_pubkey))
+        .map(|output| output.script_pubkey.len())
+        .sum();
+    let mut nonstandard = transaction
+        .output
+        .iter()
+        .map(|output| nonstandard_datacarrier_script_bytes(&output.script_pubkey))
+        .sum::<usize>();
+
+    for (input, previous) in transaction.input.iter().zip(previous_outputs) {
+        if !previous.script_pubkey.is_p2tr() {
+            continue;
+        }
+        let witness = input.witness.iter().collect::<Vec<_>>();
+        if witness.len() < 2 {
+            continue;
+        }
+        let tapscript = witness[witness.len() - 2];
+        if tapscript
+            .windows(3)
+            .any(|window| window == [0x02, b'o', b'p'])
+        {
+            nonstandard = nonstandard
+                .saturating_add(witness[0].len())
+                .saturating_add(tapscript.len());
+        }
+    }
+
+    (standard, nonstandard)
+}
+
+fn nonstandard_datacarrier_script_bytes(script: &Script) -> usize {
+    let bytes = script.as_bytes();
+    if bytes.len() >= 3 && bytes[0] == 0x00 && bytes[1] == 0x63 && bytes.last() == Some(&0x68) {
+        return bytes.len();
+    }
+
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let start = offset;
+        let opcode = bytes[offset];
+        offset += 1;
+        let pushed = match opcode {
+            0x01..=0x4b => usize::from(opcode),
+            0x4c => {
+                let Some(&length) = bytes.get(offset) else {
+                    return 0;
+                };
+                offset += 1;
+                usize::from(length)
+            }
+            0x4d => {
+                let Some(length) = bytes.get(offset..offset.saturating_add(2)) else {
+                    return 0;
+                };
+                offset += 2;
+                usize::from(u16::from_le_bytes([length[0], length[1]]))
+            }
+            _ => 0,
+        };
+        if pushed > 0 {
+            let Some(end) = offset.checked_add(pushed) else {
+                return 0;
+            };
+            if end >= bytes.len() {
+                return 0;
+            }
+            offset = end;
+            if bytes[offset] == 0x75 {
+                return offset.saturating_add(1).saturating_sub(start);
+            }
+        }
+    }
+    0
+}
+
 fn validate_standard_policy_with_modified_fee_and_policy(
     transaction: &Transaction,
     previous_outputs: &[TxOut],
@@ -4149,7 +4433,7 @@ fn validate_standard_policy_with_modified_fee_and_policy(
                 .max_datacarrier_bytes
                 .is_none_or(|max| data_carrier_bytes > max)
             {
-                return Err(MempoolError::NonStandard("datacarrier".to_owned()));
+                return Err(MempoolError::NonStandard("scriptpubkey".to_owned()));
             }
         } else if !is_standard_output_script(&output.script_pubkey, true) {
             return Err(MempoolError::NonStandard("scriptpubkey".to_owned()));
@@ -4175,7 +4459,9 @@ fn validate_standard_policy_with_modified_fee_and_policy(
         return Err(MempoolError::NonStandard("bare-datacarrier".to_owned()));
     }
 
-    validate_standard_inputs(transaction, previous_outputs)?;
+    // Core's BIP54 check counts legacy sigops across the complete
+    // transaction before checking each individual input's standardness. This
+    // gives `-maxtxlegacysigops` its stable aggregate reject reason.
     let mut legacy_sigops = 0usize;
     for (input, previous) in transaction.input.iter().zip(previous_outputs) {
         legacy_sigops = legacy_sigops
@@ -4187,12 +4473,13 @@ fn validate_standard_policy_with_modified_fee_and_policy(
             } else {
                 previous.script_pubkey.count_sigops()
             });
-        if legacy_sigops > MAX_TX_LEGACY_SIGOPS {
-            return Err(MempoolError::NonStandard(
-                "bad-txns-nonstandard-inputs".to_owned(),
-            ));
-        }
     }
+    if legacy_sigops > policy.max_tx_legacy_sigops {
+        return Err(MempoolError::NonStandard(
+            "bad-txns-input-sigops-toomany-overall".to_owned(),
+        ));
+    }
+    validate_standard_inputs(transaction, previous_outputs)?;
     let sigop_cost = validation::transaction_sigop_cost(
         transaction,
         previous_outputs,
@@ -7017,7 +7304,7 @@ mod tests {
                 1,
                 &policy,
             ),
-            Err(MempoolError::NonStandard(reason)) if reason == "datacarrier"
+            Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
         ));
 
         let mut bare_multisig = vec![0x51, 0x21];
@@ -7114,7 +7401,8 @@ mod tests {
         };
         assert!(matches!(
             validate_standard_policy(&transaction, &previous_outputs, 1),
-            Err(MempoolError::NonStandard(reason)) if reason == "bad-txns-nonstandard-inputs"
+            Err(MempoolError::NonStandard(reason))
+                if reason == "bad-txns-input-sigops-toomany-overall"
         ));
     }
 

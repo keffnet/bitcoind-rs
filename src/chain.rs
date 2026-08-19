@@ -1308,7 +1308,11 @@ impl ChainState {
         let blocks_dir = blocks_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
-        let mut store = BlockStore::open_with_xor(&blocks_dir, blocks_xor)?;
+        let mut store = if reindex || reindex_chainstate {
+            BlockStore::open_for_reindex_with_xor(&blocks_dir, blocks_xor)?
+        } else {
+            BlockStore::open_with_xor(&blocks_dir, blocks_xor)?
+        };
         let filter_store = FilterStore::open(data_dir.join("filters"))?;
         let tx_index_store = tx_index_all_enabled
             .then(|| TransactionIndexStore::open(data_dir.join("indexes/txindex")))

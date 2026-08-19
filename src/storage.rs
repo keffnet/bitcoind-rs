@@ -352,6 +352,8 @@ pub struct BlockStore {
     undo_index_file: File,
     undo_index: HashMap<BlockHash, Record>,
     xor_key: XorKey,
+    block_file_read_only: bool,
+    allow_block_file_reopen: bool,
     block_cache: HashMap<BlockHash, (Block, usize)>,
     block_cache_order: VecDeque<BlockHash>,
     block_cache_bytes: usize,
@@ -368,17 +370,42 @@ impl BlockStore {
     /// when enabled, while an existing clear directory gets a zero key so
     /// upgrading does not rewrite historical data.
     pub fn open_with_xor(directory: impl AsRef<Path>, use_xor: bool) -> Result<Self> {
+        Self::open_with_xor_mode(directory, use_xor, false, false)
+    }
+
+    /// Open an existing store for a chainstate reindex without requiring
+    /// append permission on the block data. Reindex rebuilds metadata from
+    /// durable block records; a later block write can reopen the descriptor.
+    pub(crate) fn open_for_reindex_with_xor(
+        directory: impl AsRef<Path>,
+        use_xor: bool,
+    ) -> Result<Self> {
+        Self::open_with_xor_mode(directory, use_xor, true, true)
+    }
+
+    fn open_with_xor_mode(
+        directory: impl AsRef<Path>,
+        use_xor: bool,
+        prefer_read_only_blocks: bool,
+        allow_block_file_reopen: bool,
+    ) -> Result<Self> {
         let directory = directory.as_ref();
         create_dir_all(directory)
             .with_context(|| format!("creating block directory {}", directory.display()))?;
         let xor_key = init_xor_key(directory, use_xor)?;
         let path = directory.join("blocks.dat");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening block store {}", path.display()))?;
+        let block_file_read_only =
+            prefer_read_only_blocks && path.is_file() && std::fs::metadata(&path)?.len() != 0;
+        let mut file = if block_file_read_only {
+            OpenOptions::new().read(true).open(&path)
+        } else {
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&path)
+        }
+        .with_context(|| format!("opening block store {}", path.display()))?;
         let index_path = directory.join("blocks.index");
         let mut index_file = OpenOptions::new()
             .create(true)
@@ -433,6 +460,8 @@ impl BlockStore {
             undo_index_file,
             undo_index,
             xor_key,
+            block_file_read_only,
+            allow_block_file_reopen,
             block_cache: HashMap::new(),
             block_cache_order: VecDeque::new(),
             block_cache_bytes: 0,
@@ -500,6 +529,8 @@ impl BlockStore {
             undo_index_file,
             undo_index,
             xor_key,
+            block_file_read_only: true,
+            allow_block_file_reopen: false,
             block_cache: HashMap::new(),
             block_cache_order: VecDeque::new(),
             block_cache_bytes: 0,
@@ -629,11 +660,32 @@ impl BlockStore {
         self.insert_with_sync(block, false)
     }
 
+    fn ensure_block_file_writable(&mut self) -> Result<()> {
+        if !self.block_file_read_only {
+            return Ok(());
+        }
+        if !self.allow_block_file_reopen {
+            bail!("block store is read-only")
+        }
+        self.file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| {
+                format!("reopening block store {} for writing", self.path.display())
+            })?;
+        self.serving_reader
+            .replace(self.file.try_clone()?, self.index.clone());
+        self.block_file_read_only = false;
+        Ok(())
+    }
+
     fn insert_with_sync(&mut self, block: &Block, sync: bool) -> Result<BlockHash> {
         let hash = block.block_hash();
         if self.index.contains_key(&hash) {
             return Ok(hash);
         }
+        self.ensure_block_file_writable()?;
         let raw_bytes = serialize(block);
         let bytes = encode_storage_payload(&raw_bytes, MAX_STORED_BLOCK_SIZE)?;
         let offset = self.file.seek(SeekFrom::End(0))?;
@@ -778,6 +830,7 @@ impl BlockStore {
         retained_blocks: &HashSet<BlockHash>,
         retained_undo: &HashSet<BlockHash>,
     ) -> Result<()> {
+        self.ensure_block_file_writable()?;
         let block_hashes = self
             .index
             .keys()
@@ -4843,6 +4896,38 @@ mod tests {
                 .len(),
             filter_len
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reindex_reads_read_only_blocks_and_reopens_for_new_writes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = genesis_block(Network::Regtest);
+        let mut second = first.clone();
+        second.header.nonce = 1;
+        let mut third = first.clone();
+        third.header.nonce = 2;
+        {
+            let mut store = BlockStore::open(directory.path()).unwrap();
+            store.insert(&first).unwrap();
+            store.insert(&second).unwrap();
+        }
+
+        let block_path = directory.path().join("blocks.dat");
+        let mut read_only = std::fs::metadata(&block_path).unwrap().permissions();
+        read_only.set_mode(0o444);
+        std::fs::set_permissions(&block_path, read_only).unwrap();
+
+        let mut store = BlockStore::open_for_reindex_with_xor(directory.path(), false).unwrap();
+        assert_eq!(store.get(&first.block_hash()).unwrap(), Some(first));
+        assert_eq!(store.get(&second.block_hash()).unwrap(), Some(second));
+
+        let writable = std::fs::Permissions::from_mode(0o644);
+        std::fs::set_permissions(&block_path, writable).unwrap();
+        store.insert(&third).unwrap();
+        assert_eq!(store.get(&third.block_hash()).unwrap(), Some(third));
     }
 
     #[test]

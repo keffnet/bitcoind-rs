@@ -871,7 +871,9 @@ pub struct ChainState {
     max_tip_age_secs: u64,
     script_check_workers: usize,
     script_checks_enabled: bool,
-    script_check_log_state: Mutex<Option<&'static str>>,
+    // `None` means no transition has been logged yet; the nested option
+    // preserves a logged "disabled" state separately from that sentinel.
+    script_check_log_state: Mutex<Option<Option<&'static str>>>,
     signet_challenge: Option<Vec<u8>>,
     deployment_parameters: validation::DeploymentParameters,
     pub store: BlockStore,
@@ -6316,17 +6318,20 @@ impl ChainState {
     ) -> Result<BlockApplication> {
         let script_check_reason = self.script_check_reason(block, height);
         let block_hash = block.block_hash();
-        let log_script_enable = {
+        let log_script_transition = {
             let mut previous = self.script_check_log_state.lock();
-            let should_log = script_check_reason.is_some() && previous.is_none();
-            *previous = script_check_reason;
+            let should_log = *previous != Some(script_check_reason);
+            *previous = Some(script_check_reason);
             should_log
         };
-        if log_script_enable {
-            let reason = script_check_reason.expect("script-check log state is enabled");
-            tracing::info!(
-                "Enabling script verification at block #{height} ({block_hash}): {reason}."
-            );
+        if log_script_transition {
+            if let Some(reason) = script_check_reason {
+                tracing::info!(
+                    "Enabling script verification at block #{height} ({block_hash}): {reason}."
+                );
+            } else {
+                tracing::info!("Disabling script verification at block #{height} ({block_hash}).");
+            }
         }
         let skip_script_checks = self.should_skip_script_checks(block, height);
         self.validate_block_transactions_with_options(

@@ -8608,15 +8608,32 @@ impl ChainState {
             .block_index
             .get(&parent_hash)
             .context("header parent is not indexed")?;
-        let headers = self
-            .headers_to_hash(&parent_hash)
-            .context("header parent has no contiguous ancestor chain")?;
-        validation::validate_mandatory_version_bits_with_params(
-            &headers,
-            &self.deployment_parameters,
-            parent.height.saturating_add(1),
-            header.version.to_consensus(),
-        )?;
+        let height = parent.height.saturating_add(1);
+        let mandatory_version_bits_window =
+            self.deployment_parameters.bip9.iter().any(|deployment| {
+                if deployment.max_activation_height
+                    >= validation::Bip9Deployment::MAX_ACTIVATION_HEIGHT
+                {
+                    return false;
+                }
+                let period = deployment.period.max(1);
+                let enforcement_start = deployment
+                    .max_activation_height
+                    .saturating_sub(period.saturating_mul(2));
+                let enforcement_end = deployment.max_activation_height.saturating_sub(period);
+                (enforcement_start..enforcement_end).contains(&height)
+            });
+        if mandatory_version_bits_window {
+            let headers = self
+                .headers_to_hash(&parent_hash)
+                .context("header parent has no contiguous ancestor chain")?;
+            validation::validate_mandatory_version_bits_with_params(
+                &headers,
+                &self.deployment_parameters,
+                height,
+                header.version.to_consensus(),
+            )?;
+        }
         Ok(())
     }
 

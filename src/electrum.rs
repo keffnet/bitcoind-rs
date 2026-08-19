@@ -1390,7 +1390,7 @@ fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
         }
         return Ok(json!(chain::transaction_hex(&entry.transaction)));
     }
-    bail!("transaction not found")
+    bail!("daemon error: unknown txid={txid}")
 }
 
 fn transaction_get_batch(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -3246,6 +3246,13 @@ mod tests {
         assert!(verbose["vin"][0].get("txinwitness").is_none());
         assert!(verbose["vout"][0]["scriptPubKey"]["desc"].is_string());
         assert!(verbose["vout"][0]["scriptPubKey"]["type"].is_string());
+        let unknown_txid = Txid::from_byte_array([0xaa; 32]);
+        assert_eq!(
+            transaction_get(&node, &json!([unknown_txid.to_string()]))
+                .unwrap_err()
+                .to_string(),
+            format!("daemon error: unknown txid={unknown_txid}")
+        );
         let side_location = chain::TxLocation {
             block_hash: BlockHash::from_byte_array([1; 32]),
             height: 0,

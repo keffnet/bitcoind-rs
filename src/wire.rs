@@ -2002,6 +2002,92 @@ mod tests {
     }
 
     #[test]
+    fn malformed_wire_frames_do_not_panic() {
+        // Keep a deterministic parser-fuzz smoke test in the regular suite.
+        // Each payload-bearing command is fed truncated, structurally random,
+        // and boundary-sized payloads with a valid frame checksum. The parser
+        // must reject malformed application data as an error, never unwind.
+        const COMMANDS: &[&str] = &[
+            "version",
+            "addr",
+            "addrv2",
+            "ping",
+            "pong",
+            "getheaders",
+            "getblocks",
+            "headers",
+            "inv",
+            "getdata",
+            "notfound",
+            "block",
+            "merkleblock",
+            "tx",
+            "filterload",
+            "filteradd",
+            "feefilter",
+            "sendcmpct",
+            "cmpctblock",
+            "getblocktxn",
+            "blocktxn",
+            "getcfilters",
+            "cfilter",
+            "getcfheaders",
+            "cfheaders",
+            "getcfcheckpt",
+            "cfcheckpt",
+        ];
+        const LENGTHS: &[usize] = &[0, 1, 2, 7, 8, 16, 32, 80, 256, 1024];
+
+        let mut state = 0x6a09_e667_f3bc_c908_u64;
+        let next_byte = |state: &mut u64| {
+            *state ^= state.wrapping_shl(13);
+            *state ^= state.wrapping_shr(7);
+            *state ^= state.wrapping_shl(17);
+            (*state >> 24) as u8
+        };
+
+        for command in COMMANDS {
+            for &length in LENGTHS {
+                let mut payload = vec![0; length];
+                for byte in &mut payload {
+                    *byte = next_byte(&mut state);
+                }
+
+                let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
+                frame.extend_from_slice(&network_magic(Network::Regtest));
+                let mut command_bytes = [0; 12];
+                command_bytes[..command.len()].copy_from_slice(command.as_bytes());
+                frame.extend_from_slice(&command_bytes);
+                frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                frame.extend_from_slice(&checksum(&payload));
+                frame.extend_from_slice(&payload);
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _ = decode_message(Network::Regtest, &frame);
+                }));
+                assert!(
+                    result.is_ok(),
+                    "parser panicked for {command} payload length {length}"
+                );
+            }
+        }
+
+        for length in [0, 1, 2, 13, 32, 256, 1024] {
+            let mut payload = vec![0; length];
+            for byte in &mut payload {
+                *byte = next_byte(&mut state);
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = decode_v2_message(&payload);
+            }));
+            assert!(
+                result.is_ok(),
+                "BIP324 parser panicked for payload length {length}"
+            );
+        }
+    }
+
+    #[test]
     fn uses_bip339_wtx_inventory_type_and_keeps_legacy_witness_getdata() {
         assert_eq!(InventoryType::WitnessTransaction.as_u32(), 5);
         assert_eq!(

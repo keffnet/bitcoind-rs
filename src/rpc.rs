@@ -56,7 +56,7 @@ use crate::fee_estimator::{EstimatorBucket, RawFeeEstimate};
 use crate::mempool::{
     MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool, MempoolError, MempoolLoadOptions,
     PackageTestAcceptFailure, package_is_child_with_parents_tree, package_is_topologically_sorted,
-    package_weight, transaction_dynamic_memory_usage,
+    package_weight,
 };
 use crate::script::{core_multisig_solution, is_core_multisig, is_core_p2pk};
 use crate::validation;
@@ -13680,23 +13680,6 @@ fn package_policy_error(transactions: &[Transaction]) -> Option<&'static str> {
     None
 }
 
-fn package_has_unincluded_mempool_parent(transactions: &[Transaction], mempool: &Mempool) -> bool {
-    let package_txids = transactions
-        .iter()
-        .map(Transaction::compute_txid)
-        .collect::<HashSet<_>>();
-    // Core's package shape check applies this rule to the final child only.
-    // Earlier package parents may legitimately spend an unconfirmed mempool
-    // transaction; the child itself must spend only package outputs or
-    // confirmed chainstate outputs.
-    transactions.last().is_some_and(|child| {
-        child.input.iter().any(|input| {
-            mempool.get(&input.previous_output.txid).is_some()
-                && !package_txids.contains(&input.previous_output.txid)
-        })
-    })
-}
-
 fn mempool_reject_reason(error: &MempoolError) -> String {
     error.reject_reason()
 }
@@ -13853,10 +13836,6 @@ fn accepted_transaction_json(
     }
     if include_allowed {
         result.insert("allowed".to_owned(), Value::Bool(true));
-        result.insert(
-            "usage".to_owned(),
-            json!(transaction_dynamic_memory_usage(transaction)),
-        );
     }
     result.insert("vsize".to_owned(), json!(entry.vsize));
     let mut fees = json!({"base": sat_to_btc(entry.fee_sat)});
@@ -13872,7 +13851,6 @@ fn test_mempool_transaction_base(transaction: &Transaction) -> Value {
     json!({
         "txid": transaction.compute_txid().to_string(),
         "wtxid": transaction.compute_wtxid().to_string(),
-        "usage": transaction_dynamic_memory_usage(transaction),
     })
 }
 
@@ -14247,11 +14225,28 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         && error != "package-contains-duplicates"
     {
         // Core reports package-wide validation errors as a structured
-        // submitpackage result.  The package-wide validation pass has no
-        // per-transaction results for these errors.
+        // submitpackage result.  When its package validation pass has no
+        // per-transaction results, the RPC still emits one
+        // `package-not-validated` entry for every submitted transaction.
+        let tx_results = if error == "conflict-in-package" {
+            transactions
+                .iter()
+                .map(|transaction| {
+                    (
+                        transaction.compute_wtxid().to_string(),
+                        json!({
+                            "txid": transaction.compute_txid().to_string(),
+                            "error": "package-not-validated",
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<_, _>>()
+        } else {
+            serde_json::Map::new()
+        };
         return Ok(json!({
             "package_msg": error,
-            "tx-results": {},
+            "tx-results": tx_results,
             "replaced-transactions": [],
         }));
     }
@@ -14263,15 +14258,6 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
 
     let chain = node.chain.read();
     let original_mempool = node.mempool.read().clone();
-    if transactions.len() > 1
-        && package_has_unincluded_mempool_parent(&transactions, &original_mempool)
-    {
-        return Ok(json!({
-            "package_msg": "package-not-child-with-unconfirmed-parents",
-            "tx-results": {},
-            "replaced-transactions": [],
-        }));
-    }
     let mut individual_candidate = original_mempool.clone();
     let before_transactions = original_mempool
         .transactions()
@@ -17709,7 +17695,6 @@ mod tests {
                 {
                     "txid": existing.compute_txid().to_string(),
                     "wtxid": existing.compute_wtxid().to_string(),
-                    "usage": crate::mempool::transaction_dynamic_memory_usage(&existing),
                     "allowed": false,
                     "reject-reason": "txn-already-in-mempool",
                     "reject-details": "txn-already-in-mempool",
@@ -17717,7 +17702,6 @@ mod tests {
                 {
                     "txid": unprocessed.compute_txid().to_string(),
                     "wtxid": unprocessed.compute_wtxid().to_string(),
-                    "usage": crate::mempool::transaction_dynamic_memory_usage(&unprocessed),
                 },
             ])
         );

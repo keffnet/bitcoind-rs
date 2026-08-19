@@ -2716,7 +2716,7 @@ impl Mempool {
             false,
             true,
             false,
-            true,
+            false,
             true,
             false,
             false,
@@ -4444,9 +4444,6 @@ fn validate_standard_policy_with_modified_fee_and_policy(
     if dust_outputs == 1 && (base_fee_sat != 0 || modified_fee_sat != 0) {
         return Err(MempoolError::DustWithFee);
     }
-    if data_carrier_outputs > 1 {
-        return Err(MempoolError::NonStandard("multi-op-return".to_owned()));
-    }
     if monetary_outputs == 0 && data_carrier_outputs > 0 && !policy.permit_bare_datacarrier {
         return Err(MempoolError::NonStandard("bare-datacarrier".to_owned()));
     }
@@ -4774,9 +4771,11 @@ fn validate_standard_witnesses(
                 "bad-witness-nonstandard".to_owned(),
             ));
         }
+        // Core treats witness stuffing on a direct P2A output as an ordinary
+        // nonstandard witness rather than exposing an anchor-specific reason.
         if is_p2a_script(spending_script) && !previous.script_pubkey.is_p2sh() {
             return Err(MempoolError::NonStandard(
-                "bad-witness-anchor-not-empty".to_owned(),
+                "bad-witness-nonstandard".to_owned(),
             ));
         } else if spending_script.is_p2wpkh() {
             let Some(pubkey) = input.witness.iter().nth(1) else {
@@ -7006,7 +7005,7 @@ mod tests {
         anchor_spend.output[0].script_pubkey = previous.script_pubkey.clone();
         assert!(matches!(
             validate_standard_policy(&anchor_spend, std::slice::from_ref(&anchor_previous), 0),
-            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-anchor-not-empty"
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
         ));
         anchor_spend.input[0].witness = Witness::default();
         assert!(

@@ -701,6 +701,12 @@ impl Mempool {
             )
     }
 
+    pub fn entry_dynamic_memory_usage(&self, txid: &Txid) -> Option<usize> {
+        self.entries
+            .get(txid)
+            .map(|entry| mempool_entry_memory_usage(&entry.transaction))
+    }
+
     /// Sum of virtual transaction sizes, matching Core's `getmempoolinfo.bytes`.
     pub fn vbytes(&self) -> u64 {
         self.vbytes
@@ -1554,6 +1560,21 @@ impl Mempool {
         chain: &ChainState,
     ) -> Result<Txid, MempoolError> {
         self.accept(transaction, chain)
+    }
+
+    /// Admit a transaction while suppressing the standardness checks selected
+    /// by Core's `sendrawtransaction(ignore_rejects=...)` compatibility path.
+    /// Consensus, fee, replacement, and cluster checks remain enabled.
+    pub(crate) fn accept_with_standard_policy_disabled(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+    ) -> Result<Txid, MempoolError> {
+        let require_standard = self.policy.require_standard;
+        self.policy.require_standard = false;
+        let result = self.accept_with_sibling(transaction, chain, true);
+        self.policy.require_standard = require_standard;
+        result
     }
 
     fn accept_with_sibling(

@@ -2079,9 +2079,10 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "invalidateblock" | "reconsiderblock" | "preciousblock" => Some(&["blockhash"]),
         "getrawtransaction" => Some(&["txid", "verbosity", "blockhash"]),
         "decoderawtransaction" => Some(&["hexstring", "iswitness"]),
-        "createrawtransaction" => {
-            Some(&["inputs", "outputs", "locktime", "replaceable", "version"])
-        }
+        // Core v31.1 exposes four parameters here.  The transaction builder
+        // keeps its fifth-version argument for direct internal callers, but
+        // it is not part of the Core-compatible RPC surface.
+        "createrawtransaction" => Some(&["inputs", "outputs", "locktime", "replaceable"]),
         "decodescript" => Some(&["hexstring"]),
         "combinerawtransaction" => Some(&["txs"]),
         "createpsbt" => Some(&["inputs", "outputs", "locktime", "replaceable", "version"]),
@@ -2100,7 +2101,9 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "signmessagewithprivkey" => Some(&["privkey", "message"]),
         "verifymessage" => Some(&["address", "signature", "message"]),
         "createmultisig" => Some(&["nrequired", "keys", "address_type"]),
-        "sendrawtransaction" => Some(&["hexstring", "maxfeerate", "maxburnamount"]),
+        "sendrawtransaction" => {
+            Some(&["hexstring", "maxfeerate", "maxburnamount", "ignore_rejects"])
+        }
         "abortprivatebroadcast" => Some(&["txid"]),
         "signrawtransactionwithkey" => Some(&["hexstring", "privkeys", "prevtxs", "sighashtype"]),
         "submitblock" => Some(&["hexdata", "dummy"]),
@@ -2161,7 +2164,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "estimaterawfee" => Some(&["conf_target", "threshold"]),
         "savefeeestimates" => Some(&[]),
         "logging" => Some(&["include", "exclude"]),
-        "validateaddress" => Some(&["address"]),
+        "validateaddress" => Some(&["address", "address_type"]),
         "deriveaddresses" => Some(&["descriptor", "range"]),
         "getdescriptorinfo" => Some(&["descriptor"]),
         "enumeratesigners" => Some(&[]),
@@ -3927,6 +3930,18 @@ fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if params.as_array().is_some_and(Vec::is_empty) {
         bail!("Return information about the given bitcoin address.");
     }
+    if params.get(1).is_some_and(|value| !value.is_null()) {
+        let value = params.get(1).expect("address_type was checked above");
+        let address_type = value
+            .as_str()
+            .ok_or_else(|| json_type_error(value, "string"))?;
+        if !matches!(
+            address_type,
+            "legacy" | "p2sh-segwit" | "bech32" | "bech32m"
+        ) {
+            bail!("Unknown address type '{address_type}'");
+        }
+    }
     if params.get(0).is_some_and(Value::is_null) {
         bail!("JSON value of type null is not of expected type string");
     }
@@ -3936,11 +3951,18 @@ fn validate_address(node: &Arc<Node>, params: &Value) -> Result<Value> {
         Err(error) => {
             let (error, error_locations) =
                 validateaddress_bech32_error(&value, error.to_string(), node.config.network);
-            return Ok(json!({
+            let mut result = json!({
                 "isvalid": false,
                 "error_locations": error_locations,
                 "error": error,
-            }));
+            });
+            if let Some(error_index) = result["error_locations"]
+                .as_array()
+                .and_then(|locations| locations.first())
+            {
+                result["error_index"] = error_index.clone();
+            }
+            return Ok(result);
         }
     };
     let address_type = unchecked.clone().assume_checked().address_type();
@@ -11131,27 +11153,40 @@ fn create_multisig(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
+    let legacy_ignore_at_one = params.get(1).is_some_and(Value::is_array)
+        && params.get(2).is_none_or(Value::is_null)
+        && params.get(3).is_none_or(Value::is_null);
+    let legacy_ignore_at_two = !legacy_ignore_at_one
+        && params.get(2).is_some_and(Value::is_array)
+        && params.get(3).is_none_or(Value::is_null);
+    let ignore_rejects = parse_ignore_rejects(if legacy_ignore_at_one {
+        params.get(1)
+    } else if legacy_ignore_at_two {
+        params.get(2)
+    } else {
+        params.get(3)
+    })?;
     let bytes = hex::decode(param::<String>(params, 0)?).context("TX decode failed")?;
     let transaction: Transaction = deserialize(&bytes)
         .context("TX decode failed. Make sure the tx has at least one input.")?;
-    let max_fee_rate = parse_max_fee_rate(params.get(1))?;
-    let max_burn_amount = parse_max_burn_amount(params.get(2))?;
+    let max_fee_rate = if legacy_ignore_at_one {
+        None
+    } else {
+        parse_max_fee_rate(params.get(1))?
+    };
+    let max_burn_amount = if legacy_ignore_at_two {
+        parse_max_burn_amount(None)?
+    } else {
+        parse_max_burn_amount(params.get(2))?
+    };
     validate_burn_amount(&transaction, max_burn_amount)?;
     let txid = transaction.compute_txid();
     let wtxid = transaction.compute_wtxid();
-    enforce_max_fee_rate(node, &transaction, max_fee_rate).map_err(|error| {
-        if error.to_string() == "transaction is non-standard: missing-ephemeral-spends" {
-            anyhow!(
-                "missing-ephemeral-spends, tx {txid} (wtxid={wtxid}) did not spend parent's ephemeral dust"
-            )
-        } else {
-            error
-        }
-    })?;
-    let txid = if node.config.private_broadcast {
-        node.queue_private_broadcast(transaction)?
-    } else {
-        node.accept_transaction(transaction).map_err(|error| {
+    if !ignore_rejects
+        .iter()
+        .any(|reason| matches!(reason.as_str(), "max-fee-exceeded" | "absurdly-high-fee"))
+    {
+        enforce_max_fee_rate(node, &transaction, max_fee_rate).map_err(|error| {
             if error.to_string() == "transaction is non-standard: missing-ephemeral-spends" {
                 anyhow!(
                     "missing-ephemeral-spends, tx {txid} (wtxid={wtxid}) did not spend parent's ephemeral dust"
@@ -11159,9 +11194,41 @@ fn send_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
             } else {
                 error
             }
-        })?
+        })?;
+    }
+    let txid = if node.config.private_broadcast {
+        node.queue_private_broadcast(transaction)?
+    } else {
+        node.accept_transaction_with_ignored_rejects(transaction, &ignore_rejects)
+            .map_err(|error| {
+            if error.to_string() == "transaction is non-standard: missing-ephemeral-spends" {
+                anyhow!(
+                    "missing-ephemeral-spends, tx {txid} (wtxid={wtxid}) did not spend parent's ephemeral dust"
+                )
+            } else {
+                error
+            }
+            })?
     };
     Ok(json!(txid.to_string()))
+}
+
+fn parse_ignore_rejects(value: Option<&Value>) -> Result<HashSet<String>> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(HashSet::new());
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| json_type_error(value, "array"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| json_type_error(value, "string"))
+        })
+        .collect()
 }
 
 fn private_broadcast_info(node: &Arc<Node>) -> Value {
@@ -13614,6 +13681,19 @@ fn package_policy_error(transactions: &[Transaction]) -> Option<&'static str> {
     None
 }
 
+fn package_has_unincluded_mempool_parent(transactions: &[Transaction], mempool: &Mempool) -> bool {
+    let package_txids = transactions
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<HashSet<_>>();
+    transactions.iter().any(|transaction| {
+        transaction.input.iter().any(|input| {
+            mempool.get(&input.previous_output.txid).is_some()
+                && !package_txids.contains(&input.previous_output.txid)
+        })
+    })
+}
+
 fn mempool_reject_reason(error: &MempoolError) -> String {
     error.reject_reason()
 }
@@ -13770,6 +13850,14 @@ fn accepted_transaction_json(
     }
     if include_allowed {
         result.insert("allowed".to_owned(), Value::Bool(true));
+        result.insert(
+            "usage".to_owned(),
+            json!(
+                mempool
+                    .entry_dynamic_memory_usage(&txid)
+                    .unwrap_or_default()
+            ),
+        );
     }
     result.insert("vsize".to_owned(), json!(entry.vsize));
     let mut fees = json!({"base": sat_to_btc(entry.fee_sat)});
@@ -14011,20 +14099,15 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
     if raw_transactions.is_empty() || raw_transactions.len() > MAX_PACKAGE_COUNT {
         bail!("Array must contain between 1 and {MAX_PACKAGE_COUNT} transactions.");
     }
-    let max_fee_rate = parse_max_fee_rate(params.get(1))?;
-    // Core accepts this option to suppress selected policy errors while it
-    // still performs the mandatory consensus checks. The native mempool
-    // dry-run below does not expose a policy-bypass mode yet, but accepting
-    // and validating the parameter is important for RPC compatibility; in
-    // particular, reduced-data script limits must remain mandatory here.
-    if let Some(ignore_rejects) = params.get(2).filter(|value| !value.is_null()) {
-        let reasons = ignore_rejects
-            .as_array()
-            .ok_or_else(|| json_type_error(ignore_rejects, "array"))?;
-        if reasons.iter().any(|reason| !reason.is_string()) {
-            bail!("ignore_rejects must be an array of strings")
-        }
-    }
+    let ignore_rejects = parse_ignore_rejects(params.get(2))?;
+    let ignore_max_fee = ignore_rejects
+        .iter()
+        .any(|reason| matches!(reason.as_str(), "max-fee-exceeded" | "absurdly-high-fee"));
+    let max_fee_rate = if ignore_max_fee {
+        None
+    } else {
+        parse_max_fee_rate(params.get(1))?
+    };
     let transactions = raw_transactions
         .iter()
         .map(|raw| {
@@ -14175,22 +14258,11 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         && error != "package-contains-duplicates"
     {
         // Core reports package-wide validation errors as a structured
-        // submitpackage result.  In particular, conflicting inputs are not
-        // an RPC exception: every member is marked as not validated.
+        // submitpackage result.  The package-wide validation pass has no
+        // per-transaction results for these errors.
         return Ok(json!({
             "package_msg": error,
-            "tx-results": transactions
-                .iter()
-                .map(|transaction| {
-                    (
-                        transaction.compute_wtxid().to_string(),
-                        json!({
-                            "txid": transaction.compute_txid().to_string(),
-                            "error": "package-not-validated",
-                        }),
-                    )
-                })
-                .collect::<serde_json::Map<_, _>>(),
+            "tx-results": {},
             "replaced-transactions": [],
         }));
     }
@@ -14202,6 +14274,15 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
 
     let chain = node.chain.read();
     let original_mempool = node.mempool.read().clone();
+    if transactions.len() > 1
+        && package_has_unincluded_mempool_parent(&transactions, &original_mempool)
+    {
+        return Ok(json!({
+            "package_msg": "package-not-child-with-unconfirmed-parents",
+            "tx-results": {},
+            "replaced-transactions": [],
+        }));
+    }
     let mut individual_candidate = original_mempool.clone();
     let before_transactions = original_mempool
         .transactions()
@@ -16526,6 +16607,9 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower == "invalid address or descriptor"
     {
         return -5;
+    }
+    if lower.starts_with("unknown address type ") {
+        return -8;
     }
     if lower == "address does not refer to key" {
         return -3;

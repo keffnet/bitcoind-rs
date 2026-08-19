@@ -2902,6 +2902,28 @@ impl Node {
     }
 
     pub fn accept_transaction(&self, transaction: Transaction) -> Result<Txid> {
+        self.accept_transaction_with_policy(transaction, false)
+    }
+
+    pub fn accept_transaction_with_ignored_rejects(
+        &self,
+        transaction: Transaction,
+        ignore_rejects: &HashSet<String>,
+    ) -> Result<Txid> {
+        let disable_standard_policy = ignore_rejects.iter().any(|reason| {
+            matches!(
+                reason.as_str(),
+                "scriptsig-not-pushonly" | "scriptpubkey" | "bad-txns-input-script-unknown"
+            )
+        });
+        self.accept_transaction_with_policy(transaction, disable_standard_policy)
+    }
+
+    fn accept_transaction_with_policy(
+        &self,
+        transaction: Transaction,
+        disable_standard_policy: bool,
+    ) -> Result<Txid> {
         self.expire_mempool();
         let txid = transaction.compute_txid();
         if let Some(existing) = self
@@ -2918,7 +2940,7 @@ impl Node {
             return Ok(txid);
         }
         let (txid, _) = self
-            .try_accept_transaction(transaction.clone())
+            .try_accept_transaction_with_policy(transaction.clone(), disable_standard_policy)
             .map_err(|error| {
                 let detailed = matches!(
                     &error,
@@ -3512,10 +3534,22 @@ impl Node {
         &self,
         transaction: Transaction,
     ) -> std::result::Result<(Txid, Vec<MempoolChange>), MempoolError> {
+        self.try_accept_transaction_with_policy(transaction, false)
+    }
+
+    fn try_accept_transaction_with_policy(
+        &self,
+        transaction: Transaction,
+        disable_standard_policy: bool,
+    ) -> std::result::Result<(Txid, Vec<MempoolChange>), MempoolError> {
         let (result, changes, current_height) = {
             let chain = self.chain.read();
             let mut mempool = self.mempool.write();
-            let result = mempool.accept(transaction, &chain);
+            let result = if disable_standard_policy {
+                mempool.accept_with_standard_policy_disabled(transaction, &chain)
+            } else {
+                mempool.accept(transaction, &chain)
+            };
             let changes = mempool.take_changes();
             (result, changes, chain.height())
         };

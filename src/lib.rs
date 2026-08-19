@@ -6484,7 +6484,9 @@ impl Node {
                     endpoint.clone(),
                     KnownNetworkAddress {
                         endpoint: endpoint.clone(),
-                        services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+                        services: crate::wire::NODE_NETWORK
+                            | crate::wire::NODE_WITNESS
+                            | crate::wire::NODE_REDUCED_DATA,
                         time: now,
                     },
                 );
@@ -6566,7 +6568,9 @@ impl Node {
                 reported_local_address: None,
                 inbound: false,
                 version: None,
-                services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+                services: crate::wire::NODE_NETWORK
+                    | crate::wire::NODE_WITNESS
+                    | crate::wire::NODE_REDUCED_DATA,
                 user_agent: String::new(),
                 start_height: 0,
                 relay_transactions: true,
@@ -8090,7 +8094,7 @@ impl CoreStartupError {
     fn future() -> Self {
         Self {
             message: concat!(
-                "The block database contains a block which appears to be from the future. ",
+                ": The block database contains a block which appears to be from the future. ",
                 "This may be due to your computer's date and time being set incorrectly. ",
                 "Only rebuild the block database if you are sure that your computer's date ",
                 "and time are correct.\nPlease restart with -reindex or ",
@@ -8103,7 +8107,7 @@ impl CoreStartupError {
     pub(crate) fn witness(height: u32) -> Self {
         Self {
             message: format!(
-                "Witness data for blocks after height {height} requires validation. Please restart with -reindex..\nPlease restart with -reindex or -reindex-chainstate to recover."
+                ": Witness data for blocks after height {height} requires validation. Please restart with -reindex..\nPlease restart with -reindex or -reindex-chainstate to recover."
             ),
         }
     }
@@ -8139,6 +8143,12 @@ mod tests {
     use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
     use clap::Parser;
+
+    #[test]
+    fn core_startup_recovery_errors_have_core_prefix() {
+        assert!(CoreStartupError::future().to_string().starts_with(": "));
+        assert!(CoreStartupError::witness(5).to_string().starts_with(": "));
+    }
 
     #[test]
     fn mempool_stats_follow_core_sampling_boundaries() {

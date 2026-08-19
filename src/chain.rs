@@ -2159,11 +2159,18 @@ impl ChainState {
     }
 
     /// Enable the durable transaction-body sidecar required by the in-process
-    /// Electrum service. It is intentionally separate from Core's txindex:
-    /// only block-hash keyed bodies are retained, and normal block serving
+    /// Electrum service when pruning is active. An unpruned node already has
+    /// every authoritative block body in `BlockStore`, so creating the
+    /// sidecar there would duplicate all transaction data for no benefit.
+    /// The sidecar is intentionally separate from Core's txindex: only
+    /// block-hash keyed bodies are retained, and normal block serving
     /// continues to respect pruning.
     pub fn configure_electrum_index(&mut self, enabled: bool) -> Result<()> {
         if !enabled {
+            self.electrum_store = None;
+            return Ok(());
+        }
+        if !self.is_pruned() {
             self.electrum_store = None;
             return Ok(());
         }
@@ -11098,6 +11105,7 @@ mod tests {
     fn electrum_transaction_sidecar_survives_pruning_and_restart() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_pruning(1).unwrap();
         state.configure_electrum_index(true).unwrap();
         let mut old_block_hash = None;
         let mut old_txid = None;
@@ -11128,6 +11136,7 @@ mod tests {
         let path = directory.path().to_owned();
         drop(state);
         let mut reopened = ChainState::open(Network::Regtest, &path).unwrap();
+        reopened.configure_pruning(1).unwrap();
         reopened.configure_electrum_index(true).unwrap();
         let (transaction, location) = reopened
             .transaction(&old_txid)
@@ -11138,6 +11147,32 @@ mod tests {
         assert_eq!(
             reopened.merkle_branch(&old_txid).unwrap(),
             Some((Vec::new(), 0, 5))
+        );
+    }
+
+    #[test]
+    fn unpruned_electrum_uses_native_blocks_without_a_transaction_sidecar() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_electrum_index(true).unwrap();
+
+        let block = mine_block(&state, 1);
+        let txid = block.txdata[0].compute_txid();
+        state.connect_block(block).unwrap();
+
+        assert!(state.electrum_store.is_none());
+        assert!(
+            !directory
+                .path()
+                .join("indexes/electrum/txblocks.dat")
+                .exists()
+        );
+        assert_eq!(
+            state
+                .electrum_transaction_at_height(1, 0)
+                .unwrap()
+                .expect("native block store transaction"),
+            state.transaction(&txid).unwrap().unwrap().0
         );
     }
 

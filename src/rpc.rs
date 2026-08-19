@@ -2621,6 +2621,7 @@ fn dispatch_method_for_user(
                         "version": peer.version.unwrap_or_default(),
                         "subver": peer.user_agent,
                         "inbound": peer.inbound,
+                        "startingheight": peer.start_height,
                         "bip152_hb_to": peer.bip152_highbandwidth_to,
                         "bip152_hb_from": peer.bip152_highbandwidth_from,
                         "presynced_headers": peer.presynced_headers,
@@ -2642,9 +2643,6 @@ fn dispatch_method_for_user(
                         "transport_protocol_type": peer.transport_protocol_type,
                         "session_id": peer.session_id,
                     });
-                    if node.config.deprecated_rpcs.contains("startingheight") {
-                        info["startingheight"] = json!(peer.start_height);
-                    }
                     if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
                         info["mapped_as"] = json!(mapped_as);
                     }

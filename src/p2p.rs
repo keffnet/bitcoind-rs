@@ -4858,6 +4858,17 @@ async fn serve_peer_loop(
                 {
                     anyhow::bail!("peer does not advertise the required services");
                 }
+                if !node.admit_non_reduced_outbound(peer_id, version.services) {
+                    let count = node.non_reduced_outbound_count();
+                    debug!(
+                        "peer lacks NODE_REDUCED_DATA and already have {count} non-BIP110 outbound peers (limit {}), peer={peer_id}",
+                        node.config.max_stale_outbound()
+                    );
+                    anyhow::bail!(
+                        "peer lacks NODE_REDUCED_DATA and already have {count} non-BIP110 outbound peers (limit {})",
+                        node.config.max_stale_outbound()
+                    );
+                }
                 if private_broadcast_version {
                     *peer_state.private_broadcast_peer.lock() = true;
                 }

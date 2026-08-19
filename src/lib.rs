@@ -1361,6 +1361,16 @@ impl PeerInfo {
     }
 }
 
+fn is_non_reduced_outbound(peer: &PeerInfo, services: u64) -> bool {
+    !peer.inbound
+        && !peer.manual
+        && matches!(
+            peer.connection_type,
+            "outbound-full" | "block-relay-only" | "addr-fetch"
+        )
+        && services & crate::wire::NODE_REDUCED_DATA == 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct IpSubnet {
     address: IpAddr,
@@ -1620,6 +1630,11 @@ pub struct Node {
     /// stale between reading the active tip and connecting the mined block.
     pub(crate) mining_lock: Mutex<()>,
     pub peer_count: AtomicUsize,
+    /// Number of automatic outbound peers that completed admission without
+    /// advertising NODE_REDUCED_DATA. Core limits this class separately from
+    /// the ordinary connection count because these peers may follow stale
+    /// consensus rules.
+    non_reduced_outbound_count: AtomicUsize,
     mempool_check_operations: AtomicUsize,
     block_index_check_operations: AtomicUsize,
     addrman_check_operations: AtomicUsize,
@@ -2174,6 +2189,7 @@ impl Node {
             banlist_recreated: !banlist_exists,
             mining_lock: Mutex::new(()),
             peer_count: AtomicUsize::new(0),
+            non_reduced_outbound_count: AtomicUsize::new(0),
             mempool_check_operations: AtomicUsize::new(0),
             block_index_check_operations: AtomicUsize::new(0),
             addrman_check_operations: AtomicUsize::new(0),
@@ -3800,6 +3816,33 @@ impl Node {
 
     pub fn peer_count(&self) -> usize {
         self.peer_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn non_reduced_outbound_count(&self) -> usize {
+        self.non_reduced_outbound_count.load(Ordering::Acquire)
+    }
+
+    /// Admit an automatic outbound peer that lacks NODE_REDUCED_DATA.
+    ///
+    /// The peer table write lock covers the counter reservation so a
+    /// simultaneous disconnect cannot let two handshakes pass the limit.
+    /// Manual connections and inbound/feeler/private-broadcast connections
+    /// are deliberately outside this Core limit.
+    pub(crate) fn admit_non_reduced_outbound(&self, id: usize, services: u64) -> bool {
+        let mut peers = self.peers.write();
+        let Some(peer) = peers.get_mut(&id) else {
+            return false;
+        };
+        if peer.version.is_some() || !is_non_reduced_outbound(peer, services) {
+            return true;
+        }
+        let count = self.non_reduced_outbound_count.load(Ordering::Acquire);
+        if count >= self.config.max_stale_outbound() {
+            return false;
+        }
+        self.non_reduced_outbound_count
+            .fetch_add(1, Ordering::AcqRel);
+        true
     }
 
     pub(crate) fn begin_rpc_command(&self, method: &str) -> usize {
@@ -5897,7 +5940,17 @@ impl Node {
     }
 
     pub fn unregister_peer(&self, id: usize) {
-        let endpoint = self.peers.write().remove(&id).map(|peer| peer.endpoint);
+        let endpoint = {
+            let mut peers = self.peers.write();
+            let removed = peers.remove(&id);
+            if removed.as_ref().is_some_and(|peer| {
+                peer.version.is_some() && is_non_reduced_outbound(peer, peer.services)
+            }) {
+                self.non_reduced_outbound_count
+                    .fetch_sub(1, Ordering::AcqRel);
+            }
+            removed.map(|peer| peer.endpoint)
+        };
         debug!("Cleared nodestate for peer={id}");
         self.peer_commands.write().remove(&id);
         let replacement = self.release_headers_sync_peer(id);
@@ -8024,6 +8077,51 @@ mod tests {
         assert!(Node::open(test_config(directory.path())).is_err());
         drop(node);
         assert!(Node::open(test_config(directory.path())).is_ok());
+    }
+
+    #[test]
+    fn limits_automatic_outbound_peers_without_reduced_data_service() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let services = crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS;
+
+        for id in 1..=8 {
+            node.register_peer(
+                id,
+                format!("192.0.2.{id}:18444").parse().unwrap(),
+                false,
+                sender.clone(),
+            );
+            assert!(node.admit_non_reduced_outbound(id, services));
+            node.update_peer_version(id, 70016, services, "/stale/", 0, true);
+        }
+        assert_eq!(node.non_reduced_outbound_count(), 8);
+
+        node.register_peer(9, "192.0.2.9:18444".parse().unwrap(), false, sender.clone());
+        assert!(!node.admit_non_reduced_outbound(9, services));
+
+        node.unregister_peer(1);
+        assert_eq!(node.non_reduced_outbound_count(), 7);
+        assert!(node.admit_non_reduced_outbound(9, services));
+        node.update_peer_version(9, 70016, services, "/stale/", 0, true);
+
+        // Manual connections are not counted against Core's automatic stale
+        // peer limit.
+        node.register_peer_with_endpoint(
+            10,
+            crate::address::NetworkEndpoint::from_socket("192.0.2.10:18444".parse().unwrap()),
+            false,
+            sender,
+            PeerRegistrationOptions {
+                local_address: None,
+                permissions: PeerPermissions::empty(),
+                connection_type: "outbound-full",
+                manual: true,
+            },
+        );
+        assert!(node.admit_non_reduced_outbound(10, services));
+        assert_eq!(node.non_reduced_outbound_count(), 8);
     }
 
     #[cfg(unix)]

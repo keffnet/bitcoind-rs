@@ -56,6 +56,7 @@ pub const DEFAULT_I2P_ACCEPT_INCOMING: bool = true;
 pub const DEFAULT_MAX_RECEIVE_BUFFER_KB: u64 = 5_000;
 pub const DEFAULT_MAX_SEND_BUFFER_KB: u64 = 1_000;
 pub const DEFAULT_BAN_TIME_SECS: u64 = 24 * 60 * 60;
+pub const DEFAULT_MAX_STALE_OUTBOUND: i64 = 8;
 pub const DEFAULT_CLUSTER_COUNT: usize = 64;
 pub const MAX_CLUSTER_COUNT_LIMIT: usize = 64;
 pub const DEFAULT_CLUSTER_SIZE_KVB: u64 = 101;
@@ -1576,8 +1577,9 @@ pub struct Args {
     #[arg(long = "rpcwhitelist", value_name = "USER:METHOD[,METHOD]")]
     pub rpc_whitelist: Vec<String>,
 
-    /// Re-enable selected RPC fields deprecated by Core, such as
-    /// `startingheight` and the legacy string-shaped `warnings` field.
+    /// Re-enable selected RPC fields deprecated by Core, such as the legacy
+    /// string-shaped `warnings` field. `startingheight` remains unconditional
+    /// in Core v31.1 and is accepted as a harmless compatibility value.
     #[arg(long = "deprecatedrpc", value_name = "METHOD", value_delimiter = ',')]
     pub deprecated_rpc: Vec<String>,
 
@@ -1765,6 +1767,11 @@ pub struct Args {
 
     #[arg(long = "bantime", default_value_t = DEFAULT_BAN_TIME_SECS)]
     pub ban_time: u64,
+
+    /// Maximum automatic outbound peers that do not advertise
+    /// NODE_REDUCED_DATA. Manual connections are exempt, matching Core.
+    #[arg(long = "maxstaleoutbound", default_value_t = DEFAULT_MAX_STALE_OUTBOUND)]
+    pub max_stale_outbound: i64,
 
     /// Maximum per-peer receive socket buffer in units of 1000 bytes.
     #[arg(long = "maxreceivebuffer", default_value_t = DEFAULT_MAX_RECEIVE_BUFFER_KB)]
@@ -3097,6 +3104,8 @@ pub struct Config {
     pub signet_seed_nodes: Vec<String>,
     pub deployment_parameters: Option<DeploymentParameters>,
     pub max_peers: usize,
+    #[cfg(not(test))]
+    pub max_stale_outbound: usize,
     pub max_receive_buffer: u32,
     pub max_send_buffer: u32,
     pub max_upload_target: u64,
@@ -3231,6 +3240,17 @@ fn parse_truc_policy(value: Option<&str>) -> Result<TrucPolicy> {
 }
 
 impl Config {
+    pub(crate) fn max_stale_outbound(&self) -> usize {
+        #[cfg(test)]
+        {
+            DEFAULT_MAX_STALE_OUTBOUND as usize
+        }
+        #[cfg(not(test))]
+        {
+            self.max_stale_outbound
+        }
+    }
+
     pub fn settings_path(&self) -> Option<&Path> {
         self.settings_path.as_deref()
     }
@@ -3961,6 +3981,8 @@ impl Config {
             signet_seed_nodes,
             deployment_parameters: Some(deployment_parameters),
             max_peers: args.max_peers,
+            #[cfg(not(test))]
+            max_stale_outbound: args.max_stale_outbound.clamp(0, i64::from(u32::MAX)) as usize,
             max_receive_buffer,
             max_send_buffer,
             max_upload_target,

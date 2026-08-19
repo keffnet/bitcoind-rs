@@ -755,6 +755,12 @@ impl RpcClient {
                 "Authorization failed: Incorrect rpcuser or rpcpassword".to_owned(),
             ));
         }
+        if status == 503 {
+            let message = String::from_utf8_lossy(response_body)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned();
+            return Err(Failure::local(format!("Server response: {message}")));
+        }
         if response_body.is_empty() {
             return Err(Failure::connection("no response from server"));
         }

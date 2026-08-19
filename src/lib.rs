@@ -5067,12 +5067,15 @@ impl Node {
         let Some(height) = self.chain.read().block_height_by_hash(&hash) else {
             return false;
         };
-        if let Some(peer) = self.peers.write().get_mut(&peer_id)
-            && !peer
-                .inflight_blocks
+        let mut peers = self.peers.write();
+        if peers.values().any(|peer| {
+            peer.inflight_blocks
                 .iter()
                 .any(|inflight| inflight.hash == hash)
-        {
+        }) {
+            return false;
+        }
+        if let Some(peer) = peers.get_mut(&peer_id) {
             if enforce_limit && peer.inflight_blocks.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER {
                 return false;
             }
@@ -9112,6 +9115,27 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first.block_hash(), second.block_hash()]
         );
+    }
+
+    #[test]
+    fn block_download_request_reservation_is_global() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 3);
+        node.chain
+            .write()
+            .accept_headers(std::slice::from_ref(&first.header))
+            .unwrap();
+
+        let (sender_one, _receiver_one) = tokio::sync::mpsc::unbounded_channel();
+        let (sender_two, _receiver_two) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender_one);
+        node.register_peer(2, "192.0.2.2:18444".parse().unwrap(), false, sender_two);
+
+        assert!(node.track_peer_block_request(1, first.block_hash()));
+        assert!(!node.track_peer_block_request(2, first.block_hash()));
+        node.clear_peer_block_request(1, first.block_hash());
+        assert!(node.track_peer_block_request(2, first.block_hash()));
     }
 
     #[test]

@@ -5696,13 +5696,27 @@ async fn serve_peer_loop(
                 };
                 let forced_compact_body = pending_compact_body_request.take();
                 if !requests.is_empty() {
-                    for request in &requests {
-                        // A duplicate INV can race a connecting headers
-                        // announcement from another peer. Prefer the peer
-                        // that supplied the headers, as Core's direct-fetch
-                        // path does, instead of leaving the body owned by
-                        // the stale inventory announcer.
-                        node.clear_other_peer_block_requests(peer_id, request.hash);
+                    // Reassign a single compact direct-fetch candidate to the
+                    // peer that announced it, but keep a multi-block
+                    // headers-first window owned by its existing peers.  A
+                    // headers response can arrive from several peers at
+                    // once; moving the whole window for each response
+                    // creates duplicate block downloads and breaks Core's
+                    // bounded in-flight accounting.
+                    if requests.len() == 1
+                        && matches!(
+                            requests.first().map(|request| request.kind),
+                            Some(InventoryType::CompactBlock)
+                        )
+                    {
+                        for request in &requests {
+                            // A duplicate INV can race a connecting headers
+                            // announcement from another peer. Prefer the peer
+                            // that supplied the headers, as Core's direct-fetch
+                            // path does, instead of leaving the body owned by
+                            // the stale inventory announcer.
+                            node.clear_other_peer_block_requests(peer_id, request.hash);
+                        }
                     }
                     queue_block_requests(&mut pending_block_requests, requests);
                     flush_pending_block_requests(

@@ -871,6 +871,7 @@ pub struct ChainState {
     max_tip_age_secs: u64,
     script_check_workers: usize,
     script_checks_enabled: bool,
+    script_check_log_state: Mutex<Option<&'static str>>,
     signet_challenge: Option<Vec<u8>>,
     deployment_parameters: validation::DeploymentParameters,
     pub store: BlockStore,
@@ -1527,6 +1528,7 @@ impl ChainState {
             max_tip_age_secs: MAX_TIP_AGE_SECS,
             script_check_workers: script_check_workers(DEFAULT_SCRIPT_CHECK_THREADS),
             script_checks_enabled: script_check_workers(DEFAULT_SCRIPT_CHECK_THREADS) > 0,
+            script_check_log_state: Mutex::new(None),
             signet_challenge: (network == Network::Signet).then(|| {
                 signet_challenge
                     .map(ToOwned::to_owned)
@@ -5703,7 +5705,12 @@ impl ChainState {
             );
             self.assign_header_sequence_id(hash);
             self.assign_block_sequence_id(hash);
-            if chain_work > self.tip().work {
+            // A headers-first download can deliver this body before an
+            // earlier body on the same higher-work branch.  Keep the body
+            // indexed and defer activation until the missing ancestor
+            // arrives; the body is not invalid merely because the candidate
+            // chain is temporarily incomplete.
+            if chain_work > self.tip().work && !self.candidate_chain_has_missing_body(hash) {
                 self.store.flush()?;
                 self.flush_transaction_index_store()?;
                 if let Some(store) = self.electrum_store.as_mut() {
@@ -5857,7 +5864,12 @@ impl ChainState {
         );
         self.assign_header_sequence_id(hash);
         self.assign_block_sequence_id(hash);
-        if chain_work > self.tip().work {
+        // The candidate may have more work than the active chain while an
+        // earlier body in its headers-first path is still outstanding.  Its
+        // body is already durable, so leave it as a valid side-chain
+        // candidate and let process_known_children activate it once the path
+        // becomes complete.
+        if chain_work > self.tip().work && !self.candidate_chain_has_missing_body(hash) {
             self.store.flush()?;
             self.flush_transaction_index_store()?;
             if let Some(store) = self.electrum_store.as_mut() {
@@ -5917,6 +5929,32 @@ impl ChainState {
     }
 
     fn process_known_children(&mut self, parent_hash: BlockHash) {
+        if parent_hash == self.best_hash() {
+            let best = self.best_valid_tip_hash();
+            let mut cursor = best;
+            let mut suffix_len = 0usize;
+            while let Some(hash) = cursor {
+                if self.is_active_block(&hash) {
+                    break;
+                }
+                suffix_len = suffix_len.saturating_add(1);
+                cursor = self
+                    .block_index
+                    .get(&hash)
+                    .map(|node| node.header.prev_blockhash);
+            }
+            if best.as_ref().is_some_and(|hash| {
+                *hash != self.best_hash()
+                    && self.is_descendant_or_self(hash, &parent_hash)
+                    && suffix_len >= MIN_SUFFIX_ACTIVATION_BLOCKS
+            }) && let Some(hash) = best
+                && self.activate_chain(hash).is_ok()
+                && self.best_hash() == hash
+            {
+                return;
+            }
+        }
+
         let mut children: Vec<BlockHash> = self
             .block_index
             .iter()
@@ -5944,6 +5982,22 @@ impl ChainState {
                 continue;
             };
             let _ = self.connect_block_with_existing_body(child, true, false);
+        }
+    }
+
+    fn candidate_chain_has_missing_body(&self, tip_hash: BlockHash) -> bool {
+        let mut cursor = tip_hash;
+        loop {
+            if self.is_active_block(&cursor) {
+                return false;
+            }
+            if !self.store.contains(&cursor) {
+                return true;
+            }
+            let Some(node) = self.block_index.get(&cursor) else {
+                return true;
+            };
+            cursor = node.header.prev_blockhash;
         }
     }
 
@@ -6262,12 +6316,17 @@ impl ChainState {
     ) -> Result<BlockApplication> {
         let script_check_reason = self.script_check_reason(block, height);
         let block_hash = block.block_hash();
-        if let Some(reason) = script_check_reason {
+        let log_script_enable = {
+            let mut previous = self.script_check_log_state.lock();
+            let should_log = script_check_reason.is_some() && previous.is_none();
+            *previous = script_check_reason;
+            should_log
+        };
+        if log_script_enable {
+            let reason = script_check_reason.expect("script-check log state is enabled");
             tracing::info!(
                 "Enabling script verification at block #{height} ({block_hash}): {reason}."
             );
-        } else {
-            tracing::info!("Disabling script verification at block #{height} ({block_hash}).");
         }
         let skip_script_checks = self.should_skip_script_checks(block, height);
         self.validate_block_transactions_with_options(
@@ -6715,7 +6774,7 @@ impl ChainState {
         } else {
             self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?
         };
-        self.cache_block_undo(block, &application.spent_entries)?;
+        self.cache_block_undo(block, &application.spent_entries, persist)?;
         let previous_filter_header = self
             .basic_filter_for_block(&previous)?
             .map(|(_, header)| header)
@@ -7293,7 +7352,6 @@ impl ChainState {
                 })
             })
             .collect::<Result<Vec<Block>>>()?;
-
         let old_active_chain = std::mem::take(&mut self.active_chain);
         let old_segwit_validated_blocks = self.segwit_validated_blocks.clone();
         let old_headers = std::mem::take(&mut self.headers);
@@ -7390,6 +7448,7 @@ impl ChainState {
                     )?;
                 }
             }
+            self.store.flush()?;
             self.persist_metadata()?;
             self.persist_snapshot()
         })();
@@ -7712,6 +7771,7 @@ impl ChainState {
         &mut self,
         block: &Block,
         spent_entries: &[(OutPoint, UtxoEntry)],
+        sync: bool,
     ) -> Result<()> {
         let mut undo = vec![Vec::new()];
         let mut offset = 0usize;
@@ -7733,7 +7793,11 @@ impl ChainState {
         if offset != spent_entries.len() {
             bail!("block undo contains unexpected spent outputs")
         }
-        self.store.insert_undo(block.block_hash(), &undo)?;
+        if sync {
+            self.store.insert_undo(block.block_hash(), &undo)?;
+        } else {
+            self.store.insert_undo_unsynced(block.block_hash(), &undo)?;
+        }
         self.remember_block_undo(block.block_hash(), undo);
         Ok(())
     }
@@ -9371,6 +9435,7 @@ fn open_background_replay_state(
         max_tip_age_secs: MAX_TIP_AGE_SECS,
         script_check_workers,
         script_checks_enabled: script_check_workers > 0,
+        script_check_log_state: Mutex::new(None),
         signet_challenge,
         deployment_parameters,
         store,
@@ -12600,6 +12665,28 @@ mod tests {
 
         state.connect_block(parent).unwrap();
         assert_eq!(state.best_hash(), child_hash);
+    }
+
+    #[test]
+    fn defers_higher_work_activation_until_headers_first_path_is_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let child = mine_block_from_header(&parent.header, 2, 14);
+        let grandchild = mine_block_from_header(&child.header, 3, 15);
+
+        state
+            .accept_headers(&[parent.header, child.header, grandchild.header])
+            .unwrap();
+        assert!(state.connect_block_from_peer(child.clone()).is_err());
+        assert!(state.connect_block_from_peer(grandchild.clone()).is_ok());
+        assert!(state.store.contains(&child.block_hash()));
+        assert!(state.store.contains(&grandchild.block_hash()));
+        assert_eq!(state.height(), 0);
+
+        state.connect_block_from_peer(parent).unwrap();
+        assert_eq!(state.best_hash(), grandchild.block_hash());
+        assert_eq!(state.height(), 3);
     }
 
     #[test]

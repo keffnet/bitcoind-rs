@@ -724,6 +724,22 @@ impl BlockStore {
     }
 
     pub fn insert_undo(&mut self, hash: BlockHash, undo: &[Vec<TxOut>]) -> Result<()> {
+        self.insert_undo_with_sync(hash, undo, true)
+    }
+
+    /// Append undo data without forcing a filesystem sync for every record.
+    /// Chain activation writes a complete candidate suffix as one batch and
+    /// flushes the store after the new active state is durable.
+    pub fn insert_undo_unsynced(&mut self, hash: BlockHash, undo: &[Vec<TxOut>]) -> Result<()> {
+        self.insert_undo_with_sync(hash, undo, false)
+    }
+
+    fn insert_undo_with_sync(
+        &mut self,
+        hash: BlockHash,
+        undo: &[Vec<TxOut>],
+        sync: bool,
+    ) -> Result<()> {
         if self.undo_index.contains_key(&hash) {
             return Ok(());
         }
@@ -736,12 +752,15 @@ impl BlockStore {
         record.extend_from_slice(&bytes);
         self.xor_key.apply(&mut record, offset);
         self.undo_file.write_all(&record)?;
-        self.undo_file.sync_data()?;
-        persist_index_entry(
+        if sync {
+            self.undo_file.sync_data()?;
+        }
+        persist_index_entry_with_sync(
             &mut self.undo_index_file,
             offset + 4 + bytes.len() as u64,
             hash,
             Record { offset, length },
+            sync,
         )?;
         self.undo_index.insert(hash, Record { offset, length });
         Ok(())

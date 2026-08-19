@@ -4546,9 +4546,16 @@ fn parse_rpc_auth(
         });
     }
     for value in values {
-        let (username, salt_and_hash) = value
+        let (username, salt_and_hash_and_restriction) = value
             .split_once(':')
             .ok_or_else(|| anyhow::anyhow!("invalid --rpcauth value; expected USER:SALT$HASH"))?;
+        // Core permits an optional third, wallet-restriction field after the
+        // hashed credential. Wallets are not implemented by this daemon, but
+        // the suffix must still be accepted so wallet-free RPC authentication
+        // remains compatible with Core configuration files.
+        let salt_and_hash = salt_and_hash_and_restriction
+            .split_once(':')
+            .map_or(salt_and_hash_and_restriction, |(value, _)| value);
         let (salt, encoded_hash) = salt_and_hash
             .split_once('$')
             .ok_or_else(|| anyhow::anyhow!("invalid --rpcauth value; expected USER:SALT$HASH"))?;

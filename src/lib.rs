@@ -7270,6 +7270,11 @@ impl Node {
     ) -> Result<()> {
         let startup_services = 4 + usize::from(!self.config.ipc_bind.is_empty());
         let startup = startup_sender.map(|sender| StartupLatch::new(sender, startup_services));
+        if let Some(assume_valid) = self.config.assume_valid {
+            info!("Assuming ancestors of block {assume_valid} have valid signatures.");
+        } else {
+            info!("Validating signatures for all blocks.");
+        }
         info!("SetNetworkActive: {}", self.network_active());
         if self.banlist_recreated {
             info!("Recreating the banlist database");
@@ -8101,7 +8106,7 @@ impl CoreStartupError {
     fn future() -> Self {
         Self {
             message: concat!(
-                ": The block database contains a block which appears to be from the future. ",
+                "The block database contains a block which appears to be from the future. ",
                 "This may be due to your computer's date and time being set incorrectly. ",
                 "Only rebuild the block database if you are sure that your computer's date ",
                 "and time are correct.\nPlease restart with -reindex or ",
@@ -8114,7 +8119,7 @@ impl CoreStartupError {
     pub(crate) fn witness(height: u32) -> Self {
         Self {
             message: format!(
-                ": Witness data for blocks after height {height} requires validation. Please restart with -reindex..\nPlease restart with -reindex or -reindex-chainstate to recover."
+                "Witness data for blocks after height {height} requires validation. Please restart with -reindex..\nPlease restart with -reindex or -reindex-chainstate to recover."
             ),
         }
     }
@@ -8152,9 +8157,15 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn core_startup_recovery_errors_have_core_prefix() {
-        assert!(CoreStartupError::future().to_string().starts_with(": "));
-        assert!(CoreStartupError::witness(5).to_string().starts_with(": "));
+    fn core_startup_recovery_errors_match_core_messages() {
+        assert!(CoreStartupError::future().to_string().starts_with(
+            "The block database contains a block which appears to be from the future."
+        ));
+        assert!(
+            CoreStartupError::witness(5)
+                .to_string()
+                .starts_with("Witness data for blocks after height 5 requires validation.")
+        );
     }
 
     #[test]

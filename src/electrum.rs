@@ -223,7 +223,6 @@ struct ElectrumSession {
     protocol_version: ProtocolVersion,
     version_negotiated: bool,
     request_seen: bool,
-    peers_subscribed: bool,
     peer_address: Option<SocketAddr>,
 }
 
@@ -233,7 +232,6 @@ impl Default for ElectrumSession {
             protocol_version: MIN_PROTOCOL_VERSION,
             version_negotiated: false,
             request_seen: false,
-            peers_subscribed: false,
             peer_address: None,
         }
     }
@@ -304,7 +302,6 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     let mut reader = BufReader::new(read_half);
     let mut events = node.subscribe_chain();
     let mut mempool_events = node.subscribe_mempool();
-    let mut electrum_peer_events = node.subscribe_electrum_peers();
     let mut line = Vec::new();
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
     let mut session = ElectrumSession {
@@ -372,21 +369,6 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                             .await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
-                }
-            }
-            event = electrum_peer_events.recv(), if session.peers_subscribed => {
-                match event {
-                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let notification = json!({
-                            "jsonrpc": "2.0",
-                            "method": "server.peers.subscribe",
-                            "params": [server_peers_for_protocol(&node, session.protocol_version)],
-                        });
-                        let mut encoded = serde_json::to_vec(&notification)?;
-                        encoded.push(b'\n');
-                        write_half.write_all(&encoded).await?;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => continue,
                 }
             }
             read = read_line_limited(&mut reader, &mut line, MAX_LINE_SIZE) => {
@@ -536,9 +518,6 @@ fn process_electrum_request(
     }
     if method == "blockchain.numblocks.subscribe" && result.is_ok() {
         *numblocks_subscribed = true;
-    }
-    if method == "server.peers.subscribe" && result.is_ok() {
-        session.peers_subscribed = true;
     }
     if is_notification {
         return Ok(None);
@@ -1093,10 +1072,7 @@ fn server_add_peer(
     let Some(peer) = ElectrumPeer::from_features(node, features, peer_address)? else {
         return Ok(Value::Bool(false));
     };
-    let changed = node.electrum_peers.lock().insert(peer);
-    if changed {
-        let _ = node.electrum_peer_events.send(());
-    }
+    node.electrum_peers.lock().insert(peer);
     Ok(Value::Bool(true))
 }
 
@@ -2873,7 +2849,6 @@ mod tests {
         peer_features["hosts"] = json!({
             "192.0.2.55": {"tcp_port": 50002, "ssl_port": null}
         });
-        let mut peer_events = node.subscribe_electrum_peers();
         assert_eq!(
             dispatch_with_session(
                 &node,
@@ -2885,7 +2860,6 @@ mod tests {
             .unwrap(),
             json!(true)
         );
-        assert!(peer_events.try_recv().is_ok());
         assert_eq!(
             dispatch_with_session(
                 &node,
@@ -3604,6 +3578,54 @@ mod tests {
         assert_eq!(response.as_array().map(Vec::len), Some(1));
         assert_eq!(response[0]["id"], json!(3));
         assert_eq!(response[0]["result"]["protocol_min"], json!("1.4"));
+
+        line.clear();
+        reader
+            .get_mut()
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":11,"method":"server.peers.subscribe","params":[]}
+"#,
+            )
+            .await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["id"], json!(11));
+        assert_eq!(response["result"], json!([]));
+
+        let genesis_hash = node.chain.read().block_hash(0).unwrap().to_string();
+        let peer_features = json!({
+            "server_version": "test-peer",
+            "protocol_min": "1.4",
+            "protocol_max": "1.7",
+            "genesis_hash": genesis_hash,
+            "hosts": {"192.0.2.55": {"tcp_port": 50002, "ssl_port": null}}
+        });
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "server.add_peer",
+            "params": [peer_features]
+        });
+        line.clear();
+        let mut request = serde_json::to_vec(&request)?;
+        request.push(b'\n');
+        reader.get_mut().write_all(&request).await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["id"], json!(12));
+        assert_eq!(response["result"], json!(true));
+
+        line.clear();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reader.read_until(b'\n', &mut line),
+        )
+        .await
+        {
+            Err(_) => {}
+            Ok(Ok(_)) => panic!("server.peers.subscribe emitted a notification"),
+            Ok(Err(error)) => return Err(error.into()),
+        }
 
         line.clear();
         reader.get_mut().write_all(b"{\n").await?;

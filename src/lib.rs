@@ -4622,7 +4622,7 @@ impl Node {
         i64::from(header.time) > now.saturating_sub(spacing.saturating_mul(20))
     }
 
-    fn uses_addrman_outgoing(&self) -> bool {
+    pub(crate) fn uses_addrman_outgoing(&self) -> bool {
         !self.config.connect_disabled && self.config.seed_nodes.is_empty()
     }
 

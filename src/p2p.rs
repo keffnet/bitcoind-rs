@@ -2276,6 +2276,14 @@ impl PeerManager {
                             info!(remembered, "added fixed seed peer addresses");
                         }
                     }
+                    // Core may still query DNS seeds when explicit -connect
+                    // endpoints are combined with -dnsseed=1, but it does
+                    // not let those results open AddrMan-managed automatic
+                    // peers. Keep the discovery table populated without
+                    // changing the explicit connection policy.
+                    if !discovery_node.uses_addrman_outgoing() {
+                        continue;
+                    }
                     let full_attempts = discovery_outbound
                         .automatic_full_attempts
                         .load(Ordering::Acquire);

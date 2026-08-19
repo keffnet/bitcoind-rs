@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
+use bitcoin::hashes::Hash;
 use bitcoin::{Address, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1723,11 +1724,18 @@ fn sort_mempool_records(records: &mut [(Txid, i64)]) {
     records.sort_by(|(left_txid, left_height), (right_txid, right_height)| {
         right_height
             .cmp(left_height)
-            // electrs uses Txid's native ordering here.  Comparing the
-            // displayed string is not equivalent because Bitcoin renders
-            // hashes in reverse byte order; it can invert the order and
-            // consequently change both history responses and status hashes.
-            .then_with(|| left_txid.cmp(right_txid))
+            // The Electrum status algorithm orders equal-height mempool
+            // entries by the human-readable txid. Bitcoin's Txid `Ord`
+            // compares the underlying digest bytes, while Display reverses
+            // those bytes, so compare the bytes in display order without
+            // allocating two temporary hex strings per comparison.
+            .then_with(|| {
+                left_txid
+                    .as_byte_array()
+                    .iter()
+                    .rev()
+                    .cmp(right_txid.as_byte_array().iter().rev())
+            })
     });
 }
 
@@ -2128,7 +2136,7 @@ mod tests {
     }
 
     #[test]
-    fn mempool_records_sort_by_raw_txid_order_not_display_order() {
+    fn mempool_records_sort_by_display_txid_order() {
         let raw_low = Txid::from_byte_array({
             let mut bytes = [0; 32];
             bytes[31] = 1;
@@ -2145,7 +2153,7 @@ mod tests {
         let mut records = vec![(raw_high, 0), (raw_low, 0)];
         sort_mempool_records(&mut records);
 
-        assert_eq!(records, vec![(raw_low, 0), (raw_high, 0)]);
+        assert_eq!(records, vec![(raw_high, 0), (raw_low, 0)]);
     }
 
     #[test]

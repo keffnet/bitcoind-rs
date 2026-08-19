@@ -2115,6 +2115,9 @@ impl Node {
             datacarrier_fullcount: true,
             #[cfg(test)]
             accept_nonstd_datacarrier: false,
+            #[cfg(not(test))]
+            permit_bare_datacarrier: config.permit_bare_datacarrier,
+            #[cfg(test)]
             permit_bare_datacarrier: true,
             permit_bare_multisig: config.permit_bare_multisig,
             require_standard: !config.accept_nonstd_txn,

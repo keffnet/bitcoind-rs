@@ -39,6 +39,7 @@ pub const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
 pub const DEFAULT_MAX_TX_LEGACY_SIGOPS: u64 = 2_500;
 pub const DEFAULT_MAX_DATACARRIER_BYTES: u64 = 83;
 pub const DEFAULT_ACCEPT_DATACARRIER: bool = true;
+pub const DEFAULT_CORE_POLICY: bool = false;
 pub const DEFAULT_PERMIT_BARE_MULTISIG: bool = true;
 pub const MIN_AUTO_PRUNE_TARGET_MIB: u64 = 550;
 pub const DEFAULT_PERSIST_MEMPOOL: bool = true;
@@ -1829,8 +1830,8 @@ pub struct Args {
     #[arg(long)]
     pub blockversion: Option<i32>,
 
-    #[arg(long, default_value = "0.00000001")]
-    pub blockmintxfee: String,
+    #[arg(long)]
+    pub blockmintxfee: Option<String>,
 
     #[arg(long)]
     pub minrelaytxfee: Option<String>,
@@ -1846,50 +1847,63 @@ pub struct Args {
     #[arg(long)]
     pub dustrelayfee: Option<String>,
 
-    #[arg(long = "bytespersigop", default_value_t = DEFAULT_BYTES_PER_SIGOP)]
-    pub bytes_per_sigop: u64,
+    #[arg(long = "bytespersigop")]
+    pub bytes_per_sigop: Option<u64>,
 
-    #[arg(long = "maxtxlegacysigops", default_value_t = DEFAULT_MAX_TX_LEGACY_SIGOPS)]
-    pub max_tx_legacy_sigops: u64,
+    #[arg(long = "maxtxlegacysigops")]
+    pub max_tx_legacy_sigops: Option<u64>,
 
     #[arg(
         long,
-        default_value_t = DEFAULT_ACCEPT_DATACARRIER,
         num_args = 0..=1,
         default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    pub datacarrier: bool,
+    pub datacarrier: Option<bool>,
 
-    #[arg(long, default_value_t = DEFAULT_MAX_DATACARRIER_BYTES)]
-    pub datacarriersize: u64,
+    #[arg(long)]
+    pub datacarriersize: Option<u64>,
 
     #[arg(
         long = "datacarrierfullcount",
-        default_value_t = true,
         num_args = 0..=1,
         default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    pub datacarrier_fullcount: bool,
+    pub datacarrier_fullcount: Option<bool>,
 
     #[arg(
         long = "acceptnonstddatacarrier",
-        default_value_t = false,
         num_args = 0..=1,
         default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    pub accept_nonstd_datacarrier: bool,
+    pub accept_nonstd_datacarrier: Option<bool>,
+
+    #[arg(
+        long = "permitbaredatacarrier",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub permitbare_datacarrier: Option<bool>,
 
     #[arg(
         long,
-        default_value_t = DEFAULT_PERMIT_BARE_MULTISIG,
         num_args = 0..=1,
         default_missing_value = "true",
         value_parser = clap::builder::BoolishValueParser::new()
     )]
-    pub permitbaremultisig: bool,
+    pub permitbaremultisig: Option<bool>,
+
+    #[arg(
+        long = "corepolicy",
+        default_value_t = DEFAULT_CORE_POLICY,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub core_policy: bool,
 
     #[arg(
         long,
@@ -3190,6 +3204,8 @@ pub struct Config {
     pub datacarrier_fullcount: bool,
     #[cfg(not(test))]
     pub accept_nonstd_datacarrier: bool,
+    #[cfg(not(test))]
+    pub permit_bare_datacarrier: bool,
     pub permit_bare_multisig: bool,
     pub peer_bloom_filters: bool,
     pub blocksonly: bool,
@@ -3334,6 +3350,23 @@ impl Config {
     pub fn from_args(mut args: Args) -> Result<Self> {
         if !args.disable_wallet {
             bail!("wallet support is disabled in this build; use --disablewallet=1");
+        }
+        // Core's policy profile is a set of soft defaults: explicit relay
+        // options still win, while omitted options adopt Core's policy
+        // values. Keep this normalization before any fee or policy parsing
+        // so all downstream subsystems observe the same effective settings.
+        if args.core_policy {
+            args.incrementalrelayfee
+                .get_or_insert_with(|| "0.00000100".to_owned());
+            args.blockmintxfee
+                .get_or_insert_with(|| "0.00000001".to_owned());
+            args.accept_nonstd_datacarrier.get_or_insert(true);
+            args.permitbare_datacarrier.get_or_insert(true);
+            args.permitbaremultisig.get_or_insert(true);
+            args.datacarrier_fullcount.get_or_insert(false);
+            args.max_tx_legacy_sigops.get_or_insert(u64::from(u32::MAX));
+            args.mempool_truc
+                .get_or_insert_with(|| "enforce".to_owned());
         }
         if matches!(args.onion_proxy, Some(ProxyEndpoint::Disabled)) {
             args.onion_proxy = None;
@@ -3786,14 +3819,10 @@ impl Config {
                 args.blockreservedweight
             );
         }
+        let blockmintxfee = args.blockmintxfee.as_deref().unwrap_or("0.00000001");
         let block_min_tx_fee_sat_per_kvb =
-            Amount::from_str_in(&args.blockmintxfee, Denomination::Bitcoin)
-                .with_context(|| {
-                    format!(
-                        "decoding --blockmintxfee as BTC/kvB: {}",
-                        args.blockmintxfee
-                    )
-                })?
+            Amount::from_str_in(blockmintxfee, Denomination::Bitcoin)
+                .with_context(|| format!("decoding --blockmintxfee as BTC/kvB: {}", blockmintxfee))?
                 .to_sat();
         let incremental_relay_fee_sat_per_kvb = parse_fee_rate(
             args.incrementalrelayfee.as_deref(),
@@ -3812,9 +3841,12 @@ impl Config {
         };
         let dust_relay_fee_sat_per_kvb =
             parse_fee_rate(args.dustrelayfee.as_deref(), "0.00003000", "--dustrelayfee")?;
-        let max_datacarrier_bytes = args.datacarrier.then_some(
-            usize::try_from(args.datacarriersize)
-                .context("--datacarriersize does not fit usize")?,
+        let datacarrier = args.datacarrier.unwrap_or(DEFAULT_ACCEPT_DATACARRIER);
+        let datacarriersize = args
+            .datacarriersize
+            .unwrap_or(DEFAULT_MAX_DATACARRIER_BYTES);
+        let max_datacarrier_bytes = datacarrier.then_some(
+            usize::try_from(datacarriersize).context("--datacarriersize does not fit usize")?,
         );
         if !args.fast_prune
             && args.prune != 0
@@ -4124,16 +4156,23 @@ impl Config {
             min_relay_tx_fee_sat_per_kvb,
             incremental_relay_fee_sat_per_kvb,
             dust_relay_fee_sat_per_kvb,
-            bytes_per_sigop: args.bytes_per_sigop,
+            bytes_per_sigop: args.bytes_per_sigop.unwrap_or(DEFAULT_BYTES_PER_SIGOP),
             #[cfg(not(test))]
-            max_tx_legacy_sigops: usize::try_from(args.max_tx_legacy_sigops)
-                .context("--maxtxlegacysigops does not fit usize")?,
+            max_tx_legacy_sigops: usize::try_from(
+                args.max_tx_legacy_sigops
+                    .unwrap_or(DEFAULT_MAX_TX_LEGACY_SIGOPS),
+            )
+            .context("--maxtxlegacysigops does not fit usize")?,
             max_datacarrier_bytes,
             #[cfg(not(test))]
-            datacarrier_fullcount: args.datacarrier_fullcount,
+            datacarrier_fullcount: args.datacarrier_fullcount.unwrap_or(true),
             #[cfg(not(test))]
-            accept_nonstd_datacarrier: args.accept_nonstd_datacarrier,
-            permit_bare_multisig: args.permitbaremultisig,
+            accept_nonstd_datacarrier: args.accept_nonstd_datacarrier.unwrap_or(false),
+            #[cfg(not(test))]
+            permit_bare_datacarrier: args.permitbare_datacarrier.unwrap_or(false),
+            permit_bare_multisig: args
+                .permitbaremultisig
+                .unwrap_or(DEFAULT_PERMIT_BARE_MULTISIG),
             peer_bloom_filters: args.peer_bloom_filters.unwrap_or(false),
             blocksonly: args.blocksonly,
             private_broadcast: args.privatebroadcast,

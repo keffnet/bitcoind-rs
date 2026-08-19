@@ -106,8 +106,7 @@ Mining policy follows Core's block-creation options: `--blockmaxweight` defaults
 
 The hidden debug option `--printpriority` logs the modified fee rate and txid for transactions selected into normal mining templates. `--rpcdoccheck` is accepted for Core configuration compatibility; this build has no generated Core RPC documentation schema to validate against.
 
-Relay policy follows Core's fee and standardness switches: `--minrelaytxfee` and `--incrementalrelayfee` default to 100 sat/kvB, `--dustrelayfee` defaults to 3,000 sat/kvB, and `--permitbaremultisig`, `--datacarrier`, and `--datacarriersize` control the corresponding mempool policy checks.
-`--bytespersigop=<n>` sets the sigop-adjusted transaction weight multiplier used by relay and mining; it defaults to Core's 20 bytes per sigop.
+Relay policy follows Core's fee and standardness switches: `--minrelaytxfee` and `--incrementalrelayfee` default to 100 sat/kvB, `--dustrelayfee` defaults to 3,000 sat/kvB, and `--permitbaremultisig`, `--permitbaredatacarrier`, `--datacarrier`, and `--datacarriersize` control the corresponding mempool policy checks. `--corepolicy` applies Core's policy profile as soft defaults while preserving explicitly supplied overrides. `--bytespersigop=<n>` sets the sigop-adjusted transaction weight multiplier used by relay and mining; it defaults to Core's 20 bytes per sigop, and `--maxtxlegacysigops=<n>` controls the aggregate legacy-sigop limit.
 
 `--coinstatsindex` persists incremental UTXO statistics and enables historical `gettxoutsetinfo` queries by block hash or height.
 

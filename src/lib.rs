@@ -603,44 +603,52 @@ fn import_external_block_file(
 ) -> Result<usize> {
     let bytes = fs::read(path).with_context(|| format!("reading block file {}", path.display()))?;
     let magic = wire::network_magic_with_signet_challenge(network, signet_challenge);
-    let mut offset = 0usize;
     let mut blocks = Vec::new();
-    while offset < bytes.len() {
-        let remaining = bytes.len().saturating_sub(offset);
-        if remaining < 8 {
-            bail!(
-                "block file {} ends with an incomplete record header",
-                path.display()
-            );
-        }
-        if bytes[offset..offset + 4] != magic {
-            bail!(
-                "block file {} has unexpected network magic at offset {}",
-                path.display(),
-                offset
-            );
+    let mut offset = 0usize;
+    while offset.saturating_add(magic.len()) <= bytes.len() {
+        // Core's LoadExternalBlockFile scans for the next network marker
+        // instead of requiring a bootstrap file to be a perfectly contiguous
+        // sequence. This accepts padding, copied file fragments, and harmless
+        // garbage before or between records without changing the native
+        // storage format used by this node.
+        let Some(relative_magic) = bytes[offset..]
+            .windows(magic.len())
+            .position(|candidate| candidate == magic.as_slice())
+        else {
+            break;
+        };
+        let record_offset = offset.saturating_add(relative_magic);
+        let header_end = record_offset.saturating_add(8);
+        if header_end > bytes.len() {
+            // A partial record header at EOF is treated as an incomplete
+            // tail, just as Core's buffered importer does.
+            break;
         }
         let length = u32::from_le_bytes(
-            bytes[offset + 4..offset + 8]
+            bytes[record_offset + 4..header_end]
                 .try_into()
                 .expect("record header has four length bytes"),
         ) as usize;
-        if length == 0 || length > MAX_EXTERNAL_BLOCK_RECORD_SIZE {
-            bail!(
-                "block file {} contains an invalid block length {}",
-                path.display(),
-                length
-            );
+        if !(80..=MAX_EXTERNAL_BLOCK_RECORD_SIZE).contains(&length) {
+            // Rewind by one byte so a later occurrence of the magic inside a
+            // malformed record can still be considered as a candidate.
+            offset = record_offset.saturating_add(1);
+            continue;
         }
-        let record_start = offset.saturating_add(8);
+        let record_start = header_end;
         let record_end = record_start.saturating_add(length);
         if record_end > bytes.len() {
-            bail!("block file {} ends with a truncated block", path.display());
+            // Ignore an incomplete final record. A valid prefix is still
+            // useful, and this matches Core's EOF handling for block files.
+            break;
         }
-        let block: Block = deserialize(&bytes[record_start..record_end]).with_context(|| {
-            format!("decoding block at offset {} in {}", offset, path.display())
-        })?;
-        blocks.push(block);
+        match deserialize::<Block>(&bytes[record_start..record_end]) {
+            Ok(block) => blocks.push(block),
+            Err(_) => {
+                offset = record_offset.saturating_add(1);
+                continue;
+            }
+        }
         offset = record_end;
     }
 
@@ -8151,6 +8159,42 @@ mod tests {
         );
         assert!(chain.block(&block.block_hash()).unwrap().is_some());
         assert_eq!(chain.best_hash(), block.block_hash());
+    }
+
+    #[test]
+    fn imports_padded_out_of_order_external_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let first = mine_test_block(chain.header(0).unwrap(), 1, 3);
+        let second = mine_test_block(&first.header, 2, 4);
+        let magic = wire::network_magic(Network::Regtest);
+        let frame = |block: &Block| {
+            let payload = bitcoin::consensus::encode::serialize(block);
+            let mut frame = magic.to_vec();
+            frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            frame.extend_from_slice(&payload);
+            frame
+        };
+
+        // The external importer must scan around non-record bytes, defer the
+        // child until its parent arrives, and ignore an incomplete final
+        // record instead of discarding the valid prefix.
+        let mut framed = vec![0x11, 0x22, 0x33, 0x44, 0x55];
+        framed.extend_from_slice(&frame(&second));
+        framed.extend_from_slice(&[0x91, 0x92, 0x93]);
+        framed.extend_from_slice(&frame(&first));
+        framed.extend_from_slice(&magic);
+        framed.extend_from_slice(&100u32.to_le_bytes());
+        framed.extend_from_slice(&[0xaa; 5]);
+        let path = directory.path().join("padded-external.blk");
+        fs::write(&path, framed).unwrap();
+
+        assert_eq!(
+            import_external_block_file(&mut chain, &path, Network::Regtest, None).unwrap(),
+            2
+        );
+        assert_eq!(chain.height(), 2);
+        assert_eq!(chain.best_hash(), second.block_hash());
     }
 
     #[test]

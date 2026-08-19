@@ -28633,6 +28633,7 @@ mod tests {
 
     #[test]
     fn scanblocks_and_descriptor_activity_find_mined_outputs() {
+        let _mock_time_guard = crate::time::mock_time_test_guard();
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
             network: Network::Regtest,
@@ -28829,7 +28830,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(duplicate_activity["activity"].as_array().unwrap().len(), 1);
-        let previous_mock_time = crate::time::mock_time();
         let tip_time = i64::from(node.chain.read().header(1).unwrap().time);
         crate::time::set_mock_time(tip_time.saturating_add(2 * 24 * 60 * 60));
         let chainstates = get_chain_states(&node).unwrap();
@@ -28842,6 +28842,5 @@ mod tests {
         let blockchain_progress = blockchain_info["verificationprogress"].as_f64().unwrap();
         assert!((chainstate_progress - blockchain_progress).abs() < f64::EPSILON);
         assert!(chainstate_progress < 1.0);
-        crate::time::set_mock_time(previous_mock_time);
     }
 }

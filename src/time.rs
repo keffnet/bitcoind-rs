@@ -5,6 +5,33 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static MOCK_TIME: AtomicI64 = AtomicI64::new(0);
 
+#[cfg(test)]
+static MOCK_TIME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct MockTimeTestGuard {
+    previous: i64,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+pub(crate) fn mock_time_test_guard() -> MockTimeTestGuard {
+    let lock = MOCK_TIME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    MockTimeTestGuard {
+        previous: mock_time(),
+        _lock: lock,
+    }
+}
+
+#[cfg(test)]
+impl Drop for MockTimeTestGuard {
+    fn drop(&mut self) {
+        set_mock_time(self.previous);
+    }
+}
+
 /// Set the process clock used by Bitcoin time-sensitive code. A value of zero
 /// restores the system clock, matching Core's `setmocktime` RPC.
 pub fn set_mock_time(seconds: i64) {
@@ -61,11 +88,10 @@ mod tests {
 
     #[test]
     fn system_millis_ignores_mocktime() {
-        let previous = mock_time();
+        let _guard = mock_time_test_guard();
         set_mock_time(1);
         let system = system_unix_time_millis();
         let mock = unix_time_millis();
-        set_mock_time(previous);
 
         assert_eq!(mock, 1_000);
         assert!(system > mock);

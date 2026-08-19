@@ -417,7 +417,7 @@ impl BlockStore {
         let index = match load_index(&mut index_file, data_len)? {
             Some(index) => index,
             None => {
-                let index = scan_index(&mut file, xor_key)
+                let index = scan_index(&mut file, xor_key, !block_file_read_only)
                     .with_context(|| format!("scanning {}", path.display()))?;
                 rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
                 index
@@ -496,7 +496,7 @@ impl BlockStore {
         let data_len = file.metadata()?.len();
         let index = match load_index(&mut index_file, data_len)? {
             Some(index) => index,
-            None => scan_index(&mut file, xor_key)
+            None => scan_index(&mut file, xor_key, false)
                 .with_context(|| format!("scanning {}", path.display()))?,
         };
 
@@ -4129,7 +4129,11 @@ fn index_layout_is_contiguous(index: &HashMap<BlockHash, Record>, data_len: u64)
     expected_offset == data_len
 }
 
-fn scan_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash, Record>> {
+fn scan_index(
+    file: &mut File,
+    xor_key: XorKey,
+    repair_truncated_tail: bool,
+) -> Result<HashMap<BlockHash, Record>> {
     file.seek(SeekFrom::Start(0))?;
     let mut index = HashMap::new();
     let data_len = file.metadata()?.len();
@@ -4142,8 +4146,10 @@ fn scan_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash, Rec
                 // An exact EOF is already a clean tail. Reindex may have
                 // opened the existing block file read-only, so avoid asking
                 // the descriptor to truncate when there is nothing to trim.
-                if offset < data_len {
+                if offset < data_len && repair_truncated_tail {
                     file.set_len(offset)?;
+                } else if offset < data_len {
+                    bail!("truncated block record at offset {offset}");
                 }
                 break;
             }
@@ -4153,7 +4159,11 @@ fn scan_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash, Rec
         let length = u32::from_le_bytes(length_bytes);
         let end = offset.saturating_add(4).saturating_add(u64::from(length));
         if end > data_len {
-            file.set_len(offset)?;
+            if repair_truncated_tail {
+                file.set_len(offset)?;
+            } else {
+                bail!("truncated block record at offset {offset}");
+            }
             break;
         }
         if length == 0 || length as usize > MAX_STORED_BLOCK_SIZE {

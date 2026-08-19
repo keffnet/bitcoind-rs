@@ -8930,18 +8930,25 @@ mod tests {
             "--blocksdir=external-blocks",
         ])
         .unwrap();
-        let _node = Node::open(Config::from_args(args).unwrap()).unwrap();
+        let node = Node::open(Config::from_args(args).unwrap()).unwrap();
+        let previous = *node.chain.read().header(0).unwrap();
+        node.connect_block(mine_test_block(&previous, 1, 1))
+            .unwrap();
+
+        let external_blocks = directory.path().join("external-blocks/regtest/blocks");
         assert!(
-            directory
-                .path()
-                .join("external-blocks/regtest/blocks/blocks.dat")
-                .exists()
+            external_blocks.join("blocks.dat").exists(),
+            "connected blocks must be written to the configured native blocksdir"
         );
+        for name in ["blk00000.dat", "rev00000.dat"] {
+            assert!(
+                !external_blocks.join(name).exists(),
+                "native blocksdir must not create Core file {name}"
+            );
+        }
         assert!(
-            directory
-                .path()
-                .join("external-blocks/regtest/blocks/xor.dat")
-                .exists()
+            external_blocks.join("xor.dat").exists(),
+            "configured native blocksdir must retain its XOR key"
         );
         assert!(directory.path().join("chainstate.bin").exists());
         assert!(!directory.path().join("blocks/blocks.dat").exists());

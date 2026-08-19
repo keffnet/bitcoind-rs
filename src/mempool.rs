@@ -2494,6 +2494,27 @@ impl Mempool {
             }
             previous_outputs.push(previous.clone());
         }
+        if let Some(activation_height) = chain.reduced_data_active_for_next_block() {
+            validation::validate_reduced_data_output_sizes(&transaction).map_err(|_| {
+                MempoolError::NonStandard("bad-txns-vout-script-toolarge".to_owned())
+            })?;
+            let previous_heights = previous_entries
+                .iter()
+                .map(|entry| entry.height)
+                .collect::<Vec<_>>();
+            validation::validate_reduced_data_input_sizes(
+                &transaction,
+                &previous_outputs,
+                &previous_heights,
+                activation_height,
+            )
+            .map_err(|error| match error {
+                ValidationError::Script { reason, .. } => {
+                    MempoolError::Script(format!("mempool-script-verify-flag-failed ({reason})"))
+                }
+                other => MempoolError::Script(other.to_string()),
+            })?;
+        }
         validation::validate_transaction_finality(
             &transaction,
             serving_height.saturating_add(1),

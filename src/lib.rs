@@ -6173,7 +6173,9 @@ impl Node {
                     endpoint.clone(),
                     KnownNetworkAddress {
                         endpoint: endpoint.clone(),
-                        services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+                        services: crate::wire::NODE_NETWORK
+                            | crate::wire::NODE_WITNESS
+                            | crate::wire::NODE_REDUCED_DATA,
                         time: now,
                     },
                 );
@@ -6255,7 +6257,9 @@ impl Node {
                 reported_local_address: None,
                 inbound: false,
                 version: None,
-                services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+                services: crate::wire::NODE_NETWORK
+                    | crate::wire::NODE_WITNESS
+                    | crate::wire::NODE_REDUCED_DATA,
                 user_agent: String::new(),
                 start_height: 0,
                 relay_transactions: true,

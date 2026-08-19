@@ -16,7 +16,7 @@ use crate::address::NetworkEndpoint;
 use crate::i2p::I2P_SAM_PORT;
 use crate::mempool::{RbfPolicy, TrucPolicy};
 use crate::tor::DEFAULT_TOR_CONTROL_PORT;
-use crate::validation::DeploymentParameters;
+use crate::validation::{self, DeploymentParameters};
 
 pub const DEFAULT_ZMQ_HWM: u32 = 1_000;
 pub const DEFAULT_MAX_MEMPOOL_MB: u64 = 300;
@@ -1900,10 +1900,10 @@ pub struct Args {
     pub test_activation_height: Vec<String>,
 
     /// Override regtest version-bits parameters as
-    /// `deployment:start:end[:min_activation_height]`.
+    /// `deployment:start:end[:min_activation_height[:max_activation_height[:active_duration[:threshold]]]]`.
     #[arg(
         long = "vbparams",
-        value_name = "DEPLOYMENT:START:END[:MIN_ACTIVATION_HEIGHT]",
+        value_name = "DEPLOYMENT:START:END[:MIN_ACTIVATION_HEIGHT[:MAX_ACTIVATION_HEIGHT[:ACTIVE_DURATION[:THRESHOLD]]]]",
         value_delimiter = ',',
         hide = true
     )]
@@ -4199,14 +4199,15 @@ fn parse_deployment_parameters(
 
     for value in version_bits {
         let fields = value.split(':').collect::<Vec<_>>();
-        if !(3..=4).contains(&fields.len()) {
+        if !(3..=7).contains(&fields.len()) {
             bail!(
-                "version bits parameters malformed in '{value}', expected deployment:start:end[:min_activation_height]"
+                "version bits parameters malformed in '{value}', expected deployment:start:end[:min_activation_height[:max_activation_height[:active_duration[:threshold]]]]"
             );
         }
         let deployment = match fields[0] {
             "testdummy" => 0,
             "taproot" => 1,
+            "reduced_data" => 2,
             name => bail!("invalid version bits deployment '{name}'"),
         };
         let start_time = fields[1]
@@ -4223,9 +4224,64 @@ fn parse_deployment_parameters(
         if !(0..=i64::from(u32::MAX)).contains(&min_activation_height) {
             bail!("invalid version bits minimum activation height in '{value}'");
         }
-        parameters.bip9[deployment].start_time = start_time;
-        parameters.bip9[deployment].timeout = timeout;
-        parameters.bip9[deployment].min_activation_height = min_activation_height as u32;
+        let max_activation_height = fields.get(4).map_or(
+            Ok(i64::from(validation::Bip9Deployment::MAX_ACTIVATION_HEIGHT)),
+            |height| {
+                height.parse::<i64>().with_context(|| {
+                    format!("invalid version bits maximum activation height in '{value}'")
+                })
+            },
+        )?;
+        if !(0..=i64::from(u32::MAX)).contains(&max_activation_height) {
+            bail!("invalid version bits maximum activation height in '{value}'");
+        }
+        let active_duration = fields.get(5).map_or(
+            Ok(i64::from(
+                validation::Bip9Deployment::PERMANENT_ACTIVE_DURATION,
+            )),
+            |duration| {
+                duration
+                    .parse::<i64>()
+                    .with_context(|| format!("invalid version bits active duration in '{value}'"))
+            },
+        )?;
+        if !(0..=i64::from(u32::MAX)).contains(&active_duration) {
+            bail!("invalid version bits active duration in '{value}'");
+        }
+        let threshold = fields.get(6).map_or(
+            Ok(i64::from(parameters.bip9[deployment].threshold)),
+            |threshold| {
+                threshold
+                    .parse::<i64>()
+                    .with_context(|| format!("invalid version bits threshold in '{value}'"))
+            },
+        )?;
+        if !(0..=i64::from(u32::MAX)).contains(&threshold) {
+            bail!("invalid version bits threshold in '{value}'");
+        }
+        let deployment_parameters = &mut parameters.bip9[deployment];
+        if timeout != i64::MAX
+            && max_activation_height != i64::from(validation::Bip9Deployment::MAX_ACTIVATION_HEIGHT)
+        {
+            bail!(
+                "Cannot specify both timeout and max_activation_height for deployment '{}'",
+                fields[0]
+            );
+        }
+        if active_duration != i64::from(validation::Bip9Deployment::PERMANENT_ACTIVE_DURATION)
+            && active_duration % i64::from(deployment_parameters.period) != 0
+        {
+            bail!(
+                "active_duration ({active_duration}) must be a multiple of the deployment period ({})",
+                deployment_parameters.period
+            );
+        }
+        deployment_parameters.start_time = start_time;
+        deployment_parameters.timeout = timeout;
+        deployment_parameters.min_activation_height = min_activation_height as u32;
+        deployment_parameters.max_activation_height = max_activation_height as u32;
+        deployment_parameters.active_duration = active_duration as u32;
+        deployment_parameters.threshold = threshold as u32;
     }
 
     Ok(parameters)
@@ -4798,6 +4854,34 @@ mod tests {
         assert_eq!(parameters.bip9[0].timeout, 456);
         assert_eq!(parameters.bip9[0].min_activation_height, 789);
         assert!(parameters.bip94);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--regtest",
+            "--vbparams=reduced_data:0:9223372036854775807:288:2147483647:144:108",
+        ])
+        .unwrap();
+        let parameters = Config::from_args(args)
+            .unwrap()
+            .deployment_parameters
+            .unwrap();
+        assert_eq!(parameters.bip9[2].bit, 4);
+        assert_eq!(parameters.bip9[2].min_activation_height, 288);
+        assert_eq!(parameters.bip9[2].max_activation_height, 2_147_483_647);
+        assert_eq!(parameters.bip9[2].active_duration, 144);
+        assert_eq!(parameters.bip9[2].threshold, 108);
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--regtest",
+            "--vbparams=reduced_data:0:9223372036854775807:0:2147483647:145",
+        ])
+        .unwrap();
+        assert!(Config::from_args(args).is_err());
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

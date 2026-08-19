@@ -14,7 +14,7 @@ use bitcoin::blockdata::witness::Witness;
 use bitcoin::consensus::Params;
 use bitcoin::consensus::encode::{VarInt, deserialize_partial, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
-use bitcoin::opcodes::OP_0;
+use bitcoin::opcodes::{Class, ClassifyContext, OP_0};
 use bitcoin::pow::Target;
 use bitcoin::{
     Amount, Block, BlockHash, Network, OutPoint, Script, Sequence, Transaction, Txid,
@@ -44,6 +44,8 @@ pub struct Bip9Deployment {
     pub start_time: i64,
     pub timeout: i64,
     pub min_activation_height: u32,
+    pub max_activation_height: u32,
+    pub active_duration: u32,
     pub threshold: u32,
     pub period: u32,
 }
@@ -51,6 +53,10 @@ pub struct Bip9Deployment {
 impl Bip9Deployment {
     pub const ALWAYS_ACTIVE_TIME: i64 = -1;
     pub const NEVER_ACTIVE_TIME: i64 = -2;
+    // Core stores these two fields as signed 32-bit integers and uses
+    // INT_MAX as the sentinel for an unbounded deployment.
+    pub const MAX_ACTIVATION_HEIGHT: u32 = i32::MAX as u32;
+    pub const PERMANENT_ACTIVE_DURATION: u32 = i32::MAX as u32;
 
     pub fn is_enabled(self) -> bool {
         self.start_time != Self::NEVER_ACTIVE_TIME
@@ -67,7 +73,7 @@ impl Bip9Deployment {
 pub struct DeploymentParameters {
     pub network: Network,
     pub buried: BuriedDeploymentHeights,
-    pub bip9: [Bip9Deployment; 2],
+    pub bip9: [Bip9Deployment; 3],
     pub bip94: bool,
 }
 
@@ -122,6 +128,13 @@ pub enum ValidationError {
     TooManySigopsInConnect,
     #[error("block version {actual} is below the required version {required}")]
     BadBlockVersion { actual: i32, required: i32 },
+    #[error(
+        "block must signal for {deployment} approaching max_activation_height={max_activation_height}"
+    )]
+    BadVersionBits {
+        deployment: &'static str,
+        max_activation_height: u32,
+    },
     #[error("coinbase transaction is missing or malformed")]
     BadCoinbase,
     #[error("non-coinbase transaction appears in the coinbase position")]
@@ -142,6 +155,8 @@ pub enum ValidationError {
     NegativeOutputValue(Txid),
     #[error("transaction {0} output value is out of range")]
     BadOutputValue(Txid),
+    #[error("transaction {0} output script exceeds ReducedData limits")]
+    ReducedDataOutputTooLarge(Txid),
     #[error("block output total exceeds MAX_MONEY")]
     OutputTotalOverflow,
     #[error("block subsidy and fees cannot be represented")]
@@ -198,6 +213,7 @@ impl ValidationError {
                 | Self::Script { .. }
                 | Self::CoinbaseOverpay { .. }
                 | Self::SubsidyOverflow
+                | Self::ReducedDataOutputTooLarge(_)
         )
     }
 
@@ -226,6 +242,7 @@ impl ValidationError {
             Self::BadBlockVersion { actual, .. } => {
                 format!("bad-version(0x{:08x})", *actual as u32)
             }
+            Self::BadVersionBits { deployment, .. } => format!("bad-version-{deployment}"),
             Self::BadCoinbase => "bad-cb-length".to_owned(),
             Self::FirstTransactionNotCoinbase => "bad-cb-missing".to_owned(),
             Self::ExtraCoinbase(_) => "bad-cb-multiple".to_owned(),
@@ -236,6 +253,7 @@ impl ValidationError {
             Self::DuplicateTransaction(_) => "bad-txns-duplicate".to_owned(),
             Self::NegativeOutputValue(_) => "bad-txns-vout-negative".to_owned(),
             Self::BadOutputValue(_) => "bad-txns-vout-toolarge".to_owned(),
+            Self::ReducedDataOutputTooLarge(_) => "bad-txns-vout-script-toolarge".to_owned(),
             Self::OutputTotalOverflow => "bad-txns-txouttotal-toolarge".to_owned(),
             Self::SubsidyOverflow => "bad-txns-fee-outofrange".to_owned(),
             Self::CoinbaseOverpay { .. } => "bad-cb-amount".to_owned(),
@@ -249,10 +267,203 @@ impl ValidationError {
             Self::NonFinalTransaction => "bad-txns-nonfinal".to_owned(),
             Self::NonFinalSequence => "bad-txns-nonfinal".to_owned(),
             Self::Script { reason, .. } => {
-                format!("block-script-verify-flag-failed ({reason})")
+                format!("mandatory-script-verify-flag-failed ({reason})")
             }
         }
     }
+}
+
+const REDUCED_DATA_MAX_SCRIPT_ELEMENT_SIZE: usize = 256;
+const REDUCED_DATA_MAX_OUTPUT_SCRIPT_SIZE: usize = 34;
+const REDUCED_DATA_MAX_OUTPUT_DATA_SIZE: usize = 83;
+const REDUCED_DATA_TAPROOT_CONTROL_BASE_SIZE: usize = 33;
+const REDUCED_DATA_TAPROOT_CONTROL_NODE_SIZE: usize = 32;
+const REDUCED_DATA_TAPROOT_CONTROL_MAX_SIZE: usize =
+    REDUCED_DATA_TAPROOT_CONTROL_BASE_SIZE + REDUCED_DATA_TAPROOT_CONTROL_NODE_SIZE * 7;
+
+pub(crate) fn validate_reduced_data_output_sizes(
+    transaction: &Transaction,
+) -> Result<(), ValidationError> {
+    for output in &transaction.output {
+        let script = output.script_pubkey.as_bytes();
+        if script.is_empty() {
+            continue;
+        }
+        let limit = if script[0] == 0x6a {
+            REDUCED_DATA_MAX_OUTPUT_DATA_SIZE
+        } else {
+            REDUCED_DATA_MAX_OUTPUT_SCRIPT_SIZE
+        };
+        if script.len() > limit {
+            return Err(ValidationError::ReducedDataOutputTooLarge(
+                transaction.compute_txid(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn reduced_data_script_pushes_fit(script: &Script) -> bool {
+    script.instructions().all(|instruction| match instruction {
+        Ok(Instruction::PushBytes(bytes)) => bytes.len() <= REDUCED_DATA_MAX_SCRIPT_ELEMENT_SIZE,
+        Ok(Instruction::Op(_)) | Err(_) => true,
+    })
+}
+
+fn reduced_data_script_error(transaction: &Transaction, input: usize) -> ValidationError {
+    ValidationError::Script {
+        txid: transaction.compute_txid(),
+        input,
+        reason: "Push value size limit exceeded".to_owned(),
+    }
+}
+
+/// Apply the structural parts of Core's REDUCED_DATA script flag that are not
+/// available through the older libbitcoinconsensus ABI used by this crate.
+/// The caller supplies each spent output's creation height because Core
+/// deliberately exempts UTXOs created before the deployment activated.
+pub(crate) fn validate_reduced_data_input_sizes(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+    previous_heights: &[u32],
+    activation_height: u32,
+) -> Result<(), ValidationError> {
+    for (input_index, ((input, previous_output), previous_height)) in transaction
+        .input
+        .iter()
+        .zip(previous_outputs)
+        .zip(previous_heights)
+        .enumerate()
+    {
+        if *previous_height < activation_height {
+            continue;
+        }
+
+        let script_sig_items = push_only_stack_items(input.script_sig.as_script());
+        if previous_output.script_pubkey.is_p2sh() {
+            if let Some(items) = &script_sig_items {
+                for item in items.iter().take(items.len().saturating_sub(1)) {
+                    if item.len() > REDUCED_DATA_MAX_SCRIPT_ELEMENT_SIZE {
+                        return Err(reduced_data_script_error(transaction, input_index));
+                    }
+                }
+                if let Some(redeem_script) = items.last()
+                    && !reduced_data_script_pushes_fit(Script::from_bytes(redeem_script))
+                {
+                    return Err(reduced_data_script_error(transaction, input_index));
+                }
+            } else if !reduced_data_script_pushes_fit(input.script_sig.as_script()) {
+                return Err(reduced_data_script_error(transaction, input_index));
+            }
+        } else if !reduced_data_script_pushes_fit(input.script_sig.as_script()) {
+            return Err(reduced_data_script_error(transaction, input_index));
+        }
+        if !reduced_data_script_pushes_fit(previous_output.script_pubkey.as_script()) {
+            return Err(reduced_data_script_error(transaction, input_index));
+        }
+
+        let witness_program = if previous_output.script_pubkey.is_witness_program() {
+            Some(previous_output.script_pubkey.clone())
+        } else if previous_output.script_pubkey.is_p2sh() {
+            script_sig_items
+                .as_ref()
+                .and_then(|items| items.last())
+                .map(|redeem| ScriptBuf::from_bytes(redeem.clone()))
+                .filter(|redeem| redeem.is_witness_program())
+        } else {
+            None
+        };
+        let Some(witness_program) = witness_program else {
+            continue;
+        };
+        let witness_items = input.witness.iter().collect::<Vec<_>>();
+        // Core treats the 4-byte Pay-to-Anchor program (v1, program 0x4e73)
+        // as consensus-valid when its witness is empty. It remains subject
+        // to the reduced-data limits when witness items are present.
+        let is_p2a = witness_program.as_bytes() == [0x51, 0x02, 0x4e, 0x73];
+        if is_p2a && witness_items.is_empty() {
+            continue;
+        }
+        if witness_program.is_witness_program()
+            && !witness_program.is_p2wpkh()
+            && !witness_program.is_p2wsh()
+            && !witness_program.is_p2tr()
+        {
+            return Err(reduced_data_script_error(transaction, input_index));
+        } else if witness_program.is_p2wsh() {
+            for item in witness_items
+                .iter()
+                .take(witness_items.len().saturating_sub(1))
+            {
+                if item.len() > REDUCED_DATA_MAX_SCRIPT_ELEMENT_SIZE {
+                    return Err(reduced_data_script_error(transaction, input_index));
+                }
+            }
+            if let Some(witness_script) = witness_items.last()
+                && !reduced_data_script_pushes_fit(Script::from_bytes(witness_script))
+            {
+                return Err(reduced_data_script_error(transaction, input_index));
+            }
+        } else if witness_program.is_p2tr() {
+            if witness_items.len() >= 2 {
+                let script_index = witness_items.len() - 2;
+                let control = witness_items[script_index + 1];
+                if control.len() < REDUCED_DATA_TAPROOT_CONTROL_BASE_SIZE
+                    || control.len() > REDUCED_DATA_TAPROOT_CONTROL_MAX_SIZE
+                    || (control.len() - REDUCED_DATA_TAPROOT_CONTROL_BASE_SIZE)
+                        % REDUCED_DATA_TAPROOT_CONTROL_NODE_SIZE
+                        != 0
+                {
+                    return Err(reduced_data_script_error(transaction, input_index));
+                }
+                for item in witness_items.iter().take(script_index) {
+                    if item.len() > REDUCED_DATA_MAX_SCRIPT_ELEMENT_SIZE {
+                        return Err(reduced_data_script_error(transaction, input_index));
+                    }
+                }
+                let taproot_script = Script::from_bytes(witness_items[script_index]);
+                if !reduced_data_script_pushes_fit(taproot_script) {
+                    return Err(reduced_data_script_error(transaction, input_index));
+                }
+                if control[0] & 0xfe == 0xc0
+                    && (taproot_script.instructions().any(|instruction| {
+                        matches!(
+                            instruction,
+                            Ok(Instruction::Op(op)) if matches!(op.to_u8(), 0x63 | 0x64)
+                        )
+                    }) || reduced_data_tapscript_has_op_success(taproot_script))
+                {
+                    return Err(reduced_data_script_error(transaction, input_index));
+                }
+                if witness_items.len() >= 3
+                    && witness_items[script_index - 1].first() == Some(&0x50)
+                {
+                    return Err(reduced_data_script_error(transaction, input_index));
+                }
+            } else if witness_items
+                .first()
+                .is_some_and(|item| item.len() > REDUCED_DATA_MAX_SCRIPT_ELEMENT_SIZE)
+            {
+                return Err(reduced_data_script_error(transaction, input_index));
+            }
+        } else if witness_items
+            .iter()
+            .any(|item| item.len() > REDUCED_DATA_MAX_SCRIPT_ELEMENT_SIZE)
+        {
+            return Err(reduced_data_script_error(transaction, input_index));
+        }
+    }
+    Ok(())
+}
+
+fn reduced_data_tapscript_has_op_success(script: &Script) -> bool {
+    script.instructions().any(|instruction| {
+        matches!(
+            instruction,
+            Ok(Instruction::Op(opcode))
+                if opcode.classify(ClassifyContext::TapScript) == Class::SuccessOp
+        )
+    })
 }
 
 pub fn network_params(network: Network) -> &'static Params {
@@ -329,13 +540,15 @@ pub fn buried_deployment_heights(network: Network) -> BuriedDeploymentHeights {
     }
 }
 
-pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
+pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 3] {
     let testdummy = match network {
         Network::Regtest => Bip9Deployment {
             bit: 28,
             start_time: 0,
             timeout: i64::MAX,
             min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
             threshold: 108,
             period: 144,
         },
@@ -344,6 +557,8 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
             start_time: Bip9Deployment::NEVER_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
             threshold: 1815,
             period: 2016,
         },
@@ -352,6 +567,8 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
             start_time: Bip9Deployment::NEVER_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
             threshold: 1512,
             period: 2016,
         },
@@ -362,6 +579,8 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
             start_time: 1_619_222_400,
             timeout: 1_628_640_000,
             min_activation_height: 709_632,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
             threshold: 1815,
             period: 2016,
         },
@@ -370,6 +589,8 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
             start_time: 1_619_222_400,
             timeout: 1_628_640_000,
             min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
             threshold: 1512,
             period: 2016,
         },
@@ -378,6 +599,8 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
             start_time: Bip9Deployment::ALWAYS_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
             threshold: 1512,
             period: 2016,
         },
@@ -386,6 +609,8 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
             start_time: Bip9Deployment::ALWAYS_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
             threshold: 1815,
             period: 2016,
         },
@@ -394,11 +619,225 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 2] {
             start_time: Bip9Deployment::ALWAYS_ACTIVE_TIME,
             timeout: i64::MAX,
             min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
             threshold: 108,
             period: 144,
         },
     };
-    [testdummy, taproot]
+    let reduced_data = match network {
+        Network::Bitcoin => Bip9Deployment {
+            bit: 4,
+            start_time: 1_764_547_200,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            max_activation_height: 965_664,
+            active_duration: 52_416,
+            threshold: 1_109,
+            period: 2_016,
+        },
+        Network::Testnet | Network::Testnet4 => Bip9Deployment {
+            bit: 4,
+            start_time: 1_764_547_200,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: 52_416,
+            threshold: 1_109,
+            period: 2_016,
+        },
+        Network::Signet => Bip9Deployment {
+            bit: 4,
+            start_time: Bip9Deployment::NEVER_ACTIVE_TIME,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
+            threshold: 0,
+            period: 2_016,
+        },
+        Network::Regtest => Bip9Deployment {
+            bit: 4,
+            start_time: Bip9Deployment::NEVER_ACTIVE_TIME,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
+            threshold: 0,
+            period: 144,
+        },
+    };
+    [testdummy, taproot, reduced_data]
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Bip9State {
+    Defined,
+    Started,
+    LockedIn,
+    Active,
+    Failed,
+    Expired,
+}
+
+impl Bip9State {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Defined => "defined",
+            Self::Started => "started",
+            Self::LockedIn => "locked_in",
+            Self::Active => "active",
+            Self::Failed => "failed",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+fn median_versionbits_time(headers: &[bitcoin::block::Header], end: usize) -> u32 {
+    let start = end.saturating_sub(10);
+    let mut times = headers[start..=end]
+        .iter()
+        .map(|header| header.time)
+        .collect::<Vec<_>>();
+    times.sort_unstable();
+    times[times.len() / 2]
+}
+
+pub(crate) fn versionbits_signals(header: &bitcoin::block::Header, bit: u8) -> bool {
+    let version = header.version.to_consensus() as u32;
+    version & 0xe000_0000 == 0x2000_0000 && version & (1u32 << bit) != 0
+}
+
+/// Return the threshold state governing the block at `height` and the first
+/// height at which that state applies. The header slice must start at genesis
+/// and contain the branch through the queried parent or block, as applicable.
+pub(crate) fn bip9_state_at_height(
+    headers: &[bitcoin::block::Header],
+    deployment: Bip9Deployment,
+    height: u32,
+) -> (Bip9State, u32) {
+    if deployment.start_time == Bip9Deployment::ALWAYS_ACTIVE_TIME {
+        return (Bip9State::Active, 0);
+    }
+    if deployment.start_time == Bip9Deployment::NEVER_ACTIVE_TIME {
+        return (Bip9State::Failed, 0);
+    }
+    let period = deployment.period.max(1);
+    let mut state = Bip9State::Defined;
+    let mut since = 0;
+    let mut activation_height: Option<u32> = None;
+    let mut boundary = period;
+    while boundary <= height {
+        if headers.is_empty() {
+            break;
+        }
+        let previous_end = usize::try_from(boundary - 1)
+            .unwrap_or(usize::MAX)
+            .min(headers.len().saturating_sub(1));
+        let previous_start = usize::try_from(boundary.saturating_sub(period))
+            .unwrap_or(usize::MAX)
+            .min(previous_end);
+        let median_time = median_versionbits_time(headers, previous_end);
+        let signal_count = headers[previous_start..=previous_end]
+            .iter()
+            .filter(|header| versionbits_signals(header, deployment.bit))
+            .count() as u32;
+        let next_state = match state {
+            Bip9State::Defined if i64::from(median_time) >= deployment.start_time => {
+                Bip9State::Started
+            }
+            Bip9State::Started if signal_count >= deployment.threshold => Bip9State::LockedIn,
+            Bip9State::Started
+                if deployment.max_activation_height < Bip9Deployment::MAX_ACTIVATION_HEIGHT
+                    && boundary >= deployment.max_activation_height.saturating_sub(period) =>
+            {
+                Bip9State::LockedIn
+            }
+            Bip9State::Started
+                if deployment.timeout != i64::MAX
+                    && i64::from(median_time) >= deployment.timeout =>
+            {
+                Bip9State::Failed
+            }
+            Bip9State::LockedIn if boundary >= deployment.min_activation_height => {
+                Bip9State::Active
+            }
+            Bip9State::Active
+                if deployment.active_duration < Bip9Deployment::PERMANENT_ACTIVE_DURATION
+                    && activation_height.is_some_and(|height| {
+                        boundary >= height.saturating_add(deployment.active_duration)
+                    }) =>
+            {
+                Bip9State::Expired
+            }
+            _ => state,
+        };
+        if next_state != state {
+            state = next_state;
+            since = boundary;
+            if state == Bip9State::Active {
+                activation_height = Some(boundary);
+            }
+        }
+        let Some(next_boundary) = boundary.checked_add(period) else {
+            break;
+        };
+        boundary = next_boundary;
+    }
+    (state, since)
+}
+
+pub(crate) fn reduced_data_activation_height(
+    headers: &[bitcoin::block::Header],
+    deployment: Bip9Deployment,
+    height: u32,
+) -> Option<u32> {
+    let (state, since) = bip9_state_at_height(headers, deployment, height);
+    (state == Bip9State::Active).then_some(since)
+}
+
+/// Enforce Core's mandatory-signaling window for deployments with a
+/// `max_activation_height`. The window covers the two periods immediately
+/// before the forced lock-in period; blocks in that window must signal while
+/// the deployment is still in STARTED.
+pub(crate) fn validate_mandatory_version_bits_with_params(
+    headers: &[bitcoin::block::Header],
+    params: &DeploymentParameters,
+    height: u32,
+    version: i32,
+) -> Result<(), ValidationError> {
+    const VERSIONBITS_TOP_MASK: u32 = 0xe000_0000;
+    const VERSIONBITS_TOP_BITS: u32 = 0x2000_0000;
+
+    if height == 0 {
+        return Ok(());
+    }
+    let version = version as u32;
+    const DEPLOYMENT_NAMES: [&str; 3] = ["testdummy", "taproot", "reduced_data"];
+    for (deployment_index, deployment) in params.bip9.into_iter().enumerate() {
+        if deployment.max_activation_height >= Bip9Deployment::MAX_ACTIVATION_HEIGHT {
+            continue;
+        }
+        let period = deployment.period.max(1);
+        let enforcement_start = deployment
+            .max_activation_height
+            .saturating_sub(period.saturating_mul(2));
+        let enforcement_end = deployment.max_activation_height.saturating_sub(period);
+        if !(enforcement_start..enforcement_end).contains(&height) {
+            continue;
+        }
+        let (state, _) = bip9_state_at_height(headers, deployment, height - 1);
+        if state == Bip9State::Started
+            && ((version & VERSIONBITS_TOP_MASK) != VERSIONBITS_TOP_BITS
+                || version & (1u32 << deployment.bit) == 0)
+        {
+            return Err(ValidationError::BadVersionBits {
+                deployment: DEPLOYMENT_NAMES[deployment_index],
+                max_activation_height: deployment.max_activation_height,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Return the first unknown BIP9 version bit that has reached the active
@@ -428,8 +867,11 @@ pub fn unknown_versionbits_active_with_params(
         return None;
     }
 
-    let [testdummy, taproot] = params.bip9;
-    let known_bits = (1u32 << testdummy.bit) | (1u32 << taproot.bit);
+    let [testdummy, ..] = params.bip9;
+    let known_bits = params
+        .bip9
+        .iter()
+        .fold(0u32, |bits, deployment| bits | (1u32 << deployment.bit));
     let period = usize::try_from(testdummy.period).ok()?;
     let threshold = usize::try_from(testdummy.threshold).ok()?;
     if period == 0 || threshold > period {
@@ -506,8 +948,11 @@ pub fn unknown_versionbits_active_at_boundary_with_params(
     const VERSIONBITS_TOP_BITS: u32 = 0x2000_0000;
     const VERSIONBITS_NUM_BITS: u8 = 29;
 
-    let [testdummy, taproot] = params.bip9;
-    let known_bits = (1u32 << testdummy.bit) | (1u32 << taproot.bit);
+    let [testdummy, ..] = params.bip9;
+    let known_bits = params
+        .bip9
+        .iter()
+        .fold(0u32, |bits, deployment| bits | (1u32 << deployment.bit));
     let period = usize::try_from(testdummy.period).ok()?;
     let threshold = usize::try_from(testdummy.threshold).ok()?;
     if period == 0 || threshold > period || headers.len() < period * 3 {
@@ -2125,7 +2570,7 @@ mod tests {
 
     #[test]
     fn unknown_versionbits_require_lock_in_period_before_warning() {
-        let [deployment, _] = bip9_deployments(Network::Regtest);
+        let [deployment, ..] = bip9_deployments(Network::Regtest);
         let period = usize::try_from(deployment.period).unwrap();
         let threshold = usize::try_from(deployment.threshold).unwrap();
         let unknown_bit = 27u32;
@@ -2164,6 +2609,114 @@ mod tests {
             unknown_versionbits_active_at_boundary(&headers, Network::Regtest),
             Some(unknown_bit as u8)
         );
+    }
+
+    #[test]
+    fn temporary_versionbits_deployment_expires_at_period_boundary() {
+        let deployment = Bip9Deployment {
+            bit: 4,
+            start_time: 0,
+            timeout: i64::MAX,
+            min_activation_height: 0,
+            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+            active_duration: 144,
+            threshold: 108,
+            period: 144,
+        };
+        let headers = (0..576)
+            .map(|height| Header {
+                version: BlockVersion::from_consensus(if (144..252).contains(&height) {
+                    0x2000_0000 | (1 << deployment.bit)
+                } else {
+                    4
+                }),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: height + 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bip9_state_at_height(&headers, deployment, 143),
+            (Bip9State::Defined, 0)
+        );
+        assert_eq!(
+            bip9_state_at_height(&headers, deployment, 287),
+            (Bip9State::Started, 144)
+        );
+        assert_eq!(
+            bip9_state_at_height(&headers, deployment, 431),
+            (Bip9State::LockedIn, 288)
+        );
+        assert_eq!(
+            bip9_state_at_height(&headers, deployment, 575),
+            (Bip9State::Active, 432)
+        );
+        assert_eq!(
+            bip9_state_at_height(&headers, deployment, 576),
+            (Bip9State::Expired, 576)
+        );
+    }
+
+    #[test]
+    fn reduced_data_limits_output_and_new_witness_data() {
+        let oversized_op_return = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::from_bytes(
+                    std::iter::once(0x6a)
+                        .chain(std::iter::repeat_n(0, 83))
+                        .collect(),
+                ),
+            }],
+        };
+        assert!(matches!(
+            validate_reduced_data_output_sizes(&oversized_op_return),
+            Err(ValidationError::ReducedDataOutputTooLarge(_))
+        ));
+
+        let previous_output = TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::from_bytes(
+                std::iter::once(0x00)
+                    .chain(std::iter::once(0x20))
+                    .chain(std::iter::repeat_n(0, 32))
+                    .collect(),
+            ),
+        };
+        let spending = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([8; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::from_slice(&[vec![0x42; 300], vec![0x51]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(900),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        assert!(
+            validate_reduced_data_input_sizes(
+                &spending,
+                std::slice::from_ref(&previous_output),
+                &[10],
+                10,
+            )
+            .is_err()
+        );
+        assert!(validate_reduced_data_input_sizes(&spending, &[previous_output], &[9], 10).is_ok());
     }
 
     #[test]

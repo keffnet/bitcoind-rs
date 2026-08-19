@@ -1063,6 +1063,7 @@ struct PeerState {
     local_address: Option<SocketAddr>,
     writer: PeerWriter,
     connection_type: &'static str,
+    manual: bool,
     permissions: PeerPermissions,
     private_broadcast_transaction: Option<Transaction>,
     private_broadcast_peer: parking_lot::Mutex<bool>,
@@ -4123,6 +4124,7 @@ async fn serve_peer(
         local_address,
         writer: Arc::new(Mutex::new(writer_half)),
         connection_type: options.connection_type,
+        manual: options.manual,
         permissions,
         private_broadcast_transaction: options.private_broadcast_transaction,
         private_broadcast_peer: parking_lot::Mutex::new(
@@ -5510,10 +5512,7 @@ async fn serve_peer_loop(
                             if error.to_string().contains("is on an invalidated branch")
                                 || error.to_string().contains("has an invalidated parent") =>
                         {
-                            if headers_to_accept
-                                .iter()
-                                .any(|header| !known.contains(&header.block_hash()))
-                            {
+                            if !peer_state.manual {
                                 return Err(error);
                             }
                             // A peer can legitimately answer a headers
@@ -7632,6 +7631,7 @@ async fn handle_received_block(
                             | ValidationError::TargetAboveLimit
                             | ValidationError::TimeTooOld
                             | ValidationError::BadBlockVersion { .. }
+                            | ValidationError::BadVersionBits { .. }
                     )
                 );
                 if disconnect_on_invalid && disconnect_for_header {
@@ -11273,6 +11273,7 @@ mod tests {
             local_address: None,
             writer: writer.clone(),
             connection_type: "outbound-full",
+            manual: false,
             permissions: PeerPermissions::empty(),
             private_broadcast_transaction: None,
             private_broadcast_peer: parking_lot::Mutex::new(false),
@@ -13749,6 +13750,7 @@ mod tests {
             local_address: None,
             writer: writer.clone(),
             connection_type: "outbound-full",
+            manual: false,
             permissions: PeerPermissions::empty(),
             private_broadcast_transaction: None,
             private_broadcast_peer: parking_lot::Mutex::new(false),

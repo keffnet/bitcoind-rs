@@ -60,6 +60,7 @@ use crate::mempool::{
 };
 use crate::script::{core_multisig_solution, is_core_multisig, is_core_p2pk};
 use crate::validation;
+use crate::validation::Bip9State;
 use crate::wire;
 use crate::{Node, ScanState, StartupLatch};
 
@@ -2116,7 +2117,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "generateblock" => Some(&["output", "transactions", "submit"]),
         "generate" => Some(&[]),
         "submitpackage" => Some(&["package", "maxfeerate", "maxburnamount"]),
-        "testmempoolaccept" => Some(&["rawtxs", "maxfeerate"]),
+        "testmempoolaccept" => Some(&["rawtxs", "maxfeerate", "ignore_rejects"]),
         "setmocktime" => Some(&["timestamp"]),
         "mockscheduler" => Some(&["delta_time"]),
         "echoipc" => Some(&["arg"]),
@@ -2547,6 +2548,7 @@ fn dispatch_method_for_user(
             };
             let local_services = network_service
                 | wire::NODE_WITNESS
+                | wire::NODE_REDUCED_DATA
                 | if node.config.v2_transport {
                     wire::NODE_P2P_V2
                 } else {
@@ -3582,6 +3584,7 @@ fn peer_services_names(services: u64) -> Vec<String> {
             6 => "COMPACT_FILTERS".to_owned(),
             10 => "NETWORK_LIMITED".to_owned(),
             11 => "P2P_V2".to_owned(),
+            27 => "REDUCED_DATA?".to_owned(),
             bit => format!("UNKNOWN[2^{bit}]"),
         })
         .collect()
@@ -5020,90 +5023,12 @@ fn get_blockchain_info(node: &Arc<Node>) -> Result<Value> {
     Ok(result)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Bip9State {
-    Defined,
-    Started,
-    LockedIn,
-    Active,
-    Failed,
-}
-
-impl Bip9State {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Defined => "defined",
-            Self::Started => "started",
-            Self::LockedIn => "locked_in",
-            Self::Active => "active",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-fn median_header_time(headers: &[bitcoin::block::Header], end: usize) -> u32 {
-    let start = end.saturating_sub(10);
-    let mut times = headers[start..=end]
-        .iter()
-        .map(|header| header.time)
-        .collect::<Vec<_>>();
-    times.sort_unstable();
-    times[times.len() / 2]
-}
-
-fn version_signals(header: &bitcoin::block::Header, bit: u8) -> bool {
-    let version = header.version.to_consensus() as u32;
-    version & 0xe000_0000 == 0x2000_0000 && version & (1u32 << bit) != 0
-}
-
 fn bip9_state_at_height(
     headers: &[bitcoin::block::Header],
     deployment: validation::Bip9Deployment,
-    next_height: u32,
+    height: u32,
 ) -> (Bip9State, u32) {
-    if deployment.start_time == validation::Bip9Deployment::ALWAYS_ACTIVE_TIME {
-        return (Bip9State::Active, 0);
-    }
-    if deployment.start_time == validation::Bip9Deployment::NEVER_ACTIVE_TIME {
-        return (Bip9State::Failed, 0);
-    }
-    let period = deployment.period.max(1);
-    let mut state = Bip9State::Defined;
-    let mut since = 0;
-    let mut boundary = period;
-    while boundary <= next_height {
-        let previous_end = usize::try_from(boundary - 1)
-            .unwrap_or(usize::MAX)
-            .min(headers.len().saturating_sub(1));
-        let previous_start = usize::try_from(boundary.saturating_sub(period))
-            .unwrap_or(usize::MAX)
-            .min(previous_end);
-        let median_time = median_header_time(headers, previous_end);
-        let signal_count = headers[previous_start..=previous_end]
-            .iter()
-            .filter(|header| version_signals(header, deployment.bit))
-            .count() as u32;
-        let next_state = match state {
-            Bip9State::Defined if i64::from(median_time) >= deployment.start_time => {
-                Bip9State::Started
-            }
-            Bip9State::Started if i64::from(median_time) >= deployment.timeout => Bip9State::Failed,
-            Bip9State::Started if signal_count >= deployment.threshold => Bip9State::LockedIn,
-            Bip9State::LockedIn if boundary >= deployment.min_activation_height => {
-                Bip9State::Active
-            }
-            _ => state,
-        };
-        if next_state != state {
-            state = next_state;
-            since = boundary;
-        }
-        let Some(next_boundary) = boundary.checked_add(period) else {
-            break;
-        };
-        boundary = next_boundary;
-    }
-    (state, since)
+    validation::bip9_state_at_height(headers, deployment, height)
 }
 
 fn bip9_deployment_json(
@@ -5126,6 +5051,9 @@ fn bip9_deployment_json(
         "since": since,
         "status_next": next_state.as_str(),
     });
+    if deployment.max_activation_height < validation::Bip9Deployment::MAX_ACTIVATION_HEIGHT {
+        bip9["max_activation_height"] = json!(deployment.max_activation_height);
+    }
     if matches!(state, Bip9State::Started | Bip9State::LockedIn) {
         let period = deployment.period.max(1);
         let period_start = (selected_height / period) * period;
@@ -5137,7 +5065,7 @@ fn bip9_deployment_json(
             let mut signalling = String::with_capacity(end - start + 1);
             let mut count = 0u32;
             for header in &headers[start..=end] {
-                if version_signals(header, deployment.bit) {
+                if validation::versionbits_signals(header, deployment.bit) {
                     count = count.saturating_add(1);
                     signalling.push('#');
                 } else {
@@ -5156,6 +5084,7 @@ fn bip9_deployment_json(
         bip9["bit"] = json!(deployment.bit);
         let mut statistics = json!({
             "period": period,
+            "period_start": period_start,
             "elapsed": elapsed,
             "count": count,
         });
@@ -5170,15 +5099,15 @@ fn bip9_deployment_json(
         bip9["statistics"] = statistics;
         bip9["signalling"] = json!(signalling);
     }
-    let active_since = if state == Bip9State::Active {
-        Some(since)
-    } else if next_state == Bip9State::Active {
-        // VersionBitsCache::Info uses the queried block's height plus one
-        // when activation starts in the next block.
-        Some(selected_height.saturating_add(1))
-    } else {
-        None
-    };
+    let active_since = (next_state == Bip9State::Active).then(|| {
+        if state == Bip9State::Active {
+            since
+        } else {
+            // VersionBitsCache::Info uses the queried block's height plus one
+            // when activation starts in the next block.
+            selected_height.saturating_add(1)
+        }
+    });
     let mut result = json!({
         "type": "bip9",
         "active": active_since.is_some(),
@@ -5186,6 +5115,13 @@ fn bip9_deployment_json(
     });
     if let Some(height) = active_since {
         result["height"] = json!(height);
+        if deployment.active_duration < validation::Bip9Deployment::PERMANENT_ACTIVE_DURATION {
+            result["height_end"] = json!(
+                height
+                    .saturating_add(deployment.active_duration)
+                    .saturating_sub(1)
+            );
+        }
     }
     result
 }
@@ -5245,7 +5181,7 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
             }),
         );
     }
-    let [testdummy, taproot] = deployment_parameters.bip9;
+    let [testdummy, taproot, reduced_data] = deployment_parameters.bip9;
     // Core does not register NEVER_ACTIVE deployments in getdeploymentinfo.
     // Regtest intentionally keeps testdummy enabled for versionbits tests.
     if testdummy.is_enabled() {
@@ -5258,6 +5194,12 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "taproot".to_owned(),
         bip9_deployment_json(&headers, height, taproot),
     );
+    if reduced_data.is_enabled() {
+        deployments.insert(
+            "reduced_data".to_owned(),
+            bip9_deployment_json(&headers, height, reduced_data),
+        );
+    }
     let flags =
         validation::script_flags_for_block_with_params(&deployment_parameters, height, Some(hash));
     Ok(json!({
@@ -12924,15 +12866,19 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if chain.network == Network::Signet {
         rules.push("!signet".to_owned());
     }
-    let [testdummy, taproot] = deployment_parameters.bip9;
+    let [testdummy, taproot, reduced_data] = deployment_parameters.bip9;
     let mut vbavailable = serde_json::Map::new();
-    for (name, deployment) in [("testdummy", testdummy), ("taproot", taproot)] {
+    for (name, deployment) in [
+        ("testdummy", testdummy),
+        ("taproot", taproot),
+        ("reduced_data", reduced_data),
+    ] {
         // VersionBitsCache::GBTStatus(*pindexPrev, ...) reports the state
         // governing the block after pindexPrev.  `bip9_state_at_height`
         // takes that next block height explicitly.
         let next_height = tip.height.saturating_add(1);
         let (state, _) = bip9_state_at_height(headers, deployment, next_height);
-        // Core v31.1 marks both currently registered versionbits deployments
+        // Core v31.1 marks all currently registered versionbits deployments
         // as optional in GBT. Keep the rule construction explicit so the
         // mandatory-rule behavior remains visible if a deployment changes.
         let gbt_optional_rule = true;
@@ -12957,7 +12903,7 @@ fn get_block_template(node: &Arc<Node>, params: &Value) -> Result<Value> {
                     bail!("Support for '{name}' rule requires explicit client support");
                 }
             }
-            Bip9State::Defined | Bip9State::Failed => {}
+            Bip9State::Defined | Bip9State::Failed | Bip9State::Expired => {}
         }
     }
     let mut result = json!({
@@ -13897,6 +13843,19 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
         bail!("Array must contain between 1 and {MAX_PACKAGE_COUNT} transactions.");
     }
     let max_fee_rate = parse_max_fee_rate(params.get(1))?;
+    // Core accepts this option to suppress selected policy errors while it
+    // still performs the mandatory consensus checks. The native mempool
+    // dry-run below does not expose a policy-bypass mode yet, but accepting
+    // and validating the parameter is important for RPC compatibility; in
+    // particular, reduced-data script limits must remain mandatory here.
+    if let Some(ignore_rejects) = params.get(2).filter(|value| !value.is_null()) {
+        let reasons = ignore_rejects
+            .as_array()
+            .ok_or_else(|| json_type_error(ignore_rejects, "array"))?;
+        if reasons.iter().any(|reason| !reason.is_string()) {
+            bail!("ignore_rejects must be an array of strings")
+        }
+    }
     let transactions = raw_transactions
         .iter()
         .map(|raw| {
@@ -16514,6 +16473,7 @@ fn rpc_error_code(message: &str) -> i32 {
                 | "inconclusive-not-best-prevblk"
         )
         || lower.starts_with("bad-version(")
+        || lower.starts_with("bad-version-")
     {
         return -25;
     }
@@ -23254,7 +23214,13 @@ mod tests {
         let localservices = dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap();
         assert_eq!(
             localservices["localservicesnames"],
-            json!(["NETWORK", "WITNESS", "COMPACT_FILTERS", "NETWORK_LIMITED"])
+            json!([
+                "NETWORK",
+                "WITNESS",
+                "COMPACT_FILTERS",
+                "NETWORK_LIMITED",
+                "REDUCED_DATA?"
+            ])
         );
         Arc::get_mut(&mut node)
             .unwrap()

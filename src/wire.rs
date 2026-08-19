@@ -32,6 +32,8 @@ pub const NODE_WITNESS: u64 = 1 << 3;
 pub const NODE_NETWORK_LIMITED: u64 = 1 << 10;
 pub const NODE_COMPACT_FILTERS: u64 = 1 << 6;
 pub const NODE_P2P_V2: u64 = 1 << 11;
+/// The peer enforces the v31.1 ReducedData temporary softfork rules.
+pub const NODE_REDUCED_DATA: u64 = 1 << 27;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InventoryType {
@@ -162,6 +164,7 @@ impl VersionMessage {
             | NODE_WITNESS
             | NODE_COMPACT_FILTERS
             | NODE_P2P_V2
+            | NODE_REDUCED_DATA
             | if bloom_filters { NODE_BLOOM } else { 0 };
         let user_agent = if comments.is_empty() {
             "/bitcoind-rs:0.1.0/".to_owned()

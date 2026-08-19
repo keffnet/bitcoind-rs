@@ -4122,12 +4122,12 @@ impl ChainState {
                 parent.height.saturating_add(1),
                 header.version.to_consensus(),
             )?;
-            validation::validate_header(
-                self.network,
+            self.validate_header_context(
                 header,
                 parent_hash,
                 self.expected_target_for_parent(parent_hash, header.time),
                 self.median_time_past_for_parent(parent_hash),
+                true,
             )?;
             self.block_index.insert(
                 hash,
@@ -5022,12 +5022,12 @@ impl ChainState {
                     block.header.time,
                     parent.header.time,
                 )?;
-                validation::validate_header(
-                    self.network,
+                self.validate_header_context(
                     &block.header,
                     parent_hash,
                     self.expected_target_for_parent(parent_hash, block.header.time),
                     self.median_time_past_for_parent(parent_hash),
+                    true,
                 )?;
                 self.validate_block_structure(
                     &block,
@@ -5363,23 +5363,13 @@ impl ChainState {
         )?;
         let expected_target = self.expected_target_for_parent(parent_hash, block.header.time);
         let median_time_past = self.median_time_past_for_parent(parent_hash);
-        if check_pow {
-            validation::validate_header(
-                self.network,
-                &block.header,
-                parent_hash,
-                expected_target,
-                median_time_past,
-            )?;
-        } else {
-            validation::validate_header_without_pow(
-                self.network,
-                &block.header,
-                parent_hash,
-                expected_target,
-                median_time_past,
-            )?;
-        }
+        self.validate_header_context(
+            &block.header,
+            parent_hash,
+            expected_target,
+            median_time_past,
+            check_pow,
+        )?;
         validation::validate_block_structure_with_signet_options_with_params_and_merkle(
             block,
             &self.deployment_parameters,
@@ -5622,12 +5612,12 @@ impl ChainState {
                 block.header.time,
                 parent.header.time,
             )?;
-            validation::validate_header(
-                self.network,
+            self.validate_header_context(
                 &block.header,
                 parent_hash,
                 self.expected_target_for_parent(parent_hash, block.header.time),
                 self.median_time_past_for_parent(parent_hash),
+                true,
             )?;
             self.validate_block_structure(
                 &block,
@@ -5660,12 +5650,12 @@ impl ChainState {
             block.header.time,
             parent.header.time,
         )?;
-        validation::validate_header(
-            self.network,
+        self.validate_header_context(
             &block.header,
             parent_hash,
             self.expected_target_for_parent(parent_hash, block.header.time),
             self.median_time_past_for_parent(parent_hash),
+            true,
         )?;
         self.validate_block_structure(&block, self.network, height, Amount::MAX_MONEY.to_sat())?;
         if retain_invalid_body {
@@ -6212,12 +6202,12 @@ impl ChainState {
                 block.header.time,
                 parent.header.time,
             )?;
-            validation::validate_header(
-                self.network,
+            self.validate_header_context(
                 &block.header,
                 parent_hash,
                 self.expected_target_for_parent(parent_hash, block.header.time),
                 self.median_time_past_for_parent(parent_hash),
+                true,
             )?;
             self.validate_block_structure(
                 &block,
@@ -6298,6 +6288,15 @@ impl ChainState {
             height,
             Some(block_hash),
         );
+        let reduced_data_activation_height = self
+            .headers_to_hash(&block.header.prev_blockhash)
+            .and_then(|headers| {
+                validation::reduced_data_activation_height(
+                    &headers,
+                    self.deployment_parameters.bip9[2],
+                    height,
+                )
+            });
         let csv_active = height >= self.deployment_parameters.buried.csv;
         let lock_time_cutoff = if csv_active {
             block_median_time_past
@@ -6311,6 +6310,9 @@ impl ChainState {
             csv_active,
             &[],
         )?;
+        if reduced_data_activation_height.is_some() {
+            validation::validate_reduced_data_output_sizes(&block.txdata[0])?;
+        }
         let mut sigop_cost = validation::transaction_sigop_cost(&block.txdata[0], &[], sigop_flags);
         if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
             return Err(ValidationError::TooManySigopsInConnect.into());
@@ -6351,6 +6353,21 @@ impl ChainState {
                 previous_outputs.push(entry.output.clone());
                 previous_entries.push(entry.clone());
                 spent_entries.push((outpoint, entry));
+            }
+            if let Some(activation_height) = reduced_data_activation_height {
+                validation::validate_reduced_data_output_sizes(transaction)?;
+                if !skip_script_checks {
+                    let previous_heights = previous_entries
+                        .iter()
+                        .map(|entry| entry.height)
+                        .collect::<Vec<_>>();
+                    validation::validate_reduced_data_input_sizes(
+                        transaction,
+                        &previous_outputs,
+                        &previous_heights,
+                        activation_height,
+                    )?;
+                }
             }
             sigop_cost = sigop_cost.saturating_add(validation::transaction_sigop_cost(
                 transaction,
@@ -6573,6 +6590,14 @@ impl ChainState {
         Ok(())
     }
 
+    pub(crate) fn reduced_data_active_for_next_block(&self) -> Option<u32> {
+        validation::reduced_data_activation_height(
+            &self.headers,
+            self.deployment_parameters.bip9[2],
+            self.height().saturating_add(1),
+        )
+    }
+
     fn cache_script_validation(&self, key: [u8; 32]) {
         let mut cache = self.script_cache.lock();
         if cache.entries.contains(&key) {
@@ -6647,12 +6672,12 @@ impl ChainState {
             previous_node.header.time,
         )?;
         let expected_target = self.expected_target(block.header.time);
-        validation::validate_header(
-            self.network,
+        self.validate_header_context(
             &block.header,
             previous,
             expected_target,
             self.median_time_past(),
+            true,
         )?;
         self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
         let block_median_time_past = self.median_time_past();
@@ -8254,6 +8279,47 @@ impl ChainState {
         )
     }
 
+    fn validate_header_context(
+        &self,
+        header: &bitcoin::block::Header,
+        parent_hash: BlockHash,
+        expected_target: Target,
+        median_time_past: u32,
+        check_pow: bool,
+    ) -> Result<()> {
+        if check_pow {
+            validation::validate_header(
+                self.network,
+                header,
+                parent_hash,
+                expected_target,
+                median_time_past,
+            )?;
+        } else {
+            validation::validate_header_without_pow(
+                self.network,
+                header,
+                parent_hash,
+                expected_target,
+                median_time_past,
+            )?;
+        }
+        let parent = self
+            .block_index
+            .get(&parent_hash)
+            .context("header parent is not indexed")?;
+        let headers = self
+            .headers_to_hash(&parent_hash)
+            .context("header parent has no contiguous ancestor chain")?;
+        validation::validate_mandatory_version_bits_with_params(
+            &headers,
+            &self.deployment_parameters,
+            parent.height.saturating_add(1),
+            header.version.to_consensus(),
+        )?;
+        Ok(())
+    }
+
     fn expected_target_for_parent(&self, parent_hash: BlockHash, candidate_time: u32) -> Target {
         let parent_node = self
             .block_index
@@ -9269,12 +9335,12 @@ fn run_background_validation(
                 block.header.time,
                 parent.header.time,
             )?;
-            validation::validate_header(
-                state.network,
+            state.validate_header_context(
                 &block.header,
                 parent_hash,
                 state.expected_target_for_parent(parent_hash, block.header.time),
                 state.median_time_past_for_parent(parent_hash),
+                true,
             )?;
             state.validate_block_structure(
                 &block,

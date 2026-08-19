@@ -57,3 +57,7 @@ capnpc-embedded = "0.2"
 [[bin]]
 name = "bitcoind-rs"
 path = "src/main.rs"
+
+[[bin]]
+name = "bitcoin-cli"
+path = "src/bitcoin_cli.rs"

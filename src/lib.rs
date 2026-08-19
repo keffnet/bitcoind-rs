@@ -2705,6 +2705,20 @@ impl Node {
         self.asmap.as_ref()?.mapped_as(endpoint)
     }
 
+    pub(crate) fn peer_netgroup_key(&self, endpoint: &NetworkEndpoint) -> Vec<u8> {
+        if let Some(asn) = self.mapped_as(endpoint) {
+            // Core uses NET_IPV6 as the common class prefix for AS-mapped
+            // IPv4 and IPv6 addresses so the same ASN shares a group across
+            // address families.
+            let mut key = Vec::with_capacity(1 + std::mem::size_of::<u32>());
+            key.push(2);
+            key.extend_from_slice(&asn.to_le_bytes());
+            key
+        } else {
+            endpoint.netgroup_key()
+        }
+    }
+
     pub(crate) fn addrman_hash_key(&self) -> &[u8; 32] {
         &self.addrman_key
     }
@@ -6210,11 +6224,7 @@ impl Node {
         peers
     }
 
-    /// Select an inbound peer using Core's main eviction protections.  The
-    /// network-group protection is intentionally omitted here because the
-    /// transport layer does not expose Core's keyed netgroup hash; all other
-    /// protections used by the functional eviction test are represented by
-    /// the peer state below.
+    /// Select an inbound peer using Core's main eviction protections.
     pub(crate) fn select_inbound_peer_to_evict(&self, force: bool) -> Option<usize> {
         let candidates = self
             .peer_infos()
@@ -6226,19 +6236,16 @@ impl Node {
         }
 
         let mut protected = HashSet::new();
-        // Core protects four peers from each network group before applying
-        // the other eviction criteria. The transport currently exposes the
-        // broader network class rather than Core's keyed netgroup, which is
-        // still sufficient to preserve the important localhost/full-slot
-        // behavior and to avoid evicting every peer from a network class.
-        let mut by_network = HashMap::<&'static str, Vec<&PeerInfo>>::new();
+        // Core protects four peers from each keyed network group before
+        // applying the other eviction criteria.
+        let mut by_netgroup = HashMap::<Vec<u8>, Vec<&PeerInfo>>::new();
         for peer in &candidates {
-            by_network
-                .entry(peer.endpoint.network_name())
+            by_netgroup
+                .entry(self.peer_netgroup_key(&peer.endpoint))
                 .or_default()
                 .push(peer);
         }
-        for peers in by_network.values_mut() {
+        for peers in by_netgroup.values_mut() {
             peers.sort_by_key(|peer| (peer.connected_at, peer.id));
             protected.extend(peers.iter().take(4).map(|peer| peer.id));
         }

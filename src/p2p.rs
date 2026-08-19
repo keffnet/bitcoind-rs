@@ -3079,10 +3079,17 @@ fn select_discovery_endpoints(
         .into_iter()
         .map(|peer| peer.endpoint)
         .collect();
-    let connected_asns: HashSet<_> = node
+    let connected_netgroups: HashSet<_> = node
         .peer_infos()
         .into_iter()
-        .filter_map(|peer| node.mapped_as(&peer.endpoint))
+        .filter(|peer| {
+            !peer.inbound
+                && matches!(
+                    peer.connection_type,
+                    "manual" | "outbound-full" | "block-relay-only"
+                )
+        })
+        .filter_map(|peer| outbound_ipv46_netgroup(node, &peer.endpoint))
         .collect();
     let added: HashSet<_> = node.added_network_endpoints().into_iter().collect();
     let attempts = outbound_attempts.lock();
@@ -3109,10 +3116,10 @@ fn select_discovery_endpoints(
             .then_with(|| left.endpoint.cmp(&right.endpoint))
     });
     let mut selected = Vec::with_capacity(limit);
-    let mut selected_asns = connected_asns;
+    let mut selected_netgroups = connected_netgroups;
     for entry in candidates {
-        if let Some(asn) = node.mapped_as(&entry.endpoint)
-            && !selected_asns.insert(asn)
+        if let Some(netgroup) = outbound_ipv46_netgroup(node, &entry.endpoint)
+            && !selected_netgroups.insert(netgroup)
         {
             continue;
         }
@@ -3122,6 +3129,10 @@ fn select_discovery_endpoints(
         }
     }
     selected
+}
+
+fn outbound_ipv46_netgroup(node: &Node, endpoint: &NetworkEndpoint) -> Option<Vec<u8>> {
+    matches!(endpoint, NetworkEndpoint::Ip(_)).then(|| node.peer_netgroup_key(endpoint))
 }
 
 #[cfg(test)]
@@ -13337,10 +13348,10 @@ mod tests {
             zmq: crate::config::ZmqConfig::default(),
         })
         .unwrap();
-        let added = "192.0.2.10:18444".parse().unwrap();
-        let connected = "192.0.2.11:18444".parse().unwrap();
-        let in_flight = "192.0.2.12:18444".parse().unwrap();
-        let eligible = "192.0.2.13:18444".parse().unwrap();
+        let added = "1.1.1.10:18444".parse().unwrap();
+        let connected = "2.2.2.11:18444".parse().unwrap();
+        let in_flight = "3.3.3.12:18444".parse().unwrap();
+        let eligible = "4.4.4.13:18444".parse().unwrap();
         for address in [added, connected, in_flight, eligible] {
             assert!(node.add_peer_address(address, false));
         }
@@ -13647,12 +13658,26 @@ mod tests {
             address: [9; 32],
             port: 18445,
         };
+        let ipv4_a = NetworkEndpoint::from_socket("1.2.3.4:18444".parse().unwrap());
+        let ipv4_b = NetworkEndpoint::from_socket("1.2.250.4:18445".parse().unwrap());
+        let ipv4_c = NetworkEndpoint::from_socket("1.3.3.4:18446".parse().unwrap());
         assert!(node.remember_network_address(onion.clone(), 1, 10));
         assert!(node.remember_network_address(i2p.clone(), 1, 11));
+        assert!(node.remember_network_address(ipv4_a.clone(), 1, 12));
+        assert!(node.remember_network_address(ipv4_b.clone(), 1, 13));
+        assert!(node.remember_network_address(ipv4_c.clone(), 1, 14));
         let attempts = Arc::new(parking_lot::Mutex::new(HashSet::new()));
-        let selected = select_discovery_endpoints(&node, 4, &attempts);
+        let selected = select_discovery_endpoints(&node, 8, &attempts);
         assert!(selected.contains(&onion));
         assert!(selected.contains(&i2p));
+        assert!(selected.contains(&ipv4_c));
+        assert_eq!(
+            selected
+                .iter()
+                .filter(|endpoint| endpoint.netgroup_key() == ipv4_a.netgroup_key())
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

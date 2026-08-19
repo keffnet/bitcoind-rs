@@ -145,6 +145,55 @@ impl NetworkEndpoint {
         }
     }
 
+    /// Return the unkeyed network-group identifier used by Core's peer
+    /// diversity and inbound eviction rules. The connection manager applies
+    /// the optional ASMap override before using this fallback. Ports are
+    /// deliberately excluded: peers on the same network prefix belong to the
+    /// same group regardless of their service port.
+    pub(crate) fn netgroup_key(&self) -> Vec<u8> {
+        match self {
+            Self::Ip(address) => match address.ip() {
+                IpAddr::V4(ip) if is_core_routable_ip(IpAddr::V4(ip)) => {
+                    let [first, second, ..] = ip.octets();
+                    vec![1, first, second]
+                }
+                IpAddr::V6(ip) if is_core_routable_ip(IpAddr::V6(ip)) => {
+                    let octets = ip.octets();
+                    if octets[..4] == [0x20, 0x01, 0x04, 0x70] {
+                        vec![
+                            2,
+                            octets[0],
+                            octets[1],
+                            octets[2],
+                            octets[3],
+                            octets[4] & 0xf0,
+                        ]
+                    } else {
+                        vec![2, octets[0], octets[1], octets[2], octets[3]]
+                    }
+                }
+                _ => vec![0],
+            },
+            Self::OnionV2 { address, .. } => vec![3, address[0] & 0xf0],
+            Self::OnionV3 { address, .. } => vec![3, address[0] & 0xf0],
+            Self::I2p { address, .. } => vec![4, address[0] & 0xf0],
+            Self::Cjdns { address, .. } => {
+                let octets = address.octets();
+                vec![5, octets[1], octets[2] & 0xf0]
+            }
+            Self::Dns { host, .. } => {
+                // Unresolved hostnames correspond to Core's internal address
+                // class. Keep different names in separate groups while
+                // remaining deterministic across reconnects.
+                let digest = Sha3_256::digest(host.to_ascii_lowercase().as_bytes());
+                let mut key = Vec::with_capacity(1 + digest.len());
+                key.push(6);
+                key.extend_from_slice(&digest);
+                key
+            }
+        }
+    }
+
     /// Return a directly usable socket address for endpoint types that have
     /// one. CJDNS uses IPv6 on the wire and can therefore be passed to a
     /// SOCKS5 proxy as an IPv6 destination, while still retaining its BIP155
@@ -715,5 +764,26 @@ mod tests {
             let endpoint = NetworkEndpoint::from_socket(address.parse().unwrap());
             assert!(!endpoint.uses_proxy_by_default(), "{endpoint}");
         }
+    }
+
+    #[test]
+    fn netgroup_keys_follow_core_prefix_boundaries() {
+        let ipv4_a = NetworkEndpoint::from_socket("1.2.3.4:8333".parse().unwrap());
+        let ipv4_b = NetworkEndpoint::from_socket("1.2.250.4:18333".parse().unwrap());
+        let ipv4_c = NetworkEndpoint::from_socket("1.3.3.4:8333".parse().unwrap());
+        assert_eq!(ipv4_a.netgroup_key(), ipv4_b.netgroup_key());
+        assert_ne!(ipv4_a.netgroup_key(), ipv4_c.netgroup_key());
+
+        let ipv6_a = NetworkEndpoint::from_socket("[2001:4860:1::1]:8333".parse().unwrap());
+        let ipv6_b = NetworkEndpoint::from_socket("[2001:4860:1:ffff::2]:18333".parse().unwrap());
+        let ipv6_c = NetworkEndpoint::from_socket("[2001:4861:1::1]:8333".parse().unwrap());
+        assert_eq!(ipv6_a.netgroup_key(), ipv6_b.netgroup_key());
+        assert_ne!(ipv6_a.netgroup_key(), ipv6_c.netgroup_key());
+
+        let cjdns_a = NetworkEndpoint::from_socket("[fc00:1:2::1]:8333".parse().unwrap());
+        let cjdns_b = NetworkEndpoint::from_socket("[fc00:1:2:ffff::2]:18333".parse().unwrap());
+        let cjdns_c = NetworkEndpoint::from_socket("[fc01:1:3::1]:8333".parse().unwrap());
+        assert_eq!(cjdns_a.netgroup_key(), cjdns_b.netgroup_key());
+        assert_ne!(cjdns_a.netgroup_key(), cjdns_c.netgroup_key());
     }
 }

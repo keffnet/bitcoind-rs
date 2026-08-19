@@ -575,8 +575,9 @@ pub enum MempoolError {
     #[error("too-long-mempool-chain, {0}")]
     MempoolLimits(String),
     // Store Core's stable reject reason together with its human-readable
-    // debug context. RPCs expose both as `truc-<reason>, <debug>`, while
-    // peer-facing callers can extract only the stable reason below.
+    // debug context. Core exposes TRUC policy failures as
+    // `TRUC-violation, <debug>` in RPC errors and uses `TRUC-violation` as
+    // the short reject reason.
     #[error("{0}")]
     Truc(String),
 }
@@ -642,8 +643,8 @@ impl MempoolError {
     }
 }
 
-fn truc_error(reason: &'static str, debug: String) -> MempoolError {
-    MempoolError::Truc(format!("{reason}, {debug}"))
+fn truc_error(_reason: &'static str, debug: String) -> MempoolError {
+    MempoolError::Truc(format!("TRUC-violation, {debug}"))
 }
 
 /// The package test-accept path needs to preserve the first transaction that
@@ -1440,6 +1441,26 @@ impl Mempool {
             .collect()
     }
 
+    fn connected_component(&self, txid: &Txid) -> HashSet<Txid> {
+        if !self.entries.contains_key(txid) {
+            return HashSet::new();
+        }
+        let mut component = HashSet::from([*txid]);
+        let mut pending = vec![*txid];
+        while let Some(current) = pending.pop() {
+            for connected in self
+                .parents(&current)
+                .into_iter()
+                .chain(self.children(&current))
+            {
+                if component.insert(connected) {
+                    pending.push(connected);
+                }
+            }
+        }
+        component
+    }
+
     pub fn load_from_file(&mut self, path: &Path, chain: &ChainState) -> Result<()> {
         self.load_from_file_with_expiry(path, chain, MEMPOOL_EXPIRY)
     }
@@ -1854,10 +1875,6 @@ impl Mempool {
         let mut package_fee = 0i128;
         let mut package_vsize = 0u64;
         let allow_low_fee_parent = package_is_child_with_parents_tree(transactions);
-        let package_txids = transactions
-            .iter()
-            .map(Transaction::compute_txid)
-            .collect::<HashSet<_>>();
         // Core evaluates only the transactions that are not already in the
         // mempool.  A child-with-parents package still gets aggregate
         // feerate treatment when at least two new transactions remain (for
@@ -1868,6 +1885,7 @@ impl Mempool {
             .iter()
             .filter(|transaction| candidate.get(&transaction.compute_txid()).is_none())
             .count();
+        let use_package_feerate = allow_low_fee_parent && new_transaction_count > 1;
         let package_rbf = allow_low_fee_parent
             && transactions
                 .iter()
@@ -1932,11 +1950,12 @@ impl Mempool {
                 accepted.push(txid);
                 continue;
             }
-            let enforce_fee_rate = !(allow_low_fee_parent && new_transaction_count > 1);
-            let enforce_min_relay = !transaction
-                .input
-                .iter()
-                .any(|input| package_txids.contains(&input.previous_output.txid));
+            // Core defers both the mempool minimum and min-relay checks for
+            // every member of a valid child-with-parents package. The
+            // aggregate package fee is checked after all members have been
+            // staged, allowing a zero-fee parent to be paid for by its child.
+            let enforce_fee_rate = !use_package_feerate;
+            let enforce_min_relay = !use_package_feerate;
             let result = if transactions.len() == 1 {
                 // Core's package path still permits a single transaction to
                 // replace an existing mempool conflict, but does not apply
@@ -2391,7 +2410,6 @@ impl Mempool {
             txid,
             &conflicts,
             &direct_conflicts,
-            &removal,
         ) {
             return Err(MempoolError::ReplacementFeerateDiagram);
         }
@@ -2541,76 +2559,59 @@ impl Mempool {
         replacement_id: Txid,
         conflicts: &[Txid],
         direct_conflicts: &[Txid],
-        removal: &HashSet<Txid>,
     ) -> bool {
+        // Core compares the complete chunk diagrams of every old cluster
+        // touched by the replacement with the corresponding staged clusters.
+        // Comparing only the direct conflict and its immediate parents loses
+        // retained ancestors from a chain and can reject a replacement that
+        // strictly improves the affected cluster.
         let mut old_chunks = Vec::new();
-        for txid in removal {
-            if !self.entries.contains_key(txid) || !self.descendants(txid).is_empty() {
-                continue;
-            }
-            let entry = self.entries.get(txid).expect("mempool entry exists");
-            let individual_fee = self.modified_fee_sat(txid, entry.fee_sat);
-            let individual_size = entry.vsize;
-            let ancestors = self.ancestors_for_transaction(&entry.transaction);
-            if ancestors.is_empty() {
-                old_chunks.push((individual_fee, individual_size));
-                continue;
-            }
-            let package_fee = ancestors.iter().fold(individual_fee, |fee, ancestor| {
-                fee.saturating_add(
-                    self.entries
-                        .get(ancestor)
-                        .map_or(0, |entry| self.modified_fee_sat(ancestor, entry.fee_sat)),
-                )
-            });
-            let package_size = ancestors.iter().fold(individual_size, |size, ancestor| {
-                size.saturating_add(self.entries.get(ancestor).map_or(0, |entry| entry.vsize))
-            });
-            if compare_fee_rate(individual_fee, individual_size, package_fee, package_size)
-                == Ordering::Greater
+        let mut old_components = Vec::<HashSet<Txid>>::new();
+        for conflict in conflicts.iter().chain(direct_conflicts.iter()) {
+            let component = self.connected_component(conflict);
+            if component.is_empty()
+                || old_components
+                    .iter()
+                    .any(|existing| !existing.is_disjoint(&component))
             {
-                old_chunks.push((package_fee, package_size));
-            } else {
-                old_chunks.push((
-                    package_fee.saturating_sub(individual_fee),
-                    package_size.saturating_sub(individual_size),
-                ));
-                old_chunks.push((individual_fee, individual_size));
+                continue;
             }
+            let order = self
+                .mining_order(u64::MAX, 0)
+                .into_iter()
+                .filter(|txid| component.contains(txid))
+                .collect::<Vec<_>>();
+            old_chunks.extend(component_feerate_diagram(self, &order));
+            old_components.push(component);
         }
 
         let mut new_chunks = Vec::new();
-        let mut retained_parents = HashSet::new();
-        for conflict in conflicts {
-            for parent in self.parents(conflict) {
-                if !removal.contains(&parent) && retained_parents.insert(parent) {
-                    if let Some(entry) = self.entries.get(&parent) {
-                        new_chunks
-                            .push((self.modified_fee_sat(&parent, entry.fee_sat), entry.vsize));
-                    }
-                }
-            }
+        let mut new_components = Vec::<HashSet<Txid>>::new();
+        let mut new_seeds = vec![replacement_id];
+        for component in &old_components {
+            new_seeds.extend(
+                component
+                    .iter()
+                    .copied()
+                    .filter(|txid| candidate.entries.contains_key(txid)),
+            );
         }
-        if let Some(entry) = candidate.entries.get(&replacement_id) {
-            new_chunks.push((
-                candidate.modified_fee_sat(&replacement_id, entry.fee_sat),
-                entry.vsize,
-            ));
-        }
-
-        // A replacement with multiple direct conflicts may leave an ancestor
-        // of one conflict in place even when that ancestor was not reached by
-        // the conflict walk above. Include its direct mempool parents too,
-        // matching Core's affected-cluster construction.
-        for conflict in direct_conflicts {
-            for parent in self.parents(conflict) {
-                if !removal.contains(&parent) && retained_parents.insert(parent) {
-                    if let Some(entry) = self.entries.get(&parent) {
-                        new_chunks
-                            .push((self.modified_fee_sat(&parent, entry.fee_sat), entry.vsize));
-                    }
-                }
+        for seed in new_seeds {
+            let component = candidate.connected_component(&seed);
+            if component.is_empty()
+                || new_components
+                    .iter()
+                    .any(|existing| !existing.is_disjoint(&component))
+            {
+                continue;
             }
+            let order = candidate
+                .mining_order(u64::MAX, 0)
+                .into_iter()
+                .filter(|txid| component.contains(txid))
+                .collect::<Vec<_>>();
+            new_chunks.extend(component_feerate_diagram(candidate, &order));
+            new_components.push(component);
         }
 
         sort_fee_rate_chunks(&mut old_chunks);

@@ -7701,10 +7701,8 @@ async fn handle_received_block(
         }
         Err(error) => {
             if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
-                debug!(
-                    "Block validation error: {}",
-                    validation_error.bip22_reject_reason()
-                );
+                let reject_reason = block_validation_log_reason(validation_error);
+                debug!("Block validation error: {reject_reason}");
             }
             let should_mark_invalid = error
                 .downcast_ref::<ValidationError>()
@@ -7777,6 +7775,15 @@ async fn handle_received_block(
             Ok(false)
         }
     }
+}
+
+fn block_validation_log_reason(error: &ValidationError) -> String {
+    let reason = error.bip22_reject_reason();
+    reason
+        .strip_prefix("mandatory-script-verify-flag-failed")
+        .map_or(reason.clone(), |suffix| {
+            format!("block-script-verify-flag-failed{suffix}")
+        })
 }
 
 fn unrequested_block_is_allowed(block: &Block, chain: &crate::chain::ChainState) -> bool {

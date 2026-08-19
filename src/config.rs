@@ -14,10 +14,7 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use crate::IpSubnet;
 use crate::address::NetworkEndpoint;
 use crate::i2p::I2P_SAM_PORT;
-use crate::mempool::{
-    DEFAULT_ANCESTOR_COUNT_LIMIT, DEFAULT_ANCESTOR_SIZE_LIMIT_VBYTES,
-    DEFAULT_DESCENDANT_COUNT_LIMIT, DEFAULT_DESCENDANT_SIZE_LIMIT_VBYTES, RbfPolicy, TrucPolicy,
-};
+use crate::mempool::{RbfPolicy, TrucPolicy};
 use crate::tor::DEFAULT_TOR_CONTROL_PORT;
 use crate::validation::{self, DeploymentParameters};
 
@@ -37,7 +34,11 @@ pub const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 100;
 pub const DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB: u64 = 3_000;
 pub const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
 pub const DEFAULT_MAX_TX_LEGACY_SIGOPS: u64 = 2_500;
-pub const DEFAULT_MAX_DATACARRIER_BYTES: u64 = 83;
+// Core v31.1 relays a standard OP_RETURN output up to the standard
+// transaction weight limit (400,000 WU / 4 = 100,000 vbytes). The full
+// script size, rather than only the pushed payload, is charged against this
+// budget.
+pub const DEFAULT_MAX_DATACARRIER_BYTES: u64 = 100_000;
 pub const DEFAULT_ACCEPT_DATACARRIER: bool = true;
 pub const DEFAULT_CORE_POLICY: bool = false;
 pub const DEFAULT_PERMIT_BARE_MULTISIG: bool = true;
@@ -3890,30 +3891,21 @@ impl Config {
             .limit_cluster_size_kvb
             .checked_mul(1_000)
             .context("--limitclustersize is too large")?;
-        let ancestor_count_limit = args
-            .limit_ancestor_count
-            .unwrap_or(DEFAULT_ANCESTOR_COUNT_LIMIT as i64)
-            .try_into()
-            .context("--limitancestorcount must be non-negative")?;
-        let ancestor_size_vbytes = args
-            .limit_ancestor_size
-            .map(|size| u64::try_from(size).context("--limitancestorsize must be non-negative"))
-            .transpose()?
-            .unwrap_or(DEFAULT_ANCESTOR_SIZE_LIMIT_VBYTES / 1_000)
-            .checked_mul(1_000)
-            .context("--limitancestorsize is too large")?;
-        let descendant_count_limit = args
-            .limit_descendant_count
-            .unwrap_or(DEFAULT_DESCENDANT_COUNT_LIMIT as i64)
-            .try_into()
-            .context("--limitdescendantcount must be non-negative")?;
-        let descendant_size_vbytes = args
-            .limit_descendant_size
-            .map(|size| u64::try_from(size).context("--limitdescendantsize must be non-negative"))
-            .transpose()?
-            .unwrap_or(DEFAULT_DESCENDANT_SIZE_LIMIT_VBYTES / 1_000)
-            .checked_mul(1_000)
-            .context("--limitdescendantsize is too large")?;
+        // Core v31.1 deprecated these four node-level limits in favor of
+        // connected-cluster limits. Keep accepting the options for command
+        // line/config compatibility, but do not apply them to admission;
+        // wallet-free operation has no wallet coin-selection consumer for
+        // the legacy values.
+        let _ = (
+            args.limit_ancestor_count,
+            args.limit_ancestor_size,
+            args.limit_descendant_count,
+            args.limit_descendant_size,
+        );
+        let ancestor_count_limit = usize::MAX;
+        let ancestor_size_vbytes = u64::MAX;
+        let descendant_count_limit = usize::MAX;
+        let descendant_size_vbytes = u64::MAX;
         let max_upload_target =
             parse_byte_units(&args.max_upload_target, 1 << 20).with_context(|| {
                 format!(
@@ -4169,7 +4161,11 @@ impl Config {
             #[cfg(not(test))]
             accept_nonstd_datacarrier: args.accept_nonstd_datacarrier.unwrap_or(false),
             #[cfg(not(test))]
-            permit_bare_datacarrier: args.permitbare_datacarrier.unwrap_or(false),
+            // Upstream Core has no separate bare-datacarrier switch; its
+            // standard OP_RETURN policy permits the equivalent output by
+            // default. Keep the extension opt-out available, but preserve
+            // Core's effective default here.
+            permit_bare_datacarrier: args.permitbare_datacarrier.unwrap_or(true),
             permit_bare_multisig: args
                 .permitbaremultisig
                 .unwrap_or(DEFAULT_PERMIT_BARE_MULTISIG),

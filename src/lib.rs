@@ -53,7 +53,7 @@ pub(crate) mod mining_capnp {
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
@@ -215,6 +215,7 @@ const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 const FEE_ESTIMATOR_FLUSH_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const MAX_EXTERNAL_BLOCK_RECORD_SIZE: usize = 4 * 1024 * 1024;
+const EXTERNAL_BLOCK_READ_SIZE: usize = 64 * 1024;
 // Core's DisconnectedBlockTransactions cap used while processing a reorg.
 const MAX_DISCONNECTED_TX_POOL_BYTES: usize = 20_000_000;
 const MAX_UPLOAD_TIMEFRAME_SECS: u64 = 24 * 60 * 60;
@@ -595,87 +596,166 @@ fn core_block_download_timeout(
     )
 }
 
+struct ExternalBlockReader {
+    file: File,
+    path: std::path::PathBuf,
+    magic: Vec<u8>,
+    buffer: Vec<u8>,
+    buffer_start: usize,
+    read_buffer: [u8; EXTERNAL_BLOCK_READ_SIZE],
+    eof: bool,
+}
+
+impl ExternalBlockReader {
+    fn new(file: File, path: &Path, magic: Vec<u8>) -> Self {
+        Self {
+            file,
+            path: path.to_owned(),
+            magic,
+            buffer: Vec::with_capacity(MAX_EXTERNAL_BLOCK_RECORD_SIZE + 8),
+            buffer_start: 0,
+            read_buffer: [0; EXTERNAL_BLOCK_READ_SIZE],
+            eof: false,
+        }
+    }
+
+    fn available(&self) -> usize {
+        self.buffer.len().saturating_sub(self.buffer_start)
+    }
+
+    fn compact(&mut self) {
+        if self.buffer_start >= EXTERNAL_BLOCK_READ_SIZE
+            && self.buffer_start.saturating_mul(2) >= self.buffer.len()
+        {
+            self.buffer.drain(..self.buffer_start);
+            self.buffer_start = 0;
+        }
+    }
+
+    fn discard(&mut self, bytes: usize) {
+        self.buffer_start = self.buffer_start.saturating_add(bytes);
+        self.compact();
+    }
+
+    fn fill_to(&mut self, required: usize) -> Result<bool> {
+        while self.available() < required && !self.eof {
+            self.compact();
+            let read = self
+                .file
+                .read(&mut self.read_buffer)
+                .with_context(|| format!("reading block file {}", self.path.display()))?;
+            if read == 0 {
+                self.eof = true;
+                break;
+            }
+            self.buffer.extend_from_slice(&self.read_buffer[..read]);
+        }
+        Ok(self.available() >= required)
+    }
+
+    fn next_block(&mut self) -> Result<Option<Block>> {
+        loop {
+            if !self.fill_to(self.magic.len())? {
+                return Ok(None);
+            }
+            let candidate = {
+                let available = &self.buffer[self.buffer_start..];
+                available
+                    .windows(self.magic.len())
+                    .position(|bytes| bytes == self.magic.as_slice())
+            };
+            let Some(relative_magic) = candidate else {
+                // Preserve enough bytes for a network marker split between
+                // two read buffers. The discarded prefix is arbitrary data
+                // that Core's importer would scan past.
+                self.discard(self.available().saturating_sub(self.magic.len() - 1));
+                continue;
+            };
+            let header_size = relative_magic.saturating_add(8);
+            if !self.fill_to(header_size)? {
+                // A partial record header at EOF is an incomplete tail.
+                return Ok(None);
+            }
+            let record_offset = self.buffer_start.saturating_add(relative_magic);
+            let length = u32::from_le_bytes(
+                self.buffer[record_offset + 4..record_offset + 8]
+                    .try_into()
+                    .expect("record header has four length bytes"),
+            ) as usize;
+            if !(80..=MAX_EXTERNAL_BLOCK_RECORD_SIZE).contains(&length) {
+                // Rewind by one byte so a later occurrence of the magic
+                // inside malformed data can still be considered.
+                self.discard(relative_magic.saturating_add(1));
+                continue;
+            }
+            let record_size = header_size.saturating_add(length);
+            if !self.fill_to(record_size)? {
+                // Ignore an incomplete final record while retaining the
+                // valid prefix, matching Core's EOF behavior.
+                return Ok(None);
+            }
+            let payload_start = record_offset.saturating_add(8);
+            let payload_end = payload_start.saturating_add(length);
+            let block = deserialize::<Block>(&self.buffer[payload_start..payload_end]);
+            if let Ok(block) = block {
+                self.discard(record_size);
+                return Ok(Some(block));
+            }
+            self.discard(relative_magic.saturating_add(1));
+        }
+    }
+}
+
+fn connect_external_pending(
+    chain: &mut ChainState,
+    pending: &mut Vec<Block>,
+    path: &Path,
+) -> Result<(usize, bool)> {
+    let mut remaining = Vec::with_capacity(pending.len());
+    let mut imported = 0usize;
+    let mut progress = false;
+    for block in pending.drain(..) {
+        let hash = block.block_hash();
+        if chain.header_by_hash(&hash).is_some() && chain.block(&hash)?.is_some() {
+            continue;
+        }
+        let parent_hash = block.header.prev_blockhash;
+        if chain.header_by_hash(&parent_hash).is_none() || chain.block(&parent_hash)?.is_none() {
+            remaining.push(block);
+            continue;
+        }
+        chain
+            .connect_block(block)
+            .with_context(|| format!("connecting block {hash} from {}", path.display()))?;
+        imported = imported.saturating_add(1);
+        progress = true;
+    }
+    *pending = remaining;
+    Ok((imported, progress))
+}
+
 fn import_external_block_file(
     chain: &mut ChainState,
     path: &Path,
     network: Network,
     signet_challenge: Option<&[u8]>,
 ) -> Result<usize> {
-    let bytes = fs::read(path).with_context(|| format!("reading block file {}", path.display()))?;
-    let magic = wire::network_magic_with_signet_challenge(network, signet_challenge);
-    let mut blocks = Vec::new();
-    let mut offset = 0usize;
-    while offset.saturating_add(magic.len()) <= bytes.len() {
-        // Core's LoadExternalBlockFile scans for the next network marker
-        // instead of requiring a bootstrap file to be a perfectly contiguous
-        // sequence. This accepts padding, copied file fragments, and harmless
-        // garbage before or between records without changing the native
-        // storage format used by this node.
-        let Some(relative_magic) = bytes[offset..]
-            .windows(magic.len())
-            .position(|candidate| candidate == magic.as_slice())
-        else {
-            break;
-        };
-        let record_offset = offset.saturating_add(relative_magic);
-        let header_end = record_offset.saturating_add(8);
-        if header_end > bytes.len() {
-            // A partial record header at EOF is treated as an incomplete
-            // tail, just as Core's buffered importer does.
-            break;
-        }
-        let length = u32::from_le_bytes(
-            bytes[record_offset + 4..header_end]
-                .try_into()
-                .expect("record header has four length bytes"),
-        ) as usize;
-        if !(80..=MAX_EXTERNAL_BLOCK_RECORD_SIZE).contains(&length) {
-            // Rewind by one byte so a later occurrence of the magic inside a
-            // malformed record can still be considered as a candidate.
-            offset = record_offset.saturating_add(1);
-            continue;
-        }
-        let record_start = header_end;
-        let record_end = record_start.saturating_add(length);
-        if record_end > bytes.len() {
-            // Ignore an incomplete final record. A valid prefix is still
-            // useful, and this matches Core's EOF handling for block files.
-            break;
-        }
-        match deserialize::<Block>(&bytes[record_start..record_end]) {
-            Ok(block) => blocks.push(block),
-            Err(_) => {
-                offset = record_offset.saturating_add(1);
-                continue;
-            }
-        }
-        offset = record_end;
-    }
-
-    let mut pending = blocks;
+    let file =
+        File::open(path).with_context(|| format!("reading block file {}", path.display()))?;
+    let magic = wire::network_magic_with_signet_challenge(network, signet_challenge).to_vec();
+    let mut reader = ExternalBlockReader::new(file, path, magic);
+    let mut pending = Vec::new();
     let mut imported = 0usize;
+    while let Some(block) = reader.next_block()? {
+        pending.push(block);
+        let (count, _) = connect_external_pending(chain, &mut pending, path)?;
+        imported = imported.saturating_add(count);
+    }
     while !pending.is_empty() {
-        let mut remaining = Vec::new();
-        let mut progress = false;
-        for block in pending {
-            let hash = block.block_hash();
-            if chain.header_by_hash(&hash).is_some() && chain.block(&hash)?.is_some() {
-                continue;
-            }
-            let parent_hash = block.header.prev_blockhash;
-            if chain.header_by_hash(&parent_hash).is_none() || chain.block(&parent_hash)?.is_none()
-            {
-                remaining.push(block);
-                continue;
-            }
-            chain
-                .connect_block(block)
-                .with_context(|| format!("connecting block {hash} from {}", path.display()))?;
-            imported = imported.saturating_add(1);
-            progress = true;
-        }
-        if !remaining.is_empty() && !progress {
-            let block = &remaining[0];
+        let (count, progress) = connect_external_pending(chain, &mut pending, path)?;
+        imported = imported.saturating_add(count);
+        if !progress {
+            let block = &pending[0];
             bail!(
                 "block file {} contains block {} with an unknown or unavailable parent {}",
                 path.display(),
@@ -683,7 +763,6 @@ fn import_external_block_file(
                 block.header.prev_blockhash
             );
         }
-        pending = remaining;
     }
     Ok(imported)
 }
@@ -8179,7 +8258,9 @@ mod tests {
         // The external importer must scan around non-record bytes, defer the
         // child until its parent arrives, and ignore an incomplete final
         // record instead of discarding the valid prefix.
-        let mut framed = vec![0x11, 0x22, 0x33, 0x44, 0x55];
+        // Put the first magic marker across the streaming reader's buffer
+        // boundary so scanning does not depend on record alignment.
+        let mut framed = vec![0x11; EXTERNAL_BLOCK_READ_SIZE - 2];
         framed.extend_from_slice(&frame(&second));
         framed.extend_from_slice(&[0x91, 0x92, 0x93]);
         framed.extend_from_slice(&frame(&first));

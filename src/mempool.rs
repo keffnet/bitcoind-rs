@@ -4313,6 +4313,7 @@ fn datacarrier_bytes(transaction: &Transaction, previous_outputs: &[TxOut]) -> (
     let mut nonstandard = transaction
         .output
         .iter()
+        .filter(|output| !is_core_nulldata(&output.script_pubkey))
         .map(|output| nonstandard_datacarrier_script_bytes(&output.script_pubkey))
         .sum::<usize>();
 
@@ -4425,7 +4426,7 @@ fn validate_standard_policy_with_modified_fee_and_policy(
                 .max_datacarrier_bytes
                 .is_none_or(|max| data_carrier_bytes > max)
             {
-                return Err(MempoolError::NonStandard("scriptpubkey".to_owned()));
+                return Err(MempoolError::NonStandard("datacarrier".to_owned()));
             }
         } else if !is_standard_output_script(&output.script_pubkey, true) {
             return Err(MempoolError::NonStandard("scriptpubkey".to_owned()));
@@ -4465,7 +4466,7 @@ fn validate_standard_policy_with_modified_fee_and_policy(
     }
     if legacy_sigops > policy.max_tx_legacy_sigops {
         return Err(MempoolError::NonStandard(
-            "bad-txns-input-sigops-toomany-overall".to_owned(),
+            "bad-txns-nonstandard-inputs".to_owned(),
         ));
     }
     validate_standard_inputs(transaction, previous_outputs)?;
@@ -7295,7 +7296,7 @@ mod tests {
                 1,
                 &policy,
             ),
-            Err(MempoolError::NonStandard(reason)) if reason == "scriptpubkey"
+            Err(MempoolError::NonStandard(reason)) if reason == "datacarrier"
         ));
 
         let mut bare_multisig = vec![0x51, 0x21];
@@ -7393,7 +7394,7 @@ mod tests {
         assert!(matches!(
             validate_standard_policy(&transaction, &previous_outputs, 1),
             Err(MempoolError::NonStandard(reason))
-                if reason == "bad-txns-input-sigops-toomany-overall"
+                if reason == "bad-txns-nonstandard-inputs"
         ));
     }
 

@@ -8955,6 +8955,35 @@ mod tests {
     }
 
     #[test]
+    fn node_uses_native_block_storage_without_core_block_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let previous = *node.chain.read().header(0).unwrap();
+        node.connect_block(mine_test_block(&previous, 1, 1))
+            .unwrap();
+        drop(node);
+
+        let blocks_directory = directory.path().join("blocks");
+        assert!(blocks_directory.join("blocks.dat").is_file());
+        assert!(blocks_directory.join("blocks.index").is_file());
+        assert!(blocks_directory.join("undo.dat").is_file());
+        assert!(blocks_directory.join("undo.index").is_file());
+        for name in ["blk00000.dat", "rev00000.dat"] {
+            assert!(
+                !blocks_directory.join(name).exists(),
+                "native node storage must not create Core file {name}"
+            );
+        }
+        assert!(
+            !directory
+                .path()
+                .join("indexes/electrum/txblocks.dat")
+                .exists(),
+            "unpruned nodes must not duplicate block transactions in an Electrum sidecar"
+        );
+    }
+
+    #[test]
     fn minimum_chain_work_override_reaches_chain_state() {
         let directory = tempfile::tempdir().unwrap();
         let args = crate::config::Args::try_parse_from([

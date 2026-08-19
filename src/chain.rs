@@ -1608,6 +1608,13 @@ impl ChainState {
             state.initialize_genesis(&genesis)?;
             state.index_persisted_headers(&persisted_headers)?;
             state.rebuild_block_index()?;
+            // The optional Core-style txindex is independent of the active
+            // chainstate.  Reindexing deliberately removes the snapshot that
+            // normally carries this map, so rebuild it from the native block
+            // records before replaying the selected best chain.  This keeps
+            // side-chain getrawtransaction lookups intact without creating a
+            // Core block-index or blk*/rev* storage file.
+            state.rebuild_transaction_index()?;
             let best = state
                 .best_valid_tip_hash()
                 .context("reindex found no valid chain tip")?;
@@ -7028,6 +7035,30 @@ impl ChainState {
         Ok(())
     }
 
+    fn rebuild_transaction_index(&mut self) -> Result<()> {
+        if !self.tx_index_all_enabled {
+            return Ok(());
+        }
+        let mut hashes: Vec<BlockHash> = self.store.hashes().copied().collect();
+        hashes.sort_by_key(|hash| {
+            self.block_index
+                .get(hash)
+                .map(|node| (node.height, hash.to_string()))
+                .unwrap_or((u32::MAX, hash.to_string()))
+        });
+        self.tx_index_all.clear();
+        for hash in hashes {
+            let Some(node) = self.block_index.get(&hash).copied() else {
+                continue;
+            };
+            let Some(block) = self.store.get(&hash)? else {
+                continue;
+            };
+            self.index_all_transactions(&block, node.height);
+        }
+        Ok(())
+    }
+
     fn rebuild_coinstats_index(&mut self) -> Result<()> {
         let active_chain = self.active_chain.clone();
         let tip_height = self.height();
@@ -10607,6 +10638,43 @@ mod tests {
         assert_eq!(rebuilt.height(), 3);
         assert_eq!(rebuilt.utxo_stats(), tip_stats);
         assert!(directory.path().join("chainstate.bin").exists());
+    }
+
+    #[test]
+    fn reindex_chainstate_preserves_persisted_side_chain_transactions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open_with_options_and_tx_index(
+            Network::Regtest,
+            directory.path(),
+            None,
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        state.connect_block(mine_block(&state, 2)).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side = mine_block_from_header(&genesis, 1, 77);
+        let side_txid = side.txdata[0].compute_txid();
+        state.connect_block(side).unwrap();
+        state.persist_metadata().unwrap();
+        assert!(state.transaction(&side_txid).unwrap().is_some());
+        drop(state);
+
+        let mut rebuilt = ChainState::open_with_options_and_tx_index(
+            Network::Regtest,
+            directory.path(),
+            None,
+            false,
+            false,
+            true,
+            true,
+        )
+        .unwrap();
+        assert!(rebuilt.transaction(&side_txid).unwrap().is_some());
     }
 
     #[test]

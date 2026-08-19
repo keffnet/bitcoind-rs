@@ -114,7 +114,7 @@ Relay policy follows Core's fee and standardness switches: `--minrelaytxfee` and
 
 `--blockfilterindex=basic` enables the BIP157 basic compact-filter index, its RPC/REST methods, and compact-filter P2P service; it is disabled by default, matching Core.
 
-`--reindex` and `--reindex-chainstate` rebuild this implementation's chain metadata and UTXO state from the durable block store on startup. The rebuild ignores the existing binary or legacy JSON chainstate/snapshot files and preserves the stored block records.
+`--reindex` and `--reindex-chainstate` rebuild this implementation's chain metadata and UTXO state from the durable block store on startup. The rebuild ignores the existing binary or legacy JSON chainstate/snapshot files and preserves the stored block records. When `--txindex` is enabled, either mode also reconstructs side-chain transaction locations from the native block records.
 
 `--loadblock=<path>` imports one or more Core-style network-magic/length-framed block files at startup; each block still passes normal header, consensus, and chain-selection validation.
 `--stopafterblockimport` requests clean shutdown after startup block-file import, matching Core's debug/test option.

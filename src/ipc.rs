@@ -763,6 +763,29 @@ impl crate::mining_capnp::block_template::Server for BlockTemplateService {
             cancellation.complete();
             return Ok(());
         }
+
+        // Core performs one fee comparison even when the timeout has already
+        // elapsed. In particular, fee_threshold == 0 is the documented way
+        // for a client to request a refreshed template immediately; checking
+        // the deadline first would incorrectly return nullptr.
+        if fee_threshold == 0 {
+            let template = match crate::rpc::create_ipc_block_template(&self.node, self.options) {
+                Ok(template) => template,
+                Err(error) => {
+                    cancellation.complete();
+                    return Err(capnp::Error::failed(error.to_string()));
+                }
+            };
+            debug!("IPC server send response");
+            results.get().set_result(block_template_client(
+                self.node.clone(),
+                template,
+                self.options,
+            ));
+            cancellation.complete();
+            return Ok(());
+        }
+
         let mut chain_events = self.node.subscribe_chain();
         let mut mempool_events = self.node.subscribe_mempool();
         let deadline = timeout.map(|duration| tokio::time::Instant::now() + duration);
@@ -1230,6 +1253,12 @@ mod tests {
                 );
                 let template_response = create_request.send().promise.await.unwrap();
                 let template = template_response.get().unwrap().get_result().unwrap();
+                let mut immediate_wait = template.wait_next_request();
+                let mut immediate_options = immediate_wait.get().init_options();
+                immediate_options.set_timeout(0.0);
+                immediate_options.set_fee_threshold(0);
+                let immediate_response = immediate_wait.send().promise.await.unwrap();
+                assert!(immediate_response.get().unwrap().get_result().is_ok());
                 let block_response = template.get_block_request().send().promise.await.unwrap();
                 let block: bitcoin::Block =
                     deserialize(block_response.get().unwrap().get_result().unwrap()).unwrap();

@@ -213,6 +213,7 @@ fn addrman_tried_slot(key: &[u8; 32], endpoint: &NetworkEndpoint) -> (usize, usi
     (bucket, position)
 }
 pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+pub(crate) const MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK: usize = 3;
 const BLOCK_DOWNLOAD_WINDOW: u32 = 1024;
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 const BLOCK_STALLING_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
@@ -5064,6 +5065,46 @@ impl Node {
         self.track_peer_block_request_with_limit(peer_id, hash, true)
     }
 
+    /// Reserve one of Core's parallel compact-block reconstruction attempts.
+    /// Unlike a full block download, several peers may be asked for the same
+    /// block's missing transactions at once. Keep the reservation in the
+    /// normal in-flight set so completion, stalling, and RPC peer metadata
+    /// continue to observe the same request lifecycle.
+    pub(crate) fn track_peer_compact_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
+        let Some(height) = self.chain.read().block_height_by_hash(&hash) else {
+            return false;
+        };
+        let mut peers = self.peers.write();
+        let block_requests = peers
+            .values()
+            .filter(|peer| {
+                peer.inflight_blocks
+                    .iter()
+                    .any(|inflight| inflight.hash == hash)
+            })
+            .count();
+        if block_requests >= MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK {
+            return false;
+        }
+        let Some(peer) = peers.get_mut(&peer_id) else {
+            return false;
+        };
+        if peer
+            .inflight_blocks
+            .iter()
+            .any(|inflight| inflight.hash == hash)
+            || peer.inflight_blocks.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
+        {
+            return false;
+        }
+        peer.inflight_blocks.push(InflightBlock {
+            hash,
+            height,
+            requested_at: Instant::now(),
+        });
+        true
+    }
+
     /// Record a request made by the `getblockfrompeer` RPC. Core's manual
     /// fetch path intentionally does not apply the automatic download window
     /// limit; callers may queue a range of previously-pruned blocks from one
@@ -9160,6 +9201,36 @@ mod tests {
         assert!(!node.track_peer_block_request(2, first.block_hash()));
         node.clear_peer_block_request(1, first.block_hash());
         assert!(node.track_peer_block_request(2, first.block_hash()));
+    }
+
+    #[test]
+    fn compact_block_request_reservation_allows_three_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 4);
+        node.chain
+            .write()
+            .accept_headers(std::slice::from_ref(&first.header))
+            .unwrap();
+
+        let (sender_one, _receiver_one) = tokio::sync::mpsc::unbounded_channel();
+        let (sender_two, _receiver_two) = tokio::sync::mpsc::unbounded_channel();
+        let (sender_three, _receiver_three) = tokio::sync::mpsc::unbounded_channel();
+        let (sender_four, _receiver_four) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender_one);
+        node.register_peer(2, "192.0.2.2:18444".parse().unwrap(), true, sender_two);
+        node.register_peer(3, "192.0.2.3:18444".parse().unwrap(), true, sender_three);
+        node.register_peer(4, "192.0.2.4:18444".parse().unwrap(), true, sender_four);
+
+        let hash = first.block_hash();
+        assert!(node.track_peer_compact_block_request(1, hash));
+        assert!(node.track_peer_compact_block_request(2, hash));
+        assert!(node.track_peer_compact_block_request(3, hash));
+        assert!(!node.track_peer_compact_block_request(4, hash));
+        assert!(!node.track_peer_compact_block_request(1, hash));
+
+        node.clear_peer_block_request(1, hash);
+        assert!(node.track_peer_compact_block_request(4, hash));
     }
 
     #[test]

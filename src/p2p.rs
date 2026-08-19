@@ -55,8 +55,9 @@ use crate::wire::{
 
 use crate::{
     AddrResponseCacheKey, EXTRA_PEER_CHECK_INTERVAL, MAX_BLOCK_RELAY_ONLY_ANCHORS,
-    MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, OutboundEvictionAction, PRIVATE_BROADCAST_RETRY_SECS,
-    PeerRegistrationOptions, StartupLatch, unix_time_seconds,
+    MAX_BLOCKS_IN_TRANSIT_PER_PEER, MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK, Node,
+    OutboundEvictionAction, PRIVATE_BROADCAST_RETRY_SECS, PeerRegistrationOptions, StartupLatch,
+    unix_time_seconds,
 };
 
 macro_rules! peer_log {
@@ -248,7 +249,6 @@ const MAX_ADDR_TO_SEND: usize = 1_000;
 const MAX_PCT_ADDR_TO_SEND: usize = 23;
 const MAX_CMPCTBLOCK_DEPTH: u32 = 5;
 const MAX_BLOCKTXN_DEPTH: u32 = 10;
-const MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK: usize = 3;
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 const STALE_RELAY_AGE_LIMIT_SECS: u64 = 30 * 24 * 60 * 60;
 pub(crate) const MIN_PEER_PROTO_VERSION: i32 = 31_800;
@@ -6668,7 +6668,7 @@ async fn serve_peer_loop(
                                             || block_requested_from_outbound
                                             || already_in_flight
                                                 < MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK - 1)));
-                        if !can_request || !node.track_peer_block_request(peer_id, hash) {
+                        if !can_request || !node.track_peer_compact_block_request(peer_id, hash) {
                             continue;
                         }
                         let request = BlockTransactionsRequest {

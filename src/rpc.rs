@@ -5153,7 +5153,6 @@ fn bip9_deployment_json(
         bip9["bit"] = json!(deployment.bit);
         let mut statistics = json!({
             "period": period,
-            "period_start": period_start,
             "elapsed": elapsed,
             "count": count,
         });
@@ -21997,6 +21996,11 @@ mod tests {
         assert_eq!(
             locked_in_info["bip9"]["statistics"]["possible"],
             json!(true)
+        );
+        assert!(
+            locked_in_info["bip9"]["statistics"]
+                .get("period_start")
+                .is_none()
         );
 
         let period_boundary_info =

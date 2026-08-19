@@ -7281,7 +7281,6 @@ impl Node {
         let mut p2p_task = tokio::spawn(p2p.run_with_startup(startup.clone()));
         let mut rpc_task = tokio::spawn(rpc.run_with_startup(startup.clone()));
         let mut electrum_task = tokio::spawn(electrum.run_with_startup(startup));
-        info!("init message: Done loading");
         run_notify_command(self.config.startup_notify.as_deref(), None);
         let background_node = self.clone();
         let background_validation_task = tokio::spawn(async move {

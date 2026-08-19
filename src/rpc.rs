@@ -181,6 +181,7 @@ impl RpcServer {
             self.node.config.rpc_binds.clone()
         };
         if binds.is_empty() {
+            info!("init message: Done loading");
             if let Some(startup) = startup.as_deref() {
                 startup.service_ready();
             }
@@ -236,6 +237,10 @@ impl RpcServer {
         if bound == 0 {
             bail!("unable to bind any RPC listener");
         }
+        // Core's "Done loading" marker is used by callers as a readiness
+        // boundary. Emit it only after the RPC listener is accepting binds,
+        // rather than when the service task is merely spawned.
+        info!("init message: Done loading");
         if let Some(startup) = startup.as_deref() {
             startup.service_ready();
         }

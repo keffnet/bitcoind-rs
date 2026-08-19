@@ -54,9 +54,9 @@ use crate::wire::{
 };
 
 use crate::{
-    AddrResponseCacheKey, MAX_BLOCK_RELAY_ONLY_ANCHORS, MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node,
-    OutboundEvictionAction, PRIVATE_BROADCAST_RETRY_SECS, PeerRegistrationOptions, StartupLatch,
-    unix_time_seconds,
+    AddrResponseCacheKey, EXTRA_PEER_CHECK_INTERVAL, MAX_BLOCK_RELAY_ONLY_ANCHORS,
+    MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, OutboundEvictionAction, PRIVATE_BROADCAST_RETRY_SECS,
+    PeerRegistrationOptions, StartupLatch, unix_time_seconds,
 };
 
 macro_rules! peer_log {
@@ -2023,9 +2023,8 @@ impl PeerManager {
                 .await;
             }
         });
-        let configured_connect_nodes = (self.node.config.connect_disabled
-            || !self.node.config.seed_nodes.is_empty())
-            && !self.node.config.dnsseed;
+        let configured_connect_nodes =
+            self.node.config.connect_disabled || !self.node.config.seed_nodes.is_empty();
         let has_seed_nodes = !self.node.config.seed_nodes_for_address_fetch.is_empty();
         let has_add_nodes = !self.node.config.add_nodes.is_empty();
         let has_known_network_addresses = !self.node.known_network_addresses().is_empty();
@@ -2279,13 +2278,20 @@ impl PeerManager {
                     let block_relay_attempts = discovery_outbound
                         .automatic_block_relay_attempts
                         .load(Ordering::Acquire);
+                    let extra_full = discovery_node.extra_full_outbound_requested()
+                        && max_full_relay == MAX_OUTBOUND_FULL_RELAY_CONNECTIONS
+                        && full_attempts >= max_full_relay;
+                    let extra_block_relay = discovery_node
+                        .extra_block_relay_attempt_due(unix_time_seconds())
+                        && block_relay_attempts >= max_block_relay;
                     let full_slots = max_full_relay.saturating_sub(full_attempts);
                     let block_relay_slots = max_block_relay.saturating_sub(block_relay_attempts);
-                    let available = discovery_outbound
-                        .slots
-                        .available_permits()
-                        .min(8)
-                        .min(full_slots.saturating_add(block_relay_slots));
+                    let available = discovery_outbound.slots.available_permits().min(8).min(
+                        full_slots
+                            .saturating_add(block_relay_slots)
+                            .saturating_add(usize::from(extra_full))
+                            .saturating_add(usize::from(extra_block_relay)),
+                    );
                     if available == 0 {
                         continue;
                     }
@@ -2296,10 +2302,28 @@ impl PeerManager {
                     );
                     let mut full_slots = full_slots;
                     let mut block_relay_slots = block_relay_slots;
+                    let mut extra_full = extra_full;
+                    let mut extra_block_relay = extra_block_relay;
                     for endpoint in endpoints {
-                        let Some(connection_type) =
-                            next_automatic_connection_type(&mut full_slots, &mut block_relay_slots)
-                        else {
+                        // Core's priority is normal full-relay, normal
+                        // block-relay, stale-tip full-relay, then periodic
+                        // extra block-relay. Keep the extra capacity separate
+                        // so it cannot jump ahead of a normal slot.
+                        let connection_type = if full_slots != 0 {
+                            full_slots -= 1;
+                            "outbound-full"
+                        } else if block_relay_slots != 0 {
+                            block_relay_slots -= 1;
+                            "block-relay-only"
+                        } else if extra_full {
+                            extra_full = false;
+                            "outbound-full"
+                        } else if extra_block_relay
+                            && discovery_node.claim_extra_block_relay_attempt(unix_time_seconds())
+                        {
+                            extra_block_relay = false;
+                            "block-relay-only"
+                        } else {
                             break;
                         };
                         spawn_outbound_loop(
@@ -2343,7 +2367,11 @@ impl PeerManager {
                     let block_relay_attempts = feeler_outbound
                         .automatic_block_relay_attempts
                         .load(Ordering::Acquire);
-                    if full_attempts < max_full_relay || block_relay_attempts < max_block_relay {
+                    if full_attempts < max_full_relay
+                        || block_relay_attempts < max_block_relay
+                        || feeler_node.extra_full_outbound_requested()
+                        || feeler_node.extra_block_relay_attempt_due(unix_time_seconds())
+                    {
                         continue;
                     }
                     let Some(endpoint) =
@@ -2367,6 +2395,23 @@ impl PeerManager {
                 }
             });
         }
+        let maintenance_node = self.node.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(EXTRA_PEER_CHECK_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        maintenance_node.check_for_stale_tip_and_evict_peers(
+                            unix_time_seconds(),
+                            max_full_relay,
+                            max_block_relay,
+                        );
+                    }
+                    _ = maintenance_node.wait_for_shutdown() => break,
+                }
+            }
+        });
         let dynamic_node = self.node.clone();
         let dynamic_outbound = outbound.clone();
         tokio::spawn(async move {
@@ -3055,6 +3100,7 @@ fn select_discovery_endpoints(
     selected
 }
 
+#[cfg(test)]
 fn next_automatic_connection_type(
     full_slots: &mut usize,
     block_relay_slots: &mut usize,

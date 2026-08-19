@@ -110,6 +110,11 @@ const ADDRMAN_BUCKET_SIZE: usize = 64;
 const ADDRMAN_SECRET_FILE: &str = "addrman.key";
 const BLOCK_RELAY_ONLY_ANCHORS_FILE: &str = "anchors.json";
 pub(crate) const MAX_BLOCK_RELAY_ONLY_ANCHORS: usize = 2;
+const MAX_OUTBOUND_FULL_RELAY_CONNECTIONS: usize = 8;
+pub(crate) const EXTRA_PEER_CHECK_INTERVAL: Duration = Duration::from_secs(45);
+const STALE_TIP_CHECK_INTERVAL_SECS: u64 = 10 * 60;
+const EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL_SECS: u64 = 5 * 60;
+const MINIMUM_EXTRA_PEER_CONNECT_TIME_SECS: u64 = 30;
 const COINSTATS_CLEAN_SHUTDOWN_HEIGHT_FILE: &str = "clean_shutdown_height";
 const LARGE_WORK_INVALID_CHAIN_WARNING: &str = "Warning: Found invalid chain more than 6 blocks longer than our best chain. This could be due to database corruption or consensus incompatibility with peers.";
 
@@ -1639,6 +1644,11 @@ pub struct Node {
     mock_scheduler_elapsed_secs: AtomicU64,
     block_stalling_since: parking_lot::RwLock<HashMap<usize, BlockStallingMoment>>,
     chain_sync_states: parking_lot::RwLock<HashMap<usize, ChainSyncTimeoutState>>,
+    last_tip_update: AtomicU64,
+    stale_tip_check_at: AtomicU64,
+    try_new_outbound_peer: AtomicBool,
+    extra_block_relay_peers_enabled: AtomicBool,
+    next_extra_block_relay_at: AtomicU64,
     rejected_block_bodies: parking_lot::RwLock<HashSet<BlockHash>>,
     shutdown_requested: AtomicBool,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
@@ -2076,7 +2086,7 @@ impl Node {
             }
         };
         let block_relay_only_anchors_path = network_datadir.join(BLOCK_RELAY_ONLY_ANCHORS_FILE);
-        let block_relay_only_anchors = if config.connect_disabled {
+        let block_relay_only_anchors = if config.connect_disabled || !config.seed_nodes.is_empty() {
             // Core disables AddrMan-driven outgoing connections, including
             // anchor replay and clean-shutdown anchor snapshots, when
             // -connect/-noconnect is configured. Leave a native snapshot in
@@ -2184,6 +2194,11 @@ impl Node {
             mock_scheduler_elapsed_secs: AtomicU64::new(0),
             block_stalling_since: parking_lot::RwLock::new(HashMap::new()),
             chain_sync_states: parking_lot::RwLock::new(HashMap::new()),
+            last_tip_update: AtomicU64::new(0),
+            stale_tip_check_at: AtomicU64::new(0),
+            try_new_outbound_peer: AtomicBool::new(false),
+            extra_block_relay_peers_enabled: AtomicBool::new(false),
+            next_extra_block_relay_at: AtomicU64::new(0),
             rejected_block_bodies: parking_lot::RwLock::new(HashSet::new()),
             shutdown_requested: AtomicBool::new(false),
             peers: parking_lot::RwLock::new(HashMap::new()),
@@ -2281,6 +2296,13 @@ impl Node {
             };
             (tip, activated_blocks, disconnected_blocks)
         };
+        if tip.hash != previous_tip {
+            // Core's peer manager records every active-tip change for stale
+            // tip detection. Keep the timestamp in node state rather than in
+            // the native chain files; it is deliberately runtime-only.
+            self.last_tip_update
+                .store(time::unix_time(), Ordering::Release);
+        }
         for _ in &activated_blocks {
             self.reduce_block_stalling_timeout();
         }
@@ -4492,6 +4514,198 @@ impl Node {
         }
 
         OutboundEvictionAction::None
+    }
+
+    pub(crate) fn extra_full_outbound_requested(&self) -> bool {
+        self.try_new_outbound_peer.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn extra_block_relay_attempt_due(&self, now: u64) -> bool {
+        self.extra_block_relay_peers_enabled.load(Ordering::Acquire)
+            && now >= self.next_extra_block_relay_at.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn claim_extra_block_relay_attempt(&self, now: u64) -> bool {
+        if !self.extra_block_relay_peers_enabled.load(Ordering::Acquire) {
+            return false;
+        }
+        let next = self.next_extra_block_relay_at.load(Ordering::Acquire);
+        if now < next {
+            return false;
+        }
+        self.next_extra_block_relay_at
+            .compare_exchange(
+                next,
+                now.saturating_add(EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL_SECS),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Run Core's periodic stale-tip and extra-outbound maintenance. The
+    /// connection scheduler consumes the two resulting flags on its next
+    /// AddrMan pass; the peer manager itself remains responsible for opening
+    /// and closing sockets.
+    pub(crate) fn check_for_stale_tip_and_evict_peers(
+        &self,
+        now: u64,
+        max_full_relay: usize,
+        max_block_relay: usize,
+    ) {
+        self.evict_extra_outbound_peers(now, max_full_relay, max_block_relay);
+
+        if !self.uses_addrman_outgoing() || !self.network_active() {
+            self.try_new_outbound_peer.store(false, Ordering::Release);
+            self.extra_block_relay_peers_enabled
+                .store(false, Ordering::Release);
+            return;
+        }
+
+        if max_block_relay != 0
+            && !self.extra_block_relay_peers_enabled.load(Ordering::Acquire)
+            && self.can_direct_fetch_tip(now)
+        {
+            self.extra_block_relay_peers_enabled
+                .store(true, Ordering::Release);
+            self.next_extra_block_relay_at.store(
+                now.saturating_add(EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL_SECS),
+                Ordering::Release,
+            );
+            debug!("enabling extra block-relay-only peers");
+        }
+
+        let check_at = self.stale_tip_check_at.load(Ordering::Acquire);
+        if now < check_at {
+            return;
+        }
+        let stale = self.tip_may_be_stale(now);
+        if max_full_relay == MAX_OUTBOUND_FULL_RELAY_CONNECTIONS && stale {
+            let age = now.saturating_sub(self.last_tip_update.load(Ordering::Acquire));
+            info!(
+                "Potential stale tip detected, will try using extra outbound peer (last tip update: {age} seconds ago)"
+            );
+            self.try_new_outbound_peer.store(true, Ordering::Release);
+        } else {
+            self.try_new_outbound_peer.store(false, Ordering::Release);
+        }
+        self.stale_tip_check_at.store(
+            now.saturating_add(STALE_TIP_CHECK_INTERVAL_SECS),
+            Ordering::Release,
+        );
+    }
+
+    fn tip_may_be_stale(&self, now: u64) -> bool {
+        let last_update = self.last_tip_update.load(Ordering::Acquire);
+        if last_update == 0 {
+            self.last_tip_update.store(now, Ordering::Release);
+            return false;
+        }
+        if self
+            .peer_infos()
+            .into_iter()
+            .any(|peer| !peer.inflight_heights().is_empty())
+        {
+            return false;
+        }
+        let spacing = self.chain.read().network.params().pow_target_spacing;
+        now.saturating_sub(last_update) > spacing.saturating_mul(3)
+    }
+
+    fn can_direct_fetch_tip(&self, now: u64) -> bool {
+        let chain = self.chain.read();
+        let Some(header) = chain.header(chain.height()) else {
+            return false;
+        };
+        let now = i64::try_from(now).unwrap_or(i64::MAX);
+        let spacing = i64::try_from(chain.network.params().pow_target_spacing).unwrap_or(i64::MAX);
+        i64::from(header.time) > now.saturating_sub(spacing.saturating_mul(20))
+    }
+
+    fn uses_addrman_outgoing(&self) -> bool {
+        !self.config.connect_disabled && self.config.seed_nodes.is_empty()
+    }
+
+    fn evict_extra_outbound_peers(&self, now: u64, max_full_relay: usize, max_block_relay: usize) {
+        let peers = self
+            .peer_infos()
+            .into_iter()
+            .filter(|peer| !peer.inbound && peer.version.is_some())
+            .collect::<Vec<_>>();
+
+        let mut block_relay_peers = peers
+            .iter()
+            .filter(|peer| peer.connection_type == "block-relay-only")
+            .cloned()
+            .collect::<Vec<_>>();
+        if block_relay_peers.len() > max_block_relay {
+            // Core uses monotonically increasing node ids as the connection
+            // order for this eviction decision.
+            block_relay_peers.sort_by_key(|peer| peer.id);
+            let youngest = block_relay_peers.pop();
+            let next_youngest = block_relay_peers.pop();
+            let candidate = match (youngest, next_youngest) {
+                (Some(youngest), Some(next_youngest))
+                    if youngest.last_block > next_youngest.last_block =>
+                {
+                    next_youngest
+                }
+                (Some(youngest), _) => youngest,
+                _ => return,
+            };
+            if now.saturating_sub(candidate.connected_at) >= MINIMUM_EXTRA_PEER_CONNECT_TIME_SECS
+                && candidate.inflight_heights().is_empty()
+                && self.disconnect_peer(candidate.id)
+            {
+                debug!(
+                    peer_id = candidate.id,
+                    "disconnecting extra block-relay-only peer"
+                );
+            }
+        }
+
+        let mut full_relay_peers = peers
+            .iter()
+            .filter(|peer| !peer.manual && peer.connection_type == "outbound-full")
+            .collect::<Vec<_>>();
+        if full_relay_peers.len() <= max_full_relay {
+            return;
+        }
+
+        let mut network_counts = HashMap::<&'static str, usize>::new();
+        for peer in &peers {
+            if peer.connection_type != "outbound-full" {
+                continue;
+            }
+            *network_counts
+                .entry(peer.endpoint.network_name())
+                .or_default() += 1;
+        }
+        let protected = self.chain_sync_states.read();
+        full_relay_peers.retain(|peer| {
+            !protected.get(&peer.id).is_some_and(|state| state.protect)
+                && network_counts
+                    .get(peer.endpoint.network_name())
+                    .is_some_and(|count| *count > 1)
+        });
+        full_relay_peers.sort_by(|left, right| {
+            left.last_block
+                .cmp(&right.last_block)
+                .then_with(|| right.id.cmp(&left.id))
+        });
+        let Some(candidate) = full_relay_peers.first() else {
+            return;
+        };
+        if now.saturating_sub(candidate.connected_at) > MINIMUM_EXTRA_PEER_CONNECT_TIME_SECS
+            && candidate.inflight_heights().is_empty()
+            && self.disconnect_peer(candidate.id)
+        {
+            self.try_new_outbound_peer.store(false, Ordering::Release);
+            debug!(
+                peer_id = candidate.id,
+                "disconnecting extra outbound-full peer"
+            );
+        }
     }
 
     pub(crate) fn update_peer_presynced_headers(&self, peer_id: usize, height: Option<i64>) {
@@ -6854,7 +7068,7 @@ impl Node {
         // excluded.
         let anchors_to_persist = run_result
             .is_ok()
-            .then(|| !self.config.connect_disabled)
+            .then(|| !self.config.connect_disabled && self.config.seed_nodes.is_empty())
             .and_then(|enabled| enabled.then(|| self.current_block_relay_only_anchors()));
         if let Some(task) = ipc_task {
             task.abort();
@@ -9125,6 +9339,35 @@ mod tests {
         let reopened = Node::open(test_config(directory.path())).unwrap();
         assert_eq!(reopened.take_block_relay_only_anchors(2), anchors);
         assert!(!anchors_path.exists());
+    }
+
+    #[test]
+    fn stale_tip_maintenance_matches_core_timer_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let genesis_time = u64::from(node.chain.read().header(0).unwrap().time);
+        let now = genesis_time + 1_000;
+
+        // The first pass initializes the tip timestamp and enables the
+        // post-IBD extra block-relay mechanism once direct fetch is possible.
+        node.check_for_stale_tip_and_evict_peers(now, 8, 2);
+        assert_eq!(node.last_tip_update.load(Ordering::Acquire), now);
+        assert!(!node.extra_full_outbound_requested());
+        assert!(node.extra_block_relay_peers_enabled.load(Ordering::Acquire));
+        assert!(!node.extra_block_relay_attempt_due(now));
+        assert!(!node.extra_block_relay_attempt_due(now + 299));
+        assert!(node.extra_block_relay_attempt_due(now + 300));
+        assert!(node.claim_extra_block_relay_attempt(now + 300));
+        assert!(!node.extra_block_relay_attempt_due(now + 300));
+
+        // A regtest tip is stale after three proof-of-work spacings, and the
+        // stale check itself is no more frequent than ten minutes.
+        node.last_tip_update
+            .store(now.saturating_sub(2_000), Ordering::Release);
+        node.stale_tip_check_at
+            .store(now + STALE_TIP_CHECK_INTERVAL_SECS, Ordering::Release);
+        node.check_for_stale_tip_and_evict_peers(now + STALE_TIP_CHECK_INTERVAL_SECS, 8, 2);
+        assert!(node.extra_full_outbound_requested());
     }
 
     #[test]

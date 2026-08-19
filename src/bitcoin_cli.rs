@@ -607,12 +607,12 @@ fn read_auth(
 
 fn build_params(method: &str, raw: &[String], named: bool) -> Result<Value, Failure> {
     if !named {
-        return Ok(Value::Array(
-            raw.iter()
-                .enumerate()
-                .map(|(index, value)| cli_value(method, Some(index), None, value))
-                .collect(),
-        ));
+        let values = raw
+            .iter()
+            .enumerate()
+            .map(|(index, value)| cli_value(method, Some(index), None, value))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(Value::Array(values));
     }
     let mut positional = Vec::new();
     let mut named_values = Map::new();
@@ -620,14 +620,14 @@ fn build_params(method: &str, raw: &[String], named: bool) -> Result<Value, Fail
     for value in raw {
         let Some((name, raw_value)) = split_named_argument(value) else {
             let index = positional.len();
-            positional.push(cli_value(method, Some(index), None, value));
+            positional.push(cli_value(method, Some(index), None, value)?);
             continue;
         };
         if !cli_named_parameter(method, name)
             && cli_string_parameter(method, Some(positional.len()), None)
         {
             let index = positional.len();
-            positional.push(cli_value(method, Some(index), None, value));
+            positional.push(cli_value(method, Some(index), None, value)?);
             continue;
         }
         has_named_args = true;
@@ -639,7 +639,7 @@ fn build_params(method: &str, raw: &[String], named: bool) -> Result<Value, Fail
         }
         named_values.insert(
             name.to_owned(),
-            cli_value(method, None, Some(name), raw_value),
+            cli_value(method, None, Some(name), raw_value)?,
         );
     }
     if !has_named_args {
@@ -673,39 +673,470 @@ fn split_named_argument(value: &str) -> Option<(&str, &str)> {
     Some((name, value))
 }
 
-fn cli_value(method: &str, position: Option<usize>, name: Option<&str>, value: &str) -> Value {
-    if cli_string_parameter(method, position, name) {
-        return Value::String(value.to_owned());
-    }
-    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CliParamFormat {
+    Json,
+    JsonOrString,
+    String,
 }
 
-/// Return the non-wallet parameters that Core's bitcoin-cli treats as literal
-/// strings in its RPC conversion table.  All other arguments use Core's JSON
-/// (or JSON-or-string fallback) conversion behavior.
-fn cli_string_parameter(method: &str, position: Option<usize>, name: Option<&str>) -> bool {
+fn cli_value(
+    method: &str,
+    position: Option<usize>,
+    name: Option<&str>,
+    value: &str,
+) -> Result<Value, Failure> {
+    match cli_param_format(method, position, name) {
+        Some(CliParamFormat::String) | None => Ok(Value::String(value.to_owned())),
+        Some(CliParamFormat::JsonOrString) => {
+            Ok(serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned())))
+        }
+        Some(CliParamFormat::Json) => serde_json::from_str(value)
+            .map_err(|_| Failure::local(format!("Error parsing JSON: {value}"))),
+    }
+}
+
+fn parameter_matches(
+    position: Option<usize>,
+    name: Option<&str>,
+    index: usize,
+    names: &[&str],
+) -> bool {
+    position == Some(index) || name.is_some_and(|name| names.contains(&name))
+}
+
+/// Core's `vRPCConvertParams` table for the wallet-free RPC surface. An
+/// argument absent from this table is deliberately passed as a raw string;
+/// this is how Core's CLI distinguishes natural string arguments from JSON
+/// values that need conversion.
+fn cli_param_format(
+    method: &str,
+    position: Option<usize>,
+    name: Option<&str>,
+) -> Option<CliParamFormat> {
+    if name == Some("args") {
+        return Some(CliParamFormat::Json);
+    }
     if method == "echo" {
-        return true;
+        return Some(CliParamFormat::String);
     }
+    if method == "echojson"
+        && (position.is_some_and(|position| position < 10)
+            || name
+                .and_then(|name| name.strip_prefix("arg"))
+                .and_then(|index| index.parse::<usize>().ok())
+                .is_some_and(|index| index < 10))
+    {
+        return Some(CliParamFormat::Json);
+    }
+
     match method {
-        "utxoupdatepsbt"
-        | "descriptorprocesspsbt"
-        | "finalizepsbt"
-        | "decodepsbt"
-        | "analyzepsbt" => name == Some("psbt") || position == Some(0),
+        "setmocktime" => {
+            parameter_matches(position, name, 0, &["timestamp"]).then_some(CliParamFormat::Json)
+        }
+        "mockscheduler" => {
+            parameter_matches(position, name, 0, &["delta_time"]).then_some(CliParamFormat::Json)
+        }
+        "utxoupdatepsbt" => {
+            if parameter_matches(position, name, 0, &["psbt"]) {
+                Some(CliParamFormat::String)
+            } else if parameter_matches(position, name, 1, &["descriptors"]) {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "generatetoaddress" => {
+            if parameter_matches(position, name, 0, &["nblocks"])
+                || parameter_matches(position, name, 2, &["maxtries"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "generatetodescriptor" => {
+            if parameter_matches(position, name, 0, &["num_blocks"])
+                || parameter_matches(position, name, 2, &["maxtries"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "generateblock" => {
+            if parameter_matches(position, name, 1, &["transactions"])
+                || parameter_matches(position, name, 2, &["submit"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "getnetworkhashps" => {
+            if parameter_matches(position, name, 0, &["nblocks"])
+                || parameter_matches(position, name, 1, &["height"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "getblockfrompeer" => {
+            parameter_matches(position, name, 1, &["peer_id"]).then_some(CliParamFormat::Json)
+        }
+        "getblockhash" => {
+            parameter_matches(position, name, 0, &["height"]).then_some(CliParamFormat::Json)
+        }
+        "waitforblockheight" => {
+            if parameter_matches(position, name, 0, &["height"])
+                || parameter_matches(position, name, 1, &["timeout"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "waitforblock" => {
+            parameter_matches(position, name, 1, &["timeout"]).then_some(CliParamFormat::Json)
+        }
+        "waitfornewblock" => {
+            parameter_matches(position, name, 0, &["timeout"]).then_some(CliParamFormat::Json)
+        }
+        "getblocktemplate" => parameter_matches(position, name, 0, &["template_request"])
+            .then_some(CliParamFormat::Json),
+        "deriveaddresses" => {
+            parameter_matches(position, name, 1, &["range"]).then_some(CliParamFormat::Json)
+        }
+        "scanblocks" => {
+            if parameter_matches(position, name, 1, &["scanobjects"])
+                || parameter_matches(position, name, 2, &["start_height"])
+                || parameter_matches(position, name, 3, &["stop_height"])
+                || parameter_matches(position, name, 5, &["options", "filter_false_positives"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "getdescriptoractivity" => {
+            if parameter_matches(position, name, 0, &["blockhashes"])
+                || parameter_matches(position, name, 1, &["scanobjects"])
+                || parameter_matches(position, name, 2, &["include_mempool"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "scantxoutset" => {
+            parameter_matches(position, name, 1, &["scanobjects"]).then_some(CliParamFormat::Json)
+        }
+        "createmultisig" => {
+            if parameter_matches(position, name, 0, &["nrequired"])
+                || parameter_matches(position, name, 1, &["keys"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "getblock" | "getrawtransaction" => {
+            parameter_matches(position, name, 1, &["verbosity", "verbose"])
+                .then_some(CliParamFormat::Json)
+        }
+        "getblockheader" => {
+            parameter_matches(position, name, 1, &["verbose"]).then_some(CliParamFormat::Json)
+        }
+        "getchaintxstats" => {
+            parameter_matches(position, name, 0, &["nblocks"]).then_some(CliParamFormat::Json)
+        }
+        "createrawtransaction" | "createpsbt" => {
+            if position.is_some_and(|position| position < 5)
+                || name.is_some_and(|name| {
+                    matches!(
+                        name,
+                        "inputs" | "outputs" | "locktime" | "replaceable" | "version"
+                    )
+                })
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "decoderawtransaction" => {
+            parameter_matches(position, name, 1, &["iswitness"]).then_some(CliParamFormat::Json)
+        }
+        "signrawtransactionwithkey" => {
+            if parameter_matches(position, name, 1, &["privkeys"])
+                || parameter_matches(position, name, 2, &["prevtxs"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "sendrawtransaction" => {
+            if parameter_matches(position, name, 1, &["maxfeerate"])
+                || parameter_matches(position, name, 2, &["maxburnamount"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "testmempoolaccept" => {
+            if parameter_matches(position, name, 0, &["rawtxs"])
+                || parameter_matches(position, name, 1, &["maxfeerate"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "submitpackage" => {
+            if parameter_matches(position, name, 0, &["package"])
+                || parameter_matches(position, name, 1, &["maxfeerate"])
+                || parameter_matches(position, name, 2, &["maxburnamount"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "combinerawtransaction" | "combinepsbt" | "joinpsbts" => {
+            parameter_matches(position, name, 0, &["txs"]).then_some(CliParamFormat::Json)
+        }
+        "descriptorprocesspsbt" => {
+            if parameter_matches(position, name, 0, &["psbt"])
+                || parameter_matches(position, name, 2, &["sighashtype"])
+            {
+                Some(CliParamFormat::String)
+            } else if parameter_matches(position, name, 1, &["descriptors"])
+                || parameter_matches(position, name, 3, &["bip32derivs"])
+                || parameter_matches(position, name, 4, &["finalize"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "finalizepsbt" => {
+            if parameter_matches(position, name, 0, &["psbt"]) {
+                Some(CliParamFormat::String)
+            } else if parameter_matches(position, name, 1, &["extract"]) {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "converttopsbt" => {
+            if parameter_matches(position, name, 1, &["permitsigdata"])
+                || parameter_matches(position, name, 2, &["iswitness"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "gettxout" => {
+            if parameter_matches(position, name, 1, &["n"])
+                || parameter_matches(position, name, 2, &["include_mempool"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "gettxoutproof" => {
+            parameter_matches(position, name, 0, &["txids"]).then_some(CliParamFormat::Json)
+        }
+        "gettxoutsetinfo" => {
+            if parameter_matches(position, name, 1, &["hash_or_height"]) {
+                Some(CliParamFormat::JsonOrString)
+            } else if parameter_matches(position, name, 2, &["use_index"]) {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
         "dumptxoutset" => {
-            matches!(name, Some("path") | Some("type")) || matches!(position, Some(0) | Some(1))
+            if parameter_matches(position, name, 0, &["path"])
+                || parameter_matches(position, name, 1, &["type"])
+            {
+                Some(CliParamFormat::String)
+            } else if parameter_matches(position, name, 2, &["rollback"])
+                && name == Some("rollback")
+            {
+                Some(CliParamFormat::JsonOrString)
+            } else if parameter_matches(position, name, 2, &["options"]) || position == Some(2) {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
         }
-        "importmempool" => name == Some("filepath") || position == Some(0),
-        "loadtxoutset" => name == Some("path") || position == Some(0),
+        "verifychain" => {
+            if parameter_matches(position, name, 0, &["checklevel"])
+                || parameter_matches(position, name, 1, &["nblocks"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "getblockstats" => {
+            if parameter_matches(position, name, 0, &["hash_or_height"]) {
+                Some(CliParamFormat::JsonOrString)
+            } else if parameter_matches(position, name, 1, &["stats"]) {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "pruneblockchain" => {
+            parameter_matches(position, name, 0, &["height"]).then_some(CliParamFormat::Json)
+        }
+        "getrawmempool" => {
+            if parameter_matches(position, name, 0, &["verbose"])
+                || parameter_matches(position, name, 1, &["mempool_sequence"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "getorphantxs" => {
+            parameter_matches(position, name, 0, &["verbosity"]).then_some(CliParamFormat::Json)
+        }
+        "estimatesmartfee" => {
+            parameter_matches(position, name, 0, &["conf_target"]).then_some(CliParamFormat::Json)
+        }
+        "estimaterawfee" => {
+            if parameter_matches(position, name, 0, &["conf_target"])
+                || parameter_matches(position, name, 1, &["threshold"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "prioritisetransaction" => {
+            if parameter_matches(position, name, 1, &["dummy"])
+                || parameter_matches(position, name, 2, &["fee_delta"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "setban" => {
+            if parameter_matches(position, name, 2, &["bantime"])
+                || parameter_matches(position, name, 3, &["absolute"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "setnetworkactive" => {
+            parameter_matches(position, name, 0, &["state"]).then_some(CliParamFormat::Json)
+        }
+        "getmempoolancestors" | "getmempooldescendants" => {
+            parameter_matches(position, name, 1, &["verbose"]).then_some(CliParamFormat::Json)
+        }
+        "gettxspendingprevout" => {
+            if parameter_matches(position, name, 0, &["outputs"])
+                || parameter_matches(
+                    position,
+                    name,
+                    1,
+                    &["options", "mempool_only", "return_spending_tx"],
+                )
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "logging" => {
+            if parameter_matches(position, name, 0, &["include"])
+                || parameter_matches(position, name, 1, &["exclude"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "getnodeaddresses" => {
+            parameter_matches(position, name, 0, &["count"]).then_some(CliParamFormat::Json)
+        }
+        "addpeeraddress" => {
+            if parameter_matches(position, name, 1, &["port"])
+                || parameter_matches(position, name, 2, &["tried"])
+            {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        "sendmsgtopeer" => {
+            parameter_matches(position, name, 0, &["peer_id"]).then_some(CliParamFormat::Json)
+        }
+        "stop" => parameter_matches(position, name, 0, &["wait"]).then_some(CliParamFormat::Json),
+        "addnode" => {
+            parameter_matches(position, name, 2, &["v2transport"]).then_some(CliParamFormat::Json)
+        }
+        "addconnection" => {
+            parameter_matches(position, name, 2, &["v2transport"]).then_some(CliParamFormat::Json)
+        }
+        "decodepsbt" | "analyzepsbt" => {
+            parameter_matches(position, name, 0, &["psbt"]).then_some(CliParamFormat::String)
+        }
         "verifymessage" => {
-            matches!(name, Some("signature") | Some("message"))
-                || matches!(position, Some(1) | Some(2))
+            if parameter_matches(position, name, 1, &["signature"])
+                || parameter_matches(position, name, 2, &["message"])
+            {
+                Some(CliParamFormat::String)
+            } else {
+                None
+            }
         }
-        "signmessagewithprivkey" => name == Some("message") || position == Some(1),
-        "echoipc" => name == Some("arg") || position == Some(0),
-        _ => false,
+        "echoipc" => {
+            parameter_matches(position, name, 0, &["arg"]).then_some(CliParamFormat::String)
+        }
+        "loadtxoutset" => {
+            parameter_matches(position, name, 0, &["path"]).then_some(CliParamFormat::String)
+        }
+        "signmessagewithprivkey" => {
+            parameter_matches(position, name, 1, &["message"]).then_some(CliParamFormat::String)
+        }
+        "importmempool" => {
+            if parameter_matches(position, name, 0, &["filepath"]) {
+                Some(CliParamFormat::String)
+            } else if parameter_matches(
+                position,
+                name,
+                1,
+                &[
+                    "options",
+                    "apply_fee_delta_priority",
+                    "use_current_time",
+                    "apply_unbroadcast_set",
+                ],
+            ) {
+                Some(CliParamFormat::Json)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
+}
+
+/// Return whether Core's bitcoin-cli treats a parameter as a literal string.
+fn cli_string_parameter(method: &str, position: Option<usize>, name: Option<&str>) -> bool {
+    cli_param_format(method, position, name) == Some(CliParamFormat::String)
 }
 
 /// Names recognized by the affected RPCs when `-named` is used.  This lets
@@ -1207,6 +1638,26 @@ mod tests {
         let params =
             build_params("loadtxoutset", &["path=snapshot=part=one".to_owned()], true).unwrap();
         assert_eq!(params, json!({"path": "snapshot=part=one"}));
+    }
+
+    #[test]
+    fn core_conversion_table_leaves_unlisted_strings_raw() {
+        assert_eq!(
+            build_params("getrawtransaction", &["123".to_owned()], false).unwrap(),
+            json!(["123"])
+        );
+        assert_eq!(
+            build_params("getrawtransaction", &["txid=123".to_owned()], true).unwrap(),
+            json!({"txid": "123"})
+        );
+        assert_eq!(
+            build_params("getblockhash", &["123".to_owned()], false).unwrap(),
+            json!([123])
+        );
+        assert_eq!(
+            build_params("getblockstats", &["not-a-height".to_owned()], false).unwrap(),
+            json!(["not-a-height"])
+        );
     }
 
     #[test]

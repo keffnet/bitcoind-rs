@@ -1499,6 +1499,8 @@ struct OutboundContext {
     peers: PeerRegistry,
     next_peer_id: Arc<AtomicUsize>,
     attempts: OutboundAttempts,
+    automatic_full_attempts: Arc<AtomicUsize>,
+    automatic_block_relay_attempts: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1889,6 +1891,8 @@ impl PeerManager {
             peers: peers.clone(),
             next_peer_id: next_peer_id.clone(),
             attempts: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            automatic_full_attempts: Arc::new(AtomicUsize::new(0)),
+            automatic_block_relay_attempts: Arc::new(AtomicUsize::new(0)),
         };
         let anchor_endpoints = self
             .node
@@ -2266,22 +2270,42 @@ impl PeerManager {
                             info!(remembered, "added fixed seed peer addresses");
                         }
                     }
-                    let available = discovery_outbound.slots.available_permits().min(8);
+                    let full_attempts = discovery_outbound
+                        .automatic_full_attempts
+                        .load(Ordering::Acquire);
+                    let block_relay_attempts = discovery_outbound
+                        .automatic_block_relay_attempts
+                        .load(Ordering::Acquire);
+                    let full_slots = max_full_relay.saturating_sub(full_attempts);
+                    let block_relay_slots = max_block_relay.saturating_sub(block_relay_attempts);
+                    let available = discovery_outbound
+                        .slots
+                        .available_permits()
+                        .min(8)
+                        .min(full_slots.saturating_add(block_relay_slots));
                     if available == 0 {
                         continue;
                     }
-                    for endpoint in select_discovery_endpoints(
+                    let endpoints = select_discovery_endpoints(
                         &discovery_node,
                         available,
                         &discovery_outbound.attempts,
-                    ) {
+                    );
+                    let mut full_slots = full_slots;
+                    let mut block_relay_slots = block_relay_slots;
+                    for endpoint in endpoints {
+                        let Some(connection_type) =
+                            next_automatic_connection_type(&mut full_slots, &mut block_relay_slots)
+                        else {
+                            break;
+                        };
                         spawn_outbound_loop(
                             discovery_node.clone(),
                             endpoint,
                             discovery_outbound.clone(),
                             false,
                             None,
-                            "outbound-full",
+                            connection_type,
                             false,
                             false,
                             None,
@@ -2640,24 +2664,43 @@ fn spawn_outbound_loop(
         peers,
         next_peer_id: peer_id_allocator,
         attempts: outbound_attempts,
+        automatic_full_attempts,
+        automatic_block_relay_attempts,
         ..
     } = outbound;
+    let automatic_attempt_counter = if !manual && !addconnection {
+        match connection_type {
+            "outbound-full" => Some(automatic_full_attempts),
+            "block-relay-only" => Some(automatic_block_relay_attempts),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(counter) = automatic_attempt_counter.as_ref() {
+        counter.fetch_add(1, Ordering::AcqRel);
+    }
     let mut completion = completion;
     tokio::spawn(async move {
         struct AttemptGuard {
             endpoint: NetworkEndpoint,
             attempts: OutboundAttempts,
+            automatic_attempt_counter: Option<Arc<AtomicUsize>>,
         }
 
         impl Drop for AttemptGuard {
             fn drop(&mut self) {
                 self.attempts.lock().remove(&self.endpoint);
+                if let Some(counter) = self.automatic_attempt_counter.as_ref() {
+                    counter.fetch_sub(1, Ordering::AcqRel);
+                }
             }
         }
 
         let _attempt = AttemptGuard {
             endpoint: endpoint.clone(),
             attempts: outbound_attempts,
+            automatic_attempt_counter,
         };
         // Core's RPC `addnode ... onetry` opens a manual connection directly
         // and does not consume the semaphore reserved for persistent
@@ -2955,6 +2998,21 @@ fn select_discovery_endpoints(
         }
     }
     selected
+}
+
+fn next_automatic_connection_type(
+    full_slots: &mut usize,
+    block_relay_slots: &mut usize,
+) -> Option<&'static str> {
+    if *full_slots != 0 {
+        *full_slots -= 1;
+        Some("outbound-full")
+    } else if *block_relay_slots != 0 {
+        *block_relay_slots -= 1;
+        Some("block-relay-only")
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -10347,6 +10405,32 @@ mod tests {
             true,
             PeerPermissions::FORCE_RELAY
         ));
+    }
+
+    #[test]
+    fn automatic_outbound_roles_fill_full_relay_before_block_relay_slots() {
+        let mut full_slots = 2;
+        let mut block_relay_slots = 2;
+        assert_eq!(
+            next_automatic_connection_type(&mut full_slots, &mut block_relay_slots),
+            Some("outbound-full")
+        );
+        assert_eq!(
+            next_automatic_connection_type(&mut full_slots, &mut block_relay_slots),
+            Some("outbound-full")
+        );
+        assert_eq!(
+            next_automatic_connection_type(&mut full_slots, &mut block_relay_slots),
+            Some("block-relay-only")
+        );
+        assert_eq!(
+            next_automatic_connection_type(&mut full_slots, &mut block_relay_slots),
+            Some("block-relay-only")
+        );
+        assert_eq!(
+            next_automatic_connection_type(&mut full_slots, &mut block_relay_slots),
+            None
+        );
     }
 
     #[test]

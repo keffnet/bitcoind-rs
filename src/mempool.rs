@@ -669,6 +669,7 @@ fn package_individual_retryable(error: &MempoolError) -> bool {
             | MempoolError::MinRelayFee
             | MempoolError::MinRelayFeeWithContext(_)
             | MempoolError::Full
+            | MempoolError::TooManyReplacementCandidates { .. }
             | MempoolError::ReplacementFee
             | MempoolError::ReplacementFeeWithContext(_)
             | MempoolError::ReplacementFeerateDiagram
@@ -2447,9 +2448,7 @@ impl Mempool {
         txid: Txid,
         direct_conflicts: &[Txid],
     ) -> Result<(), MempoolError> {
-        let count = direct_conflicts.iter().fold(0usize, |count, conflict| {
-            count.saturating_add(1 + self.descendants(conflict).len())
-        });
+        let count = self.conflicting_cluster_count(direct_conflicts);
         if count > MAX_REPLACEMENT_CANDIDATES {
             return Err(MempoolError::TooManyReplacementCandidates {
                 txid,
@@ -2505,24 +2504,16 @@ impl Mempool {
     /// conflicts. Core limits this count rather than the number of individual
     /// transactions so a replacement can still evict a large connected
     /// package while bounding work across unrelated clusters.
-    #[cfg(test)]
     fn conflicting_cluster_count(&self, direct_conflicts: &[Txid]) -> usize {
         let mut visited = HashSet::new();
         let mut clusters = 0;
         for conflict in direct_conflicts {
-            if !self.entries.contains_key(conflict) || !visited.insert(*conflict) {
+            if !self.entries.contains_key(conflict) || visited.contains(conflict) {
                 continue;
             }
             clusters += 1;
-            let mut pending = vec![*conflict];
-            while let Some(txid) = pending.pop() {
-                pending.extend(self.parents(&txid));
-                pending.extend(self.children(&txid));
-                for connected in std::mem::take(&mut pending) {
-                    if visited.insert(connected) {
-                        pending.push(connected);
-                    }
-                }
+            for connected in self.connected_component(conflict) {
+                visited.insert(connected);
             }
         }
         clusters

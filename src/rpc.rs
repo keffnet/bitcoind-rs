@@ -2079,10 +2079,9 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "invalidateblock" | "reconsiderblock" | "preciousblock" => Some(&["blockhash"]),
         "getrawtransaction" => Some(&["txid", "verbosity", "blockhash"]),
         "decoderawtransaction" => Some(&["hexstring", "iswitness"]),
-        // Core v31.1 exposes four parameters here.  The transaction builder
-        // keeps its fifth-version argument for direct internal callers, but
-        // it is not part of the Core-compatible RPC surface.
-        "createrawtransaction" => Some(&["inputs", "outputs", "locktime", "replaceable"]),
+        "createrawtransaction" => {
+            Some(&["inputs", "outputs", "locktime", "replaceable", "version"])
+        }
         "decodescript" => Some(&["hexstring"]),
         "combinerawtransaction" => Some(&["txs"]),
         "createpsbt" => Some(&["inputs", "outputs", "locktime", "replaceable", "version"]),
@@ -12652,9 +12651,10 @@ fn mining_block_with_deployment_parameters(
         // Core's CMutableTransaction default is version 2, including for
         // coinbase transactions assembled by generatetoaddress.
         version: Version::TWO,
-        // Core's CMutableTransaction constructor leaves coinbase locktime at
-        // zero. The height and extranonce are carried by scriptSig instead.
-        lock_time: LockTime::ZERO,
+        // Core's block assembler commits the preceding height in the
+        // coinbase lock time.  This also makes generated regtest chains match
+        // Core's AssumeUTXO fixtures exactly.
+        lock_time: LockTime::from_consensus(height.saturating_sub(1)),
         input: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: {
@@ -12664,8 +12664,9 @@ fn mining_block_with_deployment_parameters(
                 }
                 builder.into_script()
             },
-            // Core's default CTxIn sequence is SEQUENCE_FINAL.
-            sequence: bitcoin::Sequence::MAX,
+            // Core's block assembler uses MAX_SEQUENCE_NONFINAL so timelock
+            // semantics remain observable to miners and RPC clients.
+            sequence: bitcoin::Sequence::from_consensus(0xffff_fffe),
             witness: Witness::default(),
         }],
         output: vec![TxOut {
@@ -22208,9 +22209,12 @@ mod tests {
             pre_segwit_block.txdata[0].input[0]
                 .sequence
                 .to_consensus_u32(),
-            u32::MAX
+            0xffff_fffe
         );
-        assert_eq!(pre_segwit_block.txdata[0].lock_time, LockTime::ZERO);
+        assert_eq!(
+            pre_segwit_block.txdata[0].lock_time,
+            LockTime::from_consensus(0)
+        );
         assert_eq!(pre_segwit_block.txdata[0].output.len(), 1);
         assert!(get_block_template(&node, &json!([{}])).is_err());
 

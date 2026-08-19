@@ -1706,7 +1706,7 @@ pub struct Node {
     pub events: broadcast::Sender<ChainEvent>,
     pub mempool_events: broadcast::Sender<MempoolEvent>,
     peer_mempool_events: broadcast::Sender<PeerMempoolEvent>,
-    pub(crate) zmq_events: broadcast::Sender<zmq::Event>,
+    pub(crate) zmq_events: zmq::EventBus,
     pub(crate) txout_scan: Arc<ScanState>,
     pub(crate) blockfilter_scan: Arc<ScanState>,
     pub rpc_cookie: Option<String>,
@@ -2244,7 +2244,7 @@ impl Node {
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
-        let (zmq_events, _) = broadcast::channel(zmq::event_buffer_capacity(&config.zmq));
+        let zmq_events = zmq::EventBus::new(&config.zmq);
         let zmq_mempool_sequence = mempool.sequence();
         let rpc_cookie = config
             .rpc_cookie_path
@@ -3692,7 +3692,7 @@ impl Node {
             return;
         }
         let mempool_sequence = self.zmq_mempool_sequence.fetch_add(1, Ordering::Relaxed);
-        let _ = self.zmq_events.send(zmq::Event::TransactionAdded {
+        self.zmq_events.send(zmq::Event::TransactionAdded {
             transaction: Arc::new(transaction),
             mempool_sequence,
         });
@@ -3704,7 +3704,7 @@ impl Node {
             return;
         }
         let mempool_sequence = self.zmq_mempool_sequence.fetch_add(1, Ordering::Relaxed);
-        let _ = self.zmq_events.send(zmq::Event::TransactionRemoved {
+        self.zmq_events.send(zmq::Event::TransactionRemoved {
             transaction: Arc::new(transaction),
             mempool_sequence,
         });
@@ -3735,7 +3735,7 @@ impl Node {
                 mempool_sequence: sequence,
             },
         };
-        let _ = self.zmq_events.send(event);
+        self.zmq_events.send(event);
     }
 
     pub(crate) fn notify_zmq_mempool_changes(&self, changes: Vec<MempoolChange>) {
@@ -3760,20 +3760,17 @@ impl Node {
             return;
         }
         for block in disconnected.iter().rev() {
-            let _ = self
-                .zmq_events
+            self.zmq_events
                 .send(zmq::Event::BlockDisconnected(Arc::new(block.clone())));
         }
         for block in connected {
-            let _ = self
-                .zmq_events
+            self.zmq_events
                 .send(zmq::Event::BlockConnected(Arc::new(block.clone())));
         }
         if (!self.config.zmq.pub_hash_block.is_empty() || !self.config.zmq.pub_raw_block.is_empty())
             && let Some(block) = connected.last()
         {
-            let _ = self
-                .zmq_events
+            self.zmq_events
                 .send(zmq::Event::BlockTip(Arc::new(block.clone())));
         }
     }
@@ -4021,8 +4018,9 @@ impl Node {
         self.peer_mempool_events.subscribe()
     }
 
+    #[cfg(test)]
     pub(crate) fn subscribe_zmq(&self) -> broadcast::Receiver<zmq::Event> {
-        self.zmq_events.subscribe()
+        self.zmq_events.subscribe_all()
     }
 
     pub fn peer_count(&self) -> usize {
@@ -7321,7 +7319,7 @@ impl Node {
         let mut ipc_task = ipc.map(|server| tokio::task::spawn_local(server.run()));
         let mut zmq_task = tokio::spawn(zmq::run_with_startup(
             self.config.zmq.clone(),
-            self.subscribe_zmq(),
+            self.zmq_events.subscribe_topics(),
             startup.clone(),
         ));
 

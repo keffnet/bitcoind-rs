@@ -1269,6 +1269,7 @@ pub struct PeerInfo {
     pub min_ping: Option<f64>,
     pub connection_type: &'static str,
     pub manual: bool,
+    pub forced_inbound: bool,
     addr_token_bucket: f64,
     addr_token_timestamp: u128,
     ping_nonce: Option<u64>,
@@ -1281,6 +1282,7 @@ pub(crate) struct PeerRegistrationOptions {
     pub(crate) permissions: PeerPermissions,
     pub(crate) connection_type: &'static str,
     pub(crate) manual: bool,
+    pub(crate) forced_inbound: bool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -5442,6 +5444,7 @@ impl Node {
                 permissions: PeerPermissions::empty(),
                 connection_type: if inbound { "inbound" } else { "outbound-full" },
                 manual: false,
+                forced_inbound: false,
             },
         );
         // The production registration path deliberately excludes unroutable
@@ -5469,6 +5472,7 @@ impl Node {
             permissions,
             connection_type,
             manual,
+            forced_inbound,
         } = options;
         let address = endpoint.peer_socket_addr();
         let connected_at = time::unix_time();
@@ -5503,6 +5507,7 @@ impl Node {
             session_id: String::new(),
             connection_type,
             manual,
+            forced_inbound,
             connected_at,
             last_send: 0,
             last_recv: 0,
@@ -6011,7 +6016,7 @@ impl Node {
     /// transport layer does not expose Core's keyed netgroup hash; all other
     /// protections used by the functional eviction test are represented by
     /// the peer state below.
-    pub(crate) fn select_inbound_peer_to_evict(&self) -> Option<usize> {
+    pub(crate) fn select_inbound_peer_to_evict(&self, force: bool) -> Option<usize> {
         let candidates = self
             .peer_infos()
             .into_iter()
@@ -6022,7 +6027,27 @@ impl Node {
         }
 
         let mut protected = HashSet::new();
-        let mut by_ping = candidates.clone();
+        // Core protects four peers from each network group before applying
+        // the other eviction criteria. The transport currently exposes the
+        // broader network class rather than Core's keyed netgroup, which is
+        // still sufficient to preserve the important localhost/full-slot
+        // behavior and to avoid evicting every peer from a network class.
+        let mut by_network = HashMap::<&'static str, Vec<&PeerInfo>>::new();
+        for peer in &candidates {
+            by_network
+                .entry(peer.endpoint.network_name())
+                .or_default()
+                .push(peer);
+        }
+        for peers in by_network.values_mut() {
+            peers.sort_by_key(|peer| (peer.connected_at, peer.id));
+            protected.extend(peers.iter().take(4).map(|peer| peer.id));
+        }
+        let mut by_ping = candidates
+            .iter()
+            .filter(|peer| !protected.contains(&peer.id))
+            .cloned()
+            .collect::<Vec<_>>();
         by_ping.sort_by(|left, right| {
             left.min_ping
                 .unwrap_or(f64::INFINITY)
@@ -6033,7 +6058,7 @@ impl Node {
 
         let mut by_transaction = candidates
             .iter()
-            .filter(|peer| peer.last_transaction != 0)
+            .filter(|peer| peer.last_transaction != 0 && !protected.contains(&peer.id))
             .cloned()
             .collect::<Vec<_>>();
         by_transaction.sort_by(|left, right| {
@@ -6046,7 +6071,7 @@ impl Node {
 
         let mut by_block = candidates
             .iter()
-            .filter(|peer| peer.last_block != 0)
+            .filter(|peer| peer.last_block != 0 && !protected.contains(&peer.id))
             .cloned()
             .collect::<Vec<_>>();
         by_block.sort_by(|left, right| {
@@ -6057,9 +6082,25 @@ impl Node {
         });
         protected.extend(by_block.into_iter().take(4).map(|peer| peer.id));
 
-        candidates
+        let mut evictable = candidates
             .into_iter()
             .filter(|peer| !protected.contains(&peer.id))
+            .collect::<Vec<_>>();
+        if evictable.is_empty() {
+            if !force {
+                return None;
+            }
+            // Core uses a random candidate as the force-inbound fallback.
+            // The connection id is a stable fallback for this deterministic
+            // peer manager.
+            evictable = self
+                .peer_infos()
+                .into_iter()
+                .filter(|peer| peer.inbound && !peer.permissions.contains(PeerPermissions::NO_BAN))
+                .collect();
+        }
+        evictable
+            .into_iter()
             .min_by_key(|peer| (peer.connected_at, peer.id))
             .map(|peer| peer.id)
     }
@@ -6340,6 +6381,7 @@ impl Node {
                 session_id: String::new(),
                 connection_type: "outbound-full",
                 manual: false,
+                forced_inbound: false,
                 connected_at: now,
                 last_send: now,
                 last_recv: now,
@@ -6412,6 +6454,7 @@ impl Node {
             session_id: String::new(),
             connection_type: "outbound-full",
             manual: false,
+            forced_inbound: false,
             connected_at: time,
             last_send: time,
             last_recv: time,
@@ -7722,6 +7765,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                         session_id: String::new(),
                         connection_type: "outbound-full",
                         manual: false,
+                        forced_inbound: false,
                         connected_at: entry.time,
                         last_send: entry.time,
                         last_recv: entry.time,
@@ -8139,6 +8183,7 @@ mod tests {
                 permissions: PeerPermissions::empty(),
                 connection_type: "outbound-full",
                 manual: true,
+                forced_inbound: false,
             },
         );
         assert!(node.admit_non_reduced_outbound(10, services));
@@ -9447,6 +9492,7 @@ mod tests {
                     permissions: PeerPermissions::empty(),
                     connection_type,
                     manual: false,
+                    forced_inbound: false,
                 },
             );
         }
@@ -9543,6 +9589,7 @@ mod tests {
                 permissions: PeerPermissions::empty(),
                 connection_type: "private-broadcast",
                 manual: false,
+                forced_inbound: false,
             },
         );
         node.update_peer_version(7, 70016, crate::wire::NODE_NETWORK, "/peer/", 1, true);

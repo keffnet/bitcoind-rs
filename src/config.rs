@@ -567,6 +567,9 @@ impl PeerPermissions {
     pub const MEMPOOL: Self = Self(1 << 4);
     pub const DOWNLOAD: Self = Self(1 << 5);
     pub const ADDR: Self = Self(1 << 6);
+    /// When inbound slots are full, allow this peer to force eviction of an
+    /// otherwise protected inbound connection. Core also implies `noban`.
+    pub const FORCE_INBOUND: Self = Self((1 << 10) | Self::NO_BAN.0);
     const IMPLICIT: Self = Self(1 << 31);
 
     const ALL: Self = Self(
@@ -574,7 +577,8 @@ impl PeerPermissions {
             | Self::FORCE_RELAY.0
             | Self::NO_BAN.0
             | Self::MEMPOOL.0
-            | Self::ADDR.0,
+            | Self::ADDR.0
+            | Self::FORCE_INBOUND.0,
     );
 
     pub const fn empty() -> Self {
@@ -633,6 +637,7 @@ impl PeerPermissions {
                 "mempool" => flags = flags.union(Self::MEMPOOL),
                 "download" => flags = flags.union(Self::DOWNLOAD),
                 "addr" => flags = flags.union(Self::ADDR),
+                "forceinbound" => flags = flags.union(Self::FORCE_INBOUND),
                 "all" => flags = flags.union(Self::ALL),
                 "in" => incoming = true,
                 "out" => outgoing = true,

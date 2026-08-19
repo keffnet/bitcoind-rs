@@ -2555,7 +2555,9 @@ async fn run_i2p_listener(
                 let peer_id_allocator = next_peer_id.clone();
                 let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
-                    let Some(_permit) = acquire_inbound_slot(&node, &slots).await else {
+                    let Some((_permit, forced_inbound)) =
+                        acquire_inbound_slot(&node, &slots, false).await
+                    else {
                         peer_log!(
                             node,
                             debug,
@@ -2575,6 +2577,7 @@ async fn run_i2p_listener(
                             connection_type: "inbound",
                             manual: false,
                             permissions: None,
+                            forced_inbound,
                             private_broadcast_transaction: None,
                         },
                         peers,
@@ -2600,17 +2603,18 @@ async fn run_i2p_listener(
 async fn acquire_inbound_slot(
     node: &Arc<Node>,
     slots: &Arc<Semaphore>,
-) -> Option<OwnedSemaphorePermit> {
+    force_inbound: bool,
+) -> Option<(OwnedSemaphorePermit, bool)> {
     if let Ok(permit) = slots.clone().try_acquire_owned() {
-        return Some(permit);
+        return Some((permit, false));
     }
-    let peer_id = node.select_inbound_peer_to_evict()?;
+    let peer_id = node.select_inbound_peer_to_evict(force_inbound)?;
     if !node.disconnect_peer(peer_id) {
         return None;
     }
     for _ in 0..100 {
         if let Ok(permit) = slots.clone().try_acquire_owned() {
-            return Some(permit);
+            return Some((permit, true));
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -2703,12 +2707,16 @@ async fn run_inbound_listener(
         let transport_v2 = (!node.config.v2_transport).then_some(false);
         let peer_id = next_peer_id.fetch_add(1, Ordering::Relaxed);
         tokio::spawn(async move {
-            let Some(permit) = acquire_inbound_slot(&node, &slots).await else {
+            let force_inbound = permissions
+                .is_some_and(|permissions| permissions.contains(PeerPermissions::FORCE_INBOUND));
+            let Some((permit, forced_inbound)) =
+                acquire_inbound_slot(&node, &slots, force_inbound).await
+            else {
                 peer_log!(
                     node,
                     debug,
                     address,
-                    "rejecting peer because peer limit is reached"
+                    "failed to find an eviction candidate - connection dropped (full)"
                 );
                 return;
             };
@@ -2722,6 +2730,7 @@ async fn run_inbound_listener(
                     connection_type: "inbound",
                     manual: false,
                     permissions,
+                    forced_inbound,
                     private_broadcast_transaction: None,
                 },
                 peers,
@@ -2903,6 +2912,7 @@ fn spawn_outbound_loop(
                             connection_type,
                             manual,
                             permissions: None,
+                            forced_inbound: false,
                             private_broadcast_transaction: None,
                         },
                         peers.clone(),
@@ -3010,6 +3020,7 @@ fn spawn_private_broadcast_loop(
                         connection_type: "private-broadcast",
                         manual: false,
                         permissions: None,
+                        forced_inbound: false,
                         private_broadcast_transaction: Some(transaction),
                     },
                     peers,
@@ -3955,6 +3966,7 @@ struct PeerConnectionOptions {
     connection_type: &'static str,
     manual: bool,
     permissions: Option<PeerPermissions>,
+    forced_inbound: bool,
     private_broadcast_transaction: Option<Transaction>,
 }
 
@@ -4006,6 +4018,7 @@ async fn serve_peer(
                 permissions,
                 connection_type: options.connection_type,
                 manual: options.manual,
+                forced_inbound: options.forced_inbound,
             },
         );
         if detect_transport || options.outbound {
@@ -4111,6 +4124,7 @@ async fn serve_peer(
             permissions,
             connection_type: options.connection_type,
             manual: options.manual,
+            forced_inbound: options.forced_inbound,
         },
     );
     if let Some(transport_stats) = transport_stats {
@@ -10255,6 +10269,7 @@ mod tests {
                 connection_type: "private-broadcast",
                 manual: false,
                 permissions: None,
+                forced_inbound: false,
                 private_broadcast_transaction: Some(transaction),
             },
             source_peers,
@@ -10271,6 +10286,7 @@ mod tests {
                 connection_type: "inbound",
                 manual: false,
                 permissions: None,
+                forced_inbound: false,
                 private_broadcast_transaction: None,
             },
             target_peers,
@@ -10333,6 +10349,7 @@ mod tests {
                 connection_type: "inbound",
                 manual: false,
                 permissions: None,
+                forced_inbound: false,
                 private_broadcast_transaction: None,
             },
             Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -10418,6 +10435,7 @@ mod tests {
                 connection_type: "inbound",
                 manual: false,
                 permissions: None,
+                forced_inbound: false,
                 private_broadcast_transaction: None,
             },
             Arc::new(parking_lot::Mutex::new(HashMap::new())),

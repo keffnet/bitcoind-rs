@@ -2652,7 +2652,7 @@ fn dispatch_method_for_user(
                         },
                         "transport_protocol_type": peer.transport_protocol_type,
                         "session_id": peer.session_id,
-                        "forced_inbound": false,
+                        "forced_inbound": peer.forced_inbound,
                         "misbehavior_score": 0,
                     });
                     if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
@@ -23880,6 +23880,7 @@ mod tests {
                 permissions: crate::config::PeerPermissions::FORCE_RELAY,
                 connection_type: "outbound-full",
                 manual: false,
+                forced_inbound: false,
             },
         );
         let genesis = node.chain.read().best_hash();
@@ -24448,6 +24449,7 @@ mod tests {
                 permissions: crate::config::PeerPermissions::empty(),
                 connection_type: "outbound-full",
                 manual: false,
+                forced_inbound: false,
             },
         );
         disconnect_node(&node, &json!(["example.invalid:18444"])).unwrap();

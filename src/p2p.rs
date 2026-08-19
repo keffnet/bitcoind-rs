@@ -146,6 +146,11 @@ struct V2Reader {
     reader: V2BufferedReader,
     length_bytes: [u8; NUM_LENGTH_BYTES],
     length_read: usize,
+    // `read` is polled from the peer loop's select, so a timer or command can
+    // cancel it while the payload is still arriving. Keep the decoded length
+    // across that cancellation; otherwise the next poll would decrypt the
+    // same length bytes a second time with an already-advanced cipher.
+    packet_len: Option<usize>,
     packet_bytes: Vec<u8>,
     packet_read: usize,
 }
@@ -172,31 +177,38 @@ impl V2Reader {
             reader,
             length_bytes: [0; NUM_LENGTH_BYTES],
             length_read: 0,
+            packet_len: None,
             packet_bytes: Vec::new(),
             packet_read: 0,
         }
     }
 
     async fn read(&mut self, on_bytes: &mut impl FnMut(usize)) -> Result<V2Payload> {
-        while self.length_read < NUM_LENGTH_BYTES {
-            let count = self
-                .reader
-                .read_some(&mut self.length_bytes[self.length_read..])
-                .await?;
-            if count == 0 {
-                bail!("peer closed the BIP324 transport");
+        let packet_len = if let Some(packet_len) = self.packet_len {
+            packet_len
+        } else {
+            while self.length_read < NUM_LENGTH_BYTES {
+                let count = self
+                    .reader
+                    .read_some(&mut self.length_bytes[self.length_read..])
+                    .await?;
+                if count == 0 {
+                    bail!("peer closed the BIP324 transport");
+                }
+                on_bytes(count);
+                self.length_read += count;
             }
-            on_bytes(count);
-            self.length_read += count;
-        }
 
-        let packet_len = self.cipher.decrypt_packet_len(self.length_bytes);
-        if packet_len > BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION {
-            let contents_len = packet_len.saturating_sub(1 + 16);
-            debug!("V2 transport error: packet too large ({contents_len} bytes)");
-            bail!("BIP324 packet too large ({contents_len} bytes)");
-        }
-        self.packet_bytes.resize(packet_len, 0);
+            let packet_len = self.cipher.decrypt_packet_len(self.length_bytes);
+            if packet_len > BIP324_MAX_PACKET_SIZE_FOR_ALLOCATION {
+                let contents_len = packet_len.saturating_sub(1 + 16);
+                debug!("V2 transport error: packet too large ({contents_len} bytes)");
+                bail!("BIP324 packet too large ({contents_len} bytes)");
+            }
+            self.packet_len = Some(packet_len);
+            self.packet_bytes.resize(packet_len, 0);
+            packet_len
+        };
         while self.packet_read < packet_len {
             let count = self
                 .reader
@@ -212,6 +224,7 @@ impl V2Reader {
         let packet_bytes = std::mem::take(&mut self.packet_bytes);
         self.packet_read = 0;
         self.length_read = 0;
+        self.packet_len = None;
         let mut plaintext = vec![0; InboundCipher::decryption_buffer_len(packet_len)];
         let packet_type = self
             .cipher
@@ -13753,6 +13766,67 @@ mod tests {
             wire::decode_v2_message(payload.contents()).unwrap(),
             server_message
         );
+    }
+
+    #[tokio::test]
+    async fn bip324_reader_resumes_after_cancellation_during_packet_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address);
+        let server = listener.accept();
+        let (client, server) = tokio::join!(client, server);
+        let client = client.unwrap();
+        let (server, _) = server.unwrap();
+
+        let (client_result, server_result) = tokio::join!(
+            establish_v2(client, Network::Regtest, Role::Initiator),
+            establish_v2(server, Network::Regtest, Role::Responder),
+        );
+        let (_, client_writer, _, _) = client_result.unwrap();
+        let (server_reader, _, _, _) = server_result.unwrap();
+        let mut client_writer = match client_writer {
+            PeerWriterKind::V2(writer) => writer,
+            PeerWriterKind::V1(_) => panic!("expected encrypted client writer"),
+        };
+        let mut server_reader = match server_reader {
+            PeerReader::V2(reader) => reader,
+            PeerReader::V1(_) => panic!("expected encrypted server reader"),
+        };
+
+        let contents = vec![0x42; 200_000];
+        let mut packet = vec![0; OutboundCipher::encryption_buffer_len(contents.len())];
+        client_writer
+            .cipher
+            .encrypt(&contents, &mut packet, PacketType::Genuine, None)
+            .unwrap();
+        let first_chunk = NUM_LENGTH_BYTES + 64;
+        client_writer
+            .writer
+            .write_all(&packet[..first_chunk])
+            .await
+            .unwrap();
+
+        let mut on_bytes = |_count: usize| {};
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(50), server_reader.read(&mut on_bytes))
+                .await;
+        assert!(
+            cancelled.is_err(),
+            "partial packet read unexpectedly completed"
+        );
+
+        client_writer
+            .writer
+            .write_all(&packet[first_chunk..])
+            .await
+            .unwrap();
+        let payload =
+            tokio::time::timeout(Duration::from_secs(2), server_reader.read(&mut on_bytes))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(payload.packet_type(), PacketType::Genuine);
+        assert_eq!(payload.contents(), contents.as_slice());
     }
 
     #[tokio::test]

@@ -2023,8 +2023,12 @@ impl PeerManager {
                 .await;
             }
         });
-        let configured_connect_nodes =
-            self.node.config.connect_disabled || !self.node.config.seed_nodes.is_empty();
+        // Explicit -connect disables AddrMan-driven outbound slots, but
+        // Core still runs DNS seeding when -dnsseed=1 was explicitly enabled
+        // so the discovered addresses can be retained for later use.
+        let configured_connect_nodes = (self.node.config.connect_disabled
+            || !self.node.config.seed_nodes.is_empty())
+            && !self.node.config.dnsseed;
         let has_seed_nodes = !self.node.config.seed_nodes_for_address_fetch.is_empty();
         let has_add_nodes = !self.node.config.add_nodes.is_empty();
         let has_known_network_addresses = !self.node.known_network_addresses().is_empty();

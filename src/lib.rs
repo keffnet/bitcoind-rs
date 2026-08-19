@@ -2076,7 +2076,14 @@ impl Node {
             }
         };
         let block_relay_only_anchors_path = network_datadir.join(BLOCK_RELAY_ONLY_ANCHORS_FILE);
-        let block_relay_only_anchors =
+        let block_relay_only_anchors = if config.connect_disabled {
+            // Core disables AddrMan-driven outgoing connections, including
+            // anchor replay and clean-shutdown anchor snapshots, when
+            // -connect/-noconnect is configured. Leave a native snapshot in
+            // place so a later restart without that restriction can still
+            // consume it.
+            Vec::new()
+        } else {
             match load_block_relay_only_anchors(&block_relay_only_anchors_path) {
                 Ok(anchors) => {
                     if block_relay_only_anchors_path.exists() {
@@ -2097,7 +2104,8 @@ impl Node {
                     quarantine_persistent_file(&block_relay_only_anchors_path, &error);
                     Vec::new()
                 }
-            };
+            }
+        };
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
@@ -6846,7 +6854,8 @@ impl Node {
         // excluded.
         let anchors_to_persist = run_result
             .is_ok()
-            .then(|| self.current_block_relay_only_anchors());
+            .then(|| !self.config.connect_disabled)
+            .and_then(|enabled| enabled.then(|| self.current_block_relay_only_anchors()));
         if let Some(task) = ipc_task {
             task.abort();
         }

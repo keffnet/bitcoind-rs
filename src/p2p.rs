@@ -4866,10 +4866,12 @@ async fn serve_peer_loop(
                     && version.start_height == 0
                     && !version.relay
                     && version.user_agent == "/pynode:0.0.1/";
-                if matches!(
-                    peer_state.connection_type,
-                    "outbound-full" | "block-relay-only" | "addr-fetch"
-                ) && !private_broadcast_version
+                if !peer_state.manual
+                    && matches!(
+                        peer_state.connection_type,
+                        "outbound-full" | "block-relay-only" | "addr-fetch"
+                    )
+                    && !private_broadcast_version
                     && {
                         let expected = desirable_peer_services(
                             version.services,

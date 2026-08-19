@@ -1455,6 +1455,42 @@ impl ChainState {
                 None,
             )
         };
+        let segwit_height = usize::try_from(deployment_parameters.buried.segwit)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let migrated_segwit_validated_blocks = || {
+            active_chain
+                .iter()
+                .enumerate()
+                .skip(segwit_height)
+                .map(|(_, hash)| *hash)
+                .collect()
+        };
+        let persisted_segwit_validated_blocks = match persisted_segwit_validated_blocks {
+            None => {
+                // Older native metadata predates the per-block SegWit marker.
+                // Its active chain was built by the native validator, so
+                // migrate the existing post-SegWit entries as validated
+                // before writing the upgraded metadata below.
+                Some(migrated_segwit_validated_blocks())
+            }
+            Some(validated_blocks)
+                if data_dir.join("chainstate.snapshot").exists()
+                    && active_chain
+                        .iter()
+                        .enumerate()
+                        .skip(segwit_height)
+                        .any(|(_, hash)| !validated_blocks.contains(hash)) =>
+            {
+                // A snapshot replay performed before native delta replay
+                // tracked this marker only for the snapshot prefix. The
+                // active chain was still validated by this node, so repair
+                // the partial marker before the next startup can apply the
+                // Core-compatible witness-state check.
+                Some(migrated_segwit_validated_blocks())
+            }
+            Some(validated_blocks) => Some(validated_blocks),
+        };
         let persisted_tx_counts = if rebuild_chainstate {
             None
         } else {
@@ -2845,6 +2881,8 @@ impl ChainState {
                 self.snapshot_base = None;
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
+                self.mark_active_chain_segwit_validated();
+                self.persist_metadata()?;
                 self.persist_snapshot()?;
                 self.remove_assumeutxo_artifacts()?;
                 self.persist_snapshot_provenance()?;
@@ -2859,6 +2897,8 @@ impl ChainState {
                 self.snapshot_base = None;
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
+                self.mark_active_chain_segwit_validated();
+                self.persist_metadata()?;
                 self.persist_snapshot()?;
                 self.remove_assumeutxo_artifacts()?;
                 self.persist_snapshot_provenance()?;
@@ -8720,6 +8760,14 @@ impl ChainState {
         self.persist_tx_counts()
     }
 
+    fn mark_active_chain_segwit_validated(&mut self) {
+        let segwit_height = usize::try_from(self.deployment_parameters.buried.segwit)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        self.segwit_validated_blocks
+            .extend(self.active_chain.iter().skip(segwit_height).copied());
+    }
+
     fn persist_tx_counts(&self) -> Result<()> {
         if self.active_tx_counts.len() != self.active_chain.len() {
             // A pre-sidecar pruned snapshot may not contain enough data to
@@ -8932,6 +8980,9 @@ impl ChainState {
             }
         }
         self.active_chain.push(delta.block_hash);
+        if delta.height >= self.deployment_parameters.buried.segwit {
+            self.segwit_validated_blocks.insert(delta.block_hash);
+        }
         self.headers.push(node.header);
         let count = u32::try_from(delta.transactions.len())
             .context("chainstate delta transaction count does not fit u32")?;
@@ -10957,6 +11008,11 @@ mod tests {
         assert!(directory.path().join("chainstate.bin").exists());
         reopened.persist_snapshot().unwrap();
         drop(reopened);
+
+        let reopened_again = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened_again.best_hash(), tip);
+        assert_eq!(reopened_again.height(), height);
+        drop(reopened_again);
 
         let binary_metadata = fs::read(directory.path().join("chainstate.bin")).unwrap();
         assert!(binary_metadata.starts_with(CHAIN_METADATA_MAGIC));

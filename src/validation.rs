@@ -267,7 +267,7 @@ impl ValidationError {
             Self::NonFinalTransaction => "bad-txns-nonfinal".to_owned(),
             Self::NonFinalSequence => "bad-txns-nonfinal".to_owned(),
             Self::Script { reason, .. } => {
-                format!("mandatory-script-verify-flag-failed ({reason})")
+                format!("block-script-verify-flag-failed ({reason})")
             }
         }
     }

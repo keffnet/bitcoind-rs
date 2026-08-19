@@ -19,6 +19,30 @@ use zeromq::{PubSocket, Socket, SocketSend, ZmqMessage};
 use crate::StartupLatch;
 use crate::config::ZmqConfig;
 
+const DEFAULT_ZMQ_EVENT_BUFFER: usize = 4_096;
+const MAX_ZMQ_EVENT_BUFFER: usize = 65_536;
+
+/// Return the bounded validation-event buffer used before notifications reach
+/// the ZMQ transport.
+///
+/// Core applies each configured HWM to the corresponding PUB socket queue.
+/// The Rust transport also has a byte-oriented write buffer, so the shared
+/// validation channel is a second, deliberately conservative loss boundary.
+/// Using the smallest active message HWM ensures that no topic can retain
+/// more pending validation events than its configured limit. A hard ceiling
+/// prevents an accidental very large command-line HWM from preallocating an
+/// unbounded amount of memory in the broadcast ring.
+pub(crate) fn event_buffer_capacity(config: &ZmqConfig) -> usize {
+    config
+        .notifications()
+        .iter()
+        .map(|notification| usize::try_from(notification.hwm).unwrap_or(usize::MAX))
+        .min()
+        .map_or(DEFAULT_ZMQ_EVENT_BUFFER, |hwm| {
+            hwm.clamp(1, MAX_ZMQ_EVENT_BUFFER)
+        })
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
     TransactionAdded {
@@ -284,6 +308,25 @@ mod tests {
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
     use zeromq::{Socket, SocketRecv, SubSocket};
+
+    #[test]
+    fn event_buffer_capacity_tracks_active_message_hwms() {
+        let mut config = ZmqConfig::default();
+        assert_eq!(event_buffer_capacity(&config), DEFAULT_ZMQ_EVENT_BUFFER);
+
+        config.pub_hash_tx.push("tcp://127.0.0.1:0".to_owned());
+        config.hash_tx_hwm = 7;
+        assert_eq!(event_buffer_capacity(&config), 7);
+
+        config.pub_sequence.push("tcp://127.0.0.1:0".to_owned());
+        config.sequence_hwm = 3;
+        assert_eq!(event_buffer_capacity(&config), 3);
+
+        config.sequence_hwm = u32::MAX;
+        assert_eq!(event_buffer_capacity(&config), 7);
+        config.hash_tx_hwm = u32::MAX;
+        assert_eq!(event_buffer_capacity(&config), MAX_ZMQ_EVENT_BUFFER);
+    }
 
     #[test]
     fn sequence_payload_matches_core_layout() {

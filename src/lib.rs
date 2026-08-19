@@ -2244,7 +2244,7 @@ impl Node {
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
-        let (zmq_events, _) = broadcast::channel(4_096);
+        let (zmq_events, _) = broadcast::channel(zmq::event_buffer_capacity(&config.zmq));
         let zmq_mempool_sequence = mempool.sequence();
         let rpc_cookie = config
             .rpc_cookie_path

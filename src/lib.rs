@@ -1760,6 +1760,7 @@ pub struct Node {
     peer_manager_requests:
         parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<p2p::PeerManagerRequest>>>,
     pub(crate) electrum_peers: parking_lot::Mutex<electrum::ElectrumPeerRegistry>,
+    pub(crate) electrum_peer_events: broadcast::Sender<()>,
     private_broadcasts: parking_lot::Mutex<HashMap<Wtxid, PrivateBroadcastEntry>>,
     compact_extra_transactions: parking_lot::Mutex<CompactExtraTransactions>,
     recently_rejected_transactions: parking_lot::Mutex<RecentlyRejectedTransactions>,
@@ -2243,6 +2244,7 @@ impl Node {
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
+        let (electrum_peer_events, _) = broadcast::channel(256);
         let (zmq_events, _) = broadcast::channel(4_096);
         let zmq_mempool_sequence = mempool.sequence();
         let rpc_cookie = config
@@ -2332,6 +2334,7 @@ impl Node {
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
             electrum_peers: parking_lot::Mutex::new(electrum::ElectrumPeerRegistry::default()),
+            electrum_peer_events,
             private_broadcasts: parking_lot::Mutex::new(HashMap::new()),
             compact_extra_transactions: parking_lot::Mutex::new(CompactExtraTransactions::new(
                 compact_extra_limit,
@@ -4004,6 +4007,10 @@ impl Node {
 
     pub(crate) fn subscribe_peer_mempool(&self) -> broadcast::Receiver<PeerMempoolEvent> {
         self.peer_mempool_events.subscribe()
+    }
+
+    pub(crate) fn subscribe_electrum_peers(&self) -> broadcast::Receiver<()> {
+        self.electrum_peer_events.subscribe()
     }
 
     pub(crate) fn subscribe_zmq(&self) -> broadcast::Receiver<zmq::Event> {

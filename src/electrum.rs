@@ -27,7 +27,7 @@ const SERVER_NAME: &str = "bitcoind-rs 0.1.0";
 const MAX_ELECTRUM_PEERS: usize = 1_024;
 const MAX_SCRIPTPUBKEY_SIZE: usize = 10_000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ElectrumPeer {
     key: String,
     ip: String,
@@ -42,7 +42,8 @@ pub(crate) struct ElectrumPeerRegistry {
 }
 
 impl ElectrumPeerRegistry {
-    fn insert(&mut self, peer: ElectrumPeer) {
+    fn insert(&mut self, peer: ElectrumPeer) -> bool {
+        let changed = self.peers.get(&peer.key) != Some(&peer);
         if !self.peers.contains_key(&peer.key) {
             while self.peers.len() >= MAX_ELECTRUM_PEERS {
                 let Some(oldest) = self.order.pop_front() else {
@@ -53,6 +54,7 @@ impl ElectrumPeerRegistry {
             self.order.push_back(peer.key.clone());
         }
         self.peers.insert(peer.key.clone(), peer);
+        changed
     }
 
     fn as_value(&self) -> Value {
@@ -221,6 +223,7 @@ struct ElectrumSession {
     protocol_version: ProtocolVersion,
     version_negotiated: bool,
     request_seen: bool,
+    peers_subscribed: bool,
     peer_address: Option<SocketAddr>,
 }
 
@@ -230,6 +233,7 @@ impl Default for ElectrumSession {
             protocol_version: MIN_PROTOCOL_VERSION,
             version_negotiated: false,
             request_seen: false,
+            peers_subscribed: false,
             peer_address: None,
         }
     }
@@ -300,6 +304,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     let mut reader = BufReader::new(read_half);
     let mut events = node.subscribe_chain();
     let mut mempool_events = node.subscribe_mempool();
+    let mut electrum_peer_events = node.subscribe_electrum_peers();
     let mut line = Vec::new();
     let mut subscriptions: HashMap<String, Subscription> = HashMap::new();
     let mut session = ElectrumSession {
@@ -367,6 +372,21 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                             .await?;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                }
+            }
+            event = electrum_peer_events.recv(), if session.peers_subscribed => {
+                match event {
+                    Ok(()) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let notification = json!({
+                            "jsonrpc": "2.0",
+                            "method": "server.peers.subscribe",
+                            "params": [server_peers_for_protocol(&node, session.protocol_version)],
+                        });
+                        let mut encoded = serde_json::to_vec(&notification)?;
+                        encoded.push(b'\n');
+                        write_half.write_all(&encoded).await?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => continue,
                 }
             }
             read = read_line_limited(&mut reader, &mut line, MAX_LINE_SIZE) => {
@@ -516,6 +536,9 @@ fn process_electrum_request(
     }
     if method == "blockchain.numblocks.subscribe" && result.is_ok() {
         *numblocks_subscribed = true;
+    }
+    if method == "server.peers.subscribe" && result.is_ok() {
+        session.peers_subscribed = true;
     }
     if is_notification {
         return Ok(None);
@@ -1070,7 +1093,10 @@ fn server_add_peer(
     let Some(peer) = ElectrumPeer::from_features(node, features, peer_address)? else {
         return Ok(Value::Bool(false));
     };
-    node.electrum_peers.lock().insert(peer);
+    let changed = node.electrum_peers.lock().insert(peer);
+    if changed {
+        let _ = node.electrum_peer_events.send(());
+    }
     Ok(Value::Bool(true))
 }
 
@@ -2215,6 +2241,24 @@ mod tests {
         assert_eq!(peers[MAX_ELECTRUM_PEERS - 1][1], json!("peer-1024.example"));
     }
 
+    #[test]
+    fn electrum_peer_registry_reports_changes() {
+        let mut registry = ElectrumPeerRegistry::default();
+        let peer = ElectrumPeer {
+            key: "peer.example".to_owned(),
+            ip: "192.0.2.1".to_owned(),
+            host: "peer.example".to_owned(),
+            features: vec!["v1.7".to_owned(), "t50001".to_owned()],
+        };
+
+        assert!(registry.insert(peer.clone()));
+        assert!(!registry.insert(peer.clone()));
+
+        let mut updated_peer = peer;
+        updated_peer.features.push("s50002".to_owned());
+        assert!(registry.insert(updated_peer));
+    }
+
     #[tokio::test]
     async fn history_notifications_refresh_after_mempool_activity() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -2829,6 +2873,7 @@ mod tests {
         peer_features["hosts"] = json!({
             "192.0.2.55": {"tcp_port": 50002, "ssl_port": null}
         });
+        let mut peer_events = node.subscribe_electrum_peers();
         assert_eq!(
             dispatch_with_session(
                 &node,
@@ -2840,6 +2885,7 @@ mod tests {
             .unwrap(),
             json!(true)
         );
+        assert!(peer_events.try_recv().is_ok());
         assert_eq!(
             dispatch_with_session(
                 &node,

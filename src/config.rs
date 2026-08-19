@@ -14,7 +14,10 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use crate::IpSubnet;
 use crate::address::NetworkEndpoint;
 use crate::i2p::I2P_SAM_PORT;
-use crate::mempool::{RbfPolicy, TrucPolicy};
+use crate::mempool::{
+    DEFAULT_ANCESTOR_COUNT_LIMIT, DEFAULT_ANCESTOR_SIZE_LIMIT_VBYTES,
+    DEFAULT_DESCENDANT_COUNT_LIMIT, DEFAULT_DESCENDANT_SIZE_LIMIT_VBYTES, RbfPolicy, TrucPolicy,
+};
 use crate::tor::DEFAULT_TOR_CONTROL_PORT;
 use crate::validation::{self, DeploymentParameters};
 
@@ -3187,6 +3190,11 @@ pub struct Config {
     pub cluster_count: usize,
     /// Maximum virtual size of a connected mempool cluster.
     pub cluster_size_vbytes: u64,
+    /// Legacy per-transaction ancestor and descendant policy limits.
+    pub ancestor_count_limit: usize,
+    pub ancestor_size_vbytes: u64,
+    pub descendant_count_limit: usize,
+    pub descendant_size_vbytes: u64,
     pub rbf_policy: RbfPolicy,
     pub truc_policy: TrucPolicy,
     /// Maximum age of a mempool entry in hours.
@@ -3822,6 +3830,30 @@ impl Config {
             .limit_cluster_size_kvb
             .checked_mul(1_000)
             .context("--limitclustersize is too large")?;
+        let ancestor_count_limit = args
+            .limit_ancestor_count
+            .unwrap_or(DEFAULT_ANCESTOR_COUNT_LIMIT as i64)
+            .try_into()
+            .context("--limitancestorcount must be non-negative")?;
+        let ancestor_size_vbytes = args
+            .limit_ancestor_size
+            .map(|size| u64::try_from(size).context("--limitancestorsize must be non-negative"))
+            .transpose()?
+            .unwrap_or(DEFAULT_ANCESTOR_SIZE_LIMIT_VBYTES / 1_000)
+            .checked_mul(1_000)
+            .context("--limitancestorsize is too large")?;
+        let descendant_count_limit = args
+            .limit_descendant_count
+            .unwrap_or(DEFAULT_DESCENDANT_COUNT_LIMIT as i64)
+            .try_into()
+            .context("--limitdescendantcount must be non-negative")?;
+        let descendant_size_vbytes = args
+            .limit_descendant_size
+            .map(|size| u64::try_from(size).context("--limitdescendantsize must be non-negative"))
+            .transpose()?
+            .unwrap_or(DEFAULT_DESCENDANT_SIZE_LIMIT_VBYTES / 1_000)
+            .checked_mul(1_000)
+            .context("--limitdescendantsize is too large")?;
         let max_upload_target =
             parse_byte_units(&args.max_upload_target, 1 << 20).with_context(|| {
                 format!(
@@ -4092,6 +4124,10 @@ impl Config {
             max_mempool_mb: max_mempool,
             cluster_count: args.limit_cluster_count,
             cluster_size_vbytes,
+            ancestor_count_limit,
+            ancestor_size_vbytes,
+            descendant_count_limit,
+            descendant_size_vbytes,
             rbf_policy,
             truc_policy,
             mempool_expiry_hours: args.mempoolexpiry,

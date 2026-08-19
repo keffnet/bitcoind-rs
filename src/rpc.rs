@@ -56,7 +56,7 @@ use crate::fee_estimator::{EstimatorBucket, RawFeeEstimate};
 use crate::mempool::{
     MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT, Mempool, MempoolError, MempoolLoadOptions,
     PackageTestAcceptFailure, package_is_child_with_parents_tree, package_is_topologically_sorted,
-    package_weight,
+    package_weight, transaction_dynamic_memory_usage,
 };
 use crate::script::{core_multisig_solution, is_core_multisig, is_core_p2pk};
 use crate::validation;
@@ -13684,8 +13684,12 @@ fn package_has_unincluded_mempool_parent(transactions: &[Transaction], mempool: 
         .iter()
         .map(Transaction::compute_txid)
         .collect::<HashSet<_>>();
-    transactions.iter().any(|transaction| {
-        transaction.input.iter().any(|input| {
+    // Core's package shape check applies this rule to the final child only.
+    // Earlier package parents may legitimately spend an unconfirmed mempool
+    // transaction; the child itself must spend only package outputs or
+    // confirmed chainstate outputs.
+    transactions.last().is_some_and(|child| {
+        child.input.iter().any(|input| {
             mempool.get(&input.previous_output.txid).is_some()
                 && !package_txids.contains(&input.previous_output.txid)
         })
@@ -13850,11 +13854,7 @@ fn accepted_transaction_json(
         result.insert("allowed".to_owned(), Value::Bool(true));
         result.insert(
             "usage".to_owned(),
-            json!(
-                mempool
-                    .entry_dynamic_memory_usage(&txid)
-                    .unwrap_or_default()
-            ),
+            json!(transaction_dynamic_memory_usage(transaction)),
         );
     }
     result.insert("vsize".to_owned(), json!(entry.vsize));
@@ -13865,6 +13865,14 @@ fn accepted_transaction_json(
     }
     result.insert("fees".to_owned(), fees);
     Ok(Value::Object(result))
+}
+
+fn test_mempool_transaction_base(transaction: &Transaction) -> Value {
+    json!({
+        "txid": transaction.compute_txid().to_string(),
+        "wtxid": transaction.compute_wtxid().to_string(),
+        "usage": transaction_dynamic_memory_usage(transaction),
+    })
 }
 
 fn package_transaction_json(
@@ -13974,12 +13982,9 @@ fn rejected_transaction_json(transaction: &Transaction, error: &MempoolError) ->
     } else {
         reject_details
     };
-    let mut result = json!({
-        "txid": transaction.compute_txid().to_string(),
-        "wtxid": transaction.compute_wtxid().to_string(),
-        "allowed": false,
-        "reject-reason": mempool_reject_reason(error),
-    });
+    let mut result = test_mempool_transaction_base(transaction);
+    result["allowed"] = Value::Bool(false);
+    result["reject-reason"] = json!(mempool_reject_reason(error));
     if !matches!(error, MempoolError::MissingInput(_)) {
         result["reject-details"] = json!(reject_details);
     }
@@ -14050,15 +14055,15 @@ fn package_test_failure_json(
     failure: PackageTestAcceptFailure,
 ) -> Result<Value> {
     match failure {
-        PackageTestAcceptFailure::Package { error } => Ok(json!(
+        PackageTestAcceptFailure::Package { error } => Ok(Value::Array(
             transactions
                 .iter()
-                .map(|transaction| json!({
-                    "txid": transaction.compute_txid().to_string(),
-                    "wtxid": transaction.compute_wtxid().to_string(),
-                    "package-error": error.clone(),
-                }))
-                .collect::<Vec<_>>()
+                .map(|transaction| {
+                    let mut result = test_mempool_transaction_base(transaction);
+                    result["package-error"] = json!(error);
+                    result
+                })
+                .collect::<Vec<_>>(),
         )),
         PackageTestAcceptFailure::Transaction {
             index,
@@ -14070,10 +14075,7 @@ fn package_test_failure_json(
                 if transaction_index == index {
                     result.push(rejected_transaction_json(transaction, &error));
                 } else if transaction_index > index || !prior_results_validated {
-                    result.push(json!({
-                        "txid": transaction.compute_txid().to_string(),
-                        "wtxid": transaction.compute_wtxid().to_string(),
-                    }));
+                    result.push(test_mempool_transaction_base(transaction));
                 } else {
                     result.push(accepted_transaction_json(
                         transaction,
@@ -14117,15 +14119,15 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
         })
         .collect::<Result<Vec<Transaction>>>()?;
     if let Some(error) = package_policy_error(&transactions) {
-        return Ok(json!(
+        return Ok(Value::Array(
             transactions
                 .iter()
-                .map(|transaction| json!({
-                    "txid": transaction.compute_txid().to_string(),
-                    "wtxid": transaction.compute_wtxid().to_string(),
-                    "package-error": error,
-                }))
-                .collect::<Vec<_>>()
+                .map(|transaction| {
+                    let mut result = test_mempool_transaction_base(transaction);
+                    result["package-error"] = json!(error);
+                    result
+                })
+                .collect::<Vec<_>>(),
         ));
     }
 
@@ -14149,38 +14151,28 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
                     let entry = candidate
                         .get(&transaction.compute_txid())
                         .ok_or_else(|| anyhow!("accepted package transaction disappeared"))?;
-                    result.push(json!({
-                        "txid": transaction.compute_txid().to_string(),
-                        "wtxid": transaction.compute_wtxid().to_string(),
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
+                    let mut result_inner = test_mempool_transaction_base(transaction);
+                    result_inner["allowed"] = Value::Bool(false);
+                    result_inner["reject-reason"] = json!("max-fee-exceeded");
+                    result.push(result_inner);
                     debug_assert!(exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate));
                 } else {
-                    result.push(json!({
-                        "txid": transaction.compute_txid().to_string(),
-                        "wtxid": transaction.compute_wtxid().to_string(),
-                    }));
+                    result.push(test_mempool_transaction_base(transaction));
                 }
                 continue;
             }
             if exit_early {
-                result.push(json!({
-                    "txid": transaction.compute_txid().to_string(),
-                    "wtxid": transaction.compute_wtxid().to_string(),
-                }));
+                result.push(test_mempool_transaction_base(transaction));
                 continue;
             }
             let entry = candidate
                 .get(&transaction.compute_txid())
                 .ok_or_else(|| anyhow!("accepted package transaction disappeared"))?;
             if exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate) {
-                result.push(json!({
-                    "txid": transaction.compute_txid().to_string(),
-                    "wtxid": transaction.compute_wtxid().to_string(),
-                    "allowed": false,
-                    "reject-reason": "max-fee-exceeded",
-                }));
+                let mut result_inner = test_mempool_transaction_base(transaction);
+                result_inner["allowed"] = Value::Bool(false);
+                result_inner["reject-reason"] = json!("max-fee-exceeded");
+                result.push(result_inner);
                 exit_early = true;
             } else {
                 result.push(accepted_transaction_json(
@@ -14201,12 +14193,10 @@ pub(crate) fn test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<Va
                 .get(&txid)
                 .ok_or_else(|| anyhow!("accepted transaction disappeared"))?;
             if exceeds_max_fee(entry.fee_sat, entry.vsize, max_fee_rate) {
-                Ok(json!([{
-                    "txid": txid.to_string(),
-                    "wtxid": transactions[0].compute_wtxid().to_string(),
-                    "allowed": false,
-                    "reject-reason": "max-fee-exceeded",
-                }]))
+                let mut result = test_mempool_transaction_base(&transactions[0]);
+                result["allowed"] = Value::Bool(false);
+                result["reject-reason"] = json!("max-fee-exceeded");
+                Ok(json!([result]))
             } else {
                 Ok(json!([accepted_transaction_json(
                     &transactions[0],
@@ -14417,8 +14407,11 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
             .filter(|transaction| individually_accepted.contains(&transaction.compute_txid()))
             .cloned()
             .collect::<Vec<_>>();
-        let commit_individual_prefix =
-            package_rbf_atomic || (truc_failure && !standalone_accepted.is_empty());
+        let commit_individual_prefix = package_rbf_atomic
+            || (truc_failure
+                && standalone_accepted
+                    .iter()
+                    .any(|transaction| candidate.get(&transaction.compute_txid()).is_some()));
         let replaced_transactions = if commit_individual_prefix {
             // Core has already committed independently valid package members
             // before running the package-RBF retry.  Commit that prefix while
@@ -16515,7 +16508,7 @@ fn rpc_error_code(message: &str) -> i32 {
     if lower.starts_with("testblockvalidity failed:") {
         return -25;
     }
-    if lower == "too-large-cluster" {
+    if lower == "too-large-cluster" || lower.starts_with("too-long-mempool-chain") {
         return -26;
     }
     if lower.starts_with("too many potential replacements") {
@@ -16530,6 +16523,7 @@ fn rpc_error_code(message: &str) -> i32 {
         return -26;
     }
     if lower == "min relay fee not met"
+        || lower.starts_with("min relay fee not met,")
         || lower == "mempool min fee not met"
         || lower == "transaction fee rate is below the relay minimum"
         || lower.starts_with("transaction is non-standard:")
@@ -16539,7 +16533,7 @@ fn rpc_error_code(message: &str) -> i32 {
         || lower.starts_with("insufficient fee (including sibling eviction)")
         || lower.starts_with("insufficient feerate:")
         || lower.starts_with("replacement transaction fee is too low")
-        || lower.starts_with("truc-violation,")
+        || lower.starts_with("truc-")
     {
         return -26;
     }
@@ -17516,6 +17510,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -17710,6 +17708,7 @@ mod tests {
                 {
                     "txid": existing.compute_txid().to_string(),
                     "wtxid": existing.compute_wtxid().to_string(),
+                    "usage": crate::mempool::transaction_dynamic_memory_usage(&existing),
                     "allowed": false,
                     "reject-reason": "txn-already-in-mempool",
                     "reject-details": "txn-already-in-mempool",
@@ -17717,6 +17716,7 @@ mod tests {
                 {
                     "txid": unprocessed.compute_txid().to_string(),
                     "wtxid": unprocessed.compute_wtxid().to_string(),
+                    "usage": crate::mempool::transaction_dynamic_memory_usage(&unprocessed),
                 },
             ])
         );
@@ -17911,6 +17911,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -18090,6 +18094,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -18316,6 +18324,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -18468,6 +18480,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -18612,6 +18628,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: true,
             stats_enable: false,
@@ -18799,6 +18819,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: true,
             stats_enable: false,
@@ -19010,6 +19034,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -19489,6 +19517,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -19672,6 +19704,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -19828,6 +19864,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -19984,6 +20024,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -20136,6 +20180,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -20276,6 +20324,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -20424,6 +20476,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -20561,6 +20617,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -20786,6 +20846,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -20962,6 +21026,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -21134,6 +21202,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -21328,6 +21400,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -21486,6 +21562,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -21675,6 +21755,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -22030,6 +22114,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -22315,6 +22403,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -22453,6 +22545,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -22634,6 +22730,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -22779,6 +22879,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -22930,6 +23034,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -23123,6 +23231,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -23279,6 +23391,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -23494,6 +23610,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -23780,6 +23900,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -23920,6 +24044,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -24286,6 +24414,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -24527,6 +24659,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -24737,6 +24873,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -25048,6 +25188,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -25438,6 +25582,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -25587,6 +25735,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -25862,6 +26014,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -26015,6 +26171,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -26554,6 +26714,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -26713,6 +26877,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -26900,6 +27068,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -27352,6 +27524,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -27883,6 +28059,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -28095,6 +28275,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -28338,6 +28522,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -28733,6 +28921,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -28884,6 +29076,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -29057,6 +29253,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,

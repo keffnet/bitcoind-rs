@@ -2102,8 +2102,13 @@ impl Node {
             dust_relay_fee_sat_per_kvb: config.dust_relay_fee_sat_per_kvb,
             bytes_per_sigop: config.bytes_per_sigop,
             max_datacarrier_bytes: config.max_datacarrier_bytes,
+            permit_bare_datacarrier: true,
             permit_bare_multisig: config.permit_bare_multisig,
             require_standard: !config.accept_nonstd_txn,
+            ancestor_count_limit: config.ancestor_count_limit,
+            ancestor_size_limit_vbytes: config.ancestor_size_vbytes,
+            descendant_count_limit: config.descendant_count_limit,
+            descendant_size_limit_vbytes: config.descendant_size_vbytes,
             cluster_count_limit: config.cluster_count,
             cluster_vsize_limit: config.cluster_size_vbytes,
             rbf_policy: config.rbf_policy,
@@ -2798,30 +2803,49 @@ impl Node {
                 if transaction.is_coinbase() {
                     continue;
                 }
-                if let Ok(txid) = mempool.accept_reorg(transaction, &chain, added_at) {
-                    fee_estimator_exclusions.insert(txid);
+                match mempool.accept_reorg(transaction.clone(), &chain, added_at) {
+                    Ok(txid) => {
+                        fee_estimator_exclusions.insert(txid);
+                    }
+                    Err(error) => {
+                        debug!(
+                            txid = %transaction.compute_txid(),
+                            %error,
+                            "reorg transaction rejected while restoring mempool"
+                        );
+                    }
                 }
             }
         } else {
-            for (index, block) in disconnected_blocks.iter().rev().enumerate() {
-                let mut pool = DisconnectedTransactionPool::default();
+            // InvalidateBlock disconnects one tip at a time in Core, but the
+            // final chain state is passed to this reconciliation hook only
+            // after the whole invalidated suffix has been disconnected. Queue
+            // the most recent ten blocks in newest-to-oldest order, then
+            // replay the aggregate pool oldest-first so parents are available
+            // before descendants.
+            let mut pool = DisconnectedTransactionPool::default();
+            for block in disconnected_blocks.iter().rev().take(10) {
                 for evicted in pool.add_block(block) {
                     mempool.remove_recursive(&evicted.compute_txid());
                 }
-                for activated in activated_blocks {
-                    pool.remove_for_block(activated);
+            }
+            for activated in activated_blocks {
+                pool.remove_for_block(activated);
+            }
+            for transaction in pool.take_oldest_first() {
+                if transaction.is_coinbase() {
+                    continue;
                 }
-                let restore = index < 10;
-                for transaction in pool.take_oldest_first() {
-                    if transaction.is_coinbase() {
-                        continue;
-                    }
-                    if !restore {
-                        mempool.remove_recursive(&transaction.compute_txid());
-                        continue;
-                    }
-                    if let Ok(txid) = mempool.accept_reorg(transaction, &chain, added_at) {
+                match mempool.accept_reorg(transaction.clone(), &chain, added_at) {
+                    Ok(txid) => {
                         fee_estimator_exclusions.insert(txid);
+                    }
+                    Err(error) => {
+                        debug!(
+                            txid = %transaction.compute_txid(),
+                            %error,
+                            "reorg transaction rejected while restoring mempool"
+                        );
                     }
                 }
             }
@@ -8275,6 +8299,10 @@ mod tests {
             max_mempool_mb: 300,
             cluster_count: 64,
             cluster_size_vbytes: 101_000,
+            ancestor_count_limit: 25,
+            ancestor_size_vbytes: 101_000,
+            descendant_count_limit: 25,
+            descendant_size_vbytes: 101_000,
             mempool_expiry_hours: 336,
             coinstatsindex: false,
             stats_enable: false,
@@ -9546,7 +9574,7 @@ mod tests {
         node.invalidate_block(parent_block_hash).unwrap();
         let mempool = node.mempool.read();
         assert!(mempool.get(&parent_txid).is_some());
-        assert!(mempool.get(&child_txid).is_none());
+        assert!(mempool.get(&child_txid).is_some());
     }
 
     #[test]

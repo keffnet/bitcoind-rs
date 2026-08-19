@@ -608,7 +608,10 @@ fn read_auth(
 fn build_params(method: &str, raw: &[String], named: bool) -> Result<Value, Failure> {
     if !named {
         return Ok(Value::Array(
-            raw.iter().map(|value| cli_value(method, value)).collect(),
+            raw.iter()
+                .enumerate()
+                .map(|(index, value)| cli_value(method, Some(index), None, value))
+                .collect(),
         ));
     }
     let mut positional = Vec::new();
@@ -616,9 +619,17 @@ fn build_params(method: &str, raw: &[String], named: bool) -> Result<Value, Fail
     let mut has_named_args = false;
     for value in raw {
         let Some((name, raw_value)) = split_named_argument(value) else {
-            positional.push(cli_value(method, value));
+            let index = positional.len();
+            positional.push(cli_value(method, Some(index), None, value));
             continue;
         };
+        if !cli_named_parameter(method, name)
+            && cli_string_parameter(method, Some(positional.len()), None)
+        {
+            let index = positional.len();
+            positional.push(cli_value(method, Some(index), None, value));
+            continue;
+        }
         has_named_args = true;
         if name == "args" && !positional.is_empty() {
             return Err(Failure::Rpc {
@@ -626,7 +637,10 @@ fn build_params(method: &str, raw: &[String], named: bool) -> Result<Value, Fail
                 message: "Parameter args specified multiple times".to_owned(),
             });
         }
-        named_values.insert(name.to_owned(), cli_value(method, raw_value));
+        named_values.insert(
+            name.to_owned(),
+            cli_value(method, None, Some(name), raw_value),
+        );
     }
     if !has_named_args {
         return Ok(Value::Array(positional));
@@ -659,11 +673,75 @@ fn split_named_argument(value: &str) -> Option<(&str, &str)> {
     Some((name, value))
 }
 
-fn cli_value(method: &str, value: &str) -> Value {
-    if method == "echo" {
+fn cli_value(method: &str, position: Option<usize>, name: Option<&str>, value: &str) -> Value {
+    if cli_string_parameter(method, position, name) {
         return Value::String(value.to_owned());
     }
     serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_owned()))
+}
+
+/// Return the non-wallet parameters that Core's bitcoin-cli treats as literal
+/// strings in its RPC conversion table.  All other arguments use Core's JSON
+/// (or JSON-or-string fallback) conversion behavior.
+fn cli_string_parameter(method: &str, position: Option<usize>, name: Option<&str>) -> bool {
+    if method == "echo" {
+        return true;
+    }
+    match method {
+        "utxoupdatepsbt"
+        | "descriptorprocesspsbt"
+        | "finalizepsbt"
+        | "decodepsbt"
+        | "analyzepsbt" => name == Some("psbt") || position == Some(0),
+        "dumptxoutset" => {
+            matches!(name, Some("path") | Some("type")) || matches!(position, Some(0) | Some(1))
+        }
+        "importmempool" => name == Some("filepath") || position == Some(0),
+        "loadtxoutset" => name == Some("path") || position == Some(0),
+        "verifymessage" => {
+            matches!(name, Some("signature") | Some("message"))
+                || matches!(position, Some(1) | Some(2))
+        }
+        "signmessagewithprivkey" => name == Some("message") || position == Some(1),
+        "echoipc" => name == Some("arg") || position == Some(0),
+        _ => false,
+    }
+}
+
+/// Names recognized by the affected RPCs when `-named` is used.  This lets
+/// the Core-compatible `name=value` heuristic preserve a literal string such
+/// as `message=part=one` while still accepting a real named argument.
+fn cli_named_parameter(method: &str, name: &str) -> bool {
+    match method {
+        "echo" | "echojson" => {
+            name == "args"
+                || name
+                    .strip_prefix("arg")
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .is_some_and(|index| index < 10)
+        }
+        "utxoupdatepsbt" => matches!(name, "psbt" | "descriptors"),
+        "descriptorprocesspsbt" => matches!(
+            name,
+            "psbt" | "descriptors" | "sighashtype" | "bip32derivs" | "finalize"
+        ),
+        "finalizepsbt" => matches!(name, "psbt" | "extract"),
+        "decodepsbt" | "analyzepsbt" => name == "psbt",
+        "dumptxoutset" => matches!(name, "path" | "type" | "options" | "rollback"),
+        "importmempool" => matches!(
+            name,
+            "filepath"
+                | "options"
+                | "apply_fee_delta_priority"
+                | "use_current_time"
+                | "apply_unbroadcast_set"
+        ),
+        "loadtxoutset" => name == "path",
+        "verifymessage" => matches!(name, "address" | "signature" | "message"),
+        "signmessagewithprivkey" => matches!(name, "privkey" | "message"),
+        "echoipc" => name == "arg",
+        _ => false,
+    }
 }
 
 impl RpcClient {
@@ -1100,6 +1178,35 @@ mod tests {
         let params =
             build_params("echo", &["arg0=0".to_owned(), "arg1=1".to_owned()], true).unwrap();
         assert_eq!(params, json!({"arg0": "0", "arg1": "1"}));
+    }
+
+    #[test]
+    fn core_string_conversion_entries_preserve_json_looking_values() {
+        let params = build_params(
+            "signmessagewithprivkey",
+            &["privkey=1abc".to_owned(), "message=123".to_owned()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(params, json!({"privkey": "1abc", "message": "123"}));
+
+        let params = build_params(
+            "finalizepsbt",
+            &["psbt=123".to_owned(), "extract=false".to_owned()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(params, json!({"psbt": "123", "extract": false}));
+    }
+
+    #[test]
+    fn core_named_string_heuristic_preserves_equals_in_positional_paths() {
+        let params = build_params("loadtxoutset", &["snapshot=part=one".to_owned()], true).unwrap();
+        assert_eq!(params, json!(["snapshot=part=one"]));
+
+        let params =
+            build_params("loadtxoutset", &["path=snapshot=part=one".to_owned()], true).unwrap();
+        assert_eq!(params, json!({"path": "snapshot=part=one"}));
     }
 
     #[test]

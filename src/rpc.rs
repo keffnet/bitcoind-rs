@@ -2621,7 +2621,6 @@ fn dispatch_method_for_user(
             node.peer_infos()
                 .into_iter()
                 .map(|peer| {
-                    let versioned = peer.version.is_some();
                     let (synced_headers, synced_blocks) = {
                         let chain = node.chain.read();
                         let synced_headers = peer
@@ -2647,7 +2646,6 @@ fn dispatch_method_for_user(
                         "lastrecv": peer.last_recv,
                         "last_transaction": peer.last_transaction,
                         "last_block": peer.last_block,
-                        "last_block_announcement": peer.last_block_announcement,
                         "bytessent": peer.bytes_sent,
                         "bytesrecv": peer.bytes_received,
                         "conntime": peer.connected_at,
@@ -2655,7 +2653,6 @@ fn dispatch_method_for_user(
                         "version": peer.version.unwrap_or_default(),
                         "subver": peer.user_agent,
                         "inbound": peer.inbound,
-                        "startingheight": peer.start_height,
                         "bip152_hb_to": peer.bip152_highbandwidth_to,
                         "bip152_hb_from": peer.bip152_highbandwidth_from,
                         "presynced_headers": peer.presynced_headers,
@@ -2665,15 +2662,7 @@ fn dispatch_method_for_user(
                         "addr_relay_enabled": peer.addr_relay_enabled,
                         "addr_processed": peer.addr_processed,
                         "addr_rate_limited": peer.addr_rate_limited,
-                        "permissions": if versioned || !peer.inbound {
-                            peer.permissions.to_strings()
-                        } else {
-                            peer.permissions
-                                .union(crate::config::PeerPermissions::BLOOM_FILTER)
-                                .to_strings()
-                        },
-                        "forced_inbound": peer.forced_inbound,
-                        "misbehavior_score": 0,
+                        "permissions": peer.permissions.to_strings(),
                         "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
                         "bytessent_per_msg": peer.bytes_sent_per_msg,
                         "bytesrecv_per_msg": peer.bytes_received_per_msg,
@@ -2687,6 +2676,9 @@ fn dispatch_method_for_user(
                     });
                     if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
                         info["mapped_as"] = json!(mapped_as);
+                    }
+                    if node.config.deprecated_rpcs.contains("startingheight") {
+                        info["startingheight"] = json!(peer.start_height);
                     }
                     if let Some(address) = peer.local_address {
                         info["addrbind"] = json!(address.to_string());
@@ -2702,12 +2694,6 @@ fn dispatch_method_for_user(
                     }
                     if let Some(ping_wait) = peer.ping_wait().filter(|wait| *wait > 0.0) {
                         info["pingwait"] = json!(ping_wait);
-                    }
-                    if !versioned {
-                        if let Some(object) = info.as_object_mut() {
-                            object.remove("last_inv_sequence");
-                            object.remove("inv_to_send");
-                        }
                     }
                     info
                 })
@@ -24207,14 +24193,15 @@ mod tests {
         .unwrap();
         let unversioned_peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(unversioned_peer_info[0]["relaytxes"], json!(false));
-        assert_eq!(
-            unversioned_peer_info[0]["last_block_announcement"],
-            json!(0)
+        assert!(
+            unversioned_peer_info[0]
+                .get("last_block_announcement")
+                .is_none()
         );
-        assert_eq!(unversioned_peer_info[0]["forced_inbound"], json!(false));
-        assert_eq!(unversioned_peer_info[0]["misbehavior_score"], json!(0));
-        assert!(unversioned_peer_info[0].get("last_inv_sequence").is_none());
-        assert!(unversioned_peer_info[0].get("inv_to_send").is_none());
+        assert!(unversioned_peer_info[0].get("forced_inbound").is_none());
+        assert!(unversioned_peer_info[0].get("misbehavior_score").is_none());
+        assert_eq!(unversioned_peer_info[0]["last_inv_sequence"], json!(0));
+        assert_eq!(unversioned_peer_info[0]["inv_to_send"], json!(0));
         assert_eq!(
             unversioned_peer_info[0]["permissions"],
             json!(["forcerelay", "relay"])

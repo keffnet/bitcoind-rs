@@ -1706,11 +1706,20 @@ impl PeerReader {
                         // Core catches payload deserialization exceptions in
                         // ProcessMessage after BIP324 has already authenticated
                         // and framed the packet. Discard the malformed message
-                        // but keep the encrypted transport alive.
-                        if error.to_string().contains("non-minimal varint") {
+                        // but keep the encrypted transport alive. Match Core's
+                        // diagnostic for stream-deserialization failures too;
+                        // callers use it to distinguish a recoverable malformed
+                        // application message from a transport failure.
+                        if let Some(transaction_reason) =
+                            wire::v2_transaction_optional_data_error(contents)
+                        {
+                            debug!("{transaction_reason}");
+                        } else if error.to_string().contains("non-minimal varint") {
                             debug!("non-canonical ReadCompactSize()");
                         } else {
-                            debug!(%error, "discarding malformed BIP324 application message");
+                            debug!(
+                                "Exception 'DataStream::read(): end of data' (std::ios_base::failure) caught"
+                            );
                         }
                         break Ok((None, bytes, true));
                     }

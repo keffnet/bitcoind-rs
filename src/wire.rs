@@ -780,6 +780,19 @@ fn transaction_optional_data_error(payload: &[u8]) -> Option<&'static str> {
     (flags != 1).then_some("Unknown transaction optional data")
 }
 
+pub(crate) fn v2_transaction_optional_data_error(payload: &[u8]) -> Option<&'static str> {
+    let message_type = *payload.first()?;
+    let payload_start = if message_type == 0 { 13 } else { 1 };
+    let command = if message_type == 0 {
+        decode_command(payload.get(1..13)?).ok()?
+    } else {
+        v2_message_command(message_type)?
+    };
+    (command == "tx")
+        .then(|| transaction_optional_data_error(payload.get(payload_start..)?))
+        .flatten()
+}
+
 fn recoverable_payload_message_with_magic(magic: [u8; 4], frame: &[u8]) -> Option<Message> {
     if frame.len() < HEADER_SIZE || frame[..4] != magic {
         return None;
@@ -1891,6 +1904,30 @@ mod tests {
         assert!(v2_message_type_is_valid(
             &encode_v2_message(&Message::Ping(42)).unwrap()
         ));
+    }
+
+    #[test]
+    fn bip324_malformed_transactions_use_core_optional_data_diagnostic() {
+        let transaction_payload = [0u8; 4].into_iter().chain([0, 2, 0, 0]).collect::<Vec<_>>();
+
+        let mut short_id_payload = vec![21];
+        short_id_payload.extend_from_slice(&transaction_payload);
+        assert_eq!(
+            v2_transaction_optional_data_error(&short_id_payload),
+            Some("Unknown transaction optional data")
+        );
+
+        let mut extended_payload = vec![0];
+        extended_payload.extend_from_slice(b"tx\0\0\0\0\0\0\0\0\0\0");
+        extended_payload.extend_from_slice(&transaction_payload);
+        assert_eq!(
+            v2_transaction_optional_data_error(&extended_payload),
+            Some("Unknown transaction optional data")
+        );
+        assert_eq!(
+            v2_transaction_optional_data_error(&encode_v2_message(&Message::Ping(1)).unwrap()),
+            None
+        );
     }
 
     #[test]

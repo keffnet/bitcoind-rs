@@ -254,17 +254,6 @@ async fn handle_connection(
 ) -> Result<()> {
     stream.set_nodelay(true)?;
     let mut connection = HttpConnection::new(stream);
-    if !rpc_client_allowed(&node, peer.ip()) {
-        connection
-            .write_response(
-                "403 Forbidden",
-                "text/plain",
-                b"RPC client address is not allowed\r\n",
-                false,
-            )
-            .await?;
-        return Ok(());
-    }
     loop {
         let request = match tokio::time::timeout(request_timeout, connection.read_request()).await {
             Ok(request) => request?,
@@ -273,6 +262,22 @@ async fn handle_connection(
         let Some(request) = request else {
             return Ok(());
         };
+        // Core's HTTP server parses the request before applying the
+        // connection-address ACL.  In particular, an unauthorized client
+        // must be able to finish sending its request and receive the plain
+        // HTTP 403 response instead of seeing a reset/BrokenPipe while the
+        // request body is still in flight.
+        if !rpc_client_allowed(&node, peer.ip()) {
+            connection
+                .write_response(
+                    "403 Forbidden",
+                    "text/plain",
+                    b"RPC client address is not allowed\r\n",
+                    false,
+                )
+                .await?;
+            return Ok(());
+        }
         let keep_alive = request.keep_alive;
         let mut shutdown_after_response = false;
         let (status, content_type, body) = if node.config.rest

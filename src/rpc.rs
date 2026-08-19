@@ -2218,6 +2218,152 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
     }
 }
 
+fn rpc_argument_is_string(method: &str, name: &str) -> bool {
+    match method {
+        "help" => name == "command",
+        "format" => matches!(name, "command" | "output"),
+        "getdeploymentinfo" | "getblockheader" | "getblock" | "getblocklocations"
+        | "getchaintxstats" | "gettxoutproof" | "getblockfrompeer" | "waitforblock"
+        | "invalidateblock" | "reconsiderblock" | "preciousblock" => name == "blockhash",
+        "getblockfilter" => matches!(name, "blockhash" | "filtertype"),
+        "verifytxoutproof" => name == "proof",
+        "submitheader" => name == "hexdata",
+        "waitfornewblock" => name == "current_tip",
+        "getrawtransaction" => matches!(name, "txid" | "blockhash"),
+        "decoderawtransaction" | "decodescript" | "converttopsbt" => name == "hexstring",
+        "decodepsbt" | "analyzepsbt" | "finalizepsbt" => name == "psbt",
+        "utxoupdatepsbt" => name == "psbt",
+        "descriptorprocesspsbt" => matches!(name, "psbt" | "sighashtype"),
+        "signmessagewithprivkey" => matches!(name, "privkey" | "message"),
+        "verifymessage" => matches!(name, "address" | "signature" | "message"),
+        "createmultisig" => name == "address_type",
+        "sendrawtransaction" => name == "hexstring",
+        "abortprivatebroadcast" | "gettxout" => name == "txid",
+        "signrawtransactionwithkey" => matches!(name, "hexstring" | "sighashtype"),
+        "submitblock" => matches!(name, "hexdata" | "dummy"),
+        "prioritisetransaction" => matches!(name, "txid" | "dummy"),
+        "generatetoaddress" => name == "address",
+        "generatetodescriptor" => name == "descriptor",
+        "generateblock" => name == "output",
+        "echo" | "echojson" => name.starts_with("arg"),
+        "echoipc" => name == "arg",
+        "getmemoryinfo" => name == "mode",
+        "getmempoolentry"
+        | "getmempoolancestors"
+        | "getmempooldescendants"
+        | "getmempoolcluster" => name == "txid",
+        "importmempool" => name == "filepath",
+        "gettxoutsetinfo" => name == "hash_type",
+        "dumptxoutset" => matches!(name, "path" | "type"),
+        "loadtxoutset" => name == "path",
+        "scanblocks" => matches!(name, "action" | "filtertype"),
+        "scantxoutset" => name == "action",
+        "getnodeaddresses" => name == "network",
+        "addpeeraddress" => name == "address",
+        "sendmsgtopeer" => matches!(name, "msg_type" | "msg"),
+        "addconnection" => matches!(name, "address" | "connection_type"),
+        "addnode" => matches!(name, "node" | "command"),
+        "disconnectnode" => name == "address",
+        "getaddednodeinfo" => name == "node",
+        "setban" => matches!(name, "subnet" | "command"),
+        "estimatesmartfee" => name == "estimate_mode",
+        "validateaddress" => matches!(name, "address" | "address_type"),
+        "deriveaddresses" | "getdescriptorinfo" => name == "descriptor",
+        "getindexinfo" => name == "index_name",
+        "setprunelock" => name == "id",
+        _ => false,
+    }
+}
+
+fn rpc_argument_aliases(method: &str, index: usize, name: &str) -> &'static [&'static str] {
+    match (method, index, name) {
+        ("getblock" | "getrawtransaction", 1, "verbosity") => &["verbose"],
+        ("dumptxoutset", 2, "options") => &["rollback"],
+        ("gettxspendingprevout", 1, "options") => &["mempool_only", "return_spending_tx"],
+        ("scanblocks", 5, "options") => &["filter_false_positives"],
+        ("gettxoutproof", 2, "options") => &["prove_witness"],
+        ("verifytxoutproof", 1, "options") => &["verify_witness"],
+        ("importmempool", 1, "options") => &[
+            "use_current_time",
+            "apply_fee_delta_priority",
+            "apply_unbroadcast_set",
+        ],
+        _ => &[],
+    }
+}
+
+fn rpc_command_conversions() -> Value {
+    const HIDDEN_METHODS: &[&str] = &[
+        "addconnection",
+        "addpeeraddress",
+        "echo",
+        "echoipc",
+        "echojson",
+        "enumeratesigners",
+        "estimaterawfee",
+        "generate",
+        "generateblock",
+        "generatetoaddress",
+        "generatetodescriptor",
+        "getmempoolfeeratediagram",
+        "getorphantxs",
+        "getrawaddrman",
+        "invalidateblock",
+        "mockscheduler",
+        "reconsiderblock",
+        "sendmsgtopeer",
+        "setmocktime",
+        "syncwithvalidationinterfacequeue",
+    ];
+
+    let mut methods = rpc_help("")
+        .lines()
+        .filter(|line| !line.starts_with("==") && !line.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    methods.extend(HIDDEN_METHODS.iter().map(|method| (*method).to_owned()));
+    methods.sort_unstable();
+    methods.dedup();
+
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    for method in methods {
+        if matches!(method.as_str(), "echo" | "echojson") {
+            for index in 0..10 {
+                entries.push(json!([method, index, format!("arg{index}"), true]));
+            }
+            continue;
+        }
+
+        let Some(names) = rpc_parameter_names(&method) else {
+            continue;
+        };
+        for (index, name) in names.iter().enumerate() {
+            let key = (method.clone(), index, (*name).to_owned());
+            if seen.insert(key) {
+                entries.push(json!([
+                    method,
+                    index,
+                    name,
+                    rpc_argument_is_string(&method, name),
+                ]));
+            }
+            for alias in rpc_argument_aliases(&method, index, name) {
+                let key = (method.clone(), index, (*alias).to_owned());
+                if seen.insert(key) {
+                    entries.push(json!([
+                        method,
+                        index,
+                        alias,
+                        rpc_argument_is_string(&method, alias),
+                    ]));
+                }
+            }
+        }
+    }
+    Value::Array(entries)
+}
+
 fn dispatch_method(node: &Arc<Node>, method: &str, params: &Value) -> Result<Value> {
     dispatch_method_for_user(node, method, params, None)
 }
@@ -2747,7 +2893,7 @@ fn dispatch_method_for_user(
                     .ok_or_else(|| json_type_error(value, "string"))?,
             };
             if command == "dump_all_command_conversions" {
-                Ok(json!([]))
+                Ok(rpc_command_conversions())
             } else {
                 Ok(json!(rpc_help(command)))
             }
@@ -19045,6 +19191,32 @@ mod tests {
             "getblock ( \"blockhash\" \"verbosity\" )"
         );
         assert_eq!(rpc_help_usage("getblockcount"), "getblockcount");
+    }
+
+    #[test]
+    fn command_conversion_map_describes_core_argument_types() {
+        let map = rpc_command_conversions();
+        let entries = map.as_array().expect("conversion map array");
+        let is_string = |method: &str, index: u64, name: &str| {
+            entries
+                .iter()
+                .find(|entry| entry[0] == method && entry[1] == index && entry[2] == name)
+                .and_then(|entry| entry[3].as_bool())
+        };
+
+        assert!(entries.len() > 100);
+        assert_eq!(is_string("getrawtransaction", 0, "txid"), Some(true));
+        assert_eq!(is_string("getblock", 1, "verbose"), Some(false));
+        assert_eq!(
+            is_string("gettxoutsetinfo", 1, "hash_or_height"),
+            Some(false)
+        );
+        assert_eq!(is_string("decodepsbt", 0, "psbt"), Some(true));
+        assert_eq!(
+            is_string("gettxspendingprevout", 1, "return_spending_tx"),
+            Some(false)
+        );
+        assert_eq!(is_string("echojson", 0, "arg0"), Some(true));
     }
 
     #[test]

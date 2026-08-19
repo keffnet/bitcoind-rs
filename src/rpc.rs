@@ -12652,9 +12652,9 @@ fn mining_block_with_deployment_parameters(
         // Core's CMutableTransaction default is version 2, including for
         // coinbase transactions assembled by generatetoaddress.
         version: Version::TWO,
-        // Core's block assembler commits the preceding height in the
-        // coinbase lock time.
-        lock_time: LockTime::from_consensus(height.saturating_sub(1)),
+        // Core's CMutableTransaction constructor leaves coinbase locktime at
+        // zero. The height and extranonce are carried by scriptSig instead.
+        lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: {
@@ -12664,10 +12664,8 @@ fn mining_block_with_deployment_parameters(
                 }
                 builder.into_script()
             },
-            // Core's block assembler uses MAX_SEQUENCE_NONFINAL for generated
-            // coinbases so timelock semantics remain observable to miners and
-            // RPC clients.
-            sequence: bitcoin::Sequence::from_consensus(0xffff_fffe),
+            // Core's default CTxIn sequence is SEQUENCE_FINAL.
+            sequence: bitcoin::Sequence::MAX,
             witness: Witness::default(),
         }],
         output: vec![TxOut {
@@ -22122,8 +22120,9 @@ mod tests {
             pre_segwit_block.txdata[0].input[0]
                 .sequence
                 .to_consensus_u32(),
-            0xffff_fffe
+            u32::MAX
         );
+        assert_eq!(pre_segwit_block.txdata[0].lock_time, LockTime::ZERO);
         assert_eq!(pre_segwit_block.txdata[0].output.len(), 1);
         assert!(get_block_template(&node, &json!([{}])).is_err());
 

@@ -1864,6 +1864,16 @@ async fn dispatch_method_async_for_user(
     params: &Value,
     auth_user: Option<String>,
 ) -> Result<Value> {
+    // Classify unknown methods before validating named parameters. Core
+    // reports a disabled or unknown RPC as -32601 regardless of whether the
+    // caller used positional or named parameters; normalizing first would
+    // incorrectly turn it into a named-argument error.
+    if rpc_parameter_names(method).is_none()
+        && !matches!(method, "echo" | "echojson")
+        && rpc_help(method).starts_with("help: unknown command:")
+    {
+        return dispatch_method_for_user(node, method, params, auth_user.as_deref());
+    }
     let normalized_params = normalize_rpc_params(method, params)?;
     debug!("ThreadRPCServer method={method}");
     let command_id = node.begin_rpc_command(method);
@@ -1947,6 +1957,12 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
     let Some(object) = params.as_object() else {
         bail!("RPC params must be an array or object")
     };
+    if rpc_parameter_names(method).is_none()
+        && !matches!(method, "echo" | "echojson")
+        && rpc_help(method).starts_with("help: unknown command:")
+    {
+        return Ok(Value::Object(object.clone()));
+    }
     if method == "createrawtransaction" && object.is_empty() {
         return Ok(Value::Array(Vec::new()));
     }
@@ -19624,6 +19640,10 @@ mod tests {
         assert!(normalize_rpc_params("getblockhash", &json!([0, 1])).is_err());
         assert!(normalize_rpc_params("getblockcount", &json!([1])).is_err());
         assert!(normalize_rpc_params("getmempoolentry", &json!(["00", false])).is_err());
+        assert_eq!(
+            normalize_rpc_params("getwalletinfo", &json!({})).unwrap(),
+            json!({})
+        );
         assert!(
             normalize_rpc_params("getmempoolentry", &json!({"txid": "00", "verbose": true}),)
                 .is_err()

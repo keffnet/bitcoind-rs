@@ -16979,10 +16979,28 @@ fn rpc_help(method: &str) -> String {
     } else if method == "getorphantxs" {
         "getorphantxs\n\nReturns orphan transactions currently held by the node.".to_owned()
     } else if known_method {
-        format!("{method}\n\n{method}: wallet-free Bitcoin Core-compatible RPC")
+        format!(
+            "{}\n\n{method}: wallet-free Bitcoin Core-compatible RPC",
+            rpc_help_usage(method)
+        )
     } else {
         format!("help: unknown command: {method}")
     }
+}
+
+fn rpc_help_usage(method: &str) -> String {
+    let Some(names) = rpc_parameter_names(method) else {
+        return method.to_owned();
+    };
+    if names.is_empty() {
+        return method.to_owned();
+    }
+    let arguments = names
+        .iter()
+        .map(|name| format!("\"{name}\""))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{method} ( {arguments} )")
 }
 
 #[cfg(test)]
@@ -19015,13 +19033,18 @@ mod tests {
                 .count(),
             1
         );
-        assert!(command_lines.iter().any(|line| *line == "dumptxoutset"));
+        assert!(command_lines.contains(&"dumptxoutset"));
         assert!(!command_lines.iter().any(|line| {
             matches!(
                 *line,
                 "addconnection" | "generate" | "getmempoolfeeratediagram" | "getorphantxs"
             )
         }));
+        assert_eq!(
+            rpc_help_usage("getblock"),
+            "getblock ( \"blockhash\" \"verbosity\" )"
+        );
+        assert_eq!(rpc_help_usage("getblockcount"), "getblockcount");
     }
 
     #[test]

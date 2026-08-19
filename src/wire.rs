@@ -164,7 +164,6 @@ impl VersionMessage {
             | NODE_WITNESS
             | NODE_COMPACT_FILTERS
             | NODE_P2P_V2
-            | NODE_REDUCED_DATA
             | if bloom_filters { NODE_BLOOM } else { 0 };
         let user_agent = if comments.is_empty() {
             "/bitcoind-rs:0.1.0/".to_owned()

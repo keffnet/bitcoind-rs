@@ -1742,15 +1742,28 @@ async fn dispatch_request(
         ));
     };
     let id = request.get("id").cloned().unwrap_or(Value::Null);
-    // Core defaults to its legacy response format unless the request carries
-    // the exact JSON-RPC 2.0 marker.  In particular, it accepts numeric
-    // values and unrecognized strings as legacy requests for compatibility
-    // with older clients; JSONRPCRequest::parse in Core only promotes
-    // "2.0" to the v2 response format.
-    let json_rpc_2 = request
-        .get("jsonrpc")
-        .and_then(Value::as_str)
-        .is_some_and(|value| value == "2.0");
+    // Core accepts only the JSON-RPC 1.0 and 2.0 version markers. Requests
+    // without a marker, or with the legacy `version` field, retain the
+    // historical Bitcoin RPC response format.
+    let json_rpc_2 = match request_object.get("jsonrpc") {
+        None => false,
+        Some(Value::String(version)) if version == "2.0" => true,
+        Some(Value::String(version)) if version == "1.0" => false,
+        Some(Value::String(_)) => {
+            return Some(json_rpc_invalid_request(
+                id,
+                false,
+                "JSON-RPC version not supported",
+            ));
+        }
+        Some(_) => {
+            return Some(json_rpc_invalid_request(
+                id,
+                false,
+                "jsonrpc field must be a string",
+            ));
+        }
+    };
     let is_notification = json_rpc_2 && !request_object.contains_key("id");
     let Some(method) = request_object.get("method").and_then(Value::as_str) else {
         if is_notification {
@@ -2563,7 +2576,6 @@ fn dispatch_method_for_user(
             };
             let local_services = network_service
                 | wire::NODE_WITNESS
-                | wire::NODE_REDUCED_DATA
                 | if node.config.v2_transport {
                     wire::NODE_P2P_V2
                 } else {
@@ -2623,11 +2635,12 @@ fn dispatch_method_for_user(
                         "services": format!("{:016x}", peer.services),
                         "servicesnames": peer_services_names(peer.services),
                         "relaytxes": peer.relay_transactions,
+                        "last_inv_sequence": peer.last_inv_sequence,
+                        "inv_to_send": peer.inv_to_send,
                         "lastsend": peer.last_send,
                         "lastrecv": peer.last_recv,
                         "last_transaction": peer.last_transaction,
                         "last_block": peer.last_block,
-                        "last_block_announcement": peer.last_block_announcement,
                         "bytessent": peer.bytes_sent,
                         "bytesrecv": peer.bytes_received,
                         "conntime": peer.connected_at,
@@ -2656,8 +2669,6 @@ fn dispatch_method_for_user(
                         },
                         "transport_protocol_type": peer.transport_protocol_type,
                         "session_id": peer.session_id,
-                        "forced_inbound": peer.forced_inbound,
-                        "misbehavior_score": 0,
                     });
                     if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
                         info["mapped_as"] = json!(mapped_as);
@@ -3617,7 +3628,6 @@ fn peer_services_names(services: u64) -> Vec<String> {
             6 => "COMPACT_FILTERS".to_owned(),
             10 => "NETWORK_LIMITED".to_owned(),
             11 => "P2P_V2".to_owned(),
-            27 => "REDUCED_DATA?".to_owned(),
             bit => format!("UNKNOWN[2^{bit}]"),
         })
         .collect()
@@ -16889,7 +16899,6 @@ fn rpc_help(method: &str) -> String {
             "Mining",
             "Network",
             "Rawtransactions",
-            "Stats",
             "Util",
         ]
         .into_iter()
@@ -19593,8 +19602,8 @@ mod tests {
             br#"{"jsonrpc":"2.1","method":"getblockcount","id":9}"#.as_slice(),
         ] {
             let response = dispatch_json_rpc(&node, request).await.unwrap();
-            assert_eq!(response["result"], json!(0));
-            assert_eq!(response["error"], Value::Null);
+            assert_eq!(response["result"], Value::Null);
+            assert_eq!(response["error"]["code"], json!(-32600));
             assert!(response.get("jsonrpc").is_none());
         }
     }
@@ -23648,13 +23657,7 @@ mod tests {
         let localservices = dispatch_method(&node, "getnetworkinfo", &json!([])).unwrap();
         assert_eq!(
             localservices["localservicesnames"],
-            json!([
-                "NETWORK",
-                "WITNESS",
-                "COMPACT_FILTERS",
-                "NETWORK_LIMITED",
-                "REDUCED_DATA?"
-            ])
+            json!(["NETWORK", "WITNESS", "COMPACT_FILTERS", "NETWORK_LIMITED"])
         );
         Arc::get_mut(&mut node)
             .unwrap()

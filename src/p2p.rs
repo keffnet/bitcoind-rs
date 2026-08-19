@@ -4879,13 +4879,14 @@ async fn serve_peer_loop(
                 }
                 if !node.admit_non_reduced_outbound(peer_id, version.services) {
                     let count = node.non_reduced_outbound_count();
+                    let max_stale_outbound = node.config.max_stale_outbound().unwrap_or_default();
                     debug!(
                         "peer lacks NODE_REDUCED_DATA and already have {count} non-BIP110 outbound peers (limit {}), peer={peer_id}",
-                        node.config.max_stale_outbound()
+                        max_stale_outbound
                     );
                     anyhow::bail!(
                         "peer lacks NODE_REDUCED_DATA and already have {count} non-BIP110 outbound peers (limit {})",
-                        node.config.max_stale_outbound()
+                        max_stale_outbound
                     );
                 }
                 if private_broadcast_version {

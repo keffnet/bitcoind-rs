@@ -588,9 +588,7 @@ impl PeerPermissions {
             | Self::FORCE_RELAY.0
             | Self::NO_BAN.0
             | Self::MEMPOOL.0
-            | Self::ADDR.0
-            | Self::BLOCK_FILTERS.0
-            | Self::FORCE_INBOUND.0,
+            | Self::ADDR.0,
     );
 
     pub const fn empty() -> Self {
@@ -687,10 +685,7 @@ impl PeerPermissions {
         if whitelist_relay {
             resolved = resolved.union(Self::RELAY);
         }
-        resolved
-            .union(Self::MEMPOOL)
-            .union(Self::NO_BAN)
-            .union(Self::ADDR)
+        resolved.union(Self::MEMPOOL).union(Self::NO_BAN)
     }
 }
 
@@ -1796,10 +1791,11 @@ pub struct Args {
     #[arg(long = "bantime", default_value_t = DEFAULT_BAN_TIME_SECS)]
     pub ban_time: u64,
 
-    /// Maximum automatic outbound peers that do not advertise
-    /// NODE_REDUCED_DATA. Manual connections are exempt, matching Core.
-    #[arg(long = "maxstaleoutbound", default_value_t = DEFAULT_MAX_STALE_OUTBOUND)]
-    pub max_stale_outbound: i64,
+    /// Optional project-specific limit for automatic outbound peers that do
+    /// not advertise NODE_REDUCED_DATA. Disabled by default for Core peer
+    /// compatibility; manual connections are exempt when enabled.
+    #[arg(long = "maxstaleoutbound", value_name = "N")]
+    pub max_stale_outbound: Option<i64>,
 
     /// Maximum per-peer receive socket buffer in units of 1000 bytes.
     #[arg(long = "maxreceivebuffer", default_value_t = DEFAULT_MAX_RECEIVE_BUFFER_KB)]
@@ -3183,7 +3179,7 @@ pub struct Config {
     pub deployment_parameters: Option<DeploymentParameters>,
     pub max_peers: usize,
     #[cfg(not(test))]
-    pub max_stale_outbound: usize,
+    pub max_stale_outbound: Option<usize>,
     pub max_receive_buffer: u32,
     pub max_send_buffer: u32,
     pub max_upload_target: u64,
@@ -3333,10 +3329,10 @@ fn parse_truc_policy(value: Option<&str>) -> Result<TrucPolicy> {
 }
 
 impl Config {
-    pub(crate) fn max_stale_outbound(&self) -> usize {
+    pub(crate) fn max_stale_outbound(&self) -> Option<usize> {
         #[cfg(test)]
         {
-            DEFAULT_MAX_STALE_OUTBOUND as usize
+            Some(DEFAULT_MAX_STALE_OUTBOUND as usize)
         }
         #[cfg(not(test))]
         {
@@ -3774,24 +3770,6 @@ impl Config {
             args.whitelistforcerelay,
             args.blocksonly,
         )?;
-        let mut peer_permissions = peer_permissions;
-        // Core enables bloom-filter permission for localhost by default when
-        // -peerbloomfilters was not specified. An explicit false disables
-        // even that localhost exception.
-        if args.peer_bloom_filters.is_none() {
-            peer_permissions.whitelist.push(WhitelistRule {
-                subnet: WhitelistSubnet::parse("127.0.0.0/8")?,
-                permissions: PeerPermissions::BLOOM_FILTER,
-                incoming: true,
-                outgoing: true,
-            });
-            peer_permissions.whitelist.push(WhitelistRule {
-                subnet: WhitelistSubnet::parse("::1/128")?,
-                permissions: PeerPermissions::BLOOM_FILTER,
-                incoming: true,
-                outgoing: true,
-            });
-        }
         let mut seen_bindings = HashSet::new();
         for address in p2p_binds
             .iter()
@@ -4134,7 +4112,9 @@ impl Config {
             deployment_parameters: Some(deployment_parameters),
             max_peers: args.max_peers,
             #[cfg(not(test))]
-            max_stale_outbound: args.max_stale_outbound.clamp(0, i64::from(u32::MAX)) as usize,
+            max_stale_outbound: args
+                .max_stale_outbound
+                .map(|value| value.clamp(0, i64::from(u32::MAX)) as usize),
             max_receive_buffer,
             max_send_buffer,
             max_upload_target,

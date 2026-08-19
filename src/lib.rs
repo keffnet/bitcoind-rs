@@ -1720,10 +1720,8 @@ pub struct Node {
     /// stale between reading the active tip and connecting the mined block.
     pub(crate) mining_lock: Mutex<()>,
     pub peer_count: AtomicUsize,
-    /// Number of automatic outbound peers that completed admission without
-    /// advertising NODE_REDUCED_DATA. Core limits this class separately from
-    /// the ordinary connection count because these peers may follow stale
-    /// consensus rules.
+    /// Number of automatic outbound peers admitted under the optional
+    /// NODE_REDUCED_DATA compatibility policy.
     non_reduced_outbound_count: AtomicUsize,
     mempool_check_operations: AtomicUsize,
     block_index_check_operations: AtomicUsize,
@@ -4019,13 +4017,17 @@ impl Node {
         self.non_reduced_outbound_count.load(Ordering::Acquire)
     }
 
-    /// Admit an automatic outbound peer that lacks NODE_REDUCED_DATA.
+    /// Admit an automatic outbound peer under the optional reduced-data
+    /// compatibility policy.
     ///
     /// The peer table write lock covers the counter reservation so a
     /// simultaneous disconnect cannot let two handshakes pass the limit.
     /// Manual connections and inbound/feeler/private-broadcast connections
-    /// are deliberately outside this Core limit.
+    /// are deliberately outside this project-specific limit.
     pub(crate) fn admit_non_reduced_outbound(&self, id: usize, services: u64) -> bool {
+        let Some(max_stale_outbound) = self.config.max_stale_outbound() else {
+            return true;
+        };
         let mut peers = self.peers.write();
         let Some(peer) = peers.get_mut(&id) else {
             return false;
@@ -4034,7 +4036,7 @@ impl Node {
             return true;
         }
         let count = self.non_reduced_outbound_count.load(Ordering::Acquire);
-        if count >= self.config.max_stale_outbound() {
+        if count >= max_stale_outbound {
             return false;
         }
         self.non_reduced_outbound_count
@@ -6471,9 +6473,7 @@ impl Node {
                     endpoint.clone(),
                     KnownNetworkAddress {
                         endpoint: endpoint.clone(),
-                        services: crate::wire::NODE_NETWORK
-                            | crate::wire::NODE_WITNESS
-                            | crate::wire::NODE_REDUCED_DATA,
+                        services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
                         time: now,
                     },
                 );
@@ -6555,9 +6555,7 @@ impl Node {
                 reported_local_address: None,
                 inbound: false,
                 version: None,
-                services: crate::wire::NODE_NETWORK
-                    | crate::wire::NODE_WITNESS
-                    | crate::wire::NODE_REDUCED_DATA,
+                services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
                 user_agent: String::new(),
                 start_height: 0,
                 relay_transactions: true,

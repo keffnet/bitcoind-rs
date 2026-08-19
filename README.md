@@ -81,7 +81,7 @@ Use `--asmap=<file>` to load Core's validated compressed IP-to-ASN map (relative
 
 `--seednode=<host[:port]>` opens a one-shot address-fetch connection during startup; `--connect` takes precedence, matching Core's manual-connection modes.
 
-Use `--txindex` to enable confirmed transaction lookup without supplying a block hash to `getrawtransaction`; Core-style pruning and `--txindex` are mutually exclusive.
+Use `--txindex` to enable confirmed transaction lookup without supplying a block hash to `getrawtransaction`; Core-style pruning and `--txindex` are mutually exclusive. The native `indexes/txindex/txindex.dat` sidecar stores only block-keyed transaction IDs, so restart does not need to decode every block body and no Core block-index database is created.
 
 Use `--blocksdir=<path>` to place the append-only block and undo records outside the data directory; relative paths are resolved beneath `--datadir`, while chainstate and indexes remain in the data directory. An explicitly supplied blocks directory must already exist, matching Core.
 Block and undo payloads use Zstandard compression level 6 by default when it reduces size, independently per record, and are then optionally obfuscated with Core-style 8-byte cyclic XOR; `--blocksxor=false` keeps the compressed store clear. A fresh blocks directory receives a random key in `xor.dat`, while an existing clear directory receives a zero key. Disabling XOR after a nonzero key has been stored is rejected.
@@ -114,7 +114,7 @@ Relay policy follows Core's fee and standardness switches: `--minrelaytxfee` and
 
 `--blockfilterindex=basic` enables the BIP157 basic compact-filter index, its RPC/REST methods, and compact-filter P2P service; it is disabled by default, matching Core.
 
-`--reindex` and `--reindex-chainstate` rebuild this implementation's chain metadata and UTXO state from the durable block store on startup. The rebuild ignores the existing binary or legacy JSON chainstate/snapshot files and preserves the stored block records. When `--txindex` is enabled, either mode also reconstructs side-chain transaction locations from the native block records.
+`--reindex` and `--reindex-chainstate` rebuild this implementation's chain metadata and UTXO state from the durable block store on startup. The rebuild ignores the existing binary or legacy JSON chainstate/snapshot files and preserves the stored block records. When `--txindex` is enabled, either mode also reconstructs side-chain transaction locations from the native block records and refreshes the compact txid sidecar.
 
 `--loadblock=<path>` imports one or more Core-style network-magic/length-framed block files at startup; each block still passes normal header, consensus, and chain-selection validation.
 `--stopafterblockimport` requests clean shutdown after startup block-file import, matching Core's debug/test option.

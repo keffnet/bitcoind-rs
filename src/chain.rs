@@ -34,7 +34,8 @@ use crate::config::{
 use crate::muhash::MuHash3072;
 use crate::storage::{
     BlockStore, BlockStoreReader, ChainstateStore, CoinStatsRecord, CoinStatsStore,
-    ElectrumBlockStore, ElectrumHistoryStore, FilterStore, StoredUtxo, UtxoStore,
+    ElectrumBlockStore, ElectrumHistoryStore, FilterStore, StoredUtxo, TransactionIndexStore,
+    UtxoStore,
 };
 use crate::validation::{self, ValidationError};
 
@@ -881,6 +882,7 @@ pub struct ChainState {
     electrum_history_store: ElectrumHistoryStore,
     blockfilter_index_enabled: bool,
     tx_index_all_enabled: bool,
+    tx_index_store: Option<TransactionIndexStore>,
     coinstats_store: CoinStatsStore,
     txospender_index_enabled: bool,
     coinstats_index_enabled: bool,
@@ -1305,6 +1307,9 @@ impl ChainState {
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
         let mut store = BlockStore::open_with_xor(&blocks_dir, blocks_xor)?;
         let filter_store = FilterStore::open(data_dir.join("filters"))?;
+        let tx_index_store = tx_index_all_enabled
+            .then(|| TransactionIndexStore::open(data_dir.join("indexes/txindex")))
+            .transpose()?;
         let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
         let genesis = genesis_block(network);
         let genesis_hash = genesis.block_hash();
@@ -1537,6 +1542,7 @@ impl ChainState {
             electrum_history_store,
             blockfilter_index_enabled,
             tx_index_all_enabled,
+            tx_index_store,
             coinstats_store,
             txospender_index_enabled: false,
             coinstats_index_enabled: false,
@@ -1607,14 +1613,14 @@ impl ChainState {
         if rebuild_chainstate {
             state.initialize_genesis(&genesis)?;
             state.index_persisted_headers(&persisted_headers)?;
-            state.rebuild_block_index()?;
+            state.rebuild_block_index(false)?;
             // The optional Core-style txindex is independent of the active
             // chainstate.  Reindexing deliberately removes the snapshot that
             // normally carries this map, so rebuild it from the native block
             // records before replaying the selected best chain.  This keeps
             // side-chain getrawtransaction lookups intact without creating a
             // Core block-index or blk*/rev* storage file.
-            state.rebuild_transaction_index()?;
+            state.rebuild_transaction_index(true)?;
             let best = state
                 .best_valid_tip_hash()
                 .context("reindex found no valid chain tip")?;
@@ -1729,7 +1735,7 @@ impl ChainState {
             state.remove_snapshot_provenance_file()?;
         }
         state.index_persisted_headers(&persisted_headers)?;
-        state.rebuild_block_index()?;
+        state.rebuild_block_index(true)?;
         state.initialize_block_sequence_ids_after_load();
         if state
             .active_chain
@@ -5554,6 +5560,7 @@ impl ChainState {
             }
             self.index_active_transactions(&block, node.height);
             self.index_all_transactions(&block, node.height);
+            self.persist_transaction_index_for_block(&block)?;
             let count =
                 u32::try_from(block.txdata.len()).context("transaction count does not fit u32")?;
             let height = usize::try_from(node.height).context("block height does not fit usize")?;
@@ -5698,6 +5705,7 @@ impl ChainState {
             self.assign_block_sequence_id(hash);
             if chain_work > self.tip().work {
                 self.store.flush()?;
+                self.flush_transaction_index_store()?;
                 if let Some(store) = self.electrum_store.as_mut() {
                     store.flush()?;
                 }
@@ -5851,6 +5859,7 @@ impl ChainState {
         self.assign_block_sequence_id(hash);
         if chain_work > self.tip().work {
             self.store.flush()?;
+            self.flush_transaction_index_store()?;
             if let Some(store) = self.electrum_store.as_mut() {
                 store.flush()?;
             }
@@ -5864,6 +5873,7 @@ impl ChainState {
 
     fn insert_side_chain_body(&mut self, block: &Block) -> Result<()> {
         self.store.insert_unsynced(block)?;
+        self.persist_transaction_index_for_block_unsynced(block)?;
         if self.prune_height.is_some() {
             self.prune_protected_blocks
                 .insert(block.block_hash(), self.height());
@@ -6803,6 +6813,9 @@ impl ChainState {
             }
         }
         if persist {
+            self.persist_transaction_index_for_block(block)?;
+        }
+        if persist {
             let additions = created_utxos
                 .iter()
                 .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
@@ -6965,6 +6978,7 @@ impl ChainState {
         );
         self.assign_header_sequence_id(genesis.block_hash());
         self.index_transactions(genesis, 0);
+        self.persist_transaction_index_for_block(genesis)?;
         self.cache_basic_filter_for_block(genesis, &[], &FilterHeader::all_zeros())?;
         self.remember_block_undo(genesis.block_hash(), vec![Vec::new()]);
         self.store
@@ -6989,15 +7003,15 @@ impl ChainState {
         Ok(())
     }
 
-    fn rebuild_block_index(&mut self) -> Result<()> {
+    fn rebuild_block_index(&mut self, rebuild_tx_index: bool) -> Result<()> {
         let hashes: Vec<BlockHash> = self.store.hashes().copied().collect();
         let mut blocks = Vec::new();
-        for hash in hashes {
-            if self.block_index.contains_key(&hash) {
+        for hash in &hashes {
+            if self.block_index.contains_key(hash) {
                 continue;
             }
-            if let Some(block) = self.store.get(&hash)? {
-                blocks.push((hash, block));
+            if let Some(block) = self.store.get(hash)? {
+                blocks.push((*hash, block));
             }
         }
         for _ in 0..blocks.len() {
@@ -7026,19 +7040,30 @@ impl ChainState {
             }
         }
         for (hash, block) in blocks {
-            if let Some(node) = self.block_index.get(&hash).copied() {
-                self.index_all_transactions(&block, node.height);
-            } else {
+            if !self.block_index.contains_key(&hash) {
                 let _ = self.queue_orphan_block(block.header.prev_blockhash, block);
             }
+        }
+        if rebuild_tx_index
+            && self.tx_index_all_enabled
+            && !self.restore_transaction_index(&hashes)?
+        {
+            self.rebuild_transaction_index(false)?;
         }
         Ok(())
     }
 
-    fn rebuild_transaction_index(&mut self) -> Result<()> {
+    fn rebuild_transaction_index(&mut self, clear_existing: bool) -> Result<()> {
         if !self.tx_index_all_enabled {
             return Ok(());
         }
+        if clear_existing {
+            self.tx_index_all.clear();
+        }
+        self.tx_index_store
+            .as_mut()
+            .context("transaction index store is not initialized")?
+            .clear()?;
         let mut hashes: Vec<BlockHash> = self.store.hashes().copied().collect();
         hashes.sort_by_key(|hash| {
             self.block_index
@@ -7046,7 +7071,6 @@ impl ChainState {
                 .map(|node| (node.height, hash.to_string()))
                 .unwrap_or((u32::MAX, hash.to_string()))
         });
-        self.tx_index_all.clear();
         for hash in hashes {
             let Some(node) = self.block_index.get(&hash).copied() else {
                 continue;
@@ -7054,9 +7078,62 @@ impl ChainState {
             let Some(block) = self.store.get(&hash)? else {
                 continue;
             };
-            self.index_all_transactions(&block, node.height);
+            self.index_all_transactions_from_rebuild(&block, node.height);
+            self.persist_transaction_index_for_block_unsynced(&block)?;
         }
+        self.flush_transaction_index_store()?;
         Ok(())
+    }
+
+    fn restore_transaction_index(&mut self, hashes: &[BlockHash]) -> Result<bool> {
+        if !self.tx_index_all_enabled {
+            return Ok(true);
+        }
+        let Some(store) = self.tx_index_store.as_mut() else {
+            return Ok(false);
+        };
+        let stored_hashes: HashSet<BlockHash> = store.hashes().copied().collect();
+        if stored_hashes
+            .iter()
+            .any(|hash| !self.block_index.contains_key(hash))
+            || hashes.iter().any(|hash| !stored_hashes.contains(hash))
+        {
+            return Ok(false);
+        }
+
+        let mut ordered = hashes.to_vec();
+        ordered.sort_by_key(|hash| {
+            self.block_index
+                .get(hash)
+                .map(|node| (node.height, hash.to_string()))
+                .unwrap_or((u32::MAX, hash.to_string()))
+        });
+        let mut entries = Vec::with_capacity(ordered.len());
+        for hash in ordered {
+            let Some(txids) = (match store.get(&hash) {
+                Ok(txids) => txids,
+                Err(_) => return Ok(false),
+            }) else {
+                return Ok(false);
+            };
+            let Some(node) = self.block_index.get(&hash).copied() else {
+                return Ok(false);
+            };
+            entries.push((hash, node.height, txids));
+        }
+        for (block_hash, height, txids) in entries {
+            for (transaction_index, txid) in txids.into_iter().enumerate() {
+                self.index_latest_transaction_location(
+                    txid,
+                    TxLocation {
+                        block_hash,
+                        height,
+                        transaction_index,
+                    },
+                );
+            }
+        }
+        Ok(true)
     }
 
     fn rebuild_coinstats_index(&mut self) -> Result<()> {
@@ -7950,6 +8027,78 @@ impl ChainState {
                 },
             );
         }
+    }
+
+    fn index_all_transactions_from_rebuild(&mut self, block: &Block, height: u32) {
+        if !self.tx_index_all_enabled {
+            return;
+        }
+        for (transaction_index, transaction) in block.txdata.iter().enumerate() {
+            self.index_latest_transaction_location(
+                transaction.compute_txid(),
+                TxLocation {
+                    block_hash: block.block_hash(),
+                    height,
+                    transaction_index,
+                },
+            );
+        }
+    }
+
+    fn index_latest_transaction_location(&mut self, txid: Txid, location: TxLocation) {
+        let should_replace = self.tx_index_all.get(&txid).is_none_or(|current| {
+            (
+                location.height,
+                location.block_hash.to_string(),
+                location.transaction_index,
+            ) >= (
+                current.height,
+                current.block_hash.to_string(),
+                current.transaction_index,
+            )
+        });
+        if should_replace {
+            self.tx_index_all.insert(txid, location);
+        }
+    }
+
+    fn persist_transaction_index_for_block(&mut self, block: &Block) -> Result<()> {
+        self.persist_transaction_index_for_block_with_sync(block, true)
+    }
+
+    fn persist_transaction_index_for_block_unsynced(&mut self, block: &Block) -> Result<()> {
+        self.persist_transaction_index_for_block_with_sync(block, false)
+    }
+
+    fn persist_transaction_index_for_block_with_sync(
+        &mut self,
+        block: &Block,
+        sync: bool,
+    ) -> Result<()> {
+        if !self.tx_index_all_enabled {
+            return Ok(());
+        }
+        let txids = block
+            .txdata
+            .iter()
+            .map(Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        let store = self
+            .tx_index_store
+            .as_mut()
+            .context("transaction index store is not initialized")?;
+        if sync {
+            store.insert(block.block_hash(), &txids)
+        } else {
+            store.insert_unsynced(block.block_hash(), &txids)
+        }
+    }
+
+    fn flush_transaction_index_store(&mut self) -> Result<()> {
+        if let Some(store) = self.tx_index_store.as_mut() {
+            store.flush()?;
+        }
+        Ok(())
     }
 
     fn index_active_transactions(&mut self, block: &Block, height: u32) {
@@ -9233,6 +9382,7 @@ fn open_background_replay_state(
         electrum_history_store,
         blockfilter_index_enabled: false,
         tx_index_all_enabled: false,
+        tx_index_store: None,
         coinstats_store,
         txospender_index_enabled: false,
         coinstats_index_enabled: false,
@@ -10662,7 +10812,26 @@ mod tests {
         state.connect_block(side).unwrap();
         state.persist_metadata().unwrap();
         assert!(state.transaction(&side_txid).unwrap().is_some());
+        assert!(
+            directory
+                .path()
+                .join("indexes/txindex/txindex.dat")
+                .exists()
+        );
         drop(state);
+
+        let mut reopened = ChainState::open_with_options_and_tx_index(
+            Network::Regtest,
+            directory.path(),
+            None,
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(reopened.transaction(&side_txid).unwrap().is_some());
+        drop(reopened);
 
         let mut rebuilt = ChainState::open_with_options_and_tx_index(
             Network::Regtest,

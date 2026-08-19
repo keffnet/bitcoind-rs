@@ -31,6 +31,7 @@ const MAX_STORED_FILTER_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_CHAINSTATE_DELTA_SIZE: usize = 64 * 1024 * 1024;
 const MAX_STORED_ELECTRUM_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_ELECTRUM_HISTORY_SIZE: usize = 4 * 1024 * 1024;
+const MAX_STORED_TRANSACTION_INDEX_SIZE: usize = 8 * 1024 * 1024;
 const MAX_STORED_UTXO_SIZE: usize = 100 * 1024;
 const MIN_UTXO_COMPACTION_DATA_SIZE: u64 = 16 * 1024 * 1024;
 const MIN_UTXO_COMPACTION_STALE_SIZE: u64 = 8 * 1024 * 1024;
@@ -1100,6 +1101,20 @@ const MAX_STORED_COINSTATS_SIZE: usize = 4 * 1024;
 
 /// Durable coinstats records keyed by block hash.
 pub struct CoinStatsStore {
+    path: PathBuf,
+    file: File,
+    index_file: File,
+    index: HashMap<BlockHash, Record>,
+}
+
+/// Durable transaction-ID lists keyed by block hash.
+///
+/// The optional Core-style txindex needs a transaction location for every
+/// stored block, but it does not need to duplicate transaction bodies. Keeping
+/// only the txids in a separate native sidecar lets a normal restart rebuild
+/// the in-memory location map without decoding every block record. The block
+/// store remains authoritative for the transaction bytes.
+pub struct TransactionIndexStore {
     path: PathBuf,
     file: File,
     index_file: File,
@@ -3180,6 +3195,169 @@ impl CoinStatsStore {
     }
 }
 
+impl TransactionIndexStore {
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        let directory = directory.as_ref();
+        create_dir_all(directory).with_context(|| {
+            format!(
+                "creating transaction index directory {}",
+                directory.display()
+            )
+        })?;
+        let path = directory.join("txindex.dat");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening transaction index store {}", path.display()))?;
+        let index_path = directory.join("txindex.index");
+        let mut index_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&index_path)
+            .with_context(|| format!("opening transaction index {}", index_path.display()))?;
+        let data_len = file.metadata()?.len();
+        let index = match load_index_with_limit(
+            &mut index_file,
+            data_len,
+            MAX_STORED_TRANSACTION_INDEX_SIZE,
+        )? {
+            Some(index) => index,
+            None => {
+                let index = scan_transaction_index(&mut file)?;
+                rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
+                index
+            }
+        };
+        Ok(Self {
+            path,
+            file,
+            index_file,
+            index,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
+    pub fn contains(&self, hash: &BlockHash) -> bool {
+        self.index.contains_key(hash)
+    }
+
+    pub fn hashes(&self) -> impl Iterator<Item = &BlockHash> {
+        self.index.keys()
+    }
+
+    pub fn disk_usage(&self) -> Result<u64> {
+        self.file
+            .metadata()?
+            .len()
+            .checked_add(self.index_file.metadata()?.len())
+            .context("transaction index store size overflowed")
+    }
+
+    pub fn get(&mut self, hash: &BlockHash) -> Result<Option<Vec<Txid>>> {
+        let Some(record) = self.index.get(hash).copied() else {
+            return Ok(None);
+        };
+        let bytes = read_storage_record(
+            &self.file,
+            record,
+            XorKey::default(),
+            MAX_STORED_TRANSACTION_INDEX_SIZE,
+            "transaction index",
+        )?;
+        let (stored_hash, txids) = decode_transaction_index_value(&bytes)?;
+        if stored_hash != *hash {
+            bail!("stored transaction index hash does not match its index");
+        }
+        Ok(Some(txids))
+    }
+
+    pub fn insert(&mut self, hash: BlockHash, txids: &[Txid]) -> Result<()> {
+        self.insert_with_sync(hash, txids, true)
+    }
+
+    /// Append a transaction-ID record without forcing a filesystem sync.
+    /// Block relay batches side-chain bodies this way; the owning chainstate
+    /// flushes the sidecar when the corresponding block store is flushed.
+    pub fn insert_unsynced(&mut self, hash: BlockHash, txids: &[Txid]) -> Result<()> {
+        self.insert_with_sync(hash, txids, false)
+    }
+
+    fn insert_with_sync(&mut self, hash: BlockHash, txids: &[Txid], sync: bool) -> Result<()> {
+        if self.index.contains_key(&hash) {
+            return Ok(());
+        }
+        let count = u32::try_from(txids.len()).context("transaction index count is too large")?;
+        let txid_bytes = txids
+            .len()
+            .checked_mul(32)
+            .context("transaction index size overflowed")?;
+        let raw_len = 32usize
+            .checked_add(4)
+            .and_then(|len| len.checked_add(txid_bytes))
+            .context("transaction index size overflowed")?;
+        let mut raw = Vec::with_capacity(raw_len);
+        raw.extend_from_slice(&hash.to_byte_array());
+        raw.extend_from_slice(&count.to_le_bytes());
+        for txid in txids {
+            raw.extend_from_slice(&txid.to_byte_array());
+        }
+        let bytes = encode_storage_payload(&raw, MAX_STORED_TRANSACTION_INDEX_SIZE)?;
+        let offset = self.file.seek(SeekFrom::End(0))?;
+        let length = u32::try_from(bytes.len()).context("transaction index record is too large")?;
+        self.file.write_all(&length.to_le_bytes())?;
+        self.file.write_all(&bytes)?;
+        let record = Record { offset, length };
+        if sync {
+            self.file.sync_data()?;
+        }
+        persist_index_entry_with_sync(
+            &mut self.index_file,
+            offset + 4 + bytes.len() as u64,
+            hash,
+            record,
+            sync,
+        )?;
+        self.index.insert(hash, record);
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        self.index_file.sync_data()?;
+        Ok(())
+    }
+
+    /// Remove all sidecar records before a full txindex rebuild.
+    pub fn clear(&mut self) -> Result<()> {
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.file.sync_data()?;
+        self.index.clear();
+        rewrite_index(&mut self.index_file, 0, &self.index)
+    }
+}
+
+impl Drop for TransactionIndexStore {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
 /// Durable transaction bodies retained for the in-process Electrum service.
 ///
 /// The normal block store may prune old block bodies, but Electrum clients
@@ -3530,6 +3708,89 @@ fn scan_coinstats_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
             .is_some()
         {
             bail!("duplicate block hash in coinstats store");
+        }
+    }
+    file.seek(SeekFrom::End(0))?;
+    Ok(index)
+}
+
+fn decode_transaction_index_value(bytes: &[u8]) -> Result<(BlockHash, Vec<Txid>)> {
+    if bytes.len() < 32 + 4 {
+        bail!("transaction index record is truncated");
+    }
+    let hash = BlockHash::from_byte_array(
+        bytes[..32]
+            .try_into()
+            .expect("transaction index block hash has fixed width"),
+    );
+    let count = usize::try_from(u32::from_le_bytes(
+        bytes[32..36]
+            .try_into()
+            .expect("transaction index count has fixed width"),
+    ))
+    .context("transaction index count does not fit usize")?;
+    let txid_bytes = count
+        .checked_mul(32)
+        .context("transaction index count overflows its record")?;
+    let expected_len = 36usize
+        .checked_add(txid_bytes)
+        .context("transaction index record length overflowed")?;
+    if expected_len != bytes.len() {
+        bail!("transaction index count does not match record length");
+    }
+    let mut txids = Vec::with_capacity(count);
+    for chunk in bytes[36..].chunks_exact(32) {
+        txids.push(Txid::from_byte_array(
+            chunk
+                .try_into()
+                .expect("transaction index txid has fixed width"),
+        ));
+    }
+    Ok((hash, txids))
+}
+
+fn scan_transaction_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut index = HashMap::new();
+    let data_len = file.metadata()?.len();
+    loop {
+        let offset = file.stream_position()?;
+        let mut length_bytes = [0u8; 4];
+        match file.read_exact(&mut length_bytes) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                file.set_len(offset)?;
+                break;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let length = u32::from_le_bytes(length_bytes);
+        let end = offset.saturating_add(4).saturating_add(u64::from(length));
+        if end > data_len {
+            file.set_len(offset)?;
+            break;
+        }
+        if length == 0 || length as usize > MAX_STORED_TRANSACTION_INDEX_SIZE {
+            bail!(
+                "invalid transaction index record length {} at offset {}",
+                length,
+                offset
+            );
+        }
+        let mut encoded = vec![0u8; length as usize];
+        file.read_exact(&mut encoded).map_err(|error| {
+            anyhow::anyhow!(
+                "truncated transaction index record at offset {}: {}",
+                offset,
+                error
+            )
+        })?;
+        let bytes = decode_storage_payload(&encoded, MAX_STORED_TRANSACTION_INDEX_SIZE)
+            .context("decoding compressed transaction index record")?;
+        let (hash, _) = decode_transaction_index_value(&bytes)
+            .with_context(|| format!("decoding transaction index record at offset {offset}"))?;
+        if index.insert(hash, Record { offset, length }).is_some() {
+            bail!("duplicate block hash in transaction index store");
         }
     }
     file.seek(SeekFrom::End(0))?;
@@ -3964,6 +4225,32 @@ mod tests {
             decode_storage_payload(&raw, MAX_STORED_BLOCK_SIZE).unwrap(),
             small
         );
+    }
+
+    #[test]
+    fn transaction_index_store_round_trips_txids_without_block_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_hash = BlockHash::from_byte_array([1u8; 32]);
+        let second_hash = BlockHash::from_byte_array([2u8; 32]);
+        let first_txids = vec![
+            Txid::from_byte_array([3u8; 32]),
+            Txid::from_byte_array([4u8; 32]),
+        ];
+        let second_txids = vec![Txid::from_byte_array([5u8; 32])];
+        {
+            let mut store = TransactionIndexStore::open(directory.path()).unwrap();
+            store.insert(first_hash, &first_txids).unwrap();
+            store.insert(second_hash, &second_txids).unwrap();
+            assert_eq!(store.len(), 2);
+            assert_eq!(store.get(&first_hash).unwrap(), Some(first_txids.clone()));
+            assert_eq!(store.get(&second_hash).unwrap(), Some(second_txids.clone()));
+        }
+
+        let mut reopened = TransactionIndexStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&first_hash).unwrap(), Some(first_txids));
+        assert_eq!(reopened.get(&second_hash).unwrap(), Some(second_txids));
+        reopened.clear().unwrap();
+        assert!(reopened.is_empty());
     }
 
     #[test]

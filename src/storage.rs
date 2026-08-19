@@ -4674,6 +4674,31 @@ mod tests {
     }
 
     #[test]
+    fn native_block_store_does_not_create_core_block_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let block = genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+
+        let mut store = BlockStore::open(directory.path()).unwrap();
+        store.insert(&block).unwrap();
+        store.insert_undo(hash, &[Vec::new()]).unwrap();
+        drop(store);
+
+        for name in ["blk00000.dat", "rev00000.dat"] {
+            assert!(
+                !directory.path().join(name).exists(),
+                "native storage must not create Core file {name}"
+            );
+        }
+        for name in ["blocks.dat", "blocks.index", "undo.dat", "undo.index"] {
+            assert!(
+                directory.path().join(name).exists(),
+                "missing native file {name}"
+            );
+        }
+    }
+
+    #[test]
     fn persists_and_recovers_xored_blocks_and_undo() {
         let directory = tempfile::tempdir().unwrap();
         let block = genesis_block(Network::Regtest);

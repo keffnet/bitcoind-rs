@@ -1601,8 +1601,7 @@ pub struct Args {
     pub rpc_whitelist: Vec<String>,
 
     /// Re-enable selected RPC fields deprecated by Core, such as the legacy
-    /// string-shaped `warnings` field. `startingheight` remains unconditional
-    /// in Core v31.1 and is accepted as a harmless compatibility value.
+    /// string-shaped `warnings` field and the optional `startingheight` field.
     #[arg(long = "deprecatedrpc", value_name = "METHOD", value_delimiter = ',')]
     pub deprecated_rpc: Vec<String>,
 

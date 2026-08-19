@@ -7760,14 +7760,14 @@ fn initialize_settings_file(path: &Path) -> Result<()> {
                     )
                 } else {
                     anyhow::anyhow!(
-                        "Settings file {} does not contain valid JSON. This is probably caused by disk corruption or a crash, and can be fixed by removing the file, which will reset settings to default values.",
+                        "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error",
                         path.display()
                     )
                 }
             })?;
         deserializer.end().map_err(|_error| {
             anyhow::anyhow!(
-                "Settings file {} does not contain valid JSON. This is probably caused by disk corruption or a crash, and can be fixed by removing the file, which will reset settings to default values.",
+                "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error",
                 path.display()
             )
         })?;

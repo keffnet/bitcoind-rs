@@ -394,8 +394,7 @@ impl BlockStore {
             .with_context(|| format!("creating block directory {}", directory.display()))?;
         let xor_key = init_xor_key(directory, use_xor)?;
         let path = directory.join("blocks.dat");
-        let block_file_read_only =
-            prefer_read_only_blocks && path.is_file() && std::fs::metadata(&path)?.len() != 0;
+        let block_file_read_only = prefer_read_only_blocks && path.is_file();
         let mut file = if block_file_read_only {
             OpenOptions::new().read(true).open(&path)
         } else {
@@ -4140,7 +4139,12 @@ fn scan_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash, Rec
         match file.read_exact(&mut length_bytes) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                file.set_len(offset)?;
+                // An exact EOF is already a clean tail. Reindex may have
+                // opened the existing block file read-only, so avoid asking
+                // the descriptor to truncate when there is nothing to trim.
+                if offset < data_len {
+                    file.set_len(offset)?;
+                }
                 break;
             }
             Err(error) => return Err(error.into()),
@@ -4908,7 +4912,10 @@ mod tests {
         let mut second = first.clone();
         second.header.nonce = 1;
         let mut third = first.clone();
-        third.header.nonce = 2;
+        third.header.nonce = 3;
+        assert_ne!(first.block_hash(), second.block_hash());
+        assert_ne!(first.block_hash(), third.block_hash());
+        assert_ne!(second.block_hash(), third.block_hash());
         {
             let mut store = BlockStore::open(directory.path()).unwrap();
             store.insert(&first).unwrap();
@@ -4921,13 +4928,36 @@ mod tests {
         std::fs::set_permissions(&block_path, read_only).unwrap();
 
         let mut store = BlockStore::open_for_reindex_with_xor(directory.path(), false).unwrap();
+        assert!(store.block_file_read_only);
         assert_eq!(store.get(&first.block_hash()).unwrap(), Some(first));
         assert_eq!(store.get(&second.block_hash()).unwrap(), Some(second));
 
         let writable = std::fs::Permissions::from_mode(0o644);
         std::fs::set_permissions(&block_path, writable).unwrap();
         store.insert(&third).unwrap();
+        assert!(!store.block_file_read_only);
         assert_eq!(store.get(&third.block_hash()).unwrap(), Some(third));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reindex_opens_empty_read_only_block_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let block_path = directory.path().join("blocks.dat");
+        std::fs::write(&block_path, []).unwrap();
+        let mut read_only = std::fs::metadata(&block_path).unwrap().permissions();
+        read_only.set_mode(0o444);
+        std::fs::set_permissions(&block_path, read_only).unwrap();
+
+        let mut store = BlockStore::open_for_reindex_with_xor(directory.path(), false).unwrap();
+        assert!(store.block_file_read_only);
+
+        std::fs::set_permissions(&block_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let block = genesis_block(Network::Regtest);
+        store.insert(&block).unwrap();
+        assert_eq!(store.get(&block.block_hash()).unwrap(), Some(block));
     }
 
     #[test]

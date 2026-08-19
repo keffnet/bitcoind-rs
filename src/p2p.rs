@@ -286,6 +286,7 @@ const DNS_SEED_OUTBOUND_THRESHOLD: usize = 2;
 const DNS_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(11);
 const SEEDNODE_FALLBACK_DELAY: u64 = 10;
 const FIXED_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(60);
+const FEELER_INTERVAL: Duration = Duration::from_secs(2 * 60);
 /// Core keeps manually added connections in a separate, bounded pool rather
 /// than consuming automatic `-maxconnections` slots.
 const MAX_ADDNODE_CONNECTIONS: usize = 8;
@@ -1501,6 +1502,7 @@ struct OutboundContext {
     attempts: OutboundAttempts,
     automatic_full_attempts: Arc<AtomicUsize>,
     automatic_block_relay_attempts: Arc<AtomicUsize>,
+    automatic_feeler_attempts: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Debug)]
@@ -1893,6 +1895,7 @@ impl PeerManager {
             attempts: Arc::new(parking_lot::Mutex::new(HashSet::new())),
             automatic_full_attempts: Arc::new(AtomicUsize::new(0)),
             automatic_block_relay_attempts: Arc::new(AtomicUsize::new(0)),
+            automatic_feeler_attempts: Arc::new(AtomicUsize::new(0)),
         };
         let anchor_endpoints = self
             .node
@@ -2314,6 +2317,56 @@ impl PeerManager {
                 }
             });
         }
+        if !configured_connect_nodes {
+            let feeler_node = self.node.clone();
+            let feeler_outbound = outbound.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(FEELER_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = feeler_node.wait_for_shutdown() => break,
+                    }
+                    if !feeler_node.network_active()
+                        || feeler_outbound.slots.available_permits() == 0
+                        || feeler_outbound
+                            .automatic_feeler_attempts
+                            .load(Ordering::Acquire)
+                            != 0
+                    {
+                        continue;
+                    }
+                    let full_attempts = feeler_outbound
+                        .automatic_full_attempts
+                        .load(Ordering::Acquire);
+                    let block_relay_attempts = feeler_outbound
+                        .automatic_block_relay_attempts
+                        .load(Ordering::Acquire);
+                    if full_attempts < max_full_relay || block_relay_attempts < max_block_relay {
+                        continue;
+                    }
+                    let Some(endpoint) =
+                        select_discovery_endpoints(&feeler_node, 1, &feeler_outbound.attempts)
+                            .into_iter()
+                            .next()
+                    else {
+                        continue;
+                    };
+                    spawn_outbound_loop(
+                        feeler_node.clone(),
+                        endpoint,
+                        feeler_outbound.clone(),
+                        false,
+                        None,
+                        "feeler",
+                        false,
+                        false,
+                        None,
+                    );
+                }
+            });
+        }
         let dynamic_node = self.node.clone();
         let dynamic_outbound = outbound.clone();
         tokio::spawn(async move {
@@ -2666,12 +2719,14 @@ fn spawn_outbound_loop(
         attempts: outbound_attempts,
         automatic_full_attempts,
         automatic_block_relay_attempts,
+        automatic_feeler_attempts,
         ..
     } = outbound;
     let automatic_attempt_counter = if !manual && !addconnection {
         match connection_type {
             "outbound-full" => Some(automatic_full_attempts),
             "block-relay-only" => Some(automatic_block_relay_attempts),
+            "feeler" => Some(automatic_feeler_attempts),
             _ => None,
         }
     } else {

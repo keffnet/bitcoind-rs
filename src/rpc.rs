@@ -6161,7 +6161,11 @@ fn get_rpc_whitelist(node: &Arc<Node>, auth_user: Option<&str>) -> Result<Value>
     } else if node.config.rpc_whitelist_default {
         Vec::new()
     } else {
-        rpc_help("").lines().map(ToOwned::to_owned).collect()
+        rpc_help("")
+            .lines()
+            .filter(|line| !line.starts_with("==") && !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
     };
     let methods = methods
         .into_iter()
@@ -16778,144 +16782,179 @@ fn rpc_connection_type(connection_type: &str) -> &str {
 }
 
 fn rpc_help(method: &str) -> String {
-    const METHODS: &[&str] = &[
-        "getblockchaininfo",
-        "getdeploymentinfo",
-        "getblockcount",
-        "getbestblockhash",
-        "getblockhash",
-        "getblockheader",
-        "getblock",
-        "getblockfilter",
-        "getblocklocations",
-        "getblockstats",
-        "getblockfileinfo",
-        "getchaintxstats",
-        "getnetworkhashps",
-        "getmemoryinfo",
-        "gettxoutproof",
-        "verifytxoutproof",
-        "submitheader",
-        "getblockfrompeer",
-        "invalidateblock",
-        "reconsiderblock",
-        "preciousblock",
-        "getrawtransaction",
-        "decoderawtransaction",
-        "createrawtransaction",
-        "decodescript",
-        "combinerawtransaction",
-        "createpsbt",
-        "decodepsbt",
-        "converttopsbt",
-        "analyzepsbt",
-        "combinepsbt",
-        "joinpsbts",
-        "finalizepsbt",
-        "utxoupdatepsbt",
-        "descriptorprocesspsbt",
-        "signmessagewithprivkey",
-        "verifymessage",
-        "createmultisig",
-        "sendrawtransaction",
-        "getprivatebroadcastinfo",
-        "abortprivatebroadcast",
-        "signrawtransactionwithkey",
-        "submitblock",
-        "getblocktemplate",
-        "getmininginfo",
-        "prioritisetransaction",
-        "getprioritisedtransactions",
+    const CATEGORIES: &[(&str, &[&str])] = &[
+        (
+            "Blockchain",
+            &[
+                "dumptxoutset",
+                "getbestblockhash",
+                "getblock",
+                "getblockchaininfo",
+                "getblockcount",
+                "getblockfileinfo",
+                "getblockfilter",
+                "getblockfrompeer",
+                "getblockhash",
+                "getblockheader",
+                "getblocklocations",
+                "getblockstats",
+                "getchainstates",
+                "getchaintips",
+                "getchaintxstats",
+                "getdeploymentinfo",
+                "getdescriptoractivity",
+                "getdifficulty",
+                "getmempoolancestors",
+                "getmempoolcluster",
+                "getmempooldescendants",
+                "getmempoolentry",
+                "getmempoolinfo",
+                "getmempoolstats",
+                "getrawmempool",
+                "gettxout",
+                "gettxoutproof",
+                "gettxoutsetinfo",
+                "gettxspendingprevout",
+                "importmempool",
+                "listmempooltransactions",
+                "listprunelocks",
+                "loadtxoutset",
+                "maxmempool",
+                "preciousblock",
+                "pruneblockchain",
+                "scanblocks",
+                "scantxoutset",
+                "savemempool",
+                "setprunelock",
+                "verifychain",
+                "verifytxoutproof",
+                "waitforblock",
+                "waitforblockheight",
+                "waitfornewblock",
+            ],
+        ),
+        (
+            "Control",
+            &[
+                "format",
+                "getgeneralinfo",
+                "getmemoryinfo",
+                "getrpcinfo",
+                "getrpcwhitelist",
+                "help",
+                "logging",
+                "scriptthreadsinfo",
+                "setscriptthreadsenabled",
+                "stop",
+                "uptime",
+            ],
+        ),
+        (
+            "Mining",
+            &[
+                "getblocktemplate",
+                "getmininginfo",
+                "getnetworkhashps",
+                "getprioritisedtransactions",
+                "prioritisetransaction",
+                "submitblock",
+                "submitheader",
+            ],
+        ),
+        (
+            "Network",
+            &[
+                "addnode",
+                "clearbanned",
+                "disconnectnode",
+                "getaddednodeinfo",
+                "getaddrmaninfo",
+                "getconnectioncount",
+                "getnettotals",
+                "getnetworkinfo",
+                "getnodeaddresses",
+                "getpeerinfo",
+                "listbanned",
+                "ping",
+                "setban",
+                "setnetworkactive",
+            ],
+        ),
+        (
+            "Rawtransactions",
+            &[
+                "abortprivatebroadcast",
+                "analyzepsbt",
+                "combinepsbt",
+                "combinerawtransaction",
+                "converttopsbt",
+                "createpsbt",
+                "createrawtransaction",
+                "decodepsbt",
+                "decoderawtransaction",
+                "decodescript",
+                "descriptorprocesspsbt",
+                "finalizepsbt",
+                "getprivatebroadcastinfo",
+                "getrawtransaction",
+                "joinpsbts",
+                "sendrawtransaction",
+                "signrawtransactionwithkey",
+                "submitpackage",
+                "testmempoolaccept",
+                "utxoupdatepsbt",
+            ],
+        ),
+        (
+            "Util",
+            &[
+                "createmultisig",
+                "deriveaddresses",
+                "estimatesmartfee",
+                "getdescriptorinfo",
+                "getindexinfo",
+                "savefeeestimates",
+                "signmessagewithprivkey",
+                "validateaddress",
+                "verifymessage",
+            ],
+        ),
+        ("Zmq", &["getzmqnotifications"]),
+    ];
+    const HIDDEN_METHODS: &[&str] = &[
+        "addconnection",
+        "addpeeraddress",
+        "echo",
+        "echoipc",
+        "echojson",
+        "enumeratesigners",
+        "estimaterawfee",
+        "generate",
+        "generateblock",
         "generatetoaddress",
         "generatetodescriptor",
-        "generateblock",
-        "generate",
-        "submitpackage",
-        "testmempoolaccept",
-        "verifychain",
-        "gettxout",
-        "gettxspendingprevout",
-        "getmempoolinfo",
-        "getmempoolstats",
-        "listmempooltransactions",
-        "maxmempool",
-        "getrawmempool",
-        "getmempoolentry",
-        "getmempoolancestors",
-        "getmempooldescendants",
-        "getmempoolcluster",
         "getmempoolfeeratediagram",
-        "savemempool",
-        "importmempool",
-        "gettxoutsetinfo",
-        "dumptxoutset",
-        "loadtxoutset",
-        "pruneblockchain",
-        "listprunelocks",
-        "setprunelock",
-        "scriptthreadsinfo",
-        "setscriptthreadsenabled",
-        "waitfornewblock",
-        "waitforblock",
-        "waitforblockheight",
-        "scantxoutset",
-        "scanblocks",
-        "getdescriptoractivity",
-        "getchainstates",
-        "getchaintips",
-        "getnetworkinfo",
-        "getgeneralinfo",
-        "getpeerinfo",
-        "getnettotals",
-        "getnodeaddresses",
-        "getaddrmaninfo",
+        "getorphantxs",
+        "getrawaddrman",
+        "invalidateblock",
+        "mockscheduler",
+        "reconsiderblock",
         "sendmsgtopeer",
-        "addconnection",
-        "addnode",
-        "disconnectnode",
-        "getaddednodeinfo",
-        "setban",
-        "listbanned",
-        "clearbanned",
-        "ping",
-        "setnetworkactive",
-        "getrpcinfo",
-        "getrpcwhitelist",
-        "format",
-        "stop",
-        "estimatesmartfee",
-        "estimaterawfee",
-        "savefeeestimates",
-        "getdifficulty",
-        "getconnectioncount",
-        "uptime",
-        "getindexinfo",
-        "getzmqnotifications",
-        "logging",
-        "validateaddress",
-        "deriveaddresses",
-        "getdescriptorinfo",
-        "enumeratesigners",
+        "setmocktime",
+        "syncwithvalidationinterfacequeue",
     ];
+    let visible_method = CATEGORIES
+        .iter()
+        .any(|(_, methods)| methods.contains(&method));
+    let known_method = visible_method || HIDDEN_METHODS.contains(&method);
     if method.is_empty() {
         let mut result = String::new();
-        for (index, title) in [
-            "Blockchain",
-            "Control",
-            "Mining",
-            "Network",
-            "Rawtransactions",
-            "Util",
-            "Zmq",
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (index, (title, methods)) in CATEGORIES.iter().enumerate() {
             if index != 0 {
                 result.push('\n');
             }
             result.push_str(&format!("== {title} ==\n"));
-            result.push_str(&METHODS.join("\n"));
+            result.push_str(&methods.join("\n"));
         }
         result
     } else if method == "logging" {
@@ -16939,7 +16978,7 @@ fn rpc_help(method: &str) -> String {
         "getrawaddrman\n\nReturns raw address-manager entries.".to_owned()
     } else if method == "getorphantxs" {
         "getorphantxs\n\nReturns orphan transactions currently held by the node.".to_owned()
-    } else if METHODS.contains(&method) {
+    } else if known_method {
         format!("{method}\n\n{method}: wallet-free Bitcoin Core-compatible RPC")
     } else {
         format!("help: unknown command: {method}")
@@ -18965,6 +19004,24 @@ mod tests {
                 "Zmq",
             ]
         );
+        let command_lines = help
+            .lines()
+            .filter(|line| !line.starts_with("==") && !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            command_lines
+                .iter()
+                .filter(|line| **line == "getblockcount")
+                .count(),
+            1
+        );
+        assert!(command_lines.iter().any(|line| *line == "dumptxoutset"));
+        assert!(!command_lines.iter().any(|line| {
+            matches!(
+                *line,
+                "addconnection" | "generate" | "getmempoolfeeratediagram" | "getorphantxs"
+            )
+        }));
     }
 
     #[test]

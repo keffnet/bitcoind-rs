@@ -39,7 +39,10 @@ fn main() {
             .downcast_ref::<bitcoind_rs::CoreStartupError>()
             .is_some()
         {
-            eprintln!("{error}");
+            // Core routes the non-interactive recovery prompt through its
+            // message-box fallback, whose empty caption produces this
+            // leading ": " in stderr.
+            eprintln!(": {error}");
         } else {
             eprintln!("Error: {error}");
         }

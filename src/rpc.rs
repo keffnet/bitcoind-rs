@@ -800,6 +800,9 @@ fn dispatch_rest_with_body(
             "getmempoolinfo",
             &Value::Array(Vec::new()),
         )?),
+        "mempool/info/with_fee_histogram" if format == "json" => {
+            rest_json(dispatch_method(node, "getmempoolinfo", &json!([true]))?)
+        }
         "mempool/contents" if format == "json" => {
             let verbose = rest_query_bool(query, "verbose", true)?;
             let sequence = rest_query_bool(query, "mempool_sequence", false)?;
@@ -1739,25 +1742,15 @@ async fn dispatch_request(
         ));
     };
     let id = request.get("id").cloned().unwrap_or(Value::Null);
-    let json_rpc_2 = match request.get("jsonrpc") {
-        None | Some(Value::Null) => false,
-        Some(Value::String(value)) if value == "1.0" => false,
-        Some(Value::String(value)) if value == "2.0" => true,
-        Some(Value::String(_)) => {
-            return Some(json_rpc_invalid_request(
-                id,
-                false,
-                "JSON-RPC version not supported",
-            ));
-        }
-        Some(_) => {
-            return Some(json_rpc_invalid_request(
-                id,
-                false,
-                "jsonrpc field must be a string",
-            ));
-        }
-    };
+    // Core defaults to its legacy response format unless the request carries
+    // the exact JSON-RPC 2.0 marker.  In particular, it accepts numeric
+    // values and unrecognized strings as legacy requests for compatibility
+    // with older clients; JSONRPCRequest::parse in Core only promotes
+    // "2.0" to the v2 response format.
+    let json_rpc_2 = request
+        .get("jsonrpc")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "2.0");
     let is_notification = json_rpc_2 && !request_object.contains_key("id");
     let Some(method) = request_object.get("method").and_then(Value::as_str) else {
         if is_notification {
@@ -2054,6 +2047,7 @@ fn normalize_rpc_params(method: &str, params: &Value) -> Result<Value> {
 fn rpc_parameter_alias(method: &str, name: &str) -> Option<&'static str> {
     match (method, name) {
         ("getblock" | "getrawtransaction", "verbose") => Some("verbosity"),
+        ("getmempoolinfo", "with_fee_histogram") => Some("fee_histogram"),
         ("dumptxoutset", "rollback") => Some("options"),
         ("gettxspendingprevout", "mempool_only" | "return_spending_tx") => Some("options"),
         ("scanblocks", "filter_false_positives") => Some("options"),
@@ -2125,6 +2119,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "getmemoryinfo" => Some(&["mode"]),
         "gettxout" => Some(&["txid", "n", "include_mempool"]),
         "gettxspendingprevout" => Some(&["outputs", "options"]),
+        "getmempoolinfo" => Some(&["fee_histogram"]),
         "getrawmempool" => Some(&["verbose", "mempool_sequence"]),
         "listmempooltransactions" => Some(&["start_sequence", "verbose"]),
         "maxmempool" => Some(&["megabytes"]),
@@ -2174,7 +2169,6 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         | "getbestblockhash"
         | "getmininginfo"
         | "getprioritisedtransactions"
-        | "getmempoolinfo"
         | "getmempoolfeeratediagram"
         | "savemempool"
         | "getchainstates"
@@ -2354,6 +2348,7 @@ fn dispatch_method_for_user(
         "gettxout" => get_txout(node, params),
         "gettxspendingprevout" => get_tx_spending_prevout(node, params),
         "getmempoolinfo" => {
+            let histogram_floors = parse_mempool_histogram_floors(params)?;
             let mut mempool = node.mempool.write();
             let total_fee = mempool
                 .transaction_order()
@@ -2361,7 +2356,7 @@ fn dispatch_method_for_user(
                 .filter_map(|txid| mempool.get(&txid))
                 .map(|entry| entry.fee_sat)
                 .sum::<u64>();
-            Ok(json!({
+            let mut result = json!({
                 "loaded": true,
                 "size": mempool.len(),
                 "bytes": mempool.vbytes(),
@@ -2371,17 +2366,33 @@ fn dispatch_method_for_user(
                 "minrelaytxfee": sat_to_btc(mempool.min_relay_fee_sat_per_kvb()),
                 "unbroadcastcount": mempool.unbroadcast_txids().len(),
                 "incrementalrelayfee": sat_to_btc(mempool.incremental_relay_fee_sat_per_kvb()),
+                "dustrelayfee": sat_to_btc(mempool.dust_relay_fee_sat_per_kvb()),
+                // Dynamic dust adjustment is not enabled by this node yet;
+                // the static floor therefore equals the configured rate.
+                "dustrelayfeefloor": sat_to_btc(mempool.dust_relay_fee_sat_per_kvb()),
+                "dustdynamic": "off",
                 "total_fee": sat_to_btc(total_fee),
-                // Core 31.1 keeps this deprecated compatibility field
-                // unconditionally true, even when the configured replacement
-                // policy still requires BIP125 signaling.
-                "fullrbf": true,
+                "fullrbf": mempool.full_rbf(),
+                "rbf_policy": match mempool.rbf_policy() {
+                    crate::mempool::RbfPolicy::Never => "never",
+                    crate::mempool::RbfPolicy::OptIn => "optin",
+                    crate::mempool::RbfPolicy::Always => "always",
+                },
+                "truc_policy": match mempool.truc_policy() {
+                    crate::mempool::TrucPolicy::Reject => "reject",
+                    crate::mempool::TrucPolicy::Accept => "accept",
+                    crate::mempool::TrucPolicy::Enforce => "enforce",
+                },
                 "permitbaremultisig": mempool.permit_bare_multisig(),
                 "maxdatacarriersize": mempool.max_datacarrier_bytes().unwrap_or_default(),
                 "limitclustercount": mempool.cluster_count_limit(),
                 "limitclustersize": mempool.cluster_vsize_limit(),
                 "optimal": mempool.optimal(),
-            }))
+            });
+            if let Some(floors) = histogram_floors {
+                result["fee_histogram"] = mempool_fee_histogram(&mempool, &floors);
+            }
+            Ok(result)
         }
         "getrawmempool" => {
             let verbose = optional_bool(params, 0, false, "verbose")?;
@@ -2608,12 +2619,11 @@ fn dispatch_method_for_user(
                         "services": format!("{:016x}", peer.services),
                         "servicesnames": peer_services_names(peer.services),
                         "relaytxes": peer.relay_transactions,
-                        "last_inv_sequence": peer.last_inv_sequence,
-                        "inv_to_send": peer.inv_to_send,
                         "lastsend": peer.last_send,
                         "lastrecv": peer.last_recv,
                         "last_transaction": peer.last_transaction,
                         "last_block": peer.last_block,
+                        "last_block_announcement": peer.last_block_announcement,
                         "bytessent": peer.bytes_sent,
                         "bytesrecv": peer.bytes_received,
                         "conntime": peer.connected_at,
@@ -2642,6 +2652,8 @@ fn dispatch_method_for_user(
                         },
                         "transport_protocol_type": peer.transport_protocol_type,
                         "session_id": peer.session_id,
+                        "forced_inbound": false,
+                        "misbehavior_score": 0,
                     });
                     if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
                         info["mapped_as"] = json!(mapped_as);
@@ -13329,6 +13341,144 @@ fn get_mempool_fee_rate_diagram(node: &Arc<Node>) -> Result<Value> {
     Ok(Value::Array(diagram))
 }
 
+const DEFAULT_MEMPOOL_HISTOGRAM_FLOORS: &[u64] = &[
+    1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 17, 20, 25, 30, 40, 50, 60, 70, 80, 100, 120, 140, 170,
+    200, 250, 300, 400, 500, 600, 700, 800, 1_000, 1_200, 1_400, 1_700, 2_000, 2_500, 3_000, 4_000,
+    5_000, 6_000, 7_000, 8_000, 10_000,
+];
+
+fn parse_mempool_histogram_floors(params: &Value) -> Result<Option<Vec<u64>>> {
+    let params = params
+        .as_array()
+        .ok_or_else(|| anyhow!("Internal error: RPC parameters are not an array"))?;
+    if params.len() > 1 {
+        bail!("too many parameters")
+    }
+    let Some(value) = params.first() else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    if let Some(enabled) = value.as_bool() {
+        return Ok(enabled.then(|| DEFAULT_MEMPOOL_HISTOGRAM_FLOORS.to_vec()));
+    }
+    let floors = value
+        .as_array()
+        .ok_or_else(|| anyhow!("Invalid number of parameters"))?;
+    if floors.is_empty() {
+        bail!("Invalid number of parameters")
+    }
+    let mut parsed = Vec::with_capacity(floors.len());
+    for (index, floor) in floors.iter().enumerate() {
+        let floor = floor
+            .as_i64()
+            .or_else(|| floor.as_u64().and_then(|value| i64::try_from(value).ok()))
+            .ok_or_else(|| anyhow!("Histogram fee rates must be integers"))?;
+        if floor < 0 {
+            bail!("Non-negative values are expected")
+        }
+        let floor = u64::try_from(floor).expect("non-negative floor fits u64");
+        if index > 0 && parsed[index - 1] >= floor {
+            bail!("Strictly increasing values are expected")
+        }
+        parsed.push(floor);
+    }
+    Ok(Some(parsed))
+}
+
+fn mempool_package_metrics(mempool: &Mempool, txids: impl Iterator<Item = Txid>) -> (i128, u64) {
+    txids.fold((0i128, 0u64), |(fee, size), txid| {
+        let Some(entry) = mempool.get(&txid) else {
+            return (fee, size);
+        };
+        (
+            fee.saturating_add(mempool.modified_fee_sat_for(&txid, entry.fee_sat)),
+            size.saturating_add(entry.vsize),
+        )
+    })
+}
+
+fn mempool_fee_histogram(mempool: &Mempool, floors: &[u64]) -> Value {
+    let mut groups = vec![(0u64, 0u64, 0u64); floors.len()];
+    let mut total_fees = 0u64;
+    for txid in mempool.transaction_order() {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        total_fees = total_fees.saturating_add(entry.fee_sat);
+        let fee = mempool.modified_fee_sat_for(&txid, entry.fee_sat);
+        let size = entry.vsize.max(1);
+        let (ancestor_fee, ancestor_size) = mempool_package_metrics(
+            mempool,
+            mempool
+                .ancestors(&txid)
+                .into_iter()
+                .chain(std::iter::once(txid)),
+        );
+        let (descendant_fee, descendant_size) = mempool_package_metrics(
+            mempool,
+            std::iter::once(txid).chain(mempool.descendants(&txid)),
+        );
+        let fee_per_byte = fee / i128::from(size);
+        let ancestor_fee_per_byte = if ancestor_size == 0 {
+            0
+        } else {
+            ancestor_fee / i128::from(ancestor_size)
+        };
+        let descendant_fee_per_byte = if descendant_size == 0 {
+            0
+        } else {
+            descendant_fee / i128::from(descendant_size)
+        };
+        let combined_size = ancestor_size
+            .saturating_add(descendant_size)
+            .saturating_sub(size);
+        let combined_fee = ancestor_fee
+            .saturating_add(descendant_fee)
+            .saturating_sub(fee);
+        let combined_fee_per_byte = if combined_size == 0 {
+            0
+        } else {
+            combined_fee / i128::from(combined_size)
+        };
+        let fee_rate = std::cmp::max(
+            std::cmp::min(descendant_fee_per_byte, combined_fee_per_byte),
+            std::cmp::min(fee_per_byte, ancestor_fee_per_byte),
+        );
+        let Some(group_index) = floors
+            .iter()
+            .rposition(|floor| fee_rate >= i128::from(*floor))
+        else {
+            continue;
+        };
+        groups[group_index].0 = groups[group_index].0.saturating_add(size);
+        groups[group_index].1 = groups[group_index].1.saturating_add(1);
+        groups[group_index].2 = groups[group_index].2.saturating_add(entry.fee_sat);
+    }
+
+    let mut histogram = Map::new();
+    for (index, floor) in floors.iter().copied().enumerate() {
+        let (sizes, count, fees) = groups[index];
+        let to_feerate = floors
+            .get(index + 1)
+            .copied()
+            .map_or_else(|| json!(i64::MAX), |value| json!(value));
+        histogram.insert(
+            floor.to_string(),
+            json!({
+                "sizes": sizes,
+                "count": count,
+                "fees": fees,
+                "from_feerate": floor,
+                "to_feerate": to_feerate,
+            }),
+        );
+    }
+    histogram.insert("total_fees".to_owned(), json!(total_fees));
+    Value::Object(histogram)
+}
+
 fn mempool_entry_json(mempool: &Mempool, txid: &Txid) -> Result<Value> {
     let entry = mempool
         .get(txid)
@@ -19297,6 +19447,16 @@ mod tests {
             .unwrap();
         assert_eq!(legacy["result"], json!(0));
         assert_eq!(legacy["id"], Value::Null);
+
+        for request in [
+            br#"{"jsonrpc":1.0,"method":"getblockcount","id":8}"#.as_slice(),
+            br#"{"jsonrpc":"2.1","method":"getblockcount","id":9}"#.as_slice(),
+        ] {
+            let response = dispatch_json_rpc(&node, request).await.unwrap();
+            assert_eq!(response["result"], json!(0));
+            assert_eq!(response["error"], Value::Null);
+            assert!(response.get("jsonrpc").is_none());
+        }
     }
 
     #[test]
@@ -23758,7 +23918,6 @@ mod tests {
         node.update_peer_reported_local_address(7, Some("198.51.100.2:18444".parse().unwrap()));
         node.set_peer_transport_protocol(7, true);
         node.set_peer_session_id(7, Some("ab".repeat(32)));
-        node.set_peer_inv_to_send(7, 3);
         let peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(peer_info[0]["id"], json!(7));
         assert_eq!(
@@ -23777,7 +23936,6 @@ mod tests {
         assert_eq!(peer_info[0]["addrlocal"], json!("198.51.100.2:18444"));
         assert_eq!(peer_info[0]["transport_protocol_type"], json!("v2"));
         assert_eq!(peer_info[0]["session_id"], json!("ab".repeat(32)));
-        assert_eq!(peer_info[0]["inv_to_send"], json!(3));
         assert_eq!(peer_info[0]["startingheight"], json!(0));
         assert!(peer_info[0].get("pingtime").is_none());
         assert_eq!(peer_info[0]["synced_headers"], json!(-1));

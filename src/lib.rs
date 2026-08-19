@@ -1250,6 +1250,7 @@ pub struct PeerInfo {
     pub inv_to_send: usize,
     pub last_transaction: u64,
     pub last_block: u64,
+    pub last_block_announcement: u64,
     pub(crate) best_known_block: Option<BlockHash>,
     // Core keeps the latest block announcement that is not in the global
     // index yet.  Once another peer supplies the missing headers, the
@@ -4203,6 +4204,7 @@ impl Node {
         let Some(peer) = peers.get_mut(&peer_id) else {
             return;
         };
+        let active_work = chain.tip().work;
 
         let mut update_known = |candidate_hash: BlockHash, candidate_work| {
             let should_update = peer.best_known_block.is_none_or(|current| {
@@ -4212,6 +4214,9 @@ impl Node {
             });
             if should_update {
                 peer.best_known_block = Some(candidate_hash);
+                if candidate_work > active_work {
+                    peer.last_block_announcement = unix_time_seconds();
+                }
             }
         };
 
@@ -4247,6 +4252,7 @@ impl Node {
             peer.last_unknown_block = Some(unknown_hash);
             return;
         };
+        let active_work = chain.tip().work;
         let should_update = peer.best_known_block.is_none_or(|current| {
             chain
                 .chain_work_by_hash(&current)
@@ -4254,6 +4260,9 @@ impl Node {
         });
         if should_update {
             peer.best_known_block = Some(unknown_hash);
+            if unknown_work > active_work {
+                peer.last_block_announcement = unix_time_seconds();
+            }
         }
     }
 
@@ -5507,6 +5516,7 @@ impl Node {
             inv_to_send: 0,
             last_transaction: 0,
             last_block: 0,
+            last_block_announcement: 0,
             best_known_block: None,
             last_unknown_block: None,
             last_common_block: None,
@@ -5936,7 +5946,15 @@ impl Node {
         address: SocketAddr,
         inbound: bool,
     ) -> PeerPermissions {
-        self.config.peer_permissions(address.ip(), inbound)
+        let permissions = self.config.peer_permissions(address.ip(), inbound);
+        // Core grants the bloom-filter permission to localhost by default
+        // when -peerbloomfilters is not enabled globally. This is represented
+        // as a whitelist permission rather than as a local service bit.
+        if !self.config.peer_bloom_filters && address.ip().is_loopback() {
+            permissions.union(PeerPermissions::BLOOM_FILTER)
+        } else {
+            permissions
+        }
     }
 
     pub fn unregister_peer(&self, id: usize) {
@@ -6335,6 +6353,7 @@ impl Node {
                 inv_to_send: 0,
                 last_transaction: 0,
                 last_block: 0,
+                last_block_announcement: 0,
                 best_known_block: None,
                 last_unknown_block: None,
                 last_common_block: None,
@@ -6406,6 +6425,7 @@ impl Node {
             inv_to_send: 0,
             last_transaction: 0,
             last_block: 0,
+            last_block_announcement: 0,
             best_known_block: None,
             last_unknown_block: None,
             last_common_block: None,
@@ -7715,6 +7735,7 @@ fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
                         inv_to_send: 0,
                         last_transaction: 0,
                         last_block: 0,
+                        last_block_announcement: 0,
                         best_known_block: None,
                         last_unknown_block: None,
                         last_common_block: None,

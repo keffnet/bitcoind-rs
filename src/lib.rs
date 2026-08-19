@@ -108,6 +108,8 @@ const MAX_KNOWN_ADDRESSES: usize = 10_000;
 const ADDRMAN_TRIED_BUCKET_COUNT: usize = 256;
 const ADDRMAN_BUCKET_SIZE: usize = 64;
 const ADDRMAN_SECRET_FILE: &str = "addrman.key";
+const BLOCK_RELAY_ONLY_ANCHORS_FILE: &str = "anchors.json";
+pub(crate) const MAX_BLOCK_RELAY_ONLY_ANCHORS: usize = 2;
 const COINSTATS_CLEAN_SHUTDOWN_HEIGHT_FILE: &str = "clean_shutdown_height";
 const LARGE_WORK_INVALID_CHAIN_WARNING: &str = "Warning: Found invalid chain more than 6 blocks longer than our best chain. This could be due to database corruption or consensus incompatibility with peers.";
 
@@ -1547,6 +1549,13 @@ struct PersistedAddress {
     source_port: Option<u16>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedAnchor {
+    address: String,
+    network: String,
+    port: u16,
+}
+
 type LoadedAddressState = (
     HashMap<SocketAddr, PeerInfo>,
     HashSet<SocketAddr>,
@@ -1599,6 +1608,8 @@ pub struct Node {
     pub(crate) tor_controller: Option<Arc<tor::TorController>>,
     outbound_tor_ok_at_least_once: AtomicBool,
     mempool_path: std::path::PathBuf,
+    block_relay_only_anchors_path: std::path::PathBuf,
+    block_relay_only_anchors: parking_lot::RwLock<Vec<NetworkEndpoint>>,
     banlist_recreated: bool,
     /// Serialize RPC mining operations so a block template cannot become
     /// stale between reading the active tip and connecting the mined block.
@@ -2064,6 +2075,29 @@ impl Node {
                 )
             }
         };
+        let block_relay_only_anchors_path = network_datadir.join(BLOCK_RELAY_ONLY_ANCHORS_FILE);
+        let block_relay_only_anchors =
+            match load_block_relay_only_anchors(&block_relay_only_anchors_path) {
+                Ok(anchors) => {
+                    if block_relay_only_anchors_path.exists() {
+                        // Like Core, consume the startup snapshot. A clean
+                        // shutdown will replace it with the peers that are
+                        // actually connected at that point; an unclean restart
+                        // must not keep retrying stale anchors indefinitely.
+                        fs::remove_file(&block_relay_only_anchors_path).with_context(|| {
+                            format!(
+                                "removing consumed block-relay-only anchors {}",
+                                block_relay_only_anchors_path.display()
+                            )
+                        })?;
+                    }
+                    anchors
+                }
+                Err(error) => {
+                    quarantine_persistent_file(&block_relay_only_anchors_path, &error);
+                    Vec::new()
+                }
+            };
         let (events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
@@ -2117,6 +2151,8 @@ impl Node {
             tor_controller,
             outbound_tor_ok_at_least_once: AtomicBool::new(false),
             mempool_path,
+            block_relay_only_anchors_path,
+            block_relay_only_anchors: parking_lot::RwLock::new(block_relay_only_anchors),
             banlist_recreated: !banlist_exists,
             mining_lock: Mutex::new(()),
             peer_count: AtomicUsize::new(0),
@@ -6804,6 +6840,13 @@ impl Node {
             _ = self.wait_for_shutdown() => Ok(()),
         };
 
+        // Snapshot connected block-relay-only peers before stopping the P2P
+        // tasks. This is the native equivalent of Core's clean-shutdown
+        // anchors dump; inbound peers and full-relay peers are deliberately
+        // excluded.
+        let anchors_to_persist = run_result
+            .is_ok()
+            .then(|| self.current_block_relay_only_anchors());
         if let Some(task) = ipc_task {
             task.abort();
         }
@@ -6824,6 +6867,9 @@ impl Node {
         }
         if run_result.is_ok() && self.config.coinstatsindex {
             self.persist_coinstats_clean_shutdown_height()?;
+        }
+        if let Some(anchors) = anchors_to_persist {
+            self.persist_block_relay_only_anchors(&anchors)?;
         }
         self.persist_known_addresses()?;
         self.remove_rpc_cookie();
@@ -6870,6 +6916,64 @@ impl Node {
             .with_context(|| format!("flushing {}", temporary_path.display()))?;
         fs::rename(&temporary_path, path)
             .with_context(|| format!("installing {}", path.display()))?;
+        Ok(())
+    }
+
+    pub(crate) fn take_block_relay_only_anchors(&self, limit: usize) -> Vec<NetworkEndpoint> {
+        let mut anchors = self.block_relay_only_anchors.write();
+        let count = limit.min(anchors.len());
+        anchors.drain(..count).collect()
+    }
+
+    fn current_block_relay_only_anchors(&self) -> Vec<NetworkEndpoint> {
+        let mut anchors = Vec::with_capacity(MAX_BLOCK_RELAY_ONLY_ANCHORS);
+        for peer in self.peer_infos() {
+            if peer.inbound
+                || peer.connection_type != "block-relay-only"
+                || peer.endpoint.to_addr_v2().is_none()
+                || anchors.contains(&peer.endpoint)
+            {
+                continue;
+            }
+            anchors.push(peer.endpoint);
+            if anchors.len() == MAX_BLOCK_RELAY_ONLY_ANCHORS {
+                break;
+            }
+        }
+        anchors
+    }
+
+    fn persist_block_relay_only_anchors(&self, anchors: &[NetworkEndpoint]) -> Result<()> {
+        let mut seen = HashSet::new();
+        let entries = anchors
+            .iter()
+            .filter(|endpoint| endpoint.to_addr_v2().is_some() && seen.insert((*endpoint).clone()))
+            .take(MAX_BLOCK_RELAY_ONLY_ANCHORS)
+            .map(|endpoint| PersistedAnchor {
+                address: endpoint.host_string(),
+                network: endpoint.network_name().to_owned(),
+                port: endpoint.port(),
+            })
+            .collect::<Vec<_>>();
+        let temporary = self
+            .block_relay_only_anchors_path
+            .with_file_name(format!(".{BLOCK_RELAY_ONLY_ANCHORS_FILE}.tmp"));
+        fs::write(
+            &temporary,
+            serde_json::to_vec_pretty(&entries).context("serializing block-relay-only anchors")?,
+        )
+        .with_context(|| {
+            format!(
+                "writing block-relay-only anchors {}",
+                self.block_relay_only_anchors_path.display()
+            )
+        })?;
+        fs::rename(&temporary, &self.block_relay_only_anchors_path).with_context(|| {
+            format!(
+                "installing block-relay-only anchors {}",
+                self.block_relay_only_anchors_path.display()
+            )
+        })?;
         Ok(())
     }
 
@@ -7244,6 +7348,31 @@ fn load_addrman_key(data_dir: &Path) -> Result<[u8; 32]> {
     fs::rename(&temporary, &path)
         .with_context(|| format!("installing address-manager secret {}", path.display()))?;
     Ok(key)
+}
+
+fn load_block_relay_only_anchors(path: &Path) -> Result<Vec<NetworkEndpoint>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading block-relay-only anchors {}", path.display()))?;
+    let entries: Vec<PersistedAnchor> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decoding block-relay-only anchors {}", path.display()))?;
+    let mut anchors = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let endpoint =
+            NetworkEndpoint::parse(Some(&entry.network), &entry.address, Some(entry.port))
+                .with_context(|| {
+                    format!(
+                        "decoding block-relay-only anchor {}:{}",
+                        entry.address, entry.port
+                    )
+                })?;
+        if !anchors.contains(&endpoint) {
+            anchors.push(endpoint);
+        }
+    }
+    Ok(anchors)
 }
 
 fn load_known_addresses(data_dir: &Path) -> Result<LoadedAddressState> {
@@ -8948,6 +9077,48 @@ mod tests {
     }
 
     #[test]
+    fn block_relay_only_anchors_use_native_storage_and_are_consumed_on_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = NetworkEndpoint::from_socket("203.0.113.1:18444".parse().unwrap());
+        let second = NetworkEndpoint::from_socket("203.0.113.2:18444".parse().unwrap());
+        let third = NetworkEndpoint::from_socket("203.0.113.3:18444".parse().unwrap());
+        let inbound = NetworkEndpoint::from_socket("203.0.113.4:18444".parse().unwrap());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        for (id, endpoint, connection_type, inbound) in [
+            (1, first.clone(), "block-relay-only", false),
+            (2, second.clone(), "block-relay-only", false),
+            (3, third, "block-relay-only", false),
+            (4, inbound, "inbound", true),
+        ] {
+            node.register_peer_with_endpoint(
+                id,
+                endpoint,
+                inbound,
+                sender.clone(),
+                PeerRegistrationOptions {
+                    local_address: None,
+                    permissions: PeerPermissions::empty(),
+                    connection_type,
+                    manual: false,
+                },
+            );
+        }
+
+        let anchors = node.current_block_relay_only_anchors();
+        assert_eq!(anchors, vec![first.clone(), second.clone()]);
+        node.persist_block_relay_only_anchors(&anchors).unwrap();
+        let anchors_path = directory.path().join("regtest/anchors.json");
+        assert!(anchors_path.is_file());
+        assert!(!directory.path().join("regtest/anchors.dat").exists());
+        drop(node);
+
+        let reopened = Node::open(test_config(directory.path())).unwrap();
+        assert_eq!(reopened.take_block_relay_only_anchors(2), anchors);
+        assert!(!anchors_path.exists());
+    }
+
+    #[test]
     fn address_manager_sources_survive_a_restart() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(test_config(directory.path())).unwrap();
@@ -9086,6 +9257,7 @@ mod tests {
         let network_directory = directory.path().join("regtest");
         fs::create_dir_all(&network_directory).unwrap();
         fs::write(network_directory.join("banlist.json"), b"not-json").unwrap();
+        fs::write(network_directory.join("anchors.json"), b"not-json").unwrap();
 
         let node = Node::open(test_config(directory.path())).unwrap();
 
@@ -9093,7 +9265,9 @@ mod tests {
         assert!(node.banned_addresses().is_empty());
         assert!(!directory.path().join("peers.json").exists());
         assert!(!network_directory.join("banlist.json").exists());
+        assert!(!network_directory.join("anchors.json").exists());
         assert!(directory.path().join("peers.json.corrupt").exists());
         assert!(network_directory.join("banlist.json.corrupt").exists());
+        assert!(network_directory.join("anchors.json.corrupt").exists());
     }
 }

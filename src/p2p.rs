@@ -54,8 +54,9 @@ use crate::wire::{
 };
 
 use crate::{
-    AddrResponseCacheKey, MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node, OutboundEvictionAction,
-    PRIVATE_BROADCAST_RETRY_SECS, PeerRegistrationOptions, StartupLatch, unix_time_seconds,
+    AddrResponseCacheKey, MAX_BLOCK_RELAY_ONLY_ANCHORS, MAX_BLOCKS_IN_TRANSIT_PER_PEER, Node,
+    OutboundEvictionAction, PRIVATE_BROADCAST_RETRY_SECS, PeerRegistrationOptions, StartupLatch,
+    unix_time_seconds,
 };
 
 macro_rules! peer_log {
@@ -1889,6 +1890,29 @@ impl PeerManager {
             next_peer_id: next_peer_id.clone(),
             attempts: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         };
+        let anchor_endpoints = self
+            .node
+            .take_block_relay_only_anchors(max_block_relay)
+            .into_iter()
+            .take(MAX_BLOCK_RELAY_ONLY_ANCHORS)
+            .collect::<Vec<_>>();
+        info!(
+            count = anchor_endpoints.len(),
+            "loaded native block-relay-only anchors"
+        );
+        for endpoint in anchor_endpoints {
+            spawn_outbound_loop(
+                self.node.clone(),
+                endpoint,
+                outbound.clone(),
+                false,
+                None,
+                "block-relay-only",
+                false,
+                false,
+                None,
+            );
+        }
         let (add_node_sender, mut add_node_receiver) = mpsc::unbounded_channel();
         self.node.set_peer_manager_sender(add_node_sender);
         let mut chain_events = self.node.subscribe_chain();

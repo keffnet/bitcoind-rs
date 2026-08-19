@@ -8895,6 +8895,42 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn startup_block_import_persists_only_native_storage() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_directory = directory.path().join("source");
+        let source_chain = ChainState::open(Network::Regtest, &source_directory).unwrap();
+        let block = mine_test_block(source_chain.header(0).unwrap(), 1, 77);
+        drop(source_chain);
+
+        let payload = bitcoin::consensus::encode::serialize(&block);
+        let mut framed = wire::network_magic(Network::Regtest).to_vec();
+        framed.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        framed.extend_from_slice(&payload);
+        let import_path = directory.path().join("bootstrap.dat");
+        fs::write(&import_path, framed).unwrap();
+
+        let mut config = test_config(directory.path());
+        config.load_blocks.push(import_path);
+        config.stop_after_block_import = true;
+        let node = Node::open(config).unwrap();
+        assert_eq!(node.chain.read().height(), 1);
+        assert_eq!(node.chain.read().best_hash(), block.block_hash());
+        drop(node);
+
+        let blocks_directory = directory.path().join("blocks");
+        assert!(blocks_directory.join("blocks.dat").is_file());
+        assert!(blocks_directory.join("blocks.index").is_file());
+        assert!(blocks_directory.join("undo.dat").is_file());
+        assert!(blocks_directory.join("undo.index").is_file());
+        assert!(!blocks_directory.join("blk00000.dat").exists());
+        assert!(!blocks_directory.join("rev00000.dat").exists());
+
+        let reopened = Node::open(test_config(directory.path())).unwrap();
+        assert_eq!(reopened.chain.read().height(), 1);
+        assert_eq!(reopened.chain.read().best_hash(), block.block_hash());
+    }
+
     #[tokio::test]
     async fn stop_at_height_requests_shutdown_when_tip_reaches_target() {
         let directory = tempfile::tempdir().unwrap();

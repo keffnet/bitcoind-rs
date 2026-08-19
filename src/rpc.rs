@@ -16906,6 +16906,7 @@ fn rpc_help(method: &str) -> String {
             "Network",
             "Rawtransactions",
             "Util",
+            "Zmq",
         ]
         .into_iter()
         .enumerate()
@@ -18941,6 +18942,28 @@ mod tests {
         assert!(
             rpc_help("logging")
                 .contains("valid logging categories are: addrman, bench, blockstorage, cmpctblock")
+        );
+    }
+
+    #[test]
+    fn help_lists_zmq_category() {
+        let help = rpc_help("");
+        let categories = help
+            .lines()
+            .filter_map(|line| line.strip_prefix("== "))
+            .filter_map(|line| line.strip_suffix(" =="))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            categories,
+            vec![
+                "Blockchain",
+                "Control",
+                "Mining",
+                "Network",
+                "Rawtransactions",
+                "Util",
+                "Zmq",
+            ]
         );
     }
 

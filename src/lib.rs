@@ -3376,6 +3376,7 @@ impl Node {
             error,
             MempoolError::FeeRate
                 | MempoolError::MinRelayFee
+                | MempoolError::MinRelayFeeWithContext(_)
                 | MempoolError::Full
                 | MempoolError::ReplacementFee
                 | MempoolError::ReplacementFeeWithContext(_)

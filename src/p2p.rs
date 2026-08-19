@@ -1200,12 +1200,11 @@ fn peer_package_with_current(
     current: &Transaction,
 ) -> Option<(Vec<Transaction>, Vec<Txid>)> {
     for candidate in pending.values() {
-        if is_direct_parent(candidate, current) {
-            return Some((
-                vec![candidate.clone(), current.clone()],
-                vec![candidate.compute_txid(), current.compute_txid()],
-            ));
-        }
+        // Core only evaluates an opportunistic package when the transaction
+        // being processed is the parent. A child received after a low-fee
+        // parent is rejected is kept as an orphan and causes the parent to be
+        // requested again; pairing in the child handler would bypass that
+        // request/peer-attribution flow and make parent-first relay diverge.
         if is_direct_parent(current, candidate) {
             return Some((
                 vec![current.clone(), candidate.clone()],
@@ -7126,12 +7125,10 @@ async fn serve_peer_loop(
                                 }
                             }
                             // Keep retryable policy failures available for
-                            // opportunistic 1p1c evaluation. In particular,
-                            // package relay can deliver a low-fee parent
-                            // before its high-fee child; dropping the parent
-                            // here would make the later child look like an
-                            // ordinary missing-input orphan instead of a
-                            // package candidate.
+                            // opportunistic 1p1c evaluation. A child received
+                            // after a rejected parent remains an orphan; the
+                            // requested parent is paired with that deferred
+                            // child when it arrives again.
                             if !accepted_as_package {
                                 remember_peer_package_transaction(peer_state, transaction.clone());
                             }
@@ -9025,10 +9022,6 @@ async fn queue_orphan_parent_requests(
             || node.mempool.read().get(&parent_txid).is_some()
             || node.recently_confirmed_transaction(parent_txid)
             || node.orphan_nonwitness_transaction_by_txid(parent_txid)
-            || peer_state
-                .pending_package_transactions
-                .lock()
-                .contains_key(&parent_txid)
         {
             continue;
         }

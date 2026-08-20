@@ -8027,7 +8027,12 @@ impl ChainState {
             self.median_time_past(),
             true,
         )?;
-        self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
+        self.validate_block_structure_with_txids(
+            block,
+            &transaction_ids,
+            height,
+            Amount::MAX_MONEY.to_sat(),
+        )?;
         let block_median_time_past = self.median_time_past();
         let application = if persist {
             self.validate_block_transactions_with_txids(
@@ -10174,6 +10179,24 @@ impl ChainState {
     ) -> Result<validation::BlockValidationStats, ValidationError> {
         validation::validate_block_structure_with_signet_options_with_params(
             block,
+            &self.deployment_parameters,
+            height,
+            expected_coinbase_value,
+            self.signet_challenge.as_deref(),
+            true,
+        )
+    }
+
+    fn validate_block_structure_with_txids(
+        &self,
+        block: &Block,
+        transaction_ids: &[Txid],
+        height: u32,
+        expected_coinbase_value: u64,
+    ) -> Result<validation::BlockValidationStats, ValidationError> {
+        validation::validate_block_structure_with_signet_options_with_params_and_txids(
+            block,
+            transaction_ids,
             &self.deployment_parameters,
             height,
             expected_coinbase_value,

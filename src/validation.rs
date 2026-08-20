@@ -17,7 +17,7 @@ use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::opcodes::{Class, ClassifyContext, OP_0};
 use bitcoin::pow::Target;
 use bitcoin::{
-    Amount, Block, BlockHash, Network, OutPoint, Script, Sequence, Transaction, Txid,
+    Amount, Block, BlockHash, Network, OutPoint, Script, Sequence, Transaction, TxMerkleNode, Txid,
     WitnessCommitment,
 };
 
@@ -1269,13 +1269,40 @@ pub(crate) fn validate_block_structure_with_signet_options_with_params(
     signet_challenge: Option<&[u8]>,
     check_signet_solution: bool,
 ) -> Result<BlockValidationStats, ValidationError> {
-    validate_block_structure_with_signet_options_with_params_and_merkle(
+    let transaction_ids = block
+        .txdata
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<Vec<_>>();
+    validate_block_structure_with_signet_options_with_params_and_txids(
         block,
+        &transaction_ids,
         params,
         height,
         expected_coinbase_value,
         signet_challenge,
         check_signet_solution,
+    )
+}
+
+pub(crate) fn validate_block_structure_with_signet_options_with_params_and_txids(
+    block: &Block,
+    transaction_ids: &[Txid],
+    params: &DeploymentParameters,
+    height: u32,
+    expected_coinbase_value: u64,
+    signet_challenge: Option<&[u8]>,
+    check_signet_solution: bool,
+) -> Result<BlockValidationStats, ValidationError> {
+    validate_block_structure_with_options_internal(
+        block,
+        transaction_ids,
+        params,
+        height,
+        expected_coinbase_value,
+        signet_challenge,
+        check_signet_solution,
+        true,
         true,
     )
 }
@@ -1293,8 +1320,14 @@ pub(crate) fn validate_block_structure_with_signet_options_with_params_and_merkl
     check_signet_solution: bool,
     check_merkle_root: bool,
 ) -> Result<BlockValidationStats, ValidationError> {
+    let transaction_ids = block
+        .txdata
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<Vec<_>>();
     validate_block_structure_with_options_internal(
         block,
+        &transaction_ids,
         params,
         height,
         expected_coinbase_value,
@@ -1316,8 +1349,14 @@ pub(crate) fn validate_block_structure_for_verification(
     expected_coinbase_value: u64,
     signet_challenge: Option<&[u8]>,
 ) -> Result<BlockValidationStats, ValidationError> {
+    let transaction_ids = block
+        .txdata
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<Vec<_>>();
     validate_block_structure_with_options_internal(
         block,
+        &transaction_ids,
         params,
         height,
         expected_coinbase_value,
@@ -1328,24 +1367,24 @@ pub(crate) fn validate_block_structure_for_verification(
     )
 }
 
-/// Return a transaction hash involved in a merkle-tree mutation, matching
-/// Bitcoin Core's `ComputeMerkleRoot` behavior. An odd final hash is repeated
-/// for hashing but does not count as a mutation; only an actual pair of equal
-/// entries does.
-fn mutated_merkle_txid(block: &Block) -> Option<Txid> {
-    let mut layer = block
-        .txdata
-        .iter()
-        .map(Transaction::compute_txid)
-        .collect::<Vec<_>>();
+/// Compute the merkle root and report a hash involved in a tree mutation,
+/// matching Bitcoin Core's `ComputeMerkleRoot` behavior. An odd final hash is
+/// repeated for hashing but does not count as a mutation; only an actual pair
+/// of equal entries does.
+fn merkle_root_and_mutated_txid(transaction_ids: &[Txid]) -> (Option<TxMerkleNode>, Option<Txid>) {
+    if transaction_ids.is_empty() {
+        return (None, None);
+    }
+    let mut layer = transaction_ids.to_vec();
+    let mut mutated = None;
 
     while layer.len() > 1 {
         let mut next = Vec::with_capacity(layer.len().div_ceil(2));
         for pair in layer.chunks(2) {
             let left = pair[0];
             let right = *pair.get(1).unwrap_or(&left);
-            if pair.len() == 2 && left == right {
-                return Some(left);
+            if pair.len() == 2 && left == right && mutated.is_none() {
+                mutated = Some(left);
             }
 
             let mut engine = bitcoin::hashes::sha256d::Hash::engine();
@@ -1358,12 +1397,16 @@ fn mutated_merkle_txid(block: &Block) -> Option<Txid> {
         layer = next;
     }
 
-    None
+    (
+        Some(TxMerkleNode::from_raw_hash(layer[0].to_raw_hash())),
+        mutated,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn validate_block_structure_with_options_internal(
     block: &Block,
+    transaction_ids: &[Txid],
     params: &DeploymentParameters,
     height: u32,
     expected_coinbase_value: u64,
@@ -1375,12 +1418,16 @@ fn validate_block_structure_with_options_internal(
     if block.txdata.is_empty() {
         return Err(ValidationError::EmptyBlock);
     }
+    debug_assert_eq!(transaction_ids.len(), block.txdata.len());
     validate_block_version_with_params(params, height, block.header.version.to_consensus())?;
-    if check_merkle_root && !block.check_merkle_root() {
-        return Err(ValidationError::BadMerkleRoot);
-    }
-    if check_merkle_root && let Some(txid) = mutated_merkle_txid(block) {
-        return Err(ValidationError::DuplicateTransaction(txid));
+    if check_merkle_root {
+        let (merkle_root, mutated_txid) = merkle_root_and_mutated_txid(transaction_ids);
+        if merkle_root != Some(block.header.merkle_root) {
+            return Err(ValidationError::BadMerkleRoot);
+        }
+        if let Some(txid) = mutated_txid {
+            return Err(ValidationError::DuplicateTransaction(txid));
+        }
     }
     if check_witness_commitment {
         validate_witness_commitment(block, height >= params.buried.segwit)?;
@@ -1412,8 +1459,12 @@ fn validate_block_structure_with_options_internal(
         .ok_or(ValidationError::OutputTotalOverflow)?;
     let mut total_output_sat = 0u64;
     let mut legacy_sigop_cost = 0usize;
-    for (position, tx) in block.txdata.iter().enumerate() {
-        let txid = tx.compute_txid();
+    for (position, (tx, txid)) in block
+        .txdata
+        .iter()
+        .zip(transaction_ids.iter().copied())
+        .enumerate()
+    {
         if tx.base_size().saturating_mul(4) > MAX_BLOCK_WEIGHT {
             return Err(ValidationError::OversizedTransaction(txid));
         }
@@ -2359,6 +2410,25 @@ mod tests {
             2_500_000_000
         );
         assert_eq!(block_subsidy_for_network(Network::Regtest, 64 * 150), 0);
+    }
+
+    #[test]
+    fn cached_transaction_ids_compute_merkle_root_and_mutation_together() {
+        let first = Txid::from_byte_array([1; 32]);
+        let second = Txid::from_byte_array([2; 32]);
+        let third = Txid::from_byte_array([3; 32]);
+        let odd_ids = [first, second, third];
+        let expected = bitcoin::merkle_tree::calculate_root(odd_ids.into_iter())
+            .map(|root| TxMerkleNode::from_raw_hash(root.to_raw_hash()));
+        assert_eq!(merkle_root_and_mutated_txid(&odd_ids), (expected, None));
+
+        let mutated_ids = [first, second, third, third];
+        let expected = bitcoin::merkle_tree::calculate_root(mutated_ids.into_iter())
+            .map(|root| TxMerkleNode::from_raw_hash(root.to_raw_hash()));
+        assert_eq!(
+            merkle_root_and_mutated_txid(&mutated_ids),
+            (expected, Some(third))
+        );
     }
 
     #[test]

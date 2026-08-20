@@ -104,7 +104,13 @@ impl ElectrumPeer {
         else {
             return Ok(None);
         };
-        if protocol_min > protocol_max {
+        // A peer that advertises no protocol version in common cannot be
+        // useful to this server.  Do this check before inserting the peer so
+        // server.peers.subscribe never returns an unreachable endpoint.
+        if protocol_min > protocol_max
+            || protocol_max < MIN_PROTOCOL_VERSION
+            || protocol_min > MAX_PROTOCOL_VERSION
+        {
             return Ok(None);
         }
         let Some(hosts) = features.get("hosts").and_then(Value::as_object) else {
@@ -3695,6 +3701,24 @@ mod tests {
         let response: Value = serde_json::from_slice(&line)?;
         assert_eq!(response["id"], json!(12));
         assert_eq!(response["result"], json!(true));
+
+        let mut incompatible_peer_features = peer_features.clone();
+        incompatible_peer_features["protocol_min"] = json!("2.0");
+        incompatible_peer_features["protocol_max"] = json!("2.1");
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "server.add_peer",
+            "params": [incompatible_peer_features]
+        });
+        line.clear();
+        let mut request = serde_json::to_vec(&request)?;
+        request.push(b'\n');
+        reader.get_mut().write_all(&request).await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response["id"], json!(13));
+        assert_eq!(response["result"], json!(false));
 
         line.clear();
         match tokio::time::timeout(

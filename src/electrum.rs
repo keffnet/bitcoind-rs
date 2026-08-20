@@ -25,6 +25,10 @@ use crate::{Node, StartupLatch};
 const MAX_LINE_SIZE: usize = 2 * crate::validation::MAX_BLOCK_WEIGHT + 64 * 1024;
 const SERVER_NAME: &str = "bitcoind-rs 0.1.0";
 const MAX_ELECTRUM_PEERS: usize = 1_024;
+// Keep batch dispatch bounded independently of the raw line-size limit. A
+// batch of tiny requests can otherwise fan out into an unbounded number of
+// index and mempool lookups before one response is written.
+const MAX_ELECTRUM_BATCH_REQUESTS: usize = 1_024;
 const MAX_SCRIPTPUBKEY_SIZE: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -398,7 +402,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                     }
                 };
                 let response = if let Some(batch) = requests.as_array() {
-                    if batch.is_empty() {
+                    if batch.is_empty() || batch.len() > MAX_ELECTRUM_BATCH_REQUESTS {
                         Some(json!([invalid_request_response()]))
                     } else {
                         let mut responses = Vec::new();
@@ -1377,6 +1381,7 @@ fn transaction_get_batch(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .get(0)
         .and_then(Value::as_array)
         .ok_or_else(electrum_invalid_params)?;
+    validate_electrum_batch_len(txids.len())?;
     let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
     txids
         .iter()
@@ -1386,6 +1391,14 @@ fn transaction_get_batch(node: &Arc<Node>, params: &Value) -> Result<Value> {
         })
         .collect::<Result<Vec<_>>>()
         .map(Value::Array)
+}
+
+fn validate_electrum_batch_len(len: usize) -> Result<()> {
+    if len > MAX_ELECTRUM_BATCH_REQUESTS {
+        Err(electrum_invalid_params())
+    } else {
+        Ok(())
+    }
 }
 
 fn electrum_transaction_json(
@@ -1923,6 +1936,9 @@ fn raw_transaction_params(params: &Value) -> Result<&[Value]> {
         .get(0)
         .and_then(Value::as_array)
         .ok_or_else(electrum_invalid_params)?;
+    if raw_transactions.len() > crate::mempool::MAX_PACKAGE_COUNT {
+        return Err(electrum_invalid_params());
+    }
     if raw_transactions.iter().any(|raw| !raw.is_string()) {
         return Err(electrum_invalid_params());
     }
@@ -2095,6 +2111,34 @@ mod tests {
         );
         assert_eq!(response["error"]["code"], json!(-32602));
         assert_eq!(response["error"]["message"], json!("invalid params"));
+    }
+
+    #[test]
+    fn electrum_batch_and_package_limits_are_bounded() {
+        let txids = Value::Array(
+            (0..=MAX_ELECTRUM_BATCH_REQUESTS)
+                .map(|_| json!(Txid::all_zeros().to_string()))
+                .collect(),
+        );
+        let response = electrum_error_response(
+            json!(1),
+            "blockchain.transaction.get_batch",
+            validate_electrum_batch_len(txids.as_array().expect("test batch is an array").len())
+                .unwrap_err(),
+        );
+        assert_eq!(response["error"]["code"], json!(-32602));
+
+        let raw_transactions = Value::Array(
+            (0..=crate::mempool::MAX_PACKAGE_COUNT)
+                .map(|_| json!("00"))
+                .collect(),
+        );
+        let response = electrum_error_response(
+            json!(2),
+            "blockchain.transaction.broadcast_package",
+            raw_transaction_params(&json!([raw_transactions])).unwrap_err(),
+        );
+        assert_eq!(response["error"]["code"], json!(-32602));
     }
 
     #[test]
@@ -3707,6 +3751,26 @@ mod tests {
         assert_eq!(response.as_array().map(Vec::len), Some(1));
         assert_eq!(response[0]["id"], json!(3));
         assert_eq!(response[0]["result"]["protocol_min"], json!("1.4"));
+
+        let oversized_batch = Value::Array(
+            (0..=MAX_ELECTRUM_BATCH_REQUESTS)
+                .map(|id| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "server.ping",
+                        "params": [],
+                    })
+                })
+                .collect(),
+        );
+        line.clear();
+        let mut request = serde_json::to_vec(&oversized_batch)?;
+        request.push(b'\n');
+        reader.get_mut().write_all(&request).await?;
+        reader.read_until(b'\n', &mut line).await?;
+        let response: Value = serde_json::from_slice(&line)?;
+        assert_eq!(response[0]["error"]["code"], json!(-32600));
 
         line.clear();
         reader

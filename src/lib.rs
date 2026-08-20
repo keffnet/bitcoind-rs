@@ -1348,11 +1348,10 @@ pub(crate) struct BlockDownloadSchedule {
 }
 
 /// The body scheduler only needs block hashes and heights, not materialized
-/// headers.  Keeping the path for the current best-known target avoids
-/// rebuilding a nearly million-entry vector on every peer's 100 ms download
-/// tick during headers-first synchronization.
+/// headers. Keeping the longest recently used path lets peers whose targets
+/// are ancestors on that path share one cache, instead of rebuilding a nearly
+/// million-entry vector when adjacent peer tips alternate every 100 ms.
 struct BlockDownloadPathCache {
-    target_hash: BlockHash,
     hashes: Vec<BlockHash>,
 }
 
@@ -5354,30 +5353,38 @@ impl Node {
                 // has been materialized).
                 chain.best_header_tip().hash
             };
-            let peer_best_height = peer_best_known
-                .and_then(|hash| chain.block_height_by_hash(&hash))
-                .unwrap_or_else(|| chain.height());
+            let Some(peer_best_height) = chain.block_height_by_hash(&target_hash) else {
+                return BlockDownloadSchedule {
+                    requests: Vec::new(),
+                    staller: None,
+                };
+            };
+            let Ok(target_index) = usize::try_from(peer_best_height) else {
+                return BlockDownloadSchedule {
+                    requests: Vec::new(),
+                    staller: None,
+                };
+            };
             let segwit_height = chain.deployment_parameters().buried.segwit;
             let mut path_cache = self.block_download_path_cache.lock();
-            if path_cache
+            let target_is_cached = path_cache
                 .as_ref()
-                .is_none_or(|cache| cache.target_hash != target_hash)
-            {
+                .and_then(|cache| cache.hashes.get(target_index))
+                == Some(&target_hash);
+            if !target_is_cached {
                 let Some(hashes) = chain.block_hashes_to_hash(&target_hash) else {
                     return BlockDownloadSchedule {
                         requests: Vec::new(),
                         staller: None,
                     };
                 };
-                *path_cache = Some(BlockDownloadPathCache {
-                    target_hash,
-                    hashes,
-                });
+                *path_cache = Some(BlockDownloadPathCache { hashes });
             }
-            let hashes = &path_cache
+            let cached_path = path_cache
                 .as_ref()
-                .expect("block download path cache was initialized")
-                .hashes;
+                .expect("block download path cache was initialized");
+            debug_assert_eq!(cached_path.hashes.get(target_index), Some(&target_hash));
+            let hashes = &cached_path.hashes[..=target_index];
             let last_common_height = chain.common_active_height_for_hash_path(hashes);
             let window_end_height = last_common_height.saturating_add(BLOCK_DOWNLOAD_WINDOW);
             let candidates = hashes
@@ -9429,6 +9436,52 @@ mod tests {
                 .map(|item| item.hash)
                 .collect::<Vec<_>>(),
             vec![first.block_hash(), second.block_hash()]
+        );
+    }
+
+    #[test]
+    fn block_download_path_cache_reuses_a_descendant_path_for_ancestor_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 1);
+        let second = mine_test_block(&first.header, 2, 2);
+        node.chain
+            .write()
+            .accept_headers(&[first.header, second.header])
+            .unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender.clone());
+        node.register_peer(2, "192.0.2.2:18444".parse().unwrap(), false, sender);
+        node.update_peer_best_known_block(1, second.block_hash());
+        node.update_peer_best_known_block(2, first.block_hash());
+
+        let descendant =
+            node.next_block_download_schedule(1, 16, wire::NODE_NETWORK | wire::NODE_WITNESS);
+        assert_eq!(
+            descendant
+                .requests
+                .iter()
+                .map(|request| request.hash)
+                .collect::<Vec<_>>(),
+            vec![first.block_hash(), second.block_hash()]
+        );
+        let ancestor =
+            node.next_block_download_schedule(2, 16, wire::NODE_NETWORK | wire::NODE_WITNESS);
+        assert_eq!(
+            ancestor
+                .requests
+                .iter()
+                .map(|request| request.hash)
+                .collect::<Vec<_>>(),
+            vec![first.block_hash()]
+        );
+        assert_eq!(
+            node.block_download_path_cache
+                .lock()
+                .as_ref()
+                .and_then(|cache| cache.hashes.last().copied()),
+            Some(second.block_hash())
         );
     }
 

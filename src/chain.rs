@@ -668,6 +668,24 @@ struct BlockNode {
     header: bitcoin::block::Header,
     height: u32,
     chain_work: Work,
+    skip: Option<BlockHash>,
+}
+
+fn invert_lowest_one(value: u32) -> u32 {
+    value & value.saturating_sub(1)
+}
+
+/// Match Core's CBlockIndex skip-height selection. One ancestor pointer per
+/// indexed header bounds arbitrary ancestor lookups to logarithmic work.
+fn block_index_skip_height(height: u32) -> u32 {
+    if height < 2 {
+        return 0;
+    }
+    if height & 1 != 0 {
+        invert_lowest_one(invert_lowest_one(height - 1)) + 1
+    } else {
+        invert_lowest_one(height)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -5000,12 +5018,15 @@ impl ChainState {
                 self.median_time_past_for_parent(parent_hash),
                 true,
             )?;
+            let height = parent.height.saturating_add(1);
+            let skip = self.ancestor_hash(parent_hash, block_index_skip_height(height));
             self.block_index.insert(
                 hash,
                 BlockNode {
                     header: *header,
-                    height: parent.height.saturating_add(1),
+                    height,
                     chain_work: parent.chain_work + header.work(),
+                    skip,
                 },
             );
             self.assign_header_sequence_id(hash);
@@ -6633,12 +6654,14 @@ impl ChainState {
             self.record_unlinked_body(hash);
             self.insert_side_chain_body(&block)?;
             self.index_all_transactions(&block, height);
+            let skip = self.ancestor_hash(parent_hash, block_index_skip_height(height));
             self.block_index.insert(
                 hash,
                 BlockNode {
                     header: block.header,
                     height,
                     chain_work: parent.chain_work + block.header.work(),
+                    skip,
                 },
             );
             self.assign_header_sequence_id(hash);
@@ -6660,6 +6683,7 @@ impl ChainState {
             true,
         )?;
         self.validate_block_structure(&block, self.network, height, Amount::MAX_MONEY.to_sat())?;
+        let skip = self.ancestor_hash(parent_hash, block_index_skip_height(height));
         if retain_invalid_body {
             // Core's peer path accepts and stores a structurally valid
             // side-chain body without checking its UTXO-dependent rules. The
@@ -6677,6 +6701,7 @@ impl ChainState {
                     header: block.header,
                     height,
                     chain_work,
+                    skip,
                 },
             );
             self.assign_header_sequence_id(hash);
@@ -6782,6 +6807,7 @@ impl ChainState {
                         header: block.header,
                         height,
                         chain_work: parent.chain_work + block.header.work(),
+                        skip,
                     },
                 );
                 self.assign_header_sequence_id(hash);
@@ -6827,6 +6853,7 @@ impl ChainState {
                 header: block.header,
                 height,
                 chain_work,
+                skip,
             },
         );
         self.assign_header_sequence_id(hash);
@@ -7956,12 +7983,14 @@ impl ChainState {
             .get(&block.header.prev_blockhash)
             .context("block parent is not indexed")?
             .chain_work;
+        let skip = self.ancestor_hash(block.header.prev_blockhash, block_index_skip_height(height));
         self.block_index.insert(
             hash,
             BlockNode {
                 header: block.header,
                 height,
                 chain_work: parent_work + block.header.work(),
+                skip,
             },
         );
         self.update_index_prune_locks(height);
@@ -8085,6 +8114,7 @@ impl ChainState {
                 header: genesis.header,
                 height: 0,
                 chain_work: genesis.header.work(),
+                skip: None,
             },
         );
         self.assign_header_sequence_id(genesis.block_hash());
@@ -8149,12 +8179,16 @@ impl ChainState {
                 else {
                     continue;
                 };
+                let height = parent.height.saturating_add(1);
+                let skip = self
+                    .ancestor_hash(block.header.prev_blockhash, block_index_skip_height(height));
                 self.block_index.insert(
                     *hash,
                     BlockNode {
                         header: block.header,
-                        height: parent.height.saturating_add(1),
+                        height,
                         chain_work: parent.chain_work + block.header.work(),
+                        skip,
                     },
                 );
                 self.assign_header_sequence_id(*hash);
@@ -9980,8 +10014,21 @@ impl ChainState {
             {
                 return self.active_chain.get(height as usize).copied();
             }
-            hash = self.block_index.get(&hash)?.header.prev_blockhash;
-            current_height -= 1;
+            let node = self.block_index.get(&hash)?;
+            let skip_height = block_index_skip_height(current_height);
+            let previous_skip_height = block_index_skip_height(current_height - 1);
+            let use_skip = node.skip.is_some()
+                && (skip_height == height
+                    || (skip_height > height
+                        && !(previous_skip_height < skip_height.saturating_sub(2)
+                            && previous_skip_height >= height)));
+            if use_skip {
+                hash = node.skip?;
+                current_height = skip_height;
+            } else {
+                hash = node.header.prev_blockhash;
+                current_height -= 1;
+            }
         }
         (current_height == height).then_some(hash)
     }
@@ -10562,6 +10609,7 @@ impl ChainState {
         }
         for (height, header) in headers.iter().enumerate() {
             let hash = header.block_hash();
+            let height = u32::try_from(height).context("active header height does not fit u32")?;
             let chain_work = if height == 0 {
                 header.work()
             } else {
@@ -10571,12 +10619,16 @@ impl ChainState {
                     .chain_work
                     + header.work()
             };
+            let skip = (height != 0)
+                .then(|| self.ancestor_hash(header.prev_blockhash, block_index_skip_height(height)))
+                .flatten();
             self.block_index.insert(
                 hash,
                 BlockNode {
                     header: *header,
-                    height: height as u32,
+                    height,
                     chain_work,
+                    skip,
                 },
             );
             self.assign_header_sequence_id(hash);
@@ -10608,12 +10660,16 @@ impl ChainState {
                             .copied()
                             .expect("persisted header parent is indexed");
                         let hash = header.block_hash();
+                        let height = parent.height.saturating_add(1);
+                        let skip = self
+                            .ancestor_hash(header.prev_blockhash, block_index_skip_height(height));
                         self.block_index.insert(
                             hash,
                             BlockNode {
                                 header,
-                                height: parent.height.saturating_add(1),
+                                height,
                                 chain_work: parent.chain_work + header.work(),
+                                skip,
                             },
                         );
                         self.assign_header_sequence_id(hash);
@@ -12578,6 +12634,32 @@ mod tests {
     }
 
     #[test]
+    fn header_skip_list_returns_every_ancestor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut previous = *state.header(0).unwrap();
+        let mut expected = vec![previous.block_hash()];
+        let mut headers = Vec::new();
+        for height in 1..=512 {
+            let block = mine_block_from_header(&previous, height, height as u8);
+            previous = block.header;
+            expected.push(block.block_hash());
+            headers.push(block.header);
+        }
+        state.accept_headers(&headers).unwrap();
+
+        let tip = *expected.last().unwrap();
+        for (height, hash) in expected.iter().copied().enumerate() {
+            assert_eq!(state.ancestor_hash(tip, height as u32), Some(hash));
+        }
+        for (height, hash) in expected.iter().copied().enumerate().skip(1) {
+            let node = state.block_index.get(&hash).unwrap();
+            let skip_height = block_index_skip_height(height as u32);
+            assert_eq!(node.skip, expected.get(skip_height as usize).copied());
+        }
+    }
+
+    #[test]
     fn block_locators_back_off_and_reverse_ranges_are_empty() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
@@ -13920,6 +14002,7 @@ mod tests {
                 header: side_four.header,
                 height: 4,
                 chain_work: side_four_work,
+                skip: None,
             },
         );
         state.block_index.insert(
@@ -13928,6 +14011,7 @@ mod tests {
                 header: side_five.header,
                 height: 5,
                 chain_work: side_four_work + side_five.header.work(),
+                skip: None,
             },
         );
         let retained = [state.block_hash(0).unwrap(), side_four_hash, side_five_hash]
@@ -14003,6 +14087,7 @@ mod tests {
                 header: side_one.header,
                 height: 1,
                 chain_work: side_one_work,
+                skip: None,
             },
         );
         state.block_index.insert(
@@ -14011,6 +14096,7 @@ mod tests {
                 header: invalid_side_two.header,
                 height: 2,
                 chain_work: side_one_work + invalid_side_two.header.work(),
+                skip: None,
             },
         );
 

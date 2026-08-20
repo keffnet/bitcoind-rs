@@ -30,6 +30,11 @@ const MAX_ELECTRUM_PEERS: usize = 1_024;
 // index and mempool lookups before one response is written.
 const MAX_ELECTRUM_BATCH_REQUESTS: usize = 1_024;
 const MAX_SCRIPTPUBKEY_SIZE: usize = 10_000;
+// Electrum clients fetch history as one JSON result. Keep the serialized
+// history payload bounded so a heavily used script cannot force an
+// unbounded response allocation. Leave room for the JSON-RPC envelope and
+// the scriptpubkey {"history": ...} wrapper.
+const MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE: usize = 4 * 1024 * 1024 - 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ElectrumPeer {
@@ -493,6 +498,21 @@ fn electrum_invalid_params() -> anyhow::Error {
     anyhow::Error::new(ElectrumInvalidParams)
 }
 
+#[derive(Debug)]
+struct ElectrumHistoryTooLarge;
+
+impl std::fmt::Display for ElectrumHistoryTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("history too large")
+    }
+}
+
+impl std::error::Error for ElectrumHistoryTooLarge {}
+
+fn electrum_history_too_large() -> anyhow::Error {
+    anyhow::Error::new(ElectrumHistoryTooLarge)
+}
+
 fn process_electrum_request(
     node: &Arc<Node>,
     request: &Value,
@@ -548,6 +568,13 @@ fn electrum_error_response(id: Value, method: &str, error: anyhow::Error) -> Val
             "jsonrpc": "2.0",
             "id": id,
             "error": {"code": -32602, "message": "invalid params"},
+        });
+    }
+    if error.downcast_ref::<ElectrumHistoryTooLarge>().is_some() {
+        return json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": 10001, "message": "history too large"},
         });
     }
     let message = error.to_string();
@@ -622,7 +649,7 @@ fn dispatch_with_session(
         "blockchain.block.get_chunk" => block_chunk(node, params),
         "blockchain.scripthash.get_history" => {
             let script_hash = script_hash_param(params, 0)?;
-            Ok(json!(history_for_script(node, &script_hash)))
+            Ok(json!(history_for_script(node, &script_hash)?))
         }
         "blockchain.scripthash.get_balance" => {
             let script_hash = script_hash_param(params, 0)?;
@@ -661,7 +688,7 @@ fn dispatch_with_session(
         }
         "blockchain.address.get_history" => {
             let (_, script_hash) = address_param(node, params, 0)?;
-            Ok(json!(history_for_script(node, &script_hash)))
+            Ok(json!(history_for_script(node, &script_hash)?))
         }
         "blockchain.address.get_balance" => {
             let (_, script_hash) = address_param(node, params, 0)?;
@@ -701,7 +728,7 @@ fn dispatch_with_session(
         }
         "blockchain.scriptpubkey.get_history" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
-            Ok(json!({"history": history_for_script(node, &script_hash)}))
+            Ok(json!({"history": history_for_script(node, &script_hash)?}))
         }
         "blockchain.scriptpubkey.get_balance" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
@@ -718,6 +745,10 @@ fn dispatch_with_session(
         }
         "blockchain.scriptpubkey.subscribe" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
+            // The subscription only returns a status digest, but the
+            // protocol allows the server to refuse a subscription whose
+            // corresponding history would be too large to serve.
+            let _ = history_for_script(node, &script_hash)?;
             let status = history_status_for_script(node, &script_hash)
                 .map(Value::String)
                 .unwrap_or(Value::Null);
@@ -1694,19 +1725,34 @@ fn status_notification_needed(previous: &Value, current: &Value, force: bool) ->
     force || previous != current
 }
 
-fn history_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
+fn history_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>> {
     let records = history_records_for_script(node, script_hash);
     let mempool = node.mempool.read();
-    records
-        .into_iter()
-        .map(|(txid, height)| {
-            let mut result = json!({"tx_hash": txid.to_string(), "height": height});
-            if let Some(entry) = mempool.get(&txid) {
-                result["fee"] = json!(entry.fee_sat);
-            }
-            result
-        })
-        .collect()
+    history_values_for_records(&records, &mempool)
+}
+
+fn history_values_for_records(
+    records: &[(Txid, i64)],
+    mempool: &crate::mempool::Mempool,
+) -> Result<Vec<Value>> {
+    let mut values = Vec::new();
+    let mut payload_size = 2usize; // The opening and closing array brackets.
+    for (txid, height) in records {
+        let mut value = json!({"tx_hash": txid.to_string(), "height": height});
+        if let Some(entry) = mempool.get(txid) {
+            value["fee"] = json!(entry.fee_sat);
+        }
+        let entry_size = serde_json::to_vec(&value)?.len();
+        let next_size = payload_size
+            .saturating_add(entry_size)
+            .saturating_add(usize::from(!values.is_empty()));
+        if next_size > MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE {
+            return Err(electrum_history_too_large());
+        }
+        payload_size = next_size;
+        values.push(value);
+    }
+    Ok(values)
 }
 
 fn history_status_for_script(node: &Arc<Node>, script_hash: &str) -> Option<String> {
@@ -2206,6 +2252,25 @@ mod tests {
             history_status(&[(txid, 1)]),
             "549540a6810df8dc5008757fa694172b0f7a3e32facfd9f39eab228286543cde"
         );
+    }
+
+    #[test]
+    fn electrum_history_responses_use_the_standard_size_error() {
+        let txid = Txid::from_byte_array([1; 32]);
+        let mempool = crate::mempool::Mempool::new(Network::Regtest);
+        let small = history_values_for_records(&[(txid, 1)], &mempool).unwrap();
+        assert_eq!(small.len(), 1);
+
+        let entry_size = serde_json::to_vec(&small[0]).unwrap().len();
+        let count = MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE / (entry_size + 1) + 1;
+        let oversized = (0..count)
+            .map(|height| (txid, i64::try_from(height).unwrap()))
+            .collect::<Vec<_>>();
+        let error = history_values_for_records(&oversized, &mempool).unwrap_err();
+        let response =
+            electrum_error_response(json!(1), "blockchain.scriptpubkey.get_history", error);
+        assert_eq!(response["error"]["code"], json!(10001));
+        assert_eq!(response["error"]["message"], json!("history too large"));
     }
 
     #[test]

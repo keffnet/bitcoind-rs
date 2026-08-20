@@ -85,6 +85,11 @@ macro_rules! rpc_address_log {
 // particular, Core's functional suite exercises `echo` with two 8 MiB
 // arguments, whose JSON envelope is larger than the old 8 MiB cap.
 const MAX_HTTP_REQUEST: usize = 32 * 1024 * 1024;
+// Keep a batch of tiny JSON-RPC requests from turning the HTTP body limit
+// into an unbounded amount of sequential dispatch work.  This is independent
+// of the body limit because a batch of notifications can contain very little
+// JSON per request while still causing expensive chain or mempool lookups.
+const MAX_RPC_BATCH_REQUESTS: usize = 1_024;
 const DEFAULT_MAX_RAW_TX_FEE_RATE_SAT_PER_KVB: u64 = 10_000_000;
 const MAX_SCRIPT_SIZE: usize = 10_000;
 const MAX_SCRIPT_ELEMENT_SIZE: usize = 520;
@@ -1695,6 +1700,16 @@ async fn dispatch_json_rpc_http(
             return JsonRpcHttpResponse {
                 status: "200 OK",
                 body: Some(Value::Array(Vec::new())),
+            };
+        }
+        if batch.len() > MAX_RPC_BATCH_REQUESTS {
+            return JsonRpcHttpResponse {
+                status: "400 Bad Request",
+                body: Some(Value::Array(vec![json_rpc_invalid_request(
+                    Value::Null,
+                    true,
+                    "JSON-RPC batch request exceeds the server limit",
+                )])),
             };
         }
         let mut responses = Vec::with_capacity(batch.len());
@@ -20117,6 +20132,23 @@ mod tests {
         assert_eq!(response.as_array().unwrap().len(), 1);
         assert_eq!(response[0]["id"], json!(7));
         assert_eq!(response[0]["result"], json!(0));
+
+        let oversized_batch = Value::Array(
+            (0..=MAX_RPC_BATCH_REQUESTS)
+                .map(|id| {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "getblockcount",
+                    })
+                })
+                .collect(),
+        );
+        let oversized_body = serde_json::to_vec(&oversized_batch).unwrap();
+        let oversized_response = dispatch_json_rpc_http(&node, &oversized_body, None).await;
+        assert_eq!(oversized_response.status, "400 Bad Request");
+        let oversized_body = oversized_response.body.expect("batch rejection has a body");
+        assert_eq!(oversized_body[0]["error"]["code"], json!(-32600));
 
         let legacy = dispatch_json_rpc(&node, br#"{"method":"getblockcount"}"#)
             .await

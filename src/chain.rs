@@ -65,6 +65,39 @@ const ASSUMEUTXO_BASE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-base-v1\0";
 const ASSUMEUTXO_CHECKPOINT_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-checkpoint-v1\0";
 const ASSUMEUTXO_CHECKPOINT_INTERVAL: u32 = 256;
 
+/// Replace a small metadata file with a fully durable version.
+///
+/// The append-only stores have their own batching and commit markers, but the
+/// active-chain metadata and store-tip files are the commit boundary that
+/// tells restart which durable state to serve. Sync both the replacement and
+/// its directory before returning so a power loss cannot leave a new marker
+/// pointing at an unflushed file.
+fn persist_atomic_file(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(temporary)
+        .with_context(|| format!("opening temporary metadata file {}", temporary.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temporary, path)?;
+    sync_metadata_directory(path)
+}
+
+#[cfg(unix)]
+fn sync_metadata_directory(path: &Path) -> Result<()> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_metadata_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn merkle_branch_for_block(block: &Block, transaction_index: usize) -> Vec<Txid> {
     let mut layer: Vec<Txid> = block.txdata.iter().map(Transaction::compute_txid).collect();
     let mut index = transaction_index;
@@ -8438,9 +8471,7 @@ impl ChainState {
         let path = self.utxo_store_tip_path();
         let temp = path.with_extension("tip.tmp");
         let contents = format!("{}\n{}\n", self.best_hash(), self.utxo_store.generation());
-        fs::write(&temp, contents)?;
-        fs::rename(temp, path)?;
-        Ok(())
+        persist_atomic_file(&path, &temp, contents.as_bytes())
     }
 
     fn sync_utxo_store(&mut self) -> Result<()> {
@@ -8490,9 +8521,7 @@ impl ChainState {
             self.electrum_history_store.generation(),
             self.electrum_history_store.len()
         );
-        fs::write(&temp, contents)?;
-        fs::rename(temp, path)?;
-        Ok(())
+        persist_atomic_file(&path, &temp, contents.as_bytes())
     }
 
     fn sync_electrum_history_store(&mut self) -> Result<()> {
@@ -8792,8 +8821,7 @@ impl ChainState {
         let bytes = serialize_internal(CHAIN_METADATA_MAGIC, &metadata)?;
         let path = self.data_dir.join("chainstate.bin");
         let temp = self.data_dir.join("chainstate.bin.tmp");
-        fs::write(&temp, bytes)?;
-        fs::rename(temp, path)?;
+        persist_atomic_file(&path, &temp, &bytes)?;
         self.persist_tx_counts()
     }
 
@@ -8819,8 +8847,7 @@ impl ChainState {
         let bytes = serialize_internal(CHAIN_TX_COUNTS_MAGIC, &index)?;
         let path = self.data_dir.join("chainstate.txcounters");
         let temp = self.data_dir.join("chainstate.txcounters.tmp");
-        fs::write(&temp, bytes)?;
-        fs::rename(temp, path)?;
+        persist_atomic_file(&path, &temp, &bytes)?;
         Ok(())
     }
 
@@ -9046,8 +9073,7 @@ impl ChainState {
         let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
         let temp = self.data_dir.join("chainstate.snapshot.tmp");
-        fs::write(&temp, &bytes)?;
-        fs::rename(temp, path)?;
+        persist_atomic_file(&path, &temp, &bytes)?;
         self.persist_snapshot_checksum_bytes(&bytes)?;
         self.persist_tx_counts()?;
         self.chainstate_store.clear()
@@ -9062,9 +9088,7 @@ impl ChainState {
         let checksum = snapshot_checksum(bytes);
         let path = self.snapshot_checksum_path();
         let temp = self.data_dir.join("chainstate.snapshot.sha256.tmp");
-        fs::write(&temp, checksum)?;
-        fs::rename(temp, path)?;
-        Ok(())
+        persist_atomic_file(&path, &temp, checksum.as_bytes())
     }
 
     fn snapshot_checksum_path(&self) -> PathBuf {
@@ -9091,9 +9115,7 @@ impl ChainState {
         let bytes = serialize_internal(ASSUMEUTXO_BASE_MAGIC, &snapshot)?;
         let path = self.assumeutxo_base_snapshot_path();
         let temp = path.with_extension("bin.tmp");
-        fs::write(&temp, bytes)?;
-        fs::rename(temp, path)?;
-        Ok(())
+        persist_atomic_file(&path, &temp, &bytes)
     }
 
     fn remove_assumeutxo_artifacts(&self) -> Result<()> {
@@ -9209,9 +9231,8 @@ impl ChainState {
         };
         let bytes = serialize_internal(ASSUMEUTXO_STATE_MAGIC, &provenance)?;
         let temp = self.data_dir.join("assumeutxo.bin.tmp");
-        fs::write(&temp, bytes)?;
-        fs::rename(temp, self.snapshot_provenance_path())?;
-        Ok(())
+        let path = self.snapshot_provenance_path();
+        persist_atomic_file(&path, &temp, &bytes)
     }
 
     fn remove_snapshot_provenance_file(&self) -> Result<()> {
@@ -9483,9 +9504,7 @@ fn persist_assumeutxo_checkpoint(data_dir: &Path, checkpoint: &AssumeUtxoCheckpo
     let bytes = serialize_internal(ASSUMEUTXO_CHECKPOINT_MAGIC, checkpoint)?;
     let path = data_dir.join("assumeutxo-checkpoint.bin");
     let temp = path.with_extension("bin.tmp");
-    fs::write(&temp, bytes)?;
-    fs::rename(temp, path)?;
-    Ok(())
+    persist_atomic_file(&path, &temp, &bytes)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10458,6 +10477,21 @@ mod tests {
     use bitcoin::blockdata::script::Builder;
     use bitcoin::blockdata::transaction::{OutPoint, Transaction, TxIn, TxOut, Version};
     use bitcoin::blockdata::witness::Witness;
+
+    #[test]
+    fn atomically_replaces_and_durably_persists_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("metadata.bin");
+        let temporary = directory.path().join("metadata.bin.tmp");
+
+        persist_atomic_file(&path, &temporary, b"first version").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first version");
+        assert!(!temporary.exists());
+
+        persist_atomic_file(&path, &temporary, b"second version").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second version");
+        assert!(!temporary.exists());
+    }
 
     #[test]
     fn opens_network_genesis() {

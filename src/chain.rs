@@ -9081,11 +9081,16 @@ impl ChainState {
     }
 
     fn assign_header_sequence_id(&mut self, hash: BlockHash) {
-        if !self.header_sequence_ids.contains_key(&hash) {
-            let sequence_id = self.next_header_sequence_id;
-            self.header_sequence_ids.insert(hash, sequence_id);
-            self.next_header_sequence_id = self.next_header_sequence_id.saturating_add(1);
+        // Headers-first synchronization assigns this ordering when the
+        // header is accepted. Connecting its body later must not reconsider
+        // the same candidate: doing so repeats invalid-ancestor checks from
+        // the million-header tip for every historical body during IBD.
+        if self.header_sequence_ids.contains_key(&hash) {
+            return;
         }
+        let sequence_id = self.next_header_sequence_id;
+        self.header_sequence_ids.insert(hash, sequence_id);
+        self.next_header_sequence_id = self.next_header_sequence_id.saturating_add(1);
         self.consider_best_header(hash);
     }
 

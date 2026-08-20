@@ -9030,6 +9030,44 @@ mod tests {
     }
 
     #[test]
+    fn native_reindex_rebuilds_chainstate_and_transaction_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut initial_config = test_config(directory.path());
+        initial_config.txindex = true;
+
+        let (tip_hash, tip_txid) = {
+            let node = Node::open(initial_config).unwrap();
+            for height in 1..=3 {
+                let previous = *node.chain.read().header(height - 1).unwrap();
+                node.connect_block(mine_test_block(&previous, height, height as u8))
+                    .unwrap();
+            }
+            let chain = node.chain.read();
+            let tip_hash = chain.best_hash();
+            let tip = chain.block_for_serving(&tip_hash).unwrap().unwrap();
+            (tip_hash, tip.txdata[0].compute_txid())
+        };
+
+        for (reindex, reindex_chainstate) in [(true, false), (false, true)] {
+            let mut config = test_config(directory.path());
+            config.txindex = true;
+            config.reindex = reindex;
+            config.reindex_chainstate = reindex_chainstate;
+            let node = Node::open(config).unwrap();
+            assert_eq!(node.chain.read().height(), 3);
+            assert_eq!(node.chain.read().best_hash(), tip_hash);
+            assert!(node.chain.write().transaction(&tip_txid).unwrap().is_some());
+            assert!(
+                node.chain
+                    .read()
+                    .block_for_serving(&tip_hash)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
     fn minimum_chain_work_override_reaches_chain_state() {
         let directory = tempfile::tempdir().unwrap();
         let args = crate::config::Args::try_parse_from([

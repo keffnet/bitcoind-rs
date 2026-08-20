@@ -5869,18 +5869,24 @@ impl Node {
             addr_token_bucket: 1.0,
             addr_token_timestamp: time::unix_time_millis(),
         };
-        let active_connections = {
+        let (active_connections, replaced_connection) = {
             let mut peers = self.peers.write();
-            peers.insert(id, peer.clone());
-            peers.len()
+            let replaced_connection = peers.insert(id, peer.clone()).is_some();
+            (peers.len(), replaced_connection)
         };
         self.peer_commands.write().insert(id, commands);
         self.chain_sync_states
             .write()
             .insert(id, ChainSyncTimeoutState::default());
-        info!(
-            "Added connection peer={id} active_connections={active_connections} connection_type={connection_type}"
-        );
+        if replaced_connection {
+            info!(
+                "Updated connection peer_id={id} active_connections={active_connections} connection_type={connection_type}"
+            );
+        } else {
+            info!(
+                "Added connection peer_id={id} active_connections={active_connections} connection_type={connection_type}"
+            );
+        }
         let endpoint_is_addrman_candidate = match &endpoint {
             NetworkEndpoint::Ip(address) => is_core_routable_ip(address.ip()),
             NetworkEndpoint::Dns { .. } => false,
@@ -6297,7 +6303,7 @@ impl Node {
             removed.map(|peer| peer.endpoint)
         };
         let active_connections = self.peers.read().len();
-        debug!("Removed connection peer={id} active_connections={active_connections}");
+        debug!("Removed connection peer_id={id} active_connections={active_connections}");
         self.peer_commands.write().remove(&id);
         let replacement = self.release_headers_sync_peer(id);
         self.headers_sync_active.lock().remove(&id);

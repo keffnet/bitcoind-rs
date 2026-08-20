@@ -1232,6 +1232,11 @@ pub struct ChainState {
     history: HashMap<String, Vec<HistoryEntry>>,
     history_materialized: bool,
     spent_by: HashMap<OutPoint, SpentTransaction>,
+    // The node enables the optional spender index after chainstate startup
+    // configuration is known. Preserve a snapshot copy so that enabling the
+    // index can reuse the persisted prefix instead of decoding every pruned
+    // Electrum transaction body on each restart.
+    startup_spent_by: Option<(usize, HashMap<OutPoint, SpentTransaction>)>,
     // Core stores preciousblock preferences as negative reverse sequence IDs.
     // They are runtime-only and are intentionally not persisted.
     precious_blocks: HashMap<BlockHash, i32>,
@@ -1941,6 +1946,7 @@ impl ChainState {
             history: HashMap::new(),
             history_materialized: true,
             spent_by: HashMap::new(),
+            startup_spent_by: None,
             precious_blocks: HashMap::new(),
             precious_sequence: -1,
             precious_last_chainwork: None,
@@ -2004,13 +2010,15 @@ impl ChainState {
             state.history = snapshot.history;
             state.history_materialized = true;
             state.prune_height = snapshot.prune_height.or(state.prune_height);
-            let persisted_spent_by = snapshot.spent_by;
+            state.startup_spent_by = snapshot
+                .spent_by
+                .map(|spent_by| (snapshot_chain_len, spent_by));
             state.active_tx_counts.truncate(snapshot_chain_len);
             state.active_tx_totals.truncate(snapshot_chain_len);
             let headers = state.headers.clone();
             state.index_active_headers(&headers)?;
             if state.txospender_index_enabled {
-                if let Some(spent_by) = persisted_spent_by {
+                if let Some((_, spent_by)) = state.startup_spent_by.take() {
                     state.spent_by = spent_by;
                     state.validate_persisted_spent_index()?;
                 } else {
@@ -2527,12 +2535,46 @@ impl ChainState {
     /// remains useful for historical `gettxspendingprevout` queries.
     pub fn configure_txospender_index(&mut self, enabled: bool) -> Result<()> {
         self.txospender_index_enabled = enabled;
-        if enabled {
-            self.rebuild_spent_index()?;
-        } else {
+        if !enabled {
             self.spent_by.clear();
+            self.startup_spent_by = None;
+            return Ok(());
+        }
+        if !self.restore_startup_spent_index()? {
+            self.rebuild_spent_index()?;
         }
         Ok(())
+    }
+
+    /// Restore the spender map saved with the chainstate snapshot and index
+    /// only the block suffix replayed after that snapshot. A missing body or
+    /// invalid persisted entry returns `false`, allowing the caller to use
+    /// the complete native/sidecar rebuild path instead.
+    fn restore_startup_spent_index(&mut self) -> Result<bool> {
+        let Some((snapshot_chain_len, spent_by)) = self.startup_spent_by.take() else {
+            return Ok(false);
+        };
+        if snapshot_chain_len > self.active_chain.len() {
+            return Ok(false);
+        }
+
+        self.spent_by = spent_by;
+        if self.validate_persisted_spent_index().is_err() {
+            self.spent_by.clear();
+            return Ok(false);
+        }
+
+        let suffix = self.active_chain[snapshot_chain_len..].to_vec();
+        for (offset, hash) in suffix.into_iter().enumerate() {
+            let height = u32::try_from(snapshot_chain_len + offset)
+                .context("active chain height does not fit u32")?;
+            let Some(block) = self.store.get(&hash)? else {
+                self.spent_by.clear();
+                return Ok(false);
+            };
+            self.index_block_spends(&block, height);
+        }
+        Ok(true)
     }
 
     /// Enable the durable transaction-body sidecar required by the in-process
@@ -9926,6 +9968,7 @@ fn open_background_replay_state(
         history: HashMap::new(),
         history_materialized: true,
         spent_by: HashMap::new(),
+        startup_spent_by: None,
         precious_blocks: HashMap::new(),
         precious_sequence: -1,
         precious_last_chainwork: None,
@@ -12005,6 +12048,19 @@ mod tests {
         }
         state.prune(300).unwrap();
         assert!(state.is_block_pruned(&spending_block_hash));
+        // Leave a durable block suffix after the checkpoint so the restart
+        // path also exercises incremental spender indexing.
+        let suffix_block = mine_block(&state, 401);
+        state.connect_block_internal(&suffix_block, true).unwrap();
+        // The prune checkpoint already persisted the confirmed-spender map.
+        // Remove the sidecar bodies to prove restart can reuse that snapshot
+        // without decoding every historical Electrum transaction.
+        state
+            .electrum_store
+            .as_mut()
+            .unwrap()
+            .retain_only(&HashSet::new())
+            .unwrap();
 
         let path = directory.path().to_owned();
         drop(state);
@@ -13581,6 +13637,21 @@ mod tests {
         assert_eq!(
             reopened.spending_transaction(&first_output),
             Some((second_txid, 0, block_hash, 101))
+        );
+        // A corrupt or legacy snapshot must still take the complete rebuild
+        // path rather than leaving a partially restored spender map active.
+        reopened.configure_txospender_index(false).unwrap();
+        reopened.startup_spent_by = Some((
+            0,
+            HashMap::from([(
+                funding_outpoint,
+                (first_txid, 0, BlockHash::all_zeros(), 101),
+            )]),
+        ));
+        reopened.configure_txospender_index(true).unwrap();
+        assert_eq!(
+            reopened.spending_transaction(&funding_outpoint),
+            Some((first_txid, 0, block_hash, 101))
         );
     }
 

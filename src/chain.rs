@@ -9934,6 +9934,12 @@ impl ChainState {
                     == Some(self.utxo_store.generation())
                 && lines.next().is_none()
         });
+        info!(
+            "UTXO index state: marker_matches={marker_matches} durable_entries={} snapshot_entries={} generation={}",
+            self.utxo_store.len(),
+            self.utxos.len(),
+            self.utxo_store.generation()
+        );
         if marker_matches && self.utxo_store.len() == self.utxos.len() {
             return Ok(());
         }

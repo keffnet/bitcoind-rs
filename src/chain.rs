@@ -6952,15 +6952,8 @@ impl ChainState {
             height,
             Some(block_hash),
         );
-        let reduced_data_activation_height = self
-            .headers_to_hash(&block.header.prev_blockhash)
-            .and_then(|headers| {
-                validation::reduced_data_activation_height(
-                    &headers,
-                    self.deployment_parameters.bip9[2],
-                    height,
-                )
-            });
+        let reduced_data_activation_height =
+            self.reduced_data_activation_height_for_block(block.header.prev_blockhash, height);
         let csv_active = height >= self.deployment_parameters.buried.csv;
         let lock_time_cutoff = if csv_active {
             block_median_time_past
@@ -7273,6 +7266,23 @@ impl ChainState {
             self.deployment_parameters.bip9[2],
             self.height().saturating_add(1),
         )
+    }
+
+    fn reduced_data_activation_height_for_block(
+        &self,
+        parent_hash: BlockHash,
+        height: u32,
+    ) -> Option<u32> {
+        let deployment = self.deployment_parameters.bip9[2];
+        if !deployment.is_enabled() {
+            return None;
+        }
+        if deployment.start_time == validation::Bip9Deployment::ALWAYS_ACTIVE_TIME {
+            return Some(0);
+        }
+        self.headers_to_hash(&parent_hash).and_then(|headers| {
+            validation::reduced_data_activation_height(&headers, deployment, height)
+        })
     }
 
     fn cache_script_validation(&self, key: [u8; 32]) {
@@ -11116,6 +11126,25 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn reduced_data_activation_short_circuits_disabled_and_always_active_deployments() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent_hash = state.best_hash();
+
+        assert_eq!(
+            state.reduced_data_activation_height_for_block(parent_hash, 1),
+            None
+        );
+
+        state.deployment_parameters.bip9[2].start_time =
+            validation::Bip9Deployment::ALWAYS_ACTIVE_TIME;
+        assert_eq!(
+            state.reduced_data_activation_height_for_block(parent_hash, 1),
+            Some(0)
+        );
     }
 
     #[test]

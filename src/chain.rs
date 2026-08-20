@@ -2869,7 +2869,7 @@ impl ChainState {
         // block store is about to remove. Populate it before rewriting the
         // authoritative files so a crash cannot leave the active history
         // queryable only through a body that was already deleted.
-        let sidecar_blocks = if self.electrum_store.is_some() {
+        let sidecar_hashes = if self.electrum_store.is_some() {
             self.active_chain
                 .iter()
                 .enumerate()
@@ -2880,18 +2880,17 @@ impl ChainState {
                         && !retained_blocks.contains(hash))
                     .then_some(*hash)
                 })
-                .map(|hash| {
-                    self.store
-                        .get(&hash)?
-                        .with_context(|| format!("block {hash} disappeared before pruning"))
-                })
-                .collect::<Result<Vec<_>>>()?
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
         if let Some(store) = self.electrum_store.as_mut() {
-            for block in &sidecar_blocks {
-                store.insert_unsynced(block)?;
+            for hash in sidecar_hashes {
+                let block = self
+                    .store
+                    .get(&hash)?
+                    .with_context(|| format!("block {hash} disappeared before pruning"))?;
+                store.insert_unsynced(&block)?;
             }
             store.flush()?;
         }

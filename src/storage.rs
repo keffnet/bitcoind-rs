@@ -3459,7 +3459,12 @@ fn load_utxo_index(
                     );
                     return Ok(None);
                 }
-                if pending_batch != Some(batch_id) || (pending.is_empty() && batch_id != 0) {
+                let batch_matches = if batch_id == 0 {
+                    pending_batch.is_none() || pending_batch == Some(0)
+                } else {
+                    pending_batch == Some(batch_id) && !pending.is_empty()
+                };
+                if !batch_matches {
                     warn!(
                         batch_id,
                         pending_batch = ?pending_batch,
@@ -4967,7 +4972,7 @@ mod tests {
             median_time_past: 12,
             coinbase: false,
         };
-        {
+        let generation = {
             let mut store = UtxoStore::open(directory.path()).unwrap();
             store
                 .apply_batch(&[], &[(first, first_entry.clone())])
@@ -4978,12 +4983,14 @@ mod tests {
                 .unwrap();
             assert!(!store.contains(&first));
             assert_eq!(store.get(&second).unwrap(), Some(second_entry.clone()));
-        }
+            store.generation()
+        };
 
         let data_path = directory.path().join("utxos.dat");
         let committed_len = std::fs::metadata(&data_path).unwrap().len();
         {
             let reopened = UtxoStore::open(directory.path()).unwrap();
+            assert_eq!(reopened.generation(), generation);
             assert_eq!(reopened.len(), 1);
             assert_eq!(reopened.get(&second).unwrap(), Some(second_entry.clone()));
         }

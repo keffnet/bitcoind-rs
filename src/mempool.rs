@@ -450,6 +450,51 @@ fn input_script_values_for_transaction(
         .collect()
 }
 
+/// Estimate the additional allocations held by the Electrum scripthash
+/// indexes for one transaction. The forward map can share a script key across
+/// transactions, so this intentionally errs on the conservative side by
+/// charging each transaction for its affected forward entries.
+fn scripthash_index_memory_usage(
+    scripts: &[String],
+    input_script_values: &[(String, u64)],
+) -> usize {
+    let index_node_bytes = size_of::<usize>() * 3;
+    let mut usage = size_of::<Txid>()
+        .saturating_add(size_of::<Vec<String>>())
+        .saturating_add(index_node_bytes)
+        .saturating_add(scripts.len().saturating_mul(size_of::<String>()))
+        .saturating_add(
+            scripts
+                .iter()
+                .map(|script| script.capacity())
+                .sum::<usize>(),
+        )
+        .saturating_add(size_of::<Txid>())
+        .saturating_add(size_of::<Vec<(String, u64)>>())
+        .saturating_add(index_node_bytes)
+        .saturating_add(
+            input_script_values
+                .len()
+                .saturating_mul(size_of::<(String, u64)>()),
+        )
+        .saturating_add(
+            input_script_values
+                .iter()
+                .map(|(script, _)| script.capacity())
+                .sum::<usize>(),
+        );
+    for script in scripts {
+        usage = usage
+            .saturating_add(size_of::<String>())
+            .saturating_add(script.capacity())
+            .saturating_add(index_node_bytes)
+            .saturating_add(size_of::<HashSet<Txid>>())
+            .saturating_add(index_node_bytes)
+            .saturating_add(size_of::<Txid>());
+    }
+    usage
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum MempoolChangeKind {
     Added,
@@ -807,9 +852,10 @@ impl Mempool {
     }
 
     pub fn entry_dynamic_memory_usage(&self, txid: &Txid) -> Option<usize> {
-        self.entries
-            .get(txid)
-            .map(|entry| mempool_entry_memory_usage(&entry.transaction))
+        self.entries.get(txid).map(|entry| {
+            mempool_entry_memory_usage(&entry.transaction)
+                .saturating_add(self.scripthash_index_memory_usage_for(txid))
+        })
     }
 
     /// Sum of virtual transaction sizes, matching Core's `getmempoolinfo.bytes`.
@@ -1060,6 +1106,10 @@ impl Mempool {
                 bail!("mempool scripthash input-value index is inconsistent");
             }
         }
+        for txid in self.entries.keys() {
+            expected_memory_usage =
+                expected_memory_usage.saturating_add(self.scripthash_index_memory_usage_for(txid));
+        }
         if self.adjusted_weights.len() != self.entries.len()
             || self
                 .adjusted_weights
@@ -1110,6 +1160,18 @@ impl Mempool {
 
     pub fn get(&self, txid: &Txid) -> Option<&MempoolEntry> {
         self.entries.get(txid)
+    }
+
+    fn scripthash_index_memory_usage_for(&self, txid: &Txid) -> usize {
+        let Some(scripts) = self.scripts_by_transaction.get(txid) else {
+            return 0;
+        };
+        let input_script_values = self
+            .input_script_values_by_transaction
+            .get(txid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        scripthash_index_memory_usage(scripts, input_script_values)
     }
 
     /// Return the mempool transactions that can affect an Electrum
@@ -3254,15 +3316,17 @@ impl Mempool {
             }
         }
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
-        let memory_usage = mempool_entry_memory_usage(&transaction);
+        let affected_scripts = script_hashes_for_transaction(&transaction, &previous_outputs);
+        let input_script_values =
+            input_script_values_for_transaction(&transaction, &previous_outputs);
+        let memory_usage = mempool_entry_memory_usage(&transaction).saturating_add(
+            scripthash_index_memory_usage(&affected_scripts, &input_script_values),
+        );
         if enforce_mempool_policy {
             self.check_cluster_limits_with_weight(&transaction, adjusted_weight)?;
             let protected = self.ancestors_for_transaction(&transaction);
             self.ensure_space(memory_usage, &protected)?;
         }
-        let affected_scripts = script_hashes_for_transaction(&transaction, &previous_outputs);
-        let input_script_values =
-            input_script_values_for_transaction(&transaction, &previous_outputs);
         let entry = MempoolEntry {
             transaction,
             fee_sat,
@@ -3949,6 +4013,7 @@ impl Mempool {
     }
 
     fn remove_with_notification(&mut self, txid: &Txid, notify_zmq: bool) -> Option<MempoolEntry> {
+        let index_memory_usage = self.scripthash_index_memory_usage_for(txid);
         let entry = self.entries.remove(txid)?;
         self.remove_transaction_scripts(txid);
         self.adjusted_weights.remove(txid);
@@ -3956,9 +4021,9 @@ impl Mempool {
         self.wtxids.remove(&entry.transaction.compute_wtxid());
         self.relay_sequences.remove(txid);
         let size = bitcoin::consensus::encode::serialize(&entry.transaction).len();
-        self.memory_usage = self
-            .memory_usage
-            .saturating_sub(mempool_entry_memory_usage(&entry.transaction));
+        self.memory_usage = self.memory_usage.saturating_sub(
+            mempool_entry_memory_usage(&entry.transaction).saturating_add(index_memory_usage),
+        );
         self.bytes = self.bytes.saturating_sub(size);
         self.vbytes = self.vbytes.saturating_sub(entry.vsize);
         for input in &entry.transaction.input {

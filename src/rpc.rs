@@ -5414,7 +5414,7 @@ fn get_deployment_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
     let headers = chain
-        .headers_to_hash(&hash)
+        .headers_to_hash_cow(&hash)
         .ok_or_else(|| anyhow!("Block header chain is unavailable"))?;
     let deployment_parameters = chain.deployment_parameters();
     let heights = deployment_parameters.buried;

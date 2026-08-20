@@ -3860,6 +3860,32 @@ impl ChainState {
         self.block_index.get(hash).map(|node| node.header)
     }
 
+    pub(crate) fn block_hashes_to_hash(&self, hash: &BlockHash) -> Option<Vec<BlockHash>> {
+        let node = self.block_index.get(hash)?;
+        if self
+            .active_chain
+            .get(node.height as usize)
+            .is_some_and(|active_hash| active_hash == hash)
+        {
+            return self
+                .active_chain
+                .get(..=node.height as usize)
+                .map(ToOwned::to_owned);
+        }
+        let mut hashes = Vec::new();
+        let mut cursor = *hash;
+        loop {
+            let node = self.block_index.get(&cursor)?;
+            hashes.push(cursor);
+            if node.height == 0 {
+                break;
+            }
+            cursor = node.header.prev_blockhash;
+        }
+        hashes.reverse();
+        Some(hashes)
+    }
+
     pub(crate) fn headers_to_hash_cow(
         &self,
         hash: &BlockHash,
@@ -4207,24 +4233,23 @@ impl ChainState {
         if !self.blockfilter_index_enabled {
             return Ok(None);
         }
-        let Some(headers) = self.headers_to_hash(hash) else {
+        let Some(block_hashes) = self.block_hashes_to_hash(hash) else {
             return Ok(None);
         };
-        let mut stored_filters = Vec::with_capacity(headers.len());
+        let mut stored_filters = Vec::with_capacity(block_hashes.len());
         let mut all_filters_stored = true;
-        for header in &headers {
-            let block_hash = header.block_hash();
+        for block_hash in &block_hashes {
             let filter =
-                if let Some((content, filter_header)) = self.basic_filter_cache.get(&block_hash) {
+                if let Some((content, filter_header)) = self.basic_filter_cache.get(block_hash) {
                     Some((content.clone(), *filter_header))
                 } else {
-                    self.filter_store.get(&block_hash)?
+                    self.filter_store.get(block_hash)?
                 };
             let Some(filter) = filter else {
                 all_filters_stored = false;
                 break;
             };
-            stored_filters.push((block_hash, filter.0, filter.1));
+            stored_filters.push((*block_hash, filter.0, filter.1));
         }
         if all_filters_stored {
             return Ok(Some(
@@ -4238,10 +4263,9 @@ impl ChainState {
         }
         let mut previous_outputs: HashMap<OutPoint, TxOut> = HashMap::new();
         let mut previous_filter_header = FilterHeader::all_zeros();
-        let mut filters = Vec::with_capacity(headers.len());
+        let mut filters = Vec::with_capacity(block_hashes.len());
 
-        for (height, header) in headers.into_iter().enumerate() {
-            let block_hash = header.block_hash();
+        for (height, block_hash) in block_hashes.into_iter().enumerate() {
             let Some(block) = self.store.get(&block_hash)? else {
                 return Ok(None);
             };

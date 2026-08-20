@@ -1347,6 +1347,15 @@ pub(crate) struct BlockDownloadSchedule {
     pub(crate) staller: Option<usize>,
 }
 
+/// The body scheduler only needs block hashes and heights, not materialized
+/// headers.  Keeping the path for the current best-known target avoids
+/// rebuilding a nearly million-entry vector on every peer's 100 ms download
+/// tick during headers-first synchronization.
+struct BlockDownloadPathCache {
+    target_hash: BlockHash,
+    hashes: Vec<BlockHash>,
+}
+
 impl PeerInfo {
     pub(crate) fn ping_wait(&self) -> Option<f64> {
         self.ping_sent_mocktime
@@ -1754,6 +1763,7 @@ pub struct Node {
     extra_block_relay_peers_enabled: AtomicBool,
     next_extra_block_relay_at: AtomicU64,
     rejected_block_bodies: parking_lot::RwLock<HashSet<BlockHash>>,
+    block_download_path_cache: Mutex<Option<BlockDownloadPathCache>>,
     shutdown_requested: Arc<AtomicBool>,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
     peer_commands:
@@ -2325,6 +2335,7 @@ impl Node {
             extra_block_relay_peers_enabled: AtomicBool::new(false),
             next_extra_block_relay_at: AtomicU64::new(0),
             rejected_block_bodies: parking_lot::RwLock::new(HashSet::new()),
+            block_download_path_cache: Mutex::new(None),
             shutdown_requested,
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
@@ -5347,33 +5358,33 @@ impl Node {
                 .and_then(|hash| chain.block_height_by_hash(&hash))
                 .unwrap_or_else(|| chain.height());
             let segwit_height = chain.deployment_parameters().buried.segwit;
-            let Some(headers) = chain.headers_to_hash_cow(&target_hash) else {
-                return BlockDownloadSchedule {
-                    requests: Vec::new(),
-                    staller: None,
+            let mut path_cache = self.block_download_path_cache.lock();
+            if path_cache
+                .as_ref()
+                .is_none_or(|cache| cache.target_hash != target_hash)
+            {
+                let Some(hashes) = chain.block_hashes_to_hash(&target_hash) else {
+                    return BlockDownloadSchedule {
+                        requests: Vec::new(),
+                        staller: None,
+                    };
                 };
-            };
-            let last_common_height = headers
-                .iter()
-                .enumerate()
-                .rev()
-                .find_map(|(height, header)| {
-                    chain
-                        .is_active_block(&header.block_hash())
-                        .then_some(u32::try_from(height).unwrap_or(u32::MAX))
-                })
-                .unwrap_or_default();
+                *path_cache = Some(BlockDownloadPathCache {
+                    target_hash,
+                    hashes,
+                });
+            }
+            let hashes = &path_cache
+                .as_ref()
+                .expect("block download path cache was initialized")
+                .hashes;
+            let last_common_height = chain.common_active_height_for_hash_path(hashes);
             let window_end_height = last_common_height.saturating_add(BLOCK_DOWNLOAD_WINDOW);
-            let candidates = headers
+            let candidates = hashes
                 .iter()
                 .enumerate()
                 .skip(1)
-                .map(|(height, header)| {
-                    (
-                        header.block_hash(),
-                        u32::try_from(height).unwrap_or(u32::MAX),
-                    )
-                })
+                .map(|(height, hash)| (*hash, u32::try_from(height).unwrap_or(u32::MAX)))
                 .filter(|(hash, _)| !chain.store.contains(hash))
                 .filter(|(hash, _)| !self.block_body_was_rejected(hash))
                 .filter(|(hash, _)| !chain.is_block_pruned(hash))

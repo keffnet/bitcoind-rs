@@ -4065,6 +4065,34 @@ impl ChainState {
         Some(hashes)
     }
 
+    /// Return the highest height shared by an indexed path and the active
+    /// chain.  Both vectors are ordered from genesis, so equality is true up
+    /// to the fork point and false afterwards.  Binary search keeps the body
+    /// scheduler independent of the number of headers already received.
+    pub(crate) fn common_active_height_for_hash_path(&self, path: &[BlockHash]) -> u32 {
+        let common_end = path.len().min(self.active_chain.len()).saturating_sub(1);
+        let Some(genesis) = self.active_chain.first().copied() else {
+            return 0;
+        };
+        if path.is_empty() || path[0] != genesis {
+            return 0;
+        }
+        if path[common_end] == self.active_chain[common_end] {
+            return u32::try_from(common_end).unwrap_or(u32::MAX);
+        }
+        let mut low = 0usize;
+        let mut high = common_end;
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if path[middle] == self.active_chain[middle] {
+                low = middle;
+            } else {
+                high = middle.saturating_sub(1);
+            }
+        }
+        u32::try_from(low).unwrap_or(u32::MAX)
+    }
+
     pub(crate) fn headers_to_hash_cow(
         &self,
         hash: &BlockHash,
@@ -7890,10 +7918,10 @@ impl ChainState {
         self.update_index_prune_locks(height);
         self.assign_header_sequence_id(hash);
         self.assign_block_sequence_id(hash);
-        if persist {
-            self.persist_utxo_store_tip_with_sync(sync_storage)?;
+        if persist && sync_storage {
+            self.persist_utxo_store_tip_with_sync(true)?;
             if self.history_index_enabled {
-                self.persist_electrum_history_store_tip_with_sync(sync_storage)?;
+                self.persist_electrum_history_store_tip_with_sync(true)?;
             }
         }
         if let Some(stats) = self.coin_stats.as_mut() {
@@ -7903,12 +7931,12 @@ impl ChainState {
         if persist {
             if self.height() % SNAPSHOT_INTERVAL == 0 {
                 self.persist_snapshot()?;
-            } else {
+            } else if sync_storage {
                 // The block body, chainstate mutation, UTXO batch, and
                 // Electrum history batch are append-only records. Publish a
                 // compact active-tip marker instead of rewriting the full
                 // header/active-chain metadata on every block.
-                self.persist_active_chain_tip_with_sync(sync_storage)?;
+                self.persist_active_chain_tip_with_sync(true)?;
             }
             if !sync_storage {
                 self.peer_storage_blocks_since_flush =
@@ -13282,6 +13310,7 @@ mod tests {
         }
         let tip = state.best_hash();
         assert_eq!(state.height(), 70);
+        state.flush().unwrap();
         drop(state);
 
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
@@ -13692,6 +13721,31 @@ mod tests {
     fn mine_block(state: &ChainState, height: u32) -> Block {
         let previous = state.header(height - 1).expect("parent header");
         mine_block_from_header(previous, height, 0)
+    }
+
+    #[test]
+    fn common_active_height_for_hash_path_handles_active_prefix_and_fork() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let main_one = mine_block(&state, 1);
+        state.connect_block(main_one).unwrap();
+        state.connect_block(mine_block(&state, 2)).unwrap();
+
+        let side_two = mine_block_from_header(state.header(1).unwrap(), 2, 1);
+        let side_three = mine_block_from_header(&side_two.header, 3, 2);
+        state
+            .accept_headers(&[side_two.header, side_three.header])
+            .unwrap();
+
+        let active_path = state.block_hashes_to_hash(&state.best_hash()).unwrap();
+        assert_eq!(
+            state.common_active_height_for_hash_path(&active_path),
+            state.height()
+        );
+        let side_path = state
+            .block_hashes_to_hash(&side_three.block_hash())
+            .unwrap();
+        assert_eq!(state.common_active_height_for_hash_path(&side_path), 1);
     }
 
     #[test]

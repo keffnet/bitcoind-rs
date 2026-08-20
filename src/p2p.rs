@@ -7928,7 +7928,23 @@ async fn handle_received_block(
     };
     match result {
         Ok(tip) => {
-            info!(%hash, height = tip.height, "accepted peer block");
+            let (active, block_height) = {
+                let chain = node.chain.read();
+                (
+                    chain.is_active_block(&hash),
+                    chain.block_height_by_hash(&hash),
+                )
+            };
+            if active {
+                info!(%hash, height = tip.height, "accepted peer block");
+            } else {
+                debug!(
+                    %hash,
+                    height = ?block_height,
+                    active_tip_height = tip.height,
+                    "stored peer side-chain block"
+                );
+            }
             node.clear_peer_block_requests_for_hash(hash);
             node.update_peer_best_known_block(peer_id, hash);
             Ok(true)

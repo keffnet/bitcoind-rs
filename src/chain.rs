@@ -10015,6 +10015,12 @@ impl ChainState {
             return Ok(());
         }
         let marker_matches = self.electrum_history_store_tip_matches();
+        info!(
+            "Electrum history index state: marker_matches={marker_matches} durable_entries={} snapshot_entries={} generation={}",
+            self.electrum_history_store.len(),
+            self.history.len(),
+            self.electrum_history_store.generation()
+        );
         if marker_matches && self.electrum_history_store.len() == self.history.len() {
             return Ok(());
         }
@@ -10649,12 +10655,18 @@ impl ChainState {
         self.flush_append_only_stores()?;
         self.persist_metadata()?;
         self.sync_utxo_store()?;
-        if compact {
-            self.utxo_store.compact_if_needed()?;
+        if compact && self.utxo_store.compact_if_needed()? {
+            // Compaction may replace or rebuild the physical index. Publish
+            // its final generation rather than leaving the pre-compaction
+            // marker behind for the next startup.
+            self.persist_utxo_store_tip()?;
         }
         self.sync_electrum_history_store()?;
-        if compact && self.history_index_enabled {
-            self.electrum_history_store.compact_if_needed()?;
+        if compact
+            && self.history_index_enabled
+            && self.electrum_history_store.compact_if_needed()?
+        {
+            self.persist_electrum_history_store_tip()?;
         }
         let snapshot = self.current_snapshot()?;
         let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;

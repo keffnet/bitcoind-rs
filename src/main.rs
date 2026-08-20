@@ -26,6 +26,12 @@ use bitcoind_rs::{
     config::{Args, Config, ConfigFileArg, is_known_config_option},
 };
 
+fn nested_core_startup_error(error: &anyhow::Error) -> Option<&bitcoind_rs::CoreStartupError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<bitcoind_rs::CoreStartupError>())
+}
+
 fn main() {
     // Match Core's private data-file default.  This must be set before any
     // configuration, directory, or log file is created so the process umask
@@ -35,12 +41,9 @@ fn main() {
         libc::umask(0o077);
     }
     if let Err(error) = run() {
-        if error
-            .downcast_ref::<bitcoind_rs::CoreStartupError>()
-            .is_some()
-        {
+        if let Some(core_error) = nested_core_startup_error(&error) {
             // Core prints the non-interactive recovery message verbatim.
-            eprintln!("{error}");
+            eprintln!("{core_error}");
         } else {
             eprintln!("Error: {error}");
         }

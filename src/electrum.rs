@@ -3725,6 +3725,29 @@ mod tests {
         assert_eq!(line, b"abc\n");
     }
 
+    async fn read_electrum_json_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Value> {
+        let mut line = Vec::new();
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_until(b'\n', &mut line),
+        )
+        .await??;
+        if bytes == 0 {
+            bail!("Electrum connection closed while waiting for a response")
+        }
+        Ok(serde_json::from_slice(&line)?)
+    }
+
+    async fn send_electrum_json<W: tokio::io::AsyncWrite + Unpin>(
+        writer: &mut W,
+        request: Value,
+    ) -> Result<()> {
+        let mut encoded = serde_json::to_vec(&request)?;
+        encoded.push(b'\n');
+        writer.write_all(&encoded).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn electrum_features_advertise_kernel_selected_port() -> Result<()> {
         let directory = tempfile::tempdir()?;
@@ -3757,6 +3780,199 @@ mod tests {
             server_features(&node)["hosts"]["127.0.0.1"]["tcp_port"],
             address.port()
         );
+        task.abort();
+        let _ = task.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn electrum_tcp_pushes_chain_reorg_and_mempool_notifications() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--regtest",
+            "--electrum=127.0.0.1:0",
+            "--listen=false",
+            "--connect=0",
+            "--dnsseed=false",
+            "--fixedseeds=false",
+            "--acceptnonstdtxn",
+        ])?;
+        let node = Node::open(crate::config::Config::from_args(args)?)?;
+        let task = tokio::spawn(ElectrumServer::new(node.clone()).run());
+        let address = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(address) = node.electrum_address()
+                    && address.port() != 0
+                {
+                    break address;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        let client = TcpStream::connect(address).await?;
+        let mut reader = BufReader::new(client);
+        send_electrum_json(
+            reader.get_mut(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server.version",
+                "params": ["tcp-integration-test", "1.7"],
+            }),
+        )
+        .await?;
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(response["result"][1], json!("1.7"));
+
+        send_electrum_json(
+            reader.get_mut(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "blockchain.headers.subscribe",
+                "params": [],
+            }),
+        )
+        .await?;
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(response["result"]["height"], json!(0));
+
+        send_electrum_json(
+            reader.get_mut(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "blockchain.numblocks.subscribe",
+                "params": [],
+            }),
+        )
+        .await?;
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(response["result"], json!(0));
+
+        let script = ScriptBuf::from_bytes(vec![0x51]);
+        let script_hash = chain::electrum_script_hash(&script);
+        send_electrum_json(
+            reader.get_mut(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "blockchain.scriptpubkey.subscribe",
+                "params": [hex::encode(script.as_bytes())],
+            }),
+        )
+        .await?;
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(response["result"], Value::Null);
+
+        let genesis = *node.chain.read().header(0).expect("genesis header exists");
+        let main_one = mine_test_block(&genesis, 1, 1);
+        node.connect_block(main_one.clone())?;
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(response["method"], json!("blockchain.headers.subscribe"));
+        assert_eq!(response["params"][0]["height"], json!(1));
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(response["method"], json!("blockchain.numblocks.subscribe"));
+        assert_eq!(response["params"], json!([1]));
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(
+            response["method"],
+            json!("blockchain.scriptpubkey.subscribe")
+        );
+        assert_eq!(response["params"][0], json!(script_hash));
+        let mut last_status = response["params"][1].clone();
+        assert!(last_status.is_string());
+
+        let main_two = mine_test_block(&main_one.header, 2, 2);
+        node.connect_block(main_two.clone())?;
+        for expected_height in [2] {
+            let response = read_electrum_json_line(&mut reader).await?;
+            assert_eq!(response["method"], json!("blockchain.headers.subscribe"));
+            assert_eq!(response["params"][0]["height"], json!(expected_height));
+            let response = read_electrum_json_line(&mut reader).await?;
+            assert_eq!(response["method"], json!("blockchain.numblocks.subscribe"));
+            assert_eq!(response["params"], json!([expected_height]));
+            let response = read_electrum_json_line(&mut reader).await?;
+            assert_eq!(
+                response["method"],
+                json!("blockchain.scriptpubkey.subscribe")
+            );
+            assert!(response["params"][1].is_string());
+        }
+
+        // A longer side branch must trigger a notification even though the
+        // modern status subscription is already populated.
+        let side_one = mine_test_block(&genesis, 1, 11);
+        let funding_outpoint = OutPoint::new(side_one.txdata[0].compute_txid(), 0);
+        node.connect_block(side_one.clone())?;
+        let side_two = mine_test_block(&side_one.header, 2, 12);
+        node.connect_block(side_two.clone())?;
+        let side_three = mine_test_block(&side_two.header, 3, 13);
+        node.connect_block(side_three.clone())?;
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(response["method"], json!("blockchain.headers.subscribe"));
+        assert_eq!(response["params"][0]["height"], json!(3));
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(response["method"], json!("blockchain.numblocks.subscribe"));
+        assert_eq!(response["params"], json!([3]));
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(
+            response["method"],
+            json!("blockchain.scriptpubkey.subscribe")
+        );
+        assert_eq!(response["params"][0], json!(script_hash));
+        last_status = response["params"][1].clone();
+        assert!(last_status.is_string());
+
+        let mut previous = side_three.header;
+        for height in 4..=101 {
+            let block = mine_test_block(&previous, height, height as u8);
+            node.connect_block(block.clone())?;
+            let response = read_electrum_json_line(&mut reader).await?;
+            assert_eq!(response["method"], json!("blockchain.headers.subscribe"));
+            assert_eq!(response["params"][0]["height"], json!(height));
+            let response = read_electrum_json_line(&mut reader).await?;
+            assert_eq!(response["method"], json!("blockchain.numblocks.subscribe"));
+            assert_eq!(response["params"], json!([height]));
+            let response = read_electrum_json_line(&mut reader).await?;
+            assert_eq!(
+                response["method"],
+                json!("blockchain.scriptpubkey.subscribe")
+            );
+            last_status = response["params"][1].clone();
+            previous = block.header;
+        }
+
+        let transaction = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding_outpoint,
+                script_sig: ScriptBuf::from_bytes(vec![0; 100]),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: script,
+            }],
+        };
+        node.accept_transaction(transaction)?;
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(
+            response["method"],
+            json!("blockchain.scriptpubkey.subscribe")
+        );
+        assert_eq!(response["params"][0], json!(script_hash));
+        assert!(response["params"][1].is_string());
+        assert_ne!(response["params"][1], last_status);
+
+        drop(reader);
         task.abort();
         let _ = task.await;
         Ok(())

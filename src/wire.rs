@@ -27,6 +27,10 @@ pub(crate) const MAX_LOCATOR_HASHES: usize = 101;
 const MAX_USER_AGENT_LENGTH: usize = 256;
 const MAX_BLOCK_TRANSACTIONS: usize = 1_000_000;
 const MAX_TRANSACTION_OUTPUTS: usize = 1_000_000;
+const INVENTORY_ITEM_SIZE: usize = 36;
+const ADDR_ITEM_SIZE: usize = 30;
+const ADDRV2_MIN_ITEM_SIZE: usize = 9;
+const HEADER_ITEM_MIN_SIZE: usize = 81;
 // Core accepts the otherwise non-standard legacy transaction shape with no
 // inputs and no outputs. Its smallest serialization is version + two
 // CompactSize fields + locktime.
@@ -1479,6 +1483,11 @@ fn decode_inventory(reader: &mut Reader<'_>) -> Result<Vec<Inventory>, WireError
     if count > MAX_INVENTORY_ITEMS {
         return Err(WireError::Payload("too many inventory items".to_owned()));
     }
+    if count > reader.remaining() / INVENTORY_ITEM_SIZE {
+        return Err(WireError::Payload(
+            "inventory count exceeds payload size".to_owned(),
+        ));
+    }
     let mut items = Vec::with_capacity(count);
     for _ in 0..count {
         items.push(Inventory {
@@ -1493,6 +1502,11 @@ fn decode_addr(reader: &mut Reader<'_>) -> Result<Vec<NetworkAddress>, WireError
     let count = bounded_count(reader.compact_size()?)?;
     if count > 1_000 {
         return Err(WireError::Payload("too many address records".to_owned()));
+    }
+    if count > reader.remaining() / ADDR_ITEM_SIZE {
+        return Err(WireError::Payload(
+            "address count exceeds payload size".to_owned(),
+        ));
     }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
@@ -1514,6 +1528,11 @@ fn decode_addr_v2(reader: &mut Reader<'_>) -> Result<Vec<NetworkAddressV2>, Wire
     let count = bounded_count(reader.compact_size()?)?;
     if count > 1_000 {
         return Err(WireError::Payload("too many address records".to_owned()));
+    }
+    if count > reader.remaining() / ADDRV2_MIN_ITEM_SIZE {
+        return Err(WireError::Payload(
+            "address count exceeds payload size".to_owned(),
+        ));
     }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
@@ -1544,6 +1563,12 @@ fn decode_getheaders(reader: &mut Reader<'_>) -> Result<GetHeadersMessage, WireE
     if count > MAX_LOCATOR_HASHES {
         return Err(WireError::Payload("too many locator hashes".to_owned()));
     }
+    let hash_bytes = reader.remaining().saturating_sub(32);
+    if count > hash_bytes / 32 {
+        return Err(WireError::Payload(
+            "locator hash count exceeds payload size".to_owned(),
+        ));
+    }
     let mut locator_hashes = Vec::with_capacity(count);
     for _ in 0..count {
         locator_hashes.push(BlockHash::from_byte_array(reader.array::<32>()?));
@@ -1559,6 +1584,11 @@ fn decode_headers(reader: &mut Reader<'_>) -> Result<Vec<bitcoin::block::Header>
     let count = bounded_count(reader.compact_size()?)?;
     if count > 2_000 {
         return Err(WireError::Payload("too many headers".to_owned()));
+    }
+    if count > reader.remaining() / HEADER_ITEM_MIN_SIZE {
+        return Err(WireError::Payload(
+            "header count exceeds payload size".to_owned(),
+        ));
     }
     let mut headers = Vec::with_capacity(count);
     for _ in 0..count {
@@ -2025,11 +2055,32 @@ mod tests {
         put_compact_size(50_001, &mut inventory).unwrap();
         assert!(decode_inventory(&mut Reader::new(&inventory)).is_err());
 
+        let mut short_inventory = Vec::new();
+        put_compact_size(MAX_INVENTORY_ITEMS, &mut short_inventory).unwrap();
+        assert!(decode_inventory(&mut Reader::new(&short_inventory)).is_err());
+
         let mut locator = Vec::new();
         put_i32(VersionMessage::PROTOCOL_VERSION, &mut locator);
         put_compact_size(102, &mut locator).unwrap();
         locator.extend_from_slice(&[0; 32 * 103]);
         assert!(decode_getheaders(&mut Reader::new(&locator)).is_err());
+
+        let mut short_locator = Vec::new();
+        put_i32(VersionMessage::PROTOCOL_VERSION, &mut short_locator);
+        put_compact_size(MAX_LOCATOR_HASHES, &mut short_locator).unwrap();
+        assert!(decode_getheaders(&mut Reader::new(&short_locator)).is_err());
+
+        let mut short_headers = Vec::new();
+        put_compact_size(2_000, &mut short_headers).unwrap();
+        assert!(decode_headers(&mut Reader::new(&short_headers)).is_err());
+
+        let mut short_addr = Vec::new();
+        put_compact_size(1_000, &mut short_addr).unwrap();
+        assert!(decode_addr(&mut Reader::new(&short_addr)).is_err());
+
+        let mut short_addrv2 = Vec::new();
+        put_compact_size(1_000, &mut short_addrv2).unwrap();
+        assert!(decode_addr_v2(&mut Reader::new(&short_addrv2)).is_err());
     }
 
     #[test]

@@ -312,6 +312,9 @@ const MAX_PRIVATE_BROADCAST_CONNECTIONS: usize = 64;
 const INVENTORY_BROADCAST_TARGET: usize = 70;
 const INVENTORY_BROADCAST_MAX: usize = 1_000;
 const BLOCK_RELAY_INTERVAL: Duration = Duration::from_millis(100);
+// Give a burst of block announcements a short chance to coalesce before
+// emitting getdata, while keeping direct block fetches responsive.
+const GETDATA_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 
 fn block_relay_cursor_after_batch(previous: BlockHash, announced: &[BlockHash]) -> BlockHash {
     announced.last().copied().unwrap_or(previous)
@@ -4575,6 +4578,9 @@ async fn serve_peer_loop(
     let mut block_download_interval = tokio::time::interval(Duration::from_millis(100));
     block_download_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     block_download_interval.tick().await;
+    let mut getdata_flush_interval = tokio::time::interval(GETDATA_FLUSH_INTERVAL);
+    getdata_flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    getdata_flush_interval.tick().await;
     let mut pending_block_requests = Vec::new();
     let mut pending_getdata = VecDeque::new();
     let mut headers_sync: Option<LowWorkHeadersSync> = None;
@@ -4974,6 +4980,17 @@ async fn serve_peer_loop(
                         node.note_block_staller(staller);
                     }
                 }
+                continue;
+            }
+            _ = getdata_flush_interval.tick(), if !pending_block_requests.is_empty() => {
+                flush_pending_block_requests(
+                    node,
+                    peer_id,
+                    writer,
+                    node.config.network,
+                    &mut pending_block_requests,
+                )
+                .await?;
                 continue;
             }
             _ = block_relay_interval.tick(), if version_received && verack_received && !*peer_state.private_broadcast_peer.lock() && !reader.has_partial_frame() => {
@@ -6200,14 +6217,6 @@ async fn serve_peer_loop(
                         let schedule =
                             node.next_block_download_schedule(peer_id, available, peer_services);
                         queue_block_requests(&mut pending_block_requests, schedule.requests);
-                        flush_pending_block_requests(
-                            node,
-                            peer_id,
-                            writer,
-                            node.config.network,
-                            &mut pending_block_requests,
-                        )
-                        .await?;
                         if pending_block_requests.is_empty()
                             && let Some(staller) = schedule.staller
                         {

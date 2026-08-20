@@ -312,7 +312,10 @@ impl ElectrumServer {
             startup.service_ready();
         }
         loop {
-            let (stream, peer) = listener.accept().await?;
+            let (stream, peer) = tokio::select! {
+                result = listener.accept() => result?,
+                _ = self.node.wait_for_shutdown() => return Ok(()),
+            };
             let node = self.node.clone();
             tokio::spawn(async move {
                 if let Err(error) = handle_client(node, stream).await {
@@ -341,6 +344,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     loop {
         line.clear();
         tokio::select! {
+            _ = node.wait_for_shutdown() => return Ok(()),
             event = events.recv() => {
                 let tip = match event {
                     Ok(tip) => tip,
@@ -2121,6 +2125,7 @@ mod tests {
     use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
     use clap::Parser;
+    use tokio::io::AsyncReadExt;
 
     fn mine_test_block(previous: &Header, height: u32, tag: u8) -> Block {
         let mut block = Block {
@@ -3782,6 +3787,60 @@ mod tests {
         );
         task.abort();
         let _ = task.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn electrum_clients_close_when_node_shuts_down() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--regtest",
+            "--electrum=127.0.0.1:0",
+            "--listen=false",
+            "--connect=0",
+            "--dnsseed=false",
+            "--fixedseeds=false",
+        ])?;
+        let node = Node::open(crate::config::Config::from_args(args)?)?;
+        let run_task = tokio::spawn(node.clone().run());
+        let address = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(address) = node.electrum_address()
+                    && address.port() != 0
+                {
+                    break address;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        let stream = TcpStream::connect(address).await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        send_electrum_json(
+            &mut write_half,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server.version",
+                "params": ["shutdown-test", "1.7"],
+            }),
+        )
+        .await?;
+        let response = read_electrum_json_line(&mut reader).await?;
+        assert_eq!(response["result"][1], json!("1.7"));
+
+        node.request_shutdown();
+        let mut buffer = [0u8; 1];
+        let bytes_read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), reader.read(&mut buffer))
+                .await??;
+        assert_eq!(bytes_read, 0, "Electrum client remained connected");
+        run_task.await??;
         Ok(())
     }
 

@@ -4990,6 +4990,7 @@ impl ChainState {
 
         let mut transactions: HashMap<Txid, (Transaction, TxLocation)> =
             HashMap::with_capacity(by_block.len());
+        let mut pruned_blocks = Vec::new();
         for (block_hash, entries) in by_block {
             if let Some(block) = self.store.get(&block_hash)? {
                 for (txid, location) in entries {
@@ -5008,11 +5009,19 @@ impl ChainState {
                 }
                 continue;
             }
+            pruned_blocks.push((block_hash, entries));
+        }
 
-            let Some(store) = self.electrum_store.as_mut() else {
-                continue;
-            };
-            let Some(block_transactions) = store.transactions_for_block(&block_hash)? else {
+        let Some(store) = self.electrum_store.as_mut() else {
+            return Ok(transactions);
+        };
+        let block_hashes = pruned_blocks
+            .iter()
+            .map(|(block_hash, _)| *block_hash)
+            .collect::<Vec<_>>();
+        let block_transactions = store.transactions_for_blocks(&block_hashes)?;
+        for (block_hash, entries) in pruned_blocks {
+            let Some(block_transactions) = block_transactions.get(&block_hash) else {
                 continue;
             };
             for (txid, location) in entries {
@@ -13153,6 +13162,41 @@ mod tests {
         assert_eq!(transactions[&second_txid].1.height, 2);
         assert_eq!(transactions[&first_txid].0.compute_txid(), first_txid);
         assert_eq!(transactions[&second_txid].0.compute_txid(), second_txid);
+    }
+
+    #[test]
+    fn active_transaction_batch_reads_pruned_sidecar_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_pruning(1).unwrap();
+        state.configure_electrum_index(true).unwrap();
+
+        let mut selected = Vec::new();
+        let mut selected_hashes = HashSet::new();
+        for height in 1..=300 {
+            let block = mine_block(&state, height);
+            if matches!(height, 2 | 4) {
+                selected.push((block.txdata[0].compute_txid(), block.block_hash()));
+                selected_hashes.insert(block.block_hash());
+            }
+            state.connect_block(block).unwrap();
+        }
+        state.prune(5).unwrap();
+
+        let sidecar = state.electrum_store.as_ref().unwrap();
+        assert!(selected_hashes.iter().all(|hash| sidecar.contains(hash)));
+        assert!(
+            selected_hashes
+                .iter()
+                .all(|hash| !state.store.contains(hash))
+        );
+
+        let requested = [selected[1].0, selected[0].0, selected[1].0];
+        let transactions = state.active_transactions(&requested).unwrap();
+        assert_eq!(transactions.len(), 2);
+        for (txid, _) in selected {
+            assert_eq!(transactions[&txid].0.compute_txid(), txid);
+        }
     }
 
     #[test]

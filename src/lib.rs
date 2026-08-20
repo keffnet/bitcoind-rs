@@ -1776,6 +1776,7 @@ pub struct Node {
     added_node_names: parking_lot::RwLock<HashMap<NetworkEndpoint, String>>,
     banned_addresses: parking_lot::RwLock<HashMap<IpSubnet, BannedAddress>>,
     banned_network_addresses: parking_lot::RwLock<HashMap<NetworkEndpoint, BannedNetworkAddress>>,
+    electrum_address: parking_lot::RwLock<Option<SocketAddr>>,
     listen_address: parking_lot::RwLock<Option<SocketAddr>>,
     listen_addresses: parking_lot::RwLock<Vec<SocketAddr>>,
     mapped_addresses: parking_lot::RwLock<Vec<SocketAddr>>,
@@ -2276,6 +2277,7 @@ impl Node {
             config.logging.debug_categories.iter().cloned().collect()
         };
         let mempool_stats = MempoolStats::new(config.stats_enable, config.stats_max_memory_target);
+        let electrum_address = config.electrum_bind;
         let node = Arc::new(Self {
             config,
             _data_dir_lock: data_dir_lock,
@@ -2352,6 +2354,7 @@ impl Node {
             added_node_names: parking_lot::RwLock::new(added_node_names),
             banned_addresses: parking_lot::RwLock::new(banned_addresses),
             banned_network_addresses: parking_lot::RwLock::new(banned_network_addresses),
+            electrum_address: parking_lot::RwLock::new(electrum_address),
             listen_address: parking_lot::RwLock::new(None),
             listen_addresses: parking_lot::RwLock::new(Vec::new()),
             mapped_addresses: parking_lot::RwLock::new(Vec::new()),
@@ -5562,6 +5565,14 @@ impl Node {
     pub(crate) fn set_listen_address(&self, address: SocketAddr) {
         *self.listen_address.write() = Some(address);
         *self.listen_addresses.write() = vec![address];
+    }
+
+    pub(crate) fn set_electrum_address(&self, address: SocketAddr) {
+        *self.electrum_address.write() = Some(address);
+    }
+
+    pub(crate) fn electrum_address(&self) -> Option<SocketAddr> {
+        *self.electrum_address.read()
     }
 
     pub(crate) fn add_listen_address(&self, address: SocketAddr) {

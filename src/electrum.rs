@@ -287,6 +287,10 @@ impl ElectrumServer {
         let listener = TcpListener::bind(address)
             .await
             .with_context(|| format!("binding Electrum listener {address}"))?;
+        // Port zero is useful for test harnesses and supervisors. Advertise
+        // the kernel-selected port in server.features rather than the
+        // unresolved configuration value.
+        self.node.set_electrum_address(listener.local_addr()?);
         if let Some(startup) = startup.as_deref() {
             startup.service_ready();
         }
@@ -907,7 +911,7 @@ fn server_features(node: &Arc<Node>) -> Value {
 
 fn server_features_for_protocol(node: &Arc<Node>, protocol_version: ProtocolVersion) -> Value {
     let mut hosts = serde_json::Map::new();
-    if let Some(address) = node.config.electrum_bind {
+    if let Some(address) = node.electrum_address() {
         let host = if address.ip().is_unspecified() {
             "localhost".to_owned()
         } else {
@@ -1981,6 +1985,7 @@ mod tests {
     use bitcoin::blockdata::transaction::{TxIn, TxOut, Version};
     use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
+    use clap::Parser;
 
     fn mine_test_block(previous: &Header, height: u32, tag: u8) -> Block {
         let mut block = Block {
@@ -3481,6 +3486,43 @@ mod tests {
             4
         );
         assert_eq!(line, b"abc\n");
+    }
+
+    #[tokio::test]
+    async fn electrum_features_advertise_kernel_selected_port() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--regtest",
+            "--electrum=127.0.0.1:0",
+            "--listen=false",
+            "--connect=0",
+            "--dnsseed=false",
+            "--fixedseeds=false",
+        ])?;
+        let node = Node::open(crate::config::Config::from_args(args)?)?;
+        let server = ElectrumServer::new(node.clone());
+        let task = tokio::spawn(server.run());
+        let address = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(address) = node.electrum_address()
+                    && address.port() != 0
+                {
+                    break address;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(
+            server_features(&node)["hosts"]["127.0.0.1"]["tcp_port"],
+            address.port()
+        );
+        task.abort();
+        let _ = task.await;
+        Ok(())
     }
 
     #[tokio::test]

@@ -2235,16 +2235,24 @@ impl ElectrumHistoryStore {
             let next_batch_id = batch_id
                 .checked_add(1)
                 .context("Electrum history batch identifier exhausted during compaction")?;
-            let entries_empty = locations.is_empty();
             let mut compact_index = HashMap::with_capacity(locations.len());
-            if !entries_empty {
-                for (script_hash_bytes, location) in &locations {
-                    let body = read_history_data_record(&self.file, *location)?;
-                    let history = decode_history_value(&body, *script_hash_bytes)?;
-                    let body = encode_history_value(batch_id, *script_hash_bytes, &history)?;
-                    let location = append_history_data_record(&mut compact_data, &body)?;
-                    compact_index.insert(*script_hash_bytes, location);
+            let mut copied_entries = 0usize;
+            for (script_hash_bytes, location) in &locations {
+                let body = read_history_data_record(&self.file, *location)?;
+                let history = decode_history_value(&body, *script_hash_bytes)?;
+                if history.is_empty() {
+                    // Reorg deltas may leave an empty replacement value for a
+                    // script that no longer has any active-chain history.
+                    // Keep the append-only log readable, but do not carry a
+                    // phantom key into the compacted index.
+                    continue;
                 }
+                let body = encode_history_value(batch_id, *script_hash_bytes, &history)?;
+                let location = append_history_data_record(&mut compact_data, &body)?;
+                compact_index.insert(*script_hash_bytes, location);
+                copied_entries = copied_entries.saturating_add(1);
+            }
+            if copied_entries != 0 {
                 let commit = encode_history_commit(batch_id);
                 append_history_data_record(&mut compact_data, &commit)?;
             }
@@ -2265,7 +2273,7 @@ impl ElectrumHistoryStore {
             rewrite_history_index(
                 &mut compact_index_file,
                 data_end,
-                if entries_empty {
+                if copied_entries == 0 {
                     self.next_batch_id
                 } else {
                     next_batch_id
@@ -2309,7 +2317,7 @@ impl ElectrumHistoryStore {
                     )
                 })?;
             self.index = compact_index;
-            self.next_batch_id = if entries_empty {
+            self.next_batch_id = if copied_entries == 0 {
                 self.next_batch_id
             } else {
                 next_batch_id
@@ -4888,6 +4896,37 @@ mod tests {
         let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
         assert_eq!(reopened.get(&script_hash).unwrap(), history);
         assert_eq!(reopened.generation(), 10);
+    }
+
+    #[test]
+    fn electrum_history_compaction_drops_empty_reorg_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let removed_script = hex::encode([12u8; 32]);
+        let live_script = hex::encode([13u8; 32]);
+        let removed_txid = Txid::from_byte_array([14u8; 32]);
+        let live_txid = Txid::from_byte_array([15u8; 32]);
+        let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
+        store
+            .apply_batch(&[
+                (removed_script.clone(), vec![(removed_txid, 1)]),
+                (live_script.clone(), vec![(live_txid, 2)]),
+            ])
+            .unwrap();
+        store
+            .apply_batch(&[(removed_script.clone(), Vec::new())])
+            .unwrap();
+        assert_eq!(store.len(), 2);
+
+        store.compact().unwrap();
+        assert_eq!(store.len(), 1);
+        assert!(store.get(&removed_script).unwrap().is_empty());
+        assert_eq!(store.get(&live_script).unwrap(), vec![(live_txid, 2)]);
+        drop(store);
+
+        let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert!(!reopened.contains(&removed_script));
+        assert_eq!(reopened.get(&live_script).unwrap(), vec![(live_txid, 2)]);
     }
 
     #[test]

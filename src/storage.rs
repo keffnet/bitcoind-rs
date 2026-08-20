@@ -1267,6 +1267,12 @@ impl ChainstateStore {
         Ok(())
     }
 
+    pub fn flush(&mut self) -> Result<()> {
+        self.flush_pending_writes()?;
+        self.index_file.sync_data()?;
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

@@ -7454,6 +7454,10 @@ impl Node {
         mempool_expiry_task.abort();
         fee_estimator_task.abort();
         unbroadcast_retry_task.abort();
+        self.chain
+            .write()
+            .flush()
+            .context("flushing chainstate during shutdown")?;
         run_notify_command(self.config.shutdown_notify.as_deref(), None);
         if let Err(error) = self.flush_fee_estimates(true) {
             warn!(%error, "unable to flush fee estimates during shutdown");

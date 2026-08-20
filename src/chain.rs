@@ -1926,6 +1926,26 @@ impl ChainState {
         self.active_chain.len().saturating_sub(1) as u32
     }
 
+    /// Make all append-only stores and the chain metadata durable.
+    ///
+    /// Header synchronization can update the in-memory block index while a
+    /// large metadata replacement is still in flight.  A final flush during
+    /// orderly shutdown closes that window and makes the current header tip
+    /// available on the next restart.
+    pub fn flush(&mut self) -> Result<()> {
+        self.store.flush()?;
+        self.chainstate_store.flush()?;
+        self.utxo_store.flush()?;
+        self.electrum_history_store.flush()?;
+        if let Some(store) = self.electrum_store.as_mut() {
+            store.flush()?;
+        }
+        if let Some(store) = self.tx_index_store.as_mut() {
+            store.flush()?;
+        }
+        self.persist_metadata()
+    }
+
     /// Verify the block-index parent links, chain-work accumulation, active
     /// chain vectors, and persisted transaction-count accounting.
     pub fn check_consistency(&self) -> Result<()> {
@@ -12730,6 +12750,27 @@ mod tests {
         state.connect_block(child).unwrap();
         assert_eq!(state.height(), 2);
         assert_eq!(state.blocks_ahead_of_tip(), None);
+    }
+
+    #[test]
+    fn flush_persists_header_tip_for_clean_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let child = mine_block_from_header(&parent.header, 2, 10);
+
+        // Model the in-memory portion of a header response immediately before
+        // the shutdown path takes its final durable snapshot.
+        let (_, inserted) = state
+            .accept_headers_internal(&[parent.header, child.header])
+            .unwrap();
+        assert!(inserted);
+        state.flush().unwrap();
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_header_tip().hash, child.block_hash());
+        assert_eq!(reopened.blocks_ahead_of_tip(), Some(2));
     }
 
     #[test]

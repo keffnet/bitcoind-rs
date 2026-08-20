@@ -69,6 +69,10 @@ const ASSUMEUTXO_CHECKPOINT_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-checkpoint-v
 const ASSUMEUTXO_CHECKPOINT_INTERVAL: u32 = 256;
 const HEADER_RECORD_SIZE: usize = 80 + 4;
 const HEADER_JOURNAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+// Re-enabling Electrum after a history-disabled IBD must not materialize the
+// whole script-history map. Keep only this many scripts' complete histories
+// resident while replaying and writing the durable store.
+const ELECTRUM_REBUILD_BATCH_SCRIPTS: usize = 4_096;
 // Peer/IBD writes use append-only records and publish a bounded durability
 // boundary instead of forcing several fsyncs for every block. Direct API and
 // mining paths retain their immediate-sync behavior.
@@ -2779,10 +2783,13 @@ impl ChainState {
         }
         if !was_enabled {
             // A caller may enable the index after opening a node with it
-            // disabled. Read the durable history lazily rather than serving
+            // disabled. Rebuild from block/undo records rather than serving
             // the intentionally empty in-memory map from the disabled mode.
             self.history.clear();
             self.history_materialized = false;
+            if !self.electrum_history_store_tip_matches() {
+                self.rebuild_electrum_history_index()?;
+            }
         }
         if !self.is_pruned() {
             self.electrum_store = None;
@@ -2802,6 +2809,83 @@ impl ChainState {
         store.retain_only(&retained)?;
         self.electrum_store = Some(store);
         Ok(())
+    }
+
+    /// Rebuild the Electrum script-history store after a node was synchronized
+    /// with history indexing disabled. Undo records contain the exact spent
+    /// outputs in transaction-input order, so this can reconstruct both output
+    /// and spending histories without keeping a second full UTXO set in RAM.
+    ///
+    /// The active chain is preflighted before replacing the durable history
+    /// values. That makes a later enable fail cleanly on a pruned node whose
+    /// historical bodies or undo records are unavailable instead of silently
+    /// publishing a partial index.
+    fn rebuild_electrum_history_index(&mut self) -> Result<()> {
+        let active_chain = self.active_chain.clone();
+        for hash in &active_chain {
+            let block = self
+                .store
+                .get(hash)?
+                .with_context(|| format!("Electrum history rebuild is missing block {hash}"))?;
+            let undo = self
+                .store
+                .get_undo(hash)?
+                .with_context(|| format!("Electrum history rebuild is missing undo for {hash}"))?;
+            self.validate_block_undo(&block, &undo)
+                .with_context(|| format!("invalid undo data while rebuilding block {hash}"))?;
+        }
+
+        self.electrum_history_store
+            .replace_all(std::iter::empty())?;
+        let mut pending: HashMap<String, Vec<(Txid, u32)>> = HashMap::new();
+        for (height, hash) in active_chain.iter().copied().enumerate() {
+            let height = u32::try_from(height).context("active chain height does not fit u32")?;
+            let block = self
+                .store
+                .get(&hash)?
+                .with_context(|| format!("Electrum history rebuild is missing block {hash}"))?;
+            let undo = self
+                .store
+                .get_undo(&hash)?
+                .with_context(|| format!("Electrum history rebuild is missing undo for {hash}"))?;
+            self.check_shutdown_interrupt()?;
+            for (transaction_index, transaction) in block.txdata.iter().enumerate() {
+                let txid = transaction.compute_txid();
+                let mut affected_scripts = HashSet::new();
+                if transaction_index > 0 {
+                    for output in &undo[transaction_index] {
+                        affected_scripts.insert(electrum_script_hash(&output.script_pubkey));
+                    }
+                }
+                for output in &transaction.output {
+                    affected_scripts.insert(electrum_script_hash(&output.script_pubkey));
+                }
+                let entry = (txid, height);
+                for script_hash in affected_scripts {
+                    if !pending.contains_key(&script_hash) {
+                        let history = self.electrum_history_store.get(&script_hash)?;
+                        pending.insert(script_hash.clone(), history);
+                    }
+                    let history = pending
+                        .get_mut(&script_hash)
+                        .expect("history rebuild entry was inserted above");
+                    if history.last() != Some(&entry) {
+                        history.push(entry);
+                    }
+                }
+            }
+            if pending.len() >= ELECTRUM_REBUILD_BATCH_SCRIPTS {
+                let updates = std::mem::take(&mut pending).into_iter().collect::<Vec<_>>();
+                self.electrum_history_store.apply_batch(&updates)?;
+            }
+        }
+        if !pending.is_empty() {
+            let updates = pending.into_iter().collect::<Vec<_>>();
+            self.electrum_history_store.apply_batch(&updates)?;
+        }
+        self.history.clear();
+        self.history_materialized = false;
+        self.persist_electrum_history_store_tip()
     }
 
     /// Enable or disable the durable coinstats index. Enabling it builds any
@@ -9539,13 +9623,10 @@ impl ChainState {
         self.persist_electrum_history_store_tip()
     }
 
-    fn reconcile_electrum_history_store(&mut self) -> Result<()> {
-        if !self.history_index_enabled {
-            return Ok(());
-        }
+    fn electrum_history_store_tip_matches(&self) -> bool {
         let tip = fs::read_to_string(self.electrum_history_store_tip_path()).ok();
         let expected_tip = self.best_hash().to_string();
-        let marker_matches = tip.as_deref().is_some_and(|tip| {
+        tip.as_deref().is_some_and(|tip| {
             let mut lines = tip.lines();
             lines.next().map(str::trim) == Some(expected_tip.as_str())
                 && lines
@@ -9557,9 +9638,36 @@ impl ChainState {
                     .and_then(|length| length.trim().parse::<usize>().ok())
                     == Some(self.electrum_history_store.len())
                 && lines.next().is_none()
-        });
+        })
+    }
+
+    fn reconcile_electrum_history_store(&mut self) -> Result<()> {
+        if !self.history_index_enabled {
+            return Ok(());
+        }
+        let marker_matches = self.electrum_history_store_tip_matches();
         if marker_matches && self.electrum_history_store.len() == self.history.len() {
             return Ok(());
+        }
+        if marker_matches && self.history.is_empty() {
+            // The durable store is complete even when the in-memory snapshot
+            // was produced while history indexing was disabled.
+            self.history_materialized = false;
+            return Ok(());
+        }
+        // A node synchronized with Electrum disabled persists an intentionally
+        // empty history map and no matching tip marker. A suffix replay may
+        // populate this map partially before reconciliation, so use the
+        // genesis history entry as the completeness marker. If it is absent,
+        // rebuilding here is the only way to recover the historical index
+        // without requiring the operator to guess that a full chainstate
+        // reindex is necessary.
+        let has_genesis_history = self
+            .history
+            .values()
+            .any(|entries| entries.iter().any(|entry| entry.height == 0));
+        if self.height() > 0 && !has_genesis_history {
+            return self.rebuild_electrum_history_index();
         }
         self.sync_electrum_history_store()
     }
@@ -13241,12 +13349,19 @@ mod tests {
         state.configure_electrum_index(false).unwrap();
         let generation = state.electrum_history_store.generation();
         let block = mine_block(&state, 1);
+        let txid = block.txdata[0].compute_txid();
         let script_hash = electrum_script_hash(&block.txdata[0].output[0].script_pubkey);
 
         state.connect_block(block).unwrap();
 
         assert_eq!(state.electrum_history_store.generation(), generation);
         assert!(state.get_history(&script_hash).is_empty());
+
+        state.configure_electrum_index(true).unwrap();
+        assert_eq!(
+            state.get_history(&script_hash),
+            vec![HistoryEntry { txid, height: 1 }]
+        );
     }
 
     #[test]
@@ -13257,7 +13372,8 @@ mod tests {
         let script_hash = electrum_script_hash(&first.txdata[0].output[0].script_pubkey);
         enabled.connect_block(first).unwrap();
         let generation = enabled.electrum_history_store.generation();
-        assert!(!enabled.get_history(&script_hash).is_empty());
+        let expected_first_history = enabled.get_history(&script_hash);
+        assert!(!expected_first_history.is_empty());
         drop(enabled);
 
         let mut disabled = ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index(
@@ -13280,8 +13396,22 @@ mod tests {
         assert!(disabled.get_history(&script_hash).is_empty());
         assert_eq!(disabled.electrum_history_store.generation(), generation);
 
-        disabled.connect_block(mine_block(&disabled, 2)).unwrap();
+        // Leave a disabled-mode snapshot behind so the next enabled startup
+        // must repair a partially replayed suffix, not just an empty map.
+        disabled.persist_snapshot().unwrap();
+        let second = mine_block(&disabled, 2);
+        let second_txid = second.txdata[0].compute_txid();
+        disabled.connect_block(second).unwrap();
         assert_eq!(disabled.electrum_history_store.generation(), generation);
+
+        drop(disabled);
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut expected_history = expected_first_history;
+        expected_history.push(HistoryEntry {
+            txid: second_txid,
+            height: 2,
+        });
+        assert_eq!(reopened.get_history(&script_hash), expected_history);
     }
 
     #[test]

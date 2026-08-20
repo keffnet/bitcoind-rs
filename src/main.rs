@@ -90,34 +90,36 @@ fn run() -> Result<()> {
 }
 
 async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()> {
-    let node = Node::open(config)?;
-    let _pid_file = PidFile::create(node.config.pid_path.clone())?;
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(node.config.logging.tracing_filter()));
-    let (writer, log_file) = if let Some(path) = node
-        .config
+        .unwrap_or_else(|_| EnvFilter::new(config.logging.tracing_filter()));
+    let (writer, log_file) = if let Some(path) = config
         .debug_log_file_enabled
-        .then_some(&node.config.debug_log_path)
+        .then_some(&config.debug_log_path)
     {
-        let log_file = ReloadableLogFile::open(path, node.config.shrink_debug_file)
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Could not create debug log directory {}", parent.display())
+            })?;
+        }
+        let log_file = ReloadableLogFile::open(path, config.shrink_debug_file)
             .with_context(|| format!("Could not open debug log file {}", path.display()))?;
         let log_file_for_signal = log_file.clone();
-        if node.config.print_to_console {
-            let writer = if node.config.logging.log_rate_limit {
+        if config.print_to_console {
+            let writer = if config.logging.log_rate_limit {
                 BoxMakeWriter::new(std::io::stdout.and(RateLimitedLogFile::new(log_file.clone())))
             } else {
                 BoxMakeWriter::new(std::io::stdout.and(log_file.clone()))
             };
             (writer, Some(log_file_for_signal))
         } else {
-            let writer = if node.config.logging.log_rate_limit {
+            let writer = if config.logging.log_rate_limit {
                 BoxMakeWriter::new(RateLimitedLogFile::new(log_file.clone()))
             } else {
                 BoxMakeWriter::new(log_file.clone())
             };
             (writer, Some(log_file_for_signal))
         }
-    } else if node.config.print_to_console {
+    } else if config.print_to_console {
         (BoxMakeWriter::new(std::io::stdout), None)
     } else {
         (BoxMakeWriter::new(std::io::sink), None)
@@ -127,19 +129,27 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
         .with_target(false)
         .with_ansi(false)
         .with_writer(writer)
-        .with_level(node.config.logging.level_always)
-        .with_thread_names(node.config.logging.thread_names)
-        .with_file(node.config.logging.source_locations)
-        .with_line_number(node.config.logging.source_locations);
-    if !node.config.logging.timestamps {
+        .with_level(config.logging.level_always)
+        .with_thread_names(config.logging.thread_names)
+        .with_file(config.logging.source_locations)
+        .with_line_number(config.logging.source_locations);
+    if !config.logging.timestamps {
         builder.without_time().init();
-    } else if node.config.logging.time_micros {
+    } else if config.logging.time_micros {
         builder
             .with_timer(CoreLogTimer { microseconds: true })
             .init();
     } else {
         builder.init();
     }
+    tracing::info!("Loading block index");
+    let node = Node::open(config)?;
+    let _pid_file = PidFile::create(node.config.pid_path.clone())?;
+    let (best_height, best_hash) = {
+        let chain = node.chain.read();
+        (chain.height(), chain.best_hash())
+    };
+    tracing::info!("Loaded best chain: hash={best_hash} height={best_height}");
     node.log_asmap_configuration();
     if node.config.network == Network::Signet {
         tracing::info!(

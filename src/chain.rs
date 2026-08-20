@@ -10,6 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bincode::{deserialize as deserialize_binary, serialize as serialize_binary};
@@ -27,7 +28,7 @@ use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 use crate::config::{
     DEFAULT_SCRIPT_CHECK_THREADS, MAX_SCRIPT_CHECK_THREADS, network_data_dir_name,
@@ -53,6 +54,34 @@ const MAX_MISSING_UTXO_CACHE_ENTRIES: usize = 8_192;
 // hash-table/deque bookkeeping is accounted for as roughly 64 bytes here.
 const DEFAULT_SCRIPT_CACHE_ENTRIES: usize = (32 * 1024 * 1024) / 64;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
+const REPLAY_LOG_INTERVAL: usize = 10_000;
+
+fn log_replay_progress(
+    stage: &str,
+    completed: usize,
+    total: usize,
+    height: usize,
+    target_height: usize,
+    started: Instant,
+) {
+    if completed != total && completed % REPLAY_LOG_INTERVAL != 0 {
+        return;
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let rate = if elapsed > 0.0 {
+        completed as f64 / elapsed
+    } else {
+        0.0
+    };
+    let progress = if total == 0 {
+        100.0
+    } else {
+        completed as f64 * 100.0 / total as f64
+    };
+    info!(
+        "Replaying blocks: stage={stage} height={height} target={target_height} progress={progress:.1}% rate={rate:.0} blocks/s"
+    );
+}
 const FAST_PRUNE_BLOCKFILE_SIZE: usize = 0x10_000;
 const MAX_ORPHAN_BLOCKS: usize = 128;
 const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
@@ -2230,20 +2259,71 @@ impl ChainState {
                 state.spent_by.clear();
             }
             state.index_persisted_headers(&persisted_headers)?;
-            let deltas = state.load_chainstate_deltas(&active_chain, snapshot_chain_len);
-            if let Some(deltas) =
-                deltas.filter(|deltas| state.validate_chainstate_deltas(deltas).is_ok())
-            {
-                for delta in deltas {
+            let replay_blocks = active_chain.len().saturating_sub(snapshot_chain_len);
+            let target_height = active_chain.len().saturating_sub(1);
+            let replay_started = Instant::now();
+            if replay_blocks > 0 {
+                info!(
+                    "Replaying blocks from chainstate snapshot: height={} target={} blocks={replay_blocks}",
+                    snapshot_chain_len.saturating_sub(1),
+                    target_height
+                );
+            }
+            let loaded_deltas = state.load_chainstate_deltas(&active_chain, snapshot_chain_len);
+            let validated_deltas = match loaded_deltas {
+                Some(deltas) => match state.validate_chainstate_deltas(&deltas) {
+                    Ok(()) => Some(deltas),
+                    Err(error) => {
+                        warn!(
+                            "Chainstate replay records are invalid ({error:#}); falling back to native block replay"
+                        );
+                        None
+                    }
+                },
+                None => {
+                    if replay_blocks > 0 {
+                        warn!(
+                            "Chainstate replay records are missing or incomplete; falling back to native block replay"
+                        );
+                    }
+                    None
+                }
+            };
+            if let Some(deltas) = validated_deltas {
+                let apply_started = Instant::now();
+                for (offset, delta) in deltas.into_iter().enumerate() {
                     state.apply_chainstate_delta(delta)?;
+                    log_replay_progress(
+                        "apply-deltas",
+                        offset + 1,
+                        replay_blocks,
+                        snapshot_chain_len + offset,
+                        target_height,
+                        apply_started,
+                    );
                 }
             } else {
-                for hash in active_chain.iter().skip(snapshot_chain_len) {
+                let apply_started = Instant::now();
+                for (offset, hash) in active_chain.iter().skip(snapshot_chain_len).enumerate() {
                     let block = state.store.get(hash)?.with_context(|| {
                         format!("active block {hash} is missing from block store")
                     })?;
                     state.connect_block_internal(&block, false)?;
+                    log_replay_progress(
+                        "apply-blocks",
+                        offset + 1,
+                        replay_blocks,
+                        snapshot_chain_len + offset,
+                        target_height,
+                        apply_started,
+                    );
                 }
+            }
+            if replay_blocks > 0 {
+                info!(
+                    "Replayed {replay_blocks} blocks to height {target_height} in {:.2}s",
+                    replay_started.elapsed().as_secs_f64()
+                );
             }
         } else {
             state.snapshot_base = None;
@@ -2251,17 +2331,51 @@ impl ChainState {
             state.snapshot_validation_error = None;
             state.active_tx_counts.clear();
             state.active_tx_totals.clear();
+            let replay_blocks = active_chain.len().saturating_sub(1);
+            let target_height = active_chain.len().saturating_sub(1);
+            let replay_started = Instant::now();
+            if replay_blocks > 0 {
+                info!(
+                    "Replaying blocks without a chainstate snapshot: height=0 target={target_height} blocks={replay_blocks}"
+                );
+            }
             let mut blocks = Vec::with_capacity(active_chain.len());
-            for hash in &active_chain {
+            let load_started = Instant::now();
+            for (height, hash) in active_chain.iter().enumerate() {
                 let block = state
                     .store
                     .get(hash)?
                     .with_context(|| format!("active block {hash} is missing from block store"))?;
                 blocks.push(block);
+                if height > 0 {
+                    log_replay_progress(
+                        "load-blocks",
+                        height,
+                        replay_blocks,
+                        height,
+                        target_height,
+                        load_started,
+                    );
+                }
             }
             state.initialize_genesis(&blocks[0])?;
-            for block in blocks.iter().skip(1) {
+            let apply_started = Instant::now();
+            for (offset, block) in blocks.iter().skip(1).enumerate() {
                 state.connect_block_internal(block, false)?;
+                log_replay_progress(
+                    "apply-blocks",
+                    offset + 1,
+                    replay_blocks,
+                    offset + 1,
+                    target_height,
+                    apply_started,
+                );
+            }
+            if replay_blocks > 0 {
+                info!(
+                    "Replayed {replay_blocks} blocks to height {target_height} in {:.2}s",
+                    replay_started.elapsed().as_secs_f64()
+                );
             }
         }
         if state.active_tx_counts.len() != state.active_chain.len() {
@@ -10250,7 +10364,10 @@ impl ChainState {
             return Some(Vec::new());
         }
         let mut parent_hash = *active_chain.get(start_height.checked_sub(1)?)?;
-        let mut deltas = Vec::with_capacity(active_chain.len() - start_height);
+        let total = active_chain.len() - start_height;
+        let target_height = active_chain.len().saturating_sub(1);
+        let started = Instant::now();
+        let mut deltas = Vec::with_capacity(total);
         for (height, block_hash) in active_chain.iter().enumerate().skip(start_height) {
             let bytes = self.chainstate_store.get(block_hash).ok().flatten()?;
             let delta = deserialize_chainstate_delta(&bytes).ok()?;
@@ -10267,6 +10384,14 @@ impl ChainState {
             }
             parent_hash = *block_hash;
             deltas.push(delta);
+            log_replay_progress(
+                "load-deltas",
+                deltas.len(),
+                total,
+                height,
+                target_height,
+                started,
+            );
         }
         Some(deltas)
     }
@@ -10275,8 +10400,12 @@ impl ChainState {
         let mut parent_hash = self.best_hash();
         let mut height = u32::try_from(self.active_chain.len())
             .context("active chain height does not fit u32")?;
+        let target_height = deltas
+            .last()
+            .map_or_else(|| self.height() as usize, |delta| delta.height as usize);
+        let started = Instant::now();
         let mut touched = HashMap::<OutPoint, Option<UtxoEntry>>::new();
-        for delta in deltas {
+        for (offset, delta) in deltas.iter().enumerate() {
             if delta.height != height
                 || delta.parent_hash != parent_hash
                 || delta.transactions.is_empty()
@@ -10326,6 +10455,14 @@ impl ChainState {
             }
             parent_hash = delta.block_hash;
             height = height.saturating_add(1);
+            log_replay_progress(
+                "validate-deltas",
+                offset + 1,
+                deltas.len(),
+                delta.height as usize,
+                target_height,
+                started,
+            );
         }
         Ok(())
     }

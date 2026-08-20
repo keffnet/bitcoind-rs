@@ -7388,19 +7388,8 @@ impl Node {
     ) -> Result<()> {
         let startup_services = 4 + usize::from(!self.config.ipc_bind.is_empty());
         let startup = startup_sender.map(|sender| StartupLatch::new(sender, startup_services));
-        // Preserve Core's initialization trace points for operators and
-        // startup tooling. The corresponding native work is completed during
-        // Node::open or by the asynchronous services below; these markers do
-        // not imply Core's blk/rev database layout.
         info!("scheduler thread start");
         info!("Loading banlist");
-        info!("Loading block index");
-        info!("Checking all blk files are present");
-        let (best_height, best_hash) = {
-            let chain = self.chain.read();
-            (chain.height(), chain.best_hash())
-        };
-        info!("Loaded best chain: hash={best_hash} height={best_height}");
         info!("init message: Verifying blocks");
         if let Some(assume_valid) = self.config.assume_valid {
             info!("Assuming ancestors of block {assume_valid} have valid signatures.");

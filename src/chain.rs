@@ -1808,16 +1808,29 @@ impl ChainState {
         let blocks_dir = blocks_dir.as_ref().to_owned();
         fs::create_dir_all(&data_dir)
             .with_context(|| format!("creating chain data directory {}", data_dir.display()))?;
+        let block_store_started = Instant::now();
+        info!("Loading native block and undo storage indexes");
         let mut store = if reindex || reindex_chainstate {
             BlockStore::open_for_reindex_with_xor(&blocks_dir, blocks_xor)?
         } else {
             BlockStore::open_with_xor(&blocks_dir, blocks_xor)?
         };
+        info!(
+            "Loaded native block storage index: blocks={} in {:.2}s",
+            store.len(),
+            block_store_started.elapsed().as_secs_f64()
+        );
+        let auxiliary_store_started = Instant::now();
+        info!("Loading auxiliary storage indexes");
         let filter_store = FilterStore::open(data_dir.join("filters"))?;
         let tx_index_store = tx_index_all_enabled
             .then(|| TransactionIndexStore::open(data_dir.join("indexes/txindex")))
             .transpose()?;
         let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
+        info!(
+            "Loaded auxiliary storage indexes in {:.2}s",
+            auxiliary_store_started.elapsed().as_secs_f64()
+        );
         let genesis = genesis_block(network);
         let genesis_hash = genesis.block_hash();
         if !store.contains(&genesis_hash) {
@@ -1840,10 +1853,30 @@ impl ChainState {
                 }
             }
         }
+        let chainstate_store_started = Instant::now();
+        info!("Loading chainstate delta index");
         let chainstate_store = ChainstateStore::open(&chainstate_path)?;
+        info!(
+            "Loaded chainstate delta index in {:.2}s",
+            chainstate_store_started.elapsed().as_secs_f64()
+        );
+        let utxo_store_started = Instant::now();
+        info!("Loading UTXO value index");
         let utxo_store = UtxoStore::open(chainstate_path.join("utxos"))?;
+        info!(
+            "Loaded UTXO value index: entries={} in {:.2}s",
+            utxo_store.len(),
+            utxo_store_started.elapsed().as_secs_f64()
+        );
+        let history_store_started = Instant::now();
+        info!("Loading Electrum history value index");
         let electrum_history_store =
             ElectrumHistoryStore::open(data_dir.join("indexes/electrum-history"))?;
+        info!(
+            "Loaded Electrum history value index: entries={} in {:.2}s",
+            electrum_history_store.len(),
+            history_store_started.elapsed().as_secs_f64()
+        );
         if rebuild_chainstate {
             // Reindex rebuilds the UTXO/chainstate data, but Core keeps the
             // block-index headers that describe pruned ancestors.  Preserve
@@ -2186,6 +2219,8 @@ impl ChainState {
         }
         let loaded_snapshot = snapshot.is_some();
         let snapshot_verified = snapshot.as_ref().is_some_and(|(_, verified)| *verified);
+        let chainstate_restore_started = Instant::now();
+        info!("Restoring chainstate indexes");
         if rebuild_chainstate {
             state.initialize_genesis(&genesis)?;
             state.index_persisted_headers(&persisted_headers)?;
@@ -2388,6 +2423,12 @@ impl ChainState {
                 );
             }
         }
+        info!(
+            "Restored chainstate indexes: transactions={} history_scripts={} in {:.2}s",
+            state.tx_index.len(),
+            state.history.len(),
+            chainstate_restore_started.elapsed().as_secs_f64()
+        );
         if state.active_tx_counts.len() != state.active_chain.len() {
             state.active_tx_counts = state.tx_counts_from_index().unwrap_or_default();
         }

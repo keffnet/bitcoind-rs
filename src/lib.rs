@@ -5387,10 +5387,17 @@ impl Node {
             let hashes = &cached_path.hashes[..=target_index];
             let last_common_height = chain.common_active_height_for_hash_path(hashes);
             let window_end_height = last_common_height.saturating_add(BLOCK_DOWNLOAD_WINDOW);
+            let first_candidate_height = usize::try_from(last_common_height)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1);
             let candidates = hashes
                 .iter()
                 .enumerate()
-                .skip(1)
+                // The active prefix cannot contain a missing download
+                // candidate. Starting immediately after the common ancestor
+                // keeps each peer's 100 ms refill independent of the current
+                // chain height instead of rescanning from genesis.
+                .skip(first_candidate_height)
                 .map(|(height, hash)| (*hash, u32::try_from(height).unwrap_or(u32::MAX)))
                 .filter(|(hash, _)| !chain.store.contains(hash))
                 .filter(|(hash, _)| !self.block_body_was_rejected(hash))

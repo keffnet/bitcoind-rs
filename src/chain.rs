@@ -6544,7 +6544,7 @@ impl ChainState {
         if self.has_invalid_ancestor(hash) {
             bail!("block {hash} is on an invalidated branch")
         }
-        if self.active_chain.contains(&hash) {
+        if self.is_active_block(&hash) {
             if self.store.contains(&hash) {
                 return Ok(self.tip());
             }
@@ -6590,7 +6590,7 @@ impl ChainState {
         // current tip.
         if self.store.contains(&hash) && !allow_existing_body {
             let reconnectable_active_candidate = self.block_index.get(&hash).is_some_and(|node| {
-                !self.active_chain.contains(&hash) && node.header.prev_blockhash == self.best_hash()
+                !self.is_active_block(&hash) && node.header.prev_blockhash == self.best_hash()
             });
             if !reconnectable_active_candidate {
                 return Ok(self.tip());

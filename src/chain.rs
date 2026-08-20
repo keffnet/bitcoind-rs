@@ -6199,14 +6199,16 @@ impl ChainState {
         if history.is_empty() {
             return None;
         }
-        let mut input = String::new();
+        let mut hasher = Sha256::new();
         for entry in history {
-            input.push_str(&entry.txid.to_string());
-            input.push(':');
-            input.push_str(&entry.height.to_string());
-            input.push(':');
+            let txid = entry.txid.to_string();
+            let height = entry.height.to_string();
+            hasher.update(txid.as_bytes());
+            hasher.update([b':']);
+            hasher.update(height.as_bytes());
+            hasher.update([b':']);
         }
-        Some(hex::encode(Sha256::digest(input.as_bytes())))
+        Some(hex::encode(hasher.finalize()))
     }
 
     pub fn merkle_branch(&mut self, txid: &Txid) -> Result<Option<(Vec<Txid>, usize, u32)>> {

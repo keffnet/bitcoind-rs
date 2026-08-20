@@ -1952,14 +1952,16 @@ fn history_status_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Opti
 }
 
 fn history_status(records: &[(Txid, i64)]) -> String {
-    let mut input = String::new();
+    let mut hasher = Sha256::new();
     for (txid, height) in records {
-        input.push_str(&txid.to_string());
-        input.push(':');
-        input.push_str(&height.to_string());
-        input.push(':');
+        let txid = txid.to_string();
+        let height = height.to_string();
+        hasher.update(txid.as_bytes());
+        hasher.update([b':']);
+        hasher.update(height.as_bytes());
+        hasher.update([b':']);
     }
-    hex::encode(Sha256::digest(input.as_bytes()))
+    hex::encode(hasher.finalize())
 }
 
 fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<(Txid, i64)>> {

@@ -433,6 +433,23 @@ fn script_hashes_for_transaction(
     scripts
 }
 
+fn input_script_values_for_transaction(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+) -> Vec<(String, u64)> {
+    transaction
+        .input
+        .iter()
+        .zip(previous_outputs)
+        .map(|(_, output)| {
+            (
+                crate::chain::electrum_script_hash(&output.script_pubkey),
+                output.value.to_sat(),
+            )
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum MempoolChangeKind {
     Added,
@@ -474,6 +491,10 @@ pub struct Mempool {
     /// complete mempool for every address lookup.
     transactions_by_script: HashMap<String, HashSet<Txid>>,
     scripts_by_transaction: HashMap<Txid, Vec<String>>,
+    /// Values of resolved inputs grouped by their previous-output script.
+    /// These remain available after a confirmed prevout leaves the UTXO set
+    /// due to a mempool spend.
+    input_script_values_by_transaction: HashMap<Txid, Vec<(String, u64)>>,
     wtxids: HashMap<Wtxid, Txid>,
     priorities: HashMap<Txid, i64>,
     unbroadcast: HashSet<Txid>,
@@ -743,6 +764,7 @@ impl Mempool {
             children: HashMap::new(),
             transactions_by_script: HashMap::new(),
             scripts_by_transaction: HashMap::new(),
+            input_script_values_by_transaction: HashMap::new(),
             wtxids: HashMap::new(),
             priorities: HashMap::new(),
             unbroadcast: HashSet::new(),
@@ -1019,6 +1041,25 @@ impl Mempool {
                 bail!("mempool scripthash forward index is inconsistent");
             }
         }
+        if self.input_script_values_by_transaction.len() != self.entries.len()
+            || self
+                .input_script_values_by_transaction
+                .keys()
+                .any(|txid| !self.entries.contains_key(txid))
+        {
+            bail!("mempool scripthash input-value index is inconsistent");
+        }
+        for (txid, input_values) in &self.input_script_values_by_transaction {
+            let Some(scripts) = self.scripts_by_transaction.get(txid) else {
+                bail!("mempool scripthash input-value index is inconsistent");
+            };
+            if input_values
+                .iter()
+                .any(|(script_hash, _)| !scripts.contains(script_hash))
+            {
+                bail!("mempool scripthash input-value index is inconsistent");
+            }
+        }
         if self.adjusted_weights.len() != self.entries.len()
             || self
                 .adjusted_weights
@@ -1082,7 +1123,22 @@ impl Mempool {
             .unwrap_or_default()
     }
 
-    fn index_transaction_scripts(&mut self, txid: Txid, scripts: Vec<String>) {
+    pub(crate) fn input_value_for_script(&self, txid: &Txid, script_hash: &str) -> u64 {
+        self.input_script_values_by_transaction
+            .get(txid)
+            .into_iter()
+            .flatten()
+            .filter(|(input_script_hash, _)| input_script_hash == script_hash)
+            .map(|(_, value)| *value)
+            .sum()
+    }
+
+    fn index_transaction_scripts(
+        &mut self,
+        txid: Txid,
+        scripts: Vec<String>,
+        input_script_values: Vec<(String, u64)>,
+    ) {
         for script_hash in &scripts {
             self.transactions_by_script
                 .entry(script_hash.clone())
@@ -1090,9 +1146,12 @@ impl Mempool {
                 .insert(txid);
         }
         self.scripts_by_transaction.insert(txid, scripts);
+        self.input_script_values_by_transaction
+            .insert(txid, input_script_values);
     }
 
     fn remove_transaction_scripts(&mut self, txid: &Txid) {
+        self.input_script_values_by_transaction.remove(txid);
         let Some(scripts) = self.scripts_by_transaction.remove(txid) else {
             return;
         };
@@ -1112,8 +1171,9 @@ impl Mempool {
         let txid = entry.transaction.compute_txid();
         let wtxid = entry.transaction.compute_wtxid();
         let scripts = script_hashes_for_transaction(&entry.transaction, &[]);
+        let input_script_values = input_script_values_for_transaction(&entry.transaction, &[]);
         self.entries.insert(txid, entry);
-        self.index_transaction_scripts(txid, scripts);
+        self.index_transaction_scripts(txid, scripts, input_script_values);
         self.wtxids.insert(wtxid, txid);
         self.invalidate_graph_optimality();
     }
@@ -3201,6 +3261,8 @@ impl Mempool {
             self.ensure_space(memory_usage, &protected)?;
         }
         let affected_scripts = script_hashes_for_transaction(&transaction, &previous_outputs);
+        let input_script_values =
+            input_script_values_for_transaction(&transaction, &previous_outputs);
         let entry = MempoolEntry {
             transaction,
             fee_sat,
@@ -3222,7 +3284,7 @@ impl Mempool {
         self.bytes += size;
         self.vbytes = self.vbytes.saturating_add(vsize);
         self.entries.insert(txid, entry);
-        self.index_transaction_scripts(txid, affected_scripts);
+        self.index_transaction_scripts(txid, affected_scripts, input_script_values);
         self.adjusted_weights.insert(txid, adjusted_weight);
         self.wtxids.insert(wtxid, txid);
         self.relay_sequences.insert(txid, self.sequence);
@@ -3840,6 +3902,7 @@ impl Mempool {
         self.children.clear();
         self.transactions_by_script.clear();
         self.scripts_by_transaction.clear();
+        self.input_script_values_by_transaction.clear();
         self.wtxids.clear();
         self.invalidate_graph_optimality();
         let relay_sequences = std::mem::take(&mut self.relay_sequences);
@@ -5646,9 +5709,12 @@ mod tests {
             value: Amount::from_sat(2),
             script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
         };
-        let scripts = script_hashes_for_transaction(&transaction, &[previous_output]);
+        let previous_outputs = [previous_output];
+        let scripts = script_hashes_for_transaction(&transaction, &previous_outputs);
+        let input_script_values =
+            input_script_values_for_transaction(&transaction, &previous_outputs);
 
-        pool.index_transaction_scripts(txid, scripts.clone());
+        pool.index_transaction_scripts(txid, scripts.clone(), input_script_values);
         for script_hash in scripts {
             assert_eq!(pool.transaction_ids_for_script(&script_hash), vec![txid]);
         }
@@ -5762,6 +5828,10 @@ mod tests {
         assert_eq!(
             pool.transaction_ids_for_script(&created_script_hash),
             vec![txid]
+        );
+        assert_eq!(
+            pool.input_value_for_script(&txid, &spent_script_hash),
+            utxo.output.value.to_sat()
         );
         pool.check_consistency().unwrap();
     }

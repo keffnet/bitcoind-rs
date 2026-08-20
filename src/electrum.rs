@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
-use bitcoin::{Address, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Address, BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -1120,9 +1120,8 @@ fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
 }
 
 fn mempool_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
-    let chain = node.chain.read();
     let mempool = node.mempool.read();
-    mempool_records_for_script(&chain, &mempool, script_hash)
+    mempool_records_for_script(&mempool, script_hash)
         .into_iter()
         .filter_map(|(txid, height)| {
             let entry = mempool.get(&txid)?;
@@ -1737,7 +1736,7 @@ fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<(Txid,
     for entry in chain.get_history(script_hash) {
         append_history_record(&mut records, &mut seen, entry.txid, i64::from(entry.height));
     }
-    for (txid, height) in mempool_records_for_script(&chain, &mempool, script_hash) {
+    for (txid, height) in mempool_records_for_script(&mempool, script_hash) {
         append_history_record(&mut records, &mut seen, txid, height);
     }
     records
@@ -1759,16 +1758,18 @@ fn append_history_record(
 }
 
 fn mempool_records_for_script(
-    chain: &crate::chain::ChainState,
     mempool: &crate::mempool::Mempool,
     script_hash: &str,
 ) -> Vec<(Txid, i64)> {
+    // The admission index includes resolved prevout scripts. Re-resolving
+    // them from the UTXO set would miss a confirmed output once it has been
+    // spent by this mempool transaction.
     let mut records = mempool
         .transaction_ids_for_script(script_hash)
         .into_iter()
         .filter_map(|txid| {
             let entry = mempool.get(&txid)?;
-            transaction_affects_script(&entry.transaction, chain, mempool, script_hash).then_some((
+            Some((
                 txid,
                 mempool_transaction_height(&entry.transaction, mempool),
             ))
@@ -1811,13 +1812,8 @@ fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> (u64, i64) {
         let Some(entry) = mempool.get(&txid) else {
             continue;
         };
-        for input in &entry.transaction.input {
-            if let Some(output) = output_for_outpoint(&chain, &mempool, input.previous_output)
-                && chain::electrum_script_hash(&output.script_pubkey) == script_hash
-            {
-                unconfirmed -= output.value.to_sat() as i64;
-            }
-        }
+        unconfirmed -=
+            i64::try_from(mempool.input_value_for_script(&txid, script_hash)).unwrap_or(i64::MAX);
         for output in &entry.transaction.output {
             if chain::electrum_script_hash(&output.script_pubkey) == script_hash {
                 unconfirmed += output.value.to_sat() as i64;
@@ -1882,39 +1878,6 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
             })
         })
         .collect()
-}
-
-fn transaction_affects_script(
-    transaction: &Transaction,
-    chain: &crate::chain::ChainState,
-    mempool: &crate::mempool::Mempool,
-    script_hash: &str,
-) -> bool {
-    transaction
-        .output
-        .iter()
-        .any(|output| chain::electrum_script_hash(&output.script_pubkey) == script_hash)
-        || transaction.input.iter().any(|input| {
-            output_for_outpoint(chain, mempool, input.previous_output).is_some_and(|output| {
-                chain::electrum_script_hash(&output.script_pubkey) == script_hash
-            })
-        })
-}
-
-fn output_for_outpoint(
-    chain: &crate::chain::ChainState,
-    mempool: &crate::mempool::Mempool,
-    outpoint: OutPoint,
-) -> Option<TxOut> {
-    chain
-        .utxo(&outpoint)
-        .map(|entry| entry.output.clone())
-        .or_else(|| {
-            mempool
-                .get(&outpoint.txid)
-                .and_then(|entry| entry.transaction.output.get(outpoint.vout as usize))
-                .cloned()
-        })
 }
 
 fn script_hash_param(params: &Value, index: usize) -> Result<String> {
@@ -2518,6 +2481,15 @@ mod tests {
             node.connect_block(block)?;
         }
         let funding_outpoint = funding_outpoint.expect("funding output exists");
+        let spent_script_hash = chain::electrum_script_hash(
+            &node
+                .chain
+                .read()
+                .utxo(&funding_outpoint)
+                .expect("funding output remains unspent")
+                .output
+                .script_pubkey,
+        );
         let transaction = Transaction {
             version: Version::ONE,
             lock_time: LockTime::ZERO,
@@ -2529,20 +2501,27 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(4_999_999_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
             }],
         };
-        let script_hash = chain::electrum_script_hash(&transaction.output[0].script_pubkey);
-        let key = format!("scripthash:{script_hash}");
+        let txid = transaction.compute_txid();
+        let key = format!("scripthash:{spent_script_hash}");
         let mut subscriptions = HashMap::new();
         subscriptions.insert(
             key.clone(),
             Subscription::Scripthash {
-                script_hash: script_hash.clone(),
+                script_hash: spent_script_hash.clone(),
                 status: Value::Null,
             },
         );
         node.accept_transaction(transaction)?;
+        assert!(
+            mempool_for_script(&node, &spent_script_hash)
+                .iter()
+                .any(|entry| entry["tx_hash"] == json!(txid.to_string()))
+        );
+        let (_, unconfirmed) = balance_for_script(&node, &spent_script_hash);
+        assert_eq!(unconfirmed, -5_000_000_000);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;

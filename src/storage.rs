@@ -2087,6 +2087,19 @@ impl ElectrumHistoryStore {
         decode_history_value(&body, script_hash)
     }
 
+    /// Read one script history while refusing to allocate more than `limit`
+    /// entries. The normal full-history reader remains available for chain
+    /// rebuilds, but bounded Electrum requests should reject an oversized
+    /// history before copying it into a temporary vector.
+    pub fn get_limited(&self, script_hash: &str, limit: usize) -> Result<Option<Vec<(Txid, u32)>>> {
+        let script_hash = encode_history_script_hash(script_hash)?;
+        let Some(location) = self.index.get(&script_hash).copied() else {
+            return Ok(Some(Vec::new()));
+        };
+        let body = read_history_data_record(&self.file, location)?;
+        decode_history_value_limited(&body, script_hash, limit)
+    }
+
     pub fn keys(&self) -> Vec<String> {
         self.index.keys().map(hex::encode).collect()
     }
@@ -2438,6 +2451,15 @@ fn read_history_data_record(file: &File, location: HistoryLocation) -> Result<Ve
 }
 
 fn decode_history_value(body: &[u8], expected_script_hash: [u8; 32]) -> Result<Vec<(Txid, u32)>> {
+    decode_history_value_limited(body, expected_script_hash, usize::MAX)
+        .map(|entries| entries.expect("unlimited history limit cannot be exceeded"))
+}
+
+fn decode_history_value_limited(
+    body: &[u8],
+    expected_script_hash: [u8; 32],
+    limit: usize,
+) -> Result<Option<Vec<(Txid, u32)>>> {
     if body.len() < 1 + 8 + 32 + 4 || body[0] != HISTORY_PUT {
         bail!("Electrum history value is truncated or has an invalid operation");
     }
@@ -2463,6 +2485,9 @@ fn decode_history_value(body: &[u8], expected_script_hash: [u8; 32]) -> Result<V
     if expected_len != body.len() {
         bail!("Electrum history count does not match value length");
     }
+    if count > limit {
+        return Ok(None);
+    }
     let mut entries = Vec::with_capacity(count);
     let mut offset = 45usize;
     for _ in 0..count {
@@ -2479,7 +2504,7 @@ fn decode_history_value(body: &[u8], expected_script_hash: [u8; 32]) -> Result<V
         entries.push((txid, height));
         offset += 36;
     }
-    Ok(entries)
+    Ok(Some(entries))
 }
 
 fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocation>, u64)> {
@@ -4759,6 +4784,29 @@ mod tests {
         let recovered = ElectrumHistoryStore::open(directory.path()).unwrap();
         assert_eq!(recovered.get(&script_hash).unwrap(), second_history);
         assert_eq!(std::fs::metadata(data_path).unwrap().len(), committed_len);
+    }
+
+    #[test]
+    fn electrum_history_limited_reads_reject_oversized_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let script_hash = hex::encode([9u8; 32]);
+        let history = (0..128u32)
+            .map(|height| (Txid::from_byte_array([height as u8; 32]), height))
+            .collect::<Vec<_>>();
+        let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
+        store
+            .apply_batch(&[(script_hash.clone(), history.clone())])
+            .unwrap();
+
+        assert_eq!(
+            store.get_limited(&script_hash, history.len()).unwrap(),
+            Some(history.clone())
+        );
+        assert_eq!(
+            store.get_limited(&script_hash, history.len() - 1).unwrap(),
+            None
+        );
+        assert_eq!(store.get_limited(&script_hash, 0).unwrap(), None);
     }
 
     #[test]

@@ -429,6 +429,8 @@ pub struct HistoryEntry {
     pub height: u32,
 }
 
+type ElectrumUnspent = (OutPoint, i64, usize, u64);
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainTip {
     pub hash: BlockHash,
@@ -4988,15 +4990,38 @@ impl ChainState {
     }
 
     pub fn get_history_checked(&self, script_hash: &str) -> Result<Vec<HistoryEntry>> {
+        Ok(self
+            .get_history_checked_limited(script_hash, usize::MAX)?
+            .expect("unlimited history limit cannot be exceeded"))
+    }
+
+    /// Read a script history without materializing more than `limit` entries.
+    /// `None` means that the history exists but is larger than the requested
+    /// bound. Internal chain rebuilds use `get_history_checked` to retain the
+    /// complete history; bounded Electrum requests use this method.
+    pub fn get_history_checked_limited(
+        &self,
+        script_hash: &str,
+        limit: usize,
+    ) -> Result<Option<Vec<HistoryEntry>>> {
         if self.history_materialized {
-            return Ok(self.history.get(script_hash).cloned().unwrap_or_default());
+            let Some(history) = self.history.get(script_hash) else {
+                return Ok(Some(Vec::new()));
+            };
+            if history.len() > limit {
+                return Ok(None);
+            }
+            return Ok(Some(history.clone()));
         }
         Ok(self
             .electrum_history_store
-            .get(script_hash)?
-            .into_iter()
-            .map(|(txid, height)| HistoryEntry { txid, height })
-            .collect())
+            .get_limited(script_hash, limit)?
+            .map(|history| {
+                history
+                    .into_iter()
+                    .map(|(txid, height)| HistoryEntry { txid, height })
+                    .collect()
+            }))
     }
 
     pub fn script_hashes(&self) -> Vec<String> {
@@ -5033,12 +5058,20 @@ impl ChainState {
     /// `OP_RETURN`) in its scripthash status index.  The Electrum node path
     /// enables the durable spender index, which lets this projection retain
     /// those outputs without polluting consensus UTXO accounting.
-    pub(crate) fn electrum_unspent_for_script(
+    /// Return Electrum's unspent projection while bounding the history scan.
+    /// A busy script can have a small current UTXO set but still require a
+    /// large history walk, so bounded callers should reject it before doing
+    /// that work.
+    pub(crate) fn electrum_unspent_for_script_limited(
         &mut self,
         script_hash: &str,
-    ) -> Result<Vec<(OutPoint, i64, usize, u64)>> {
+        history_limit: usize,
+    ) -> Result<Option<Vec<ElectrumUnspent>>> {
+        let Some(history) = self.get_history_checked_limited(script_hash, history_limit)? else {
+            return Ok(None);
+        };
         let mut outputs = HashMap::new();
-        for history in self.get_history_checked(script_hash)? {
+        for history in history {
             let Some(location) =
                 self.active_transaction_location_at_height(&history.txid, history.height)
             else {
@@ -5088,7 +5121,7 @@ impl ChainState {
                 .then_with(|| left.0.txid.cmp(&right.0.txid))
                 .then_with(|| left.0.vout.cmp(&right.0.vout))
         });
-        Ok(outputs)
+        Ok(Some(outputs))
     }
 
     pub fn utxo(&self, outpoint: &OutPoint) -> Option<UtxoEntry> {
@@ -12523,7 +12556,10 @@ mod tests {
         state.configure_txospender_index(true).unwrap();
         let script_hash = electrum_script_hash(&bitcoin::ScriptBuf::from_bytes(vec![0x6a]));
         assert_eq!(
-            state.electrum_unspent_for_script(&script_hash).unwrap(),
+            state
+                .electrum_unspent_for_script_limited(&script_hash, usize::MAX)
+                .unwrap()
+                .unwrap(),
             vec![(OutPoint::new(coinbase_txid, 1), 1, 0, 500_000_000,)]
         );
     }
@@ -12661,6 +12697,25 @@ mod tests {
                 .map(|(txid, height)| HistoryEntry { txid, height })
                 .collect::<Vec<_>>(),
             expected_history
+        );
+        assert_eq!(
+            state
+                .get_history_checked_limited(&script_hash, expected_history.len())
+                .unwrap(),
+            Some(expected_history.clone())
+        );
+        assert!(expected_history.len() > 1);
+        assert_eq!(
+            state
+                .get_history_checked_limited(&script_hash, expected_history.len() - 1)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            state
+                .electrum_unspent_for_script_limited(&script_hash, expected_history.len() - 1)
+                .unwrap(),
+            None
         );
 
         drop(state);

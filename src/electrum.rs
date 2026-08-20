@@ -1911,7 +1911,12 @@ fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec
     let mempool = node.mempool.read();
     let mut records = Vec::new();
     let mut seen = HashSet::new();
-    for entry in chain.get_history_checked(script_hash)? {
+    let Some(history) =
+        chain.get_history_checked_limited(script_hash, MAX_ELECTRUM_HISTORY_RECORDS)?
+    else {
+        return Err(electrum_history_too_large());
+    };
+    for entry in history {
         append_history_record(&mut records, &mut seen, entry.txid, i64::from(entry.height))?;
     }
     for (txid, height) in mempool_records_for_script(&mempool, script_hash)? {
@@ -1992,7 +1997,8 @@ fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> Result<(u64, i64)>
     let mut chain = node.chain.write();
     let mempool = node.mempool.read();
     let confirmed = chain
-        .electrum_unspent_for_script(script_hash)?
+        .electrum_unspent_for_script_limited(script_hash, MAX_ELECTRUM_HISTORY_RECORDS)?
+        .ok_or_else(electrum_history_too_large)?
         .into_iter()
         .map(|(_, _, _, value)| value)
         .sum();
@@ -2028,7 +2034,8 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>>
         }
     }
     let mut confirmed = chain
-        .electrum_unspent_for_script(script_hash)?
+        .electrum_unspent_for_script_limited(script_hash, MAX_ELECTRUM_HISTORY_RECORDS)?
+        .ok_or_else(electrum_history_too_large)?
         .into_iter()
         .filter(|(outpoint, _, _, _)| !spent.contains(outpoint))
         .collect::<Vec<_>>();

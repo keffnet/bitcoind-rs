@@ -2645,7 +2645,7 @@ impl ChainState {
     /// IBD deliberately avoids foreground snapshots, so this checkpoint
     /// bounds the next startup replay without pausing block acceptance.
     pub fn checkpoint_for_shutdown(&mut self) -> Result<()> {
-        self.persist_snapshot()
+        self.persist_snapshot_with_compaction(!self.initial_block_download)
     }
 
     /// Verify the block-index parent links, chain-work accumulation, active
@@ -10638,6 +10638,10 @@ impl ChainState {
     }
 
     fn persist_snapshot(&mut self) -> Result<()> {
+        self.persist_snapshot_with_compaction(true)
+    }
+
+    fn persist_snapshot_with_compaction(&mut self, compact: bool) -> Result<()> {
         // A snapshot is also a full chainstate checkpoint.  This matters when
         // callers request one between periodic checkpoints: the active-tip
         // sidecar may otherwise point past metadata whose old block bodies
@@ -10645,9 +10649,11 @@ impl ChainState {
         self.flush_append_only_stores()?;
         self.persist_metadata()?;
         self.sync_utxo_store()?;
-        self.utxo_store.compact_if_needed()?;
+        if compact {
+            self.utxo_store.compact_if_needed()?;
+        }
         self.sync_electrum_history_store()?;
-        if self.history_index_enabled {
+        if compact && self.history_index_enabled {
             self.electrum_history_store.compact_if_needed()?;
         }
         let snapshot = self.current_snapshot()?;

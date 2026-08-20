@@ -75,10 +75,41 @@ pub struct StoredUtxo {
 
 pub type StoredElectrumHistory = Vec<(Txid, u32)>;
 
-#[derive(Clone, Copy, Debug)]
-struct UtxoLocation {
-    offset: u64,
-    length: u32,
+/// Compact in-memory pointer into the append-only UTXO value log.
+///
+/// A normal UTXO record is below 100 KiB, so 17 bits are sufficient for its
+/// encoded length.  The remaining 47 bits address a value log up to 128 TiB.
+/// Keeping the pointer in one word matters at mainnet scale: the UTXO index
+/// has one entry per live outpoint, and the pointer is present in every hash
+/// table value.  The on-disk index format remains the existing u64 offset +
+/// u32 length encoding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UtxoLocation(u64);
+
+impl UtxoLocation {
+    const LENGTH_BITS: u32 = 17;
+    const LENGTH_MASK: u64 = (1 << Self::LENGTH_BITS) - 1;
+    const MAX_OFFSET: u64 = (1 << (u64::BITS - Self::LENGTH_BITS)) - 1;
+
+    fn new(offset: u64, length: u32) -> Result<Self> {
+        if length == 0 || u64::from(length) > Self::LENGTH_MASK {
+            bail!("UTXO record length does not fit compact location: {length}");
+        }
+        if offset > Self::MAX_OFFSET {
+            bail!("UTXO record offset does not fit compact location: {offset}");
+        }
+        Ok(Self((offset << Self::LENGTH_BITS) | u64::from(length)))
+    }
+
+    #[inline]
+    fn offset(self) -> u64 {
+        self.0 >> Self::LENGTH_BITS
+    }
+
+    #[inline]
+    fn length(self) -> u32 {
+        (self.0 & Self::LENGTH_MASK) as u32
+    }
 }
 
 type UtxoIndexState = (HashMap<OutPoint, UtxoLocation>, u64, u64);
@@ -1595,7 +1626,7 @@ impl UtxoStore {
             .iter()
             .map(|(outpoint, location)| (*outpoint, *location))
             .collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(_, location)| location.offset);
+        locations.sort_unstable_by_key(|(_, location)| location.offset());
         locations
             .into_iter()
             .map(|(outpoint, location)| {
@@ -1639,7 +1670,7 @@ impl UtxoStore {
                 });
                 self.pending_write_bytes = self
                     .pending_write_bytes
-                    .saturating_add(4usize.saturating_add(location.length as usize));
+                    .saturating_add(4usize.saturating_add(location.length() as usize));
             }
             for (outpoint, entry) in additions {
                 let body = encode_utxo_put(batch_id, outpoint, entry)?;
@@ -1650,13 +1681,13 @@ impl UtxoStore {
                 });
                 self.pending_write_bytes = self
                     .pending_write_bytes
-                    .saturating_add(4usize.saturating_add(location.length as usize));
+                    .saturating_add(4usize.saturating_add(location.length() as usize));
             }
             let commit = encode_utxo_commit(batch_id);
             let commit_location = append_utxo_data_record(&mut self.file, &commit)?;
             self.pending_write_bytes = self
                 .pending_write_bytes
-                .saturating_add(4usize.saturating_add(commit_location.length as usize));
+                .saturating_add(4usize.saturating_add(commit_location.length() as usize));
             self.file.sync_data()?;
             data_committed = true;
             append_utxo_index_batch(
@@ -1732,7 +1763,7 @@ impl UtxoStore {
             .iter()
             .map(|(outpoint, location)| (*outpoint, *location))
             .collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(_, location)| location.offset);
+        locations.sort_unstable_by_key(|(_, location)| location.offset());
         let compact_data_path = self.path.with_extension("dat.compact");
         let compact_index_path = self.index_path.with_extension("index.compact");
         for path in [&compact_data_path, &compact_index_path] {
@@ -1863,7 +1894,7 @@ impl UtxoStore {
             + self
                 .index
                 .values()
-                .map(|location| 4u64.saturating_add(u64::from(location.length)))
+                .map(|location| 4u64.saturating_add(u64::from(location.length())))
                 .sum::<u64>()
             + if self.index.is_empty() { 0 } else { 13 };
         let stale_bytes = data_len.saturating_sub(live_bytes);
@@ -2835,17 +2866,18 @@ fn append_utxo_data_record(file: &mut File, body: &[u8]) -> Result<UtxoLocation>
     let offset = data_len_after(file)?;
     let length =
         u32::try_from(encoded_body.len()).context("UTXO log record length does not fit u32")?;
+    let location = UtxoLocation::new(offset, length)?;
     file.write_all(&length.to_le_bytes())?;
     file.write_all(&encoded_body)?;
-    Ok(UtxoLocation { offset, length })
+    Ok(location)
 }
 
 fn read_utxo_data_record(file: &File, location: UtxoLocation) -> Result<Vec<u8>> {
     read_storage_record(
         file,
         Record {
-            offset: location.offset,
-            length: location.length,
+            offset: location.offset(),
+            length: location.length(),
         },
         XorKey::default(),
         MAX_STORED_UTXO_SIZE + 64,
@@ -2905,19 +2937,14 @@ fn scan_utxo_data(file: &mut File) -> Result<(HashMap<OutPoint, UtxoLocation>, u
                     u64::from_le_bytes(body[1..9].try_into().expect("fixed UTXO batch identifier"));
                 let outpoint = decode_outpoint(&body[9..45])?;
                 decode_stored_utxo(&body[45..])?;
+                let location = UtxoLocation::new(record_start, length)?;
                 if pending_batch != Some(batch_id) {
                     if pending_batch.is_some() {
                         bail!("UTXO log contains interleaved mutation batches");
                     }
                     pending_batch = Some(batch_id);
                 }
-                pending.push(PendingUtxoOperation::Put {
-                    outpoint,
-                    location: UtxoLocation {
-                        offset: record_start,
-                        length,
-                    },
-                });
+                pending.push(PendingUtxoOperation::Put { outpoint, location });
                 max_batch = max_batch.max(batch_id);
             }
             UTXO_DELETE => {
@@ -3042,23 +3069,11 @@ fn load_utxo_index(
                     }
                     pending_batch = Some(batch_id);
                 }
-                pending.push(PendingUtxoOperation::Put {
-                    outpoint,
-                    location: UtxoLocation {
-                        offset,
-                        length: value_length,
-                    },
-                });
-                if validate_utxo_data_header(
-                    data_file,
-                    UtxoLocation {
-                        offset,
-                        length: value_length,
-                    },
-                    outpoint,
-                )
-                .is_err()
-                {
+                let Ok(location) = UtxoLocation::new(offset, value_length) else {
+                    return Ok(None);
+                };
+                pending.push(PendingUtxoOperation::Put { outpoint, location });
+                if validate_utxo_data_header(data_file, location, outpoint).is_err() {
                     return Ok(None);
                 }
                 max_batch = max_batch.max(batch_id);
@@ -3186,8 +3201,8 @@ fn append_utxo_index_operation(
         PendingUtxoOperation::Put { outpoint, location } => {
             body.push(UTXO_PUT);
             body.extend_from_slice(&batch_id.to_le_bytes());
-            body.extend_from_slice(&location.offset.to_le_bytes());
-            body.extend_from_slice(&location.length.to_le_bytes());
+            body.extend_from_slice(&location.offset().to_le_bytes());
+            body.extend_from_slice(&location.length().to_le_bytes());
             body.extend_from_slice(&encode_outpoint(outpoint));
         }
         PendingUtxoOperation::Delete { outpoint } => {
@@ -4431,6 +4446,19 @@ mod tests {
             decode_storage_payload(&raw, MAX_STORED_BLOCK_SIZE).unwrap(),
             small
         );
+    }
+
+    #[test]
+    fn utxo_locations_use_one_word_without_changing_disk_coordinates() {
+        assert_eq!(
+            std::mem::size_of::<UtxoLocation>(),
+            std::mem::size_of::<u64>()
+        );
+        let location = UtxoLocation::new(123_456_789, 98_765).unwrap();
+        assert_eq!(location.offset(), 123_456_789);
+        assert_eq!(location.length(), 98_765);
+        assert!(UtxoLocation::new(UtxoLocation::MAX_OFFSET + 1, 1).is_err());
+        assert!(UtxoLocation::new(0, (UtxoLocation::LENGTH_MASK + 1) as u32).is_err());
     }
 
     #[test]

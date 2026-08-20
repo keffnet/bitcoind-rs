@@ -16,7 +16,7 @@ use bitcoin::{
 use rand::random;
 use serde::{Deserialize, Serialize};
 
-use crate::chain::ChainState;
+use crate::chain::{COINBASE_MATURITY, ChainState};
 use crate::config::{
     DEFAULT_ACCEPT_DATACARRIER, DEFAULT_BYTES_PER_SIGOP, DEFAULT_CLUSTER_COUNT,
     DEFAULT_CLUSTER_SIZE_KVB, DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
@@ -3120,7 +3120,8 @@ impl Mempool {
                     .utxo(&input.previous_output)
                     .ok_or(MempoolError::MissingInput(input.previous_output))?;
                 if entry.coinbase
-                    && serving_height.saturating_add(1) < entry.height.saturating_add(100)
+                    && serving_height.saturating_add(1)
+                        < entry.height.saturating_add(COINBASE_MATURITY)
                 {
                     return Err(MempoolError::PrematureCoinbase);
                 }
@@ -4093,6 +4094,84 @@ impl Mempool {
         }
         for txid in conflicts {
             self.remove_recursive(&txid);
+        }
+    }
+
+    /// Remove mempool entries that are no longer final or mature after a
+    /// chain reorganization. Core deliberately does not re-run script
+    /// validation for every mempool transaction here: block connection and
+    /// conflict removal already account for changed inputs, while script
+    /// validity is independent of which valid chain contains the prevout.
+    ///
+    /// This implementation has no cached Core lockpoints yet, so it resolves
+    /// the small input metadata set needed for BIP68 and coinbase maturity.
+    /// That remains substantially cheaper than rebuilding every mempool index
+    /// and executing every input script after each reorg.
+    pub fn remove_for_reorg(&mut self, chain: &ChainState) {
+        let serving_tip = chain.utxo_tip();
+        let serving_median_time_past = chain
+            .median_time_past_for_hash(&serving_tip.hash)
+            .unwrap_or_else(|| chain.median_time_past_value());
+        let spend_height = serving_tip.height.saturating_add(1);
+        let txids = self.entries.keys().copied().collect::<Vec<_>>();
+        let mut to_remove = Vec::new();
+
+        for txid in txids {
+            let Some(entry) = self.entries.get(&txid) else {
+                continue;
+            };
+            let mut previous_entries = Vec::with_capacity(entry.transaction.input.len());
+            let mut invalid = false;
+            for input in &entry.transaction.input {
+                if let Some(parent) = self.entries.get(&input.previous_output.txid) {
+                    let Some(output) = parent
+                        .transaction
+                        .output
+                        .get(input.previous_output.vout as usize)
+                    else {
+                        invalid = true;
+                        break;
+                    };
+                    previous_entries.push(crate::chain::UtxoEntry {
+                        output: output.clone(),
+                        height: spend_height,
+                        median_time_past: serving_median_time_past,
+                        coinbase: false,
+                    });
+                    continue;
+                }
+
+                let Some(previous) = chain.utxo(&input.previous_output) else {
+                    invalid = true;
+                    break;
+                };
+                if previous.coinbase
+                    && spend_height < previous.height.saturating_add(COINBASE_MATURITY)
+                {
+                    invalid = true;
+                    break;
+                }
+                previous_entries.push(previous);
+            }
+
+            if invalid
+                || validation::validate_transaction_finality(
+                    &entry.transaction,
+                    spend_height,
+                    serving_median_time_past,
+                    true,
+                    &previous_entries,
+                )
+                .is_err()
+            {
+                to_remove.push(txid);
+            }
+        }
+
+        for txid in to_remove {
+            if self.entries.contains_key(&txid) {
+                self.remove_recursive(&txid);
+            }
         }
     }
 
@@ -6217,7 +6296,7 @@ mod tests {
         insert_policy_entry(&mut pool, root);
         insert_policy_entry(&mut pool, child);
 
-        pool.revalidate(&chain);
+        pool.remove_for_reorg(&chain);
 
         assert!(pool.is_empty());
         assert_eq!(pool.sequence(), 3);
@@ -6229,6 +6308,23 @@ mod tests {
         )));
         assert_eq!(changes[0].sequence, 1);
         assert_eq!(changes[1].sequence, 2);
+    }
+
+    #[test]
+    fn reorg_cleanup_removes_missing_inputs_and_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = graph_transaction(Txid::from_byte_array([3; 32]), 3);
+        let child = graph_transaction(parent.compute_txid(), 4);
+        let mut pool = Mempool::new(Network::Regtest);
+        let parent_id = insert_policy_entry(&mut pool, parent);
+        let child_id = insert_policy_entry(&mut pool, child);
+
+        pool.remove_for_reorg(&chain);
+
+        assert!(pool.get(&parent_id).is_none());
+        assert!(pool.get(&child_id).is_none());
+        assert_eq!(pool.take_changes().len(), 2);
     }
 
     #[test]

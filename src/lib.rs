@@ -2868,6 +2868,15 @@ impl Node {
                     mempool.remove_recursive(&evicted.compute_txid());
                 }
             }
+            // A deep invalidation does not resurrect transactions from blocks
+            // beyond Core's ten-block window, but it still removes their
+            // descendants from the mempool. The aggregate hook receives the
+            // whole suffix, so perform that cleanup explicitly here.
+            for block in disconnected_blocks.iter().rev().skip(10) {
+                for transaction in &block.txdata {
+                    mempool.remove_recursive(&transaction.compute_txid());
+                }
+            }
             for activated in activated_blocks {
                 pool.remove_for_block(activated);
             }
@@ -2889,7 +2898,7 @@ impl Node {
                 }
             }
         }
-        mempool.revalidate(&chain);
+        mempool.remove_for_reorg(&chain);
         mempool.enforce_size_limit();
         let mempool_after = mempool
             .transaction_order()

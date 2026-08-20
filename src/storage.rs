@@ -2100,6 +2100,40 @@ impl ElectrumHistoryStore {
         decode_history_value_limited(&body, script_hash, limit)
     }
 
+    /// Read several script histories in data-file order. Reorgs commonly
+    /// touch thousands of scripts whose latest values were appended close
+    /// together; sorting by record offset turns that workload into a mostly
+    /// sequential scan instead of issuing one random seek per script.
+    pub fn get_batch(&self, script_hashes: &[String]) -> Result<HashMap<String, Vec<(Txid, u32)>>> {
+        let mut requests = script_hashes
+            .iter()
+            .map(|script_hash| {
+                let encoded = encode_history_script_hash(script_hash)?;
+                Ok((
+                    script_hash.clone(),
+                    encoded,
+                    self.index.get(&encoded).copied(),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        requests.sort_unstable_by_key(|(_, _, location)| {
+            location.map_or(u64::MAX, HistoryLocation::offset)
+        });
+
+        let mut histories = HashMap::with_capacity(requests.len());
+        for (script_hash, encoded, location) in requests {
+            let entries = match location {
+                Some(location) => {
+                    let body = read_history_data_record(&self.file, location)?;
+                    decode_history_value(&body, encoded)?
+                }
+                None => Vec::new(),
+            };
+            histories.insert(script_hash, entries);
+        }
+        Ok(histories)
+    }
+
     pub fn keys(&self) -> Vec<String> {
         self.index.keys().map(hex::encode).collect()
     }
@@ -4815,6 +4849,34 @@ mod tests {
             None
         );
         assert_eq!(store.get_limited(&script_hash, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn electrum_history_batch_reads_existing_and_missing_scripts() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_script = hex::encode([16u8; 32]);
+        let second_script = hex::encode([17u8; 32]);
+        let missing_script = hex::encode([18u8; 32]);
+        let first_history = vec![(Txid::from_byte_array([19u8; 32]), 20)];
+        let second_history = vec![(Txid::from_byte_array([21u8; 32]), 22)];
+        let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
+        store
+            .apply_batch(&[
+                (first_script.clone(), first_history.clone()),
+                (second_script.clone(), second_history.clone()),
+            ])
+            .unwrap();
+
+        let histories = store
+            .get_batch(&[
+                missing_script.clone(),
+                second_script.clone(),
+                first_script.clone(),
+            ])
+            .unwrap();
+        assert_eq!(histories.get(&first_script), Some(&first_history));
+        assert_eq!(histories.get(&second_script), Some(&second_history));
+        assert_eq!(histories.get(&missing_script), Some(&Vec::new()));
     }
 
     #[test]

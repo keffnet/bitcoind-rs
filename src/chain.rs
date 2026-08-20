@@ -1680,6 +1680,43 @@ impl ChainState {
         blocks_xor: bool,
         deployment_parameters: validation::DeploymentParameters,
     ) -> Result<Self> {
+        Self::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index(
+            network,
+            data_dir,
+            blocks_dir,
+            signet_challenge,
+            blockfilter_index_enabled,
+            reindex,
+            reindex_chainstate,
+            tx_index_all_enabled,
+            minimum_chain_work_override,
+            assume_valid_block,
+            blocks_xor,
+            deployment_parameters,
+            true,
+        )
+    }
+
+    /// Open chainstate with explicit consensus deployments and an optional
+    /// Electrum history index.  Disabling the index avoids replaying and
+    /// rewriting history records during startup when the Electrum listener
+    /// is disabled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        blocks_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
+        reindex: bool,
+        reindex_chainstate: bool,
+        tx_index_all_enabled: bool,
+        minimum_chain_work_override: Option<Work>,
+        assume_valid_block: Option<BlockHash>,
+        blocks_xor: bool,
+        deployment_parameters: validation::DeploymentParameters,
+        electrum_history_index_enabled: bool,
+    ) -> Result<Self> {
         if deployment_parameters.network != network {
             bail!("consensus deployment parameters use a different network");
         }
@@ -2033,7 +2070,7 @@ impl ChainState {
             tx_index_all: HashMap::new(),
             history: HashMap::new(),
             history_materialized: true,
-            history_index_enabled: true,
+            history_index_enabled: electrum_history_index_enabled,
             spent_by: HashMap::new(),
             startup_spent_by: None,
             precious_blocks: HashMap::new(),
@@ -2109,7 +2146,11 @@ impl ChainState {
             } else {
                 HashMap::new()
             };
-            state.history = snapshot.history;
+            state.history = if state.history_index_enabled {
+                snapshot.history
+            } else {
+                HashMap::new()
+            };
             state.history_materialized = true;
             state.prune_height = snapshot.prune_height.or(state.prune_height);
             state.startup_spent_by = snapshot
@@ -2687,10 +2728,20 @@ impl ChainState {
     /// block-hash keyed bodies are retained, and normal block serving
     /// continues to respect pruning.
     pub fn configure_electrum_index(&mut self, enabled: bool) -> Result<()> {
+        let was_enabled = self.history_index_enabled;
         self.history_index_enabled = enabled;
         if !enabled {
+            self.history.clear();
+            self.history_materialized = true;
             self.electrum_store = None;
             return Ok(());
+        }
+        if !was_enabled {
+            // A caller may enable the index after opening a node with it
+            // disabled. Read the durable history lazily rather than serving
+            // the intentionally empty in-memory map from the disabled mode.
+            self.history.clear();
+            self.history_materialized = false;
         }
         if !self.is_pruned() {
             self.electrum_store = None;
@@ -5116,6 +5167,9 @@ impl ChainState {
         script_hash: &str,
         limit: usize,
     ) -> Result<Option<Vec<HistoryEntry>>> {
+        if !self.history_index_enabled {
+            return Ok(Some(Vec::new()));
+        }
         if self.history_materialized {
             let Some(history) = self.history.get(script_hash) else {
                 return Ok(Some(Vec::new()));
@@ -5137,6 +5191,9 @@ impl ChainState {
     }
 
     pub fn script_hashes(&self) -> Vec<String> {
+        if !self.history_index_enabled {
+            return Vec::new();
+        }
         if self.history_materialized {
             self.history.keys().cloned().collect()
         } else {
@@ -7654,7 +7711,9 @@ impl ChainState {
         self.assign_block_sequence_id(hash);
         if persist {
             self.persist_utxo_store_tip()?;
-            self.persist_electrum_history_store_tip()?;
+            if self.history_index_enabled {
+                self.persist_electrum_history_store_tip()?;
+            }
         }
         if let Some(stats) = self.coin_stats.as_mut() {
             stats.apply_block_metrics(application.metrics);
@@ -8146,7 +8205,11 @@ impl ChainState {
                         ))
                     })
                     .collect::<Result<_>>()?;
-                self.history = snapshot.history;
+                self.history = if self.history_index_enabled {
+                    snapshot.history
+                } else {
+                    HashMap::new()
+                };
                 self.active_tx_counts = old_active_tx_counts
                     .get(..snapshot_chain_len)
                     .unwrap_or_default()
@@ -8496,8 +8559,10 @@ impl ChainState {
         } else {
             Vec::new()
         };
-        self.electrum_history_store.apply_batch(&history_updates)?;
-        self.persist_electrum_history_store_tip()?;
+        if self.history_index_enabled {
+            self.electrum_history_store.apply_batch(&history_updates)?;
+            self.persist_electrum_history_store_tip()?;
+        }
         self.persist_metadata()?;
 
         if snapshot_invalidated {
@@ -9112,6 +9177,9 @@ impl ChainState {
     }
 
     fn active_history_map_for_read(&self) -> Result<HashMap<String, Vec<HistoryEntry>>> {
+        if !self.history_index_enabled {
+            return Ok(HashMap::new());
+        }
         if self.history_materialized {
             Ok(self.history.clone())
         } else {
@@ -9286,7 +9354,7 @@ impl ChainState {
 
     fn sync_electrum_history_store(&mut self) -> Result<()> {
         if !self.history_index_enabled {
-            return self.persist_electrum_history_store_tip();
+            return Ok(());
         }
         if !self.history_materialized {
             // Normal active-chain connects append exact replacement values to
@@ -9311,6 +9379,9 @@ impl ChainState {
     }
 
     fn reconcile_electrum_history_store(&mut self) -> Result<()> {
+        if !self.history_index_enabled {
+            return Ok(());
+        }
         let tip = fs::read_to_string(self.electrum_history_store_tip_path()).ok();
         let expected_tip = self.best_hash().to_string();
         let marker_matches = tip.as_deref().is_some_and(|tip| {
@@ -9861,7 +9932,9 @@ impl ChainState {
         self.sync_utxo_store()?;
         self.utxo_store.compact_if_needed()?;
         self.sync_electrum_history_store()?;
-        self.electrum_history_store.compact_if_needed()?;
+        if self.history_index_enabled {
+            self.electrum_history_store.compact_if_needed()?;
+        }
         let snapshot = self.current_snapshot()?;
         let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
@@ -10070,7 +10143,9 @@ impl ChainState {
             } else {
                 HashMap::new()
             },
-            history: if self.history_materialized {
+            history: if !self.history_index_enabled {
+                HashMap::new()
+            } else if self.history_materialized {
                 self.history.clone()
             } else {
                 self.load_history_map_from_store()?
@@ -12985,6 +13060,41 @@ mod tests {
 
         assert_eq!(state.electrum_history_store.generation(), generation);
         assert!(state.get_history(&script_hash).is_empty());
+    }
+
+    #[test]
+    fn disabled_electrum_skips_history_replay_at_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut enabled = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let first = mine_block(&enabled, 1);
+        let script_hash = electrum_script_hash(&first.txdata[0].output[0].script_pubkey);
+        enabled.connect_block(first).unwrap();
+        let generation = enabled.electrum_history_store.generation();
+        assert!(!enabled.get_history(&script_hash).is_empty());
+        drop(enabled);
+
+        let mut disabled = ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index(
+            Network::Regtest,
+            directory.path(),
+            directory.path().join("blocks"),
+            None,
+            true,
+            false,
+            false,
+            true,
+            None,
+            None,
+            false,
+            validation::DeploymentParameters::for_network(Network::Regtest),
+            false,
+        )
+        .unwrap();
+        assert!(!disabled.history_index_enabled);
+        assert!(disabled.get_history(&script_hash).is_empty());
+        assert_eq!(disabled.electrum_history_store.generation(), generation);
+
+        disabled.connect_block(mine_block(&disabled, 2)).unwrap();
+        assert_eq!(disabled.electrum_history_store.generation(), generation);
     }
 
     #[test]

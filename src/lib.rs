@@ -2021,7 +2021,7 @@ impl Node {
             .flatten()
             .and_then(|height| height.trim().parse().ok());
         let mut chain =
-            ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters(
+            ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index(
                 config.network,
                 &chain_data_dir,
                 blocks_dir,
@@ -2034,6 +2034,7 @@ impl Node {
                 config.assume_valid,
                 config.blocks_xor,
                 deployment_parameters,
+                config.electrum_bind.is_some(),
             )
             .map_err(core_startup_chain_error)?;
         chain.set_shutdown_interrupt(shutdown_requested.clone());

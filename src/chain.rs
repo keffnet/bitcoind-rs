@@ -13165,6 +13165,24 @@ mod tests {
     }
 
     #[test]
+    fn peer_storage_batch_reopens_after_durability_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=70 {
+            let block = mine_block(&state, height);
+            state.connect_block_from_peer(block).unwrap();
+        }
+        let tip = state.best_hash();
+        assert_eq!(state.height(), 70);
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.height(), 70);
+        assert_eq!(reopened.best_hash(), tip);
+        assert_eq!(reopened.block_hash(70), Some(tip));
+    }
+
+    #[test]
     fn active_utxo_values_are_served_from_the_durable_store() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();

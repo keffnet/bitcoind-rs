@@ -300,6 +300,10 @@ const DNS_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(11);
 const SEEDNODE_FALLBACK_DELAY: u64 = 10;
 const FIXED_SEED_FALLBACK_DELAY: Duration = Duration::from_secs(60);
 const FEELER_INTERVAL: Duration = Duration::from_secs(2 * 60);
+// Core skips addresses attempted in the last ten minutes while it has other
+// AddrMan candidates. Without this guard, a peer that accepts TCP and closes
+// during VERSION is selected again on every 500 ms discovery pass.
+const AUTOMATIC_OUTBOUND_RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Core keeps manually added connections in a separate, bounded pool rather
 /// than consuming automatic `-maxconnections` slots.
 const MAX_ADDNODE_CONNECTIONS: usize = 8;
@@ -1505,6 +1509,7 @@ impl KnownTxInventory {
 
 type PeerRegistry = Arc<parking_lot::Mutex<HashMap<usize, Arc<PeerState>>>>;
 type OutboundAttempts = Arc<parking_lot::Mutex<HashSet<NetworkEndpoint>>>;
+type OutboundLastAttempts = Arc<parking_lot::Mutex<HashMap<NetworkEndpoint, Instant>>>;
 
 #[derive(Clone)]
 struct OutboundContext {
@@ -1517,6 +1522,7 @@ struct OutboundContext {
     peers: PeerRegistry,
     next_peer_id: Arc<AtomicUsize>,
     attempts: OutboundAttempts,
+    last_attempts: OutboundLastAttempts,
     automatic_full_attempts: Arc<AtomicUsize>,
     automatic_block_relay_attempts: Arc<AtomicUsize>,
     automatic_feeler_attempts: Arc<AtomicUsize>,
@@ -1935,6 +1941,7 @@ impl PeerManager {
             peers: peers.clone(),
             next_peer_id: next_peer_id.clone(),
             attempts: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            last_attempts: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             automatic_full_attempts: Arc::new(AtomicUsize::new(0)),
             automatic_block_relay_attempts: Arc::new(AtomicUsize::new(0)),
             automatic_feeler_attempts: Arc::new(AtomicUsize::new(0)),
@@ -2361,6 +2368,7 @@ impl PeerManager {
                         &discovery_node,
                         available,
                         &discovery_outbound.attempts,
+                        &discovery_outbound.last_attempts,
                     );
                     let mut full_slots = full_slots;
                     let mut block_relay_slots = block_relay_slots;
@@ -2436,11 +2444,14 @@ impl PeerManager {
                     {
                         continue;
                     }
-                    let Some(endpoint) =
-                        select_discovery_endpoints(&feeler_node, 1, &feeler_outbound.attempts)
-                            .into_iter()
-                            .next()
-                    else {
+                    let Some(endpoint) = select_discovery_endpoints(
+                        &feeler_node,
+                        1,
+                        &feeler_outbound.attempts,
+                        &feeler_outbound.last_attempts,
+                    )
+                    .into_iter()
+                    .next() else {
                         continue;
                     };
                     spawn_outbound_loop(
@@ -2889,6 +2900,7 @@ fn spawn_outbound_loop(
         peers,
         next_peer_id: peer_id_allocator,
         attempts: outbound_attempts,
+        last_attempts: outbound_last_attempts,
         automatic_full_attempts,
         automatic_block_relay_attempts,
         automatic_feeler_attempts,
@@ -3011,6 +3023,11 @@ fn spawn_outbound_loop(
                 }
                 continue;
             }
+            if automatic {
+                outbound_last_attempts
+                    .lock()
+                    .insert(endpoint.clone(), Instant::now());
+            }
             log_outbound_connection_attempt(&endpoint, transport_v2, connection_type);
             let connection = tokio::select! {
                 result = connect_peer_endpoint_with_options_and_dns_with_i2p(
@@ -3030,7 +3047,16 @@ fn spawn_outbound_loop(
             };
             match connection {
                 Ok(stream) => {
-                    peer_log!(node, info, endpoint, "connected to configured peer");
+                    if persistent || manual {
+                        peer_log!(node, info, endpoint, "connected to configured peer");
+                    } else {
+                        peer_log!(
+                            node,
+                            debug,
+                            endpoint,
+                            "connected to automatic outbound peer"
+                        );
+                    }
                     complete_one_try(&mut completion);
                     if let Err(error) = serve_peer(
                         node.clone(),
@@ -3226,6 +3252,7 @@ fn select_discovery_endpoints(
     node: &Arc<Node>,
     limit: usize,
     outbound_attempts: &OutboundAttempts,
+    outbound_last_attempts: &OutboundLastAttempts,
 ) -> Vec<NetworkEndpoint> {
     if limit == 0 {
         return Vec::new();
@@ -3249,6 +3276,8 @@ fn select_discovery_endpoints(
         .collect();
     let added: HashSet<_> = node.added_network_endpoints().into_iter().collect();
     let attempts = outbound_attempts.lock();
+    let last_attempts = outbound_last_attempts.lock();
+    let now = Instant::now();
     let mut candidates = node
         .known_network_addresses()
         .into_iter()
@@ -3262,9 +3291,13 @@ fn select_discovery_endpoints(
                 && !node.is_banned_for_endpoint(&entry.endpoint)
                 && !added.contains(&entry.endpoint)
                 && !attempts.contains(&entry.endpoint)
+                && !last_attempts.get(&entry.endpoint).is_some_and(|attempted| {
+                    now.saturating_duration_since(*attempted) < AUTOMATIC_OUTBOUND_RETRY_INTERVAL
+                })
         })
         .collect::<Vec<_>>();
     drop(attempts);
+    drop(last_attempts);
     candidates.sort_by(|left, right| {
         node.is_network_address_tried(&right.endpoint)
             .cmp(&node.is_network_address_tried(&left.endpoint))
@@ -3387,7 +3420,8 @@ fn select_discovery_addresses(
     limit: usize,
     outbound_attempts: &OutboundAttempts,
 ) -> Vec<SocketAddr> {
-    select_discovery_endpoints(node, limit, outbound_attempts)
+    let last_attempts = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    select_discovery_endpoints(node, limit, outbound_attempts, &last_attempts)
         .into_iter()
         .filter_map(|endpoint| endpoint.legacy_socket_addr())
         .collect()
@@ -5187,6 +5221,14 @@ async fn serve_peer_loop(
                 if !version_received {
                     continue;
                 }
+                if outbound && !peer_state.manual {
+                    node.promote_network_address_to_tried(&peer_state.endpoint);
+                }
+                info!(
+                    "Completed connection peer_id={peer_id} active_connections={} connection_type={}",
+                    node.peer_infos().len(),
+                    peer_state.connection_type
+                );
                 // Core does not queue transaction announcements until the
                 // version handshake is complete. Otherwise a transaction
                 // received while a spy is still negotiating could be
@@ -13917,7 +13959,8 @@ mod tests {
         assert!(node.remember_network_address(ipv4_b.clone(), 1, 13));
         assert!(node.remember_network_address(ipv4_c.clone(), 1, 14));
         let attempts = Arc::new(parking_lot::Mutex::new(HashSet::new()));
-        let selected = select_discovery_endpoints(&node, 8, &attempts);
+        let last_attempts = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let selected = select_discovery_endpoints(&node, 8, &attempts, &last_attempts);
         assert!(selected.contains(&onion));
         assert!(selected.contains(&i2p));
         assert!(selected.contains(&ipv4_c));
@@ -13927,6 +13970,13 @@ mod tests {
                 .filter(|endpoint| endpoint.netgroup_key() == ipv4_a.netgroup_key())
                 .count(),
             1
+        );
+
+        last_attempts.lock().insert(ipv4_c.clone(), Instant::now());
+        let selected = select_discovery_endpoints(&node, 8, &attempts, &last_attempts);
+        assert!(
+            !selected.contains(&ipv4_c),
+            "an address that just failed must not be selected on every discovery tick"
         );
     }
 

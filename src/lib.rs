@@ -5879,11 +5879,11 @@ impl Node {
             .write()
             .insert(id, ChainSyncTimeoutState::default());
         if replaced_connection {
-            info!(
+            debug!(
                 "Updated connection peer_id={id} active_connections={active_connections} connection_type={connection_type}"
             );
         } else {
-            info!(
+            debug!(
                 "Added connection peer_id={id} active_connections={active_connections} connection_type={connection_type}"
             );
         }
@@ -5900,7 +5900,6 @@ impl Node {
                 let mut known = self.known_addresses.write();
                 if self.reserve_known_address(&mut known, address) {
                     known.insert(address, peer);
-                    self.tried_addresses.write().insert(address);
                     self.network_address_sources
                         .write()
                         .entry(endpoint.clone())
@@ -5918,7 +5917,6 @@ impl Node {
                                 time: connected_at,
                             });
                     entry.time = entry.time.max(connected_at);
-                    self.network_tried_addresses.write().insert(endpoint);
                     self.network_address_sources
                         .write()
                         .entry(peer.endpoint.clone())

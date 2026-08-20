@@ -2931,6 +2931,14 @@ impl ChainState {
             BackgroundValidationOutcome::Complete {
                 base_matches: true, ..
             } => {
+                // Snapshot activation can leave the historical prefix with
+                // header-only transaction counts. The background worker
+                // validates those block bodies in an isolated chainstate,
+                // so promote the counts explicitly when that validation
+                // completes. Core exposes the counts through getblock,
+                // getchaintxstats, and nChainTx even after the snapshot
+                // chainstate is retired.
+                self.rebuild_active_tx_counts()?;
                 self.snapshot_base = None;
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
@@ -2945,6 +2953,7 @@ impl ChainState {
                 utxos,
                 ..
             } => {
+                self.rebuild_active_tx_counts()?;
                 self.utxos = utxos;
                 self.utxos_materialized = true;
                 self.snapshot_base = None;
@@ -2958,6 +2967,7 @@ impl ChainState {
             }
             BackgroundValidationOutcome::Failed { error, utxos, .. } => {
                 if let Some(utxos) = utxos {
+                    self.rebuild_active_tx_counts()?;
                     self.utxos = utxos;
                     self.utxos_materialized = true;
                     self.snapshot_base = None;
@@ -10840,12 +10850,18 @@ mod tests {
         }
         let base = state.best_hash();
         let expected = state.load_utxo_map_from_store().unwrap();
+        let expected_tx_counts = state.active_tx_counts.clone();
         state.persist_snapshot().unwrap();
         state
             .persist_assumeutxo_base_snapshot(base, &expected)
             .unwrap();
         state.snapshot_base = Some(base);
         state.snapshot_validated = false;
+        // A snapshot node can initially know only headers for the active
+        // prefix. Background replay must restore the Core-visible nTx and
+        // nChainTx values when it promotes the validated chainstate.
+        state.active_tx_counts.fill(0);
+        state.active_tx_totals = cumulative_tx_counts(&state.active_tx_counts);
         state.persist_snapshot_provenance().unwrap();
         state.start_background_validation().unwrap();
 
@@ -10859,6 +10875,16 @@ mod tests {
         assert!(state.snapshot_provenance().is_none());
         assert!(state.background_chainstate().is_none());
         assert_eq!(state.load_utxo_map_from_store().unwrap(), expected);
+        assert_eq!(state.active_tx_counts, expected_tx_counts);
+        assert_eq!(
+            state.chain_transaction_count(state.height()),
+            Some(
+                expected_tx_counts
+                    .iter()
+                    .map(|count| u64::from(*count))
+                    .sum()
+            )
+        );
         assert!(!directory.path().join("assumeutxo.bin").exists());
         assert!(!directory.path().join("assumeutxo-base.bin").exists());
     }

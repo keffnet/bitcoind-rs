@@ -69,3 +69,7 @@ path = "src/bitcoin.rs"
 [[bin]]
 name = "bitcoin-util"
 path = "src/bitcoin_util.rs"
+
+[[bin]]
+name = "bitcoin-tx"
+path = "src/bitcoin_tx.rs"

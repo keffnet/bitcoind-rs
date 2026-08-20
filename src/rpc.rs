@@ -7548,7 +7548,11 @@ fn parse_transaction_verbosity(value: Option<&Value>) -> Result<i64> {
     parse_verbosity(value, 0)
 }
 
-fn decoded_transaction_json(transaction: &Transaction, network: Network) -> Value {
+/// Render a decoded transaction using the same wallet-free JSON shape exposed
+/// by `decoderawtransaction`. The standalone `bitcoin-tx` utility reuses the
+/// daemon's mature transaction renderer so RPC and offline tool output cannot
+/// drift on script, witness, or weight fields.
+pub fn decoded_transaction_json(transaction: &Transaction, network: Network) -> Value {
     let mut result = rpc_transaction(transaction, None, None, None, None, network);
     result
         .as_object_mut()
@@ -11788,11 +11792,71 @@ fn enforce_max_fee_rate(
     Ok(())
 }
 
-struct SigningPrevout {
-    output: TxOut,
-    amount_provided: bool,
-    redeem_script: Option<ScriptBuf>,
-    witness_script: Option<ScriptBuf>,
+pub struct SigningPrevout {
+    pub output: TxOut,
+    pub amount_provided: bool,
+    pub redeem_script: Option<ScriptBuf>,
+    pub witness_script: Option<ScriptBuf>,
+}
+
+/// Sign a transaction using only explicitly supplied keys and prevout
+/// metadata. This is the wallet-free primitive shared by the RPC method and
+/// the standalone `bitcoin-tx` utility; it never reads or writes wallet state.
+pub fn sign_transaction_offline(
+    transaction: &mut Transaction,
+    private_keys: &[bitcoin::PrivateKey],
+    prevouts: &HashMap<OutPoint, SigningPrevout>,
+    sighash_name: &str,
+) -> Result<()> {
+    let sighash_type = parse_raw_sighash_type(sighash_name)?;
+    let previous_outputs = transaction
+        .input
+        .iter()
+        .map(|input| {
+            prevouts
+                .get(&input.previous_output)
+                .map(|prevout| prevout.output.clone())
+        })
+        .collect::<Option<Vec<_>>>();
+    let secp = Secp256k1::new();
+    for input_index in 0..transaction.input.len() {
+        let transaction_before_signing = transaction.clone();
+        let input = &transaction.input[input_index];
+        let Some(prevout) = prevouts.get(&input.previous_output) else {
+            continue;
+        };
+        if !prevout.amount_provided
+            && (prevout.output.script_pubkey.is_witness_program()
+                || prevout.witness_script.is_some()
+                || prevout
+                    .redeem_script
+                    .as_ref()
+                    .is_some_and(|script| script.is_witness_program()))
+            && !is_p2a_script(&prevout.output.script_pubkey)
+        {
+            bail!(
+                "Missing amount for CTxOut with scriptPubKey={}",
+                hex::encode(prevout.output.script_pubkey.as_bytes())
+            )
+        }
+        let signing_result = sign_transaction_input(
+            transaction,
+            input_index,
+            prevout,
+            private_keys,
+            &secp,
+            sighash_type,
+            previous_outputs.as_deref(),
+        );
+        let variants = [transaction_before_signing, transaction.clone()];
+        if let Err(error) =
+            combine_multisig_input(transaction, input_index, &variants, &prevout.output)
+        {
+            debug!(input_index, %error, "unable to merge existing raw transaction signatures");
+        }
+        signing_result?;
+    }
+    Ok(())
 }
 
 fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -11876,7 +11940,10 @@ fn sign_raw_transaction_with_key(node: &Arc<Node>, params: &Value) -> Result<Val
                     .is_some_and(|script| script.is_witness_program()))
             && !is_p2a_script(&prevout.output.script_pubkey)
         {
-            bail!("Missing amount")
+            bail!(
+                "Missing amount for CTxOut with scriptPubKey={}",
+                hex::encode(prevout.output.script_pubkey.as_bytes())
+            )
         }
         let signing_result = sign_transaction_input(
             &mut transaction,
@@ -12163,7 +12230,7 @@ fn sign_transaction_input(
     };
 
     let signature_for_key = |key: &bitcoin::PrivateKey| {
-        let signature = secp.sign_ecdsa(&message, &key.inner);
+        let signature = secp.sign_ecdsa_low_r(&message, &key.inner);
         let mut bytes = signature.serialize_der().to_vec();
         bytes.push(sighash_type.to_u32() as u8);
         Ok::<_, anyhow::Error>(bytes)
@@ -16688,7 +16755,6 @@ pub(crate) fn script_json_with_network(
         );
     }
     result.insert("hex".to_owned(), json!(hex::encode(script.as_bytes())));
-    result.insert("type".to_owned(), json!(script_type));
     if let Some(network) = network {
         if script_type != "pubkey"
             && let Ok(address) = Address::from_script(script, network)
@@ -16696,6 +16762,7 @@ pub(crate) fn script_json_with_network(
             result.insert("address".to_owned(), json!(address.to_string()));
         }
     }
+    result.insert("type".to_owned(), json!(script_type));
     Value::Object(result)
 }
 

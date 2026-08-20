@@ -1145,6 +1145,24 @@ impl FilterStore {
     /// durable is recoverable because `open` falls back to scanning the
     /// append-only records when the index length is stale.
     pub fn insert_batch(&mut self, entries: &[(BlockHash, &[u8], FilterHeader)]) -> Result<()> {
+        self.insert_batch_with_sync(entries, true)
+    }
+
+    /// Append immutable filters without forcing a filesystem sync for every
+    /// block. The owning chainstate flushes the append-only stores at its
+    /// bounded peer-write durability boundary.
+    pub fn insert_batch_unsynced(
+        &mut self,
+        entries: &[(BlockHash, &[u8], FilterHeader)],
+    ) -> Result<()> {
+        self.insert_batch_with_sync(entries, false)
+    }
+
+    fn insert_batch_with_sync(
+        &mut self,
+        entries: &[(BlockHash, &[u8], FilterHeader)],
+        sync: bool,
+    ) -> Result<()> {
         let mut seen = HashSet::new();
         let mut pending = Vec::new();
         let mut data_len = self.file.seek(SeekFrom::End(0))?;
@@ -1184,7 +1202,9 @@ impl FilterStore {
             self.file.write_all(&bytes)?;
             records.push((hash, Record { offset, length }));
         }
-        self.file.sync_data()?;
+        if sync {
+            self.file.sync_data()?;
+        }
 
         self.index_file.seek(SeekFrom::Start(0))?;
         self.index_file.write_all(&data_len.to_le_bytes())?;
@@ -1194,10 +1214,18 @@ impl FilterStore {
             self.index_file.write_all(&record.offset.to_le_bytes())?;
             self.index_file.write_all(&record.length.to_le_bytes())?;
         }
-        self.index_file.sync_data()?;
+        if sync {
+            self.index_file.sync_data()?;
+        }
         for (hash, record) in records {
             self.index.insert(hash, record);
         }
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        self.index_file.sync_data()?;
         Ok(())
     }
 }
@@ -1380,6 +1408,19 @@ impl ChainstateStore {
     }
 
     pub fn insert(&mut self, hash: BlockHash, payload: &[u8]) -> Result<()> {
+        self.insert_with_index_sync(hash, payload, true)
+    }
+
+    pub fn insert_unsynced(&mut self, hash: BlockHash, payload: &[u8]) -> Result<()> {
+        self.insert_with_index_sync(hash, payload, false)
+    }
+
+    fn insert_with_index_sync(
+        &mut self,
+        hash: BlockHash,
+        payload: &[u8],
+        sync_index: bool,
+    ) -> Result<()> {
         if self.index.contains_key(&hash) {
             return Ok(());
         }
@@ -1399,11 +1440,12 @@ impl ChainstateStore {
             .pending_write_bytes
             .saturating_add(4usize.saturating_add(usize::try_from(length).unwrap_or(usize::MAX)));
         let record = Record { offset, length };
-        persist_index_entry(
+        persist_index_entry_with_sync(
             &mut self.index_file,
             offset + 4 + u64::from(length),
             hash,
             record,
+            sync_index,
         )?;
         self.index.insert(hash, record);
         if self.pending_write_bytes >= self.write_batch_limit {
@@ -1681,6 +1723,26 @@ impl UtxoStore {
         removals: &[OutPoint],
         additions: &[(OutPoint, StoredUtxo)],
     ) -> Result<()> {
+        self.apply_batch_with_sync(removals, additions, true)
+    }
+
+    /// Apply a UTXO mutation batch without forcing a filesystem sync. The
+    /// record-level commit marker and append-only index remain intact; the
+    /// owning chainstate performs a bounded flush for peer/IBD writes.
+    pub fn apply_batch_unsynced(
+        &mut self,
+        removals: &[OutPoint],
+        additions: &[(OutPoint, StoredUtxo)],
+    ) -> Result<()> {
+        self.apply_batch_with_sync(removals, additions, false)
+    }
+
+    fn apply_batch_with_sync(
+        &mut self,
+        removals: &[OutPoint],
+        additions: &[(OutPoint, StoredUtxo)],
+        sync: bool,
+    ) -> Result<()> {
         if removals.is_empty() && additions.is_empty() {
             return Ok(());
         }
@@ -1718,7 +1780,9 @@ impl UtxoStore {
             self.pending_write_bytes = self
                 .pending_write_bytes
                 .saturating_add(4usize.saturating_add(commit_location.length() as usize));
-            self.file.sync_data()?;
+            if sync {
+                self.file.sync_data()?;
+            }
             data_committed = true;
             append_utxo_index_batch(
                 &mut self.index_file,
@@ -1728,7 +1792,9 @@ impl UtxoStore {
                 self.generation,
                 &operations,
             )?;
-            self.index_file.sync_data()?;
+            if sync {
+                self.index_file.sync_data()?;
+            }
             Ok(())
         })();
         if let Err(error) = write_result {
@@ -2160,6 +2226,18 @@ impl ElectrumHistoryStore {
     /// Apply complete replacement values for the scripts touched by a block.
     /// The caller supplies each script's new chronological history.
     pub fn apply_batch(&mut self, updates: &[(String, Vec<(Txid, u32)>)]) -> Result<()> {
+        self.apply_batch_with_sync(updates, true)
+    }
+
+    pub fn apply_batch_unsynced(&mut self, updates: &[(String, Vec<(Txid, u32)>)]) -> Result<()> {
+        self.apply_batch_with_sync(updates, false)
+    }
+
+    fn apply_batch_with_sync(
+        &mut self,
+        updates: &[(String, Vec<(Txid, u32)>)],
+        sync: bool,
+    ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
@@ -2182,7 +2260,9 @@ impl ElectrumHistoryStore {
             }
             let commit = encode_history_commit(batch_id);
             append_history_data_record(&mut self.file, &commit)?;
-            self.file.sync_data()?;
+            if sync {
+                self.file.sync_data()?;
+            }
             data_committed = true;
             append_history_index_batch(
                 &mut self.index_file,
@@ -2191,7 +2271,9 @@ impl ElectrumHistoryStore {
                 next_batch_id,
                 &operations,
             )?;
-            self.index_file.sync_data()?;
+            if sync {
+                self.index_file.sync_data()?;
+            }
             Ok(())
         })();
         if let Err(error) = write_result {
@@ -3390,6 +3472,14 @@ impl CoinStatsStore {
     }
 
     pub fn insert(&mut self, record: &CoinStatsRecord) -> Result<()> {
+        self.insert_with_sync(record, true)
+    }
+
+    pub fn insert_unsynced(&mut self, record: &CoinStatsRecord) -> Result<()> {
+        self.insert_with_sync(record, false)
+    }
+
+    fn insert_with_sync(&mut self, record: &CoinStatsRecord, sync: bool) -> Result<()> {
         if self.index.contains_key(&record.block_hash) {
             return Ok(());
         }
@@ -3399,13 +3489,16 @@ impl CoinStatsStore {
         let length = u32::try_from(bytes.len()).context("coinstats length does not fit u32")?;
         self.file.write_all(&length.to_le_bytes())?;
         self.file.write_all(&bytes)?;
-        self.file.sync_data()?;
+        if sync {
+            self.file.sync_data()?;
+        }
         let record_index = Record { offset, length };
-        persist_index_entry(
+        persist_index_entry_with_sync(
             &mut self.index_file,
             offset + 4 + bytes.len() as u64,
             record.block_hash,
             record_index,
+            sync,
         )?;
         self.index.insert(record.block_hash, record_index);
         Ok(())
@@ -3428,6 +3521,12 @@ impl CoinStatsStore {
             bail!("stored coinstats hash does not match coinstats index");
         }
         Ok(Some(decoded))
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.file.sync_data()?;
+        self.index_file.sync_data()?;
+        Ok(())
     }
 }
 
@@ -4331,15 +4430,6 @@ fn rewrite_index(file: &mut File, data_len: u64, index: &HashMap<BlockHash, Reco
     }
     file.sync_data()?;
     Ok(())
-}
-
-fn persist_index_entry(
-    file: &mut File,
-    data_len: u64,
-    hash: BlockHash,
-    record: Record,
-) -> Result<()> {
-    persist_index_entry_with_sync(file, data_len, hash, record, true)
 }
 
 fn persist_index_entry_with_sync(

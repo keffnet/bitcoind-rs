@@ -69,6 +69,10 @@ const ASSUMEUTXO_CHECKPOINT_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-checkpoint-v
 const ASSUMEUTXO_CHECKPOINT_INTERVAL: u32 = 256;
 const HEADER_RECORD_SIZE: usize = 80 + 4;
 const HEADER_JOURNAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
+// Peer/IBD writes use append-only records and publish a bounded durability
+// boundary instead of forcing several fsyncs for every block. Direct API and
+// mining paths retain their immediate-sync behavior.
+const PEER_STORAGE_FLUSH_BLOCKS: u32 = 64;
 
 /// Replace a small metadata file with a fully durable version.
 ///
@@ -99,6 +103,15 @@ fn persist_atomic_file(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<()
 /// metadata files continue to use [`persist_atomic_file`] with a directory
 /// sync.
 fn persist_advisory_atomic_file(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<()> {
+    persist_advisory_atomic_file_with_sync(path, temporary, bytes, true)
+}
+
+fn persist_advisory_atomic_file_with_sync(
+    path: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+    sync: bool,
+) -> Result<()> {
     let mut file = fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -106,7 +119,9 @@ fn persist_advisory_atomic_file(path: &Path, temporary: &Path, bytes: &[u8]) -> 
         .open(temporary)
         .with_context(|| format!("opening temporary advisory file {}", temporary.display()))?;
     file.write_all(bytes)?;
-    file.sync_data()?;
+    if sync {
+        file.sync_data()?;
+    }
     drop(file);
     fs::rename(temporary, path)?;
     Ok(())
@@ -1333,6 +1348,7 @@ pub struct ChainState {
     // stop at transaction boundaries when shutdown is requested.  Standalone
     // ChainState users keep the default flag, which is never set.
     shutdown_interrupt: Arc<AtomicBool>,
+    peer_storage_blocks_since_flush: u32,
 }
 
 struct HeaderMerkleCache {
@@ -2080,6 +2096,7 @@ impl ChainState {
             block_undo_cache: HashMap::new(),
             script_cache: Mutex::new(ScriptValidationCache::default()),
             shutdown_interrupt: Arc::new(AtomicBool::new(false)),
+            peer_storage_blocks_since_flush: 0,
         };
         let snapshot = if rebuild_chainstate {
             None
@@ -2377,6 +2394,39 @@ impl ChainState {
         self.active_chain.len().saturating_sub(1) as u32
     }
 
+    fn flush_append_only_stores(&mut self) -> Result<()> {
+        self.store.flush()?;
+        self.chainstate_store.flush()?;
+        self.utxo_store.flush()?;
+        self.electrum_history_store.flush()?;
+        self.filter_store.flush()?;
+        self.coinstats_store.flush()?;
+        if let Some(store) = self.electrum_store.as_mut() {
+            store.flush()?;
+        }
+        if let Some(store) = self.tx_index_store.as_mut() {
+            store.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush_peer_storage_if_needed(&mut self) -> Result<()> {
+        if self.peer_storage_blocks_since_flush < PEER_STORAGE_FLUSH_BLOCKS {
+            return Ok(());
+        }
+        self.flush_append_only_stores()?;
+        // Publish the advisory markers only after every append-only record in
+        // the batch has reached stable storage. Startup can therefore discard
+        // an incomplete suffix without trusting a tip marker that outran it.
+        self.persist_active_chain_tip()?;
+        self.persist_utxo_store_tip()?;
+        if self.history_index_enabled {
+            self.persist_electrum_history_store_tip()?;
+        }
+        self.peer_storage_blocks_since_flush = 0;
+        Ok(())
+    }
+
     /// Make all append-only stores and the chain metadata durable.
     ///
     /// Header synchronization can update the in-memory block index while a
@@ -2384,16 +2434,7 @@ impl ChainState {
     /// orderly shutdown closes that window and makes the current header tip
     /// available on the next restart.
     pub fn flush(&mut self) -> Result<()> {
-        self.store.flush()?;
-        self.chainstate_store.flush()?;
-        self.utxo_store.flush()?;
-        self.electrum_history_store.flush()?;
-        if let Some(store) = self.electrum_store.as_mut() {
-            store.flush()?;
-        }
-        if let Some(store) = self.tx_index_store.as_mut() {
-            store.flush()?;
-        }
+        self.flush_append_only_stores()?;
         self.persist_metadata()
     }
 
@@ -6299,11 +6340,15 @@ impl ChainState {
     }
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {
-        self.connect_block_with_existing_body(block, false, false)
+        self.connect_block_with_existing_body(block, false, false, true)
     }
 
     pub(crate) fn connect_block_from_peer(&mut self, block: Block) -> Result<ChainTip> {
-        self.connect_block_with_existing_body(block, false, true)
+        let result = self.connect_block_with_existing_body(block, false, true, false);
+        if result.is_ok() {
+            self.flush_peer_storage_if_needed()?;
+        }
+        result
     }
 
     fn connect_block_with_existing_body(
@@ -6311,6 +6356,7 @@ impl ChainState {
         block: Block,
         allow_existing_body: bool,
         retain_invalid_body: bool,
+        sync_storage: bool,
     ) -> Result<ChainTip> {
         self.check_shutdown_interrupt()?;
         self.poll_background_validation()?;
@@ -6380,7 +6426,9 @@ impl ChainState {
             bail!("block {hash} is on an invalidated branch")
         }
         if parent_hash == self.best_hash() {
-            if let Err(error) = self.connect_block_internal(&block, true) {
+            if let Err(error) =
+                self.connect_block_internal_with_storage_sync(&block, true, sync_storage)
+            {
                 if retain_invalid_body
                     && error
                         .downcast_ref::<ValidationError>()
@@ -6650,7 +6698,7 @@ impl ChainState {
             return;
         };
         for child in children {
-            let _ = self.connect_block_with_existing_body(child, true, false);
+            let _ = self.connect_block_with_existing_body(child, true, false, true);
         }
     }
 
@@ -6733,7 +6781,7 @@ impl ChainState {
             let Ok(Some(child)) = self.store.get(&child_hash) else {
                 continue;
             };
-            let _ = self.connect_block_with_existing_body(child, true, false);
+            let _ = self.connect_block_with_existing_body(child, true, false, true);
         }
     }
 
@@ -7517,14 +7565,38 @@ impl ChainState {
     }
 
     fn connect_block_internal(&mut self, block: &Block, persist: bool) -> Result<()> {
-        self.connect_block_internal_with_index_journal(block, persist, None)
+        self.connect_block_internal_with_storage_sync(block, persist, true)
+    }
+
+    fn connect_block_internal_with_storage_sync(
+        &mut self,
+        block: &Block,
+        persist: bool,
+        sync_storage: bool,
+    ) -> Result<()> {
+        self.connect_block_internal_with_index_journal_and_sync(block, persist, None, sync_storage)
     }
 
     fn connect_block_internal_with_index_journal(
         &mut self,
         block: &Block,
         persist: bool,
+        tx_index_all_changes: Option<&mut HashMap<Txid, Option<TxLocation>>>,
+    ) -> Result<()> {
+        self.connect_block_internal_with_index_journal_and_sync(
+            block,
+            persist,
+            tx_index_all_changes,
+            true,
+        )
+    }
+
+    fn connect_block_internal_with_index_journal_and_sync(
+        &mut self,
+        block: &Block,
+        persist: bool,
         mut tx_index_all_changes: Option<&mut HashMap<Txid, Option<TxLocation>>>,
+        sync_storage: bool,
     ) -> Result<()> {
         let height = self.height().saturating_add(1);
         let previous = self.best_hash();
@@ -7559,22 +7631,27 @@ impl ChainState {
             self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?
         };
         self.check_shutdown_interrupt()?;
-        self.cache_block_undo(block, &application.spent_entries, persist)?;
+        self.cache_block_undo(block, &application.spent_entries, persist && sync_storage)?;
         let previous_filter_header = self
             .basic_filter_for_block(&previous)?
             .map(|(_, header)| header)
             .unwrap_or(FilterHeader::all_zeros());
-        self.cache_basic_filter_for_block(
+        self.cache_basic_filter_for_block_with_sync(
             block,
             &application.spent_entries,
             &previous_filter_header,
+            sync_storage,
         )?;
 
         let hash = block.block_hash();
         let spent_entries: HashMap<OutPoint, UtxoEntry> =
             application.spent_entries.iter().cloned().collect();
         if persist {
-            self.store.insert(block)?;
+            if sync_storage {
+                self.store.insert(block)?;
+            } else {
+                self.store.insert_unsynced(block)?;
+            }
         }
         if persist {
             let delta = self.chainstate_delta_for_block(
@@ -7585,7 +7662,11 @@ impl ChainState {
                 application.metrics,
             );
             let bytes = serialize_chainstate_delta(&delta)?;
-            self.chainstate_store.insert(hash, &bytes)?;
+            if sync_storage {
+                self.chainstate_store.insert(hash, &bytes)?;
+            } else {
+                self.chainstate_store.insert_unsynced(hash, &bytes)?;
+            }
         }
         let mut created_utxos = Vec::new();
         let removals = application
@@ -7664,16 +7745,21 @@ impl ChainState {
             }
         }
         if persist {
-            self.persist_transaction_index_for_block(block)?;
+            self.persist_transaction_index_for_block_with_sync(block, sync_storage)?;
         }
         if persist {
             let additions = created_utxos
                 .iter()
                 .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
                 .collect::<Vec<_>>();
-            self.utxo_store.apply_batch(&removals, &additions)?;
+            if sync_storage {
+                self.utxo_store.apply_batch(&removals, &additions)?;
+            } else {
+                self.utxo_store
+                    .apply_batch_unsynced(&removals, &additions)?;
+            }
             if self.history_index_enabled {
-                self.persist_history_updates(history_updates)?;
+                self.persist_history_updates_with_sync(history_updates, sync_storage)?;
             }
         }
         if self.txospender_index_enabled {
@@ -7721,24 +7807,28 @@ impl ChainState {
         self.assign_header_sequence_id(hash);
         self.assign_block_sequence_id(hash);
         if persist {
-            self.persist_utxo_store_tip()?;
+            self.persist_utxo_store_tip_with_sync(sync_storage)?;
             if self.history_index_enabled {
-                self.persist_electrum_history_store_tip()?;
+                self.persist_electrum_history_store_tip_with_sync(sync_storage)?;
             }
         }
         if let Some(stats) = self.coin_stats.as_mut() {
             stats.apply_block_metrics(application.metrics);
         }
-        self.persist_coinstats_record(hash, height)?;
+        self.persist_coinstats_record_with_sync(hash, height, sync_storage)?;
         if persist {
             if self.height() % SNAPSHOT_INTERVAL == 0 {
                 self.persist_snapshot()?;
             } else {
                 // The block body, chainstate mutation, UTXO batch, and
-                // Electrum history batch were made durable above. Publish a
+                // Electrum history batch are append-only records. Publish a
                 // compact active-tip marker instead of rewriting the full
                 // header/active-chain metadata on every block.
-                self.persist_active_chain_tip()?;
+                self.persist_active_chain_tip_with_sync(sync_storage)?;
+            }
+            if !sync_storage {
+                self.peer_storage_blocks_since_flush =
+                    self.peer_storage_blocks_since_flush.saturating_add(1);
             }
             self.utxo_store.maybe_simulate_crash()?;
         }
@@ -7851,6 +7941,15 @@ impl ChainState {
     }
 
     fn persist_coinstats_record(&mut self, hash: BlockHash, height: u32) -> Result<()> {
+        self.persist_coinstats_record_with_sync(hash, height, true)
+    }
+
+    fn persist_coinstats_record_with_sync(
+        &mut self,
+        hash: BlockHash,
+        height: u32,
+        sync: bool,
+    ) -> Result<()> {
         if !self.coinstats_index_enabled {
             return Ok(());
         }
@@ -7858,7 +7957,12 @@ impl ChainState {
             .coin_stats
             .as_ref()
             .context("coinstats accumulator is not initialized")?;
-        self.coinstats_store.insert(&stats.record(hash, height))?;
+        let record = stats.record(hash, height);
+        if sync {
+            self.coinstats_store.insert(&record)?;
+        } else {
+            self.coinstats_store.insert_unsynced(&record)?;
+        }
         self.update_index_prune_locks(height);
         Ok(())
     }
@@ -8644,6 +8748,21 @@ impl ChainState {
         spent_entries: &[(OutPoint, UtxoEntry)],
         previous_filter_header: &FilterHeader,
     ) -> Result<()> {
+        self.cache_basic_filter_for_block_with_sync(
+            block,
+            spent_entries,
+            previous_filter_header,
+            true,
+        )
+    }
+
+    fn cache_basic_filter_for_block_with_sync(
+        &mut self,
+        block: &Block,
+        spent_entries: &[(OutPoint, UtxoEntry)],
+        previous_filter_header: &FilterHeader,
+        sync: bool,
+    ) -> Result<()> {
         if !self.blockfilter_index_enabled {
             return Ok(());
         }
@@ -8666,8 +8785,16 @@ impl ChainState {
                 .ok_or(bitcoin::bip158::Error::UtxoMissing(*outpoint))
         })?;
         let filter_header = filter.filter_header(previous_filter_header);
-        self.filter_store
-            .insert(block.block_hash(), &filter.content, filter_header)?;
+        if sync {
+            self.filter_store
+                .insert(block.block_hash(), &filter.content, filter_header)?;
+        } else {
+            self.filter_store.insert_batch_unsynced(&[(
+                block.block_hash(),
+                filter.content.as_slice(),
+                filter_header,
+            )])?;
+        }
         self.cache_basic_filter(block.block_hash(), filter.content, filter_header);
         if let Some(node) = self.block_index.get(&block.block_hash()) {
             self.update_index_prune_locks(node.height);
@@ -9237,9 +9364,10 @@ impl ChainState {
         Ok(())
     }
 
-    fn persist_history_updates(
+    fn persist_history_updates_with_sync(
         &mut self,
         updates: HashMap<String, Vec<HistoryEntry>>,
+        sync: bool,
     ) -> Result<()> {
         if !self.history_index_enabled || updates.is_empty() {
             return Ok(());
@@ -9256,7 +9384,12 @@ impl ChainState {
                 )
             })
             .collect::<Vec<_>>();
-        self.electrum_history_store.apply_batch(&store_updates)?;
+        if sync {
+            self.electrum_history_store.apply_batch(&store_updates)?;
+        } else {
+            self.electrum_history_store
+                .apply_batch_unsynced(&store_updates)?;
+        }
         if self.history_materialized {
             for (script_hash, entries) in updates {
                 self.history.insert(script_hash, entries);
@@ -9319,6 +9452,13 @@ impl ChainState {
         persist_advisory_atomic_file(&path, &temp, contents.as_bytes())
     }
 
+    fn persist_utxo_store_tip_with_sync(&self, sync: bool) -> Result<()> {
+        let path = self.utxo_store_tip_path();
+        let temp = path.with_extension("tip.tmp");
+        let contents = format!("{}\n{}\n", self.best_hash(), self.utxo_store.generation());
+        persist_advisory_atomic_file_with_sync(&path, &temp, contents.as_bytes(), sync)
+    }
+
     fn sync_utxo_store(&mut self) -> Result<()> {
         if !self.utxos_materialized {
             // Normal active-chain connects already commit the exact mutation
@@ -9358,6 +9498,10 @@ impl ChainState {
     }
 
     fn persist_electrum_history_store_tip(&self) -> Result<()> {
+        self.persist_electrum_history_store_tip_with_sync(true)
+    }
+
+    fn persist_electrum_history_store_tip_with_sync(&self, sync: bool) -> Result<()> {
         let path = self.electrum_history_store_tip_path();
         let temp = path.with_extension("tip.tmp");
         let contents = format!(
@@ -9366,7 +9510,7 @@ impl ChainState {
             self.electrum_history_store.generation(),
             self.electrum_history_store.len()
         );
-        persist_advisory_atomic_file(&path, &temp, contents.as_bytes())
+        persist_advisory_atomic_file_with_sync(&path, &temp, contents.as_bytes(), sync)
     }
 
     fn sync_electrum_history_store(&mut self) -> Result<()> {
@@ -9705,6 +9849,10 @@ impl ChainState {
     }
 
     fn persist_active_chain_tip(&self) -> Result<()> {
+        self.persist_active_chain_tip_with_sync(true)
+    }
+
+    fn persist_active_chain_tip_with_sync(&self, sync: bool) -> Result<()> {
         let tip = ActiveChainTip {
             active_tip: self.best_hash().to_string(),
             height: self.height(),
@@ -9718,7 +9866,7 @@ impl ChainState {
         let bytes = serialize_internal(CHAIN_ACTIVE_TIP_MAGIC, &tip)?;
         let path = self.data_dir.join("chainstate.active-tip");
         let temp = self.data_dir.join("chainstate.active-tip.tmp");
-        persist_advisory_atomic_file(&path, &temp, &bytes)
+        persist_advisory_atomic_file_with_sync(&path, &temp, &bytes, sync)
     }
 
     fn load_snapshot(&self, active_chain: &[BlockHash]) -> Result<Option<(ChainSnapshot, bool)>> {
@@ -9945,6 +10093,7 @@ impl ChainState {
         // callers request one between periodic checkpoints: the active-tip
         // sidecar may otherwise point past metadata whose old block bodies
         // have since been pruned.
+        self.flush_append_only_stores()?;
         self.persist_metadata()?;
         self.sync_utxo_store()?;
         self.utxo_store.compact_if_needed()?;
@@ -9960,7 +10109,9 @@ impl ChainState {
         self.persist_snapshot_checksum_bytes(&bytes)?;
         self.persist_tx_counts()?;
         self.chainstate_store.clear()?;
-        self.persist_active_chain_tip()
+        self.persist_active_chain_tip()?;
+        self.peer_storage_blocks_since_flush = 0;
+        Ok(())
     }
 
     fn persist_snapshot_checksum(&self) -> Result<()> {
@@ -10521,6 +10672,7 @@ fn open_background_replay_state(
             script_cache_max_entries,
         )),
         shutdown_interrupt: Arc::new(AtomicBool::new(false)),
+        peer_storage_blocks_since_flush: 0,
     })
 }
 

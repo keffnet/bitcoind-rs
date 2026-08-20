@@ -1023,10 +1023,15 @@ async fn serve_connection(stream: UnixStream, node: Arc<Node>) -> Result<()> {
         Side::Server,
         ReaderOptions::new(),
     );
-    let bootstrap: crate::init_capnp::init::Client = new_client(InitService { node });
+    let bootstrap: crate::init_capnp::init::Client = new_client(InitService { node: node.clone() });
     let rpc_system = RpcSystem::new(Box::new(network), Some(bootstrap.client));
-    rpc_system.await.context("serving IPC connection")?;
-    Ok(())
+    tokio::select! {
+        result = rpc_system => {
+            result.context("serving IPC connection")?;
+            Ok(())
+        }
+        _ = node.wait_for_shutdown() => Ok(()),
+    }
 }
 
 fn parse_socket_path(address: &str, datadir: &Path, network: bitcoin::Network) -> Result<PathBuf> {

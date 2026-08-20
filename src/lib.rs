@@ -5635,6 +5635,10 @@ impl Node {
         }
     }
 
+    pub(crate) fn shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::Acquire)
+    }
+
     pub(crate) fn onion_proxy(&self) -> Option<ProxyEndpoint> {
         if !self.config.onion_enabled {
             return None;
@@ -7302,6 +7306,7 @@ impl Node {
     pub fn request_shutdown(&self) {
         self.shutdown_requested.store(true, Ordering::Release);
         self.shutdown.notify_waiters();
+        self.disconnect_all_peers();
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {

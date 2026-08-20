@@ -219,7 +219,10 @@ impl RpcServer {
             let work_queue = work_queue.clone();
             listeners.spawn(async move {
                 loop {
-                    let (stream, peer) = listener.accept().await?;
+                    let (stream, peer) = tokio::select! {
+                        result = listener.accept() => result?,
+                        _ = node.wait_for_shutdown() => return Ok(()),
+                    };
                     let node = node.clone();
                     let work_queue = work_queue.clone();
                     tokio::spawn(async move {
@@ -267,9 +270,14 @@ async fn handle_connection(
     stream.set_nodelay(true)?;
     let mut connection = HttpConnection::new(stream);
     loop {
-        let request = match tokio::time::timeout(request_timeout, connection.read_request()).await {
-            Ok(request) => request?,
-            Err(_) => return Ok(()),
+        let request = tokio::select! {
+            result = tokio::time::timeout(request_timeout, connection.read_request()) => {
+                match result {
+                    Ok(request) => request?,
+                    Err(_) => return Ok(()),
+                }
+            }
+            _ = node.wait_for_shutdown() => return Ok(()),
         };
         let Some(request) = request else {
             return Ok(());
@@ -17511,6 +17519,69 @@ mod tests {
         drop(pending);
         drop(first);
         assert!(queue.acquire().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn rpc_clients_close_when_node_shuts_down() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let probe = TcpListener::bind("127.0.0.1:0").await?;
+        let address = probe.local_addr()?;
+        drop(probe);
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--regtest",
+            &format!("--rpc={address}"),
+            "--listen=false",
+            "--connect=0",
+            "--dnsseed=false",
+            "--fixedseeds=false",
+        ])?;
+        let node = Node::open(Config::from_args(args)?)?;
+        let server_task = tokio::spawn(RpcServer::new(node.clone()).run());
+        let mut client = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match TcpStream::connect(address).await {
+                    Ok(client) => break client,
+                    Err(_) => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await?;
+        let cookie = node
+            .rpc_cookie
+            .as_deref()
+            .expect("RPC cookie is enabled by default");
+        let auth = basic_auth_header("__cookie__", &cookie[11..]);
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"uptime","params":[]}"#;
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+            body.len()
+        );
+        client.write_all(request.as_bytes()).await?;
+        let mut response = [0u8; 4096];
+        let bytes_read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read(&mut response),
+        )
+        .await??;
+        assert!(bytes_read != 0);
+        assert!(
+            response[..bytes_read].starts_with(b"HTTP/1.1 200 OK"),
+            "{}",
+            String::from_utf8_lossy(&response[..bytes_read])
+        );
+
+        node.request_shutdown();
+        let bytes_read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read(&mut response),
+        )
+        .await??;
+        assert_eq!(bytes_read, 0, "RPC client remained connected");
+        server_task.await??;
+        Ok(())
     }
 
     fn basic_auth_header(username: &str, password: &str) -> String {

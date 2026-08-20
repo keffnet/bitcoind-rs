@@ -1968,10 +1968,13 @@ impl PeerManager {
         tokio::spawn(async move {
             let mut last_announced_tip = block_relay_node.chain.read().best_hash();
             loop {
-                let tip = match chain_events.recv().await {
-                    Ok(tip) => tip,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                let tip = tokio::select! {
+                    event = chain_events.recv() => match event {
+                        Ok(tip) => tip,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = block_relay_node.wait_for_shutdown() => break,
                 };
                 if block_relay_node.chain.read().is_initial_block_download() {
                     // Core does not announce blocks while IBD is active. Move
@@ -2028,10 +2031,13 @@ impl PeerManager {
         let relay_network = self.node.config.network;
         tokio::spawn(async move {
             loop {
-                let event = match mempool_events.recv().await {
-                    Ok(event) => event,
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                let event = tokio::select! {
+                    event = mempool_events.recv() => match event {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = relay_node.wait_for_shutdown() => break,
                 };
                 let initial_block_download = relay_node.chain.read().is_initial_block_download();
                 if initial_block_download {
@@ -2227,7 +2233,10 @@ impl PeerManager {
                 let seednode_fallback_started_at = unix_time_seconds();
                 let mut queried_delayed_dns_seed = false;
                 loop {
-                    ticker.tick().await;
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = discovery_node.wait_for_shutdown() => break,
+                    }
                     if !discovery_node.network_active() {
                         continue;
                     }
@@ -2504,6 +2513,7 @@ impl PeerManager {
                         dynamic_node.reattempt_stale_private_broadcasts();
                         dynamic_node.schedule_private_broadcasts();
                     }
+                    _ = dynamic_node.wait_for_shutdown() => break,
                 }
             }
         });
@@ -2696,12 +2706,21 @@ async fn run_tor_service(
 ) -> Result<()> {
     let mut retry_delay = Duration::from_secs(1);
     loop {
-        match tor_controller.publish(target, virtual_port).await {
+        let published = tokio::select! {
+            result = tor_controller.publish(target, virtual_port) => result,
+            _ = node.wait_for_shutdown() => return Ok(()),
+        };
+        match published {
             Ok((endpoint, mut control)) => {
                 node.add_listen_network_address(endpoint.clone());
                 retry_delay = Duration::from_secs(1);
-                if let Err(error) = tor_controller.wait_for_disconnect(&mut control).await {
-                    debug!(%error, "Tor onion service control connection ended");
+                tokio::select! {
+                    result = tor_controller.wait_for_disconnect(&mut control) => {
+                        if let Err(error) = result {
+                            debug!(%error, "Tor onion service control connection ended");
+                        }
+                    }
+                    _ = node.wait_for_shutdown() => return Ok(()),
                 }
                 node.remove_listen_network_address(&endpoint);
                 tor_controller.clear();
@@ -2709,7 +2728,10 @@ async fn run_tor_service(
             Err(error) => {
                 tor_controller.clear();
                 debug!(%error, "Tor onion service setup failed; retrying");
-                tokio::time::sleep(retry_delay).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay) => {}
+                    _ = node.wait_for_shutdown() => return Ok(()),
+                }
                 retry_delay = (retry_delay * 3 / 2).min(Duration::from_secs(600));
             }
         }
@@ -2725,7 +2747,10 @@ async fn run_inbound_listener(
     permissions: Option<PeerPermissions>,
 ) -> Result<()> {
     loop {
-        let (stream, address) = listener.accept().await?;
+        let (stream, address) = tokio::select! {
+            result = listener.accept() => result?,
+            _ = node.wait_for_shutdown() => return Ok(()),
+        };
         let banned = match permissions {
             Some(permissions) => node.is_banned_for_permissions(address, permissions),
             None => node.is_banned_for_peer(address, true),
@@ -2911,6 +2936,10 @@ fn spawn_outbound_loop(
             return;
         }
         loop {
+            if node.shutdown_requested() {
+                complete_one_try(&mut completion);
+                return;
+            }
             if persistent && !node.is_node_added_endpoint(&endpoint) {
                 complete_one_try(&mut completion);
                 return;
@@ -2920,7 +2949,13 @@ fn spawn_outbound_loop(
                     complete_one_try(&mut completion);
                     return;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = node.wait_for_shutdown() => {
+                        complete_one_try(&mut completion);
+                        return;
+                    }
+                }
                 continue;
             }
             if node
@@ -2932,7 +2967,13 @@ fn spawn_outbound_loop(
                     complete_one_try(&mut completion);
                     return;
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = node.wait_for_shutdown() => {
+                        complete_one_try(&mut completion);
+                        return;
+                    }
+                }
                 continue;
             }
             log_outbound_connection_attempt(&endpoint, transport_v2, connection_type);
@@ -2997,7 +3038,13 @@ fn spawn_outbound_loop(
                     );
                 }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = node.wait_for_shutdown() => {
+                    complete_one_try(&mut completion);
+                    return;
+                }
+            }
         }
     });
 }
@@ -4145,14 +4192,16 @@ async fn serve_peer(
     if options.outbound && options.transport_v2 != Some(false) && node.config.v2_transport {
         debug!("start sending v2 handshake to peer={peer_id}");
     }
-    let transport = establish_transport(
-        &node,
-        peer_id,
-        stream,
-        options.outbound,
-        options.transport_v2,
-    )
-    .await;
+    let transport = tokio::select! {
+        result = establish_transport(
+            &node,
+            peer_id,
+            stream,
+            options.outbound,
+            options.transport_v2,
+        ) => result,
+        _ = node.wait_for_shutdown() => return Ok(()),
+    };
     let (mut reader, writer_half, local_address, session_id) = match transport {
         Ok(transport) => transport,
         Err(error) if options.outbound && transport_v2_possible => {
@@ -4505,6 +4554,7 @@ async fn serve_peer_loop(
         } else {
             tokio::select! {
             biased;
+            _ = node.wait_for_shutdown() => anyhow::bail!("node shutting down"),
             message = reader.read_message_with_magic(
                 node.network_magic(),
                 &mut record_partial_bytes,

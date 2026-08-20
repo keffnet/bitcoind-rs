@@ -50,7 +50,6 @@ const MAX_MISSING_UTXO_CACHE_ENTRIES: usize = 8_192;
 // hash-table/deque bookkeeping is accounted for as roughly 64 bytes here.
 const DEFAULT_SCRIPT_CACHE_ENTRIES: usize = (32 * 1024 * 1024) / 64;
 const MIN_BLOCKS_TO_KEEP: u32 = 288;
-const MIN_SUFFIX_ACTIVATION_BLOCKS: usize = 32;
 const FAST_PRUNE_BLOCKFILE_SIZE: usize = 0x10_000;
 const MAX_ORPHAN_BLOCKS: usize = 128;
 const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
@@ -1300,6 +1299,10 @@ pub struct ChainState {
     // persisted because Core resets the active chain to zero on restart.
     block_sequence_ids: HashMap<BlockHash, u64>,
     next_block_sequence_id: u64,
+    // Block downloads arrive out of order inside the in-flight window. Keep
+    // only stored, not-yet-connected children here so completing a gap can
+    // walk the available suffix without scanning the global header index.
+    pending_body_children: HashMap<BlockHash, Vec<BlockHash>>,
     // Preserve the arrival order of bodies whose parent data is not yet
     // available. Core replays these bodies in insertion order when the
     // missing parent arrives, which determines equal-work chain selection.
@@ -2071,6 +2074,7 @@ impl ChainState {
             block_index: HashMap::new(),
             block_sequence_ids: HashMap::new(),
             next_block_sequence_id: 1,
+            pending_body_children: HashMap::new(),
             unlinked_body_order: HashMap::new(),
             next_unlinked_body_order: 1,
             header_sequence_ids: HashMap::new(),
@@ -6577,8 +6581,8 @@ impl ChainState {
                 }
                 return Err(error);
             }
-            self.process_orphans(hash);
-            self.process_known_children(hash);
+            self.process_orphans(hash, sync_storage);
+            self.process_known_children(hash, sync_storage);
             self.update_ibd_status();
             return Ok(self.tip());
         }
@@ -6665,13 +6669,19 @@ impl ChainState {
             // indexed and defer activation until the missing ancestor
             // arrives; the body is not invalid merely because the candidate
             // chain is temporarily incomplete.
-            if chain_work > self.tip().work && !self.candidate_chain_has_missing_body(hash) {
+            let extends_active_tip =
+                self.ancestor_hash(hash, self.height()) == Some(self.best_hash());
+            if chain_work > self.tip().work
+                && !extends_active_tip
+                && !self.candidate_chain_has_missing_body(hash)
+            {
                 self.store.flush()?;
                 self.flush_transaction_index_store()?;
                 self.activate_chain(hash)?;
             }
-            self.process_orphans(hash);
-            self.process_known_children(hash);
+            let active_tip = self.best_hash();
+            self.process_orphans(hash, sync_storage);
+            self.process_known_children(active_tip, sync_storage);
             self.update_ibd_status();
             return Ok(self.tip());
         }
@@ -6814,8 +6824,8 @@ impl ChainState {
             self.flush_transaction_index_store()?;
             self.activate_chain(hash)?;
         }
-        self.process_orphans(hash);
-        self.process_known_children(hash);
+        self.process_orphans(hash, sync_storage);
+        self.process_known_children(hash, sync_storage);
         self.update_ibd_status();
         Ok(self.tip())
     }
@@ -6823,19 +6833,26 @@ impl ChainState {
     fn insert_side_chain_body(&mut self, block: &Block) -> Result<()> {
         self.store.insert_unsynced(block)?;
         self.persist_transaction_index_for_block_unsynced(block)?;
+        let hash = block.block_hash();
+        let children = self
+            .pending_body_children
+            .entry(block.header.prev_blockhash)
+            .or_default();
+        if !children.contains(&hash) {
+            children.push(hash);
+        }
         if self.prune_height.is_some() {
-            self.prune_protected_blocks
-                .insert(block.block_hash(), self.height());
+            self.prune_protected_blocks.insert(hash, self.height());
         }
         Ok(())
     }
 
-    fn process_orphans(&mut self, parent_hash: BlockHash) {
+    fn process_orphans(&mut self, parent_hash: BlockHash, sync_storage: bool) {
         let Some(children) = self.orphans.remove(&parent_hash) else {
             return;
         };
         for child in children {
-            let _ = self.connect_block_with_existing_body(child, true, false, true);
+            let _ = self.connect_block_with_existing_body(child, true, false, sync_storage);
         }
     }
 
@@ -6865,41 +6882,10 @@ impl ChainState {
         self.next_unlinked_body_order = self.next_unlinked_body_order.saturating_add(1);
     }
 
-    fn process_known_children(&mut self, parent_hash: BlockHash) {
-        if parent_hash == self.best_hash() {
-            let best = self.best_valid_tip_hash();
-            let mut cursor = best;
-            let mut suffix_len = 0usize;
-            while let Some(hash) = cursor {
-                if self.is_active_block(&hash) {
-                    break;
-                }
-                suffix_len = suffix_len.saturating_add(1);
-                cursor = self
-                    .block_index
-                    .get(&hash)
-                    .map(|node| node.header.prev_blockhash);
-            }
-            if best.as_ref().is_some_and(|hash| {
-                *hash != self.best_hash()
-                    && self.is_descendant_or_self(hash, &parent_hash)
-                    && suffix_len >= MIN_SUFFIX_ACTIVATION_BLOCKS
-            }) && let Some(hash) = best
-                && self.activate_chain(hash).is_ok()
-                && self.best_hash() == hash
-            {
-                return;
-            }
-        }
-
-        let mut children: Vec<BlockHash> = self
-            .block_index
-            .iter()
-            .filter_map(|(hash, node)| {
-                (node.header.prev_blockhash == parent_hash && self.store.contains(hash))
-                    .then_some(*hash)
-            })
-            .collect();
+    fn process_known_children(&mut self, parent_hash: BlockHash, sync_storage: bool) {
+        let Some(mut children) = self.pending_body_children.remove(&parent_hash) else {
+            return;
+        };
         children.sort_by(|left, right| {
             self.unlinked_body_order
                 .get(left)
@@ -6918,7 +6904,7 @@ impl ChainState {
             let Ok(Some(child)) = self.store.get(&child_hash) else {
                 continue;
             };
-            let _ = self.connect_block_with_existing_body(child, true, false, true);
+            let _ = self.connect_block_with_existing_body(child, true, false, sync_storage);
         }
     }
 
@@ -10843,6 +10829,7 @@ fn open_background_replay_state(
         block_index: block_index.clone(),
         block_sequence_ids: HashMap::new(),
         next_block_sequence_id: 1,
+        pending_body_children: HashMap::new(),
         unlinked_body_order: HashMap::new(),
         next_unlinked_body_order: 1,
         header_sequence_ids: HashMap::new(),
@@ -14557,6 +14544,8 @@ mod tests {
         state.connect_block_from_peer(parent).unwrap();
         assert_eq!(state.best_hash(), grandchild.block_hash());
         assert_eq!(state.height(), 3);
+        assert_eq!(state.peer_storage_blocks_since_flush, 3);
+        assert!(state.pending_body_children.is_empty());
     }
 
     #[test]

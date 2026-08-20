@@ -2560,7 +2560,8 @@ impl PeerManager {
             ));
         }
         if inbound_listeners.is_empty() {
-            return std::future::pending::<Result<()>>().await;
+            self.node.wait_for_shutdown().await;
+            return Ok(());
         }
         while let Some(result) = inbound_listeners.join_next().await {
             result??;
@@ -2772,7 +2773,7 @@ async fn run_inbound_listener(
             Some(permissions) => node.is_banned_for_permissions(address, permissions),
             None => node.is_banned_for_peer(address, true),
         };
-        if !node.network_active() {
+        if !node.network_active() || node.shutdown_requested() {
             continue;
         }
         if banned {
@@ -4407,21 +4408,20 @@ async fn serve_peer(
 }
 
 struct PeerCountGuard<'a> {
-    count: &'a AtomicUsize,
+    node: &'a Node,
 }
 
 impl<'a> PeerCountGuard<'a> {
     fn new(node: &'a Arc<Node>) -> Self {
         node.peer_count.fetch_add(1, Ordering::Relaxed);
-        Self {
-            count: &node.peer_count,
-        }
+        Self { node }
     }
 }
 
 impl Drop for PeerCountGuard<'_> {
     fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::Relaxed);
+        self.node.peer_count.fetch_sub(1, Ordering::Release);
+        self.node.notify_peer_task_finished();
     }
 }
 

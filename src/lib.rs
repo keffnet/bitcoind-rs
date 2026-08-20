@@ -1791,6 +1791,7 @@ pub struct Node {
     pub started_at: Instant,
     pub(crate) network_nonce: u64,
     ipc_wait_cancellation: AtomicBool,
+    peer_tasks_changed: Notify,
     shutdown: Notify,
 }
 
@@ -2374,6 +2375,7 @@ impl Node {
             started_at: Instant::now(),
             network_nonce: random(),
             ipc_wait_cancellation: AtomicBool::new(false),
+            peer_tasks_changed: Notify::new(),
             shutdown: Notify::new(),
         });
         if node.config.check_addrman != 0 {
@@ -4033,6 +4035,25 @@ impl Node {
 
     pub fn peer_count(&self) -> usize {
         self.peer_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn notify_peer_task_finished(&self) {
+        self.peer_tasks_changed.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_peer_tasks(&self) {
+        loop {
+            if self.peer_count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            let notified = self.peer_tasks_changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.peer_count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn non_reduced_outbound_count(&self) -> usize {
@@ -7464,10 +7485,30 @@ impl Node {
             .is_ok()
             .then(|| !self.config.connect_disabled && self.config.seed_nodes.is_empty())
             .and_then(|enabled| enabled.then(|| self.current_block_relay_only_anchors()));
+        // Every shutdown path, including SIGINT/SIGTERM and an unexpected
+        // service exit, must publish the same cancellation signal as RPC
+        // `stop`. Peer handlers are spawned below the top-level P2P task;
+        // aborting only that parent would otherwise leave a handler capable
+        // of mutating chainstate while the final metadata flush is running.
+        self.request_shutdown();
         if let Some(task) = ipc_task {
             task.abort();
         }
-        p2p_task.abort();
+        if !p2p_task.is_finished() {
+            match tokio::time::timeout(Duration::from_secs(10), &mut p2p_task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    warn!(%error, "P2P service ended during shutdown");
+                }
+                Ok(Err(error)) => {
+                    warn!(%error, "P2P service task failed during shutdown");
+                }
+                Err(_) => {
+                    warn!("timed out waiting for P2P service shutdown");
+                    p2p_task.abort();
+                }
+            }
+        }
         rpc_task.abort();
         electrum_task.abort();
         zmq_task.abort();
@@ -7475,6 +7516,9 @@ impl Node {
         mempool_expiry_task.abort();
         fee_estimator_task.abort();
         unbroadcast_retry_task.abort();
+        tokio::time::timeout(Duration::from_secs(10), self.wait_for_peer_tasks())
+            .await
+            .map_err(|_| anyhow!("timed out waiting for peer handlers during shutdown"))?;
         self.chain
             .write()
             .flush()
@@ -8917,6 +8961,31 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), node.run())
             .await
             .expect("pre-run shutdown should wake the node")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_peer_handlers_before_flushing_chainstate() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        node.peer_count.fetch_add(1, Ordering::Release);
+        node.request_shutdown();
+
+        let run_node = node.clone();
+        let mut run_task = tokio::spawn(async move { run_node.run().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut run_task)
+                .await
+                .is_err(),
+            "shutdown must not flush while a peer handler is still active"
+        );
+
+        node.peer_count.fetch_sub(1, Ordering::Release);
+        node.notify_peer_task_finished();
+        tokio::time::timeout(Duration::from_secs(2), run_task)
+            .await
+            .expect("node shutdown should finish after peer handlers exit")
+            .unwrap()
             .unwrap();
     }
 

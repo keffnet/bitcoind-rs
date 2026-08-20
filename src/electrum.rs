@@ -666,7 +666,7 @@ fn dispatch_with_session(
         }
         "blockchain.scripthash.subscribe" => {
             let script_hash = script_hash_param(params, 0)?;
-            let status = history_status_for_script(node, &script_hash)
+            let status = history_status_for_script(node, &script_hash)?
                 .map(Value::String)
                 .unwrap_or(Value::Null);
             subscriptions.insert(
@@ -705,7 +705,7 @@ fn dispatch_with_session(
         }
         "blockchain.address.subscribe" => {
             let (address, script_hash) = address_param(node, params, 0)?;
-            let status = history_status_for_script(node, &script_hash)
+            let status = history_status_for_script(node, &script_hash)?
                 .map(Value::String)
                 .unwrap_or(Value::Null);
             subscriptions.insert(
@@ -749,7 +749,7 @@ fn dispatch_with_session(
             // protocol allows the server to refuse a subscription whose
             // corresponding history would be too large to serve.
             let _ = history_for_script(node, &script_hash)?;
-            let status = history_status_for_script(node, &script_hash)
+            let status = history_status_for_script(node, &script_hash)?
                 .map(Value::String)
                 .unwrap_or(Value::Null);
             subscriptions.insert(
@@ -1651,7 +1651,7 @@ async fn send_status_notifications(
                 script_hash,
                 status,
             } => {
-                let current = history_status_for_script(node, script_hash)
+                let current = history_status_for_script(node, script_hash)?
                     .map(Value::String)
                     .unwrap_or(Value::Null);
                 if status_notification_needed(status, &current, false) {
@@ -1669,7 +1669,7 @@ async fn send_status_notifications(
                 script_hash,
                 status,
             } => {
-                let current = history_status_for_script(node, script_hash)
+                let current = history_status_for_script(node, script_hash)?
                     .map(Value::String)
                     .unwrap_or(Value::Null);
                 if status_notification_needed(status, &current, false) {
@@ -1687,7 +1687,7 @@ async fn send_status_notifications(
                 script_hash,
                 status,
             } => {
-                let current = history_status_for_script(node, script_hash)
+                let current = history_status_for_script(node, script_hash)?
                     .map(Value::String)
                     .unwrap_or(Value::Null);
                 if status_notification_needed(status, &current, force_reorg_notification) {
@@ -1726,7 +1726,7 @@ fn status_notification_needed(previous: &Value, current: &Value, force: bool) ->
 }
 
 fn history_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>> {
-    let records = history_records_for_script(node, script_hash);
+    let records = history_records_for_script(node, script_hash)?;
     let mempool = node.mempool.read();
     history_values_for_records(&records, &mempool)
 }
@@ -1755,12 +1755,12 @@ fn history_values_for_records(
     Ok(values)
 }
 
-fn history_status_for_script(node: &Arc<Node>, script_hash: &str) -> Option<String> {
-    let records = history_records_for_script(node, script_hash);
+fn history_status_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Option<String>> {
+    let records = history_records_for_script(node, script_hash)?;
     if records.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(history_status(&records))
+    Ok(Some(history_status(&records)))
 }
 
 fn history_status(records: &[(Txid, i64)]) -> String {
@@ -1774,18 +1774,18 @@ fn history_status(records: &[(Txid, i64)]) -> String {
     hex::encode(Sha256::digest(input.as_bytes()))
 }
 
-fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<(Txid, i64)> {
+fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<(Txid, i64)>> {
     let chain = node.chain.read();
     let mempool = node.mempool.read();
     let mut records = Vec::new();
     let mut seen = HashSet::new();
-    for entry in chain.get_history(script_hash) {
+    for entry in chain.get_history_checked(script_hash)? {
         append_history_record(&mut records, &mut seen, entry.txid, i64::from(entry.height));
     }
     for (txid, height) in mempool_records_for_script(&mempool, script_hash) {
         append_history_record(&mut records, &mut seen, txid, height);
     }
-    records
+    Ok(records)
 }
 
 fn append_history_record(

@@ -2463,12 +2463,19 @@ impl ChainState {
                 );
             }
         }
-        let reconciliation_started = Instant::now();
+        info!("Reconciling UTXO index");
+        let utxo_reconciliation_started = Instant::now();
         state.reconcile_utxo_store()?;
+        info!(
+            "Reconciled UTXO index in {:.2}s",
+            utxo_reconciliation_started.elapsed().as_secs_f64()
+        );
+        info!("Reconciling Electrum history index");
+        let history_reconciliation_started = Instant::now();
         state.reconcile_electrum_history_store()?;
         info!(
-            "Reconciled chainstate indexes in {:.2}s",
-            reconciliation_started.elapsed().as_secs_f64()
+            "Reconciled Electrum history index in {:.2}s",
+            history_reconciliation_started.elapsed().as_secs_f64()
         );
         if active_tip_sidecar_trusted {
             state.initialize_pending_body_children_after_load();
@@ -2480,6 +2487,7 @@ impl ChainState {
             }
         }
         state.update_ibd_status();
+        info!("Persisting startup metadata");
         let metadata_started = Instant::now();
         state.persist_metadata()?;
         info!(

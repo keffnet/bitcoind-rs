@@ -7468,6 +7468,28 @@ impl ChainState {
         utxos: &U,
         block_median_time_past: u32,
     ) -> Result<BlockApplication> {
+        let transaction_ids = block
+            .txdata
+            .iter()
+            .map(Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        self.validate_block_transactions_with_txids(
+            block,
+            &transaction_ids,
+            height,
+            utxos,
+            block_median_time_past,
+        )
+    }
+
+    fn validate_block_transactions_with_txids<U: UtxoLookup + ?Sized>(
+        &self,
+        block: &Block,
+        transaction_ids: &[Txid],
+        height: u32,
+        utxos: &U,
+        block_median_time_past: u32,
+    ) -> Result<BlockApplication> {
         let script_check_reason = self.script_check_reason(block, height);
         let block_hash = block.block_hash();
         let log_script_transition = {
@@ -7486,8 +7508,9 @@ impl ChainState {
             }
         }
         let skip_script_checks = self.should_skip_script_checks(block, height);
-        self.validate_block_transactions_with_options(
+        self.validate_block_transactions_with_options_and_txids(
             block,
+            transaction_ids,
             height,
             utxos,
             block_median_time_past,
@@ -7503,11 +7526,37 @@ impl ChainState {
         block_median_time_past: u32,
         skip_script_checks: bool,
     ) -> Result<BlockApplication> {
+        let transaction_ids = block
+            .txdata
+            .iter()
+            .map(Transaction::compute_txid)
+            .collect::<Vec<_>>();
+        self.validate_block_transactions_with_options_and_txids(
+            block,
+            &transaction_ids,
+            height,
+            utxos,
+            block_median_time_past,
+            skip_script_checks,
+        )
+    }
+
+    fn validate_block_transactions_with_options_and_txids<U: UtxoLookup + ?Sized>(
+        &self,
+        block: &Block,
+        transaction_ids: &[Txid],
+        height: u32,
+        utxos: &U,
+        block_median_time_past: u32,
+        skip_script_checks: bool,
+    ) -> Result<BlockApplication> {
+        if transaction_ids.len() != block.txdata.len() {
+            bail!("cached transaction ID count does not match block")
+        }
         self.check_shutdown_interrupt()?;
         if self.enforce_bip30(height, block.block_hash(), block.header.prev_blockhash) {
-            for transaction in &block.txdata {
+            for (transaction, txid) in block.txdata.iter().zip(transaction_ids.iter().copied()) {
                 self.check_shutdown_interrupt()?;
-                let txid = transaction.compute_txid();
                 for (vout, _) in transaction.output.iter().enumerate() {
                     if utxos.contains(&OutPoint::new(txid, vout as u32))? {
                         return Err(ValidationError::Bip30(txid).into());
@@ -7552,9 +7601,14 @@ impl ChainState {
         if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
             return Err(ValidationError::TooManySigopsInConnect.into());
         }
-        for (transaction_index, transaction) in block.txdata.iter().enumerate().skip(1) {
+        for (transaction_index, (transaction, txid)) in block
+            .txdata
+            .iter()
+            .zip(transaction_ids.iter().copied())
+            .enumerate()
+            .skip(1)
+        {
             self.check_shutdown_interrupt()?;
-            let txid = transaction.compute_txid();
             let mut transaction_spent = HashSet::new();
             let mut input_total = 0u64;
             let mut previous_outputs = Vec::with_capacity(transaction.input.len());
@@ -7949,6 +8003,11 @@ impl ChainState {
         sync_storage: bool,
     ) -> Result<()> {
         let height = self.height().saturating_add(1);
+        let transaction_ids = block
+            .txdata
+            .iter()
+            .map(Transaction::compute_txid)
+            .collect::<Vec<_>>();
         let previous = self.best_hash();
         let previous_node = self
             .block_index
@@ -7971,14 +8030,21 @@ impl ChainState {
         self.validate_block_structure(block, self.network, height, Amount::MAX_MONEY.to_sat())?;
         let block_median_time_past = self.median_time_past();
         let application = if persist {
-            self.validate_block_transactions(
+            self.validate_block_transactions_with_txids(
                 block,
+                &transaction_ids,
                 height,
                 &self.utxo_store,
                 block_median_time_past,
             )?
         } else {
-            self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?
+            self.validate_block_transactions_with_txids(
+                block,
+                &transaction_ids,
+                height,
+                &self.utxos,
+                block_median_time_past,
+            )?
         };
         self.check_shutdown_interrupt()?;
         self.cache_block_undo(block, &application.spent_entries, persist && sync_storage)?;
@@ -8006,6 +8072,7 @@ impl ChainState {
         if persist {
             let delta = self.chainstate_delta_for_block(
                 block,
+                &transaction_ids,
                 height,
                 block_median_time_past,
                 &spent_entries,
@@ -8036,8 +8103,12 @@ impl ChainState {
         }
         let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
         let mut history_updates = HashMap::new();
-        for (transaction_index, transaction) in block.txdata.iter().enumerate() {
-            let txid = transaction.compute_txid();
+        for (transaction_index, (transaction, txid)) in block
+            .txdata
+            .iter()
+            .zip(transaction_ids.iter().copied())
+            .enumerate()
+        {
             for (output_index, output) in transaction.output.iter().enumerate() {
                 let outpoint = OutPoint::new(txid, output_index as u32);
                 if !spent_outpoints.contains(&outpoint)
@@ -8201,6 +8272,7 @@ impl ChainState {
     fn chainstate_delta_for_block(
         &self,
         block: &Block,
+        transaction_ids: &[Txid],
         height: u32,
         median_time_past: u32,
         spent_entries: &HashMap<OutPoint, UtxoEntry>,
@@ -8212,8 +8284,12 @@ impl ChainState {
         let mut transactions = Vec::with_capacity(block.txdata.len());
         let mut history = Vec::new();
         let mut spent_by = Vec::new();
-        for (transaction_index, transaction) in block.txdata.iter().enumerate() {
-            let txid = transaction.compute_txid();
+        for (transaction_index, (transaction, txid)) in block
+            .txdata
+            .iter()
+            .zip(transaction_ids.iter().copied())
+            .enumerate()
+        {
             transactions.push((
                 txid,
                 TxLocation {

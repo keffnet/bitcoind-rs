@@ -773,9 +773,9 @@ impl BlockStore {
 
     pub fn flush(&mut self) -> Result<()> {
         self.file.sync_data()?;
-        self.index_file.sync_data()?;
+        publish_index_data_len(&mut self.index_file, data_len_after(&self.file)?)?;
         self.undo_file.sync_data()?;
-        self.undo_index_file.sync_data()?;
+        publish_index_data_len(&mut self.undo_index_file, data_len_after(&self.undo_file)?)?;
         Ok(())
     }
 
@@ -1192,28 +1192,38 @@ impl FilterStore {
             return Ok(());
         }
 
+        let data_bytes_capacity = pending.iter().fold(0usize, |total, (_, bytes, _, _)| {
+            total.saturating_add(4).saturating_add(bytes.len())
+        });
+        let mut data_bytes = Vec::with_capacity(data_bytes_capacity);
         let mut records = Vec::with_capacity(pending.len());
         for (hash, bytes, offset, length) in pending {
             debug_assert_eq!(
                 bytes.len(),
                 usize::try_from(length).expect("u32 fits usize")
             );
-            self.file.write_all(&length.to_le_bytes())?;
-            self.file.write_all(&bytes)?;
+            data_bytes.extend_from_slice(&length.to_le_bytes());
+            data_bytes.extend_from_slice(&bytes);
             records.push((hash, Record { offset, length }));
         }
+        self.file.write_all(&data_bytes)?;
         if sync {
             self.file.sync_data()?;
         }
 
-        self.index_file.seek(SeekFrom::Start(0))?;
-        self.index_file.write_all(&data_len.to_le_bytes())?;
-        self.index_file.seek(SeekFrom::End(0))?;
-        for (hash, record) in &records {
-            self.index_file.write_all(&hash.to_byte_array())?;
-            self.index_file.write_all(&record.offset.to_le_bytes())?;
-            self.index_file.write_all(&record.length.to_le_bytes())?;
+        if sync {
+            self.index_file.seek(SeekFrom::Start(0))?;
+            self.index_file.write_all(&data_len.to_le_bytes())?;
         }
+        self.index_file.seek(SeekFrom::End(0))?;
+        let mut index_bytes =
+            Vec::with_capacity(records.len().saturating_mul(INDEX_RECORD_SIZE as usize));
+        for (hash, record) in &records {
+            index_bytes.extend_from_slice(&hash.to_byte_array());
+            index_bytes.extend_from_slice(&record.offset.to_le_bytes());
+            index_bytes.extend_from_slice(&record.length.to_le_bytes());
+        }
+        self.index_file.write_all(&index_bytes)?;
         if sync {
             self.index_file.sync_data()?;
         }
@@ -1225,7 +1235,7 @@ impl FilterStore {
 
     pub fn flush(&mut self) -> Result<()> {
         self.file.sync_data()?;
-        self.index_file.sync_data()?;
+        publish_index_data_len(&mut self.index_file, data_len_after(&self.file)?)?;
         Ok(())
     }
 }
@@ -1359,7 +1369,7 @@ impl ChainstateStore {
 
     pub fn flush(&mut self) -> Result<()> {
         self.flush_pending_writes()?;
-        self.index_file.sync_data()?;
+        publish_index_data_len(&mut self.index_file, data_len_after(&self.file)?)?;
         Ok(())
     }
 
@@ -1433,9 +1443,11 @@ impl ChainstateStore {
             .context("chainstate delta length overflow")?;
         let length = u32::try_from(length).context("chainstate delta length does not fit u32")?;
         let offset = self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&length.to_le_bytes())?;
-        self.file.write_all(&hash.to_byte_array())?;
-        self.file.write_all(&encoded_payload)?;
+        let mut record_bytes = Vec::with_capacity(4 + 32 + encoded_payload.len());
+        record_bytes.extend_from_slice(&length.to_le_bytes());
+        record_bytes.extend_from_slice(&hash.to_byte_array());
+        record_bytes.extend_from_slice(&encoded_payload);
+        self.file.write_all(&record_bytes)?;
         self.pending_write_bytes = self
             .pending_write_bytes
             .saturating_add(4usize.saturating_add(usize::try_from(length).unwrap_or(usize::MAX)));
@@ -2502,6 +2514,13 @@ fn data_len_after(file: &File) -> Result<u64> {
     Ok(file.metadata()?.len())
 }
 
+fn append_length_prefixed_bytes(destination: &mut Vec<u8>, body: &[u8]) -> Result<()> {
+    let length = u32::try_from(body.len()).context("storage record length does not fit u32")?;
+    destination.extend_from_slice(&length.to_le_bytes());
+    destination.extend_from_slice(body);
+    Ok(())
+}
+
 fn encode_history_script_hash(script_hash: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(script_hash).context("decoding Electrum script hash")?;
     bytes
@@ -2556,8 +2575,10 @@ fn append_history_data_record(file: &mut File, body: &[u8]) -> Result<HistoryLoc
     let offset = data_len_after(file)?;
     let length =
         u32::try_from(encoded_body.len()).context("Electrum history record is too large")?;
-    file.write_all(&length.to_le_bytes())?;
-    file.write_all(&encoded_body)?;
+    let mut record_bytes = Vec::with_capacity(4 + encoded_body.len());
+    record_bytes.extend_from_slice(&length.to_le_bytes());
+    record_bytes.extend_from_slice(&encoded_body);
+    file.write_all(&record_bytes)?;
     HistoryLocation::new(offset, length)
 }
 
@@ -2891,16 +2912,23 @@ fn append_history_index_batch(
     operations: &[PendingHistoryOperation],
 ) -> Result<()> {
     file.seek(SeekFrom::End(0))?;
+    let mut bytes = Vec::with_capacity(
+        operations
+            .len()
+            .saturating_mul(4 + 1 + 8 + 8 + 4 + 32)
+            .saturating_add(4 + 25),
+    );
     for operation in operations {
-        append_history_index_operation(file, batch_id, operation)?;
+        let body = encode_history_index_operation(batch_id, operation)?;
+        append_length_prefixed_bytes(&mut bytes, &body)?;
     }
     let mut commit = Vec::with_capacity(25);
     commit.push(HISTORY_COMMIT);
     commit.extend_from_slice(&batch_id.to_le_bytes());
     commit.extend_from_slice(&data_end.to_le_bytes());
     commit.extend_from_slice(&next_batch_id.to_le_bytes());
-    file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
-    file.write_all(&commit)?;
+    append_length_prefixed_bytes(&mut bytes, &commit)?;
+    file.write_all(&bytes)?;
     Ok(())
 }
 
@@ -2909,16 +2937,25 @@ fn append_history_index_operation(
     batch_id: u64,
     operation: &PendingHistoryOperation,
 ) -> Result<()> {
+    let body = encode_history_index_operation(batch_id, operation)?;
+    let mut bytes = Vec::with_capacity(4 + body.len());
+    append_length_prefixed_bytes(&mut bytes, &body)?;
+    file.write_all(&bytes)?;
+    Ok(())
+}
+
+fn encode_history_index_operation(
+    batch_id: u64,
+    operation: &PendingHistoryOperation,
+) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(64);
     body.push(HISTORY_PUT);
     body.extend_from_slice(&batch_id.to_le_bytes());
     body.extend_from_slice(&operation.location.offset().to_le_bytes());
     body.extend_from_slice(&operation.location.length().to_le_bytes());
     body.extend_from_slice(&operation.script_hash);
-    let length = u32::try_from(body.len()).context("Electrum history index record too large")?;
-    file.write_all(&length.to_le_bytes())?;
-    file.write_all(&body)?;
-    Ok(())
+    u32::try_from(body.len()).context("Electrum history index record too large")?;
+    Ok(body)
 }
 
 fn rewrite_history_index(
@@ -3043,8 +3080,10 @@ fn append_utxo_data_record(file: &mut File, body: &[u8]) -> Result<UtxoLocation>
     let length =
         u32::try_from(encoded_body.len()).context("UTXO log record length does not fit u32")?;
     let location = UtxoLocation::new(offset, length)?;
-    file.write_all(&length.to_le_bytes())?;
-    file.write_all(&encoded_body)?;
+    let mut record_bytes = Vec::with_capacity(4 + encoded_body.len());
+    record_bytes.extend_from_slice(&length.to_le_bytes());
+    record_bytes.extend_from_slice(&encoded_body);
+    file.write_all(&record_bytes)?;
     Ok(location)
 }
 
@@ -3353,8 +3392,15 @@ fn append_utxo_index_batch(
     operations: &[PendingUtxoOperation],
 ) -> Result<()> {
     file.seek(SeekFrom::End(0))?;
+    let mut bytes = Vec::with_capacity(
+        operations
+            .len()
+            .saturating_mul(4 + 1 + 8 + 8 + 4 + 36)
+            .saturating_add(4 + 33),
+    );
     for operation in operations {
-        append_utxo_index_operation(file, batch_id, operation)?;
+        let body = encode_utxo_index_operation(batch_id, operation)?;
+        append_length_prefixed_bytes(&mut bytes, &body)?;
     }
     let mut commit = Vec::with_capacity(33);
     commit.push(UTXO_COMMIT);
@@ -3362,8 +3408,8 @@ fn append_utxo_index_batch(
     commit.extend_from_slice(&data_end.to_le_bytes());
     commit.extend_from_slice(&next_batch_id.to_le_bytes());
     commit.extend_from_slice(&generation.to_le_bytes());
-    file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
-    file.write_all(&commit)?;
+    append_length_prefixed_bytes(&mut bytes, &commit)?;
+    file.write_all(&bytes)?;
     Ok(())
 }
 
@@ -3372,6 +3418,14 @@ fn append_utxo_index_operation(
     batch_id: u64,
     operation: &PendingUtxoOperation,
 ) -> Result<()> {
+    let body = encode_utxo_index_operation(batch_id, operation)?;
+    let mut bytes = Vec::with_capacity(4 + body.len());
+    append_length_prefixed_bytes(&mut bytes, &body)?;
+    file.write_all(&bytes)?;
+    Ok(())
+}
+
+fn encode_utxo_index_operation(batch_id: u64, operation: &PendingUtxoOperation) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(64);
     match operation {
         PendingUtxoOperation::Put { outpoint, location } => {
@@ -3387,10 +3441,8 @@ fn append_utxo_index_operation(
             body.extend_from_slice(&encode_outpoint(outpoint));
         }
     }
-    let length = u32::try_from(body.len()).context("UTXO index record is too large")?;
-    file.write_all(&length.to_le_bytes())?;
-    file.write_all(&body)?;
-    Ok(())
+    u32::try_from(body.len()).context("UTXO index record is too large")?;
+    Ok(body)
 }
 
 fn rewrite_utxo_index(
@@ -3487,8 +3539,10 @@ impl CoinStatsStore {
         let bytes = encode_storage_payload(&raw_bytes, MAX_STORED_COINSTATS_SIZE)?;
         let offset = self.file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("coinstats length does not fit u32")?;
-        self.file.write_all(&length.to_le_bytes())?;
-        self.file.write_all(&bytes)?;
+        let mut record_bytes = Vec::with_capacity(4 + bytes.len());
+        record_bytes.extend_from_slice(&length.to_le_bytes());
+        record_bytes.extend_from_slice(&bytes);
+        self.file.write_all(&record_bytes)?;
         if sync {
             self.file.sync_data()?;
         }
@@ -3525,7 +3579,7 @@ impl CoinStatsStore {
 
     pub fn flush(&mut self) -> Result<()> {
         self.file.sync_data()?;
-        self.index_file.sync_data()?;
+        publish_index_data_len(&mut self.index_file, data_len_after(&self.file)?)?;
         Ok(())
     }
 }
@@ -3654,8 +3708,10 @@ impl TransactionIndexStore {
         let bytes = encode_storage_payload(&raw, MAX_STORED_TRANSACTION_INDEX_SIZE)?;
         let offset = self.file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("transaction index record is too large")?;
-        self.file.write_all(&length.to_le_bytes())?;
-        self.file.write_all(&bytes)?;
+        let mut record_bytes = Vec::with_capacity(4 + bytes.len());
+        record_bytes.extend_from_slice(&length.to_le_bytes());
+        record_bytes.extend_from_slice(&bytes);
+        self.file.write_all(&record_bytes)?;
         let record = Record { offset, length };
         if sync {
             self.file.sync_data()?;
@@ -3673,7 +3729,7 @@ impl TransactionIndexStore {
 
     pub fn flush(&mut self) -> Result<()> {
         self.file.sync_data()?;
-        self.index_file.sync_data()?;
+        publish_index_data_len(&mut self.index_file, data_len_after(&self.file)?)?;
         Ok(())
     }
 
@@ -3795,8 +3851,10 @@ impl ElectrumBlockStore {
         let offset = self.file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len())
             .context("Electrum transaction record length does not fit u32")?;
-        self.file.write_all(&length.to_le_bytes())?;
-        self.file.write_all(&bytes)?;
+        let mut record_bytes = Vec::with_capacity(4 + bytes.len());
+        record_bytes.extend_from_slice(&length.to_le_bytes());
+        record_bytes.extend_from_slice(&bytes);
+        self.file.write_all(&record_bytes)?;
         if sync {
             self.file.sync_data()?;
         }
@@ -3846,7 +3904,7 @@ impl ElectrumBlockStore {
 
     pub fn flush(&mut self) -> Result<()> {
         self.file.sync_data()?;
-        self.index_file.sync_data()?;
+        publish_index_data_len(&mut self.index_file, data_len_after(&self.file)?)?;
         Ok(())
     }
 
@@ -4439,15 +4497,26 @@ fn persist_index_entry_with_sync(
     record: Record,
     sync: bool,
 ) -> Result<()> {
-    file.seek(SeekFrom::Start(0))?;
-    file.write_all(&data_len.to_le_bytes())?;
+    if sync {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&data_len.to_le_bytes())?;
+    }
     file.seek(SeekFrom::End(0))?;
-    file.write_all(&hash.to_byte_array())?;
-    file.write_all(&record.offset.to_le_bytes())?;
-    file.write_all(&record.length.to_le_bytes())?;
+    let mut bytes = [0u8; INDEX_RECORD_SIZE as usize];
+    bytes[..32].copy_from_slice(&hash.to_byte_array());
+    bytes[32..40].copy_from_slice(&record.offset.to_le_bytes());
+    bytes[40..44].copy_from_slice(&record.length.to_le_bytes());
+    file.write_all(&bytes)?;
     if sync {
         file.sync_data()?;
     }
+    Ok(())
+}
+
+fn publish_index_data_len(file: &mut File, data_len: u64) -> Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&data_len.to_le_bytes())?;
+    file.sync_data()?;
     Ok(())
 }
 

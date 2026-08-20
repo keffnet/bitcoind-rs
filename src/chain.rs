@@ -1304,6 +1304,10 @@ pub struct ChainState {
     basic_filter_cache: HashMap<BlockHash, (Vec<u8>, FilterHeader)>,
     block_undo_cache: HashMap<BlockHash, Vec<Vec<TxOut>>>,
     script_cache: Mutex<ScriptValidationCache>,
+    // The owning node shares this flag so synchronous peer validation can
+    // stop at transaction boundaries when shutdown is requested.  Standalone
+    // ChainState users keep the default flag, which is never set.
+    shutdown_interrupt: Arc<AtomicBool>,
 }
 
 struct HeaderMerkleCache {
@@ -2012,6 +2016,7 @@ impl ChainState {
             basic_filter_cache: HashMap::new(),
             block_undo_cache: HashMap::new(),
             script_cache: Mutex::new(ScriptValidationCache::default()),
+            shutdown_interrupt: Arc::new(AtomicBool::new(false)),
         };
         let snapshot = if rebuild_chainstate {
             None
@@ -3422,6 +3427,20 @@ impl ChainState {
     pub fn configure_script_check_threads(&mut self, par: i32) {
         self.script_check_workers = script_check_workers(par);
         self.script_checks_enabled = self.script_check_workers > 0;
+    }
+
+    /// Share the node's shutdown flag with synchronous validation.  The
+    /// chain keeps an owned `Arc` so a peer validation worker can check it
+    /// without borrowing the `Node` or taking another lock.
+    pub(crate) fn set_shutdown_interrupt(&mut self, interrupt: Arc<AtomicBool>) {
+        self.shutdown_interrupt = interrupt;
+    }
+
+    fn check_shutdown_interrupt(&self) -> Result<()> {
+        if self.shutdown_interrupt.load(Ordering::Acquire) {
+            bail!("block validation interrupted by shutdown")
+        }
+        Ok(())
     }
 
     pub fn script_checks_enabled(&self) -> bool {
@@ -6059,6 +6078,7 @@ impl ChainState {
         allow_existing_body: bool,
         retain_invalid_body: bool,
     ) -> Result<ChainTip> {
+        self.check_shutdown_interrupt()?;
         self.poll_background_validation()?;
         self.promote_snapshot_chain_to_base()?;
         let hash = block.block_hash();
@@ -6851,8 +6871,10 @@ impl ChainState {
         block_median_time_past: u32,
         skip_script_checks: bool,
     ) -> Result<BlockApplication> {
+        self.check_shutdown_interrupt()?;
         if self.enforce_bip30(height, block.block_hash(), block.header.prev_blockhash) {
             for transaction in &block.txdata {
+                self.check_shutdown_interrupt()?;
                 let txid = transaction.compute_txid();
                 for (vout, _) in transaction.output.iter().enumerate() {
                     if utxos.contains(&OutPoint::new(txid, vout as u32))? {
@@ -6906,6 +6928,7 @@ impl ChainState {
             return Err(ValidationError::TooManySigopsInConnect.into());
         }
         for (transaction_index, transaction) in block.txdata.iter().enumerate().skip(1) {
+            self.check_shutdown_interrupt()?;
             let txid = transaction.compute_txid();
             let mut transaction_spent = HashSet::new();
             let mut input_total = 0u64;
@@ -7019,6 +7042,7 @@ impl ChainState {
         if !skip_script_checks {
             self.validate_script_checks(block, height, &script_jobs)?;
         }
+        self.check_shutdown_interrupt()?;
         // Core checks the accumulated fees against MAX_MONEY above, then
         // compares the coinbase output with subsidy + fees. The reward sum
         // itself is allowed to exceed MAX_MONEY; only each transaction's
@@ -7093,6 +7117,7 @@ impl ChainState {
         let block_time = block.header.time;
         if thread_count <= 1 {
             for job in &pending {
+                self.check_shutdown_interrupt()?;
                 validation::validate_transaction_scripts_at_time_with_block_hash_with_params(
                     &deployment_parameters,
                     height,
@@ -7279,6 +7304,7 @@ impl ChainState {
         } else {
             self.validate_block_transactions(block, height, &self.utxos, block_median_time_past)?
         };
+        self.check_shutdown_interrupt()?;
         self.cache_block_undo(block, &application.spent_entries, persist)?;
         let previous_filter_header = self
             .basic_filter_for_block(&previous)?
@@ -10094,6 +10120,7 @@ fn open_background_replay_state(
         script_cache: Mutex::new(ScriptValidationCache::with_max_entries(
             script_cache_max_entries,
         )),
+        shutdown_interrupt: Arc::new(AtomicBool::new(false)),
     })
 }
 

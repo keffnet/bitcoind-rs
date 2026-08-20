@@ -1754,7 +1754,7 @@ pub struct Node {
     extra_block_relay_peers_enabled: AtomicBool,
     next_extra_block_relay_at: AtomicU64,
     rejected_block_bodies: parking_lot::RwLock<HashSet<BlockHash>>,
-    shutdown_requested: AtomicBool,
+    shutdown_requested: Arc<AtomicBool>,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
     peer_commands:
         parking_lot::RwLock<HashMap<usize, tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>>>,
@@ -1958,6 +1958,7 @@ impl Node {
             time::set_mock_time(mock_time);
         }
         let network_active = config.network_active;
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
         let i2p_sam = config.i2p_sam.map(|address| {
             Arc::new(i2p::I2pSam::new(
                 address,
@@ -2034,6 +2035,7 @@ impl Node {
                 deployment_parameters,
             )
             .map_err(core_startup_chain_error)?;
+        chain.set_shutdown_interrupt(shutdown_requested.clone());
 
         fs::create_dir_all(&network_datadir).with_context(|| {
             format!(
@@ -2333,7 +2335,7 @@ impl Node {
             extra_block_relay_peers_enabled: AtomicBool::new(false),
             next_extra_block_relay_at: AtomicU64::new(0),
             rejected_block_bodies: parking_lot::RwLock::new(HashSet::new()),
-            shutdown_requested: AtomicBool::new(false),
+            shutdown_requested,
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
@@ -8911,6 +8913,18 @@ mod tests {
             .await
             .expect("pre-run shutdown should wake the node")
             .unwrap();
+    }
+
+    #[test]
+    fn shutdown_interrupts_peer_block_validation_before_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let previous = *node.chain.read().header(0).unwrap();
+        let block = mine_test_block(&previous, 1, 42);
+
+        node.request_shutdown();
+        assert!(node.connect_block_from_peer(block).is_err());
+        assert_eq!(node.chain.read().height(), 0);
     }
 
     #[tokio::test]

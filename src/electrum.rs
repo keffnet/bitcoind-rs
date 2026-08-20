@@ -653,12 +653,12 @@ fn dispatch_with_session(
         }
         "blockchain.scripthash.get_balance" => {
             let script_hash = script_hash_param(params, 0)?;
-            let (confirmed, unconfirmed) = balance_for_script(node, &script_hash);
+            let (confirmed, unconfirmed) = balance_for_script(node, &script_hash)?;
             Ok(json!({"confirmed": confirmed, "unconfirmed": unconfirmed}))
         }
         "blockchain.scripthash.listunspent" => {
             let script_hash = script_hash_param(params, 0)?;
-            Ok(json!(unspent_for_script(node, &script_hash)))
+            Ok(json!(unspent_for_script(node, &script_hash)?))
         }
         "blockchain.scripthash.get_mempool" => {
             let script_hash = script_hash_param(params, 0)?;
@@ -692,12 +692,12 @@ fn dispatch_with_session(
         }
         "blockchain.address.get_balance" => {
             let (_, script_hash) = address_param(node, params, 0)?;
-            let (confirmed, unconfirmed) = balance_for_script(node, &script_hash);
+            let (confirmed, unconfirmed) = balance_for_script(node, &script_hash)?;
             Ok(json!({"confirmed": confirmed, "unconfirmed": unconfirmed}))
         }
         "blockchain.address.listunspent" => {
             let (_, script_hash) = address_param(node, params, 0)?;
-            Ok(json!(unspent_for_script(node, &script_hash)))
+            Ok(json!(unspent_for_script(node, &script_hash)?))
         }
         "blockchain.address.get_mempool" => {
             let (_, script_hash) = address_param(node, params, 0)?;
@@ -732,12 +732,12 @@ fn dispatch_with_session(
         }
         "blockchain.scriptpubkey.get_balance" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
-            let (confirmed, unconfirmed) = balance_for_script(node, &script_hash);
+            let (confirmed, unconfirmed) = balance_for_script(node, &script_hash)?;
             Ok(json!({"confirmed": confirmed, "unconfirmed": unconfirmed}))
         }
         "blockchain.scriptpubkey.listunspent" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
-            Ok(json!({"utxos": unspent_for_script(node, &script_hash)}))
+            Ok(json!({"utxos": unspent_for_script(node, &script_hash)?}))
         }
         "blockchain.scriptpubkey.get_mempool" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
@@ -1203,7 +1203,7 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
             "funder_height".to_owned(),
             json!(mempool_transaction_height(&entry.transaction, &mempool)),
         );
-    } else if let Some(entry) = chain.utxo(outpoint) {
+    } else if let Some(entry) = chain.utxo_checked(outpoint)? {
         // A pruned node can retain an unspent output in the UTXO set after
         // its funding block body has been removed.
         status.insert("funder_height".to_owned(), json!(entry.height));
@@ -1844,12 +1844,11 @@ fn sort_mempool_records(records: &mut [(Txid, i64)]) {
     });
 }
 
-fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> (u64, i64) {
+fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> Result<(u64, i64)> {
     let mut chain = node.chain.write();
     let mempool = node.mempool.read();
     let confirmed = chain
-        .electrum_unspent_for_script(script_hash)
-        .unwrap_or_default()
+        .electrum_unspent_for_script(script_hash)?
         .into_iter()
         .map(|(_, _, _, value)| value)
         .sum();
@@ -1866,10 +1865,10 @@ fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> (u64, i64) {
             }
         }
     }
-    (confirmed, unconfirmed)
+    Ok((confirmed, unconfirmed))
 }
 
-fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
+fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>> {
     let mut chain = node.chain.write();
     let mempool = node.mempool.read();
     let mut spent = HashSet::new();
@@ -1885,8 +1884,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
         }
     }
     let mut confirmed = chain
-        .electrum_unspent_for_script(script_hash)
-        .unwrap_or_default()
+        .electrum_unspent_for_script(script_hash)?
         .into_iter()
         .filter(|(outpoint, _, _, _)| !spent.contains(outpoint))
         .collect::<Vec<_>>();
@@ -1913,7 +1911,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
     }
     confirmed.extend(unconfirmed);
     let results = confirmed;
-    results
+    Ok(results
         .into_iter()
         .map(|(outpoint, height, _, value)| {
             json!({
@@ -1923,7 +1921,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
                 "value": value,
             })
         })
-        .collect()
+        .collect())
 }
 
 fn script_hash_param(params: &Value, index: usize) -> Result<String> {
@@ -2585,7 +2583,7 @@ mod tests {
                 .iter()
                 .any(|entry| entry["tx_hash"] == json!(txid.to_string()))
         );
-        let (_, unconfirmed) = balance_for_script(&node, &spent_script_hash);
+        let (_, unconfirmed) = balance_for_script(&node, &spent_script_hash)?;
         assert_eq!(unconfirmed, -5_000_000_000);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

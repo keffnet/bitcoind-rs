@@ -90,6 +90,27 @@ fn persist_atomic_file(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<()
     sync_metadata_directory(path)
 }
 
+/// Replace an advisory marker after syncing its contents, without forcing a
+/// directory fsync for every block.  The tip markers are validated against
+/// the append-only stores and the full chainstate checkpoint on startup.  If
+/// the rename itself is lost during a power failure, startup therefore falls
+/// back to the last valid checkpoint and repairs the marker; the authoritative
+/// metadata files continue to use [`persist_atomic_file`] with a directory
+/// sync.
+fn persist_advisory_atomic_file(path: &Path, temporary: &Path, bytes: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(temporary)
+        .with_context(|| format!("opening temporary advisory file {}", temporary.display()))?;
+    file.write_all(bytes)?;
+    file.sync_data()?;
+    drop(file);
+    fs::rename(temporary, path)?;
+    Ok(())
+}
+
 #[cfg(unix)]
 fn sync_metadata_directory(path: &Path) -> Result<()> {
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
@@ -8192,13 +8213,15 @@ impl ChainState {
             !entries.is_empty()
         });
         self.rebuild_active_transaction_index_through(common_height);
-        if self.txospender_index_enabled {
-            self.spent_by.retain(|_, (_, _, block_hash, height)| {
-                *height <= common_height && self.active_chain.contains(block_hash)
-            });
-        } else {
+        if !self.txospender_index_enabled {
             self.spent_by.clear();
         }
+        // Core's txospender index rewinds asynchronously. Keep entries from
+        // the disconnected suffix visible until the next persisted block
+        // connection, where connect_block_internal reconciles them. Candidate
+        // blocks connected as part of this transition may overwrite matching
+        // outpoints without prematurely hiding the old branch from
+        // gettxspendingprevout.
 
         if self.coinstats_index_enabled {
             let mut stats = CoinStatsState::from_utxos(&self.utxos);
@@ -8955,7 +8978,7 @@ impl ChainState {
         let path = self.utxo_store_tip_path();
         let temp = path.with_extension("tip.tmp");
         let contents = format!("{}\n{}\n", self.best_hash(), self.utxo_store.generation());
-        persist_atomic_file(&path, &temp, contents.as_bytes())
+        persist_advisory_atomic_file(&path, &temp, contents.as_bytes())
     }
 
     fn sync_utxo_store(&mut self) -> Result<()> {
@@ -9005,7 +9028,7 @@ impl ChainState {
             self.electrum_history_store.generation(),
             self.electrum_history_store.len()
         );
-        persist_atomic_file(&path, &temp, contents.as_bytes())
+        persist_advisory_atomic_file(&path, &temp, contents.as_bytes())
     }
 
     fn sync_electrum_history_store(&mut self) -> Result<()> {
@@ -9351,7 +9374,7 @@ impl ChainState {
         let bytes = serialize_internal(CHAIN_ACTIVE_TIP_MAGIC, &tip)?;
         let path = self.data_dir.join("chainstate.active-tip");
         let temp = self.data_dir.join("chainstate.active-tip.tmp");
-        persist_atomic_file(&path, &temp, &bytes)
+        persist_advisory_atomic_file(&path, &temp, &bytes)
     }
 
     fn load_snapshot(&self, active_chain: &[BlockHash]) -> Result<Option<(ChainSnapshot, bool)>> {
@@ -11008,6 +11031,21 @@ mod tests {
 
         persist_atomic_file(&path, &temporary, b"second version").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second version");
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn atomically_replaces_advisory_tip_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tip.marker");
+        let temporary = directory.path().join("tip.marker.tmp");
+
+        persist_advisory_atomic_file(&path, &temporary, b"first tip").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first tip");
+        assert!(!temporary.exists());
+
+        persist_advisory_atomic_file(&path, &temporary, b"second tip").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second tip");
         assert!(!temporary.exists());
     }
 

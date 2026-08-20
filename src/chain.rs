@@ -10,7 +10,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bincode::{deserialize as deserialize_binary, serialize as serialize_binary};
@@ -108,6 +108,28 @@ const ELECTRUM_REBUILD_BATCH_SCRIPTS: usize = 4_096;
 // boundary instead of forcing several fsyncs for every block. Direct API and
 // mining paths retain their immediate-sync behavior.
 const PEER_STORAGE_FLUSH_BLOCKS: u32 = 64;
+const IBD_BENCH_BLOCKS: u32 = 256;
+
+#[derive(Default)]
+struct IbdConnectBench {
+    blocks: u32,
+    transactions: u64,
+    validation: Duration,
+    undo_and_filters: Duration,
+    block_and_delta_storage: Duration,
+    chainstate_indexes: Duration,
+    finalization: Duration,
+    total: Duration,
+}
+
+struct ConnectTimings {
+    validation: Duration,
+    undo_and_filters: Duration,
+    block_and_delta_storage: Duration,
+    chainstate_indexes: Duration,
+    finalization: Duration,
+    total: Duration,
+}
 
 /// Replace a small metadata file with a fully durable version.
 ///
@@ -1417,6 +1439,7 @@ pub struct ChainState {
     // ChainState users keep the default flag, which is never set.
     shutdown_interrupt: Arc<AtomicBool>,
     peer_storage_blocks_since_flush: u32,
+    ibd_connect_bench: IbdConnectBench,
 }
 
 struct HeaderMerkleCache {
@@ -2201,6 +2224,7 @@ impl ChainState {
             script_cache: Mutex::new(ScriptValidationCache::default()),
             shutdown_interrupt: Arc::new(AtomicBool::new(false)),
             peer_storage_blocks_since_flush: 0,
+            ibd_connect_bench: IbdConnectBench::default(),
         };
         let snapshot_load_started = Instant::now();
         let snapshot = if rebuild_chainstate {
@@ -2658,6 +2682,8 @@ impl ChainState {
         if self.peer_storage_blocks_since_flush < PEER_STORAGE_FLUSH_BLOCKS {
             return Ok(());
         }
+        let blocks = self.peer_storage_blocks_since_flush;
+        let flush_started = Instant::now();
         self.flush_append_only_stores()?;
         // Publish the advisory markers only after every append-only record in
         // the batch has reached stable storage. Startup can therefore discard
@@ -2668,7 +2694,53 @@ impl ChainState {
             self.persist_electrum_history_store_tip()?;
         }
         self.peer_storage_blocks_since_flush = 0;
+        info!(
+            "Flushed peer storage: blocks={blocks} elapsed={:.3}s",
+            flush_started.elapsed().as_secs_f64()
+        );
         Ok(())
+    }
+
+    fn record_ibd_connect_bench(&mut self, transactions: usize, timings: ConnectTimings) {
+        if !self.initial_block_download {
+            return;
+        }
+        let bench = &mut self.ibd_connect_bench;
+        bench.blocks = bench.blocks.saturating_add(1);
+        bench.transactions = bench
+            .transactions
+            .saturating_add(u64::try_from(transactions).unwrap_or(u64::MAX));
+        bench.validation += timings.validation;
+        bench.undo_and_filters += timings.undo_and_filters;
+        bench.block_and_delta_storage += timings.block_and_delta_storage;
+        bench.chainstate_indexes += timings.chainstate_indexes;
+        bench.finalization += timings.finalization;
+        bench.total += timings.total;
+        if bench.blocks < IBD_BENCH_BLOCKS {
+            return;
+        }
+        let bench = std::mem::take(bench);
+        let total_seconds = bench.total.as_secs_f64();
+        let blocks_per_second = if total_seconds > 0.0 {
+            f64::from(bench.blocks) / total_seconds
+        } else {
+            0.0
+        };
+        let transactions_per_second = if total_seconds > 0.0 {
+            bench.transactions as f64 / total_seconds
+        } else {
+            0.0
+        };
+        info!(
+            "IBD connect benchmark: blocks={} txs={} rate={blocks_per_second:.1} blocks/s txrate={transactions_per_second:.0} tx/s validation={:.2}s undo_filters={:.2}s block_delta_storage={:.2}s chainstate_indexes={:.2}s finalization={:.2}s total={total_seconds:.2}s",
+            bench.blocks,
+            bench.transactions,
+            bench.validation.as_secs_f64(),
+            bench.undo_and_filters.as_secs_f64(),
+            bench.block_and_delta_storage.as_secs_f64(),
+            bench.chainstate_indexes.as_secs_f64(),
+            bench.finalization.as_secs_f64(),
+        );
     }
 
     /// Make all append-only stores and the chain metadata durable.
@@ -8043,6 +8115,7 @@ impl ChainState {
         mut tx_index_all_changes: Option<&mut HashMap<Txid, Option<TxLocation>>>,
         sync_storage: bool,
     ) -> Result<()> {
+        let connect_started = Instant::now();
         let height = self.height().saturating_add(1);
         let transaction_ids = block
             .txdata
@@ -8093,6 +8166,7 @@ impl ChainState {
             )?
         };
         self.check_shutdown_interrupt()?;
+        let validation_finished = Instant::now();
         self.cache_block_undo(block, &application.spent_entries, persist && sync_storage)?;
         let previous_filter_header = self
             .basic_filter_for_block(&previous)?
@@ -8104,6 +8178,7 @@ impl ChainState {
             &previous_filter_header,
             sync_storage,
         )?;
+        let undo_and_filters_finished = Instant::now();
 
         let hash = block.block_hash();
         let spent_entries: HashMap<OutPoint, UtxoEntry> =
@@ -8131,6 +8206,7 @@ impl ChainState {
                 self.chainstate_store.insert_unsynced(hash, &bytes)?;
             }
         }
+        let block_and_delta_storage_finished = Instant::now();
         let mut created_utxos = Vec::new();
         let removals = application
             .spent_entries
@@ -8240,6 +8316,7 @@ impl ChainState {
                 }
             }
         }
+        let chainstate_indexes_finished = Instant::now();
         if self.txospender_index_enabled {
             if persist {
                 // The Core index may still expose spenders from a just
@@ -8311,6 +8388,22 @@ impl ChainState {
                     self.peer_storage_blocks_since_flush.saturating_add(1);
             }
             self.utxo_store.maybe_simulate_crash()?;
+        }
+        let connect_finished = Instant::now();
+        if persist && !sync_storage {
+            self.record_ibd_connect_bench(
+                block.txdata.len(),
+                ConnectTimings {
+                    validation: validation_finished.duration_since(connect_started),
+                    undo_and_filters: undo_and_filters_finished.duration_since(validation_finished),
+                    block_and_delta_storage: block_and_delta_storage_finished
+                        .duration_since(undo_and_filters_finished),
+                    chainstate_indexes: chainstate_indexes_finished
+                        .duration_since(block_and_delta_storage_finished),
+                    finalization: connect_finished.duration_since(chainstate_indexes_finished),
+                    total: connect_finished.duration_since(connect_started),
+                },
+            );
         }
         Ok(())
     }
@@ -11391,6 +11484,7 @@ fn open_background_replay_state(
         )),
         shutdown_interrupt: Arc::new(AtomicBool::new(false)),
         peer_storage_blocks_since_flush: 0,
+        ibd_connect_bench: IbdConnectBench::default(),
     })
 }
 

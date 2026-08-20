@@ -6,7 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 static MOCK_TIME: AtomicI64 = AtomicI64::new(0);
 
 #[cfg(test)]
+use std::cell::Cell;
+#[cfg(test)]
 static MOCK_TIME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+thread_local! {
+    static MOCK_TIME_TEST_GUARD_HELD: Cell<bool> = const { Cell::new(false) };
+}
 
 #[cfg(test)]
 pub(crate) struct MockTimeTestGuard {
@@ -19,8 +25,12 @@ pub(crate) fn mock_time_test_guard() -> MockTimeTestGuard {
     let lock = MOCK_TIME_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let previous = MOCK_TIME.load(Ordering::Relaxed);
+    MOCK_TIME_TEST_GUARD_HELD.with(|held| {
+        debug_assert!(!held.replace(true));
+    });
     MockTimeTestGuard {
-        previous: mock_time(),
+        previous,
         _lock: lock,
     }
 }
@@ -28,18 +38,34 @@ pub(crate) fn mock_time_test_guard() -> MockTimeTestGuard {
 #[cfg(test)]
 impl Drop for MockTimeTestGuard {
     fn drop(&mut self) {
-        set_mock_time(self.previous);
+        MOCK_TIME.store(self.previous, Ordering::Relaxed);
+        MOCK_TIME_TEST_GUARD_HELD.with(|held| held.set(false));
     }
 }
 
 /// Set the process clock used by Bitcoin time-sensitive code. A value of zero
 /// restores the system clock, matching Core's `setmocktime` RPC.
 pub fn set_mock_time(seconds: i64) {
+    #[cfg(test)]
+    if !MOCK_TIME_TEST_GUARD_HELD.with(Cell::get) {
+        let _lock = MOCK_TIME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        MOCK_TIME.store(seconds, Ordering::Relaxed);
+        return;
+    }
     MOCK_TIME.store(seconds, Ordering::Relaxed);
 }
 
 /// Return the configured mock timestamp, or zero when the system clock is in use.
 pub fn mock_time() -> i64 {
+    #[cfg(test)]
+    if !MOCK_TIME_TEST_GUARD_HELD.with(Cell::get) {
+        let _lock = MOCK_TIME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        return MOCK_TIME.load(Ordering::Relaxed);
+    }
     MOCK_TIME.load(Ordering::Relaxed)
 }
 

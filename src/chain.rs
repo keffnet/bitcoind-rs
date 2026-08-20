@@ -1127,21 +1127,23 @@ fn load_active_chain_from_tip(
     store: &mut BlockStore,
     persisted_active_chain: &[BlockHash],
     persisted_prune_locks: &mut HashMap<String, PruneLock>,
-) -> Result<Vec<BlockHash>> {
+) -> Result<(Vec<BlockHash>, bool)> {
     const MAX_REPLAY_BLOCKS: u32 = SNAPSHOT_INTERVAL;
 
     let path = data_dir.join("chainstate.active-tip");
     let fallback = || persisted_active_chain.to_vec();
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(fallback()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((fallback(), false));
+        }
         Err(error) => {
             debug!(
                 path = %path.display(),
                 error = %error,
                 "ignoring unreadable active-chain tip sidecar"
             );
-            return Ok(fallback());
+            return Ok((fallback(), false));
         }
     };
     let tip: ActiveChainTip = match deserialize_internal(&bytes, CHAIN_ACTIVE_TIP_MAGIC) {
@@ -1152,22 +1154,27 @@ fn load_active_chain_from_tip(
                 error = %error,
                 "ignoring invalid active-chain tip sidecar"
             );
-            return Ok(fallback());
+            return Ok((fallback(), false));
         }
     };
     let Some(checkpoint_hash) = persisted_active_chain.last().copied() else {
-        return Ok(fallback());
+        return Ok((fallback(), false));
     };
     let checkpoint_height =
         u32::try_from(persisted_active_chain.len().saturating_sub(1)).unwrap_or(u32::MAX);
-    if tip.height <= checkpoint_height
-        || tip.height.saturating_sub(checkpoint_height) > MAX_REPLAY_BLOCKS
-    {
-        return Ok(fallback());
-    }
     let Ok(tip_hash) = tip.active_tip.parse::<BlockHash>() else {
-        return Ok(fallback());
+        return Ok((fallback(), false));
     };
+    if tip.height <= checkpoint_height {
+        let trusted = usize::try_from(tip.height)
+            .ok()
+            .and_then(|height| persisted_active_chain.get(height))
+            == Some(&tip_hash);
+        return Ok((fallback(), trusted));
+    }
+    if tip.height.saturating_sub(checkpoint_height) > MAX_REPLAY_BLOCKS {
+        return Ok((fallback(), false));
+    }
 
     let suffix_len = usize::try_from(tip.height - checkpoint_height).unwrap_or(usize::MAX);
     let mut suffix = Vec::with_capacity(suffix_len);
@@ -1175,21 +1182,21 @@ fn load_active_chain_from_tip(
     let mut height = tip.height;
     while height > checkpoint_height {
         let Some(block) = store.get(&cursor)? else {
-            return Ok(fallback());
+            return Ok((fallback(), false));
         };
         suffix.push(cursor);
         cursor = block.header.prev_blockhash;
         height -= 1;
     }
     if cursor != checkpoint_hash {
-        return Ok(fallback());
+        return Ok((fallback(), false));
     }
 
     *persisted_prune_locks = tip.prune_locks;
     suffix.reverse();
     let mut active_chain = persisted_active_chain.to_vec();
     active_chain.extend(suffix);
-    Ok(active_chain)
+    Ok((active_chain, true))
 }
 
 fn load_active_tx_counts(
@@ -1901,8 +1908,9 @@ impl ChainState {
         };
         load_header_journal(&data_dir, &mut persisted_headers)?;
         let checkpoint_chain_len = active_chain.len();
+        let mut active_tip_sidecar_trusted = false;
         if !rebuild_chainstate {
-            active_chain =
+            (active_chain, active_tip_sidecar_trusted) =
                 load_active_chain_from_tip(&data_dir, &mut store, &active_chain, &mut prune_locks)?;
         }
         let active_chain_extended = active_chain.len() > checkpoint_chain_len;
@@ -2302,6 +2310,15 @@ impl ChainState {
         }
         state.reconcile_utxo_store()?;
         state.reconcile_electrum_history_store()?;
+        if active_tip_sidecar_trusted {
+            state.initialize_pending_body_children_after_load();
+            let recovery_height = state.height();
+            let recovery_tip = state.best_hash();
+            state.process_known_children(recovery_tip, false);
+            if state.height() != recovery_height {
+                state.flush_append_only_stores()?;
+            }
+        }
         state.update_ibd_status();
         state.persist_metadata()?;
         if state.snapshot_base.is_some()
@@ -6905,6 +6922,27 @@ impl ChainState {
                 continue;
             };
             let _ = self.connect_block_with_existing_body(child, true, false, sync_storage);
+        }
+    }
+
+    fn initialize_pending_body_children_after_load(&mut self) {
+        self.pending_body_children.clear();
+        let pending = self
+            .store
+            .hashes()
+            .copied()
+            .filter(|hash| !self.is_active_block(hash))
+            .filter_map(|hash| {
+                self.block_index
+                    .get(&hash)
+                    .map(|node| (node.header.prev_blockhash, hash))
+            })
+            .collect::<Vec<_>>();
+        for (parent_hash, hash) in pending {
+            self.pending_body_children
+                .entry(parent_hash)
+                .or_default()
+                .push(hash);
         }
     }
 
@@ -14546,6 +14584,28 @@ mod tests {
         assert_eq!(state.height(), 3);
         assert_eq!(state.peer_storage_blocks_since_flush, 3);
         assert!(state.pending_body_children.is_empty());
+    }
+
+    #[test]
+    fn startup_connects_a_stored_header_suffix_without_redownloading_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let child = mine_block_from_header(&parent.header, 2, 16);
+        let grandchild = mine_block_from_header(&child.header, 3, 17);
+        state
+            .accept_headers(&[parent.header, child.header, grandchild.header])
+            .unwrap();
+        for block in [&grandchild, &child, &parent] {
+            state.store.insert(block).unwrap();
+        }
+        state.flush().unwrap();
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), grandchild.block_hash());
+        assert_eq!(reopened.height(), 3);
+        assert!(reopened.pending_body_children.is_empty());
     }
 
     #[test]

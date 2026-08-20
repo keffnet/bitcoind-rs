@@ -117,10 +117,11 @@ type UtxoIndexState = (HashMap<OutPoint, UtxoLocation>, u64, u64);
 
 #[derive(Default)]
 struct UtxoReadCache {
-    entries: HashMap<OutPoint, (StoredUtxo, usize)>,
-    order: VecDeque<OutPoint>,
+    entries: HashMap<OutPoint, (StoredUtxo, usize, u64)>,
+    order: VecDeque<(OutPoint, u64)>,
     bytes: usize,
     limit: usize,
+    next_generation: u64,
 }
 
 impl UtxoReadCache {
@@ -130,11 +131,12 @@ impl UtxoReadCache {
     }
 
     fn get(&mut self, outpoint: &OutPoint) -> Option<StoredUtxo> {
-        let entry = self.entries.get(outpoint).map(|(entry, _)| entry.clone());
-        if entry.is_some() {
-            self.touch(*outpoint);
-        }
-        entry
+        // Outputs are normally read once, immediately before being spent.
+        // FIFO retention avoids an O(cache size) LRU-list update in that hot
+        // path while still keeping recently created outputs resident.
+        self.entries
+            .get(outpoint)
+            .map(|(entry, _, _)| entry.clone())
     }
 
     fn insert(&mut self, outpoint: OutPoint, entry: StoredUtxo) {
@@ -142,21 +144,21 @@ impl UtxoReadCache {
         if self.limit == 0 || bytes > self.limit {
             return;
         }
-        if let Some((_, old_bytes)) = self.entries.remove(&outpoint) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        if let Some((_, old_bytes, _)) = self.entries.insert(outpoint, (entry, bytes, generation)) {
             self.bytes = self.bytes.saturating_sub(old_bytes);
-            self.order.retain(|cached| *cached != outpoint);
         }
         self.bytes = self.bytes.saturating_add(bytes);
-        self.entries.insert(outpoint, (entry, bytes));
-        self.order.push_back(outpoint);
+        self.order.push_back((outpoint, generation));
         self.trim();
     }
 
     fn remove(&mut self, outpoint: &OutPoint) {
-        if let Some((_, bytes)) = self.entries.remove(outpoint) {
+        if let Some((_, bytes, _)) = self.entries.remove(outpoint) {
             self.bytes = self.bytes.saturating_sub(bytes);
-            self.order.retain(|cached| cached != outpoint);
         }
+        self.compact_order_if_needed();
     }
 
     fn clear(&mut self) {
@@ -165,23 +167,34 @@ impl UtxoReadCache {
         self.bytes = 0;
     }
 
-    fn touch(&mut self, outpoint: OutPoint) {
-        if let Some(position) = self.order.iter().position(|cached| *cached == outpoint) {
-            self.order.remove(position);
-        }
-        self.order.push_back(outpoint);
-    }
-
     fn trim(&mut self) {
         while self.bytes > self.limit {
-            let Some(outpoint) = self.order.pop_front() else {
+            let Some((outpoint, generation)) = self.order.pop_front() else {
                 self.bytes = 0;
                 break;
             };
-            if let Some((_, bytes)) = self.entries.remove(&outpoint) {
+            let is_current = self
+                .entries
+                .get(&outpoint)
+                .is_some_and(|(_, _, current)| *current == generation);
+            if is_current && let Some((_, bytes, _)) = self.entries.remove(&outpoint) {
                 self.bytes = self.bytes.saturating_sub(bytes);
             }
         }
+        self.compact_order_if_needed();
+    }
+
+    fn compact_order_if_needed(&mut self) {
+        let maximum_entries = self.entries.len().saturating_mul(2).saturating_add(1_024);
+        if self.order.len() <= maximum_entries {
+            return;
+        }
+        let entries = &self.entries;
+        self.order.retain(|(outpoint, generation)| {
+            entries
+                .get(outpoint)
+                .is_some_and(|(_, _, current)| current == generation)
+        });
     }
 }
 
@@ -1830,13 +1843,22 @@ impl UtxoStore {
             match operation {
                 PendingUtxoOperation::Put { outpoint, location } => {
                     self.index.insert(outpoint, location);
-                    self.read_cache.lock().remove(&outpoint);
                 }
                 PendingUtxoOperation::Delete { outpoint } => {
                     self.index.remove(&outpoint);
-                    self.read_cache.lock().remove(&outpoint);
                 }
             }
+        }
+        // Keep newly created coins in the configured dbcache allocation.
+        // Previously only disk reads populated this cache and the same block
+        // connection immediately removed those spent entries, making IBD do
+        // a random value-log read and decompression for nearly every input.
+        let mut read_cache = self.read_cache.lock();
+        for outpoint in removals {
+            read_cache.remove(outpoint);
+        }
+        for (outpoint, entry) in additions {
+            read_cache.insert(*outpoint, entry.clone());
         }
         self.next_batch_id = next_batch_id;
         Ok(())
@@ -5082,12 +5104,14 @@ mod tests {
         store
             .apply_batch(&[], &[(outpoint, first.clone())])
             .unwrap();
+        assert!(store.read_cache.lock().entries.contains_key(&outpoint));
         assert_eq!(store.get(&outpoint).unwrap(), Some(first));
         assert_eq!(store.read_cache.lock().entries.len(), 1);
 
         store
             .apply_batch(&[outpoint], &[(outpoint, second.clone())])
             .unwrap();
+        assert!(store.read_cache.lock().entries.contains_key(&outpoint));
         assert_eq!(store.get(&outpoint).unwrap(), Some(second));
         assert_eq!(store.read_cache.lock().entries.len(), 1);
 

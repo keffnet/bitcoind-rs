@@ -410,6 +410,29 @@ pub(crate) fn transaction_dynamic_memory_usage(transaction: &Transaction) -> usi
     usage
 }
 
+/// Collect the Electrum scripthashes touched by a transaction.  Previous
+/// outputs are supplied by mempool admission, where they are already loaded
+/// for consensus and script validation; this avoids a second UTXO lookup and
+/// also covers spends of unconfirmed parent outputs.
+fn script_hashes_for_transaction(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+) -> Vec<String> {
+    let mut scripts = transaction
+        .output
+        .iter()
+        .map(|output| crate::chain::electrum_script_hash(&output.script_pubkey))
+        .chain(
+            previous_outputs
+                .iter()
+                .map(|output| crate::chain::electrum_script_hash(&output.script_pubkey)),
+        )
+        .collect::<Vec<_>>();
+    scripts.sort_unstable();
+    scripts.dedup();
+    scripts
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum MempoolChangeKind {
     Added,
@@ -445,6 +468,12 @@ pub struct Mempool {
     adjusted_weights: HashMap<Txid, u64>,
     spent: HashMap<OutPoint, Txid>,
     children: HashMap<Txid, HashSet<Txid>>,
+    /// Transactions that can change an Electrum scripthash query.  The
+    /// index includes both outputs paying to the script and inputs spending
+    /// a script-matching previous output, so callers do not need to scan the
+    /// complete mempool for every address lookup.
+    transactions_by_script: HashMap<String, HashSet<Txid>>,
+    scripts_by_transaction: HashMap<Txid, Vec<String>>,
     wtxids: HashMap<Wtxid, Txid>,
     priorities: HashMap<Txid, i64>,
     unbroadcast: HashSet<Txid>,
@@ -712,6 +741,8 @@ impl Mempool {
             adjusted_weights: HashMap::new(),
             spent: HashMap::new(),
             children: HashMap::new(),
+            transactions_by_script: HashMap::new(),
+            scripts_by_transaction: HashMap::new(),
             wtxids: HashMap::new(),
             priorities: HashMap::new(),
             unbroadcast: HashSet::new(),
@@ -957,6 +988,37 @@ impl Mempool {
         if self.wtxids != expected_wtxids {
             bail!("mempool wtxid index is inconsistent");
         }
+        if self.scripts_by_transaction.len() != self.entries.len()
+            || self
+                .scripts_by_transaction
+                .keys()
+                .any(|txid| !self.entries.contains_key(txid))
+        {
+            bail!("mempool scripthash transaction index is inconsistent");
+        }
+        for (txid, scripts) in &self.scripts_by_transaction {
+            for script_hash in scripts {
+                if !self
+                    .transactions_by_script
+                    .get(script_hash)
+                    .is_some_and(|txids| txids.contains(txid))
+                {
+                    bail!("mempool scripthash reverse index is inconsistent");
+                }
+            }
+        }
+        for (script_hash, txids) in &self.transactions_by_script {
+            if txids.is_empty()
+                || txids.iter().any(|txid| {
+                    !self
+                        .scripts_by_transaction
+                        .get(txid)
+                        .is_some_and(|scripts| scripts.contains(script_hash))
+                })
+            {
+                bail!("mempool scripthash forward index is inconsistent");
+            }
+        }
         if self.adjusted_weights.len() != self.entries.len()
             || self
                 .adjusted_weights
@@ -1009,11 +1071,49 @@ impl Mempool {
         self.entries.get(txid)
     }
 
+    /// Return the mempool transactions that can affect an Electrum
+    /// scripthash query.  The returned order is deliberately unspecified;
+    /// Electrum callers apply their protocol-specific ordering after
+    /// filtering this set.
+    pub(crate) fn transaction_ids_for_script(&self, script_hash: &str) -> Vec<Txid> {
+        self.transactions_by_script
+            .get(script_hash)
+            .map(|txids| txids.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    fn index_transaction_scripts(&mut self, txid: Txid, scripts: Vec<String>) {
+        for script_hash in &scripts {
+            self.transactions_by_script
+                .entry(script_hash.clone())
+                .or_default()
+                .insert(txid);
+        }
+        self.scripts_by_transaction.insert(txid, scripts);
+    }
+
+    fn remove_transaction_scripts(&mut self, txid: &Txid) {
+        let Some(scripts) = self.scripts_by_transaction.remove(txid) else {
+            return;
+        };
+        for script_hash in scripts {
+            let Some(txids) = self.transactions_by_script.get_mut(&script_hash) else {
+                continue;
+            };
+            txids.remove(txid);
+            if txids.is_empty() {
+                self.transactions_by_script.remove(&script_hash);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn insert_test_entry(&mut self, entry: MempoolEntry) {
         let txid = entry.transaction.compute_txid();
         let wtxid = entry.transaction.compute_wtxid();
+        let scripts = script_hashes_for_transaction(&entry.transaction, &[]);
         self.entries.insert(txid, entry);
+        self.index_transaction_scripts(txid, scripts);
         self.wtxids.insert(wtxid, txid);
         self.invalidate_graph_optimality();
     }
@@ -3100,6 +3200,7 @@ impl Mempool {
             let protected = self.ancestors_for_transaction(&transaction);
             self.ensure_space(memory_usage, &protected)?;
         }
+        let affected_scripts = script_hashes_for_transaction(&transaction, &previous_outputs);
         let entry = MempoolEntry {
             transaction,
             fee_sat,
@@ -3121,6 +3222,7 @@ impl Mempool {
         self.bytes += size;
         self.vbytes = self.vbytes.saturating_add(vsize);
         self.entries.insert(txid, entry);
+        self.index_transaction_scripts(txid, affected_scripts);
         self.adjusted_weights.insert(txid, adjusted_weight);
         self.wtxids.insert(wtxid, txid);
         self.relay_sequences.insert(txid, self.sequence);
@@ -3736,6 +3838,8 @@ impl Mempool {
         self.adjusted_weights.clear();
         self.spent.clear();
         self.children.clear();
+        self.transactions_by_script.clear();
+        self.scripts_by_transaction.clear();
         self.wtxids.clear();
         self.invalidate_graph_optimality();
         let relay_sequences = std::mem::take(&mut self.relay_sequences);
@@ -3783,6 +3887,7 @@ impl Mempool {
 
     fn remove_with_notification(&mut self, txid: &Txid, notify_zmq: bool) -> Option<MempoolEntry> {
         let entry = self.entries.remove(txid)?;
+        self.remove_transaction_scripts(txid);
         self.adjusted_weights.remove(txid);
         self.unbroadcast.remove(txid);
         self.wtxids.remove(&entry.transaction.compute_wtxid());
@@ -5533,6 +5638,27 @@ mod tests {
     }
 
     #[test]
+    fn scripthash_index_covers_inputs_and_removes_entries() {
+        let mut pool = Mempool::new(Network::Regtest);
+        let transaction = graph_transaction(Txid::from_byte_array([7; 32]), 1);
+        let txid = transaction.compute_txid();
+        let previous_output = TxOut {
+            value: Amount::from_sat(2),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
+        };
+        let scripts = script_hashes_for_transaction(&transaction, &[previous_output]);
+
+        pool.index_transaction_scripts(txid, scripts.clone());
+        for script_hash in scripts {
+            assert_eq!(pool.transaction_ids_for_script(&script_hash), vec![txid]);
+        }
+
+        pool.remove_transaction_scripts(&txid);
+        assert!(pool.transactions_by_script.is_empty());
+        assert!(pool.scripts_by_transaction.is_empty());
+    }
+
+    #[test]
     fn package_feerate_can_sponsor_a_low_fee_child() {
         let directory = tempfile::tempdir().unwrap();
         let mut chain = ChainState::open(Network::Regtest, directory.path()).unwrap();
@@ -5609,6 +5735,7 @@ mod tests {
             .all_utxos()
             .find(|(_, entry)| chain.height() + 1 >= entry.height + 100)
             .expect("matured coinbase output");
+        let spent_script_hash = crate::chain::electrum_script_hash(&utxo.output.script_pubkey);
         let transaction = Transaction {
             version: Version::ONE,
             lock_time: LockTime::ZERO,
@@ -5620,11 +5747,22 @@ mod tests {
             }],
             output: vec![TxOut {
                 value: Amount::from_sat(utxo.output.value.to_sat() - 1_000),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
             }],
         };
+        let txid = transaction.compute_txid();
+        let created_script_hash =
+            crate::chain::electrum_script_hash(&transaction.output[0].script_pubkey);
         let mut pool = Mempool::new(Network::Regtest);
         pool.accept(transaction, &chain).unwrap();
+        assert_eq!(
+            pool.transaction_ids_for_script(&spent_script_hash),
+            vec![txid]
+        );
+        assert_eq!(
+            pool.transaction_ids_for_script(&created_script_hash),
+            vec![txid]
+        );
         pool.check_consistency().unwrap();
     }
 

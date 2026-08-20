@@ -1764,7 +1764,7 @@ fn mempool_records_for_script(
     script_hash: &str,
 ) -> Vec<(Txid, i64)> {
     let mut records = mempool
-        .transaction_order()
+        .transaction_ids_for_script(script_hash)
         .into_iter()
         .filter_map(|txid| {
             let entry = mempool.get(&txid)?;
@@ -1807,7 +1807,7 @@ fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> (u64, i64) {
         .map(|(_, _, _, value)| value)
         .sum();
     let mut unconfirmed = 0i64;
-    for txid in mempool.transaction_order() {
+    for txid in mempool.transaction_ids_for_script(script_hash) {
         let Some(entry) = mempool.get(&txid) else {
             continue;
         };
@@ -1831,7 +1831,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
     let mut chain = node.chain.write();
     let mempool = node.mempool.read();
     let mut spent = HashSet::new();
-    for txid in mempool.transaction_order() {
+    for txid in mempool.transaction_ids_for_script(script_hash) {
         if let Some(entry) = mempool.get(&txid) {
             spent.extend(
                 entry
@@ -1856,7 +1856,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
             .then_with(|| left.0.vout.cmp(&right.0.vout))
     });
     let mut unconfirmed = Vec::new();
-    for txid in mempool.transaction_order() {
+    for txid in mempool.transaction_ids_for_script(script_hash) {
         let Some(entry) = mempool.get(&txid) else {
             continue;
         };

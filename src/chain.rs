@@ -7907,7 +7907,14 @@ impl ChainState {
                 for script_hash in affected_scripts {
                     let entry = HistoryEntry { txid, height };
                     if persist {
-                        self.append_history_update(&mut history_updates, &script_hash, entry)?;
+                        if sync_storage {
+                            self.append_history_update(&mut history_updates, &script_hash, entry)?;
+                        } else {
+                            let additions = history_updates.entry(script_hash).or_default();
+                            if additions.last() != Some(&entry) {
+                                additions.push(entry);
+                            }
+                        }
                     } else {
                         self.add_history(&script_hash, entry);
                     }
@@ -7950,7 +7957,11 @@ impl ChainState {
                     .apply_batch_unsynced(&removals, &additions)?;
             }
             if self.history_index_enabled {
-                self.persist_history_updates_with_sync(history_updates, sync_storage)?;
+                if sync_storage {
+                    self.persist_history_updates_with_sync(history_updates, true)?;
+                } else {
+                    self.persist_history_appends_unsynced(history_updates)?;
+                }
             }
         }
         if self.txospender_index_enabled {
@@ -9639,6 +9650,37 @@ impl ChainState {
         if self.history_materialized {
             for (script_hash, entries) in updates {
                 self.history.insert(script_hash, entries);
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_history_appends_unsynced(
+        &mut self,
+        updates: HashMap<String, Vec<HistoryEntry>>,
+    ) -> Result<()> {
+        if !self.history_index_enabled || updates.is_empty() {
+            return Ok(());
+        }
+        let store_updates = updates
+            .iter()
+            .map(|(script_hash, entries)| {
+                (
+                    script_hash.clone(),
+                    entries
+                        .iter()
+                        .map(|entry| (entry.txid, entry.height))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.electrum_history_store
+            .append_entries_unsynced(&store_updates)?;
+        if self.history_materialized {
+            for (script_hash, entries) in updates {
+                for entry in entries {
+                    self.add_history(&script_hash, entry);
+                }
             }
         }
         Ok(())

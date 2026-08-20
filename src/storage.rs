@@ -2063,6 +2063,7 @@ pub struct ElectrumHistoryStore {
     index_file: File,
     index: HashMap<[u8; 32], HistoryLocation>,
     next_batch_id: u64,
+    pending: HashMap<[u8; 32], StoredElectrumHistory>,
 }
 
 impl ElectrumHistoryStore {
@@ -2117,6 +2118,7 @@ impl ElectrumHistoryStore {
             index_file,
             index,
             next_batch_id,
+            pending: HashMap::new(),
         })
     }
 
@@ -2129,11 +2131,15 @@ impl ElectrumHistoryStore {
     }
 
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.index
+            .keys()
+            .chain(self.pending.keys())
+            .collect::<HashSet<_>>()
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        self.index.is_empty() && self.pending.is_empty()
     }
 
     /// Monotonically increasing checkpoint used by chainstate to detect a
@@ -2145,7 +2151,9 @@ impl ElectrumHistoryStore {
     pub fn contains(&self, script_hash: &str) -> bool {
         encode_history_script_hash(script_hash)
             .ok()
-            .is_some_and(|script_hash| self.index.contains_key(&script_hash))
+            .is_some_and(|script_hash| {
+                self.pending.contains_key(&script_hash) || self.index.contains_key(&script_hash)
+            })
     }
 
     pub fn disk_usage(&self) -> Result<u64> {
@@ -2158,6 +2166,9 @@ impl ElectrumHistoryStore {
 
     pub fn get(&self, script_hash: &str) -> Result<Vec<(Txid, u32)>> {
         let script_hash = encode_history_script_hash(script_hash)?;
+        if let Some(entries) = self.pending.get(&script_hash) {
+            return Ok(entries.clone());
+        }
         let Some(location) = self.index.get(&script_hash).copied() else {
             return Ok(Vec::new());
         };
@@ -2171,6 +2182,9 @@ impl ElectrumHistoryStore {
     /// history before copying it into a temporary vector.
     pub fn get_limited(&self, script_hash: &str, limit: usize) -> Result<Option<Vec<(Txid, u32)>>> {
         let script_hash = encode_history_script_hash(script_hash)?;
+        if let Some(entries) = self.pending.get(&script_hash) {
+            return Ok((entries.len() <= limit).then(|| entries.clone()));
+        }
         let Some(location) = self.index.get(&script_hash).copied() else {
             return Ok(Some(Vec::new()));
         };
@@ -2190,22 +2204,24 @@ impl ElectrumHistoryStore {
                 Ok((
                     script_hash.clone(),
                     encoded,
+                    self.pending.get(&encoded).cloned(),
                     self.index.get(&encoded).copied(),
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        requests.sort_unstable_by_key(|(_, _, location)| {
+        requests.sort_unstable_by_key(|(_, _, _, location)| {
             location.map_or(u64::MAX, HistoryLocation::offset)
         });
 
         let mut histories = HashMap::with_capacity(requests.len());
-        for (script_hash, encoded, location) in requests {
-            let entries = match location {
-                Some(location) => {
+        for (script_hash, encoded, pending, location) in requests {
+            let entries = match (pending, location) {
+                (Some(entries), _) => entries,
+                (None, Some(location)) => {
                     let body = read_history_data_record(&self.file, location)?;
                     decode_history_value(&body, encoded)?
                 }
-                None => Vec::new(),
+                (None, None) => Vec::new(),
             };
             histories.insert(script_hash, entries);
         }
@@ -2213,7 +2229,14 @@ impl ElectrumHistoryStore {
     }
 
     pub fn keys(&self) -> Vec<String> {
-        self.index.keys().map(hex::encode).collect()
+        self.index
+            .keys()
+            .chain(self.pending.keys())
+            .copied()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .map(hex::encode)
+            .collect()
     }
 
     pub fn entries(&self) -> Result<Vec<(String, StoredElectrumHistory)>> {
@@ -2223,7 +2246,7 @@ impl ElectrumHistoryStore {
             .map(|(script_hash, location)| (*script_hash, *location))
             .collect::<Vec<_>>();
         locations.sort_unstable_by_key(|(_, location)| location.offset());
-        locations
+        let mut entries = locations
             .into_iter()
             .map(|(script_hash, location)| {
                 let body = read_history_data_record(&self.file, location)?;
@@ -2232,17 +2255,77 @@ impl ElectrumHistoryStore {
                     decode_history_value(&body, script_hash)?,
                 ))
             })
-            .collect()
+            .collect::<Result<HashMap<_, _>>>()?;
+        for (script_hash, pending) in &self.pending {
+            entries.insert(hex::encode(script_hash), pending.clone());
+        }
+        Ok(entries.into_iter().collect())
     }
 
     /// Apply complete replacement values for the scripts touched by a block.
     /// The caller supplies each script's new chronological history.
     pub fn apply_batch(&mut self, updates: &[(String, Vec<(Txid, u32)>)]) -> Result<()> {
+        self.flush_pending()?;
         self.apply_batch_with_sync(updates, true)
     }
 
     pub fn apply_batch_unsynced(&mut self, updates: &[(String, Vec<(Txid, u32)>)]) -> Result<()> {
-        self.apply_batch_with_sync(updates, false)
+        for (script_hash, entries) in updates {
+            self.pending
+                .insert(encode_history_script_hash(script_hash)?, entries.clone());
+        }
+        Ok(())
+    }
+
+    /// Accumulate active-chain history additions until the owning chainstate
+    /// reaches its bounded durability flush. Reused scripts are read and
+    /// rewritten once per batch instead of once per block.
+    pub fn append_entries_unsynced(
+        &mut self,
+        updates: &[(String, Vec<(Txid, u32)>)],
+    ) -> Result<()> {
+        for (script_hash, additions) in updates {
+            if additions.is_empty() {
+                continue;
+            }
+            let encoded = encode_history_script_hash(script_hash)?;
+            if !self.pending.contains_key(&encoded) {
+                let existing = match self.index.get(&encoded).copied() {
+                    Some(location) => {
+                        let body = read_history_data_record(&self.file, location)?;
+                        decode_history_value(&body, encoded)?
+                    }
+                    None => Vec::new(),
+                };
+                self.pending.insert(encoded, existing);
+            }
+            let history = self
+                .pending
+                .get_mut(&encoded)
+                .expect("pending history was initialized above");
+            for entry in additions {
+                if history.last() != Some(entry) {
+                    history.push(*entry);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        let updates = pending
+            .iter()
+            .map(|(script_hash, entries)| (hex::encode(script_hash), entries.clone()))
+            .collect::<Vec<_>>();
+        if let Err(error) = self.apply_batch_with_sync(&updates, true) {
+            self.pending = pending;
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn apply_batch_with_sync(
@@ -2489,6 +2572,7 @@ impl ElectrumHistoryStore {
         self.file.write_all(ELECTRUM_HISTORY_DATA_MAGIC)?;
         self.file.sync_data()?;
         self.index.clear();
+        self.pending.clear();
         self.next_batch_id = 1;
         self.index_file.set_len(0)?;
         self.index_file.seek(SeekFrom::End(0))?;
@@ -2498,6 +2582,7 @@ impl ElectrumHistoryStore {
     }
 
     pub fn flush(&mut self) -> Result<()> {
+        self.flush_pending()?;
         self.file.sync_data()?;
         self.index_file.sync_data()?;
         Ok(())
@@ -5008,6 +5093,34 @@ mod tests {
         let recovered = ElectrumHistoryStore::open(directory.path()).unwrap();
         assert_eq!(recovered.get(&script_hash).unwrap(), second_history);
         assert_eq!(std::fs::metadata(data_path).unwrap().len(), committed_len);
+    }
+
+    #[test]
+    fn electrum_history_appends_are_published_as_one_durability_batch() {
+        let directory = tempfile::tempdir().unwrap();
+        let script_hash = hex::encode([31u8; 32]);
+        let first = (Txid::from_byte_array([32u8; 32]), 1);
+        let second = (Txid::from_byte_array([33u8; 32]), 2);
+        let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
+        let initial_size = store.disk_usage().unwrap();
+
+        store
+            .append_entries_unsynced(&[(script_hash.clone(), vec![first])])
+            .unwrap();
+        store
+            .append_entries_unsynced(&[(script_hash.clone(), vec![second])])
+            .unwrap();
+        assert_eq!(store.get(&script_hash).unwrap(), vec![first, second]);
+        assert_eq!(store.disk_usage().unwrap(), initial_size);
+        assert_eq!(store.len(), 1);
+
+        store.flush().unwrap();
+        assert!(store.pending.is_empty());
+        assert!(store.disk_usage().unwrap() > initial_size);
+        drop(store);
+
+        let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&script_hash).unwrap(), vec![first, second]);
     }
 
     #[test]

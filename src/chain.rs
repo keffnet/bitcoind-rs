@@ -8353,20 +8353,13 @@ impl ChainState {
             !self.snapshot_validated && !self.is_active_block(&base) && path.contains(&base)
         });
         if let Some(common_height) = common_height.filter(|_| !pending_snapshot_reorg) {
-            let common_height_index = usize::try_from(common_height).unwrap_or(usize::MAX);
-            let candidate_suffix_len = path
-                .len()
-                .saturating_sub(common_height_index.saturating_add(1));
-            // A normal short reorg is cheaper to apply by disconnecting the
-            // old suffix and connecting the candidate suffix than by
-            // replaying the entire active chain.  This is especially
-            // important after a busy mempool has produced blocks containing
-            // thousands of transactions: the full replay is correct but
-            // needlessly turns an O(suffix) reorg into an O(chain) operation.
-            if (common_height < self.height()
-                || candidate_suffix_len >= MIN_SUFFIX_ACTIVATION_BLOCKS)
-                && self.activate_chain_from_pruned_suffix(&path, common_height)?
-            {
+            // Any candidate sharing the live chainstate can be activated by
+            // disconnecting and connecting only its suffix. Falling back to
+            // a genesis replay for a short extension is especially harmful
+            // during IBD: out-of-order block batches routinely complete a
+            // suffix a few blocks at a time, turning every batch into an
+            // O(active chain) replay while the chain write lock is held.
+            if self.activate_chain_from_pruned_suffix(&path, common_height)? {
                 return Ok(());
             }
         }
@@ -14564,6 +14557,33 @@ mod tests {
         state.connect_block_from_peer(parent).unwrap();
         assert_eq!(state.best_hash(), grandchild.block_hash());
         assert_eq!(state.height(), 3);
+    }
+
+    #[test]
+    fn activates_a_short_extension_without_replaying_the_active_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+
+        let extension = mine_block(&state, 4);
+        let extension_hash = extension.block_hash();
+        state.accept_headers(&[extension.header]).unwrap();
+        state.store.insert(&extension).unwrap();
+
+        // Model a pruned active prefix. Suffix activation needs only the
+        // candidate body, while a genesis replay would fail immediately.
+        let retained_blocks = HashSet::from([extension_hash]);
+        state
+            .store
+            .prune(&retained_blocks, &HashSet::new())
+            .unwrap();
+        assert!(!state.store.contains(&state.network_genesis_hash()));
+
+        state.activate_chain(extension_hash).unwrap();
+        assert_eq!(state.best_hash(), extension_hash);
+        assert_eq!(state.height(), 4);
     }
 
     #[test]

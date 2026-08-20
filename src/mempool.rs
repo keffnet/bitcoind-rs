@@ -1770,6 +1770,12 @@ impl Mempool {
                 }
             }
         }
+        // A dump can contain a child before its parent when entries were
+        // collected from a partially rebuilt pool.  Normal admission links a
+        // child to parents already present, so repair the reverse index once
+        // after this bulk load rather than adding an O(n) scan to every
+        // transaction admission.
+        self.rebuild_children_index();
         Ok(())
     }
 
@@ -4007,6 +4013,30 @@ impl Mempool {
                 }
             }
         }
+        // Revalidation is a bulk rebuild.  A retained child can precede its
+        // reaccepted parent in the old pool, so make the bidirectional graph
+        // index authoritative after replaying all entries.
+        self.rebuild_children_index();
+    }
+
+    /// Reconstruct the parent-to-child index from the authoritative
+    /// transactions.  This is used only at bulk boundaries (load, revalidate,
+    /// and chain reorganization); ordinary admission maintains the index
+    /// incrementally.
+    pub(crate) fn rebuild_children_index(&mut self) {
+        let mut children: HashMap<Txid, HashSet<Txid>> = HashMap::new();
+        for (txid, entry) in &self.entries {
+            for input in &entry.transaction.input {
+                if self.entries.contains_key(&input.previous_output.txid) {
+                    children
+                        .entry(input.previous_output.txid)
+                        .or_default()
+                        .insert(*txid);
+                }
+            }
+        }
+        self.children = children;
+        self.invalidate_graph_optimality();
     }
 
     pub fn remove(&mut self, txid: &Txid) -> Option<MempoolEntry> {
@@ -6600,6 +6630,25 @@ mod tests {
         assert_eq!(pool.ancestors(&grandchild_id), vec![root_id, child_id]);
         assert_eq!(pool.descendants(&root_id), vec![child_id, grandchild_id]);
         assert_eq!(pool.get_by_wtxid(&grandchild_wtxid).unwrap().added_at, 3);
+    }
+
+    #[test]
+    fn rebuilds_children_when_a_parent_is_added_after_existing_children() {
+        let parent = graph_transaction(Txid::from_byte_array([60; 32]), 60);
+        let parent_id = parent.compute_txid();
+        let child = graph_transaction(parent_id, 61);
+        let child_id = child.compute_txid();
+        let mut pool = Mempool::new(Network::Regtest);
+
+        // This is the ordering produced when a disconnected parent is
+        // restored while its descendants were already in the mempool.
+        insert_policy_entry(&mut pool, child);
+        insert_policy_entry(&mut pool, parent);
+        assert!(pool.children(&parent_id).is_empty());
+
+        pool.rebuild_children_index();
+
+        assert_eq!(pool.children(&parent_id), vec![child_id]);
     }
 
     #[test]

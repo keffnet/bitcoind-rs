@@ -2899,6 +2899,12 @@ impl Node {
                 }
             }
         }
+        // Disconnected-block transactions are replayed oldest-first, but
+        // their descendants may already have been in the mempool.  Rebuild
+        // the reverse graph once after the bulk restoration so those edges
+        // are visible to reorg cleanup, descendant accounting, and TRUC/RBF
+        // policy checks.
+        mempool.rebuild_children_index();
         mempool.remove_for_reorg(&chain);
         mempool.enforce_size_limit();
         let mempool_after = mempool

@@ -8026,6 +8026,14 @@ impl ChainState {
                     )?;
                 }
             }
+            // A persisted snapshot does not carry the transaction-count
+            // vectors. Normally the old active prefix supplies them, but a
+            // reorg can activate a snapshot prefix that is longer than the
+            // currently active chain. Keep the vectors aligned before the
+            // snapshot becomes the new durable checkpoint; otherwise the
+            // next -checkblockindex operation would observe an impossible
+            // active-chain state and panic.
+            self.repair_active_tx_count_vectors()?;
             self.store.flush()?;
             self.persist_snapshot()
         })();
@@ -9943,6 +9951,22 @@ impl ChainState {
             );
         }
         self.active_tx_counts = counts;
+        self.active_tx_totals = cumulative_tx_counts(&self.active_tx_counts);
+        Ok(())
+    }
+
+    fn repair_active_tx_count_vectors(&mut self) -> Result<()> {
+        if self.active_tx_counts.len() != self.active_chain.len() {
+            if self.prune_height.is_none() {
+                self.rebuild_active_tx_counts()?;
+            } else {
+                // Pruned/snapshot prefixes may intentionally have unknown
+                // per-block counts. Preserve known entries and use zero for
+                // the header-only portion, matching the existing snapshot
+                // representation while keeping all active vectors aligned.
+                self.active_tx_counts.resize(self.active_chain.len(), 0);
+            }
+        }
         self.active_tx_totals = cumulative_tx_counts(&self.active_tx_counts);
         Ok(())
     }

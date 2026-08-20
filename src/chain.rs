@@ -4703,6 +4703,15 @@ impl ChainState {
         self.block_locator_hashes_from(self.best_hash())
     }
 
+    /// Build the locator used to continue headers synchronization. The best
+    /// known header can be far ahead of the active body chain during IBD; an
+    /// active-tip locator in that state would make a peer resend the entire
+    /// already-indexed header suffix and unnecessarily enter low-work
+    /// presynchronization again.
+    pub(crate) fn best_header_locator_hashes(&self) -> Vec<BlockHash> {
+        self.block_locator_hashes_from(self.best_header_tip().hash)
+    }
+
     /// Build a locator from any indexed header. Core uses this form while
     /// re-downloading a low-work header chain: the locator must retain the
     /// common chain start even though the headers being synchronized are not
@@ -12578,6 +12587,7 @@ mod tests {
             state.headers_after_locator(&[side_hash], BlockHash::all_zeros()),
             Vec::new()
         );
+        assert_eq!(state.best_header_locator_hashes()[0], side_hash);
     }
 
     #[test]

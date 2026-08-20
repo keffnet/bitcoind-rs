@@ -8799,7 +8799,7 @@ async fn request_headers(
     writer: &PeerWriter,
     peer_state: &PeerState,
 ) -> Result<()> {
-    let locator = node.chain.read().block_locator_hashes();
+    let locator = node.chain.read().best_header_locator_hashes();
     request_headers_with_locator(node, peer_id, writer, peer_state, locator, false).await
 }
 

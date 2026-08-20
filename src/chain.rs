@@ -1310,6 +1310,10 @@ pub struct ChainState {
     // values for headers whose original order was not persisted.
     header_sequence_ids: HashMap<BlockHash, u64>,
     next_header_sequence_id: u64,
+    // Core keeps a direct pointer to its best header. Header synchronization
+    // consults this for every peer, so recomputing it from the entire block
+    // index would turn each handshake into an O(number of headers) scan.
+    best_header_hash: Mutex<Option<BlockHash>>,
     orphans: HashMap<BlockHash, Vec<Block>>,
     invalid_blocks: HashSet<BlockHash>,
     prune_height: Option<u32>,
@@ -2071,6 +2075,7 @@ impl ChainState {
             next_unlinked_body_order: 1,
             header_sequence_ids: HashMap::new(),
             next_header_sequence_id: 1,
+            best_header_hash: Mutex::new(None),
             orphans: HashMap::new(),
             invalid_blocks,
             prune_height,
@@ -3228,24 +3233,32 @@ impl ChainState {
     }
 
     pub fn best_header_tip(&self) -> ChainTip {
-        self.block_index
+        let mut cached = self.best_header_hash.lock();
+        if let Some(hash) = *cached
+            && let Some(node) = self.block_index.get(&hash)
+            && !self.has_invalid_ancestor(hash)
+        {
+            return ChainTip {
+                hash,
+                height: node.height,
+                work: node.chain_work,
+            };
+        }
+
+        let (hash, node) = self
+            .block_index
             .iter()
             .filter(|(hash, _)| !self.has_invalid_ancestor(**hash))
             .max_by(|(left_hash, left), (right_hash, right)| {
-                left.chain_work
-                    .cmp(&right.chain_work)
-                    .then_with(|| {
-                        self.header_sequence_id(right_hash)
-                            .cmp(&self.header_sequence_id(left_hash))
-                    })
-                    .then_with(|| right_hash.to_string().cmp(&left_hash.to_string()))
+                self.compare_header_candidates(left_hash, left, right_hash, right)
             })
-            .map(|(hash, node)| ChainTip {
-                hash: *hash,
-                height: node.height,
-                work: node.chain_work,
-            })
-            .expect("genesis header is indexed")
+            .expect("genesis header is indexed");
+        *cached = Some(*hash);
+        ChainTip {
+            hash: *hash,
+            height: node.height,
+            work: node.chain_work,
+        }
     }
 
     /// Estimate validation progress using Core's ChainTxData model.
@@ -3883,6 +3896,7 @@ impl ChainState {
             .filter(|candidate| self.is_descendant_or_self(candidate, hash))
             .collect();
         self.invalid_blocks.extend(invalidated);
+        self.best_header_hash.lock().take();
         let best_valid = self
             .best_valid_tip_hash()
             .context("invalidated chain has no valid alternative")?;
@@ -3902,6 +3916,7 @@ impl ChainState {
     /// method.
     pub fn mark_block_invalid(&mut self, hash: &BlockHash) -> Result<()> {
         if self.block_index.contains_key(hash) && self.invalid_blocks.insert(*hash) {
+            self.best_header_hash.lock().take();
             self.persist_metadata()?;
         }
         Ok(())
@@ -3928,6 +3943,7 @@ impl ChainState {
         for candidate in reconsidered {
             self.invalid_blocks.remove(&candidate);
         }
+        self.best_header_hash.lock().take();
         if let Some(best_valid) = self.best_valid_tip_hash()
             && best_valid != self.best_hash()
         {
@@ -9048,12 +9064,12 @@ impl ChainState {
     }
 
     fn assign_header_sequence_id(&mut self, hash: BlockHash) {
-        if self.header_sequence_ids.contains_key(&hash) {
-            return;
+        if !self.header_sequence_ids.contains_key(&hash) {
+            let sequence_id = self.next_header_sequence_id;
+            self.header_sequence_ids.insert(hash, sequence_id);
+            self.next_header_sequence_id = self.next_header_sequence_id.saturating_add(1);
         }
-        let sequence_id = self.next_header_sequence_id;
-        self.header_sequence_ids.insert(hash, sequence_id);
-        self.next_header_sequence_id = self.next_header_sequence_id.saturating_add(1);
+        self.consider_best_header(hash);
     }
 
     fn header_sequence_id(&self, hash: &BlockHash) -> u64 {
@@ -9061,6 +9077,55 @@ impl ChainState {
             .get(hash)
             .copied()
             .unwrap_or(u64::MAX)
+    }
+
+    fn compare_header_candidates(
+        &self,
+        left_hash: &BlockHash,
+        left: &BlockNode,
+        right_hash: &BlockHash,
+        right: &BlockNode,
+    ) -> std::cmp::Ordering {
+        left.chain_work
+            .cmp(&right.chain_work)
+            .then_with(|| {
+                self.header_sequence_id(right_hash)
+                    .cmp(&self.header_sequence_id(left_hash))
+            })
+            .then_with(|| right_hash.to_string().cmp(&left_hash.to_string()))
+    }
+
+    fn consider_best_header(&self, candidate_hash: BlockHash) {
+        let Some(candidate) = self.block_index.get(&candidate_hash) else {
+            return;
+        };
+        if self.has_invalid_ancestor(candidate_hash) {
+            return;
+        }
+
+        let mut cached = self.best_header_hash.lock();
+        let Some(current_hash) = *cached else {
+            // This is the first indexed header during normal initialization.
+            // A cleared cache on a populated index must instead be rebuilt by
+            // best_header_tip(), which considers every surviving branch.
+            if self.block_index.len() == 1 {
+                *cached = Some(candidate_hash);
+            }
+            return;
+        };
+        let Some(current) = self.block_index.get(&current_hash) else {
+            cached.take();
+            return;
+        };
+        if self.has_invalid_ancestor(current_hash) {
+            cached.take();
+            return;
+        }
+        if self.compare_header_candidates(&candidate_hash, candidate, &current_hash, current)
+            == std::cmp::Ordering::Greater
+        {
+            *cached = Some(candidate_hash);
+        }
     }
 
     /// Recreate Core's restart behavior for its memory-only candidate order:
@@ -9087,6 +9152,7 @@ impl ChainState {
         }
         self.next_block_sequence_id = if has_loaded_fork { 2 } else { 1 };
         self.next_header_sequence_id = 2;
+        self.best_header_hash.lock().take();
     }
 
     fn has_full_block_data_to_active_fork(&self, hash: BlockHash) -> bool {
@@ -10788,6 +10854,7 @@ fn open_background_replay_state(
         next_unlinked_body_order: 1,
         header_sequence_ids: HashMap::new(),
         next_header_sequence_id: 1,
+        best_header_hash: Mutex::new(None),
         orphans: HashMap::new(),
         invalid_blocks: HashSet::new(),
         prune_height: None,

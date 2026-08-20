@@ -4540,7 +4540,7 @@ impl Node {
     pub(crate) fn best_header_is_recent(&self) -> bool {
         let chain = self.chain.read();
         let best_header = chain.best_header_tip();
-        let Some(header) = chain.header(best_header.height) else {
+        let Some(header) = chain.header_by_hash(&best_header.hash) else {
             return false;
         };
         u64::from(header.time).saturating_add(24 * 60 * 60) >= time::unix_time()

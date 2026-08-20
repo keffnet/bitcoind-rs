@@ -60,6 +60,7 @@ const CHAIN_METADATA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-v1\0";
 const CHAIN_SNAPSHOT_MAGIC: &[u8] = b"bitcoind-rs-snapshot-v1\0";
 const CHAINSTATE_DELTA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-delta-v1\0";
 const CHAIN_TX_COUNTS_MAGIC: &[u8] = b"bitcoind-rs-tx-counts-v1\0";
+const CHAIN_ACTIVE_TIP_MAGIC: &[u8] = b"bitcoind-rs-active-tip-v1\0";
 const ASSUMEUTXO_STATE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-v1\0";
 const ASSUMEUTXO_BASE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-base-v1\0";
 const ASSUMEUTXO_CHECKPOINT_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-checkpoint-v1\0";
@@ -699,6 +700,19 @@ struct ActiveTxCounts {
     counts: Vec<u32>,
 }
 
+/// The latest active-chain tip beyond the full metadata checkpoint.  Normal
+/// block extension updates this compact sidecar instead of rewriting every
+/// known header and every active-chain hash on each block.  The sidecar is
+/// advisory: startup accepts it only when the native block store proves an
+/// exact descendant path from the checkpoint tip.
+#[derive(Serialize, Deserialize)]
+struct ActiveChainTip {
+    active_tip: String,
+    height: u32,
+    #[serde(default)]
+    prune_locks: HashMap<String, PruneLock>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct SnapshotProvenance {
     base_hash: String,
@@ -855,7 +869,81 @@ fn deserialize_chainstate_delta(bytes: &[u8]) -> Result<ChainstateDelta> {
     Ok(stored.delta)
 }
 
-fn load_active_tx_counts(data_dir: &Path, active_chain: &[BlockHash]) -> Result<Option<Vec<u32>>> {
+fn load_active_chain_from_tip(
+    data_dir: &Path,
+    store: &mut BlockStore,
+    persisted_active_chain: &[BlockHash],
+    persisted_prune_locks: &mut HashMap<String, PruneLock>,
+) -> Result<Vec<BlockHash>> {
+    const MAX_REPLAY_BLOCKS: u32 = SNAPSHOT_INTERVAL;
+
+    let path = data_dir.join("chainstate.active-tip");
+    let fallback = || persisted_active_chain.to_vec();
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(fallback()),
+        Err(error) => {
+            debug!(
+                path = %path.display(),
+                error = %error,
+                "ignoring unreadable active-chain tip sidecar"
+            );
+            return Ok(fallback());
+        }
+    };
+    let tip: ActiveChainTip = match deserialize_internal(&bytes, CHAIN_ACTIVE_TIP_MAGIC) {
+        Ok(tip) => tip,
+        Err(error) => {
+            debug!(
+                path = %path.display(),
+                error = %error,
+                "ignoring invalid active-chain tip sidecar"
+            );
+            return Ok(fallback());
+        }
+    };
+    let Some(checkpoint_hash) = persisted_active_chain.last().copied() else {
+        return Ok(fallback());
+    };
+    let checkpoint_height =
+        u32::try_from(persisted_active_chain.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    if tip.height <= checkpoint_height
+        || tip.height.saturating_sub(checkpoint_height) > MAX_REPLAY_BLOCKS
+    {
+        return Ok(fallback());
+    }
+    let Ok(tip_hash) = tip.active_tip.parse::<BlockHash>() else {
+        return Ok(fallback());
+    };
+
+    let suffix_len = usize::try_from(tip.height - checkpoint_height).unwrap_or(usize::MAX);
+    let mut suffix = Vec::with_capacity(suffix_len);
+    let mut cursor = tip_hash;
+    let mut height = tip.height;
+    while height > checkpoint_height {
+        let Some(block) = store.get(&cursor)? else {
+            return Ok(fallback());
+        };
+        suffix.push(cursor);
+        cursor = block.header.prev_blockhash;
+        height -= 1;
+    }
+    if cursor != checkpoint_hash {
+        return Ok(fallback());
+    }
+
+    *persisted_prune_locks = tip.prune_locks;
+    suffix.reverse();
+    let mut active_chain = persisted_active_chain.to_vec();
+    active_chain.extend(suffix);
+    Ok(active_chain)
+}
+
+fn load_active_tx_counts(
+    data_dir: &Path,
+    active_chain: &[BlockHash],
+    store: &mut BlockStore,
+) -> Result<Option<Vec<u32>>> {
     let path = data_dir.join("chainstate.txcounters");
     if !path.exists() {
         return Ok(None);
@@ -864,16 +952,29 @@ fn load_active_tx_counts(data_dir: &Path, active_chain: &[BlockHash]) -> Result<
         .with_context(|| format!("reading transaction-count index {}", path.display()))?;
     let index: ActiveTxCounts = deserialize_internal(&bytes, CHAIN_TX_COUNTS_MAGIC)
         .with_context(|| format!("decoding transaction-count index {}", path.display()))?;
-    let Some(active_tip) = active_chain.last() else {
-        return Ok(None);
-    };
-    let stored_tip = active_tip
-        .to_string()
-        .eq_ignore_ascii_case(&index.active_tip);
-    if !stored_tip || index.counts.len() != active_chain.len() {
+    if index.counts.is_empty() || index.counts.len() > active_chain.len() {
         return Ok(None);
     }
-    Ok(Some(index.counts))
+    let Some(stored_active_tip) = active_chain.get(index.counts.len() - 1) else {
+        return Ok(None);
+    };
+    let stored_tip = stored_active_tip
+        .to_string()
+        .eq_ignore_ascii_case(&index.active_tip);
+    if !stored_tip {
+        return Ok(None);
+    }
+
+    let mut counts = index.counts;
+    for hash in active_chain.iter().skip(counts.len()) {
+        let Some(block) = store.get(hash)? else {
+            return Ok(None);
+        };
+        let count =
+            u32::try_from(block.txdata.len()).context("transaction count does not fit u32")?;
+        counts.push(count);
+    }
+    Ok(Some(counts))
 }
 
 fn cumulative_tx_counts(counts: &[u32]) -> Vec<u64> {
@@ -1386,6 +1487,7 @@ impl ChainState {
                 data_dir.join("chainstate.snapshot"),
                 data_dir.join("chainstate.snapshot.sha256"),
                 data_dir.join("chainstate.txcounters"),
+                data_dir.join("chainstate.active-tip"),
                 snapshot_provenance_path.clone(),
             ] {
                 match fs::remove_file(&path) {
@@ -1399,11 +1501,11 @@ impl ChainState {
             }
         }
         let (
-            active_chain,
+            mut active_chain,
             persisted_headers,
             invalid_blocks,
             prune_height,
-            prune_locks,
+            mut prune_locks,
             prune_protected_blocks,
             persisted_segwit_validated_blocks,
         ) = if metadata_path.exists() || legacy_metadata_path.exists() {
@@ -1488,6 +1590,12 @@ impl ChainState {
                 None,
             )
         };
+        let checkpoint_chain_len = active_chain.len();
+        if !rebuild_chainstate {
+            active_chain =
+                load_active_chain_from_tip(&data_dir, &mut store, &active_chain, &mut prune_locks)?;
+        }
+        let active_chain_extended = active_chain.len() > checkpoint_chain_len;
         let segwit_height = usize::try_from(deployment_parameters.buried.segwit)
             .unwrap_or(usize::MAX)
             .max(1);
@@ -1524,10 +1632,17 @@ impl ChainState {
             }
             Some(validated_blocks) => Some(validated_blocks),
         };
+        let persisted_segwit_validated_blocks = if active_chain_extended {
+            let mut validated_blocks = persisted_segwit_validated_blocks.unwrap_or_default();
+            validated_blocks.extend(active_chain.iter().skip(segwit_height).copied());
+            Some(validated_blocks)
+        } else {
+            persisted_segwit_validated_blocks
+        };
         let persisted_tx_counts = if rebuild_chainstate {
             None
         } else {
-            load_active_tx_counts(&data_dir, &active_chain)?
+            load_active_tx_counts(&data_dir, &active_chain, &mut store)?
         };
         let persisted_tx_totals = persisted_tx_counts
             .as_deref()
@@ -1949,7 +2064,6 @@ impl ChainState {
         self.active_chain = path;
         self.active_tx_counts.resize(self.active_chain.len(), 0);
         self.active_tx_totals = cumulative_tx_counts(&self.active_tx_counts);
-        self.persist_metadata()?;
         self.persist_snapshot()?;
         self.update_ibd_status();
         Ok(())
@@ -2599,7 +2713,6 @@ impl ChainState {
         self.prune_height = Some(target_height);
         self.prune_protected_blocks
             .retain(|hash, height| *height >= target_height && retained_blocks.contains(hash));
-        self.persist_metadata()?;
         self.persist_snapshot()?;
         Ok(target_height)
     }
@@ -2943,7 +3056,6 @@ impl ChainState {
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
                 self.mark_active_chain_segwit_validated();
-                self.persist_metadata()?;
                 self.persist_snapshot()?;
                 self.remove_assumeutxo_artifacts()?;
                 self.persist_snapshot_provenance()?;
@@ -2960,7 +3072,6 @@ impl ChainState {
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
                 self.mark_active_chain_segwit_validated();
-                self.persist_metadata()?;
                 self.persist_snapshot()?;
                 self.remove_assumeutxo_artifacts()?;
                 self.persist_snapshot_provenance()?;
@@ -7047,9 +7158,14 @@ impl ChainState {
         }
         self.persist_coinstats_record(hash, height)?;
         if persist {
-            self.persist_metadata()?;
             if self.height() % SNAPSHOT_INTERVAL == 0 {
                 self.persist_snapshot()?;
+            } else {
+                // The block body, chainstate mutation, UTXO batch, and
+                // Electrum history batch were made durable above. Publish a
+                // compact active-tip marker instead of rewriting the full
+                // header/active-chain metadata on every block.
+                self.persist_active_chain_tip()?;
             }
             self.utxo_store.maybe_simulate_crash()?;
         }
@@ -7561,7 +7677,6 @@ impl ChainState {
                 }
             }
             self.store.flush()?;
-            self.persist_metadata()?;
             self.persist_snapshot()
         })();
         if let Err(error) = replay {
@@ -8832,7 +8947,8 @@ impl ChainState {
         let path = self.data_dir.join("chainstate.bin");
         let temp = self.data_dir.join("chainstate.bin.tmp");
         persist_atomic_file(&path, &temp, &bytes)?;
-        self.persist_tx_counts()
+        self.persist_tx_counts()?;
+        self.persist_active_chain_tip()
     }
 
     fn mark_active_chain_segwit_validated(&mut self) {
@@ -8859,6 +8975,23 @@ impl ChainState {
         let temp = self.data_dir.join("chainstate.txcounters.tmp");
         persist_atomic_file(&path, &temp, &bytes)?;
         Ok(())
+    }
+
+    fn persist_active_chain_tip(&self) -> Result<()> {
+        let tip = ActiveChainTip {
+            active_tip: self.best_hash().to_string(),
+            height: self.height(),
+            prune_locks: self
+                .prune_locks
+                .iter()
+                .filter(|(_, lock)| !lock.temporary)
+                .map(|(id, lock)| (id.clone(), lock.clone()))
+                .collect(),
+        };
+        let bytes = serialize_internal(CHAIN_ACTIVE_TIP_MAGIC, &tip)?;
+        let path = self.data_dir.join("chainstate.active-tip");
+        let temp = self.data_dir.join("chainstate.active-tip.tmp");
+        persist_atomic_file(&path, &temp, &bytes)
     }
 
     fn load_snapshot(&self, active_chain: &[BlockHash]) -> Result<Option<(ChainSnapshot, bool)>> {
@@ -9075,6 +9208,11 @@ impl ChainState {
     }
 
     fn persist_snapshot(&mut self) -> Result<()> {
+        // A snapshot is also a full chainstate checkpoint.  This matters when
+        // callers request one between periodic checkpoints: the active-tip
+        // sidecar may otherwise point past metadata whose old block bodies
+        // have since been pruned.
+        self.persist_metadata()?;
         self.sync_utxo_store()?;
         self.utxo_store.compact_if_needed()?;
         self.sync_electrum_history_store()?;
@@ -9086,7 +9224,8 @@ impl ChainState {
         persist_atomic_file(&path, &temp, &bytes)?;
         self.persist_snapshot_checksum_bytes(&bytes)?;
         self.persist_tx_counts()?;
-        self.chainstate_store.clear()
+        self.chainstate_store.clear()?;
+        self.persist_active_chain_tip()
     }
 
     fn persist_snapshot_checksum(&self) -> Result<()> {
@@ -12831,6 +12970,56 @@ mod tests {
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.best_header_tip().hash, child.block_hash());
         assert_eq!(reopened.blocks_ahead_of_tip(), Some(2));
+    }
+
+    #[test]
+    fn active_tip_sidecar_recovers_blocks_after_stale_metadata_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        let tip = state.best_hash();
+        let metadata_bytes = fs::read(directory.path().join("chainstate.bin")).unwrap();
+        let metadata: ChainMetadata =
+            deserialize_internal(&metadata_bytes, CHAIN_METADATA_MAGIC).unwrap();
+        assert_eq!(metadata.active_chain.len(), 1);
+        assert_eq!(
+            metadata
+                .active_chain
+                .first()
+                .and_then(|hash| hash.parse::<BlockHash>().ok()),
+            Some(genesis_block(Network::Regtest).block_hash())
+        );
+        assert!(directory.path().join("chainstate.active-tip").is_file());
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), tip);
+        assert_eq!(reopened.height(), 3);
+        assert_eq!(reopened.active_tx_counts, vec![1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn invalid_active_tip_sidecar_is_ignored() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        fs::write(
+            directory.path().join("chainstate.active-tip"),
+            b"not a native active-tip record",
+        )
+        .unwrap();
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.height(), 0);
+        assert_eq!(
+            reopened.best_hash(),
+            genesis_block(Network::Regtest).block_hash()
+        );
     }
 
     #[test]

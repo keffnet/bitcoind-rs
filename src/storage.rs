@@ -1767,9 +1767,10 @@ impl UtxoStore {
         let mut data_committed = false;
         let mut operations = Vec::with_capacity(removals.len() + additions.len());
         let write_result = (|| -> Result<()> {
+            let mut data_bytes = Vec::new();
             for outpoint in removals {
                 let body = encode_utxo_delete(batch_id, outpoint);
-                let location = append_utxo_data_record(&mut self.file, &body)?;
+                let location = buffer_utxo_data_record(&mut data_bytes, batch_start, &body)?;
                 operations.push(PendingUtxoOperation::Delete {
                     outpoint: *outpoint,
                 });
@@ -1779,7 +1780,7 @@ impl UtxoStore {
             }
             for (outpoint, entry) in additions {
                 let body = encode_utxo_put(batch_id, outpoint, entry)?;
-                let location = append_utxo_data_record(&mut self.file, &body)?;
+                let location = buffer_utxo_data_record(&mut data_bytes, batch_start, &body)?;
                 operations.push(PendingUtxoOperation::Put {
                     outpoint: *outpoint,
                     location,
@@ -1789,10 +1790,11 @@ impl UtxoStore {
                     .saturating_add(4usize.saturating_add(location.length() as usize));
             }
             let commit = encode_utxo_commit(batch_id);
-            let commit_location = append_utxo_data_record(&mut self.file, &commit)?;
+            let commit_location = buffer_utxo_data_record(&mut data_bytes, batch_start, &commit)?;
             self.pending_write_bytes = self
                 .pending_write_bytes
                 .saturating_add(4usize.saturating_add(commit_location.length() as usize));
+            self.file.write_all(&data_bytes)?;
             if sync {
                 self.file.sync_data()?;
             }
@@ -2345,17 +2347,19 @@ impl ElectrumHistoryStore {
         let mut operations = Vec::with_capacity(updates.len());
         let mut data_committed = false;
         let write_result = (|| -> Result<()> {
+            let mut data_bytes = Vec::new();
             for (script_hash, entries) in updates {
                 let script_hash_bytes = encode_history_script_hash(script_hash)?;
                 let body = encode_history_value(batch_id, script_hash_bytes, entries)?;
-                let location = append_history_data_record(&mut self.file, &body)?;
+                let location = buffer_history_data_record(&mut data_bytes, batch_start, &body)?;
                 operations.push(PendingHistoryOperation {
                     script_hash: script_hash_bytes,
                     location,
                 });
             }
             let commit = encode_history_commit(batch_id);
-            append_history_data_record(&mut self.file, &commit)?;
+            buffer_history_data_record(&mut data_bytes, batch_start, &commit)?;
+            self.file.write_all(&data_bytes)?;
             if sync {
                 self.file.sync_data()?;
             }
@@ -2654,17 +2658,32 @@ fn encode_history_commit(batch_id: u64) -> Vec<u8> {
 }
 
 fn append_history_data_record(file: &mut File, body: &[u8]) -> Result<HistoryLocation> {
+    let offset = data_len_after(file)?;
+    let mut record_bytes = Vec::new();
+    let location = buffer_history_data_record(&mut record_bytes, offset, body)?;
+    file.write_all(&record_bytes)?;
+    Ok(location)
+}
+
+fn buffer_history_data_record(
+    destination: &mut Vec<u8>,
+    data_start: u64,
+    body: &[u8],
+) -> Result<HistoryLocation> {
     if body.is_empty() || body.len() > MAX_STORED_ELECTRUM_HISTORY_SIZE {
         bail!("Electrum history log record is too large");
     }
     let encoded_body = encode_storage_payload(body, MAX_STORED_ELECTRUM_HISTORY_SIZE)?;
-    let offset = data_len_after(file)?;
+    let offset = data_start
+        .checked_add(
+            u64::try_from(destination.len())
+                .context("Electrum history batch length does not fit u64")?,
+        )
+        .context("Electrum history log offset overflowed")?;
     let length =
         u32::try_from(encoded_body.len()).context("Electrum history record is too large")?;
-    let mut record_bytes = Vec::with_capacity(4 + encoded_body.len());
-    record_bytes.extend_from_slice(&length.to_le_bytes());
-    record_bytes.extend_from_slice(&encoded_body);
-    file.write_all(&record_bytes)?;
+    destination.extend_from_slice(&length.to_le_bytes());
+    destination.extend_from_slice(&encoded_body);
     HistoryLocation::new(offset, length)
 }
 
@@ -3158,18 +3177,32 @@ fn encode_utxo_commit(batch_id: u64) -> Vec<u8> {
 }
 
 fn append_utxo_data_record(file: &mut File, body: &[u8]) -> Result<UtxoLocation> {
+    let offset = data_len_after(file)?;
+    let mut record_bytes = Vec::new();
+    let location = buffer_utxo_data_record(&mut record_bytes, offset, body)?;
+    file.write_all(&record_bytes)?;
+    Ok(location)
+}
+
+fn buffer_utxo_data_record(
+    destination: &mut Vec<u8>,
+    data_start: u64,
+    body: &[u8],
+) -> Result<UtxoLocation> {
     if body.is_empty() || body.len() > MAX_STORED_UTXO_SIZE + 64 {
         bail!("UTXO log record is too large");
     }
     let encoded_body = encode_storage_payload(body, MAX_STORED_UTXO_SIZE + 64)?;
-    let offset = data_len_after(file)?;
+    let offset = data_start
+        .checked_add(
+            u64::try_from(destination.len()).context("UTXO batch length does not fit u64")?,
+        )
+        .context("UTXO log offset overflowed")?;
     let length =
         u32::try_from(encoded_body.len()).context("UTXO log record length does not fit u32")?;
     let location = UtxoLocation::new(offset, length)?;
-    let mut record_bytes = Vec::with_capacity(4 + encoded_body.len());
-    record_bytes.extend_from_slice(&length.to_le_bytes());
-    record_bytes.extend_from_slice(&encoded_body);
-    file.write_all(&record_bytes)?;
+    destination.extend_from_slice(&length.to_le_bytes());
+    destination.extend_from_slice(&encoded_body);
     Ok(location)
 }
 

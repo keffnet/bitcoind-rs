@@ -2683,16 +2683,7 @@ fn append_history_index_batch(
 ) -> Result<()> {
     file.seek(SeekFrom::End(0))?;
     for operation in operations {
-        let mut body = Vec::with_capacity(64);
-        body.push(HISTORY_PUT);
-        body.extend_from_slice(&batch_id.to_le_bytes());
-        body.extend_from_slice(&operation.location.offset.to_le_bytes());
-        body.extend_from_slice(&operation.location.length.to_le_bytes());
-        body.extend_from_slice(&operation.script_hash);
-        let length =
-            u32::try_from(body.len()).context("Electrum history index record too large")?;
-        file.write_all(&length.to_le_bytes())?;
-        file.write_all(&body)?;
+        append_history_index_operation(file, batch_id, operation)?;
     }
     let mut commit = Vec::with_capacity(25);
     commit.push(HISTORY_COMMIT);
@@ -2701,6 +2692,23 @@ fn append_history_index_batch(
     commit.extend_from_slice(&next_batch_id.to_le_bytes());
     file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
     file.write_all(&commit)?;
+    Ok(())
+}
+
+fn append_history_index_operation(
+    file: &mut File,
+    batch_id: u64,
+    operation: &PendingHistoryOperation,
+) -> Result<()> {
+    let mut body = Vec::with_capacity(64);
+    body.push(HISTORY_PUT);
+    body.extend_from_slice(&batch_id.to_le_bytes());
+    body.extend_from_slice(&operation.location.offset.to_le_bytes());
+    body.extend_from_slice(&operation.location.length.to_le_bytes());
+    body.extend_from_slice(&operation.script_hash);
+    let length = u32::try_from(body.len()).context("Electrum history index record too large")?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(&body)?;
     Ok(())
 }
 
@@ -2713,14 +2721,23 @@ fn rewrite_history_index(
     file.set_len(0)?;
     file.seek(SeekFrom::End(0))?;
     file.write_all(ELECTRUM_HISTORY_INDEX_MAGIC)?;
-    let operations = index
-        .iter()
-        .map(|(script_hash, location)| PendingHistoryOperation {
-            script_hash: *script_hash,
-            location: *location,
-        })
-        .collect::<Vec<_>>();
-    append_history_index_batch(file, 0, data_end, next_batch_id, &operations)?;
+    for (script_hash, location) in index {
+        append_history_index_operation(
+            file,
+            0,
+            &PendingHistoryOperation {
+                script_hash: *script_hash,
+                location: *location,
+            },
+        )?;
+    }
+    let mut commit = Vec::with_capacity(25);
+    commit.push(HISTORY_COMMIT);
+    commit.extend_from_slice(&0u64.to_le_bytes());
+    commit.extend_from_slice(&data_end.to_le_bytes());
+    commit.extend_from_slice(&next_batch_id.to_le_bytes());
+    file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
+    file.write_all(&commit)?;
     file.sync_data()?;
     Ok(())
 }
@@ -3144,24 +3161,7 @@ fn append_utxo_index_batch(
 ) -> Result<()> {
     file.seek(SeekFrom::End(0))?;
     for operation in operations {
-        let mut body = Vec::with_capacity(64);
-        match operation {
-            PendingUtxoOperation::Put { outpoint, location } => {
-                body.push(UTXO_PUT);
-                body.extend_from_slice(&batch_id.to_le_bytes());
-                body.extend_from_slice(&location.offset.to_le_bytes());
-                body.extend_from_slice(&location.length.to_le_bytes());
-                body.extend_from_slice(&encode_outpoint(outpoint));
-            }
-            PendingUtxoOperation::Delete { outpoint } => {
-                body.push(UTXO_DELETE);
-                body.extend_from_slice(&batch_id.to_le_bytes());
-                body.extend_from_slice(&encode_outpoint(outpoint));
-            }
-        }
-        let length = u32::try_from(body.len()).context("UTXO index record is too large")?;
-        file.write_all(&length.to_le_bytes())?;
-        file.write_all(&body)?;
+        append_utxo_index_operation(file, batch_id, operation)?;
     }
     let mut commit = Vec::with_capacity(33);
     commit.push(UTXO_COMMIT);
@@ -3171,6 +3171,32 @@ fn append_utxo_index_batch(
     commit.extend_from_slice(&generation.to_le_bytes());
     file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
     file.write_all(&commit)?;
+    Ok(())
+}
+
+fn append_utxo_index_operation(
+    file: &mut File,
+    batch_id: u64,
+    operation: &PendingUtxoOperation,
+) -> Result<()> {
+    let mut body = Vec::with_capacity(64);
+    match operation {
+        PendingUtxoOperation::Put { outpoint, location } => {
+            body.push(UTXO_PUT);
+            body.extend_from_slice(&batch_id.to_le_bytes());
+            body.extend_from_slice(&location.offset.to_le_bytes());
+            body.extend_from_slice(&location.length.to_le_bytes());
+            body.extend_from_slice(&encode_outpoint(outpoint));
+        }
+        PendingUtxoOperation::Delete { outpoint } => {
+            body.push(UTXO_DELETE);
+            body.extend_from_slice(&batch_id.to_le_bytes());
+            body.extend_from_slice(&encode_outpoint(outpoint));
+        }
+    }
+    let length = u32::try_from(body.len()).context("UTXO index record is too large")?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(&body)?;
     Ok(())
 }
 
@@ -3185,21 +3211,24 @@ fn rewrite_utxo_index(
     file.seek(SeekFrom::End(0))?;
     file.write_all(UTXO_INDEX_MAGIC)?;
     let checkpoint_batch = 0u64;
-    let operations = index
-        .iter()
-        .map(|(outpoint, location)| PendingUtxoOperation::Put {
-            outpoint: *outpoint,
-            location: *location,
-        })
-        .collect::<Vec<_>>();
-    append_utxo_index_batch(
-        file,
-        checkpoint_batch,
-        data_end,
-        next_batch_id,
-        generation,
-        &operations,
-    )?;
+    for (outpoint, location) in index {
+        append_utxo_index_operation(
+            file,
+            checkpoint_batch,
+            &PendingUtxoOperation::Put {
+                outpoint: *outpoint,
+                location: *location,
+            },
+        )?;
+    }
+    let mut commit = Vec::with_capacity(33);
+    commit.push(UTXO_COMMIT);
+    commit.extend_from_slice(&checkpoint_batch.to_le_bytes());
+    commit.extend_from_slice(&data_end.to_le_bytes());
+    commit.extend_from_slice(&next_batch_id.to_le_bytes());
+    commit.extend_from_slice(&generation.to_le_bytes());
+    file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
+    file.write_all(&commit)?;
     file.sync_data()?;
     Ok(())
 }

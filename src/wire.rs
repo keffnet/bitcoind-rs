@@ -25,6 +25,13 @@ const HEADER_SIZE: usize = 24;
 const MAX_INVENTORY_ITEMS: usize = 50_000;
 pub(crate) const MAX_LOCATOR_HASHES: usize = 101;
 const MAX_USER_AGENT_LENGTH: usize = 256;
+const MAX_BLOCK_TRANSACTIONS: usize = 1_000_000;
+const MAX_TRANSACTION_OUTPUTS: usize = 1_000_000;
+// Core accepts the otherwise non-standard legacy transaction shape with no
+// inputs and no outputs. Its smallest serialization is version + two
+// CompactSize fields + locktime.
+const MIN_SERIALIZED_EMPTY_TRANSACTION_SIZE: usize = 10;
+const MIN_SERIALIZED_TXOUT_SIZE: usize = 9;
 
 pub const NODE_NETWORK: u64 = 1;
 pub const NODE_BLOOM: u64 = 1 << 2;
@@ -1139,23 +1146,34 @@ fn decode_transaction_core_compatible(payload: &[u8]) -> Result<Transaction, Wir
 }
 
 fn decode_block_core_compatible(payload: &[u8]) -> Result<Block, WireError> {
-    if let Ok(block) = deserialize(payload) {
-        return Ok(block);
-    }
-
     let (header, header_consumed) =
         deserialize_partial::<bitcoin::block::Header>(payload).map_err(payload_error)?;
     let (transaction_count, count_consumed) =
         deserialize_partial::<VarInt>(&payload[header_consumed..]).map_err(payload_error)?;
     let transaction_count = usize::try_from(transaction_count.0)
         .map_err(|_| WireError::Payload("block transaction count is too large".to_owned()))?;
-    if transaction_count > 1_000_000 {
+    if transaction_count > MAX_BLOCK_TRANSACTIONS {
         return Err(WireError::Payload(
             "block transaction count is too large".to_owned(),
         ));
     }
 
     let mut offset = header_consumed.saturating_add(count_consumed);
+    let remaining_len = payload.len().saturating_sub(offset);
+    if transaction_count > remaining_len / MIN_SERIALIZED_EMPTY_TRANSACTION_SIZE {
+        return Err(WireError::Payload(
+            "block transaction count exceeds payload size".to_owned(),
+        ));
+    }
+
+    // Preflight the vector count before asking the bitcoin crate to decode the
+    // block. A peer can otherwise advertise a large transaction count in a
+    // tiny malformed payload and make deserialization reserve a large Vec
+    // before it discovers that the bytes are missing.
+    if let Ok(block) = deserialize(payload) {
+        return Ok(block);
+    }
+
     let mut txdata = Vec::with_capacity(transaction_count);
     for _ in 0..transaction_count {
         let remaining = payload
@@ -1220,12 +1238,20 @@ fn decode_empty_input_transaction(payload: &[u8]) -> Result<(Transaction, usize)
     .map_err(payload_error)?;
     let output_count = usize::try_from(output_count.0)
         .map_err(|_| WireError::Payload("transaction output count is too large".to_owned()))?;
-    if output_count > 1_000_000 {
+    if output_count > MAX_TRANSACTION_OUTPUTS {
         return Err(WireError::Payload(
             "transaction output count is too large".to_owned(),
         ));
     }
     let mut offset = output_offset.saturating_add(output_count_consumed);
+    let remaining_len = payload.len().saturating_sub(offset);
+    let max_outputs_from_payload =
+        remaining_len.saturating_sub(std::mem::size_of::<u32>()) / MIN_SERIALIZED_TXOUT_SIZE;
+    if output_count > max_outputs_from_payload {
+        return Err(WireError::Payload(
+            "transaction output count exceeds payload size".to_owned(),
+        ));
+    }
     let mut output = Vec::with_capacity(output_count);
     for _ in 0..output_count {
         let (txout, consumed) = deserialize_partial::<bitcoin::TxOut>(
@@ -1829,6 +1855,25 @@ mod tests {
         assert!(transaction.input.is_empty());
         assert!(transaction.output.is_empty());
         assert_eq!(transaction.lock_time, LockTime::from_consensus(0));
+    }
+
+    #[test]
+    fn rejects_block_transaction_count_that_cannot_fit_in_payload() {
+        let header = bitcoin::blockdata::constants::genesis_block(Network::Regtest).header;
+        let mut payload = serialize(&header);
+        put_compact_size(MAX_BLOCK_TRANSACTIONS, &mut payload).unwrap();
+
+        assert!(decode_block_core_compatible(&payload).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_input_output_count_that_cannot_fit_in_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2i32.to_le_bytes());
+        put_compact_size(0, &mut payload).unwrap();
+        put_compact_size(MAX_TRANSACTION_OUTPUTS, &mut payload).unwrap();
+
+        assert!(decode_empty_input_transaction(&payload).is_err());
     }
 
     #[tokio::test]

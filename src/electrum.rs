@@ -35,6 +35,14 @@ const MAX_SCRIPTPUBKEY_SIZE: usize = 10_000;
 // unbounded response allocation. Leave room for the JSON-RPC envelope and
 // the scriptpubkey {"history": ...} wrapper.
 const MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE: usize = 4 * 1024 * 1024 - 256;
+// Bound serialized responses as well as request lines. This prevents a
+// batch of large transaction responses from accumulating without limit in
+// the connection task. The line budget is large enough for a hexadecimal
+// representation of a maximum-weight transaction plus its JSON envelope.
+const MAX_ELECTRUM_RESPONSE_SIZE: usize = MAX_LINE_SIZE;
+// Leave room for the JSON-RPC envelope when a method builds an array result
+// before the outer response encoder can apply its limit.
+const MAX_ELECTRUM_RESULT_PAYLOAD_SIZE: usize = MAX_ELECTRUM_RESPONSE_SIZE - 1_024;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ElectrumPeer {
@@ -406,11 +414,15 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         continue;
                     }
                 };
-                let response = if let Some(batch) = requests.as_array() {
+                let mut encoded = if let Some(batch) = requests.as_array() {
                     if batch.is_empty() || batch.len() > MAX_ELECTRUM_BATCH_REQUESTS {
-                        Some(json!([invalid_request_response()]))
+                        Some(encode_electrum_batch(vec![
+                            serde_json::to_vec(&invalid_request_response())?,
+                        ])?)
                     } else {
-                        let mut responses = Vec::new();
+                        let mut encoded_batch = vec![b'['];
+                        let mut response_count = 0usize;
+                        let mut response_too_large = false;
                         for request in batch {
                             if let Some(response) = process_electrum_request(
                                 &node,
@@ -420,10 +432,30 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                                 &mut headers_subscribed,
                                 &mut numblocks_subscribed,
                             )? {
-                                responses.push(response);
+                                let encoded_response = encode_bounded_electrum_response(response)?;
+                                if !append_electrum_batch_response(
+                                    &mut encoded_batch,
+                                    &mut response_count,
+                                    &encoded_response,
+                                ) {
+                                    response_too_large = true;
+                                    // Do not retain or process the rest of a
+                                    // batch once its output budget is known
+                                    // to be exceeded.
+                                    break;
+                                }
                             }
                         }
-                        (!responses.is_empty()).then_some(Value::Array(responses))
+                        if response_too_large {
+                            Some(serde_json::to_vec(&json!([oversized_electrum_response(
+                                Value::Null,
+                            )]))?)
+                        } else if response_count == 0 {
+                            None
+                        } else {
+                            encoded_batch.push(b']');
+                            Some(encoded_batch)
+                        }
                     }
                 } else {
                     process_electrum_request(
@@ -434,13 +466,14 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         &mut headers_subscribed,
                         &mut numblocks_subscribed,
                     )?
+                    .map(encode_bounded_electrum_response)
+                    .transpose()?
                 };
-                let Some(response) = response else {
+                let Some(mut encoded_response) = encoded.take() else {
                     continue;
                 };
-                let mut encoded = serde_json::to_vec(&response)?;
-                encoded.push(b'\n');
-                write_half.write_all(&encoded).await?;
+                encoded_response.push(b'\n');
+                write_half.write_all(&encoded_response).await?;
             }
         }
     }
@@ -483,6 +516,59 @@ fn invalid_request_response() -> Value {
     })
 }
 
+fn oversized_electrum_response(id: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {"code": 1, "message": "response too large"},
+    })
+}
+
+fn encode_bounded_electrum_response(response: Value) -> Result<Vec<u8>> {
+    let mut encoded = serde_json::to_vec(&response)?;
+    if encoded.len().saturating_add(1) > MAX_ELECTRUM_RESPONSE_SIZE {
+        let id = response.get("id").cloned().unwrap_or(Value::Null);
+        encoded = serde_json::to_vec(&oversized_electrum_response(id))?;
+    }
+    Ok(encoded)
+}
+
+fn encode_electrum_batch(responses: Vec<Vec<u8>>) -> Result<Vec<u8>> {
+    let mut encoded = vec![b'['];
+    let mut response_count = 0usize;
+    for response in responses {
+        if !append_electrum_batch_response(&mut encoded, &mut response_count, &response) {
+            return Ok(serde_json::to_vec(&json!([oversized_electrum_response(
+                Value::Null,
+            )]))?);
+        }
+    }
+    encoded.push(b']');
+    Ok(encoded)
+}
+
+fn append_electrum_batch_response(
+    encoded: &mut Vec<u8>,
+    response_count: &mut usize,
+    response: &[u8],
+) -> bool {
+    let separator_size = usize::from(*response_count != 0);
+    let projected_size = encoded
+        .len()
+        .saturating_add(separator_size)
+        .saturating_add(response.len())
+        .saturating_add(2); // closing bracket and newline
+    if projected_size > MAX_ELECTRUM_RESPONSE_SIZE {
+        return false;
+    }
+    if *response_count != 0 {
+        encoded.push(b',');
+    }
+    encoded.extend_from_slice(response);
+    *response_count += 1;
+    true
+}
+
 #[derive(Debug)]
 struct ElectrumInvalidParams;
 
@@ -511,6 +597,21 @@ impl std::error::Error for ElectrumHistoryTooLarge {}
 
 fn electrum_history_too_large() -> anyhow::Error {
     anyhow::Error::new(ElectrumHistoryTooLarge)
+}
+
+#[derive(Debug)]
+struct ElectrumResponseTooLarge;
+
+impl std::fmt::Display for ElectrumResponseTooLarge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("response too large")
+    }
+}
+
+impl std::error::Error for ElectrumResponseTooLarge {}
+
+fn electrum_response_too_large() -> anyhow::Error {
+    anyhow::Error::new(ElectrumResponseTooLarge)
 }
 
 fn process_electrum_request(
@@ -576,6 +677,9 @@ fn electrum_error_response(id: Value, method: &str, error: anyhow::Error) -> Val
             "id": id,
             "error": {"code": 10001, "message": "history too large"},
         });
+    }
+    if error.downcast_ref::<ElectrumResponseTooLarge>().is_some() {
+        return oversized_electrum_response(id);
     }
     let message = error.to_string();
     if message == format!("unsupported Electrum method {method}") {
@@ -1413,14 +1517,22 @@ fn transaction_get_batch(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(electrum_invalid_params)?;
     validate_electrum_batch_len(txids.len())?;
     let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
-    txids
-        .iter()
-        .map(|txid| {
-            let txid = txid.as_str().ok_or_else(electrum_invalid_params)?;
-            transaction_get(node, &json!([txid, verbose]))
-        })
-        .collect::<Result<Vec<_>>>()
-        .map(Value::Array)
+    let mut transactions = Vec::with_capacity(txids.len());
+    let mut payload_size = 2usize; // The opening and closing array brackets.
+    for txid in txids {
+        let txid = txid.as_str().ok_or_else(electrum_invalid_params)?;
+        let transaction = transaction_get(node, &json!([txid, verbose]))?;
+        let transaction_size = serde_json::to_vec(&transaction)?.len();
+        let next_size = payload_size
+            .saturating_add(transaction_size)
+            .saturating_add(usize::from(!transactions.is_empty()));
+        if next_size > MAX_ELECTRUM_RESULT_PAYLOAD_SIZE {
+            return Err(electrum_response_too_large());
+        }
+        payload_size = next_size;
+        transactions.push(transaction);
+    }
+    Ok(Value::Array(transactions))
 }
 
 fn validate_electrum_batch_len(len: usize) -> Result<()> {
@@ -2241,6 +2353,45 @@ mod tests {
         assert!(client_protocol_range(&json!(["test", ["1.4", "1.7", "1.8"]])).is_err());
         let mut session = ElectrumSession::default();
         assert!(negotiate_version(&json!([42, "1.4"]), &mut session).is_err());
+    }
+
+    #[test]
+    fn electrum_single_response_is_bounded() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": "x".repeat(MAX_ELECTRUM_RESPONSE_SIZE),
+        });
+        let encoded = encode_bounded_electrum_response(response).unwrap();
+        assert!(encoded.len().saturating_add(1) <= MAX_ELECTRUM_RESPONSE_SIZE);
+        let response: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(response["id"], json!(7));
+        assert_eq!(response["error"]["message"], json!("response too large"));
+    }
+
+    #[test]
+    fn electrum_batch_response_is_bounded() {
+        let response = encode_electrum_batch(vec![
+            vec![b'0'; MAX_ELECTRUM_RESPONSE_SIZE],
+            serde_json::to_vec(&json!({"id": 1, "result": true})).unwrap(),
+        ])
+        .unwrap();
+        assert!(response.len().saturating_add(1) <= MAX_ELECTRUM_RESPONSE_SIZE);
+        let response: Value = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response[0]["id"], Value::Null);
+        assert_eq!(response[0]["error"]["message"], json!("response too large"));
+    }
+
+    #[test]
+    fn electrum_oversized_method_result_uses_bounded_error() {
+        let response = electrum_error_response(
+            json!(9),
+            "blockchain.transaction.get_batch",
+            electrum_response_too_large(),
+        );
+        assert_eq!(response["id"], json!(9));
+        assert_eq!(response["error"]["code"], json!(1));
+        assert_eq!(response["error"]["message"], json!("response too large"));
     }
 
     #[test]

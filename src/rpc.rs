@@ -8677,12 +8677,179 @@ fn decode_script(node: &Arc<Node>, params: &Value) -> Result<Value> {
 
 fn parse_psbt(params: &Value, index: usize) -> Result<Psbt> {
     let encoded = param::<String>(params, index)?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-    Ok(Psbt::deserialize(&bytes)?)
+    deserialize_psbt(&encoded)
+}
+
+fn deserialize_psbt(encoded: &str) -> Result<Psbt> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| anyhow!("TX decode failed invalid base64"))?;
+    let psbt = Psbt::deserialize(&bytes).map_err(|error| anyhow!("TX decode failed {error}"))?;
+    validate_psbt_structure(&psbt).map_err(|error| anyhow!("TX decode failed {error}"))?;
+    Ok(psbt)
+}
+
+fn validate_psbt_structure(psbt: &Psbt) -> Result<()> {
+    for (index, input) in psbt.inputs.iter().enumerate() {
+        let Some(transaction_input) = psbt.unsigned_tx.input.get(index) else {
+            bail!("PSBT input count does not match unsigned transaction")
+        };
+        if let Some(transaction) = &input.non_witness_utxo {
+            if transaction.compute_txid() != transaction_input.previous_output.txid {
+                bail!("Non-witness UTXO does not match outpoint hash")
+            }
+            if transaction_input.previous_output.vout as usize >= transaction.output.len() {
+                bail!("Input specifies output index that does not exist")
+            }
+        }
+        validate_psbt_musig2_map(&input.unknown, "Input")?;
+    }
+    for output in &psbt.outputs {
+        validate_psbt_musig2_map(&output.unknown, "Output")?;
+    }
+    Ok(())
 }
 
 fn encode_psbt(psbt: &Psbt) -> String {
-    base64::engine::general_purpose::STANDARD.encode(psbt.serialize())
+    let serialized = psbt.serialize();
+    let serialized =
+        core_compatible_psbt_serialization(&serialized, psbt.inputs.len(), psbt.outputs.len())
+            .unwrap_or(serialized);
+    base64::engine::general_purpose::STANDARD.encode(serialized)
+}
+
+fn read_psbt_compact_size(bytes: &[u8], cursor: &mut usize) -> Option<usize> {
+    let first = *bytes.get(*cursor)?;
+    *cursor += 1;
+    let (width, value) = match first {
+        0..=252 => (0, u64::from(first)),
+        253 => (
+            2,
+            u64::from(u16::from_le_bytes([
+                *bytes.get(*cursor)?,
+                *bytes.get(*cursor + 1)?,
+            ])),
+        ),
+        254 => (
+            4,
+            u64::from(u32::from_le_bytes([
+                *bytes.get(*cursor)?,
+                *bytes.get(*cursor + 1)?,
+                *bytes.get(*cursor + 2)?,
+                *bytes.get(*cursor + 3)?,
+            ])),
+        ),
+        255 => (
+            8,
+            u64::from_le_bytes([
+                *bytes.get(*cursor)?,
+                *bytes.get(*cursor + 1)?,
+                *bytes.get(*cursor + 2)?,
+                *bytes.get(*cursor + 3)?,
+                *bytes.get(*cursor + 4)?,
+                *bytes.get(*cursor + 5)?,
+                *bytes.get(*cursor + 6)?,
+                *bytes.get(*cursor + 7)?,
+            ]),
+        ),
+    };
+    *cursor = cursor.checked_add(width)?;
+    usize::try_from(value).ok()
+}
+
+fn read_psbt_map(bytes: &[u8], cursor: &mut usize) -> Option<Vec<Vec<u8>>> {
+    let mut pairs = Vec::new();
+    loop {
+        let start = *cursor;
+        let key_len = read_psbt_compact_size(bytes, cursor)?;
+        if key_len == 0 {
+            return Some(pairs);
+        }
+        let key_end = cursor.checked_add(key_len)?;
+        let key = bytes.get(*cursor..key_end)?;
+        *cursor = key_end;
+        let value_len = read_psbt_compact_size(bytes, cursor)?;
+        let value_end = cursor.checked_add(value_len)?;
+        bytes.get(*cursor..value_end)?;
+        *cursor = value_end;
+        if key.is_empty() {
+            return None;
+        }
+        pairs.push(bytes.get(start..value_end)?.to_vec());
+    }
+}
+
+fn psbt_pair_key_and_type(pair: &[u8]) -> Option<(u8, &[u8])> {
+    let mut cursor = 0;
+    let key_len = read_psbt_compact_size(pair, &mut cursor)?;
+    if key_len == 0 {
+        return None;
+    }
+    let key_end = cursor.checked_add(key_len)?;
+    let key = pair.get(cursor..key_end)?;
+    key.first()
+        .copied()
+        .map(|type_value| (type_value, &key[1..]))
+}
+
+fn sort_core_partial_sig_pairs(pairs: &mut [Vec<u8>]) {
+    let mut partial_sigs = pairs
+        .iter()
+        .filter_map(|pair| {
+            psbt_pair_key_and_type(pair)
+                .filter(|(type_value, _)| *type_value == PSBT_IN_PARTIAL_SIG)
+                .map(|_| pair.clone())
+        })
+        .collect::<Vec<_>>();
+    partial_sigs.sort_by_key(|pair| {
+        let key = psbt_pair_key_and_type(pair)
+            .map(|(_, key)| bitcoin::hashes::hash160::Hash::hash(key).to_byte_array());
+        key.unwrap_or_default()
+    });
+    let mut partial_sig = partial_sigs.into_iter();
+    for pair in pairs {
+        if psbt_pair_key_and_type(pair)
+            .is_some_and(|(type_value, _)| type_value == PSBT_IN_PARTIAL_SIG)
+        {
+            *pair = partial_sig
+                .next()
+                .expect("partial signature count is unchanged");
+        }
+    }
+}
+
+fn core_compatible_psbt_serialization(
+    bytes: &[u8],
+    input_count: usize,
+    output_count: usize,
+) -> Option<Vec<u8>> {
+    if bytes.get(..5)? != b"psbt\xff" {
+        return None;
+    }
+    let mut cursor = 5;
+    let global = read_psbt_map(bytes, &mut cursor)?;
+    let mut serialized = Vec::with_capacity(bytes.len());
+    serialized.extend_from_slice(b"psbt\xff");
+    for pair in global {
+        serialized.extend_from_slice(&pair);
+    }
+    serialized.push(0);
+    for _ in 0..input_count {
+        let mut map = read_psbt_map(bytes, &mut cursor)?;
+        sort_core_partial_sig_pairs(&mut map);
+        for pair in map {
+            serialized.extend_from_slice(&pair);
+        }
+        serialized.push(0);
+    }
+    for _ in 0..output_count {
+        let map = read_psbt_map(bytes, &mut cursor)?;
+        for pair in map {
+            serialized.extend_from_slice(&pair);
+        }
+        serialized.push(0);
+    }
+    (cursor == bytes.len()).then_some(serialized)
 }
 
 fn create_psbt(node: &Arc<Node>, params: &Value) -> Result<Value> {
@@ -8754,10 +8921,71 @@ fn psbt_unknown_json_filtered(
     )
 }
 
+const PSBT_IN_PARTIAL_SIG: u8 = 0x02;
 const PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: u8 = 0x1a;
 const PSBT_IN_MUSIG2_PUB_NONCE: u8 = 0x1b;
 const PSBT_IN_MUSIG2_PARTIAL_SIG: u8 = 0x1c;
 const PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS: u8 = 0x08;
+
+fn validate_psbt_musig2_map(
+    values: &std::collections::BTreeMap<bitcoin::psbt::raw::Key, Vec<u8>>,
+    context: &str,
+) -> Result<()> {
+    let is_input = context == "Input";
+    for (key, value) in values {
+        if (is_input && key.type_value == PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS)
+            || (!is_input && key.type_value == PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS)
+        {
+            if key.key.len() != 33 {
+                bail!("{context} musig2 participants pubkeys aggregate key is not 34 bytes")
+            }
+            if !is_compressed_musig2_pubkey(&key.key) {
+                bail!("{context} musig2 aggregate pubkey is invalid")
+            }
+            if value.len() % 33 != 0 {
+                bail!("{context} musig2 participants pubkeys value size is not a multiple of 33")
+            }
+            if value
+                .chunks_exact(33)
+                .any(|participant| !is_compressed_musig2_pubkey(participant))
+            {
+                bail!("{context} musig2 participant pubkey is invalid")
+            }
+            continue;
+        }
+        if is_input
+            && matches!(
+                key.type_value,
+                PSBT_IN_MUSIG2_PUB_NONCE | PSBT_IN_MUSIG2_PARTIAL_SIG
+            )
+        {
+            if !matches!(key.key.len(), 66 | 98) {
+                bail!(
+                    "{context} musig2 {} key is not expected size of 67 or 99 bytes",
+                    if key.type_value == PSBT_IN_MUSIG2_PUB_NONCE {
+                        "pubnonce"
+                    } else {
+                        "partial sig"
+                    }
+                )
+            }
+            if !is_compressed_musig2_pubkey(&key.key[33..66]) {
+                bail!("musig2 aggregate pubkey is invalid")
+            }
+            if !is_compressed_musig2_pubkey(&key.key[..33]) {
+                bail!("musig2 participant pubkey is invalid")
+            }
+            if key.type_value == PSBT_IN_MUSIG2_PUB_NONCE {
+                if value.len() != 66 {
+                    bail!("Input musig2 pubnonce value is not 66 bytes")
+                }
+            } else if value.len() != 32 {
+                bail!("Size of value was not the stated size")
+            }
+        }
+    }
+    Ok(())
+}
 
 fn is_compressed_musig2_pubkey(bytes: &[u8]) -> bool {
     bytes.len() == 33 && bitcoin::PublicKey::from_slice(bytes).is_ok()
@@ -9232,13 +9460,12 @@ fn combine_psbt(params: &Value) -> Result<Value> {
     let first = first
         .as_str()
         .ok_or_else(|| anyhow!("PSBT values must be base64 strings"))?;
-    let mut combined =
-        Psbt::deserialize(&base64::engine::general_purpose::STANDARD.decode(first)?)?;
+    let mut combined = deserialize_psbt(first)?;
     for value in iter {
         let encoded = value
             .as_str()
             .ok_or_else(|| anyhow!("PSBT values must be base64 strings"))?;
-        let other = Psbt::deserialize(&base64::engine::general_purpose::STANDARD.decode(encoded)?)?;
+        let other = deserialize_psbt(encoded)?;
         combined.combine(other)?;
     }
     Ok(json!(encode_psbt(&combined)))
@@ -9258,9 +9485,7 @@ fn join_psbts(params: &Value) -> Result<Value> {
             let encoded = value
                 .as_str()
                 .ok_or_else(|| anyhow!("PSBT values must be base64 strings"))?;
-            Ok(Psbt::deserialize(
-                &base64::engine::general_purpose::STANDARD.decode(encoded)?,
-            )?)
+            deserialize_psbt(encoded)
         })
         .collect::<Result<Vec<_>>>()?;
     let version = psbts
@@ -27286,6 +27511,66 @@ mod tests {
     }
 
     #[test]
+    fn psbt_partial_signature_serialization_matches_core_keyid_order() {
+        let secp = Secp256k1::new();
+        let first_secret = bitcoin::secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
+        let first_public: bitcoin::PublicKey =
+            "03089dc10c7ac6db54f91329af617333db388cead0c231f723379d1b99030b02dc"
+                .parse()
+                .unwrap();
+        let second_public: bitcoin::PublicKey =
+            "023add904f3d6dcf59ddb906b0dee23529b7ffb9ed50e5e86151926860221f0e73"
+                .parse()
+                .unwrap();
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(unsigned).unwrap();
+        let message = Message::from_digest([1; 32]);
+        let signature = secp.sign_ecdsa(&message, &first_secret);
+        for public in [first_public, second_public] {
+            psbt.inputs[0].partial_sigs.insert(
+                public,
+                EcdsaSignature {
+                    signature,
+                    sighash_type: EcdsaSighashType::All,
+                },
+            );
+        }
+        let serialized = base64::engine::general_purpose::STANDARD
+            .decode(encode_psbt(&psbt))
+            .unwrap();
+        let mut cursor = 5;
+        read_psbt_map(&serialized, &mut cursor).unwrap();
+        let input_pairs = read_psbt_map(&serialized, &mut cursor).unwrap();
+        let partial_keys = input_pairs
+            .iter()
+            .filter_map(|pair| {
+                let (type_value, key) = psbt_pair_key_and_type(pair)?;
+                (type_value == PSBT_IN_PARTIAL_SIG).then(|| key.to_vec())
+            })
+            .collect::<Vec<_>>();
+        let mut expected = vec![first_public.to_bytes(), second_public.to_bytes()];
+        expected.sort_by_key(|key| bitcoin::hashes::hash160::Hash::hash(key).to_byte_array());
+        assert_eq!(partial_keys, expected);
+        assert_ne!(
+            partial_keys,
+            vec![second_public.to_bytes(), first_public.to_bytes()]
+        );
+    }
+
+    #[test]
     fn psbt_rpcs_cover_wallet_free_lifecycle() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(Config {
@@ -27526,6 +27811,22 @@ mod tests {
         );
         assert!(decoded_musig["outputs"][0].get("unknown").is_none());
 
+        let mut invalid_musig = musig_psbt.clone();
+        invalid_musig.inputs[0].unknown.clear();
+        invalid_musig.inputs[0].unknown.insert(
+            bitcoin::psbt::raw::Key {
+                type_value: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS,
+                key: vec![0; 32],
+            },
+            Vec::new(),
+        );
+        let invalid_musig_error = parse_psbt(&json!([encode_psbt(&invalid_musig)]), 0).unwrap_err();
+        assert!(
+            format!("{invalid_musig_error:#}")
+                .contains("Input musig2 participants pubkeys aggregate key is not 34 bytes"),
+            "{invalid_musig_error:#}"
+        );
+
         assert_eq!(
             combine_psbt(&json!([[created.clone(), created]])).unwrap(),
             json!(encode_psbt(&created_psbt))
@@ -27604,10 +27905,7 @@ mod tests {
         let mut mismatched_utxo = updated_psbt.clone();
         mismatched_utxo.unsigned_tx.input[0].previous_output =
             OutPoint::new(Txid::from_byte_array([0xab; 32]), 0);
-        let mismatched_analysis = analyze_psbt(&json!([encode_psbt(&mismatched_utxo)])).unwrap();
-        assert_eq!(mismatched_analysis["next"], "updater");
-        assert_eq!(mismatched_analysis["inputs"][0]["has_utxo"], false);
-        assert!(mismatched_analysis.get("fee").is_none());
+        assert!(analyze_psbt(&json!([encode_psbt(&mismatched_utxo)])).is_err());
 
         let secret = bitcoin::secp256k1::SecretKey::from_slice(&[1; 32]).unwrap();
         let private = bitcoin::PrivateKey::new(secret, Network::Regtest);

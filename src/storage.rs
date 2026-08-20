@@ -188,10 +188,40 @@ fn stored_utxo_cache_bytes(entry: &StoredUtxo) -> usize {
     64usize.saturating_add(entry.output.script_pubkey.len())
 }
 
-#[derive(Clone, Copy, Debug)]
-struct HistoryLocation {
-    offset: u64,
-    length: u32,
+/// Compact in-memory pointer into the append-only Electrum history log.
+///
+/// History records are capped at 4 MiB.  Storing `length - 1` in 22 bits
+/// represents that full range, leaving 42 bits for a history log up to 4 TiB.
+/// The durable history index deliberately keeps its existing u64 offset and
+/// u32 length fields, so this optimization only changes resident memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HistoryLocation(u64);
+
+impl HistoryLocation {
+    const LENGTH_BITS: u32 = 22;
+    const LENGTH_MASK: u64 = (1 << Self::LENGTH_BITS) - 1;
+    const MAX_LENGTH: u32 = (Self::LENGTH_MASK + 1) as u32;
+    const MAX_OFFSET: u64 = (1 << (u64::BITS - Self::LENGTH_BITS)) - 1;
+
+    fn new(offset: u64, length: u32) -> Result<Self> {
+        if length == 0 || length > Self::MAX_LENGTH {
+            bail!("Electrum history record length does not fit compact location: {length}");
+        }
+        if offset > Self::MAX_OFFSET {
+            bail!("Electrum history record offset does not fit compact location: {offset}");
+        }
+        Ok(Self((offset << Self::LENGTH_BITS) | u64::from(length - 1)))
+    }
+
+    #[inline]
+    fn offset(self) -> u64 {
+        self.0 >> Self::LENGTH_BITS
+    }
+
+    #[inline]
+    fn length(self) -> u32 {
+        ((self.0 & Self::LENGTH_MASK) + 1) as u32
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2067,7 +2097,7 @@ impl ElectrumHistoryStore {
             .iter()
             .map(|(script_hash, location)| (*script_hash, *location))
             .collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(_, location)| location.offset);
+        locations.sort_unstable_by_key(|(_, location)| location.offset());
         locations
             .into_iter()
             .map(|(script_hash, location)| {
@@ -2164,7 +2194,7 @@ impl ElectrumHistoryStore {
             .iter()
             .map(|(script_hash, location)| (*script_hash, *location))
             .collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(_, location)| location.offset);
+        locations.sort_unstable_by_key(|(_, location)| location.offset());
         let compact_data_path = self.path.with_extension("dat.compact");
         let compact_index_path = self.index_path.with_extension("index.compact");
         for path in [&compact_data_path, &compact_index_path] {
@@ -2292,7 +2322,7 @@ impl ElectrumHistoryStore {
             + self
                 .index
                 .values()
-                .map(|location| 4u64.saturating_add(u64::from(location.length)))
+                .map(|location| 4u64.saturating_add(u64::from(location.length())))
                 .sum::<u64>()
             + if self.index.is_empty() { 0 } else { 13 };
         let stale_bytes = data_len.saturating_sub(live_bytes);
@@ -2391,15 +2421,15 @@ fn append_history_data_record(file: &mut File, body: &[u8]) -> Result<HistoryLoc
         u32::try_from(encoded_body.len()).context("Electrum history record is too large")?;
     file.write_all(&length.to_le_bytes())?;
     file.write_all(&encoded_body)?;
-    Ok(HistoryLocation { offset, length })
+    HistoryLocation::new(offset, length)
 }
 
 fn read_history_data_record(file: &File, location: HistoryLocation) -> Result<Vec<u8>> {
     read_storage_record(
         file,
         Record {
-            offset: location.offset,
-            length: location.length,
+            offset: location.offset(),
+            length: location.length(),
         },
         XorKey::default(),
         MAX_STORED_ELECTRUM_HISTORY_SIZE,
@@ -2517,10 +2547,7 @@ fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocati
                 }
                 pending.push(PendingHistoryOperation {
                     script_hash,
-                    location: HistoryLocation {
-                        offset: record_start,
-                        length,
-                    },
+                    location: HistoryLocation::new(record_start, length)?,
                 });
                 max_batch = max_batch.max(batch_id);
             }
@@ -2621,12 +2648,12 @@ fn load_history_index(
                     }
                     pending_batch = Some(batch_id);
                 }
+                let Ok(location) = HistoryLocation::new(offset, value_length) else {
+                    return Ok(None);
+                };
                 pending.push(PendingHistoryOperation {
                     script_hash,
-                    location: HistoryLocation {
-                        offset,
-                        length: value_length,
-                    },
+                    location,
                 });
                 max_batch = max_batch.max(batch_id);
             }
@@ -2736,8 +2763,8 @@ fn append_history_index_operation(
     let mut body = Vec::with_capacity(64);
     body.push(HISTORY_PUT);
     body.extend_from_slice(&batch_id.to_le_bytes());
-    body.extend_from_slice(&operation.location.offset.to_le_bytes());
-    body.extend_from_slice(&operation.location.length.to_le_bytes());
+    body.extend_from_slice(&operation.location.offset().to_le_bytes());
+    body.extend_from_slice(&operation.location.length().to_le_bytes());
     body.extend_from_slice(&operation.script_hash);
     let length = u32::try_from(body.len()).context("Electrum history index record too large")?;
     file.write_all(&length.to_le_bytes())?;
@@ -4459,6 +4486,19 @@ mod tests {
         assert_eq!(location.length(), 98_765);
         assert!(UtxoLocation::new(UtxoLocation::MAX_OFFSET + 1, 1).is_err());
         assert!(UtxoLocation::new(0, (UtxoLocation::LENGTH_MASK + 1) as u32).is_err());
+    }
+
+    #[test]
+    fn history_locations_use_one_word_without_changing_disk_coordinates() {
+        assert_eq!(
+            std::mem::size_of::<HistoryLocation>(),
+            std::mem::size_of::<u64>()
+        );
+        let location = HistoryLocation::new(123_456_789, HistoryLocation::MAX_LENGTH).unwrap();
+        assert_eq!(location.offset(), 123_456_789);
+        assert_eq!(location.length(), HistoryLocation::MAX_LENGTH);
+        assert!(HistoryLocation::new(HistoryLocation::MAX_OFFSET + 1, 1).is_err());
+        assert!(HistoryLocation::new(0, HistoryLocation::MAX_LENGTH + 1).is_err());
     }
 
     #[test]

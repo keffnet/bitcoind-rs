@@ -5336,11 +5336,12 @@ impl Node {
                 .and_then(|hash| chain.block_height_by_hash(&hash))
                 .unwrap_or_else(|| chain.height());
             let segwit_height = chain.deployment_parameters().buried.segwit;
-            let headers = chain
-                .headers_to_hash(&target_hash)
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+            let Some(headers) = chain.headers_to_hash_cow(&target_hash) else {
+                return BlockDownloadSchedule {
+                    requests: Vec::new(),
+                    staller: None,
+                };
+            };
             let last_common_height = headers
                 .iter()
                 .enumerate()
@@ -5353,7 +5354,7 @@ impl Node {
                 .unwrap_or_default();
             let window_end_height = last_common_height.saturating_add(BLOCK_DOWNLOAD_WINDOW);
             let candidates = headers
-                .into_iter()
+                .iter()
                 .enumerate()
                 .skip(1)
                 .map(|(height, header)| {

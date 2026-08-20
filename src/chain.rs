@@ -1,5 +1,6 @@
 //! Active-chain state, UTXO application, and Electrum indexing.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -3859,7 +3860,10 @@ impl ChainState {
         self.block_index.get(hash).map(|node| node.header)
     }
 
-    pub fn headers_to_hash(&self, hash: &BlockHash) -> Option<Vec<bitcoin::block::Header>> {
+    pub(crate) fn headers_to_hash_cow(
+        &self,
+        hash: &BlockHash,
+    ) -> Option<Cow<'_, [bitcoin::block::Header]>> {
         let node = self.block_index.get(hash)?;
         if self
             .active_chain
@@ -3867,7 +3871,7 @@ impl ChainState {
             .is_some_and(|active_hash| active_hash == hash)
             && let Some(headers) = self.headers.get(..=node.height as usize)
         {
-            return Some(headers.to_vec());
+            return Some(Cow::Borrowed(headers));
         }
         let mut headers = Vec::new();
         let mut cursor = *hash;
@@ -3880,7 +3884,12 @@ impl ChainState {
             cursor = node.header.prev_blockhash;
         }
         headers.reverse();
-        Some(headers)
+        Some(Cow::Owned(headers))
+    }
+
+    pub fn headers_to_hash(&self, hash: &BlockHash) -> Option<Vec<bitcoin::block::Header>> {
+        self.headers_to_hash_cow(hash)
+            .map(|headers| headers.into_owned())
     }
 
     pub fn block_height_by_hash(&self, hash: &BlockHash) -> Option<u32> {
@@ -7280,7 +7289,7 @@ impl ChainState {
         if deployment.start_time == validation::Bip9Deployment::ALWAYS_ACTIVE_TIME {
             return Some(0);
         }
-        self.headers_to_hash(&parent_hash).and_then(|headers| {
+        self.headers_to_hash_cow(&parent_hash).and_then(|headers| {
             validation::reduced_data_activation_height(&headers, deployment, height)
         })
     }
@@ -9232,7 +9241,7 @@ impl ChainState {
             });
         if mandatory_version_bits_window {
             let headers = self
-                .headers_to_hash(&parent_hash)
+                .headers_to_hash_cow(&parent_hash)
                 .context("header parent has no contiguous ancestor chain")?;
             validation::validate_mandatory_version_bits_with_params(
                 &headers,
@@ -11126,6 +11135,17 @@ mod tests {
             genesis_block(Network::Regtest).block_hash()
         );
         assert_eq!(state.utxo_stats(), (0, 0, 0));
+    }
+
+    #[test]
+    fn active_header_lookup_borrows_the_active_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+
+        assert!(matches!(
+            state.headers_to_hash_cow(&state.best_hash()),
+            Some(Cow::Borrowed(_))
+        ));
     }
 
     #[test]

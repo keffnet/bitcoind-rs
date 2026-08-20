@@ -2810,7 +2810,19 @@ fn spawn_outbound_loop(
             return;
         }
     }
-    let transport_v2 = transport_v2.or_else(|| (!node.config.v2_transport).then_some(false));
+    let automatic = !manual && !addconnection;
+    let peer_services = automatic.then(|| {
+        node.known_network_addresses()
+            .into_iter()
+            .find(|entry| entry.endpoint == endpoint)
+            .map(|entry| entry.services)
+    });
+    let transport_v2 = outbound_transport_v2(
+        transport_v2,
+        node.config.v2_transport,
+        automatic,
+        peer_services.flatten(),
+    );
     let peer_id = outbound.next_peer_id.fetch_add(1, Ordering::Relaxed);
     let OutboundContext {
         slots,
@@ -3103,6 +3115,23 @@ fn log_outbound_connection_attempt(
     debug!("trying {transport} connection ({connection_type}) to {endpoint}, lastseen=0.0hrs");
 }
 
+fn outbound_transport_v2(
+    requested: Option<bool>,
+    v2_transport_enabled: bool,
+    automatic: bool,
+    peer_services: Option<u64>,
+) -> Option<bool> {
+    requested.or_else(|| {
+        if !v2_transport_enabled {
+            Some(false)
+        } else if automatic {
+            Some(peer_services.is_some_and(|services| services & wire::NODE_P2P_V2 != 0))
+        } else {
+            None
+        }
+    })
+}
+
 fn select_discovery_endpoints(
     node: &Arc<Node>,
     limit: usize,
@@ -3185,6 +3214,46 @@ fn next_automatic_connection_type(
         Some("block-relay-only")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod outbound_transport_tests {
+    use super::outbound_transport_v2;
+    use crate::wire;
+
+    #[test]
+    fn automatic_connections_follow_the_peer_v2_service() {
+        assert_eq!(
+            outbound_transport_v2(None, true, true, Some(wire::NODE_NETWORK)),
+            Some(false)
+        );
+        assert_eq!(
+            outbound_transport_v2(
+                None,
+                true,
+                true,
+                Some(wire::NODE_NETWORK | wire::NODE_P2P_V2)
+            ),
+            Some(true)
+        );
+        assert_eq!(outbound_transport_v2(None, true, true, None), Some(false));
+    }
+
+    #[test]
+    fn explicit_transport_and_disabled_v2_override_peer_capabilities() {
+        assert_eq!(
+            outbound_transport_v2(Some(false), true, false, Some(wire::NODE_P2P_V2)),
+            Some(false)
+        );
+        assert_eq!(
+            outbound_transport_v2(Some(true), false, true, Some(wire::NODE_NETWORK)),
+            Some(true)
+        );
+        assert_eq!(
+            outbound_transport_v2(None, false, false, Some(wire::NODE_P2P_V2)),
+            Some(false)
+        );
     }
 }
 
@@ -4088,6 +4157,11 @@ async fn serve_peer(
         Ok(transport) => transport,
         Err(error) if options.outbound && transport_v2_possible => {
             let error_text = error.to_string();
+            // Core retries the same outbound attempt with v1 after a v2
+            // handshake failure and emits the normal connection-attempt
+            // diagnostic for that retry. Keep seed-node/address-fetch
+            // logs and operator diagnostics aligned with that fallback.
+            log_outbound_connection_attempt(&endpoint, Some(false), options.connection_type);
             if node.config.logging.log_ips {
                 debug!(
                     "retrying with v1 transport protocol for peer={peer_id} endpoint={endpoint} error={error_text}"

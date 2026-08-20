@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -14,7 +14,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bincode::{deserialize as deserialize_binary, serialize as serialize_binary};
 use bitcoin::bip158::{BlockFilter, FilterHeader};
 use bitcoin::blockdata::constants::genesis_block;
-use bitcoin::consensus::encode::{Decodable, VarInt, serialize};
+use bitcoin::consensus::encode::{Decodable, VarInt, deserialize, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::pow::{CompactTarget, Target, Work};
 use bitcoin::{
@@ -61,10 +61,13 @@ const CHAIN_SNAPSHOT_MAGIC: &[u8] = b"bitcoind-rs-snapshot-v1\0";
 const CHAINSTATE_DELTA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-delta-v1\0";
 const CHAIN_TX_COUNTS_MAGIC: &[u8] = b"bitcoind-rs-tx-counts-v1\0";
 const CHAIN_ACTIVE_TIP_MAGIC: &[u8] = b"bitcoind-rs-active-tip-v1\0";
+const CHAIN_HEADERS_JOURNAL_MAGIC: &[u8] = b"bitcoind-rs-headers-journal-v1\0";
 const ASSUMEUTXO_STATE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-v1\0";
 const ASSUMEUTXO_BASE_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-base-v1\0";
 const ASSUMEUTXO_CHECKPOINT_MAGIC: &[u8] = b"bitcoind-rs-assumeutxo-checkpoint-v1\0";
 const ASSUMEUTXO_CHECKPOINT_INTERVAL: u32 = 256;
+const HEADER_RECORD_SIZE: usize = 80 + 4;
+const HEADER_JOURNAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Replace a small metadata file with a fully durable version.
 ///
@@ -838,6 +841,155 @@ fn deserialize_internal<T: DeserializeOwned>(bytes: &[u8], magic: &[u8]) -> Resu
     deserialize_binary(&bytes[magic.len()..]).context("decoding internal chainstate")
 }
 
+fn header_journal_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("chainstate.headers")
+}
+
+fn header_record_checksum(header: &[u8]) -> [u8; 4] {
+    Sha256::digest(header)[..4]
+        .try_into()
+        .expect("four-byte header checksum slice")
+}
+
+/// Append headers in fixed-size, checksummed records.
+///
+/// The full chain metadata remains the recovery checkpoint.  This journal is
+/// the durable delta between checkpoints, so a headers-first sync does not
+/// rewrite every known header after each peer response.  A final short record
+/// is treated as a torn tail and discarded before appending new data.
+fn append_header_journal(data_dir: &Path, headers: &[bitcoin::block::Header]) -> Result<u64> {
+    if headers.is_empty() {
+        return Ok(0);
+    }
+    let path = header_journal_path(data_dir);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening header journal {}", path.display()))?;
+    let length = file.metadata()?.len();
+    if length == 0 {
+        file.write_all(CHAIN_HEADERS_JOURNAL_MAGIC)?;
+    } else {
+        if length < CHAIN_HEADERS_JOURNAL_MAGIC.len() as u64 {
+            bail!(
+                "header journal {} has a truncated format marker",
+                path.display()
+            );
+        }
+        let mut marker = vec![0u8; CHAIN_HEADERS_JOURNAL_MAGIC.len()];
+        file.seek(SeekFrom::Start(0))?;
+        file.read_exact(&mut marker)?;
+        if marker != CHAIN_HEADERS_JOURNAL_MAGIC {
+            bail!(
+                "header journal {} has an invalid format marker",
+                path.display()
+            );
+        }
+        let payload_length = length - CHAIN_HEADERS_JOURNAL_MAGIC.len() as u64;
+        let complete_payload_length = payload_length
+            - payload_length % u64::try_from(HEADER_RECORD_SIZE).expect("record size fits u64");
+        if complete_payload_length != payload_length {
+            file.set_len(CHAIN_HEADERS_JOURNAL_MAGIC.len() as u64 + complete_payload_length)?;
+        }
+    }
+
+    let mut encoded = Vec::with_capacity(headers.len() * HEADER_RECORD_SIZE);
+    for header in headers {
+        let bytes = serialize(header);
+        if bytes.len() != HEADER_RECORD_SIZE - 4 {
+            bail!(
+                "serialized block header has an unexpected size: {}",
+                bytes.len()
+            );
+        }
+        encoded.extend_from_slice(&bytes);
+        encoded.extend_from_slice(&header_record_checksum(&bytes));
+    }
+    file.write_all(&encoded)?;
+    file.sync_all()?;
+    drop(file);
+    sync_metadata_directory(&path)?;
+    Ok(fs::metadata(path)?.len())
+}
+
+/// Load the header journal after the last full metadata checkpoint.
+///
+/// Duplicate records are harmless and expected if a process stopped after
+/// checkpointing metadata but before deleting the journal.  Invalid or
+/// incomplete trailing records are ignored, which makes power-loss recovery
+/// safe without requiring a destructive repair during startup.
+fn load_header_journal(
+    data_dir: &Path,
+    persisted_headers: &mut Vec<bitcoin::block::Header>,
+) -> Result<()> {
+    let path = header_journal_path(data_dir);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading header journal {}", path.display()));
+        }
+    };
+    if !bytes.starts_with(CHAIN_HEADERS_JOURNAL_MAGIC) {
+        debug!(
+            path = %path.display(),
+            "ignoring header journal with an invalid format marker"
+        );
+        return Ok(());
+    }
+
+    let mut known = persisted_headers
+        .iter()
+        .map(bitcoin::block::Header::block_hash)
+        .collect::<HashSet<_>>();
+    let payload = &bytes[CHAIN_HEADERS_JOURNAL_MAGIC.len()..];
+    let complete_length = payload.len() - payload.len() % HEADER_RECORD_SIZE;
+    for record in payload[..complete_length].chunks_exact(HEADER_RECORD_SIZE) {
+        let header_bytes = &record[..HEADER_RECORD_SIZE - 4];
+        let stored_checksum: [u8; 4] = record[HEADER_RECORD_SIZE - 4..]
+            .try_into()
+            .expect("header journal checksum has four bytes");
+        if header_record_checksum(header_bytes) != stored_checksum {
+            debug!(
+                path = %path.display(),
+                "ignoring invalid header journal tail"
+            );
+            break;
+        }
+        let Ok(header) = deserialize::<bitcoin::block::Header>(header_bytes) else {
+            debug!(
+                path = %path.display(),
+                "ignoring undecodable header journal tail"
+            );
+            break;
+        };
+        if known.insert(header.block_hash()) {
+            persisted_headers.push(header);
+        }
+    }
+    if complete_length != payload.len() {
+        debug!(
+            path = %path.display(),
+            "ignoring incomplete header journal tail"
+        );
+    }
+    Ok(())
+}
+
+fn clear_header_journal(data_dir: &Path) -> Result<()> {
+    let path = header_journal_path(data_dir);
+    match fs::remove_file(&path) {
+        Ok(()) => sync_metadata_directory(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("removing header journal {}", path.display()))
+        }
+    }
+}
+
 fn deserialize_chain_snapshot(bytes: &[u8]) -> Result<ChainSnapshot> {
     match deserialize_internal::<ChainSnapshot>(bytes, CHAIN_SNAPSHOT_MAGIC) {
         Ok(snapshot) => Ok(snapshot),
@@ -1502,7 +1654,7 @@ impl ChainState {
         }
         let (
             mut active_chain,
-            persisted_headers,
+            mut persisted_headers,
             invalid_blocks,
             prune_height,
             mut prune_locks,
@@ -1590,6 +1742,7 @@ impl ChainState {
                 None,
             )
         };
+        load_header_journal(&data_dir, &mut persisted_headers)?;
         let checkpoint_chain_len = active_chain.len();
         if !rebuild_chainstate {
             active_chain =
@@ -4319,9 +4472,12 @@ impl ChainState {
     /// corresponding full blocks yet. This is the headers-first sync boundary
     /// used by the peer manager.
     pub fn accept_headers(&mut self, headers: &[bitcoin::block::Header]) -> Result<Vec<BlockHash>> {
-        let (hashes, inserted) = self.accept_headers_internal(headers)?;
-        if inserted {
-            self.persist_metadata()?;
+        let (hashes, inserted_headers) = self.accept_headers_internal(headers)?;
+        if !inserted_headers.is_empty() {
+            let journal_size = append_header_journal(&self.data_dir, &inserted_headers)?;
+            if journal_size >= HEADER_JOURNAL_CHECKPOINT_BYTES {
+                self.persist_metadata()?;
+            }
         }
         Ok(hashes)
     }
@@ -4329,9 +4485,9 @@ impl ChainState {
     fn accept_headers_internal(
         &mut self,
         headers: &[bitcoin::block::Header],
-    ) -> Result<(Vec<BlockHash>, bool)> {
+    ) -> Result<(Vec<BlockHash>, Vec<bitcoin::block::Header>)> {
         let mut hashes = Vec::with_capacity(headers.len());
-        let mut inserted = false;
+        let mut inserted_headers = Vec::new();
         for header in headers {
             let hash = header.block_hash();
             if let Some(existing) = self.block_index.get(&hash) {
@@ -4380,10 +4536,10 @@ impl ChainState {
                 },
             );
             self.assign_header_sequence_id(hash);
-            inserted = true;
+            inserted_headers.push(*header);
             hashes.push(hash);
         }
-        Ok((hashes, inserted))
+        Ok((hashes, inserted_headers))
     }
 
     pub fn block(&mut self, hash: &BlockHash) -> Result<Option<Block>> {
@@ -8948,7 +9104,8 @@ impl ChainState {
         let temp = self.data_dir.join("chainstate.bin.tmp");
         persist_atomic_file(&path, &temp, &bytes)?;
         self.persist_tx_counts()?;
-        self.persist_active_chain_tip()
+        self.persist_active_chain_tip()?;
+        clear_header_journal(&self.data_dir)
     }
 
     fn mark_active_chain_segwit_validated(&mut self) {
@@ -9494,7 +9651,7 @@ impl ChainState {
                         );
                         self.assign_header_sequence_id(hash);
                     } else {
-                        self.accept_headers_internal(&[header])?;
+                        let _ = self.accept_headers_internal(&[header])?;
                     }
                 } else {
                     remaining.push(header);
@@ -12936,6 +13093,7 @@ mod tests {
         assert_eq!(hashes, vec![parent.block_hash(), child.block_hash()]);
         assert_eq!(state.block_height_by_hash(&child.block_hash()), Some(2));
         assert_eq!(state.blocks_ahead_of_tip(), Some(2));
+        assert!(directory.path().join("chainstate.headers").is_file());
         drop(state);
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(state.height(), 0);
@@ -12952,6 +13110,30 @@ mod tests {
     }
 
     #[test]
+    fn header_journal_recovery_ignores_a_torn_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let parent = mine_block(&state, 1);
+        let child = mine_block_from_header(&parent.header, 2, 11);
+        state
+            .accept_headers(&[parent.header, child.header])
+            .unwrap();
+        let journal = directory.path().join("chainstate.headers");
+        let mut file = fs::OpenOptions::new().append(true).open(&journal).unwrap();
+        file.write_all(&[0xaa, 0xbb, 0xcc]).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_header_tip().hash, child.block_hash());
+        assert!(
+            !journal.exists(),
+            "startup should checkpoint and clear the journal"
+        );
+    }
+
+    #[test]
     fn flush_persists_header_tip_for_clean_shutdown() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
@@ -12963,7 +13145,7 @@ mod tests {
         let (_, inserted) = state
             .accept_headers_internal(&[parent.header, child.header])
             .unwrap();
-        assert!(inserted);
+        assert_eq!(inserted.len(), 2);
         state.flush().unwrap();
         drop(state);
 

@@ -2578,7 +2578,11 @@ async fn run_i2p_listener(
 ) -> Result<()> {
     let mut advertised = false;
     loop {
-        if let Ok(endpoint) = i2p_sam.local_endpoint().await {
+        let local_endpoint = tokio::select! {
+            result = i2p_sam.local_endpoint() => result,
+            _ = node.wait_for_shutdown() => return Ok(()),
+        };
+        if let Ok(endpoint) = local_endpoint {
             if !advertised {
                 node.add_listen_network_address(endpoint);
                 advertised = true;
@@ -2587,11 +2591,18 @@ async fn run_i2p_listener(
             // SAM startup is independent of the Bitcoin listener. Retry in
             // the background so a temporarily unavailable I2P router does
             // not prevent clearnet operation from starting.
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = node.wait_for_shutdown() => return Ok(()),
+            }
             continue;
         }
 
-        match i2p_sam.accept().await {
+        let accepted = tokio::select! {
+            result = i2p_sam.accept() => result,
+            _ = node.wait_for_shutdown() => return Ok(()),
+        };
+        match accepted {
             Ok((stream, endpoint)) => {
                 if !node.network_active() {
                     continue;
@@ -2641,7 +2652,10 @@ async fn run_i2p_listener(
                 debug!(%error, "I2P SAM accept failed; recreating session");
                 i2p_sam.reset().await;
                 advertised = false;
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                    _ = node.wait_for_shutdown() => return Ok(()),
+                }
             }
         }
     }
@@ -2663,7 +2677,10 @@ async fn acquire_inbound_slot(
         if let Ok(permit) = slots.clone().try_acquire_owned() {
             return Some((permit, true));
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            _ = node.wait_for_shutdown() => return None,
+        }
     }
     None
 }
@@ -2814,6 +2831,16 @@ fn complete_one_try(completion: &mut Option<oneshot::Sender<()>>) {
     }
 }
 
+async fn acquire_slot_or_shutdown(
+    node: &Node,
+    slots: Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, ()> {
+    tokio::select! {
+        result = slots.acquire_owned() => result.map_err(|_| ()),
+        _ = node.wait_for_shutdown() => Err(()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_outbound_loop(
     node: Arc<Node>,
@@ -2905,17 +2932,21 @@ fn spawn_outbound_loop(
         // slot accounting.
         let _permit = if addconnection {
             match connection_type {
-                "outbound-full" => Some(addconnection_full_slots.acquire_owned().await),
-                "block-relay-only" => Some(addconnection_block_relay_slots.acquire_owned().await),
-                "feeler" => Some(addconnection_feeler_slots.acquire_owned().await),
-                _ => Some(slots.acquire_owned().await),
+                "outbound-full" => {
+                    Some(acquire_slot_or_shutdown(&node, addconnection_full_slots).await)
+                }
+                "block-relay-only" => {
+                    Some(acquire_slot_or_shutdown(&node, addconnection_block_relay_slots).await)
+                }
+                "feeler" => Some(acquire_slot_or_shutdown(&node, addconnection_feeler_slots).await),
+                _ => Some(acquire_slot_or_shutdown(&node, slots).await),
             }
         } else if manual && persistent {
-            Some(manual_slots.acquire_owned().await)
+            Some(acquire_slot_or_shutdown(&node, manual_slots).await)
         } else if manual {
             None
         } else {
-            Some(slots.acquire_owned().await)
+            Some(acquire_slot_or_shutdown(&node, slots).await)
         };
         let _permit = match _permit {
             Some(Ok(permit)) => Some(permit),
@@ -2977,18 +3008,23 @@ fn spawn_outbound_loop(
                 continue;
             }
             log_outbound_connection_attempt(&endpoint, transport_v2, connection_type);
-            match connect_peer_endpoint_with_options_and_dns_with_i2p(
-                &endpoint,
-                node.config.proxy_for_endpoint(&endpoint),
-                node.onion_proxy(),
-                false,
-                node.config.proxy_randomize,
-                node.config.dns_lookup,
-                Duration::from_millis(node.config.connect_timeout_ms),
-                node.i2p_sam.clone(),
-            )
-            .await
-            {
+            let connection = tokio::select! {
+                result = connect_peer_endpoint_with_options_and_dns_with_i2p(
+                    &endpoint,
+                    node.config.proxy_for_endpoint(&endpoint),
+                    node.onion_proxy(),
+                    false,
+                    node.config.proxy_randomize,
+                    node.config.dns_lookup,
+                    Duration::from_millis(node.config.connect_timeout_ms),
+                    node.i2p_sam.clone(),
+                ) => result,
+                _ = node.wait_for_shutdown() => {
+                    complete_one_try(&mut completion);
+                    return;
+                }
+            };
+            match connection {
                 Ok(stream) => {
                     peer_log!(node, info, endpoint, "connected to configured peer");
                     complete_one_try(&mut completion);
@@ -3086,24 +3122,27 @@ fn spawn_private_broadcast_loop(
             endpoint: endpoint.clone(),
             attempts: outbound_attempts,
         };
-        let Ok(_permit) = private_slots.acquire_owned().await else {
+        let Ok(_permit) = acquire_slot_or_shutdown(&node, private_slots).await else {
             return;
         };
         if !node.config.allows_address(address)
             || !node.network_active()
+            || node.shutdown_requested()
             || node.is_banned_for_endpoint(&endpoint)
         {
             return;
         }
         log_outbound_connection_attempt(&endpoint, Some(false), "private-broadcast");
-        match connect_peer_endpoint_for_private_broadcast(
-            &endpoint,
-            node.private_broadcast_proxy(&endpoint),
-            node.config.proxy_randomize,
-            Duration::from_millis(node.config.connect_timeout_ms),
-        )
-        .await
-        {
+        let connection = tokio::select! {
+            result = connect_peer_endpoint_for_private_broadcast(
+                &endpoint,
+                node.private_broadcast_proxy(&endpoint),
+                node.config.proxy_randomize,
+                Duration::from_millis(node.config.connect_timeout_ms),
+            ) => result,
+            _ = node.wait_for_shutdown() => return,
+        };
+        match connection {
             Ok(stream) => {
                 peer_log!(node, info, address, "connected to private-broadcast peer");
                 if let Err(error) = serve_peer(
@@ -10357,6 +10396,29 @@ mod tests {
             persist_mempool_v1: false,
             zmq: crate::config::ZmqConfig::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn outbound_slot_wait_is_interrupted_by_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(private_broadcast_test_config(
+            directory.path(),
+            false,
+            Vec::new(),
+        ))
+        .unwrap();
+        let slots = Arc::new(Semaphore::new(0));
+        let waiter = acquire_slot_or_shutdown(&node, slots);
+        tokio::pin!(waiter);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+        node.request_shutdown();
+
+        assert!(waiter.await.is_err());
     }
 
     fn mine_private_broadcast_block(previous: &Header, height: u32, now: u32) -> Block {

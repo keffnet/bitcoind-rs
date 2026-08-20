@@ -836,17 +836,17 @@ impl BlockStore {
             .copied()
             .filter(|hash| retained_blocks.contains(hash))
             .collect::<Vec<_>>();
-        let mut block_records = Vec::with_capacity(block_hashes.len());
-        for hash in block_hashes {
-            let block = self
-                .get(&hash)?
-                .with_context(|| format!("block {hash} disappeared during pruning"))?;
-            block_records.push((hash, serialize(&block)));
-        }
+        let block_path = self.path.clone();
+        let xor_key = self.xor_key;
         let (file, index, data_len) = rewrite_record_file(
-            &self.path,
-            &block_records,
-            self.xor_key,
+            &block_path,
+            block_hashes.into_iter().map(|hash| {
+                let block = self
+                    .get(&hash)?
+                    .with_context(|| format!("block {hash} disappeared during pruning"))?;
+                Ok((hash, serialize(&block)))
+            }),
+            xor_key,
             MAX_STORED_BLOCK_SIZE,
         )?;
         self.file = file;
@@ -866,17 +866,15 @@ impl BlockStore {
             .copied()
             .filter(|hash| retained_undo.contains(hash))
             .collect::<Vec<_>>();
-        let mut undo_records = Vec::with_capacity(undo_hashes.len());
-        for hash in undo_hashes {
-            let undo = self
-                .get_undo(&hash)?
-                .with_context(|| format!("undo for block {hash} disappeared during pruning"))?;
-            undo_records.push((hash, encode_undo_record(hash, &undo)?));
-        }
         let (undo_file, undo_index, undo_data_len) = rewrite_record_file(
             &undo_path,
-            &undo_records,
-            self.xor_key,
+            undo_hashes.into_iter().map(|hash| {
+                let undo = self
+                    .get_undo(&hash)?
+                    .with_context(|| format!("undo for block {hash} disappeared during pruning"))?;
+                Ok((hash, encode_undo_record(hash, &undo)?))
+            }),
+            xor_key,
             MAX_STORED_UNDO_SIZE,
         )?;
         self.undo_file = undo_file;
@@ -945,7 +943,7 @@ impl Drop for BlockStore {
 
 fn rewrite_record_file(
     path: &Path,
-    records: &[(BlockHash, Vec<u8>)],
+    records: impl IntoIterator<Item = Result<(BlockHash, Vec<u8>)>>,
     xor_key: XorKey,
     max_size: usize,
 ) -> Result<(File, HashMap<BlockHash, Record>, u64)> {
@@ -960,9 +958,10 @@ fn rewrite_record_file(
         .write(true)
         .open(&temp_path)
         .with_context(|| format!("opening temporary store {}", temp_path.display()))?;
-    let mut index = HashMap::with_capacity(records.len());
-    for (hash, raw_bytes) in records {
-        let bytes = encode_storage_payload(raw_bytes, max_size)?;
+    let mut index = HashMap::new();
+    for record in records {
+        let (hash, raw_bytes) = record?;
+        let bytes = encode_storage_payload(&raw_bytes, max_size)?;
         let offset = temp.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("record length does not fit u32")?;
         let mut record = Vec::with_capacity(4 + bytes.len());
@@ -970,7 +969,7 @@ fn rewrite_record_file(
         record.extend_from_slice(&bytes);
         xor_key.apply(&mut record, offset);
         temp.write_all(&record)?;
-        index.insert(*hash, Record { offset, length });
+        index.insert(hash, Record { offset, length });
     }
     temp.sync_all()?;
     drop(temp);
@@ -3565,19 +3564,18 @@ impl ElectrumBlockStore {
             return Ok(false);
         }
 
-        let mut records = Vec::with_capacity(retained.len().min(hashes.len()));
-        for hash in hashes {
-            if !retained.contains(&hash) {
-                continue;
-            }
-            let transactions = self
-                .transactions(&hash)?
-                .with_context(|| format!("Electrum transaction body {hash} disappeared"))?;
-            records.push((hash, encode_electrum_block_record(hash, &transactions)?));
-        }
+        let path = self.path.clone();
         let (file, index, data_len) = rewrite_record_file(
-            &self.path,
-            &records,
+            &path,
+            hashes
+                .into_iter()
+                .filter(|hash| retained.contains(hash))
+                .map(|hash| {
+                    let transactions = self
+                        .transactions(&hash)?
+                        .with_context(|| format!("Electrum transaction body {hash} disappeared"))?;
+                    Ok((hash, encode_electrum_block_record(hash, &transactions)?))
+                }),
             XorKey::default(),
             MAX_STORED_ELECTRUM_BLOCK_SIZE + 32,
         )?;

@@ -2169,11 +2169,21 @@ impl ChainState {
             shutdown_interrupt: Arc::new(AtomicBool::new(false)),
             peer_storage_blocks_since_flush: 0,
         };
+        let snapshot_load_started = Instant::now();
         let snapshot = if rebuild_chainstate {
             None
         } else {
             state.load_snapshot(&active_chain)?
         };
+        if let Some((snapshot, verified)) = snapshot.as_ref() {
+            info!(
+                "Loaded chainstate snapshot: height={} verified={} utxos={} in {:.2}s",
+                snapshot.headers.len().saturating_sub(1),
+                verified,
+                snapshot.utxos.len(),
+                snapshot_load_started.elapsed().as_secs_f64()
+            );
+        }
         let loaded_snapshot = snapshot.is_some();
         let snapshot_verified = snapshot.as_ref().is_some_and(|(_, verified)| *verified);
         if rebuild_chainstate {
@@ -2404,7 +2414,13 @@ impl ChainState {
             state.remove_snapshot_provenance_file()?;
         }
         state.index_persisted_headers(&persisted_headers)?;
+        let block_index_started = Instant::now();
         state.rebuild_block_index(true)?;
+        info!(
+            "Loaded block index: entries={} in {:.2}s",
+            state.block_index.len(),
+            block_index_started.elapsed().as_secs_f64()
+        );
         state.initialize_block_sequence_ids_after_load();
         if state
             .active_chain
@@ -2428,10 +2444,10 @@ impl ChainState {
                     .and_then(|base| state.block_height_by_hash(&base))
                     .unwrap_or_else(|| state.height());
                 state.validate_snapshot_utxo_shape(&snapshot_utxos, snapshot_height)?;
-            } else {
+            } else if !snapshot_verified {
+                let verification_started = Instant::now();
+                info!("Verifying legacy chainstate snapshot");
                 state.validate_snapshot_utxos(&snapshot_utxos)?;
-            }
-            if !pending_assumeutxo && !snapshot_verified {
                 if state.prune_height.is_none() {
                     let expected = state
                         .replay_utxos_for_block(state.best_hash(), false)?
@@ -2441,10 +2457,19 @@ impl ChainState {
                     }
                 }
                 state.persist_snapshot_checksum()?;
+                info!(
+                    "Verified legacy chainstate snapshot in {:.2}s",
+                    verification_started.elapsed().as_secs_f64()
+                );
             }
         }
+        let reconciliation_started = Instant::now();
         state.reconcile_utxo_store()?;
         state.reconcile_electrum_history_store()?;
+        info!(
+            "Reconciled chainstate indexes in {:.2}s",
+            reconciliation_started.elapsed().as_secs_f64()
+        );
         if active_tip_sidecar_trusted {
             state.initialize_pending_body_children_after_load();
             let recovery_height = state.height();
@@ -2455,7 +2480,12 @@ impl ChainState {
             }
         }
         state.update_ibd_status();
+        let metadata_started = Instant::now();
         state.persist_metadata()?;
+        info!(
+            "Persisted startup metadata in {:.2}s",
+            metadata_started.elapsed().as_secs_f64()
+        );
         if state.snapshot_base.is_some()
             && !state.snapshot_validated
             && state.snapshot_validation_error.is_none()
@@ -2601,6 +2631,13 @@ impl ChainState {
     pub fn flush(&mut self) -> Result<()> {
         self.flush_append_only_stores()?;
         self.persist_metadata()
+    }
+
+    /// Publish a complete chainstate snapshot during an orderly shutdown.
+    /// IBD deliberately avoids foreground snapshots, so this checkpoint
+    /// bounds the next startup replay without pausing block acceptance.
+    pub fn checkpoint_for_shutdown(&mut self) -> Result<()> {
+        self.persist_snapshot()
     }
 
     /// Verify the block-index parent links, chain-work accumulation, active
@@ -8135,7 +8172,7 @@ impl ChainState {
         }
         self.persist_coinstats_record_with_sync(hash, height, sync_storage)?;
         if persist {
-            if self.height() % SNAPSHOT_INTERVAL == 0 {
+            if !self.initial_block_download && self.height() % SNAPSHOT_INTERVAL == 0 {
                 self.persist_snapshot()?;
             } else if sync_storage {
                 // The block body, chainstate mutation, UTXO batch, and
@@ -10422,13 +10459,37 @@ impl ChainState {
                 if entry.output.value > Amount::MAX_MONEY {
                     bail!("chainstate delta contains an output above the money range")
                 }
+                if entry.height == delta.height {
+                    if !delta
+                        .transactions
+                        .iter()
+                        .any(|(txid, _)| *txid == outpoint.txid)
+                    {
+                        bail!(
+                            "chainstate delta spends an output marked as created in the same block by an unknown transaction"
+                        )
+                    }
+                    // The delta records net UTXO changes. An output created
+                    // and spent within one block is absent both before and
+                    // after that block, so it must not be removed from the
+                    // snapshot-prefix UTXO set.
+                    continue;
+                }
                 let current = match touched.get(outpoint) {
                     Some(current) => current.as_ref(),
                     None => self.utxos.get(outpoint),
                 }
-                .context("chainstate delta spends a missing output")?;
+                .with_context(|| {
+                    format!(
+                        "chainstate delta at height {} spends missing output {outpoint}",
+                        delta.height
+                    )
+                })?;
                 if current != entry {
-                    bail!("chainstate delta spent output metadata does not match")
+                    bail!(
+                        "chainstate delta at height {} spent output metadata does not match for {outpoint}",
+                        delta.height
+                    )
                 }
                 touched.insert(*outpoint, None);
             }
@@ -10487,10 +10548,22 @@ impl ChainState {
             if entry.output.value > Amount::MAX_MONEY {
                 bail!("chainstate delta contains an output above the money range")
             }
+            if entry.height == delta.height {
+                if !delta
+                    .transactions
+                    .iter()
+                    .any(|(txid, _)| *txid == outpoint.txid)
+                {
+                    bail!(
+                        "chainstate delta spends an output marked as created in the same block by an unknown transaction"
+                    )
+                }
+                continue;
+            }
             let removed = self.remove_utxo(outpoint).with_context(|| {
                 format!(
-                    "chainstate delta tries to spend missing output {}",
-                    outpoint
+                    "chainstate delta at height {} tries to spend missing output {outpoint}",
+                    delta.height
                 )
             })?;
             if removed != *entry {
@@ -15127,7 +15200,9 @@ mod tests {
             state.spending_transaction(&first_output),
             Some((second_txid, 0, block_hash, 101))
         );
-        state.persist_snapshot().unwrap();
+        // Keep height 101 in the durable delta suffix. Reopening must apply
+        // the net effect of the in-block spend without trying to remove its
+        // transient output from the height-100 snapshot.
         drop(state);
         let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         reopened.configure_txospender_index(true).unwrap();

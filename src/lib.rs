@@ -7556,10 +7556,16 @@ impl Node {
         tokio::time::timeout(Duration::from_secs(10), self.wait_for_peer_tasks())
             .await
             .map_err(|_| anyhow!("timed out waiting for peer handlers during shutdown"))?;
+        info!("Flushing chainstate for clean shutdown");
+        let checkpoint_started = Instant::now();
         self.chain
             .write()
-            .flush()
-            .context("flushing chainstate during shutdown")?;
+            .checkpoint_for_shutdown()
+            .context("checkpointing chainstate during shutdown")?;
+        info!(
+            "Flushed chainstate for clean shutdown in {:.2}s",
+            checkpoint_started.elapsed().as_secs_f64()
+        );
         run_notify_command(self.config.shutdown_notify.as_deref(), None);
         if let Err(error) = self.flush_fee_estimates(true) {
             warn!(%error, "unable to flush fee estimates during shutdown");

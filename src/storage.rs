@@ -1725,7 +1725,12 @@ impl UtxoStore {
     /// normal index rebuild path on the next open.
     pub fn compact(&mut self) -> Result<()> {
         self.flush()?;
-        let entries = self.entries()?;
+        let mut locations = self
+            .index
+            .iter()
+            .map(|(outpoint, location)| (*outpoint, *location))
+            .collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|(_, location)| location.offset);
         let compact_data_path = self.path.with_extension("dat.compact");
         let compact_index_path = self.index_path.with_extension("index.compact");
         for path in [&compact_data_path, &compact_index_path] {
@@ -1753,13 +1758,22 @@ impl UtxoStore {
             let next_batch_id = batch_id
                 .checked_add(1)
                 .context("UTXO batch identifier exhausted during compaction")?;
-            let entries_empty = entries.is_empty();
-            let mut compact_index = HashMap::with_capacity(entries.len());
+            let entries_empty = locations.is_empty();
+            let mut compact_index = HashMap::with_capacity(locations.len());
             if !entries_empty {
-                for (outpoint, entry) in entries {
-                    let body = encode_utxo_put(batch_id, &outpoint, &entry)?;
+                for (outpoint, location) in &locations {
+                    let body = read_utxo_data_record(&self.file, *location)?;
+                    if body.first().copied() != Some(UTXO_PUT) || body.len() < 1 + 8 + 36 {
+                        bail!("UTXO location points to a non-value record");
+                    }
+                    let stored_outpoint = decode_outpoint(&body[9..45])?;
+                    if stored_outpoint != *outpoint {
+                        bail!("UTXO value key does not match its index");
+                    }
+                    let entry = decode_stored_utxo(&body[45..])?;
+                    let body = encode_utxo_put(batch_id, outpoint, &entry)?;
                     let location = append_utxo_data_record(&mut compact_data, &body)?;
-                    compact_index.insert(outpoint, location);
+                    compact_index.insert(*outpoint, location);
                 }
                 let commit = encode_utxo_commit(batch_id);
                 append_utxo_data_record(&mut compact_data, &commit)?;
@@ -2112,7 +2126,12 @@ impl ElectrumHistoryStore {
     /// detected by the index/data consistency checks during the next open.
     pub fn compact(&mut self) -> Result<()> {
         self.flush()?;
-        let entries = self.entries()?;
+        let mut locations = self
+            .index
+            .iter()
+            .map(|(script_hash, location)| (*script_hash, *location))
+            .collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|(_, location)| location.offset);
         let compact_data_path = self.path.with_extension("dat.compact");
         let compact_index_path = self.index_path.with_extension("index.compact");
         for path in [&compact_data_path, &compact_index_path] {
@@ -2140,14 +2159,15 @@ impl ElectrumHistoryStore {
             let next_batch_id = batch_id
                 .checked_add(1)
                 .context("Electrum history batch identifier exhausted during compaction")?;
-            let entries_empty = entries.is_empty();
-            let mut compact_index = HashMap::with_capacity(entries.len());
+            let entries_empty = locations.is_empty();
+            let mut compact_index = HashMap::with_capacity(locations.len());
             if !entries_empty {
-                for (script_hash, history) in entries {
-                    let script_hash_bytes = encode_history_script_hash(&script_hash)?;
-                    let body = encode_history_value(batch_id, script_hash_bytes, &history)?;
+                for (script_hash_bytes, location) in &locations {
+                    let body = read_history_data_record(&self.file, *location)?;
+                    let history = decode_history_value(&body, *script_hash_bytes)?;
+                    let body = encode_history_value(batch_id, *script_hash_bytes, &history)?;
                     let location = append_history_data_record(&mut compact_data, &body)?;
-                    compact_index.insert(script_hash_bytes, location);
+                    compact_index.insert(*script_hash_bytes, location);
                 }
                 let commit = encode_history_commit(batch_id);
                 append_history_data_record(&mut compact_data, &commit)?;

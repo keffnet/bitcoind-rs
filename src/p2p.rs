@@ -1794,6 +1794,22 @@ impl PeerManager {
     }
 
     pub(crate) async fn run_with_startup(self, startup: Option<Arc<StartupLatch>>) -> Result<()> {
+        info!("net thread start");
+        info!("initload thread start");
+        info!("msghand thread start");
+        if self.node.config.txindex {
+            info!("txindex thread start");
+        }
+        if self.node.config.blockfilterindex {
+            info!("block filter index thread start");
+        }
+        if self.node.config.coinstatsindex {
+            info!("coinstatsindex thread start");
+        }
+        if self.node.config.txospenderindex {
+            info!("txospenderindex thread start");
+        }
+        info!("Loading P2P addresses");
         info!(
             "Loaded {} addresses from peers.json",
             self.node.known_network_addresses().len()
@@ -2193,9 +2209,8 @@ impl PeerManager {
         }
         let discovery_node = self.node.clone();
         let discovery_outbound = outbound.clone();
-        if configured_connect_nodes {
-            info!("addcon thread start");
-        } else {
+        info!("addcon thread start");
+        if !configured_connect_nodes {
             info!("opencon thread start");
             if delayed_dns_seed_fallback {
                 info!(

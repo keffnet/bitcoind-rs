@@ -175,6 +175,7 @@ impl RpcServer {
     }
 
     pub(crate) async fn run_with_startup(self, startup: Option<Arc<StartupLatch>>) -> Result<()> {
+        info!("Starting HTTP server");
         let binds = if self.node.config.rpc_binds.is_empty() {
             self.node.config.rpc_bind.into_iter().collect::<Vec<_>>()
         } else {

@@ -8224,6 +8224,24 @@ impl ChainState {
             })
             .collect::<Result<Vec<Block>>>()?;
 
+        // Reorgs change Electrum history only for scripts appearing in the
+        // disconnected or candidate suffix.  Keep that working set small so
+        // the durable history store can receive a delta instead of a full
+        // replacement of every indexed script.
+        let mut history_scripts = HashSet::new();
+        for (_, block, undo) in &disconnected {
+            for transaction in &block.txdata {
+                for output in &transaction.output {
+                    history_scripts.insert(electrum_script_hash(&output.script_pubkey));
+                }
+            }
+            for spent_outputs in undo {
+                for output in spent_outputs {
+                    history_scripts.insert(electrum_script_hash(&output.script_pubkey));
+                }
+            }
+        }
+
         // Validate the whole transition against a temporary UTXO map before
         // changing any active-chain indexes. This keeps malformed candidate
         // blocks from leaving the live chain half-disconnected.
@@ -8243,6 +8261,14 @@ impl ChainState {
                 &candidate_utxos,
                 self.median_time_past_for_parent(parent_hash),
             )?;
+            for (_, entry) in &application.spent_entries {
+                history_scripts.insert(electrum_script_hash(&entry.output.script_pubkey));
+            }
+            for transaction in &block.txdata {
+                for output in &transaction.output {
+                    history_scripts.insert(electrum_script_hash(&output.script_pubkey));
+                }
+            }
             apply_block_to_utxos(
                 &mut candidate_utxos,
                 block,
@@ -8271,10 +8297,23 @@ impl ChainState {
             }
         }
 
-        if !self.history_materialized {
-            self.history = self.load_history_map_from_store()?;
-            self.history_materialized = true;
-        }
+        let history_before = history_scripts
+            .iter()
+            .map(|script_hash| {
+                let entries = if self.history_materialized {
+                    self.history.get(script_hash).cloned().unwrap_or_default()
+                } else {
+                    self.electrum_history_store
+                        .get(script_hash)?
+                        .into_iter()
+                        .map(|(txid, height)| HistoryEntry { txid, height })
+                        .collect()
+                };
+                Ok((script_hash.clone(), entries))
+            })
+            .collect::<Result<HashMap<_, _>>>()?;
+        self.history = history_before.clone();
+        self.history_materialized = true;
 
         let snapshot_invalidated = self.snapshot_base.is_some_and(|base| !path.contains(&base));
 
@@ -8331,7 +8370,25 @@ impl ChainState {
         self.utxo_store
             .apply_batch(&utxo_removals, &utxo_additions)?;
         self.persist_utxo_store_tip()?;
-        self.sync_electrum_history_store()?;
+        let history_updates = history_scripts
+            .into_iter()
+            .filter_map(|script_hash| {
+                let before = history_before.get(&script_hash);
+                let after = self.history.get(&script_hash);
+                (before != after).then(|| {
+                    (
+                        script_hash,
+                        after
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|entry| (entry.txid, entry.height))
+                            .collect(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        self.electrum_history_store.apply_batch(&history_updates)?;
         self.persist_electrum_history_store_tip()?;
         self.persist_metadata()?;
 

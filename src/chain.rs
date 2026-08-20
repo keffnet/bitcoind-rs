@@ -8933,6 +8933,7 @@ impl ChainState {
             return Ok(());
         }
         let active_chain = self.active_chain.clone();
+        let mut pruned_blocks = Vec::new();
         for hash in active_chain {
             let height = self
                 .block_index
@@ -8944,19 +8945,24 @@ impl ChainState {
                     .prune_height
                     .is_some_and(|prune_height| height < prune_height)
                 {
-                    let transactions = if let Some(store) = self.electrum_store.as_mut() {
-                        store.transactions_for_block(&hash)?
-                    } else {
-                        None
-                    };
-                    if let Some(transactions) = transactions {
-                        self.index_transaction_spends(&transactions, hash, height);
-                    }
+                    pruned_blocks.push((hash, height));
                     continue;
                 }
                 bail!("active block {hash} is missing from block store")
             };
             self.index_block_spends(&block, height);
+        }
+        if let Some(store) = self.electrum_store.as_mut() {
+            let hashes = pruned_blocks
+                .iter()
+                .map(|(hash, _)| *hash)
+                .collect::<Vec<_>>();
+            let transactions = store.transactions_for_blocks(&hashes)?;
+            for (hash, height) in pruned_blocks {
+                if let Some(block_transactions) = transactions.get(&hash) {
+                    self.index_transaction_spends(block_transactions, hash, height);
+                }
+            }
         }
         Ok(())
     }

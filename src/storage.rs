@@ -3787,10 +3787,43 @@ impl ElectrumBlockStore {
         self.transactions(block_hash)
     }
 
+    /// Read several pruned block transaction lists in append-log order.  The
+    /// active chain is normally traversed by height, but compaction and
+    /// recovery can leave the index order unrelated to that traversal.  Sort
+    /// the requests by record offset so restart-time index rebuilds perform
+    /// mostly forward reads from the sidecar.
+    pub(crate) fn transactions_for_blocks(
+        &mut self,
+        block_hashes: &[BlockHash],
+    ) -> Result<HashMap<BlockHash, Vec<Transaction>>> {
+        let mut records = block_hashes
+            .iter()
+            .filter_map(|hash| self.index.get(hash).copied().map(|record| (*hash, record)))
+            .collect::<Vec<_>>();
+        records.sort_unstable_by_key(|(_, record)| record.offset);
+        records.dedup_by_key(|(hash, _)| *hash);
+
+        records
+            .into_iter()
+            .map(|(hash, record)| {
+                self.transactions_from_record(hash, record)
+                    .map(|transactions| (hash, transactions))
+            })
+            .collect()
+    }
+
     fn transactions(&mut self, block_hash: &BlockHash) -> Result<Option<Vec<Transaction>>> {
         let Some(record) = self.index.get(block_hash).copied() else {
             return Ok(None);
         };
+        self.transactions_from_record(*block_hash, record).map(Some)
+    }
+
+    fn transactions_from_record(
+        &self,
+        block_hash: BlockHash,
+        record: Record,
+    ) -> Result<Vec<Transaction>> {
         let bytes = read_storage_record(
             &self.file,
             record,
@@ -3806,12 +3839,12 @@ impl ElectrumBlockStore {
                 .try_into()
                 .expect("Electrum block hash has fixed width"),
         );
-        if stored_hash != *block_hash {
+        if stored_hash != block_hash {
             bail!("stored Electrum block hash does not match its index")
         }
         let transactions: Vec<Transaction> =
             deserialize(&bytes[32..]).context("decoding stored Electrum transactions")?;
-        Ok(Some(transactions))
+        Ok(transactions)
     }
 }
 
@@ -5020,6 +5053,36 @@ mod tests {
             txid
         );
         assert_eq!(reopened.merkle_branch(&hash, 0).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn batches_electrum_transaction_reads_and_ignores_missing_blocks() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = genesis_block(Network::Regtest);
+        let mut second = first.clone();
+        second.header.nonce = 1;
+        let first_hash = first.block_hash();
+        let second_hash = second.block_hash();
+        let missing_hash = BlockHash::from_byte_array([9; 32]);
+        let mut store = ElectrumBlockStore::open(directory.path()).unwrap();
+        // Insert in the reverse chain order so the batch method has to use
+        // record offsets instead of request order.
+        store.insert(&second).unwrap();
+        store.insert(&first).unwrap();
+
+        let transactions = store
+            .transactions_for_blocks(&[first_hash, missing_hash, second_hash, first_hash])
+            .unwrap();
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(
+            transactions[&first_hash][0].compute_txid(),
+            first.txdata[0].compute_txid()
+        );
+        assert_eq!(
+            transactions[&second_hash][0].compute_txid(),
+            second.txdata[0].compute_txid()
+        );
+        assert!(!transactions.contains_key(&missing_hash));
     }
 
     #[test]

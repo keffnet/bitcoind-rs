@@ -958,7 +958,9 @@ fn rewrite_record_file(
         .write(true)
         .open(&temp_path)
         .with_context(|| format!("opening temporary store {}", temp_path.display()))?;
-    let mut index = HashMap::new();
+    let records = records.into_iter();
+    let (lower_bound, _) = records.size_hint();
+    let mut index = HashMap::with_capacity(lower_bound);
     for record in records {
         let (hash, raw_bytes) = record?;
         let bytes = encode_storage_payload(&raw_bytes, max_size)?;
@@ -4176,7 +4178,10 @@ fn rewrite_index(file: &mut File, data_len: u64, index: &HashMap<BlockHash, Reco
     file.seek(SeekFrom::Start(0))?;
     file.write_all(&data_len.to_le_bytes())?;
     let mut entries: Vec<(&BlockHash, &Record)> = index.iter().collect();
-    entries.sort_by_key(|(hash, _)| hash.to_string());
+    // Fixed-width hexadecimal encoding has the same ordering as the raw
+    // bytes, so avoid allocating a String for every index key during a
+    // rewrite.
+    entries.sort_unstable_by_key(|(hash, _)| hash.to_byte_array());
     for (hash, record) in entries {
         file.write_all(&hash.to_byte_array())?;
         file.write_all(&record.offset.to_le_bytes())?;

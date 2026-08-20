@@ -625,46 +625,22 @@ pub fn bip9_deployments(network: Network) -> [Bip9Deployment; 3] {
             period: 144,
         },
     };
-    let reduced_data = match network {
-        Network::Bitcoin => Bip9Deployment {
-            bit: 4,
-            start_time: 1_764_547_200,
-            timeout: i64::MAX,
-            min_activation_height: 0,
-            max_activation_height: 965_664,
-            active_duration: 52_416,
-            threshold: 1_109,
-            period: 2_016,
-        },
-        Network::Testnet | Network::Testnet4 => Bip9Deployment {
-            bit: 4,
-            start_time: 1_764_547_200,
-            timeout: i64::MAX,
-            min_activation_height: 0,
-            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
-            active_duration: 52_416,
-            threshold: 1_109,
-            period: 2_016,
-        },
-        Network::Signet => Bip9Deployment {
-            bit: 4,
-            start_time: Bip9Deployment::NEVER_ACTIVE_TIME,
-            timeout: i64::MAX,
-            min_activation_height: 0,
-            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
-            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
-            threshold: 0,
-            period: 2_016,
-        },
-        Network::Regtest => Bip9Deployment {
-            bit: 4,
-            start_time: Bip9Deployment::NEVER_ACTIVE_TIME,
-            timeout: i64::MAX,
-            min_activation_height: 0,
-            max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
-            active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
-            threshold: 0,
-            period: 144,
+    // `reduced_data` is retained as an opt-in regtest extension for focused
+    // experiments, but it is not part of Bitcoin Core v31.1.  In particular,
+    // do not enable it on mainnet: doing so would enforce a future mandatory
+    // signaling window against valid v31.1 peer headers.
+    let reduced_data = Bip9Deployment {
+        bit: 4,
+        start_time: Bip9Deployment::NEVER_ACTIVE_TIME,
+        timeout: i64::MAX,
+        min_activation_height: 0,
+        max_activation_height: Bip9Deployment::MAX_ACTIVATION_HEIGHT,
+        active_duration: Bip9Deployment::PERMANENT_ACTIVE_DURATION,
+        threshold: 0,
+        period: if network == Network::Regtest {
+            144
+        } else {
+            2_016
         },
     };
     [testdummy, taproot, reduced_data]
@@ -871,6 +847,7 @@ pub fn unknown_versionbits_active_with_params(
     let known_bits = params
         .bip9
         .iter()
+        .filter(|deployment| deployment.is_enabled())
         .fold(0u32, |bits, deployment| bits | (1u32 << deployment.bit));
     let period = usize::try_from(testdummy.period).ok()?;
     let threshold = usize::try_from(testdummy.threshold).ok()?;
@@ -952,6 +929,7 @@ pub fn unknown_versionbits_active_at_boundary_with_params(
     let known_bits = params
         .bip9
         .iter()
+        .filter(|deployment| deployment.is_enabled())
         .fold(0u32, |bits, deployment| bits | (1u32 << deployment.bit));
     let period = usize::try_from(testdummy.period).ok()?;
     let threshold = usize::try_from(testdummy.threshold).ok()?;
@@ -2657,6 +2635,18 @@ mod tests {
             bip9_state_at_height(&headers, deployment, 576),
             (Bip9State::Expired, 576)
         );
+    }
+
+    #[test]
+    fn core_v31_1_defaults_do_not_enable_reduced_data() {
+        let params = DeploymentParameters::for_network(Network::Bitcoin);
+        let deployment = params.bip9[2];
+        assert!(!deployment.is_enabled());
+        assert_eq!(
+            deployment.max_activation_height,
+            Bip9Deployment::MAX_ACTIVATION_HEIGHT
+        );
+        assert!(validate_mandatory_version_bits_with_params(&[], &params, 963_648, 4).is_ok());
     }
 
     #[test]

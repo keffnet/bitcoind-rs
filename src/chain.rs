@@ -42,7 +42,10 @@ use crate::validation::{self, ValidationError};
 
 pub(crate) const COINBASE_MATURITY: u32 = 100;
 const BIP34_IMPLIES_BIP30_LIMIT: u32 = 1_983_702;
-const SNAPSHOT_INTERVAL: u32 = 1_000;
+// Full snapshots rewrite the active header path, transaction indexes, and
+// UTXO state. Keep them sparse during IBD and recover the intervening suffix
+// from the durable append-only chainstate deltas and active-tip marker.
+const SNAPSHOT_INTERVAL: u32 = 100_000;
 const MAX_UNDO_CACHE_ENTRIES: usize = 1_024;
 const MAX_BASIC_FILTER_CACHE_ENTRIES: usize = 256;
 const MAX_MISSING_UTXO_CACHE_ENTRIES: usize = 8_192;

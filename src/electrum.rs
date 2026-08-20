@@ -1537,11 +1537,67 @@ fn transaction_get_batch(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .ok_or_else(electrum_invalid_params)?;
     validate_electrum_batch_len(txids.len())?;
     let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
+    let parsed_txids = txids
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(electrum_invalid_params)?
+                .parse()
+                .map_err(|_| electrum_invalid_params())
+        })
+        .collect::<Result<Vec<Txid>>>()?;
+    // Resolve all confirmed requests before touching the mempool. The chain
+    // lookup groups txids by block, so a batch containing many transactions
+    // from one compressed block decodes that block only once.
+    let active = node.chain.write().active_transactions(&parsed_txids)?;
+    let active_metadata = if verbose {
+        let chain = node.chain.read();
+        let tip_height = chain.height();
+        active
+            .iter()
+            .map(|(txid, (_, location))| {
+                (
+                    *txid,
+                    (
+                        tip_height.saturating_sub(location.height) + 1,
+                        chain
+                            .header_by_hash(&location.block_hash)
+                            .map(|header| header.time),
+                    ),
+                )
+            })
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+    let mempool = node.mempool.read();
     let mut transactions = Vec::with_capacity(txids.len());
     let mut payload_size = 2usize; // The opening and closing array brackets.
-    for txid in txids {
-        let txid = txid.as_str().ok_or_else(electrum_invalid_params)?;
-        let transaction = transaction_get(node, &json!([txid, verbose]))?;
+    for txid in parsed_txids {
+        let transaction = if let Some((transaction, location)) = active.get(&txid) {
+            if verbose {
+                let (confirmations, time) =
+                    active_metadata.get(&txid).copied().unwrap_or((0, None));
+                electrum_transaction_json(
+                    transaction,
+                    Some(location),
+                    Some(confirmations),
+                    time,
+                    node.config.network,
+                )
+            } else {
+                json!(chain::transaction_hex(transaction))
+            }
+        } else if let Some(entry) = mempool.get(&txid) {
+            if verbose {
+                electrum_transaction_json(&entry.transaction, None, None, None, node.config.network)
+            } else {
+                json!(chain::transaction_hex(&entry.transaction))
+            }
+        } else {
+            bail!("daemon error: unknown txid={txid}")
+        };
         let transaction_size = serde_json::to_vec(&transaction)?.len();
         let next_size = payload_size
             .saturating_add(transaction_size)
@@ -3617,6 +3673,9 @@ mod tests {
         assert!(verbose["vin"][0].get("txinwitness").is_none());
         assert!(verbose["vout"][0]["scriptPubKey"]["desc"].is_string());
         assert!(verbose["vout"][0]["scriptPubKey"]["type"].is_string());
+        let batch_verbose =
+            transaction_get_batch(&node, &json!([[txid.to_string()], true])).unwrap();
+        assert_eq!(batch_verbose[0], verbose);
         let unknown_txid = Txid::from_byte_array([0xaa; 32]);
         assert_eq!(
             transaction_get(&node, &json!([unknown_txid.to_string()]))

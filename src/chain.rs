@@ -4907,6 +4907,82 @@ impl ChainState {
         Ok(None)
     }
 
+    /// Read several active-chain transactions while sharing block-body reads.
+    /// Electrum clients commonly request a group of transactions from the
+    /// same block; resolving each txid independently would decode that block
+    /// once per request, which is especially expensive for compressed native
+    /// records and pruned Electrum sidecar records.
+    pub(crate) fn active_transactions(
+        &mut self,
+        txids: &[Txid],
+    ) -> Result<HashMap<Txid, (Transaction, TxLocation)>> {
+        let mut locations = HashMap::with_capacity(txids.len());
+        for txid in txids {
+            if locations.contains_key(txid) {
+                continue;
+            }
+            let candidates = self.active_transaction_locations(txid);
+            if !candidates.is_empty() {
+                locations.insert(*txid, candidates);
+            }
+        }
+
+        let mut by_block: HashMap<BlockHash, Vec<(Txid, TxLocation)>> = HashMap::new();
+        for (txid, locations) in locations {
+            for location in locations {
+                by_block
+                    .entry(location.block_hash)
+                    .or_default()
+                    .push((txid, location));
+            }
+        }
+
+        let mut transactions: HashMap<Txid, (Transaction, TxLocation)> =
+            HashMap::with_capacity(by_block.len());
+        for (block_hash, entries) in by_block {
+            if let Some(block) = self.store.get(&block_hash)? {
+                for (txid, location) in entries {
+                    let Some(transaction) = block.txdata.get(location.transaction_index).cloned()
+                    else {
+                        bail!("transaction index is inconsistent with stored block");
+                    };
+                    if transaction.compute_txid() == txid
+                        && transactions.get(&txid).is_none_or(|(_, current)| {
+                            (location.height, location.transaction_index)
+                                < (current.height, current.transaction_index)
+                        })
+                    {
+                        transactions.insert(txid, (transaction, location));
+                    }
+                }
+                continue;
+            }
+
+            let Some(store) = self.electrum_store.as_mut() else {
+                continue;
+            };
+            let Some(block_transactions) = store.transactions_for_block(&block_hash)? else {
+                continue;
+            };
+            for (txid, location) in entries {
+                let Some(transaction) = block_transactions.get(location.transaction_index).cloned()
+                else {
+                    continue;
+                };
+                if transaction.compute_txid() != txid {
+                    bail!("Electrum transaction sidecar does not match transaction index");
+                }
+                if transactions.get(&txid).is_none_or(|(_, current)| {
+                    (location.height, location.transaction_index)
+                        < (current.height, current.transaction_index)
+                }) {
+                    transactions.insert(txid, (transaction, location));
+                }
+            }
+        }
+        Ok(transactions)
+    }
+
     /// Return active-chain locations in Electrum's chronological order.
     /// Ordinary txids take the fast single-map path; only duplicate txids use
     /// the side index.
@@ -12940,6 +13016,27 @@ mod tests {
         drop(state);
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.transaction_location(&txid), Some(location));
+    }
+
+    #[test]
+    fn active_transaction_batch_preserves_requested_transactions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let first = mine_block(&state, 1);
+        let first_txid = first.txdata[0].compute_txid();
+        state.connect_block(first).unwrap();
+        let second = mine_block(&state, 2);
+        let second_txid = second.txdata[0].compute_txid();
+        state.connect_block(second).unwrap();
+
+        let transactions = state
+            .active_transactions(&[second_txid, first_txid, second_txid])
+            .unwrap();
+        assert_eq!(transactions.len(), 2);
+        assert_eq!(transactions[&first_txid].1.height, 1);
+        assert_eq!(transactions[&second_txid].1.height, 2);
+        assert_eq!(transactions[&first_txid].0.compute_txid(), first_txid);
+        assert_eq!(transactions[&second_txid].0.compute_txid(), second_txid);
     }
 
     #[test]

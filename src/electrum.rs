@@ -1542,7 +1542,47 @@ fn transaction_test_mempool_accept(node: &Arc<Node>, params: &Value) -> Result<V
     if raw_transactions.is_empty() {
         bail!("testmempoolaccept requires at least one transaction")
     }
-    crate::rpc::test_mempool_accept(node, &json!([raw_transactions]))
+    let result = crate::rpc::test_mempool_accept(node, &json!([raw_transactions]))?;
+    electrum_test_mempool_accept_result(result)
+}
+
+fn electrum_test_mempool_accept_result(result: Value) -> Result<Value> {
+    let entries = result
+        .as_array()
+        .ok_or_else(|| anyhow!("testmempoolaccept returned a non-array result"))?;
+    entries
+        .iter()
+        .map(|entry| {
+            let entry = entry
+                .as_object()
+                .ok_or_else(|| anyhow!("testmempoolaccept returned a non-object result"))?;
+            let txid = entry
+                .get("txid")
+                .cloned()
+                .ok_or_else(|| anyhow!("testmempoolaccept result omitted txid"))?;
+            let wtxid = entry
+                .get("wtxid")
+                .cloned()
+                .ok_or_else(|| anyhow!("testmempoolaccept result omitted wtxid"))?;
+            let mut normalized = serde_json::Map::from_iter([
+                ("txid".to_owned(), txid),
+                ("wtxid".to_owned(), wtxid),
+            ]);
+            if let Some(allowed) = entry.get("allowed") {
+                normalized.insert("allowed".to_owned(), allowed.clone());
+            }
+            let reason = entry
+                .get("reason")
+                .or_else(|| entry.get("reject-reason"))
+                .or_else(|| entry.get("reject-details"))
+                .or_else(|| entry.get("package-error"));
+            if let Some(reason) = reason {
+                normalized.insert("reason".to_owned(), reason.clone());
+            }
+            Ok(Value::Object(normalized))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Value::Array)
 }
 
 async fn send_status_notifications(
@@ -2044,6 +2084,54 @@ mod tests {
         );
         assert_eq!(response["error"]["code"], json!(-32602));
         assert_eq!(response["error"]["message"], json!("invalid params"));
+    }
+
+    #[test]
+    fn test_mempool_accept_uses_electrum_result_shape() {
+        let result = electrum_test_mempool_accept_result(json!([
+            {
+                "txid": "txid-accepted",
+                "wtxid": "wtxid-accepted",
+                "allowed": true,
+                "vsize": 123,
+                "fees": {"base": 0.000001},
+            },
+            {
+                "txid": "txid-rejected",
+                "wtxid": "wtxid-rejected",
+                "allowed": false,
+                "reject-reason": "missing-inputs",
+                "reject-details": "a longer diagnostic",
+            },
+            {
+                "txid": "txid-package",
+                "wtxid": "wtxid-package",
+                "package-error": "conflict-in-package",
+            },
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            result,
+            json!([
+                {
+                    "txid": "txid-accepted",
+                    "wtxid": "wtxid-accepted",
+                    "allowed": true,
+                },
+                {
+                    "txid": "txid-rejected",
+                    "wtxid": "wtxid-rejected",
+                    "allowed": false,
+                    "reason": "missing-inputs",
+                },
+                {
+                    "txid": "txid-package",
+                    "wtxid": "wtxid-package",
+                    "reason": "conflict-in-package",
+                },
+            ])
+        );
     }
 
     #[test]

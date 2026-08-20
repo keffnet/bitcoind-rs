@@ -1178,11 +1178,22 @@ impl Mempool {
     /// scripthash query.  The returned order is deliberately unspecified;
     /// Electrum callers apply their protocol-specific ordering after
     /// filtering this set.
-    pub(crate) fn transaction_ids_for_script(&self, script_hash: &str) -> Vec<Txid> {
-        self.transactions_by_script
-            .get(script_hash)
-            .map(|txids| txids.iter().copied().collect())
-            .unwrap_or_default()
+    /// Return the transactions affecting a script when the index contains no
+    /// more than `limit` entries.  Electrum responses have a bounded wire
+    /// size, so callers should reject an oversized index before copying every
+    /// txid into a temporary vector.
+    pub(crate) fn transaction_ids_for_script_limited(
+        &self,
+        script_hash: &str,
+        limit: usize,
+    ) -> Option<Vec<Txid>> {
+        let Some(txids) = self.transactions_by_script.get(script_hash) else {
+            return Some(Vec::new());
+        };
+        if txids.len() > limit {
+            return None;
+        }
+        Some(txids.iter().copied().collect())
     }
 
     pub(crate) fn input_value_for_script(&self, txid: &Txid, script_hash: &str) -> u64 {
@@ -5781,7 +5792,11 @@ mod tests {
 
         pool.index_transaction_scripts(txid, scripts.clone(), input_script_values);
         for script_hash in scripts {
-            assert_eq!(pool.transaction_ids_for_script(&script_hash), vec![txid]);
+            assert_eq!(
+                pool.transaction_ids_for_script_limited(&script_hash, usize::MAX)
+                    .unwrap(),
+                vec![txid]
+            );
         }
 
         pool.remove_transaction_scripts(&txid);
@@ -5887,11 +5902,13 @@ mod tests {
         let mut pool = Mempool::new(Network::Regtest);
         pool.accept(transaction, &chain).unwrap();
         assert_eq!(
-            pool.transaction_ids_for_script(&spent_script_hash),
+            pool.transaction_ids_for_script_limited(&spent_script_hash, usize::MAX)
+                .unwrap(),
             vec![txid]
         );
         assert_eq!(
-            pool.transaction_ids_for_script(&created_script_hash),
+            pool.transaction_ids_for_script_limited(&created_script_hash, usize::MAX)
+                .unwrap(),
             vec![txid]
         );
         assert_eq!(

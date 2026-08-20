@@ -35,6 +35,11 @@ const MAX_SCRIPTPUBKEY_SIZE: usize = 10_000;
 // unbounded response allocation. Leave room for the JSON-RPC envelope and
 // the scriptpubkey {"history": ...} wrapper.
 const MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE: usize = 4 * 1024 * 1024 - 256;
+// A serialized history entry is always substantially larger than 64 bytes
+// (the txid alone is 64 hexadecimal characters).  This conservative lower
+// bound lets us reject an oversized history before copying a large mempool
+// script index into a temporary vector.
+const MAX_ELECTRUM_HISTORY_RECORDS: usize = MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE / 64;
 // Bound serialized responses as well as request lines. This prevents a
 // batch of large transaction responses from accumulating without limit in
 // the connection task. The line budget is large enough for a hexadecimal
@@ -770,7 +775,7 @@ fn dispatch_with_session(
         }
         "blockchain.scripthash.get_mempool" => {
             let script_hash = script_hash_param(params, 0)?;
-            Ok(json!(mempool_for_script(node, &script_hash)))
+            Ok(json!(mempool_for_script(node, &script_hash)?))
         }
         "blockchain.scripthash.subscribe" => {
             let script_hash = script_hash_param(params, 0)?;
@@ -809,7 +814,7 @@ fn dispatch_with_session(
         }
         "blockchain.address.get_mempool" => {
             let (_, script_hash) = address_param(node, params, 0)?;
-            Ok(json!(mempool_for_script(node, &script_hash)))
+            Ok(json!(mempool_for_script(node, &script_hash)?))
         }
         "blockchain.address.subscribe" => {
             let (address, script_hash) = address_param(node, params, 0)?;
@@ -849,7 +854,7 @@ fn dispatch_with_session(
         }
         "blockchain.scriptpubkey.get_mempool" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
-            Ok(json!({"history": mempool_for_script(node, &script_hash)}))
+            Ok(json!({"history": mempool_for_script(node, &script_hash)?}))
         }
         "blockchain.scriptpubkey.subscribe" => {
             let script_hash = scriptpubkey_hash_param(params, 0)?;
@@ -1258,19 +1263,30 @@ fn fee_histogram(mempool: &crate::mempool::Mempool) -> Value {
     json!(histogram)
 }
 
-fn mempool_for_script(node: &Arc<Node>, script_hash: &str) -> Vec<Value> {
+fn mempool_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>> {
     let mempool = node.mempool.read();
-    mempool_records_for_script(&mempool, script_hash)
-        .into_iter()
-        .filter_map(|(txid, height)| {
-            let entry = mempool.get(&txid)?;
-            Some(json!({
+    let mut values = Vec::new();
+    let mut payload_size = 2usize; // The opening and closing array brackets.
+    for (txid, height) in mempool_records_for_script(&mempool, script_hash)? {
+        let Some(entry) = mempool.get(&txid) else {
+            continue;
+        };
+        let value = json!({
                 "tx_hash": txid.to_string(),
                 "height": height,
                 "fee": entry.fee_sat,
-            }))
-        })
-        .collect()
+        });
+        let entry_size = serde_json::to_vec(&value)?.len();
+        let next_size = payload_size
+            .saturating_add(entry_size)
+            .saturating_add(usize::from(!values.is_empty()));
+        if next_size > MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE {
+            return Err(electrum_history_too_large());
+        }
+        payload_size = next_size;
+        values.push(value);
+    }
+    Ok(values)
 }
 
 fn mempool_transaction_height(transaction: &Transaction, mempool: &crate::mempool::Mempool) -> i64 {
@@ -1896,10 +1912,10 @@ fn history_records_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec
     let mut records = Vec::new();
     let mut seen = HashSet::new();
     for entry in chain.get_history_checked(script_hash)? {
-        append_history_record(&mut records, &mut seen, entry.txid, i64::from(entry.height));
+        append_history_record(&mut records, &mut seen, entry.txid, i64::from(entry.height))?;
     }
-    for (txid, height) in mempool_records_for_script(&mempool, script_hash) {
-        append_history_record(&mut records, &mut seen, txid, height);
+    for (txid, height) in mempool_records_for_script(&mempool, script_hash)? {
+        append_history_record(&mut records, &mut seen, txid, height)?;
     }
     Ok(records)
 }
@@ -1909,25 +1925,37 @@ fn append_history_record(
     seen: &mut HashSet<(Txid, i64)>,
     txid: Txid,
     height: i64,
-) {
+) -> Result<()> {
     // Electrum/electrs represents each confirmed block occurrence.  This
     // matters for the two historical BIP30 duplicate-coinbase transactions:
     // the same txid has two distinct confirmed heights and both belong in the
     // history and status digest.
     if seen.insert((txid, height)) {
+        if records.len() >= MAX_ELECTRUM_HISTORY_RECORDS {
+            return Err(electrum_history_too_large());
+        }
         records.push((txid, height));
     }
+    Ok(())
+}
+
+fn mempool_transaction_ids_for_script(
+    mempool: &crate::mempool::Mempool,
+    script_hash: &str,
+) -> Result<Vec<Txid>> {
+    mempool
+        .transaction_ids_for_script_limited(script_hash, MAX_ELECTRUM_HISTORY_RECORDS)
+        .ok_or_else(electrum_history_too_large)
 }
 
 fn mempool_records_for_script(
     mempool: &crate::mempool::Mempool,
     script_hash: &str,
-) -> Vec<(Txid, i64)> {
+) -> Result<Vec<(Txid, i64)>> {
     // The admission index includes resolved prevout scripts. Re-resolving
     // them from the UTXO set would miss a confirmed output once it has been
     // spent by this mempool transaction.
-    let mut records = mempool
-        .transaction_ids_for_script(script_hash)
+    let mut records = mempool_transaction_ids_for_script(mempool, script_hash)?
         .into_iter()
         .filter_map(|txid| {
             let entry = mempool.get(&txid)?;
@@ -1938,7 +1966,7 @@ fn mempool_records_for_script(
         })
         .collect::<Vec<_>>();
     sort_mempool_records(&mut records);
-    records
+    Ok(records)
 }
 
 fn sort_mempool_records(records: &mut [(Txid, i64)]) {
@@ -1969,7 +1997,7 @@ fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> Result<(u64, i64)>
         .map(|(_, _, _, value)| value)
         .sum();
     let mut unconfirmed = 0i64;
-    for txid in mempool.transaction_ids_for_script(script_hash) {
+    for txid in mempool_transaction_ids_for_script(&mempool, script_hash)? {
         let Some(entry) = mempool.get(&txid) else {
             continue;
         };
@@ -1988,7 +2016,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>>
     let mut chain = node.chain.write();
     let mempool = node.mempool.read();
     let mut spent = HashSet::new();
-    for txid in mempool.transaction_ids_for_script(script_hash) {
+    for txid in mempool_transaction_ids_for_script(&mempool, script_hash)? {
         if let Some(entry) = mempool.get(&txid) {
             spent.extend(
                 entry
@@ -2012,7 +2040,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>>
             .then_with(|| left.0.vout.cmp(&right.0.vout))
     });
     let mut unconfirmed = Vec::new();
-    for txid in mempool.transaction_ids_for_script(script_hash) {
+    for txid in mempool_transaction_ids_for_script(&mempool, script_hash)? {
         let Some(entry) = mempool.get(&txid) else {
             continue;
         };
@@ -2026,18 +2054,26 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>>
         }
     }
     confirmed.extend(unconfirmed);
-    let results = confirmed;
-    Ok(results
-        .into_iter()
-        .map(|(outpoint, height, _, value)| {
-            json!({
+    let mut results = Vec::new();
+    let mut payload_size = 2usize; // The opening and closing array brackets.
+    for (outpoint, height, _, value) in confirmed {
+        let result = json!({
                 "tx_hash": outpoint.txid.to_string(),
                 "tx_pos": outpoint.vout,
                 "height": height,
                 "value": value,
-            })
-        })
-        .collect())
+        });
+        let entry_size = serde_json::to_vec(&result)?.len();
+        let next_size = payload_size
+            .saturating_add(entry_size)
+            .saturating_add(usize::from(!results.is_empty()));
+        if next_size > MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE {
+            return Err(electrum_history_too_large());
+        }
+        payload_size = next_size;
+        results.push(result);
+    }
+    Ok(results)
 }
 
 fn script_hash_param(params: &Value, index: usize) -> Result<String> {
@@ -2433,11 +2469,30 @@ mod tests {
         let mut records = Vec::new();
         let mut seen = HashSet::new();
 
-        append_history_record(&mut records, &mut seen, txid, 91_842);
-        append_history_record(&mut records, &mut seen, txid, 91_880);
-        append_history_record(&mut records, &mut seen, txid, 91_880);
+        append_history_record(&mut records, &mut seen, txid, 91_842).unwrap();
+        append_history_record(&mut records, &mut seen, txid, 91_880).unwrap();
+        append_history_record(&mut records, &mut seen, txid, 91_880).unwrap();
 
         assert_eq!(records, vec![(txid, 91_842), (txid, 91_880)]);
+    }
+
+    #[test]
+    fn history_record_materialization_is_bounded() {
+        let txid = Txid::from_byte_array([1; 32]);
+        let mut records = Vec::new();
+        let mut seen = HashSet::new();
+        for height in 0..MAX_ELECTRUM_HISTORY_RECORDS {
+            append_history_record(&mut records, &mut seen, txid, height as i64).unwrap();
+        }
+        let error = append_history_record(
+            &mut records,
+            &mut seen,
+            txid,
+            MAX_ELECTRUM_HISTORY_RECORDS as i64,
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<ElectrumHistoryTooLarge>().is_some());
+        assert_eq!(records.len(), MAX_ELECTRUM_HISTORY_RECORDS);
     }
 
     #[test]
@@ -2736,6 +2791,7 @@ mod tests {
         node.accept_transaction(transaction)?;
         assert!(
             mempool_for_script(&node, &spent_script_hash)
+                .unwrap()
                 .iter()
                 .any(|entry| entry["tx_hash"] == json!(txid.to_string()))
         );

@@ -628,6 +628,11 @@ fn sign_transaction(
     sighash_name: &str,
     registers: &HashMap<String, Value>,
 ) -> Result<()> {
+    let sighash_name = if sighash_name.is_empty() {
+        "ALL"
+    } else {
+        sighash_name
+    };
     let private_keys = registers
         .get("privatekeys")
         .ok_or_else(|| anyhow!("privatekeys register variable must be set."))?

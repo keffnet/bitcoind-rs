@@ -935,6 +935,15 @@ impl From<NetworkName> for Network {
     args_override_self = true
 )]
 pub struct Args {
+    /// Accept Core's `bitcoind node` launcher spelling when this daemon is
+    /// invoked through a wrapper that forwards the subcommand verbatim.
+    #[arg(
+        value_name = "COMMAND",
+        hide = true,
+        value_parser = clap::builder::PossibleValuesParser::new(["node"])
+    )]
+    pub command: Option<String>,
+
     #[arg(
         long,
         visible_alias = "chain",
@@ -4864,6 +4873,15 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("use includeconf= if you want to include additional config files"));
+    }
+
+    #[test]
+    fn accepts_core_node_launcher_subcommand() {
+        let args = Args::try_parse_from(["bitcoind-rs", "node"]).unwrap();
+        assert_eq!(args.command.as_deref(), Some("node"));
+
+        let error = Args::try_parse_from(["bitcoind-rs", "rpc"]).unwrap_err();
+        assert!(error.to_string().contains("invalid value 'rpc'"));
     }
 
     #[test]

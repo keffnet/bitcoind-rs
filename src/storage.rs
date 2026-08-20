@@ -3503,6 +3503,14 @@ impl ElectrumBlockStore {
         self.index.contains_key(hash)
     }
 
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.index.is_empty()
+    }
+
     pub fn disk_usage(&self) -> Result<u64> {
         self.file
             .metadata()?
@@ -3524,9 +3532,8 @@ impl ElectrumBlockStore {
         if self.index.contains_key(&hash) {
             return Ok(hash);
         }
-        let mut bytes = hash.to_byte_array().to_vec();
-        bytes.extend_from_slice(&serialize(&block.txdata));
-        let bytes = encode_storage_payload(&bytes, MAX_STORED_ELECTRUM_BLOCK_SIZE + 32)?;
+        let raw_bytes = encode_electrum_block_record(hash, &block.txdata)?;
+        let bytes = encode_storage_payload(&raw_bytes, MAX_STORED_ELECTRUM_BLOCK_SIZE + 32)?;
         let offset = self.file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len())
             .context("Electrum transaction record length does not fit u32")?;
@@ -3545,6 +3552,39 @@ impl ElectrumBlockStore {
         )?;
         self.index.insert(hash, record);
         Ok(hash)
+    }
+
+    /// Remove transaction bodies that are no longer needed by the active
+    /// pruned chain. The sidecar is intentionally append-only during normal
+    /// operation, but a reorg or a node upgraded from the earlier
+    /// eager-copying behavior can otherwise retain side-chain and still
+    /// unpruned bodies forever.
+    pub fn retain_only(&mut self, retained: &HashSet<BlockHash>) -> Result<bool> {
+        let hashes = self.index.keys().copied().collect::<Vec<_>>();
+        if hashes.iter().all(|hash| retained.contains(hash)) {
+            return Ok(false);
+        }
+
+        let mut records = Vec::with_capacity(retained.len().min(hashes.len()));
+        for hash in hashes {
+            if !retained.contains(&hash) {
+                continue;
+            }
+            let transactions = self
+                .transactions(&hash)?
+                .with_context(|| format!("Electrum transaction body {hash} disappeared"))?;
+            records.push((hash, encode_electrum_block_record(hash, &transactions)?));
+        }
+        let (file, index, data_len) = rewrite_record_file(
+            &self.path,
+            &records,
+            XorKey::default(),
+            MAX_STORED_ELECTRUM_BLOCK_SIZE + 32,
+        )?;
+        self.file = file;
+        self.index = index;
+        rewrite_index(&mut self.index_file, data_len, &self.index)?;
+        Ok(true)
     }
 
     pub fn flush(&mut self) -> Result<()> {
@@ -3605,6 +3645,18 @@ impl ElectrumBlockStore {
             deserialize(&bytes[32..]).context("decoding stored Electrum transactions")?;
         Ok(Some(transactions))
     }
+}
+
+fn encode_electrum_block_record(hash: BlockHash, transactions: &[Transaction]) -> Result<Vec<u8>> {
+    let mut bytes = hash.to_byte_array().to_vec();
+    bytes.extend_from_slice(&serialize(&transactions.to_vec()));
+    if bytes.len() > MAX_STORED_ELECTRUM_BLOCK_SIZE + 32 {
+        bail!(
+            "Electrum transaction record is too large: {} bytes",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
 }
 
 impl Drop for ElectrumBlockStore {
@@ -4689,6 +4741,27 @@ mod tests {
             txid
         );
         assert_eq!(reopened.merkle_branch(&hash, 0).unwrap(), Some(Vec::new()));
+    }
+
+    #[test]
+    fn compacts_electrum_transactions_to_the_pruned_active_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = genesis_block(Network::Regtest);
+        let mut second = first.clone();
+        second.header.nonce = 1;
+        let first_hash = first.block_hash();
+        let second_hash = second.block_hash();
+        let mut store = ElectrumBlockStore::open(directory.path()).unwrap();
+        store.insert(&first).unwrap();
+        store.insert(&second).unwrap();
+        let before = store.disk_usage().unwrap();
+
+        assert!(store.retain_only(&HashSet::from([first_hash])).unwrap());
+        assert!(store.disk_usage().unwrap() < before);
+        assert!(store.contains(&first_hash));
+        assert!(!store.contains(&second_hash));
+        assert!(store.transaction(&first_hash, 0).unwrap().is_some());
+        assert!(store.transaction(&second_hash, 0).unwrap().is_none());
     }
 
     #[test]

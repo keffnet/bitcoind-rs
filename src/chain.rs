@@ -2552,14 +2552,17 @@ impl ChainState {
             return Ok(());
         }
         let mut store = ElectrumBlockStore::open(self.data_dir.join("indexes/electrum"))?;
-        for hash in self.active_chain.clone() {
-            if store.contains(&hash) {
-                continue;
-            }
-            if let Some(block) = self.store.get(&hash)? {
-                store.insert(&block)?;
-            }
-        }
+        let prune_height = self.prune_height.unwrap_or_default();
+        let retained = self
+            .active_chain
+            .iter()
+            .enumerate()
+            .filter_map(|(height, hash)| {
+                let height = u32::try_from(height).ok()?;
+                (height < prune_height && !self.store.contains(hash)).then_some(*hash)
+            })
+            .collect::<HashSet<_>>();
+        store.retain_only(&retained)?;
         self.electrum_store = Some(store);
         Ok(())
     }
@@ -2862,6 +2865,36 @@ impl ChainState {
                     .then_some(*hash)
             })
             .collect::<HashSet<_>>();
+        // The Electrum sidecar is a fallback only for bodies that this native
+        // block store is about to remove. Populate it before rewriting the
+        // authoritative files so a crash cannot leave the active history
+        // queryable only through a body that was already deleted.
+        let sidecar_blocks = if self.electrum_store.is_some() {
+            self.active_chain
+                .iter()
+                .enumerate()
+                .filter_map(|(height, hash)| {
+                    let height = u32::try_from(height).ok()?;
+                    (height < target_height
+                        && stored_hashes.contains(hash)
+                        && !retained_blocks.contains(hash))
+                    .then_some(*hash)
+                })
+                .map(|hash| {
+                    self.store
+                        .get(&hash)?
+                        .with_context(|| format!("block {hash} disappeared before pruning"))
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        if let Some(store) = self.electrum_store.as_mut() {
+            for block in &sidecar_blocks {
+                store.insert_unsynced(block)?;
+            }
+            store.flush()?;
+        }
         self.store.prune(&retained_blocks, &retained_blocks)?;
         self.prune_height = Some(target_height);
         self.prune_protected_blocks
@@ -5933,9 +5966,6 @@ impl ChainState {
                 Amount::MAX_MONEY.to_sat(),
             )?;
             self.store.insert(&block)?;
-            if let Some(store) = self.electrum_store.as_mut() {
-                store.insert(&block)?;
-            }
             self.index_active_transactions(&block, node.height);
             self.index_all_transactions(&block, node.height);
             self.persist_transaction_index_for_block(&block)?;
@@ -5984,9 +6014,6 @@ impl ChainState {
                         .is_some_and(ValidationError::should_mark_block_invalid)
                 {
                     self.store.insert(&block)?;
-                    if let Some(store) = self.electrum_store.as_mut() {
-                        store.insert(&block)?;
-                    }
                     self.assign_block_sequence_id(hash);
                     self.persist_metadata()?;
                 }
@@ -6026,9 +6053,6 @@ impl ChainState {
             )?;
             self.record_unlinked_body(hash);
             self.insert_side_chain_body(&block)?;
-            if let Some(store) = self.electrum_store.as_mut() {
-                store.insert_unsynced(&block)?;
-            }
             self.index_all_transactions(&block, height);
             self.block_index.insert(
                 hash,
@@ -6066,9 +6090,6 @@ impl ChainState {
             // longer descendant.
             self.side_chain_utxos = None;
             self.insert_side_chain_body(&block)?;
-            if let Some(store) = self.electrum_store.as_mut() {
-                store.insert_unsynced(&block)?;
-            }
             self.index_all_transactions(&block, height);
             let chain_work = parent.chain_work + block.header.work();
             self.block_index.insert(
@@ -6089,9 +6110,6 @@ impl ChainState {
             if chain_work > self.tip().work && !self.candidate_chain_has_missing_body(hash) {
                 self.store.flush()?;
                 self.flush_transaction_index_store()?;
-                if let Some(store) = self.electrum_store.as_mut() {
-                    store.flush()?;
-                }
                 self.activate_chain(hash)?;
             }
             self.process_orphans(hash);
@@ -6123,9 +6141,6 @@ impl ChainState {
                             .is_some_and(ValidationError::should_mark_block_invalid)
                     {
                         self.insert_side_chain_body(&block)?;
-                        if let Some(store) = self.electrum_store.as_mut() {
-                            store.insert_unsynced(&block)?;
-                        }
                         self.assign_block_sequence_id(hash);
                     }
                     return Err(error);
@@ -6175,9 +6190,6 @@ impl ChainState {
                 // validation.
                 self.record_unlinked_body(hash);
                 self.insert_side_chain_body(&block)?;
-                if let Some(store) = self.electrum_store.as_mut() {
-                    store.insert_unsynced(&block)?;
-                }
                 self.index_all_transactions(&block, height);
                 self.block_index.insert(
                     hash,
@@ -6204,9 +6216,6 @@ impl ChainState {
                             .is_some_and(ValidationError::should_mark_block_invalid)
                     {
                         self.insert_side_chain_body(&block)?;
-                        if let Some(store) = self.electrum_store.as_mut() {
-                            store.insert_unsynced(&block)?;
-                        }
                         self.assign_block_sequence_id(hash);
                     }
                     return Err(error);
@@ -6225,9 +6234,6 @@ impl ChainState {
             });
         }
         self.insert_side_chain_body(&block)?;
-        if let Some(store) = self.electrum_store.as_mut() {
-            store.insert_unsynced(&block)?;
-        }
         self.index_all_transactions(&block, height);
         let chain_work = parent.chain_work + block.header.work();
         self.block_index.insert(
@@ -6248,9 +6254,6 @@ impl ChainState {
         if chain_work > self.tip().work && !self.candidate_chain_has_missing_body(hash) {
             self.store.flush()?;
             self.flush_transaction_index_store()?;
-            if let Some(store) = self.electrum_store.as_mut() {
-                store.flush()?;
-            }
             self.activate_chain(hash)?;
         }
         self.process_orphans(hash);
@@ -7169,9 +7172,6 @@ impl ChainState {
             application.spent_entries.iter().cloned().collect();
         if persist {
             self.store.insert(block)?;
-        }
-        if let Some(store) = self.electrum_store.as_mut() {
-            store.insert(block)?;
         }
         if persist {
             let delta = self.chainstate_delta_for_block(
@@ -11880,8 +11880,16 @@ mod tests {
         let old_block_hash = old_block_hash.expect("sidecar test block");
         let old_txid = old_txid.expect("sidecar test transaction");
         assert!(state.transaction(&old_txid).unwrap().is_some());
+        assert_eq!(state.electrum_store.as_ref().unwrap().len(), 0);
         state.prune(50).unwrap();
         assert!(!state.store.contains(&old_block_hash));
+        assert!(
+            state
+                .electrum_store
+                .as_ref()
+                .unwrap()
+                .contains(&old_block_hash)
+        );
         let (transaction, location) = state
             .transaction(&old_txid)
             .unwrap()

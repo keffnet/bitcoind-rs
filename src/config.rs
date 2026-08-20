@@ -13,6 +13,7 @@ use clap::{CommandFactory, Parser, ValueEnum};
 
 use crate::IpSubnet;
 use crate::address::NetworkEndpoint;
+use crate::asmap::EMBEDDED_ASMAP_PATH;
 use crate::i2p::I2P_SAM_PORT;
 use crate::mempool::{RbfPolicy, TrucPolicy};
 use crate::tor::DEFAULT_TOR_CONTROL_PORT;
@@ -3481,9 +3482,7 @@ impl Config {
         } else {
             match args.asmap.as_deref() {
                 None | Some("0") | Some("false") => None,
-                Some("1") | Some("true") => {
-                    bail!("Embedded asmap data not available")
-                }
+                Some("1") | Some("true") => Some(PathBuf::from(EMBEDDED_ASMAP_PATH)),
                 Some(path) => {
                     let path = PathBuf::from(path);
                     Some(if path.is_absolute() {
@@ -5306,7 +5305,10 @@ mod tests {
         let args = Args::try_parse_from(["bitcoind-rs", "--noasmap"]).unwrap();
         assert!(Config::from_args(args).unwrap().asmap.is_none());
         let args = Args::try_parse_from(["bitcoind-rs", "--asmap"]).unwrap();
-        assert!(Config::from_args(args).is_err());
+        assert_eq!(
+            Config::from_args(args).unwrap().asmap,
+            Some(PathBuf::from(EMBEDDED_ASMAP_PATH))
+        );
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -12,6 +12,10 @@ use bitcoin::hashes::{Hash, sha256d};
 
 use crate::address::NetworkEndpoint;
 
+/// Internal marker used by configuration to select Core's embedded v31.1 map.
+/// It is never treated as a filesystem path.
+pub(crate) const EMBEDDED_ASMAP_PATH: &str = "<embedded-asmap-v31.1>";
+
 #[derive(Clone, Debug)]
 pub struct AsMap {
     data: Vec<u8>,
@@ -19,6 +23,15 @@ pub struct AsMap {
 }
 
 impl AsMap {
+    pub fn embedded() -> Result<Self> {
+        Self::from_bytes(include_bytes!("data/ip_asn.dat"))
+            .context("Could not read embedded asmap data")
+    }
+
+    pub fn embedded_len() -> usize {
+        include_bytes!("data/ip_asn.dat").len()
+    }
+
     pub fn from_file(path: &Path) -> Result<Self> {
         let data = std::fs::read(path)
             .with_context(|| format!("Could not find asmap file \"{}\"", path.display()))?;
@@ -293,5 +306,12 @@ mod tests {
     fn all_return_map_is_valid() {
         let map = AsMap::from_bytes(&[0, 0, 0]).unwrap();
         assert_eq!(map.mapped_as_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)), Some(1));
+    }
+
+    #[test]
+    fn embedded_v31_map_is_valid() {
+        let map = AsMap::embedded().unwrap();
+        assert_eq!(AsMap::embedded_len(), 1_519_688);
+        assert!(map.mapped_as_ip("1.1.1.1".parse().unwrap()).is_some());
     }
 }

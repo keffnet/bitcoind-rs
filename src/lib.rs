@@ -77,7 +77,7 @@ use tokio::sync::{Notify, broadcast, oneshot};
 use tracing::{debug, info, warn};
 
 use crate::address::{NetworkEndpoint, is_core_routable_ip};
-use crate::asmap::AsMap;
+use crate::asmap::{AsMap, EMBEDDED_ASMAP_PATH};
 use crate::chain::ChainState;
 use crate::config::{
     Config, PeerPermissions, ProxyEndpoint, RpcCookiePermissions, core_network_blocks_dir,
@@ -1952,7 +1952,13 @@ impl Node {
         let asmap = config
             .asmap
             .as_deref()
-            .map(AsMap::from_file)
+            .map(|path| {
+                if path == Path::new(EMBEDDED_ASMAP_PATH) {
+                    AsMap::embedded()
+                } else {
+                    AsMap::from_file(path)
+                }
+            })
             .transpose()?
             .map(Arc::new);
         if let Some(mock_time) = config.mock_time {
@@ -2759,12 +2765,19 @@ impl Node {
     pub fn log_asmap_configuration(&self) {
         if let Some(asmap) = &self.asmap {
             if let Some(path) = self.config.asmap.as_deref() {
-                let size = fs::metadata(path).map_or(0, |metadata| metadata.len());
-                info!(
-                    "Opened asmap file \"{}\" ({} bytes) from disk",
-                    path.display(),
-                    size
-                );
+                if path == Path::new(EMBEDDED_ASMAP_PATH) {
+                    info!(
+                        "Opened asmap data ({} bytes) from embedded byte array",
+                        AsMap::embedded_len()
+                    );
+                } else {
+                    let size = fs::metadata(path).map_or(0, |metadata| metadata.len());
+                    info!(
+                        "Opened asmap file \"{}\" ({} bytes) from disk",
+                        path.display(),
+                        size
+                    );
+                }
             }
             info!(
                 "Using asmap version {} for IP bucketing",

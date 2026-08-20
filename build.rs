@@ -10,6 +10,7 @@ fn main() {
     for schema in schemas {
         println!("cargo:rerun-if-changed={schema}");
     }
+    println!("cargo:rerun-if-changed=src/data/ip_asn.dat");
 
     let mut command = capnpc::codegen::CodeGenerationCommand::new();
     command.output_directory(std::env::var("OUT_DIR").expect("OUT_DIR is set"));

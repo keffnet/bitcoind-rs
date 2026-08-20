@@ -7129,12 +7129,17 @@ impl ChainState {
             }
         } else {
             let chunk_size = pending.len().div_ceil(thread_count);
-            let failures = thread::scope(|scope| {
+            let shutdown_interrupt = self.shutdown_interrupt.clone();
+            let failures = thread::scope(|scope| -> Result<Vec<(usize, ValidationError)>> {
                 let handles = pending
                     .chunks(chunk_size)
                     .map(|chunk| {
-                        scope.spawn(move || {
+                        let shutdown_interrupt = shutdown_interrupt.clone();
+                        scope.spawn(move || -> Result<Option<(usize, ValidationError)>> {
                             for job in chunk {
+                                if shutdown_interrupt.load(Ordering::Acquire) {
+                                    bail!("block validation interrupted by shutdown")
+                                }
                                 if let Err(error) =
                                     validation::validate_transaction_scripts_at_time_with_block_hash_with_params(
                                         &deployment_parameters,
@@ -7145,18 +7150,23 @@ impl ChainState {
                                         &job.previous_outputs,
                                     )
                                 {
-                                    return Some((job.tx_index, error));
+                                    return Ok(Some((job.tx_index, error)));
                                 }
                             }
-                            None
+                            Ok(None)
                         })
                     })
                     .collect::<Vec<_>>();
-                handles
-                    .into_iter()
-                    .filter_map(|handle| handle.join().expect("script validation worker panicked"))
-                    .collect::<Vec<_>>()
-            });
+                let mut failures = Vec::new();
+                for handle in handles {
+                    if let Some(failure) =
+                        handle.join().expect("script validation worker panicked")?
+                    {
+                        failures.push(failure);
+                    }
+                }
+                Ok(failures)
+            })?;
             if let Some((_, error)) = failures.into_iter().min_by_key(|(tx_index, _)| *tx_index) {
                 return Err(error.into());
             }

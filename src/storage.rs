@@ -24,6 +24,7 @@ use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
 use parking_lot::{Mutex, RwLock};
 use rand::random;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 const MAX_STORED_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
@@ -3309,12 +3310,14 @@ fn load_utxo_index(
 ) -> Result<Option<UtxoIndexState>> {
     let index_len = file.metadata()?.len();
     if index_len < UTXO_INDEX_MAGIC.len() as u64 {
+        warn!("UTXO index is missing or truncated; rebuilding from the value log");
         return Ok(None);
     }
     file.seek(SeekFrom::Start(0))?;
     let mut magic = vec![0u8; UTXO_INDEX_MAGIC.len()];
     file.read_exact(&mut magic)?;
     if magic != UTXO_INDEX_MAGIC {
+        warn!("UTXO index has an unknown format; rebuilding from the value log");
         return Ok(None);
     }
     let mut position = UTXO_INDEX_MAGIC.len() as u64;
@@ -3328,6 +3331,7 @@ fn load_utxo_index(
     while position < index_len {
         let mut length_bytes = [0u8; 4];
         if file.read_exact(&mut length_bytes).is_err() {
+            warn!("UTXO index has a truncated record length; rebuilding from the value log");
             return Ok(None);
         }
         let length = u32::from_le_bytes(length_bytes);
@@ -3336,6 +3340,12 @@ fn load_utxo_index(
             .and_then(|value| value.checked_add(u64::from(length)))
             .context("UTXO index position overflowed")?;
         if next > index_len || length == 0 || length > 128 {
+            warn!(
+                position,
+                length,
+                index_len,
+                "UTXO index has invalid record bounds; rebuilding from the value log"
+            );
             return Ok(None);
         }
         let mut body = vec![0u8; length as usize];
@@ -3347,6 +3357,7 @@ fn load_utxo_index(
         match operation {
             UTXO_PUT => {
                 if body.len() != 1 + 8 + 8 + 4 + 36 {
+                    warn!("UTXO index has an invalid put record; rebuilding from the value log");
                     return Ok(None);
                 }
                 let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
@@ -3361,31 +3372,58 @@ fn load_utxo_index(
                         .and_then(|end| end.checked_add(u64::from(value_length)))
                         .is_none_or(|end| end > data_len)
                 {
+                    warn!(
+                        offset,
+                        value_length,
+                        data_len,
+                        "UTXO index points outside the value log; rebuilding"
+                    );
                     return Ok(None);
                 }
                 if pending_batch != Some(batch_id) {
                     if pending_batch.is_some() {
+                        warn!(
+                            batch_id,
+                            "UTXO index interleaves uncommitted batches; rebuilding from the value log"
+                        );
                         return Ok(None);
                     }
                     pending_batch = Some(batch_id);
                 }
                 let Ok(location) = UtxoLocation::new(offset, value_length) else {
+                    warn!(
+                        offset,
+                        value_length,
+                        "UTXO index location cannot be represented; rebuilding from the value log"
+                    );
                     return Ok(None);
                 };
                 pending.push(PendingUtxoOperation::Put { outpoint, location });
-                if validate_utxo_data_header(data_file, location, outpoint).is_err() {
+                if let Err(error) = validate_utxo_data_header(data_file, location, outpoint) {
+                    warn!(
+                        %error,
+                        %outpoint,
+                        offset,
+                        value_length,
+                        "UTXO index value validation failed; rebuilding from the value log"
+                    );
                     return Ok(None);
                 }
                 max_batch = max_batch.max(batch_id);
             }
             UTXO_DELETE => {
                 if body.len() != 1 + 8 + 36 {
+                    warn!("UTXO index has an invalid delete record; rebuilding from the value log");
                     return Ok(None);
                 }
                 let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
                 let outpoint = decode_outpoint(&body[9..45])?;
                 if pending_batch != Some(batch_id) {
                     if pending_batch.is_some() {
+                        warn!(
+                            batch_id,
+                            "UTXO index interleaves uncommitted delete batches; rebuilding from the value log"
+                        );
                         return Ok(None);
                     }
                     pending_batch = Some(batch_id);
@@ -3395,6 +3433,7 @@ fn load_utxo_index(
             }
             UTXO_COMMIT => {
                 if body.len() != 1 + 8 + 8 + 8 + 8 {
+                    warn!("UTXO index has an invalid commit record; rebuilding from the value log");
                     return Ok(None);
                 }
                 let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
@@ -3402,6 +3441,7 @@ fn load_utxo_index(
                 let next_batch_id = u64::from_le_bytes(body[17..25].try_into().unwrap());
                 let generation = u64::from_le_bytes(body[25..33].try_into().unwrap());
                 if next_batch_id == 0 {
+                    warn!("UTXO index has an invalid next batch ID; rebuilding from the value log");
                     return Ok(None);
                 }
                 if generation == 0
@@ -3410,9 +3450,22 @@ fn load_utxo_index(
                     || last_data_end.is_some_and(|previous| data_end < previous)
                     || stored_generation.is_some_and(|previous| previous != generation)
                 {
+                    warn!(
+                        batch_id,
+                        data_end,
+                        data_len,
+                        generation,
+                        "UTXO index commit metadata is inconsistent; rebuilding from the value log"
+                    );
                     return Ok(None);
                 }
                 if pending_batch != Some(batch_id) || (pending.is_empty() && batch_id != 0) {
+                    warn!(
+                        batch_id,
+                        pending_batch = ?pending_batch,
+                        pending_operations = pending.len(),
+                        "UTXO index commit does not match its operations; rebuilding from the value log"
+                    );
                     return Ok(None);
                 }
                 for operation in pending.drain(..) {
@@ -3431,11 +3484,23 @@ fn load_utxo_index(
                 stored_generation = Some(generation);
                 max_batch = max_batch.max(batch_id);
             }
-            _ => return Ok(None),
+            _ => {
+                warn!(
+                    operation,
+                    "UTXO index contains an unknown operation; rebuilding from the value log"
+                );
+                return Ok(None);
+            }
         }
         position = next;
     }
     if pending_batch.is_some() || last_data_end != Some(data_len) {
+        warn!(
+            pending_batch = ?pending_batch,
+            last_data_end = ?last_data_end,
+            data_len,
+            "UTXO index does not cover the complete value log; rebuilding"
+        );
         return Ok(None);
     }
     Ok(Some((

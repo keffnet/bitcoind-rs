@@ -32,7 +32,21 @@ fn main() -> ExitCode {
     let ipc_configured = config_requests_ipc(&arguments);
     let multiprocess =
         explicitly_multiprocess || (!explicitly_monolithic && (ipc_argument || ipc_configured));
-    let arguments = daemon_arguments(arguments);
+    let mut arguments = daemon_arguments(arguments);
+
+    // Core's `bitcoin` launcher starts the IPC node without any of the
+    // daemon-only auxiliary listeners.  Electrum is an intentional extra
+    // service of bitcoind-rs, but leaving its default listener enabled here
+    // makes a Core-style IPC launch unexpectedly claim port 30001 and can
+    // collide with an independently managed Electrum service.  Preserve an
+    // explicit command-line or config-file choice; otherwise disable only
+    // the extra listener for IPC launches.
+    if (ipc_argument || ipc_configured)
+        && !has_electrum_argument(&arguments)
+        && !config_requests_electrum(&arguments)
+    {
+        arguments.push("--electrum=0".to_owned());
+    }
 
     if explicitly_monolithic && (ipc_argument || ipc_configured) {
         let invalid = arguments
@@ -114,6 +128,36 @@ fn config_requests_ipc(arguments: &[String]) -> bool {
     })
 }
 
+fn has_electrum_argument(arguments: &[String]) -> bool {
+    arguments.iter().any(|argument| {
+        matches!(
+            argument
+                .split_once('=')
+                .map(|(name, _)| name)
+                .unwrap_or(argument),
+            "-electrum" | "--electrum"
+        )
+    })
+}
+
+fn config_requests_electrum(arguments: &[String]) -> bool {
+    let datadir = arguments.iter().find_map(|argument| {
+        argument
+            .strip_prefix("-datadir=")
+            .or_else(|| argument.strip_prefix("--datadir="))
+    });
+    let Some(datadir) = datadir else {
+        return false;
+    };
+    let path = PathBuf::from(datadir).join("bitcoin.conf");
+    std::fs::read_to_string(path).is_ok_and(|contents| {
+        contents.lines().any(|line| {
+            let line = line.split('#').next().unwrap_or_default().trim();
+            line.starts_with("electrum=")
+        })
+    })
+}
+
 fn daemon_path() -> PathBuf {
     if let Some(path) = env::var_os("BITCOIND_RS_BIN") {
         return PathBuf::from(path);
@@ -139,7 +183,7 @@ fn daemon_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{config_requests_ipc, daemon_arguments};
+    use super::{config_requests_ipc, daemon_arguments, has_electrum_argument};
 
     #[test]
     fn strips_core_wrapper_modes_and_node_subcommand() {
@@ -161,6 +205,11 @@ mod tests {
         );
         assert!(!config_requests_ipc(&[
             "-datadir=/tmp/does-not-exist".to_owned()
+        ]));
+        assert!(has_electrum_argument(&["--electrum=0".to_owned()]));
+        assert!(has_electrum_argument(&[
+            "--electrum".to_owned(),
+            "0".to_owned()
         ]));
     }
 }

@@ -8383,8 +8383,16 @@ impl ChainState {
     }
 
     fn index_block_spends(&mut self, block: &Block, height: u32) {
-        let block_hash = block.block_hash();
-        for transaction in &block.txdata {
+        self.index_transaction_spends(&block.txdata, block.block_hash(), height);
+    }
+
+    fn index_transaction_spends(
+        &mut self,
+        transactions: &[Transaction],
+        block_hash: BlockHash,
+        height: u32,
+    ) {
+        for transaction in transactions {
             let txid = transaction.compute_txid();
             for (input_index, input) in transaction.input.iter().enumerate() {
                 if !input.previous_output.is_null() {
@@ -8414,6 +8422,14 @@ impl ChainState {
                     .prune_height
                     .is_some_and(|prune_height| height < prune_height)
                 {
+                    let transactions = if let Some(store) = self.electrum_store.as_mut() {
+                        store.transactions_for_block(&hash)?
+                    } else {
+                        None
+                    };
+                    if let Some(transactions) = transactions {
+                        self.index_transaction_spends(&transactions, hash, height);
+                    }
                     continue;
                 }
                 bail!("active block {hash} is missing from block store")
@@ -11914,6 +11930,91 @@ mod tests {
         assert_eq!(
             reopened.merkle_branch(&old_txid).unwrap(),
             Some((Vec::new(), 0, 5))
+        );
+    }
+
+    #[test]
+    fn pruned_electrum_spender_index_survives_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_pruning(1).unwrap();
+        state.configure_electrum_index(true).unwrap();
+        state.configure_txospender_index(true).unwrap();
+
+        let mut funding_block = None;
+        for height in 1..=100 {
+            let block = mine_block(&state, height);
+            if height == 1 {
+                funding_block = Some(block.clone());
+            }
+            state.connect_block(block).unwrap();
+        }
+        let funding_block = funding_block.expect("funding block");
+        let funding_outpoint = OutPoint::new(funding_block.txdata[0].compute_txid(), 0);
+        let spend = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: funding_outpoint,
+                script_sig: Builder::new().push_int(1).into_script(),
+                sequence: Sequence::MAX,
+                witness: Witness::default(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(4_999_999_000),
+                script_pubkey: Builder::new().push_int(1).into_script(),
+            }],
+        };
+        let spend_txid = spend.compute_txid();
+        let previous = state.header(100).expect("height 100 header");
+        let mut spending_block = Block {
+            header: Header {
+                version: BlockVersion::from_consensus(4),
+                prev_blockhash: previous.block_hash(),
+                merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+                time: previous.time + 1,
+                bits: previous.bits,
+                nonce: 0,
+            },
+            txdata: vec![
+                coinbase_transaction(
+                    101,
+                    validation::block_subsidy_for_network(Network::Regtest, 101),
+                    3,
+                ),
+                spend,
+            ],
+        };
+        spending_block.header.merkle_root = spending_block.compute_merkle_root().unwrap();
+        while !spending_block
+            .header
+            .target()
+            .is_met_by(spending_block.block_hash())
+        {
+            spending_block.header.nonce = spending_block.header.nonce.wrapping_add(1);
+        }
+        let spending_block_hash = spending_block.block_hash();
+        state.connect_block(spending_block).unwrap();
+        assert_eq!(
+            state.spending_transaction(&funding_outpoint),
+            Some((spend_txid, 0, spending_block_hash, 101))
+        );
+
+        for height in 102..=400 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        state.prune(300).unwrap();
+        assert!(state.is_block_pruned(&spending_block_hash));
+
+        let path = directory.path().to_owned();
+        drop(state);
+        let mut reopened = ChainState::open(Network::Regtest, &path).unwrap();
+        reopened.configure_pruning(1).unwrap();
+        reopened.configure_electrum_index(true).unwrap();
+        reopened.configure_txospender_index(true).unwrap();
+        assert_eq!(
+            reopened.spending_transaction(&funding_outpoint),
+            Some((spend_txid, 0, spending_block_hash, 101))
         );
     }
 

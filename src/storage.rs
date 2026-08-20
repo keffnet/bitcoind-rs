@@ -3668,6 +3668,16 @@ impl ElectrumBlockStore {
         )))
     }
 
+    /// Read every transaction for a pruned active-chain block.  Chainstate
+    /// uses this compact sidecar not only for Electrum transaction serving,
+    /// but also to rebuild the confirmed-spender index after a restart.
+    pub(crate) fn transactions_for_block(
+        &mut self,
+        block_hash: &BlockHash,
+    ) -> Result<Option<Vec<Transaction>>> {
+        self.transactions(block_hash)
+    }
+
     fn transactions(&mut self, block_hash: &BlockHash) -> Result<Option<Vec<Transaction>>> {
         let Some(record) = self.index.get(block_hash).copied() else {
             return Ok(None);

@@ -2067,9 +2067,12 @@ impl Node {
         // when the standalone Core-style txospenderindex RPC option is off.
         // Keep this internal index enabled for Electrum without changing the
         // user-facing getindexinfo reporting for that optional index.
+        // Configure the Electrum sidecar first: a pruned restart can then
+        // rebuild confirmed spenders from its compact transaction records
+        // before the index is exposed to RPC clients.
+        chain.configure_electrum_index(config.electrum_bind.is_some())?;
         chain
             .configure_txospender_index(config.txospenderindex || config.electrum_bind.is_some())?;
-        chain.configure_electrum_index(config.electrum_bind.is_some())?;
         chain.configure_coinstats_index(config.coinstatsindex)?;
         let signet_challenge = chain.signet_challenge().map(|challenge| challenge.to_vec());
         for path in &config.load_blocks {

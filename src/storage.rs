@@ -80,7 +80,9 @@ pub type StoredElectrumHistory = Vec<(Txid, u32)>;
 
 #[derive(Default)]
 struct UtxoReadCache {
-    entries: FastHashMap<OutPoint, (StoredUtxo, usize, u64)>,
+    // Generation zero marks entries loaded by the complete sequential warm.
+    // Those entries need no second copy of every outpoint in the FIFO queue.
+    entries: FastHashMap<OutPoint, (StoredUtxo, u64)>,
     order: VecDeque<(OutPoint, u64)>,
     bytes: usize,
     limit: usize,
@@ -97,9 +99,7 @@ impl UtxoReadCache {
         // Outputs are normally read once, immediately before being spent.
         // FIFO retention avoids an O(cache size) LRU-list update in that hot
         // path while still keeping recently created outputs resident.
-        self.entries
-            .get(outpoint)
-            .map(|(entry, _, _)| entry.clone())
+        self.entries.get(outpoint).map(|(entry, _)| entry.clone())
     }
 
     fn insert(&mut self, outpoint: OutPoint, entry: StoredUtxo) {
@@ -107,19 +107,37 @@ impl UtxoReadCache {
         if self.limit == 0 || bytes > self.limit {
             return;
         }
+        self.next_generation = self.next_generation.saturating_add(1).max(1);
         let generation = self.next_generation;
-        self.next_generation = self.next_generation.saturating_add(1);
-        if let Some((_, old_bytes, _)) = self.entries.insert(outpoint, (entry, bytes, generation)) {
-            self.bytes = self.bytes.saturating_sub(old_bytes);
+        if let Some((old_entry, _)) = self.entries.insert(outpoint, (entry, generation)) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(stored_utxo_cache_bytes(&old_entry));
         }
         self.bytes = self.bytes.saturating_add(bytes);
         self.order.push_back((outpoint, generation));
         self.trim();
     }
 
+    /// Insert an entry discovered by a complete sequential database scan.
+    /// It remains cache-resident until spent or until a later size trim needs
+    /// to reclaim stationary entries, without one FIFO record per coin.
+    fn insert_stationary(&mut self, outpoint: OutPoint, entry: StoredUtxo) {
+        let bytes = stored_utxo_cache_bytes(&entry);
+        if self.limit == 0 || bytes > self.limit {
+            return;
+        }
+        if let Some((old_entry, _)) = self.entries.insert(outpoint, (entry, 0)) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(stored_utxo_cache_bytes(&old_entry));
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
     fn remove(&mut self, outpoint: &OutPoint) {
-        if let Some((_, bytes, _)) = self.entries.remove(outpoint) {
-            self.bytes = self.bytes.saturating_sub(bytes);
+        if let Some((entry, _)) = self.entries.remove(outpoint) {
+            self.bytes = self.bytes.saturating_sub(stored_utxo_cache_bytes(&entry));
         }
         self.compact_order_if_needed();
     }
@@ -133,16 +151,31 @@ impl UtxoReadCache {
     fn trim(&mut self) {
         while self.bytes > self.limit {
             let Some((outpoint, generation)) = self.order.pop_front() else {
-                self.bytes = 0;
                 break;
             };
             let is_current = self
                 .entries
                 .get(&outpoint)
-                .is_some_and(|(_, _, current)| *current == generation);
-            if is_current && let Some((_, bytes, _)) = self.entries.remove(&outpoint) {
-                self.bytes = self.bytes.saturating_sub(bytes);
+                .is_some_and(|(_, current)| *current == generation);
+            if is_current && let Some((entry, _)) = self.entries.remove(&outpoint) {
+                self.bytes = self.bytes.saturating_sub(stored_utxo_cache_bytes(&entry));
             }
+        }
+        if self.bytes > self.limit {
+            // A complete warm intentionally omits stationary entries from the
+            // FIFO. If chain growth eventually exceeds the configured limit,
+            // reclaim enough of them in one pass to leave useful headroom and
+            // avoid scanning the full map again on every subsequent insert.
+            let target = self.limit.saturating_mul(7) / 8;
+            let bytes = &mut self.bytes;
+            self.entries.retain(|_, (entry, generation)| {
+                if *bytes > target && *generation == 0 {
+                    *bytes = bytes.saturating_sub(stored_utxo_cache_bytes(entry));
+                    false
+                } else {
+                    true
+                }
+            });
         }
         self.compact_order_if_needed();
     }
@@ -156,7 +189,7 @@ impl UtxoReadCache {
         self.order.retain(|(outpoint, generation)| {
             entries
                 .get(outpoint)
-                .is_some_and(|(_, _, current)| current == generation)
+                .is_some_and(|(_, current)| current == generation)
         });
     }
 }
@@ -1297,6 +1330,11 @@ pub struct TransactionIndexStore {
     active_transactions: PartitionHandle,
     metadata: PartitionHandle,
     block_count: usize,
+    pending_blocks: FastHashMap<BlockHash, Vec<Txid>>,
+    pending_active_locations: FastHashMap<Txid, Vec<StoredTxLocation>>,
+    pending_active_hashes: HashSet<BlockHash>,
+    pending_active_tip: Option<(BlockHash, u32)>,
+    pending_item_count: usize,
 }
 
 impl TransactionIndexStore {
@@ -1345,6 +1383,11 @@ impl TransactionIndexStore {
             active_transactions,
             metadata,
             block_count,
+            pending_blocks: FastHashMap::new(),
+            pending_active_locations: FastHashMap::new(),
+            pending_active_hashes: HashSet::new(),
+            pending_active_tip: None,
+            pending_item_count: 0,
         })
     }
 
@@ -1361,13 +1404,17 @@ impl TransactionIndexStore {
     }
 
     pub fn contains(&self, hash: &BlockHash) -> Result<bool> {
+        if self.pending_blocks.contains_key(hash) {
+            return Ok(true);
+        }
         self.blocks
             .contains_key(hash.to_byte_array())
             .context("looking up transaction-index block")
     }
 
     pub fn hashes(&self) -> Result<Vec<BlockHash>> {
-        self.blocks
+        let mut hashes = self
+            .blocks
             .keys()
             .map(|key| {
                 let key = key.context("scanning transaction-index block keys")?;
@@ -1377,7 +1424,9 @@ impl TransactionIndexStore {
                     .context("transaction-index block key has invalid length")?;
                 Ok(BlockHash::from_byte_array(bytes))
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        hashes.extend(self.pending_blocks.keys().copied());
+        Ok(hashes)
     }
 
     pub fn disk_usage(&self) -> Result<u64> {
@@ -1391,6 +1440,9 @@ impl TransactionIndexStore {
     }
 
     pub fn get(&self, hash: &BlockHash) -> Result<Option<Vec<Txid>>> {
+        if let Some(txids) = self.pending_blocks.get(hash) {
+            return Ok(Some(txids.clone()));
+        }
         self.blocks
             .get(hash.to_byte_array())?
             .map(|bytes| decode_txid_list(&bytes))
@@ -1419,16 +1471,24 @@ impl TransactionIndexStore {
     }
 
     pub fn active_locations(&self, txid: &Txid) -> Result<Vec<StoredTxLocation>> {
-        self.active_transactions
+        let mut locations = self
+            .active_transactions
             .prefix(txid.to_byte_array())
             .map(|item| {
                 let (_, value) = item.context("scanning active transaction locations")?;
                 decode_stored_tx_location(&value)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if let Some(pending) = self.pending_active_locations.get(txid) {
+            locations.extend_from_slice(pending);
+        }
+        Ok(locations)
     }
 
     pub fn active_tip(&self) -> Result<Option<(BlockHash, u32)>> {
+        if let Some(tip) = self.pending_active_tip {
+            return Ok(Some(tip));
+        }
         let Some(bytes) = self.metadata.get(META_ACTIVE_TIP)? else {
             return Ok(None);
         };
@@ -1458,7 +1518,11 @@ impl TransactionIndexStore {
     }
 
     fn insert_with_sync(&mut self, hash: BlockHash, txids: &[Txid], sync: bool) -> Result<()> {
+        self.flush_pending_active(false)?;
         if self.contains(&hash)? {
+            if sync {
+                self.keyspace.persist(PersistMode::SyncData)?;
+            }
             return Ok(());
         }
         let next_count = self.block_count.saturating_add(1);
@@ -1491,6 +1555,7 @@ impl TransactionIndexStore {
         txids: &[Txid],
         sync: bool,
     ) -> Result<()> {
+        self.flush_pending_active(false)?;
         let block_exists = self.contains(&hash)?;
         let mut batch = self
             .keyspace
@@ -1558,45 +1623,87 @@ impl TransactionIndexStore {
         sync: bool,
     ) -> Result<()> {
         let block_exists = self.contains(&hash)?;
-        let next_count = self.block_count.saturating_add(usize::from(!block_exists));
-        let mut batch = self
-            .keyspace
-            .batch()
-            .durability(sync.then_some(PersistMode::SyncData));
         if !block_exists {
+            self.pending_blocks.insert(hash, txids.to_vec());
+            self.block_count = self.block_count.saturating_add(1);
+            self.pending_item_count = self.pending_item_count.saturating_add(1);
+        }
+        if self.pending_active_hashes.insert(hash) {
+            for (transaction_index, txid) in txids.iter().enumerate() {
+                let location = StoredTxLocation {
+                    block_hash: hash,
+                    height,
+                    transaction_index: u32::try_from(transaction_index)
+                        .context("transaction index does not fit u32")?,
+                };
+                self.pending_active_locations
+                    .entry(*txid)
+                    .or_default()
+                    .push(location);
+            }
+            self.pending_item_count = self.pending_item_count.saturating_add(txids.len());
+        }
+        self.pending_active_tip = Some((hash, height));
+        if sync || self.pending_item_count >= DISK_INDEX_MAX_PENDING_ITEMS {
+            self.flush_pending_active(sync)?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_active(&mut self, sync: bool) -> Result<()> {
+        if self.pending_active_tip.is_none() && self.pending_blocks.is_empty() {
+            if sync {
+                self.keyspace
+                    .persist(PersistMode::SyncData)
+                    .context("flushing transaction index database")?;
+            }
+            return Ok(());
+        }
+
+        let mut batch = fjall::Batch::with_capacity(
+            self.keyspace.clone(),
+            self.pending_item_count.saturating_add(2),
+        )
+        .durability(sync.then_some(PersistMode::SyncData));
+        for (hash, txids) in &self.pending_blocks {
             batch.insert(
                 &self.blocks,
                 hash.to_byte_array().to_vec(),
                 encode_txid_list(txids)?,
             );
-            batch.insert(
-                &self.metadata,
-                META_BLOCK_COUNT.to_vec(),
-                u64::try_from(next_count)
-                    .context("transaction-index block count does not fit u64")?
-                    .to_le_bytes()
-                    .to_vec(),
-            );
         }
-        for (transaction_index, txid) in txids.iter().enumerate() {
-            let location = StoredTxLocation {
-                block_hash: hash,
-                height,
-                transaction_index: u32::try_from(transaction_index)
-                    .context("transaction index does not fit u32")?,
-            };
-            batch.insert(
-                &self.active_transactions,
-                active_transaction_key(*txid, height, location.transaction_index).to_vec(),
-                encode_stored_tx_location(location),
-            );
+        for (txid, locations) in &self.pending_active_locations {
+            for location in locations {
+                batch.insert(
+                    &self.active_transactions,
+                    active_transaction_key(*txid, location.height, location.transaction_index)
+                        .to_vec(),
+                    encode_stored_tx_location(*location),
+                );
+            }
         }
-        let mut active_tip = Vec::with_capacity(36);
-        active_tip.extend_from_slice(&hash.to_byte_array());
-        active_tip.extend_from_slice(&height.to_le_bytes());
-        batch.insert(&self.metadata, META_ACTIVE_TIP.to_vec(), active_tip);
-        batch.commit()?;
-        self.block_count = next_count;
+        batch.insert(
+            &self.metadata,
+            META_BLOCK_COUNT.to_vec(),
+            u64::try_from(self.block_count)
+                .context("transaction-index block count does not fit u64")?
+                .to_le_bytes()
+                .to_vec(),
+        );
+        if let Some((hash, height)) = self.pending_active_tip {
+            let mut marker = Vec::with_capacity(36);
+            marker.extend_from_slice(&hash.to_byte_array());
+            marker.extend_from_slice(&height.to_le_bytes());
+            batch.insert(&self.metadata, META_ACTIVE_TIP.to_vec(), marker);
+        }
+        batch
+            .commit()
+            .context("committing active transaction-index batch")?;
+        self.pending_blocks.clear();
+        self.pending_active_locations.clear();
+        self.pending_active_hashes.clear();
+        self.pending_active_tip = None;
+        self.pending_item_count = 0;
         Ok(())
     }
 
@@ -1606,6 +1713,7 @@ impl TransactionIndexStore {
         txids: &[Txid],
         sync: bool,
     ) -> Result<()> {
+        self.flush_pending_active(false)?;
         let mut batch = self
             .keyspace
             .batch()
@@ -1626,6 +1734,7 @@ impl TransactionIndexStore {
     }
 
     pub fn set_active_tip(&mut self, hash: BlockHash, height: u32, sync: bool) -> Result<()> {
+        self.flush_pending_active(false)?;
         let mut marker = Vec::with_capacity(36);
         marker.extend_from_slice(&hash.to_byte_array());
         marker.extend_from_slice(&height.to_le_bytes());
@@ -1637,6 +1746,7 @@ impl TransactionIndexStore {
     }
 
     pub fn clear_active(&mut self) -> Result<()> {
+        self.flush_pending_active(false)?;
         clear_partition(&self.keyspace, &self.active_transactions)?;
         self.metadata.remove(META_ACTIVE_TIP)?;
         Ok(())
@@ -1649,6 +1759,11 @@ impl TransactionIndexStore {
     }
 
     pub fn clear(&mut self) -> Result<()> {
+        self.pending_blocks.clear();
+        self.pending_active_locations.clear();
+        self.pending_active_hashes.clear();
+        self.pending_active_tip = None;
+        self.pending_item_count = 0;
         clear_partition(&self.keyspace, &self.blocks)?;
         clear_partition(&self.keyspace, &self.all_indexed_blocks)?;
         clear_partition(&self.keyspace, &self.all_transactions)?;
@@ -1661,8 +1776,7 @@ impl TransactionIndexStore {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.keyspace.persist(PersistMode::SyncData)?;
-        Ok(())
+        self.flush_pending_active(true)
     }
 }
 
@@ -2169,10 +2283,12 @@ impl UtxoStore {
             return Ok(None);
         }
         cache.clear();
+        cache.entries.reserve(self.entry_count);
         for item in self.coins.iter() {
             let (key, value) = item.context("scanning UTXO database for cache warming")?;
-            cache.insert(decode_outpoint(&key)?, decode_stored_utxo(&value)?);
+            cache.insert_stationary(decode_outpoint(&key)?, decode_stored_utxo(&value)?);
         }
+        cache.trim();
         Ok(Some((cache.entries.len(), cache.bytes)))
     }
 
@@ -4206,6 +4322,78 @@ mod tests {
     }
 
     #[test]
+    fn transaction_index_batches_active_blocks_and_keeps_pending_writes_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_hash = BlockHash::from_byte_array([11u8; 32]);
+        let second_hash = BlockHash::from_byte_array([12u8; 32]);
+        let first_txid = Txid::from_byte_array([13u8; 32]);
+        let second_txid = Txid::from_byte_array([14u8; 32]);
+        {
+            let mut store = TransactionIndexStore::open(directory.path()).unwrap();
+            store
+                .connect_active_block(first_hash, 1, &[first_txid], false)
+                .unwrap();
+
+            assert!(
+                store
+                    .blocks
+                    .get(first_hash.to_byte_array())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(store.contains(&first_hash).unwrap());
+            assert_eq!(store.get(&first_hash).unwrap(), Some(vec![first_txid]));
+            assert_eq!(store.active_tip().unwrap(), Some((first_hash, 1)));
+            assert_eq!(
+                store.active_locations(&first_txid).unwrap(),
+                vec![StoredTxLocation {
+                    block_hash: first_hash,
+                    height: 1,
+                    transaction_index: 0,
+                }]
+            );
+
+            store
+                .connect_active_block(second_hash, 2, &[second_txid], true)
+                .unwrap();
+            assert!(
+                store
+                    .blocks
+                    .get(first_hash.to_byte_array())
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                store
+                    .blocks
+                    .get(second_hash.to_byte_array())
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let reopened = TransactionIndexStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.len(), 2);
+        assert_eq!(reopened.active_tip().unwrap(), Some((second_hash, 2)));
+        assert_eq!(
+            reopened.active_locations(&first_txid).unwrap(),
+            vec![StoredTxLocation {
+                block_hash: first_hash,
+                height: 1,
+                transaction_index: 0,
+            }]
+        );
+        assert_eq!(
+            reopened.active_locations(&second_txid).unwrap(),
+            vec![StoredTxLocation {
+                block_hash: second_hash,
+                height: 2,
+                transaction_index: 0,
+            }]
+        );
+    }
+
+    #[test]
     fn persists_and_reopens_genesis() {
         let directory = tempfile::tempdir().unwrap();
         let block = genesis_block(Network::Regtest);
@@ -4303,6 +4491,40 @@ mod tests {
         assert_eq!(reopened.len(), 1);
         assert_eq!(reopened.get(&first).unwrap(), None);
         assert_eq!(reopened.get(&second).unwrap(), Some(second_entry));
+    }
+
+    #[test]
+    fn complete_utxo_cache_warm_avoids_fifo_copies_and_can_trim() {
+        let mut cache = UtxoReadCache::default();
+        cache.configure_limit(400);
+        for byte in 1..=10 {
+            cache.insert_stationary(
+                OutPoint::new(Txid::from_byte_array([byte; 32]), 0),
+                StoredUtxo {
+                    output: TxOut {
+                        value: bitcoin::Amount::from_sat(u64::from(byte)),
+                        script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                    },
+                    height: u32::from(byte),
+                    median_time_past: 0,
+                    coinbase: false,
+                },
+            );
+        }
+        assert!(cache.order.is_empty());
+        assert!(cache.bytes > cache.limit);
+
+        cache.trim();
+        assert!(cache.order.is_empty());
+        assert!(cache.bytes <= cache.limit.saturating_mul(7) / 8);
+        assert_eq!(
+            cache.bytes,
+            cache
+                .entries
+                .values()
+                .map(|(entry, _)| stored_utxo_cache_bytes(entry))
+                .sum::<usize>()
+        );
     }
 
     #[test]

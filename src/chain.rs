@@ -139,7 +139,10 @@ struct IbdConnectBench {
     validation: Duration,
     undo_and_filters: Duration,
     block_and_delta_storage: Duration,
-    chainstate_indexes: Duration,
+    state_mutation: Duration,
+    transaction_indexes: Duration,
+    utxo_index: Duration,
+    history_index: Duration,
     finalization: Duration,
     total: Duration,
 }
@@ -148,7 +151,10 @@ struct ConnectTimings {
     validation: Duration,
     undo_and_filters: Duration,
     block_and_delta_storage: Duration,
-    chainstate_indexes: Duration,
+    state_mutation: Duration,
+    transaction_indexes: Duration,
+    utxo_index: Duration,
+    history_index: Duration,
     finalization: Duration,
     total: Duration,
 }
@@ -2589,7 +2595,10 @@ impl ChainState {
         bench.validation += timings.validation;
         bench.undo_and_filters += timings.undo_and_filters;
         bench.block_and_delta_storage += timings.block_and_delta_storage;
-        bench.chainstate_indexes += timings.chainstate_indexes;
+        bench.state_mutation += timings.state_mutation;
+        bench.transaction_indexes += timings.transaction_indexes;
+        bench.utxo_index += timings.utxo_index;
+        bench.history_index += timings.history_index;
         bench.finalization += timings.finalization;
         bench.total += timings.total;
         if bench.blocks < IBD_BENCH_BLOCKS {
@@ -2608,13 +2617,16 @@ impl ChainState {
             0.0
         };
         info!(
-            "IBD connect benchmark: blocks={} txs={} rate={blocks_per_second:.1} blocks/s txrate={transactions_per_second:.0} tx/s validation={:.2}s undo_filters={:.2}s block_delta_storage={:.2}s chainstate_indexes={:.2}s finalization={:.2}s total={total_seconds:.2}s",
+            "IBD connect benchmark: blocks={} txs={} rate={blocks_per_second:.1} blocks/s txrate={transactions_per_second:.0} tx/s validation={:.2}s undo_filters={:.2}s block_delta_storage={:.2}s state_mutation={:.2}s tx_indexes={:.2}s utxo_index={:.2}s history_index={:.2}s finalization={:.2}s total={total_seconds:.2}s",
             bench.blocks,
             bench.transactions,
             bench.validation.as_secs_f64(),
             bench.undo_and_filters.as_secs_f64(),
             bench.block_and_delta_storage.as_secs_f64(),
-            bench.chainstate_indexes.as_secs_f64(),
+            bench.state_mutation.as_secs_f64(),
+            bench.transaction_indexes.as_secs_f64(),
+            bench.utxo_index.as_secs_f64(),
+            bench.history_index.as_secs_f64(),
             bench.finalization.as_secs_f64(),
         );
     }
@@ -8184,6 +8196,7 @@ impl ChainState {
                 self.add_history(script_hash, entry.clone());
             }
         }
+        let state_mutation_finished = Instant::now();
         // Consensus validation uses the UTXO database, not a historical
         // txid map. Transaction locations are written only to the optional
         // disk-backed service indexes below.
@@ -8197,6 +8210,7 @@ impl ChainState {
                 store.connect_active_block(hash, height, &transaction_ids, sync_storage)?;
             }
         }
+        let transaction_indexes_finished = Instant::now();
         if persist {
             let additions = delta
                 .created
@@ -8221,11 +8235,12 @@ impl ChainState {
                 self.utxo_store
                     .apply_validated_batch_unsynced(&persistent_removals, &additions)?;
             }
-            if self.history_index_enabled {
-                self.persist_history_appends(history_updates, sync_storage)?;
-            }
         }
-        let chainstate_indexes_finished = Instant::now();
+        let utxo_index_finished = Instant::now();
+        if persist && self.history_index_enabled {
+            self.persist_history_appends(history_updates, sync_storage)?;
+        }
+        let history_index_finished = Instant::now();
         if self.txospender_index_enabled {
             if persist && self.spent_by_needs_reconciliation {
                 // The Core index may still expose spenders from a just
@@ -8315,9 +8330,13 @@ impl ChainState {
                     undo_and_filters: undo_and_filters_finished.duration_since(validation_finished),
                     block_and_delta_storage: block_and_delta_storage_finished
                         .duration_since(undo_and_filters_finished),
-                    chainstate_indexes: chainstate_indexes_finished
+                    state_mutation: state_mutation_finished
                         .duration_since(block_and_delta_storage_finished),
-                    finalization: connect_finished.duration_since(chainstate_indexes_finished),
+                    transaction_indexes: transaction_indexes_finished
+                        .duration_since(state_mutation_finished),
+                    utxo_index: utxo_index_finished.duration_since(transaction_indexes_finished),
+                    history_index: history_index_finished.duration_since(utxo_index_finished),
+                    finalization: connect_finished.duration_since(history_index_finished),
                     total: connect_finished.duration_since(connect_started),
                 },
             );

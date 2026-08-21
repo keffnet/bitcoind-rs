@@ -3253,8 +3253,13 @@ fn read_usize_metadata(partition: &PartitionHandle, key: &[u8]) -> Result<Option
         .transpose()
 }
 
-const HISTORY_EVENTS_PARTITION_NAME: &str = "events";
+const HISTORY_EVENTS_PARTITION_PREFIX: &str = "events-";
 const HISTORY_META_PARTITION_NAME: &str = "metadata";
+const META_EVENT_PARTITION_EPOCH: &[u8] = b"event-partition-epoch";
+
+fn history_events_partition_name(epoch: u64) -> String {
+    format!("{HISTORY_EVENTS_PARTITION_PREFIX}{epoch}")
+}
 
 /// Disk-backed Electrum history index.
 ///
@@ -3269,6 +3274,7 @@ pub struct ElectrumHistoryStore {
     metadata: PartitionHandle,
     entry_count: usize,
     generation: u64,
+    event_partition_epoch: u64,
     pending_events: FastHashMap<[u8; 32], Vec<[u8; HISTORY_EVENT_KEY_SIZE]>>,
     pending_event_count: usize,
 }
@@ -3285,37 +3291,60 @@ impl ElectrumHistoryStore {
         // Storage is intentionally versioned by directory. There has been no
         // public release, so the former head/chunk schema is not opened or
         // migrated; a rebuild starts with this event-oriented layout.
-        let path = directory.join("history-v2");
+        let path = directory.join("history-v3");
         let keyspace = FjallConfig::new(&path)
             .cache_size(cache_bytes.max(1024 * 1024))
             .max_write_buffer_size(DISK_INDEX_DEFAULT_WRITE_BUFFER_BYTES)
             .manual_journal_persist(true)
             .open()
             .with_context(|| format!("opening disk-backed Electrum database {}", path.display()))?;
-        let events = keyspace.open_partition(
-            HISTORY_EVENTS_PARTITION_NAME,
-            // Segment compression exploits the shared 32-byte script prefix
-            // while retaining inexpensive decompression for query serving.
-            PartitionCreateOptions::default().compression(CompressionType::Lz4),
-        )?;
         let metadata = keyspace.open_partition(
             HISTORY_META_PARTITION_NAME,
             PartitionCreateOptions::default().compression(CompressionType::None),
         )?;
-        let entry_count = read_usize_metadata(&metadata, META_ENTRY_COUNT)?.unwrap_or(0);
-        if entry_count == 0 && !events.is_empty()? {
-            bail!("Electrum history database is missing its exact entry-count metadata");
+        let stored_epoch = read_u64_metadata(&metadata, META_EVENT_PARTITION_EPOCH)?;
+        let stored_generation = read_u64_metadata(&metadata, META_GENERATION)?;
+        let stored_count = read_usize_metadata(&metadata, META_ENTRY_COUNT)?;
+        let (event_partition_epoch, generation, entry_count) =
+            match (stored_epoch, stored_generation, stored_count) {
+                (Some(epoch), Some(generation), Some(entry_count))
+                    if epoch != 0 && generation != 0 =>
+                {
+                    (epoch, generation, entry_count)
+                }
+                (None, None, None) => {
+                    let epoch = 1u64;
+                    let generation = 1u64;
+                    let mut batch = keyspace.batch().durability(Some(PersistMode::SyncData));
+                    batch.insert(
+                        &metadata,
+                        META_EVENT_PARTITION_EPOCH.to_vec(),
+                        epoch.to_le_bytes().to_vec(),
+                    );
+                    batch.insert(
+                        &metadata,
+                        META_GENERATION.to_vec(),
+                        generation.to_le_bytes().to_vec(),
+                    );
+                    batch.insert(
+                        &metadata,
+                        META_ENTRY_COUNT.to_vec(),
+                        0u64.to_le_bytes().to_vec(),
+                    );
+                    batch.commit()?;
+                    (epoch, generation, 0)
+                }
+                _ => bail!("Electrum history database metadata is incomplete"),
+            };
+        let events = keyspace.open_partition(
+            &history_events_partition_name(event_partition_epoch),
+            // Segment compression exploits the shared 32-byte script prefix
+            // while retaining inexpensive decompression for query serving.
+            PartitionCreateOptions::default().compression(CompressionType::Lz4),
+        )?;
+        if events.len()? != entry_count {
+            bail!("Electrum history database entry count does not match its active partition");
         }
-        let generation = match read_u64_metadata(&metadata, META_GENERATION)? {
-            Some(generation) if generation != 0 => generation,
-            _ => {
-                let generation = 1u64;
-                metadata.insert(META_GENERATION, generation.to_le_bytes().to_vec())?;
-                metadata.insert(META_ENTRY_COUNT, 0u64.to_le_bytes().to_vec())?;
-                keyspace.persist(PersistMode::SyncAll)?;
-                generation
-            }
-        };
         Ok(Self {
             path,
             keyspace,
@@ -3323,6 +3352,7 @@ impl ElectrumHistoryStore {
             metadata,
             entry_count,
             generation,
+            event_partition_epoch,
             pending_events: FastHashMap::new(),
             pending_event_count: 0,
         })
@@ -3680,12 +3710,18 @@ impl ElectrumHistoryStore {
     pub fn clear(&mut self) -> Result<()> {
         self.pending_events.clear();
         self.pending_event_count = 0;
-        clear_partition(&self.keyspace, &self.events)?;
-        self.entry_count = 0;
-        self.generation = self
+        let next_epoch = self
+            .event_partition_epoch
+            .checked_add(1)
+            .context("Electrum history partition epoch exhausted")?;
+        let next_generation = self
             .generation
             .checked_add(1)
             .context("Electrum history generation exhausted")?;
+        let next_events = self.keyspace.open_partition(
+            &history_events_partition_name(next_epoch),
+            PartitionCreateOptions::default().compression(CompressionType::Lz4),
+        )?;
         let mut batch = self
             .keyspace
             .batch()
@@ -3698,9 +3734,19 @@ impl ElectrumHistoryStore {
         batch.insert(
             &self.metadata,
             META_GENERATION.to_vec(),
-            self.generation.to_le_bytes().to_vec(),
+            next_generation.to_le_bytes().to_vec(),
+        );
+        batch.insert(
+            &self.metadata,
+            META_EVENT_PARTITION_EPOCH.to_vec(),
+            next_epoch.to_le_bytes().to_vec(),
         );
         batch.commit()?;
+        let previous_events = std::mem::replace(&mut self.events, next_events);
+        self.entry_count = 0;
+        self.generation = next_generation;
+        self.event_partition_epoch = next_epoch;
+        self.keyspace.delete_partition(previous_events)?;
         Ok(())
     }
 
@@ -5460,6 +5506,42 @@ mod tests {
 
         let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
         assert_eq!(reopened.get(&script_hash).unwrap(), vec![replacement]);
+    }
+
+    #[test]
+    fn electrum_history_clear_switches_partitions_without_scanning_old_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_script = hex::encode([45u8; 32]);
+        let second_script = hex::encode([46u8; 32]);
+        let first = (Txid::from_byte_array([47u8; 32]), 1);
+        let second = (Txid::from_byte_array([48u8; 32]), 2);
+        let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
+        store
+            .append_entries(&[(first_script.clone(), vec![first])])
+            .unwrap();
+        let previous_epoch = store.event_partition_epoch;
+        let previous_partition = history_events_partition_name(previous_epoch);
+
+        store.clear().unwrap();
+        assert_eq!(store.event_partition_epoch, previous_epoch + 1);
+        assert_eq!(store.len(), 0);
+        assert!(store.get(&first_script).unwrap().is_empty());
+        assert!(
+            !store
+                .keyspace
+                .list_partitions()
+                .iter()
+                .any(|name| name.as_ref() == previous_partition)
+        );
+        store
+            .append_entries(&[(second_script.clone(), vec![second])])
+            .unwrap();
+        drop(store);
+
+        let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert!(reopened.get(&first_script).unwrap().is_empty());
+        assert_eq!(reopened.get(&second_script).unwrap(), vec![second]);
     }
 
     #[test]

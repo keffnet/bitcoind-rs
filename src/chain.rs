@@ -121,7 +121,6 @@ const HEADER_JOURNAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 // Re-enabling Electrum after a history-disabled IBD must not materialize the
 // whole script-history map. Keep only this many scripts' complete histories
 // resident while replaying and writing the durable store.
-const ELECTRUM_REBUILD_BATCH_SCRIPTS: usize = 4_096;
 // Peer/IBD writes use append-only records and publish a bounded durability
 // boundary instead of forcing several fsyncs for every block. Direct API and
 // mining paths retain their immediate-sync behavior.
@@ -1354,6 +1353,11 @@ pub struct ChainState {
     history: HashMap<String, Vec<HistoryEntry>>,
     history_materialized: bool,
     history_index_enabled: bool,
+    // Snapshotless startup recovery rebuilds immutable Electrum events into
+    // a fresh LSM partition while consensus replay is already walking every
+    // block. This avoids materializing hundreds of millions of events in RAM
+    // and avoids a second block/undo pass after replay.
+    startup_history_rebuild: bool,
     spent_by: FastHashMap<OutPoint, ActiveSpender>,
     // Core's txospender index updates asynchronously. Preserve block hashes
     // only for entries in a just-disconnected suffix so RPC can expose the
@@ -2140,6 +2144,7 @@ impl ChainState {
             history: HashMap::new(),
             history_materialized: true,
             history_index_enabled: electrum_history_index_enabled,
+            startup_history_rebuild: false,
             spent_by: FastHashMap::new(),
             stale_spender_block_hashes: FastHashMap::new(),
             spent_by_needs_reconciliation: false,
@@ -2369,6 +2374,14 @@ impl ChainState {
                 format!("active genesis block {genesis_hash} is missing from block store")
             })?;
             state.initialize_genesis(&genesis)?;
+            if state.history_index_enabled {
+                info!("Streaming Electrum history recovery into a fresh disk partition");
+                state.electrum_history_store.clear()?;
+                state.startup_history_rebuild = true;
+                state.history_materialized = false;
+                let genesis_history = std::mem::take(&mut state.history);
+                state.persist_history_appends(genesis_history, false)?;
+            }
             let apply_started = Instant::now();
             for (offset, hash) in active_chain.iter().skip(1).enumerate() {
                 let block = state
@@ -2383,6 +2396,15 @@ impl ChainState {
                     offset + 1,
                     target_height,
                     apply_started,
+                );
+            }
+            if state.startup_history_rebuild {
+                state.electrum_history_store.flush()?;
+                state.startup_history_rebuild = false;
+                state.persist_electrum_history_store_tip()?;
+                info!(
+                    "Recovered Electrum history events: {}",
+                    state.electrum_history_store.len()
                 );
             }
             if replay_blocks > 0 {
@@ -3120,9 +3142,7 @@ impl ChainState {
                 .with_context(|| format!("invalid undo data while rebuilding block {hash}"))?;
         }
 
-        self.electrum_history_store
-            .replace_all(std::iter::empty())?;
-        let mut pending: HashMap<String, Vec<(Txid, u32)>> = HashMap::new();
+        self.electrum_history_store.clear()?;
         for (height, hash) in active_chain.iter().copied().enumerate() {
             let height = u32::try_from(height).context("active chain height does not fit u32")?;
             let block = self
@@ -3134,6 +3154,7 @@ impl ChainState {
                 .get_undo(&hash)?
                 .with_context(|| format!("Electrum history rebuild is missing undo for {hash}"))?;
             self.check_shutdown_interrupt()?;
+            let mut updates: HashMap<String, Vec<(Txid, u32)>> = HashMap::new();
             for (transaction_index, transaction) in block.txdata.iter().enumerate() {
                 let txid = transaction.compute_txid();
                 let mut affected_scripts = HashSet::new();
@@ -3147,27 +3168,18 @@ impl ChainState {
                 }
                 let entry = (txid, height);
                 for script_hash in affected_scripts {
-                    if !pending.contains_key(&script_hash) {
-                        let history = self.electrum_history_store.get(&script_hash)?;
-                        pending.insert(script_hash.clone(), history);
-                    }
-                    let history = pending
-                        .get_mut(&script_hash)
-                        .expect("history rebuild entry was inserted above");
+                    let history = updates.entry(script_hash).or_default();
                     if history.last() != Some(&entry) {
                         history.push(entry);
                     }
                 }
             }
-            if pending.len() >= ELECTRUM_REBUILD_BATCH_SCRIPTS {
-                let updates = std::mem::take(&mut pending).into_iter().collect::<Vec<_>>();
-                self.electrum_history_store.apply_batch(&updates)?;
+            if !updates.is_empty() {
+                self.electrum_history_store
+                    .append_entries_owned_unsynced(updates.into_iter().collect())?;
             }
         }
-        if !pending.is_empty() {
-            let updates = pending.into_iter().collect::<Vec<_>>();
-            self.electrum_history_store.apply_batch(&updates)?;
-        }
+        self.electrum_history_store.flush()?;
         self.history.clear();
         self.history_materialized = false;
         self.persist_electrum_history_store_tip()
@@ -8249,7 +8261,7 @@ impl ChainState {
             }
         }
         for (script_hash, entry) in &delta.history {
-            if persist {
+            if persist || self.startup_history_rebuild {
                 let additions = history_updates.entry(script_hash.clone()).or_default();
                 if additions.last() != Some(entry) {
                     additions.push(entry.clone());
@@ -8299,8 +8311,11 @@ impl ChainState {
             }
         }
         let utxo_index_finished = Instant::now();
-        if persist && self.history_index_enabled {
-            self.persist_history_appends(history_updates, sync_storage)?;
+        if (persist || self.startup_history_rebuild) && self.history_index_enabled {
+            // Recovery events are streamed into a fresh partition in large
+            // unsynced batches. The partition and its tip marker are flushed
+            // once after the complete replay instead of syncing every block.
+            self.persist_history_appends(history_updates, persist && sync_storage)?;
         }
         let history_index_finished = Instant::now();
         if self.txospender_index_enabled {
@@ -11454,6 +11469,7 @@ fn open_background_replay_state(
         history: HashMap::new(),
         history_materialized: true,
         history_index_enabled: true,
+        startup_history_rebuild: false,
         spent_by: FastHashMap::new(),
         stale_spender_block_hashes: FastHashMap::new(),
         spent_by_needs_reconciliation: false,
@@ -12852,6 +12868,38 @@ mod tests {
         let (cached_entries, cached_bytes) = reopened.warm_utxo_cache().unwrap();
         assert!(cached_entries >= 3);
         assert!(cached_bytes > 0);
+    }
+
+    #[test]
+    fn snapshotless_recovery_streams_history_without_materializing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        let expected_tip = state.best_hash();
+        let script_hash = electrum_script_hash(&Builder::new().push_int(1).into_script());
+        let expected_history = state.get_history(&script_hash);
+        let expected_event_count = state.electrum_history_store.len();
+        let previous_generation = state.electrum_history_store.generation();
+        assert!(!directory.path().join("chainstate.snapshot").exists());
+        drop(state);
+
+        // Model an unclean shutdown after the active-tip sidecar reached the
+        // downloaded chain but before the durable index-tip markers were
+        // published. Recovery must validate the chain from genesis, but its
+        // non-consensus Electrum events should stream directly to disk.
+        fs::remove_file(directory.path().join("chainstate/utxos.tip")).unwrap();
+        fs::remove_file(directory.path().join("indexes/electrum-history.tip")).unwrap();
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), expected_tip);
+        assert_eq!(reopened.height(), 3);
+        assert!(!reopened.history_materialized);
+        assert!(reopened.history.is_empty());
+        assert_eq!(reopened.electrum_history_store.len(), expected_event_count);
+        assert!(reopened.electrum_history_store.generation() > previous_generation);
+        assert_eq!(reopened.get_history(&script_hash), expected_history);
     }
 
     #[test]

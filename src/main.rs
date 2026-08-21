@@ -4,7 +4,10 @@ use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 #[cfg(not(unix))]
@@ -23,7 +26,7 @@ use tracing_subscriber::fmt::{
 
 use bitcoind_rs::{
     Node,
-    config::{Args, Config, ConfigFileArg, is_known_config_option},
+    config::{Args, Config, ConfigFileArg, is_known_config_option, network_data_dir_name},
 };
 
 fn nested_core_startup_error(error: &anyhow::Error) -> Option<&bitcoind_rs::CoreStartupError> {
@@ -90,17 +93,24 @@ fn run() -> Result<()> {
 }
 
 async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()> {
+    let network_dir_name = network_data_dir_name(config.network);
+    let network_data_dir = if network_dir_name.is_empty() {
+        config.datadir.clone()
+    } else {
+        config.datadir.join(network_dir_name)
+    };
+    fs::create_dir_all(&network_data_dir).with_context(|| {
+        format!(
+            "creating network data directory {}",
+            network_data_dir.display()
+        )
+    })?;
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(config.logging.tracing_filter()));
     let (writer, log_file) = if let Some(path) = config
         .debug_log_file_enabled
         .then_some(&config.debug_log_path)
     {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).with_context(|| {
-                format!("Could not create debug log directory {}", parent.display())
-            })?;
-        }
         let log_file = ReloadableLogFile::open(path, config.shrink_debug_file)
             .with_context(|| format!("Could not open debug log file {}", path.display()))?;
         let log_file_for_signal = log_file.clone();
@@ -142,8 +152,24 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     } else {
         builder.init();
     }
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let startup_signal_task = install_startup_signal_listener(shutdown_requested.clone())?;
     tracing::info!("Loading block index");
-    let node = Node::open(config)?;
+    let node = match Node::open_with_shutdown(config, shutdown_requested.clone()) {
+        Ok(node) => node,
+        Err(_) if shutdown_requested.load(Ordering::Acquire) => {
+            tracing::info!("Shutdown requested during startup");
+            startup_signal_task.abort();
+            return Ok(());
+        }
+        Err(error) => {
+            startup_signal_task.abort();
+            return Err(error);
+        }
+    };
+    if shutdown_requested.load(Ordering::Acquire) {
+        node.request_shutdown();
+    }
     let _pid_file = PidFile::create(node.config.pid_path.clone())?;
     let (best_height, best_hash) = {
         let chain = node.chain.read();
@@ -213,7 +239,36 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     if let Some(task) = log_reopen_task {
         task.abort();
     }
+    startup_signal_task.abort();
     result
+}
+
+#[cfg(unix)]
+fn install_startup_signal_listener(
+    shutdown_requested: Arc<AtomicBool>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt()).context("installing SIGINT handler")?;
+    let mut terminate = signal(SignalKind::terminate()).context("installing SIGTERM handler")?;
+    Ok(tokio::spawn(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        shutdown_requested.store(true, Ordering::Release);
+    }))
+}
+
+#[cfg(not(unix))]
+fn install_startup_signal_listener(
+    shutdown_requested: Arc<AtomicBool>,
+) -> Result<tokio::task::JoinHandle<()>> {
+    Ok(tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            shutdown_requested.store(true, Ordering::Release);
+        }
+    }))
 }
 
 fn log_config_file_path(config_file_args: &[ConfigFileArg]) {

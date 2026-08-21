@@ -4506,7 +4506,7 @@ pub(crate) fn default_network_endpoint_port(value: &str, network: Network) -> u1
 }
 
 /// Return the directory name Core uses for network-specific data.
-pub(crate) fn network_data_dir_name(network: Network) -> &'static str {
+pub fn network_data_dir_name(network: Network) -> &'static str {
     match network {
         Network::Bitcoin => "",
         Network::Testnet => "testnet3",

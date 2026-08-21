@@ -1820,6 +1820,16 @@ impl Node {
     }
 
     pub fn open(config: Config) -> Result<Arc<Self>> {
+        Self::open_with_shutdown(config, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Open a node using a process-wide shutdown flag that may already be
+    /// set during startup. The daemon uses this to make synchronous storage
+    /// recovery and block replay interruptible before services are running.
+    pub fn open_with_shutdown(
+        config: Config,
+        shutdown_requested: Arc<AtomicBool>,
+    ) -> Result<Arc<Self>> {
         fs::create_dir_all(&config.datadir)
             .with_context(|| format!("creating data directory {}", config.datadir.display()))?;
         let network_datadir = if network_data_dir_name(config.network).is_empty() {
@@ -1963,7 +1973,6 @@ impl Node {
             time::set_mock_time(mock_time);
         }
         let network_active = config.network_active;
-        let shutdown_requested = Arc::new(AtomicBool::new(false));
         let i2p_sam = config.i2p_sam.map(|address| {
             Arc::new(i2p::I2pSam::new(
                 address,
@@ -2025,7 +2034,7 @@ impl Node {
             .flatten()
             .and_then(|height| height.trim().parse().ok());
         let mut chain =
-            ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index(
+            ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index_and_shutdown_interrupt(
                 config.network,
                 &chain_data_dir,
                 blocks_dir,
@@ -2041,6 +2050,7 @@ impl Node {
                 config.electrum_bind.is_some(),
                 config.txospenderindex,
                 false,
+                shutdown_requested.clone(),
             )
             .map_err(core_startup_chain_error)?;
         if chain
@@ -2049,8 +2059,6 @@ impl Node {
         {
             return Err(CoreStartupError::future().into());
         }
-        chain.set_shutdown_interrupt(shutdown_requested.clone());
-
         fs::create_dir_all(&network_datadir).with_context(|| {
             format!(
                 "creating network data directory {}",

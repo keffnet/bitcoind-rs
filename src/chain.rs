@@ -1770,6 +1770,50 @@ impl ChainState {
         txospender_index_enabled: bool,
         preserve_disabled_spender_snapshot: bool,
     ) -> Result<Self> {
+        Self::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index_and_shutdown_interrupt(
+            network,
+            data_dir,
+            blocks_dir,
+            signet_challenge,
+            blockfilter_index_enabled,
+            reindex,
+            reindex_chainstate,
+            tx_index_all_enabled,
+            minimum_chain_work_override,
+            assume_valid_block,
+            blocks_xor,
+            deployment_parameters,
+            electrum_history_index_enabled,
+            txospender_index_enabled,
+            preserve_disabled_spender_snapshot,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Open chainstate with a shutdown flag that is already active while
+    /// startup indexes and stored blocks are replayed. The daemon installs
+    /// its signal handlers before calling this entry point, allowing a
+    /// SIGINT or SIGTERM to interrupt a long recovery rather than waiting
+    /// until all network services have started.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index_and_shutdown_interrupt(
+        network: Network,
+        data_dir: impl AsRef<Path>,
+        blocks_dir: impl AsRef<Path>,
+        signet_challenge: Option<&[u8]>,
+        blockfilter_index_enabled: bool,
+        reindex: bool,
+        reindex_chainstate: bool,
+        tx_index_all_enabled: bool,
+        minimum_chain_work_override: Option<Work>,
+        assume_valid_block: Option<BlockHash>,
+        blocks_xor: bool,
+        deployment_parameters: validation::DeploymentParameters,
+        electrum_history_index_enabled: bool,
+        txospender_index_enabled: bool,
+        preserve_disabled_spender_snapshot: bool,
+        shutdown_interrupt: Arc<AtomicBool>,
+    ) -> Result<Self> {
         if deployment_parameters.network != network {
             bail!("consensus deployment parameters use a different network");
         }
@@ -2106,7 +2150,7 @@ impl ChainState {
             basic_filter_cache: HashMap::new(),
             block_undo_cache: HashMap::new(),
             script_cache: Mutex::new(ScriptValidationCache::default()),
-            shutdown_interrupt: Arc::new(AtomicBool::new(false)),
+            shutdown_interrupt,
             peer_storage_blocks_since_flush: 0,
             peer_storage_bytes_since_flush: 0,
             ibd_connect_bench: IbdConnectBench::default(),
@@ -3879,13 +3923,6 @@ impl ChainState {
     pub fn configure_script_check_threads(&mut self, par: i32) {
         self.script_check_workers = script_check_workers(par);
         self.script_checks_enabled = self.script_check_workers > 0;
-    }
-
-    /// Share the node's shutdown flag with synchronous validation.  The
-    /// chain keeps an owned `Arc` so a peer validation worker can check it
-    /// without borrowing the `Node` or taking another lock.
-    pub(crate) fn set_shutdown_interrupt(&mut self, interrupt: Arc<AtomicBool>) {
-        self.shutdown_interrupt = interrupt;
     }
 
     fn check_shutdown_interrupt(&self) -> Result<()> {

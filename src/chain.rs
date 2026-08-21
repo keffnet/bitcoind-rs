@@ -2319,7 +2319,7 @@ impl ChainState {
             } else {
                 HashMap::new()
             };
-            state.history_materialized = true;
+            state.history_materialized = !state.history_index_enabled || !state.history.is_empty();
             state.prune_height = snapshot.prune_height.or(state.prune_height);
             state.startup_spent_by = snapshot
                 .spent_by
@@ -8325,7 +8325,7 @@ impl ChainState {
                                 additions.push(entry);
                             }
                         }
-                    } else {
+                    } else if self.history_materialized {
                         self.add_history(&script_hash, entry);
                     }
                 }
@@ -10899,7 +10899,7 @@ impl ChainState {
             }
             self.insert_utxo(*outpoint, entry.clone());
         }
-        if self.history_index_enabled {
+        if self.history_index_enabled && self.history_materialized {
             for (script_hash, entry) in &delta.history {
                 if entry.height != delta.height {
                     bail!("chainstate delta contains invalid history metadata")
@@ -11187,7 +11187,11 @@ impl ChainState {
             } else if self.history_materialized {
                 self.history.clone()
             } else {
-                self.load_history_map_from_store()?
+                // The Electrum history store has its own atomic data/index
+                // commit and an advisory tip marker published before this
+                // snapshot. Do not duplicate millions of script histories
+                // in the generic chainstate checkpoint.
+                HashMap::new()
             },
             spent_by: self.txospender_index_enabled.then(|| self.spent_by.clone()),
             prune_height: self.prune_height,
@@ -14174,6 +14178,12 @@ mod tests {
                 .unwrap(),
             None
         );
+
+        state.persist_snapshot().unwrap();
+        let snapshot_bytes = fs::read(directory.path().join("chainstate.snapshot")).unwrap();
+        let snapshot: ChainSnapshot =
+            deserialize_internal(&snapshot_bytes, CHAIN_SNAPSHOT_MAGIC).unwrap();
+        assert!(snapshot.history.is_empty());
 
         drop(state);
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();

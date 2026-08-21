@@ -31,11 +31,15 @@ const MAX_ELECTRUM_PEERS: usize = 1_024;
 // index and mempool lookups before one response is written.
 const MAX_ELECTRUM_BATCH_REQUESTS: usize = 1_024;
 const MAX_SCRIPTPUBKEY_SIZE: usize = 10_000;
-// Electrum clients fetch history as one JSON result. Keep the serialized
-// history payload bounded so a heavily used script cannot force an
-// unbounded response allocation. Leave room for the JSON-RPC envelope and
-// the scriptpubkey {"history": ...} wrapper.
-const MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE: usize = 4 * 1024 * 1024 - 256;
+// Electrum clients fetch history as one JSON result. Allow the complete
+// bounded response budget rather than the former 4 MiB sub-limit, which
+// rejected real high-activity histories even though they fit on the wire.
+// Leave room for the JSON-RPC envelope and scriptpubkey history wrapper.
+const MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE: usize = MAX_LINE_SIZE - 1_280;
+// A real mainnet history seen during IBD occupied 4,792,689 bytes. Keep that
+// valid response inside the accepted payload budget so the former 4 MiB
+// ceiling cannot regress.
+const _: () = assert!(MAX_ELECTRUM_HISTORY_PAYLOAD_SIZE > 4_792_689);
 // A serialized history entry is always substantially larger than 64 bytes
 // (the txid alone is 64 hexadecimal characters).  This conservative lower
 // bound lets us reject an oversized history before copying a large mempool

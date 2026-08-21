@@ -28,7 +28,7 @@ use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
 use fjall::compaction::{SizeTiered, Strategy as CompactionStrategy};
 use fjall::{
     CompressionType, Config as FjallConfig, Keyspace, PartitionCreateOptions, PartitionHandle,
-    PersistMode,
+    PersistMode, Snapshot,
 };
 use hashbrown::HashMap as FastHashMap;
 use parking_lot::{Mutex, RwLock};
@@ -1937,6 +1937,46 @@ pub struct TransactionIndexStore {
     pending_item_count: usize,
 }
 
+/// Point-in-time active transaction-location lookup. Fjall keeps the
+/// snapshot's old versions alive while the query runs; the small pending
+/// overlay captures writes that have not entered Fjall yet.
+pub struct ActiveTransactionLocationsQuery {
+    snapshot: Snapshot,
+    txids: Vec<Txid>,
+    pending: FastHashMap<Txid, Vec<StoredTxLocation>>,
+}
+
+impl ActiveTransactionLocationsQuery {
+    pub fn execute(self) -> Result<HashMap<Txid, Vec<StoredTxLocation>>> {
+        let mut result = HashMap::with_capacity(self.txids.len());
+        for txid in self.txids {
+            let mut locations = self
+                .snapshot
+                .prefix(txid.to_byte_array())
+                .map(|item| {
+                    let (_, value) = item.context("scanning active transaction locations")?;
+                    decode_stored_tx_location(&value)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(pending) = self.pending.get(&txid) {
+                locations.extend_from_slice(pending);
+            }
+            locations.sort_unstable_by_key(|location| {
+                (
+                    location.height,
+                    location.transaction_index,
+                    location.block_hash.to_byte_array(),
+                )
+            });
+            locations.dedup();
+            if !locations.is_empty() {
+                result.insert(txid, locations);
+            }
+        }
+        Ok(result)
+    }
+}
+
 impl TransactionIndexStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_cache(directory, DISK_INDEX_DEFAULT_CACHE_BYTES)
@@ -2083,6 +2123,29 @@ impl TransactionIndexStore {
             locations.extend_from_slice(pending);
         }
         Ok(locations)
+    }
+
+    pub fn active_locations_query(&self, txids: &[Txid]) -> ActiveTransactionLocationsQuery {
+        let mut unique = HashSet::with_capacity(txids.len());
+        let txids = txids
+            .iter()
+            .copied()
+            .filter(|txid| unique.insert(*txid))
+            .collect::<Vec<_>>();
+        let pending = txids
+            .iter()
+            .filter_map(|txid| {
+                self.pending_active_locations
+                    .get(txid)
+                    .cloned()
+                    .map(|locations| (*txid, locations))
+            })
+            .collect();
+        ActiveTransactionLocationsQuery {
+            snapshot: self.active_transactions.snapshot(),
+            txids,
+            pending,
+        }
     }
 
     pub fn active_tip(&self) -> Result<Option<(BlockHash, u32)>> {
@@ -2719,6 +2782,37 @@ pub struct UtxoStore {
     pending: FastHashMap<OutPoint, Option<StoredUtxo>>,
 }
 
+/// Point-in-time UTXO lookup for a bounded set of outpoints. Entries already
+/// present in the decoded cache or the unflushed overlay are copied while the
+/// chain lock is held; remaining point reads use the Fjall snapshot later.
+pub struct UtxoQuery {
+    snapshot: Snapshot,
+    known: FastHashMap<OutPoint, Option<StoredUtxo>>,
+    unresolved: Vec<OutPoint>,
+}
+
+impl UtxoQuery {
+    pub fn execute(self) -> Result<HashMap<OutPoint, StoredUtxo>> {
+        let mut entries = HashMap::with_capacity(self.known.len() + self.unresolved.len());
+        for (outpoint, entry) in self.known {
+            if let Some(entry) = entry {
+                entries.insert(outpoint, entry);
+            }
+        }
+        for outpoint in self.unresolved {
+            let Some(bytes) = self
+                .snapshot
+                .get(encode_outpoint(&outpoint))
+                .context("reading UTXO snapshot value")?
+            else {
+                continue;
+            };
+            entries.insert(outpoint, decode_stored_utxo(&bytes)?);
+        }
+        Ok(entries)
+    }
+}
+
 impl UtxoStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_cache(directory, DISK_INDEX_DEFAULT_CACHE_BYTES)
@@ -2959,6 +3053,33 @@ impl UtxoStore {
         let entry = decode_stored_utxo(&bytes)?;
         self.read_cache.lock().insert(*outpoint, entry.clone());
         Ok(Some(entry))
+    }
+
+    pub fn query(&self, outpoints: &[OutPoint]) -> UtxoQuery {
+        let mut unique = HashSet::with_capacity(outpoints.len());
+        let mut known = FastHashMap::with_capacity(outpoints.len());
+        let mut unresolved = Vec::new();
+        let mut read_cache = self.read_cache.lock();
+        for outpoint in outpoints {
+            if !unique.insert(*outpoint) {
+                continue;
+            }
+            if let Some(entry) = self.pending.get(outpoint) {
+                known.insert(*outpoint, entry.clone());
+            } else if let Some(entry) = read_cache.get(outpoint) {
+                known.insert(*outpoint, Some(entry));
+            } else if read_cache.complete {
+                known.insert(*outpoint, None);
+            } else {
+                unresolved.push(*outpoint);
+            }
+        }
+        drop(read_cache);
+        UtxoQuery {
+            snapshot: self.coins.snapshot(),
+            known,
+            unresolved,
+        }
     }
 
     pub fn entries(&self) -> Result<Vec<(OutPoint, StoredUtxo)>> {
@@ -3295,6 +3416,36 @@ pub struct ElectrumHistoryStore {
     pending_event_count: usize,
 }
 
+/// Bounded point-in-time history lookup. Keeping the snapshot request-scoped
+/// prevents a large script history scan from holding ChainState's global
+/// lock while preserving a coherent view across concurrent IBD flushes.
+pub struct ElectrumHistoryQuery {
+    snapshot: Snapshot,
+    script_hash: [u8; 32],
+    pending: Vec<[u8; HISTORY_EVENT_KEY_SIZE]>,
+    limit: usize,
+}
+
+impl ElectrumHistoryQuery {
+    pub fn execute(self) -> Result<Option<StoredElectrumHistory>> {
+        let mut history = Vec::new();
+        for item in self.snapshot.prefix(self.script_hash) {
+            let (key, _) = item.context("scanning Electrum history events")?;
+            history.push(decode_history_event_key(&key)?.1);
+            if history.len() > self.limit {
+                return Ok(None);
+            }
+        }
+        for key in self.pending {
+            history.push(decode_history_event_key(&key)?.1);
+            if history.len() > self.limit {
+                return Ok(None);
+            }
+        }
+        Ok(Some(history))
+    }
+}
+
 impl ElectrumHistoryStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_cache(directory, DISK_INDEX_DEFAULT_CACHE_BYTES)
@@ -3424,24 +3575,21 @@ impl ElectrumHistoryStore {
         script_hash: &str,
         limit: usize,
     ) -> Result<Option<StoredElectrumHistory>> {
+        self.query(script_hash, limit)?.execute()
+    }
+
+    pub fn query(&self, script_hash: &str, limit: usize) -> Result<ElectrumHistoryQuery> {
         let script_hash = encode_history_script_hash(script_hash)?;
-        let mut history = Vec::new();
-        for item in self.events.prefix(script_hash) {
-            let (key, _) = item.context("scanning Electrum history events")?;
-            history.push(decode_history_event_key(&key)?.1);
-            if history.len() > limit {
-                return Ok(None);
-            }
-        }
-        if let Some(events) = self.pending_events.get(&script_hash) {
-            for key in events {
-                history.push(decode_history_event_key(key)?.1);
-                if history.len() > limit {
-                    return Ok(None);
-                }
-            }
-        }
-        Ok(Some(history))
+        Ok(ElectrumHistoryQuery {
+            snapshot: self.events.snapshot(),
+            script_hash,
+            pending: self
+                .pending_events
+                .get(&script_hash)
+                .cloned()
+                .unwrap_or_default(),
+            limit,
+        })
     }
 
     pub fn get_batch(
@@ -5198,10 +5346,21 @@ mod tests {
                     transaction_index: 0,
                 }]
             );
+            let location_query = store.active_locations_query(&[first_txid, second_txid]);
 
             store
                 .connect_active_block(second_hash, 2, &[second_txid], true)
                 .unwrap();
+            let snapshotted = location_query.execute().unwrap();
+            assert_eq!(
+                snapshotted[&first_txid],
+                vec![StoredTxLocation {
+                    block_hash: first_hash,
+                    height: 1,
+                    transaction_index: 0,
+                }]
+            );
+            assert!(!snapshotted.contains_key(&second_txid));
             assert!(
                 store
                     .blocks
@@ -5317,6 +5476,7 @@ mod tests {
             .unwrap();
         assert!(store.contains(&first).unwrap());
         assert_eq!(store.pending.len(), 1);
+        let query = store.query(&[first, second]);
 
         store
             .apply_validated_batch_unsynced(&[first], &[(second, second_entry.clone())])
@@ -5332,6 +5492,9 @@ mod tests {
         assert_eq!(store.pending.len(), 2);
 
         store.flush().unwrap();
+        let snapshotted = query.execute().unwrap();
+        assert!(snapshotted.contains_key(&first));
+        assert!(!snapshotted.contains_key(&second));
         assert!(store.pending.is_empty());
         drop(store);
         let reopened = UtxoStore::open(directory.path()).unwrap();
@@ -5560,6 +5723,7 @@ mod tests {
         assert_eq!(store.pending_event_count, 2);
         assert!(store.contains(&script_hash));
         assert_eq!(store.get(&script_hash).unwrap(), vec![first, second]);
+        let query = store.query(&script_hash, usize::MAX).unwrap();
         assert_eq!(
             store.get_batch(std::slice::from_ref(&script_hash)).unwrap()[&script_hash],
             vec![first, second]
@@ -5567,6 +5731,7 @@ mod tests {
         assert_eq!(store.entries().unwrap()[0].1, vec![first, second]);
 
         store.flush().unwrap();
+        assert_eq!(query.execute().unwrap().unwrap(), vec![first, second]);
         assert_eq!(store.pending_event_count, 0);
         drop(store);
         let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();

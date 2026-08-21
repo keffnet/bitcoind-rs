@@ -1409,16 +1409,42 @@ fn mempool_transaction_height(transaction: &Transaction, mempool: &crate::mempoo
     }
 }
 
-fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
-    let chain = node.chain.read();
-    let mempool = node.mempool.read();
-    let mut status = serde_json::Map::new();
-    let confirmed_spender =
-        chain.electrum_spending_transaction(outpoint, MAX_ELECTRUM_HISTORY_RECORDS)?;
+struct ConfirmedOutpointStatus {
+    active_funder_height: Option<u32>,
+    utxo_height: Option<u32>,
+    known_funder_height: Option<u32>,
+    spender: Option<(Txid, usize, BlockHash, u32)>,
+}
 
-    let active_funder = chain
-        .transaction(&outpoint.txid)?
-        .filter(|(_, location)| chain.is_active_block(&location.block_hash))
+fn confirmed_outpoint_status(
+    node: &Arc<Node>,
+    outpoint: &OutPoint,
+) -> Result<ConfirmedOutpointStatus> {
+    let location_query = node
+        .chain
+        .read()
+        .active_transaction_location_query(&[outpoint.txid]);
+    let mut locations = location_query
+        .map(chain::ActiveTransactionLocationQuery::execute)
+        .transpose()?
+        .unwrap_or_default()
+        .remove(&outpoint.txid)
+        .unwrap_or_default();
+    let funder_location = locations.pop();
+    let funder_transaction = if let Some(location) = funder_location.clone() {
+        let occurrences = active_transaction_occurrences_for_serving(
+            node,
+            HashMap::from([(outpoint.txid, vec![location])]),
+        )?;
+        occurrences
+            .into_iter()
+            .next()
+            .map(|(_, transaction, location)| (transaction, location))
+    } else {
+        None
+    };
+    let active_funder_height = funder_transaction
+        .as_ref()
         .and_then(|(transaction, location)| {
             transaction
                 .output
@@ -1426,7 +1452,90 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
                 .is_some()
                 .then_some(location.height)
         });
-    if let Some(height) = active_funder {
+    let utxo_query = node.chain.read().prepare_utxo_query(&[*outpoint]);
+    let utxo = utxo_query.execute()?.remove(outpoint);
+    let utxo_height = utxo.as_ref().map(|entry| entry.height);
+
+    let (txospender_enabled, indexed_spender) = {
+        let chain = node.chain.read();
+        (
+            chain.txospender_index_enabled(),
+            chain.spending_transaction(outpoint),
+        )
+    };
+    let spender = if txospender_enabled {
+        indexed_spender
+    } else if utxo.is_some() {
+        None
+    } else if let Some((funding_transaction, funding_location)) = funder_transaction {
+        let Some(output) = funding_transaction.output.get(outpoint.vout as usize) else {
+            return Ok(ConfirmedOutpointStatus {
+                active_funder_height,
+                utxo_height,
+                known_funder_height: funder_location.map(|location| location.height),
+                spender: None,
+            });
+        };
+        if chain::is_unspendable_script(&output.script_pubkey) {
+            None
+        } else {
+            let script_hash = chain::electrum_script_hash(&output.script_pubkey);
+            let prepared = node
+                .chain
+                .read()
+                .prepare_electrum_history(&script_hash, MAX_ELECTRUM_HISTORY_RECORDS)?;
+            let history = prepared
+                .execute()?
+                .context("Electrum outpoint history is too large")?;
+            let txids = history
+                .iter()
+                .filter(|entry| entry.height >= funding_location.height)
+                .map(|entry| entry.txid)
+                .collect::<Vec<_>>();
+            let query = node.chain.read().active_transaction_location_query(&txids);
+            let mut candidate_locations = query
+                .map(chain::ActiveTransactionLocationQuery::execute)
+                .transpose()?
+                .unwrap_or_default();
+            let history_occurrences = history
+                .into_iter()
+                .filter(|entry| entry.height >= funding_location.height)
+                .map(|entry| (entry.txid, entry.height))
+                .collect::<HashSet<_>>();
+            for (txid, candidates) in &mut candidate_locations {
+                candidates
+                    .retain(|location| history_occurrences.contains(&(*txid, location.height)));
+            }
+            candidate_locations.retain(|_, candidates| !candidates.is_empty());
+            active_transaction_occurrences_for_serving(node, candidate_locations)?
+                .into_iter()
+                .find_map(|(txid, transaction, location)| {
+                    transaction
+                        .input
+                        .iter()
+                        .position(|input| input.previous_output == *outpoint)
+                        .map(|input_index| {
+                            (txid, input_index, location.block_hash, location.height)
+                        })
+                })
+        }
+    } else {
+        None
+    };
+
+    Ok(ConfirmedOutpointStatus {
+        active_funder_height,
+        utxo_height,
+        known_funder_height: funder_location.map(|location| location.height),
+        spender,
+    })
+}
+
+fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
+    let confirmed = confirmed_outpoint_status(node, outpoint)?;
+    let mempool = node.mempool.read();
+    let mut status = serde_json::Map::new();
+    if let Some(height) = confirmed.active_funder_height {
         status.insert("funder_height".to_owned(), json!(height));
     } else if let Some(entry) = mempool.get(&outpoint.txid)
         && entry
@@ -1439,19 +1548,19 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
             "funder_height".to_owned(),
             json!(mempool_transaction_height(&entry.transaction, &mempool)),
         );
-    } else if let Some(entry) = chain.utxo_checked(outpoint)? {
+    } else if let Some(height) = confirmed.utxo_height {
         // A pruned node can retain an unspent output in the UTXO set after
         // its funding block body has been removed.
-        status.insert("funder_height".to_owned(), json!(entry.height));
-    } else if confirmed_spender.is_some()
-        && let Some(location) = chain.transaction_location(&outpoint.txid)?
+        status.insert("funder_height".to_owned(), json!(height));
+    } else if confirmed.spender.is_some()
+        && let Some(height) = confirmed.known_funder_height
     {
         // For a spent output, the durable spender index proves that this
         // outpoint existed even when pruning removed the funding transaction.
-        status.insert("funder_height".to_owned(), json!(location.height));
+        status.insert("funder_height".to_owned(), json!(height));
     }
 
-    if let Some((txid, _, _, height)) = confirmed_spender {
+    if let Some((txid, _, _, height)) = confirmed.spender {
         status.insert("spender_txhash".to_owned(), json!(txid.to_string()));
         status.insert("spender_height".to_owned(), json!(height));
     } else if let Some(txid) = mempool.spender(outpoint)
@@ -1605,21 +1714,34 @@ fn active_transactions_for_serving(
     node: &Arc<Node>,
     txids: &[Txid],
 ) -> Result<HashMap<Txid, (Transaction, chain::TxLocation)>> {
-    let locations = {
+    let query = {
         let chain = node.chain.read();
-        let mut locations = HashMap::with_capacity(txids.len());
-        for txid in txids {
-            if locations.contains_key(txid) {
-                continue;
-            }
-            let candidates = chain.active_transaction_locations(txid)?;
-            if !candidates.is_empty() {
-                locations.insert(*txid, candidates);
-            }
-        }
-        locations
+        chain.active_transaction_location_query(txids)
     };
+    let locations = query
+        .map(chain::ActiveTransactionLocationQuery::execute)
+        .transpose()?
+        .unwrap_or_default();
+    let occurrences = active_transaction_occurrences_for_serving(node, locations)?;
+    let mut transactions = HashMap::with_capacity(txids.len());
+    for (txid, transaction, location) in occurrences {
+        if transactions
+            .get(&txid)
+            .is_none_or(|(_, current): &(Transaction, chain::TxLocation)| {
+                (location.height, location.transaction_index)
+                    < (current.height, current.transaction_index)
+            })
+        {
+            transactions.insert(txid, (transaction, location));
+        }
+    }
+    Ok(transactions)
+}
 
+fn active_transaction_occurrences_for_serving(
+    node: &Arc<Node>,
+    locations: HashMap<Txid, Vec<chain::TxLocation>>,
+) -> Result<Vec<(Txid, Transaction, chain::TxLocation)>> {
     let mut by_block: HashMap<BlockHash, Vec<(Txid, chain::TxLocation)>> = HashMap::new();
     for (txid, locations) in locations {
         for location in locations {
@@ -1630,7 +1752,7 @@ fn active_transactions_for_serving(
         }
     }
 
-    let mut transactions = HashMap::with_capacity(txids.len());
+    let mut transactions = Vec::new();
     let mut pruned_blocks = Vec::new();
     for (block_hash, entries) in by_block {
         if let Some(block) = node.block_store_reader.get(&block_hash)? {
@@ -1639,15 +1761,8 @@ fn active_transactions_for_serving(
                 else {
                     bail!("transaction index is inconsistent with stored block");
                 };
-                if transaction.compute_txid() == txid
-                    && transactions.get(&txid).is_none_or(
-                        |(_, current): &(Transaction, chain::TxLocation)| {
-                            (location.height, location.transaction_index)
-                                < (current.height, current.transaction_index)
-                        },
-                    )
-                {
-                    transactions.insert(txid, (transaction, location));
+                if transaction.compute_txid() == txid {
+                    transactions.push((txid, transaction, location));
                 }
             }
         } else {
@@ -1673,21 +1788,14 @@ fn active_transactions_for_serving(
                 if transaction.compute_txid() != txid {
                     bail!("Electrum transaction sidecar does not match transaction index");
                 }
-                if transactions.get(&txid).is_none_or(
-                    |(_, current): &(Transaction, chain::TxLocation)| {
-                        (location.height, location.transaction_index)
-                            < (current.height, current.transaction_index)
-                    },
-                ) {
-                    transactions.insert(txid, (transaction, location));
-                }
+                transactions.push((txid, transaction, location));
             }
         }
     }
 
     let chain = node.chain.read();
     transactions
-        .retain(|_, (_, location)| chain.block_hash(location.height) == Some(location.block_hash));
+        .retain(|(_, _, location)| chain.block_hash(location.height) == Some(location.block_hash));
     Ok(transactions)
 }
 
@@ -2357,15 +2465,87 @@ fn sort_mempool_records(records: &mut [(Txid, i64)]) {
     });
 }
 
+fn confirmed_unspent_for_script(
+    node: &Arc<Node>,
+    script_hash: &str,
+) -> Result<Vec<chain::ElectrumUnspent>> {
+    let prepared = node
+        .chain
+        .read()
+        .prepare_electrum_history(script_hash, MAX_ELECTRUM_HISTORY_RECORDS)?;
+    let history = prepared.execute()?.ok_or_else(electrum_history_too_large)?;
+    if history.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let txids = history.iter().map(|entry| entry.txid).collect::<Vec<_>>();
+    let location_query = node.chain.read().active_transaction_location_query(&txids);
+    let mut locations = location_query
+        .map(chain::ActiveTransactionLocationQuery::execute)
+        .transpose()?
+        .unwrap_or_default();
+    let history_occurrences = history
+        .iter()
+        .map(|entry| (entry.txid, entry.height))
+        .collect::<HashSet<_>>();
+    for (txid, candidates) in &mut locations {
+        candidates.retain(|location| history_occurrences.contains(&(*txid, location.height)));
+    }
+    locations.retain(|_, candidates| !candidates.is_empty());
+
+    let transactions = active_transaction_occurrences_for_serving(node, locations)?;
+    let mut candidates = HashMap::new();
+    let mut outpoints = Vec::new();
+    for (txid, transaction, location) in transactions {
+        for (vout, output) in transaction.output.iter().enumerate() {
+            if chain::electrum_script_hash(&output.script_pubkey) != script_hash {
+                continue;
+            }
+            let outpoint = OutPoint::new(txid, vout as u32);
+            outpoints.push(outpoint);
+            candidates.insert(
+                outpoint,
+                (
+                    i64::from(location.height),
+                    location.transaction_index,
+                    output.value.to_sat(),
+                    chain::is_unspendable_script(&output.script_pubkey),
+                ),
+            );
+        }
+    }
+
+    let utxo_query = node.chain.read().prepare_utxo_query(&outpoints);
+    let unspent = utxo_query.execute()?;
+    let mut outputs = candidates
+        .into_iter()
+        .filter_map(
+            |(outpoint, (height, transaction_index, value, unspendable))| {
+                (unspendable || unspent.contains_key(&outpoint)).then_some((
+                    outpoint,
+                    height,
+                    transaction_index,
+                    value,
+                ))
+            },
+        )
+        .collect::<Vec<_>>();
+    outputs.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.0.txid.cmp(&right.0.txid))
+            .then_with(|| left.0.vout.cmp(&right.0.vout))
+    });
+    Ok(outputs)
+}
+
 fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> Result<(u64, i64)> {
-    let chain = node.chain.read();
-    let mempool = node.mempool.read();
-    let confirmed = chain
-        .electrum_unspent_for_script_limited(script_hash, MAX_ELECTRUM_HISTORY_RECORDS)?
-        .ok_or_else(electrum_history_too_large)?
+    let confirmed = confirmed_unspent_for_script(node, script_hash)?
         .into_iter()
         .map(|(_, _, _, value)| value)
         .sum();
+    let mempool = node.mempool.read();
     let mut unconfirmed = 0i64;
     for txid in mempool_transaction_ids_for_script(&mempool, script_hash)? {
         let Some(entry) = mempool.get(&txid) else {
@@ -2383,7 +2563,7 @@ fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> Result<(u64, i64)>
 }
 
 fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>> {
-    let chain = node.chain.read();
+    let mut confirmed = confirmed_unspent_for_script(node, script_hash)?;
     let mempool = node.mempool.read();
     let mut spent = HashSet::new();
     for txid in mempool_transaction_ids_for_script(&mempool, script_hash)? {
@@ -2397,9 +2577,7 @@ fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>>
             );
         }
     }
-    let mut confirmed = chain
-        .electrum_unspent_for_script_limited(script_hash, MAX_ELECTRUM_HISTORY_RECORDS)?
-        .ok_or_else(electrum_history_too_large)?
+    confirmed = confirmed
         .into_iter()
         .filter(|(outpoint, _, _, _)| !spent.contains(outpoint))
         .collect::<Vec<_>>();
@@ -3133,7 +3311,7 @@ mod tests {
             accept_stale_fee_estimates: false,
             rpc_whitelist: std::collections::HashMap::new(),
             rpc_whitelist_default: false,
-            electrum_bind: None,
+            electrum_bind: Some("127.0.0.1:0".parse()?),
             rest: false,
             listen: true,
             dnsseed: true,
@@ -3248,6 +3426,7 @@ mod tests {
                 script_pubkey: ScriptBuf::from_bytes(vec![0x52]),
             }],
         };
+        let confirmed_transaction = transaction.clone();
         let txid = transaction.compute_txid();
         let key = format!("scripthash:{spent_script_hash}");
         let mut subscriptions = HashMap::new();
@@ -3265,8 +3444,10 @@ mod tests {
                 .iter()
                 .any(|entry| entry["tx_hash"] == json!(txid.to_string()))
         );
-        let (_, unconfirmed) = balance_for_script(&node, &spent_script_hash)?;
+        let (confirmed, unconfirmed) = balance_for_script(&node, &spent_script_hash)?;
+        assert_eq!(confirmed, 505_000_000_000);
         assert_eq!(unconfirmed, -5_000_000_000);
+        assert_eq!(unspent_for_script(&node, &spent_script_hash)?.len(), 100);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
@@ -3281,6 +3462,31 @@ mod tests {
             panic!("expected scripthash subscription")
         };
         assert!(status.is_string());
+
+        let mut spend_block = mine_test_block(&previous, 102, 102);
+        spend_block.txdata.push(confirmed_transaction);
+        spend_block.header.merkle_root = spend_block.compute_merkle_root().unwrap();
+        spend_block.header.nonce = 0;
+        while !spend_block
+            .header
+            .target()
+            .is_met_by(spend_block.block_hash())
+        {
+            spend_block.header.nonce = spend_block.header.nonce.wrapping_add(1);
+        }
+        node.connect_block(spend_block)?;
+        assert_eq!(
+            outpoint_status(&node, &funding_outpoint)?,
+            json!({
+                "funder_height": 1,
+                "spender_txhash": txid.to_string(),
+                "spender_height": 102,
+            })
+        );
+        assert_eq!(
+            balance_for_script(&node, &spent_script_hash)?,
+            (505_000_000_000, 0)
+        );
         Ok(())
     }
 

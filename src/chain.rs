@@ -37,9 +37,10 @@ use crate::config::{
 };
 use crate::muhash::MuHash3072;
 use crate::storage::{
-    BlockStore, BlockStoreReader, ChainstateStore, CoinStatsRecord, CoinStatsStore,
-    ElectrumBlockStore, ElectrumBlockStoreReader, ElectrumHistoryStore, FilterStore,
-    StoredTxLocation, StoredUndo, StoredUtxo, TransactionIndexStore, UtxoStore,
+    ActiveTransactionLocationsQuery, BlockStore, BlockStoreReader, ChainstateStore,
+    CoinStatsRecord, CoinStatsStore, ElectrumBlockStore, ElectrumBlockStoreReader,
+    ElectrumHistoryQuery, ElectrumHistoryStore, FilterStore, StoredTxLocation, StoredUndo,
+    StoredUtxo, TransactionIndexStore, UtxoQuery, UtxoStore,
 };
 use crate::validation::{self, ValidationError};
 
@@ -460,7 +461,70 @@ pub struct HistoryEntry {
     pub height: u32,
 }
 
-type ElectrumUnspent = (OutPoint, i64, usize, u64);
+pub(crate) struct ActiveTransactionLocationQuery(ActiveTransactionLocationsQuery);
+
+impl ActiveTransactionLocationQuery {
+    pub fn execute(self) -> Result<HashMap<Txid, Vec<TxLocation>>> {
+        self.0
+            .execute()?
+            .into_iter()
+            .map(|(txid, locations)| {
+                let locations = locations
+                    .into_iter()
+                    .map(ChainState::decoded_tx_location)
+                    .collect::<Result<Vec<_>>>()?;
+                Ok((txid, locations))
+            })
+            .collect()
+    }
+}
+
+pub(crate) enum PreparedElectrumHistory {
+    Ready(Option<Vec<HistoryEntry>>),
+    Stored(ElectrumHistoryQuery),
+}
+
+impl PreparedElectrumHistory {
+    pub fn execute(self) -> Result<Option<Vec<HistoryEntry>>> {
+        match self {
+            Self::Ready(history) => Ok(history),
+            Self::Stored(query) => Ok(query.execute()?.map(|history| {
+                history
+                    .into_iter()
+                    .map(|(txid, height)| HistoryEntry { txid, height })
+                    .collect()
+            })),
+        }
+    }
+}
+
+pub(crate) struct UtxoSnapshotQuery {
+    stored: UtxoQuery,
+    materialized: Option<HashMap<OutPoint, Option<UtxoEntry>>>,
+}
+
+impl UtxoSnapshotQuery {
+    pub fn execute(self) -> Result<HashMap<OutPoint, UtxoEntry>> {
+        let mut entries = self
+            .stored
+            .execute()?
+            .into_iter()
+            .map(|(outpoint, entry)| (outpoint, ChainState::decoded_utxo(entry)))
+            .collect::<HashMap<_, _>>();
+        if let Some(materialized) = self.materialized {
+            for (outpoint, entry) in materialized {
+                if let Some(entry) = entry {
+                    entries.insert(outpoint, entry);
+                } else {
+                    entries.remove(&outpoint);
+                }
+            }
+        }
+        Ok(entries)
+    }
+}
+
+pub(crate) type ElectrumUnspent = (OutPoint, i64, usize, u64);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChainTip {
@@ -5738,6 +5802,15 @@ impl ChainState {
             .collect()
     }
 
+    pub(crate) fn active_transaction_location_query(
+        &self,
+        txids: &[Txid],
+    ) -> Option<ActiveTransactionLocationQuery> {
+        self.tx_index_store
+            .as_ref()
+            .map(|store| ActiveTransactionLocationQuery(store.active_locations_query(txids)))
+    }
+
     /// Find an active occurrence at an exact height, including a duplicate
     /// txid whose latest location is in a later block.
     pub(crate) fn active_transaction_location_at_height(
@@ -5808,6 +5881,7 @@ impl ChainState {
     /// output's script hash in Electrum history, so only transactions in that
     /// script's bounded history can be candidates. This keeps the common IBD
     /// configuration from retaining one global hash entry per spent output.
+    #[cfg(test)]
     pub(crate) fn electrum_spending_transaction(
         &self,
         outpoint: &OutPoint,
@@ -5905,6 +5979,27 @@ impl ChainState {
             }))
     }
 
+    pub(crate) fn prepare_electrum_history(
+        &self,
+        script_hash: &str,
+        limit: usize,
+    ) -> Result<PreparedElectrumHistory> {
+        if !self.history_index_enabled {
+            return Ok(PreparedElectrumHistory::Ready(Some(Vec::new())));
+        }
+        if self.history_materialized {
+            let Some(history) = self.history.get(script_hash) else {
+                return Ok(PreparedElectrumHistory::Ready(Some(Vec::new())));
+            };
+            return Ok(PreparedElectrumHistory::Ready(
+                (history.len() <= limit).then(|| history.clone()),
+            ));
+        }
+        Ok(PreparedElectrumHistory::Stored(
+            self.electrum_history_store.query(script_hash, limit)?,
+        ))
+    }
+
     pub fn script_hashes(&self) -> Vec<String> {
         if !self.history_index_enabled {
             return Vec::new();
@@ -5945,6 +6040,7 @@ impl ChainState {
     /// A busy script can have a small current UTXO set but still require a
     /// large history walk, so bounded callers should reject it before doing
     /// that work.
+    #[cfg(test)]
     pub(crate) fn electrum_unspent_for_script_limited(
         &self,
         script_hash: &str,
@@ -6017,6 +6113,20 @@ impl ChainState {
             self.missing_utxo_cache.lock().insert(*outpoint);
         }
         Ok(entry)
+    }
+
+    pub(crate) fn prepare_utxo_query(&self, outpoints: &[OutPoint]) -> UtxoSnapshotQuery {
+        let materialized = self.utxos_materialized.then(|| {
+            outpoints
+                .iter()
+                .copied()
+                .map(|outpoint| (outpoint, self.utxos.get(&outpoint).cloned()))
+                .collect()
+        });
+        UtxoSnapshotQuery {
+            stored: self.utxo_store.query(outpoints),
+            materialized,
+        }
     }
 
     pub fn all_utxos(&self) -> impl Iterator<Item = (OutPoint, UtxoEntry)> {
@@ -12343,7 +12453,7 @@ fn read_snapshot_varint(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     }
 }
 
-fn is_unspendable_script(script: &Script) -> bool {
+pub(crate) fn is_unspendable_script(script: &Script) -> bool {
     script.is_op_return() || script.len() > MAX_UNSPENDABLE_SCRIPT_SIZE
 }
 

@@ -5804,34 +5804,27 @@ async fn serve_peer_loop(
                     node.forget_rejected_block_body(&hash);
                 }
 
+                let request_block_bodies =
+                    peer_block_download_allowed_for_node(node, peer_id, peer_services);
+                let direct_fetch_limit = MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                    .saturating_sub(node.peer_inflight_block_count(peer_id));
                 // Claim candidate bodies before publishing these headers to
                 // the global block index. A duplicate INV handler can run as
                 // soon as the chain lock is released; without this claim it
                 // can send GETDATA before this headers peer installs its
-                // direct-fetch reservations. Include missing bodies on the
-                // already-known parent branch because direct fetch walks back
-                // to the active chain below.
+                // direct-fetch reservations. Do not walk a historical
+                // header-only branch unless it is actually eligible for
+                // direct fetch, and never claim more than this peer can put
+                // in flight immediately.
                 let pending_direct_fetch_claims = {
                     let chain = node.chain.read();
-                    let mut claims = headers_to_accept
-                        .iter()
-                        .map(BlockHeader::block_hash)
-                        .collect::<Vec<_>>();
-                    let mut cursor = headers_to_accept
-                        .first()
-                        .map(|header| header.prev_blockhash);
-                    while let Some(hash) = cursor {
-                        if chain.is_active_block(&hash) {
-                            break;
-                        }
-                        if !chain.store.contains(&hash) && !claims.contains(&hash) {
-                            claims.push(hash);
-                        }
-                        cursor = chain
-                            .header_by_hash(&hash)
-                            .map(|header| header.prev_blockhash);
-                    }
-                    claims
+                    pending_header_direct_fetch_claims(
+                        &chain,
+                        &headers_to_accept,
+                        request_block_bodies,
+                        crate::time::unix_time_i64(),
+                        direct_fetch_limit,
+                    )
                 };
                 node.claim_pending_header_direct_fetches(peer_id, &pending_direct_fetch_claims);
 
@@ -5915,8 +5908,8 @@ async fn serve_peer_loop(
                     .into_iter()
                     .find(|peer| peer.id == peer_id)
                     .and_then(|peer| peer.best_known_block);
-                let request_block_bodies =
-                    peer_block_download_allowed_for_node(node, peer_id, peer_services);
+                let direct_fetch_limit = MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                    .saturating_sub(node.peer_inflight_block_count(peer_id));
                 let requests = {
                     let chain = node.chain.read();
                     let peer_best_height =
@@ -5952,31 +5945,16 @@ async fn serve_peer_loop(
                     let request_hashes = if !request_block_bodies {
                         Vec::new()
                     } else if request_candidate_bodies {
-                        // Direct fetch can be triggered by a header that was
-                        // announced separately from its predecessor.  Walk
-                        // back to the active chain so the request includes
-                        // every missing body in the now-competitive branch,
-                        // not only the newest header accepted in this
-                        // message.
-                        let mut branch = Vec::new();
-                        let mut cursor = hashes.last().copied();
-                        while let Some(hash) = cursor {
-                            if chain.is_active_block(&hash) {
-                                break;
-                            }
-                            if !chain.store.contains(&hash) {
-                                branch.push(hash);
-                            }
-                            cursor = chain
-                                .header_by_hash(&hash)
-                                .map(|header| header.prev_blockhash);
-                        }
-                        branch.reverse();
-                        if branch.is_empty() {
-                            hashes.clone()
-                        } else {
-                            branch
-                        }
+                        // Core only direct-fetches a connecting branch when
+                        // every missing predecessor fits the peer's current
+                        // in-flight capacity. Larger gaps are left to the
+                        // parallel body scheduler.
+                        hashes
+                            .last()
+                            .and_then(|hash| {
+                                direct_fetch_missing_branch(&chain, *hash, direct_fetch_limit)
+                            })
+                            .unwrap_or_default()
                     } else {
                         Vec::new()
                     };
@@ -10312,6 +10290,117 @@ fn can_direct_fetch(tip_time: u32, now: i64, target_spacing: u64) -> bool {
     i64::from(tip_time) > now.saturating_sub(freshness_window)
 }
 
+fn header_batch_is_direct_fetch_candidate(
+    chain: &crate::chain::ChainState,
+    headers: &[BlockHeader],
+    request_block_bodies: bool,
+    now: i64,
+) -> bool {
+    if !request_block_bodies || headers.is_empty() {
+        return false;
+    }
+    let parent_hash = headers[0].prev_blockhash;
+    let Some(parent_height) = chain.block_height_by_hash(&parent_hash) else {
+        return false;
+    };
+    let Some(parent_work) = chain.chain_work_by_hash(&parent_hash) else {
+        return false;
+    };
+    let candidate_height =
+        parent_height.saturating_add(u32::try_from(headers.len()).unwrap_or(u32::MAX));
+    let direct_fetch_allowed = chain.header(chain.height()).is_some_and(|header| {
+        can_direct_fetch(header.time, now, chain.network.params().pow_target_spacing)
+    });
+    if !direct_fetch_allowed && candidate_height > chain.height().saturating_add(2) {
+        return false;
+    }
+    let candidate_work = headers.iter().fold(parent_work, |work, header| {
+        add_work_saturating(work, header.work())
+    });
+    candidate_work >= chain.tip().work
+}
+
+/// Return the bodies that may need an atomic direct-fetch reservation before
+/// a header batch is published. Historical IBD batches are deliberately
+/// rejected before any ancestor walk, and a competitive branch must fit the
+/// peer's immediately available in-flight slots.
+fn pending_header_direct_fetch_claims(
+    chain: &crate::chain::ChainState,
+    headers: &[BlockHeader],
+    request_block_bodies: bool,
+    now: i64,
+    limit: usize,
+) -> Vec<BlockHash> {
+    if limit == 0
+        || !header_batch_is_direct_fetch_candidate(chain, headers, request_block_bodies, now)
+    {
+        return Vec::new();
+    }
+
+    if headers.len() > limit {
+        return Vec::new();
+    }
+    let mut claims = Vec::with_capacity(limit.min(headers.len()));
+    let mut seen = HashSet::with_capacity(limit);
+    for header in headers {
+        let hash = header.block_hash();
+        if !chain.store.contains(&hash) && seen.insert(hash) {
+            if claims.len() == limit {
+                return Vec::new();
+            }
+            claims.push(hash);
+        }
+    }
+
+    let mut walked = headers.len();
+    let mut cursor = headers[0].prev_blockhash;
+    loop {
+        if chain.is_active_block(&cursor) {
+            return claims;
+        }
+        if walked == limit {
+            return Vec::new();
+        }
+        let Some(header) = chain.header_by_hash(&cursor) else {
+            return Vec::new();
+        };
+        walked += 1;
+        if seen.insert(cursor) && !chain.store.contains(&cursor) {
+            claims.push(cursor);
+        }
+        cursor = header.prev_blockhash;
+    }
+}
+
+/// Find a complete missing branch for Core-style direct fetch. Returning
+/// `None` means that the branch does not connect to available chainstate
+/// within the current in-flight budget, so the parallel scheduler should
+/// handle it instead.
+fn direct_fetch_missing_branch(
+    chain: &crate::chain::ChainState,
+    tip: BlockHash,
+    limit: usize,
+) -> Option<Vec<BlockHash>> {
+    let mut branch = Vec::with_capacity(limit);
+    let mut walked = 0usize;
+    let mut cursor = tip;
+    loop {
+        if chain.is_active_block(&cursor) {
+            branch.reverse();
+            return Some(branch);
+        }
+        if walked == limit {
+            return None;
+        }
+        let header = chain.header_by_hash(&cursor)?;
+        walked += 1;
+        if !chain.store.contains(&cursor) {
+            branch.push(cursor);
+        }
+        cursor = header.prev_blockhash;
+    }
+}
+
 #[cfg(test)]
 fn fee_rate_sat_per_kvb(fee_sat: u64, vsize: u64) -> i64 {
     if vsize == 0 {
@@ -11954,6 +12043,70 @@ mod tests {
         assert_eq!(
             missing_headers_parent(&chain, &headers),
             Some(BlockHash::from_byte_array([0x42; 32]))
+        );
+    }
+
+    #[test]
+    fn historical_header_batches_skip_direct_fetch_ancestor_walks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = crate::chain::ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let (_, headers) = mined_regtest_headers(64);
+        chain.accept_headers(&headers[..48]).unwrap();
+
+        // The active body chain is still genesis. A historical continuation
+        // is not a direct-fetch candidate, so it must not claim the 48-header
+        // parent gap before entering the block index.
+        assert_eq!(chain.height(), 0);
+        assert!(
+            pending_header_direct_fetch_claims(
+                &chain,
+                &headers[48..],
+                true,
+                i64::MAX / 2,
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            )
+            .is_empty()
+        );
+
+        // Even a recent competitive branch is handed to the parallel body
+        // scheduler when the complete missing path exceeds one peer's
+        // immediate in-flight budget.
+        assert!(
+            direct_fetch_missing_branch(
+                &chain,
+                headers[47].block_hash(),
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            )
+            .is_none()
+        );
+        let complete = direct_fetch_missing_branch(&chain, headers[47].block_hash(), 48).unwrap();
+        assert_eq!(
+            complete,
+            headers[..48]
+                .iter()
+                .map(BlockHeader::block_hash)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn short_recent_header_extension_claims_each_direct_fetch_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = crate::chain::ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let (genesis, headers) = mined_regtest_headers(2);
+        let claims = pending_header_direct_fetch_claims(
+            &chain,
+            &headers,
+            true,
+            i64::from(genesis.time),
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+        );
+        assert_eq!(
+            claims.into_iter().collect::<HashSet<_>>(),
+            headers
+                .iter()
+                .map(BlockHeader::block_hash)
+                .collect::<HashSet<_>>()
         );
     }
 

@@ -8625,7 +8625,15 @@ impl ChainState {
             application.metrics,
         );
         let prepare_block = persist && !self.store.contains(&hash);
-        let prepare_delta = persist && !self.chainstate_store.contains(&hash);
+        // Peer IBD already commits the authoritative UTXO, transaction, and
+        // optional Electrum stores before publishing its active-tip marker.
+        // Persisting the same historical mutations again as chainstate
+        // deltas nearly duplicated the block data on disk and spent a large
+        // share of IBD CPU serializing and compressing records that clean
+        // restart never reads. Synchronously connected blocks retain deltas
+        // for snapshot-suffix replay; batched peer blocks fall back to native
+        // block replay if a snapshot ever needs a suffix reconstructed.
+        let prepare_delta = persist && sync_storage && !self.chainstate_store.contains(&hash);
         let prepare_block_record = || -> Result<_> {
             prepare_block
                 .then(|| BlockStore::prepare_record(block))
@@ -14652,6 +14660,12 @@ mod tests {
         state.flush_peer_storage_if_needed().unwrap();
         assert_eq!(state.peer_storage_blocks_since_flush, 0);
         assert_eq!(state.peer_storage_bytes_since_flush, 0);
+        assert_eq!(
+            fs::metadata(directory.path().join("chainstate/deltas.dat"))
+                .unwrap()
+                .len(),
+            0
+        );
         drop(state);
 
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();

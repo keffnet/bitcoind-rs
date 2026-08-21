@@ -54,6 +54,7 @@ const UTXO_DELETE: u8 = 2;
 const UTXO_COMMIT: u8 = 3;
 const HISTORY_PUT: u8 = 1;
 const HISTORY_COMMIT: u8 = 2;
+const HISTORY_APPEND: u8 = 3;
 
 #[derive(Clone, Copy, Debug)]
 struct Record {
@@ -245,6 +246,18 @@ struct PendingHistoryOperation {
 }
 
 type HistoryIndexState = (HashMap<[u8; 32], HistoryLocation>, u64);
+
+#[derive(Clone, Debug)]
+enum PendingElectrumHistory {
+    Replace(StoredElectrumHistory),
+    Append(StoredElectrumHistory),
+}
+
+#[derive(Debug)]
+struct DecodedHistoryNode {
+    previous: Option<HistoryLocation>,
+    entries: StoredElectrumHistory,
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct XorKey([u8; XOR_KEY_SIZE]);
@@ -2122,10 +2135,11 @@ impl Drop for UtxoStore {
 
 /// Durable Electrum script history.
 ///
-/// Each value-log record contains the complete history for one script hash;
-/// the in-memory index keeps only the latest record location.  Updating a
-/// script therefore appends a new value and atomically advances its pointer,
-/// while ordinary restarts avoid loading every history vector into memory.
+/// Replacement records contain a complete history for one script hash, while
+/// normal active-chain updates append bounded chunks linked to the previous
+/// head. The in-memory index keeps only the latest record location. This keeps
+/// ordinary IBD growth linear even for heavily reused scripts while ordinary
+/// restarts avoid loading every history vector into memory.
 pub struct ElectrumHistoryStore {
     path: PathBuf,
     index_path: PathBuf,
@@ -2133,7 +2147,8 @@ pub struct ElectrumHistoryStore {
     index_file: File,
     index: HashMap<[u8; 32], HistoryLocation>,
     next_batch_id: u64,
-    pending: HashMap<[u8; 32], StoredElectrumHistory>,
+    pending: HashMap<[u8; 32], PendingElectrumHistory>,
+    contains_linked_histories: bool,
 }
 
 impl ElectrumHistoryStore {
@@ -2168,6 +2183,7 @@ impl ElectrumHistoryStore {
             .open(&index_path)
             .with_context(|| format!("opening Electrum history index {}", index_path.display()))?;
         let data_len = file.metadata()?.len();
+        let contains_history_values = data_len > ELECTRUM_HISTORY_DATA_MAGIC.len() as u64;
         let loaded_index = load_history_index(&mut index_file, &file, data_len)?;
         let (index, next_batch_id) = if let Some(index) = loaded_index {
             index
@@ -2189,6 +2205,10 @@ impl ElectrumHistoryStore {
             index,
             next_batch_id,
             pending: HashMap::new(),
+            // Existing v1 stores may contain append nodes after this binary
+            // has written them. Conservatively disable automatic stale-byte
+            // estimation until a future index version persists chain sizes.
+            contains_linked_histories: contains_history_values,
         })
     }
 
@@ -2236,14 +2256,17 @@ impl ElectrumHistoryStore {
 
     pub fn get(&self, script_hash: &str) -> Result<Vec<(Txid, u32)>> {
         let script_hash = encode_history_script_hash(script_hash)?;
-        if let Some(entries) = self.pending.get(&script_hash) {
-            return Ok(entries.clone());
+        if let Some(pending) = self.pending.get(&script_hash) {
+            return match pending {
+                PendingElectrumHistory::Replace(entries) => Ok(entries.clone()),
+                PendingElectrumHistory::Append(entries) => {
+                    let mut history = self.read_history(script_hash)?;
+                    extend_history(&mut history, entries);
+                    Ok(history)
+                }
+            };
         }
-        let Some(location) = self.index.get(&script_hash).copied() else {
-            return Ok(Vec::new());
-        };
-        let body = read_history_data_record(&self.file, location)?;
-        decode_history_value(&body, script_hash)
+        self.read_history(script_hash)
     }
 
     /// Read one script history while refusing to allocate more than `limit`
@@ -2252,14 +2275,61 @@ impl ElectrumHistoryStore {
     /// history before copying it into a temporary vector.
     pub fn get_limited(&self, script_hash: &str, limit: usize) -> Result<Option<Vec<(Txid, u32)>>> {
         let script_hash = encode_history_script_hash(script_hash)?;
-        if let Some(entries) = self.pending.get(&script_hash) {
-            return Ok((entries.len() <= limit).then(|| entries.clone()));
+        if let Some(pending) = self.pending.get(&script_hash) {
+            return match pending {
+                PendingElectrumHistory::Replace(entries) => {
+                    Ok((entries.len() <= limit).then(|| entries.clone()))
+                }
+                PendingElectrumHistory::Append(entries) => {
+                    let Some(mut history) = self.read_history_limited(script_hash, limit)? else {
+                        return Ok(None);
+                    };
+                    extend_history(&mut history, entries);
+                    Ok((history.len() <= limit).then_some(history))
+                }
+            };
         }
-        let Some(location) = self.index.get(&script_hash).copied() else {
+        self.read_history_limited(script_hash, limit)
+    }
+
+    fn read_history(&self, script_hash: [u8; 32]) -> Result<StoredElectrumHistory> {
+        self.read_history_limited(script_hash, usize::MAX)
+            .map(|history| history.expect("unlimited history limit cannot be exceeded"))
+    }
+
+    fn read_history_limited(
+        &self,
+        script_hash: [u8; 32],
+        limit: usize,
+    ) -> Result<Option<StoredElectrumHistory>> {
+        let Some(mut location) = self.index.get(&script_hash).copied() else {
             return Ok(Some(Vec::new()));
         };
-        let body = read_history_data_record(&self.file, location)?;
-        decode_history_value_limited(&body, script_hash, limit)
+        let mut chunks = Vec::new();
+        let mut entry_count = 0usize;
+        loop {
+            let body = read_history_data_record(&self.file, location)?;
+            let node = decode_history_node(&body, script_hash)?;
+            entry_count = entry_count
+                .checked_add(node.entries.len())
+                .context("Electrum history entry count overflowed")?;
+            if entry_count > limit {
+                return Ok(None);
+            }
+            chunks.push(node.entries);
+            let Some(previous) = node.previous else {
+                break;
+            };
+            if !history_location_precedes(previous, location.offset()) {
+                bail!("Electrum history append chain does not point backwards");
+            }
+            location = previous;
+        }
+        let mut history = Vec::with_capacity(entry_count);
+        for entries in chunks.into_iter().rev() {
+            extend_history(&mut history, &entries);
+        }
+        Ok(Some(history))
     }
 
     /// Read several script histories in data-file order. Reorgs commonly
@@ -2285,13 +2355,19 @@ impl ElectrumHistoryStore {
 
         let mut histories = HashMap::with_capacity(requests.len());
         for (script_hash, encoded, pending, location) in requests {
-            let entries = match (pending, location) {
-                (Some(entries), _) => entries,
-                (None, Some(location)) => {
-                    let body = read_history_data_record(&self.file, location)?;
-                    decode_history_value(&body, encoded)?
+            let entries = match pending {
+                Some(PendingElectrumHistory::Replace(entries)) => entries,
+                Some(PendingElectrumHistory::Append(additions)) => {
+                    let mut history = if location.is_some() {
+                        self.read_history(encoded)?
+                    } else {
+                        Vec::new()
+                    };
+                    extend_history(&mut history, &additions);
+                    history
                 }
-                (None, None) => Vec::new(),
+                None if location.is_some() => self.read_history(encoded)?,
+                None => Vec::new(),
             };
             histories.insert(script_hash, entries);
         }
@@ -2318,16 +2394,16 @@ impl ElectrumHistoryStore {
         locations.sort_unstable_by_key(|(_, location)| location.offset());
         let mut entries = locations
             .into_iter()
-            .map(|(script_hash, location)| {
-                let body = read_history_data_record(&self.file, location)?;
-                Ok((
-                    hex::encode(script_hash),
-                    decode_history_value(&body, script_hash)?,
-                ))
+            .map(|(script_hash, _)| {
+                let encoded = hex::encode(script_hash);
+                Ok((encoded.clone(), self.get(&encoded)?))
             })
             .collect::<Result<HashMap<_, _>>>()?;
-        for (script_hash, pending) in &self.pending {
-            entries.insert(hex::encode(script_hash), pending.clone());
+        for script_hash in self.pending.keys() {
+            if !self.index.contains_key(script_hash) {
+                let encoded = hex::encode(script_hash);
+                entries.insert(encoded.clone(), self.get(&encoded)?);
+            }
         }
         Ok(entries.into_iter().collect())
     }
@@ -2341,8 +2417,10 @@ impl ElectrumHistoryStore {
 
     pub fn apply_batch_unsynced(&mut self, updates: &[(String, Vec<(Txid, u32)>)]) -> Result<()> {
         for (script_hash, entries) in updates {
-            self.pending
-                .insert(encode_history_script_hash(script_hash)?, entries.clone());
+            self.pending.insert(
+                encode_history_script_hash(script_hash)?,
+                PendingElectrumHistory::Replace(entries.clone()),
+            );
         }
         Ok(())
     }
@@ -2359,23 +2437,17 @@ impl ElectrumHistoryStore {
                 continue;
             }
             let encoded = encode_history_script_hash(script_hash)?;
-            if !self.pending.contains_key(&encoded) {
-                let existing = match self.index.get(&encoded).copied() {
-                    Some(location) => {
-                        let body = read_history_data_record(&self.file, location)?;
-                        decode_history_value(&body, encoded)?
-                    }
-                    None => Vec::new(),
-                };
-                self.pending.insert(encoded, existing);
-            }
-            let history = self
+            let pending = self
                 .pending
-                .get_mut(&encoded)
-                .expect("pending history was initialized above");
+                .entry(encoded)
+                .or_insert_with(|| PendingElectrumHistory::Append(Vec::new()));
+            let entries = match pending {
+                PendingElectrumHistory::Replace(entries)
+                | PendingElectrumHistory::Append(entries) => entries,
+            };
             for entry in additions {
-                if history.last() != Some(entry) {
-                    history.push(*entry);
+                if entries.last() != Some(entry) {
+                    entries.push(*entry);
                 }
             }
         }
@@ -2389,9 +2461,9 @@ impl ElectrumHistoryStore {
         let pending = std::mem::take(&mut self.pending);
         let updates = pending
             .iter()
-            .map(|(script_hash, entries)| (hex::encode(script_hash), entries.clone()))
+            .map(|(script_hash, update)| (hex::encode(script_hash), update.clone()))
             .collect::<Vec<_>>();
-        if let Err(error) = self.apply_batch_with_sync(&updates, true) {
+        if let Err(error) = self.apply_pending_batch_with_sync(&updates, true) {
             self.pending = pending;
             return Err(error);
         }
@@ -2401,6 +2473,23 @@ impl ElectrumHistoryStore {
     fn apply_batch_with_sync(
         &mut self,
         updates: &[(String, Vec<(Txid, u32)>)],
+        sync: bool,
+    ) -> Result<()> {
+        let updates = updates
+            .iter()
+            .map(|(script_hash, entries)| {
+                (
+                    script_hash.clone(),
+                    PendingElectrumHistory::Replace(entries.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        self.apply_pending_batch_with_sync(&updates, sync)
+    }
+
+    fn apply_pending_batch_with_sync(
+        &mut self,
+        updates: &[(String, PendingElectrumHistory)],
         sync: bool,
     ) -> Result<()> {
         if updates.is_empty() {
@@ -2415,10 +2504,25 @@ impl ElectrumHistoryStore {
         let mut data_committed = false;
         let write_result = (|| -> Result<()> {
             let mut data_bytes = Vec::new();
-            for (script_hash, entries) in updates {
+            for (script_hash, update) in updates {
                 let script_hash_bytes = encode_history_script_hash(script_hash)?;
-                let body = encode_history_value(batch_id, script_hash_bytes, entries)?;
-                let location = buffer_history_data_record(&mut data_bytes, batch_start, &body)?;
+                let location = match update {
+                    PendingElectrumHistory::Replace(entries) => buffer_history_replacement_records(
+                        &mut data_bytes,
+                        batch_start,
+                        batch_id,
+                        script_hash_bytes,
+                        entries,
+                    )?,
+                    PendingElectrumHistory::Append(entries) => buffer_history_append_records(
+                        &mut data_bytes,
+                        batch_start,
+                        batch_id,
+                        script_hash_bytes,
+                        self.index.get(&script_hash_bytes).copied(),
+                        entries,
+                    )?,
+                };
                 operations.push(PendingHistoryOperation {
                     script_hash: script_hash_bytes,
                     location,
@@ -2456,6 +2560,13 @@ impl ElectrumHistoryStore {
         for operation in operations {
             self.index.insert(operation.script_hash, operation.location);
         }
+        self.contains_linked_histories |= updates.iter().any(|(_, update)| match update {
+            PendingElectrumHistory::Append(_) => true,
+            PendingElectrumHistory::Replace(entries) => {
+                entries.len().saturating_mul(36).saturating_add(45)
+                    > MAX_STORED_ELECTRUM_HISTORY_SIZE
+            }
+        });
         self.next_batch_id = next_batch_id;
         Ok(())
     }
@@ -2520,9 +2631,8 @@ impl ElectrumHistoryStore {
                 .context("Electrum history batch identifier exhausted during compaction")?;
             let mut compact_index = HashMap::with_capacity(locations.len());
             let mut copied_entries = 0usize;
-            for (script_hash_bytes, location) in &locations {
-                let body = read_history_data_record(&self.file, *location)?;
-                let history = decode_history_value(&body, *script_hash_bytes)?;
+            for (script_hash_bytes, _) in &locations {
+                let history = self.read_history(*script_hash_bytes)?;
                 if history.is_empty() {
                     // Reorg deltas may leave an empty replacement value for a
                     // script that no longer has any active-chain history.
@@ -2530,8 +2640,16 @@ impl ElectrumHistoryStore {
                     // phantom key into the compacted index.
                     continue;
                 }
-                let body = encode_history_value(batch_id, *script_hash_bytes, &history)?;
-                let location = append_history_data_record(&mut compact_data, &body)?;
+                let data_start = data_len_after(&compact_data)?;
+                let mut record_bytes = Vec::new();
+                let location = buffer_history_replacement_records(
+                    &mut record_bytes,
+                    data_start,
+                    batch_id,
+                    *script_hash_bytes,
+                    &history,
+                )?;
+                compact_data.write_all(&record_bytes)?;
                 compact_index.insert(*script_hash_bytes, location);
                 copied_entries = copied_entries.saturating_add(1);
             }
@@ -2618,6 +2736,11 @@ impl ElectrumHistoryStore {
     /// full rewrite worthwhile.  Chainstate snapshots invoke this hook so
     /// long-running Electrum nodes reclaim old script-history versions.
     pub fn compact_if_needed(&mut self) -> Result<bool> {
+        if self.contains_linked_histories {
+            // The old latest-value estimate does not include predecessor
+            // chunks that remain logically live. Never reclaim them as stale.
+            return Ok(false);
+        }
         let data_len = data_len_after(&self.file)?;
         if data_len < MIN_ELECTRUM_HISTORY_COMPACTION_DATA_SIZE {
             return Ok(false);
@@ -2645,6 +2768,7 @@ impl ElectrumHistoryStore {
         self.file.sync_data()?;
         self.index.clear();
         self.pending.clear();
+        self.contains_linked_histories = false;
         self.next_batch_id = 1;
         self.index_file.set_len(0)?;
         self.index_file.seek(SeekFrom::End(0))?;
@@ -2717,6 +2841,89 @@ fn encode_history_value(
     Ok(body)
 }
 
+fn encode_history_append(
+    batch_id: u64,
+    script_hash: [u8; 32],
+    previous: Option<HistoryLocation>,
+    entries: &[(Txid, u32)],
+) -> Result<Vec<u8>> {
+    if entries.is_empty() {
+        bail!("Electrum history append record cannot be empty");
+    }
+    let entry_bytes = entries
+        .len()
+        .checked_mul(36)
+        .context("Electrum history append entry count overflowed")?;
+    let body_len = 1usize
+        .checked_add(8)
+        .and_then(|length| length.checked_add(32))
+        .and_then(|length| length.checked_add(8 + 4 + 4))
+        .and_then(|length| length.checked_add(entry_bytes))
+        .context("Electrum history append record length overflowed")?;
+    if body_len > MAX_STORED_ELECTRUM_HISTORY_SIZE {
+        bail!("Electrum history append record is too large: {body_len} bytes");
+    }
+    let count =
+        u32::try_from(entries.len()).context("Electrum history append count is too large")?;
+    let mut body = Vec::with_capacity(body_len);
+    body.push(HISTORY_APPEND);
+    body.extend_from_slice(&batch_id.to_le_bytes());
+    body.extend_from_slice(&script_hash);
+    body.extend_from_slice(&previous.map_or(0, HistoryLocation::offset).to_le_bytes());
+    body.extend_from_slice(&previous.map_or(0, HistoryLocation::length).to_le_bytes());
+    body.extend_from_slice(&count.to_le_bytes());
+    for (txid, height) in entries {
+        body.extend_from_slice(&txid.to_byte_array());
+        body.extend_from_slice(&height.to_le_bytes());
+    }
+    Ok(body)
+}
+
+fn buffer_history_replacement_records(
+    destination: &mut Vec<u8>,
+    data_start: u64,
+    batch_id: u64,
+    script_hash: [u8; 32],
+    entries: &[(Txid, u32)],
+) -> Result<HistoryLocation> {
+    const PUT_HEADER_SIZE: usize = 1 + 8 + 32 + 4;
+    let put_entries = (MAX_STORED_ELECTRUM_HISTORY_SIZE - PUT_HEADER_SIZE) / 36;
+    let first_end = entries.len().min(put_entries);
+    let body = encode_history_value(batch_id, script_hash, &entries[..first_end])?;
+    let mut head = buffer_history_data_record(destination, data_start, &body)?;
+    if first_end < entries.len() {
+        head = buffer_history_append_records(
+            destination,
+            data_start,
+            batch_id,
+            script_hash,
+            Some(head),
+            &entries[first_end..],
+        )?;
+    }
+    Ok(head)
+}
+
+fn buffer_history_append_records(
+    destination: &mut Vec<u8>,
+    data_start: u64,
+    batch_id: u64,
+    script_hash: [u8; 32],
+    mut previous: Option<HistoryLocation>,
+    entries: &[(Txid, u32)],
+) -> Result<HistoryLocation> {
+    const APPEND_HEADER_SIZE: usize = 1 + 8 + 32 + 8 + 4 + 4;
+    let chunk_entries = (MAX_STORED_ELECTRUM_HISTORY_SIZE - APPEND_HEADER_SIZE) / 36;
+    if entries.is_empty() {
+        return previous.context("Electrum history append has no prior value or new entries");
+    }
+    for chunk in entries.chunks(chunk_entries) {
+        let body = encode_history_append(batch_id, script_hash, previous, chunk)?;
+        previous = Some(buffer_history_data_record(destination, data_start, &body)?);
+    }
+    previous.context("Electrum history append did not produce a record")
+}
+
 fn encode_history_commit(batch_id: u64) -> Vec<u8> {
     let mut body = Vec::with_capacity(1 + 8);
     body.push(HISTORY_COMMIT);
@@ -2767,17 +2974,17 @@ fn read_history_data_record(file: &File, location: HistoryLocation) -> Result<Ve
     )
 }
 
-fn decode_history_value(body: &[u8], expected_script_hash: [u8; 32]) -> Result<Vec<(Txid, u32)>> {
-    decode_history_value_limited(body, expected_script_hash, usize::MAX)
-        .map(|entries| entries.expect("unlimited history limit cannot be exceeded"))
+fn history_location_precedes(previous: HistoryLocation, current_offset: u64) -> bool {
+    previous.offset() >= ELECTRUM_HISTORY_DATA_MAGIC.len() as u64
+        && previous
+            .offset()
+            .checked_add(4)
+            .and_then(|end| end.checked_add(u64::from(previous.length())))
+            .is_some_and(|end| end <= current_offset)
 }
 
-fn decode_history_value_limited(
-    body: &[u8],
-    expected_script_hash: [u8; 32],
-    limit: usize,
-) -> Result<Option<Vec<(Txid, u32)>>> {
-    if body.len() < 1 + 8 + 32 + 4 || body[0] != HISTORY_PUT {
+fn decode_history_node(body: &[u8], expected_script_hash: [u8; 32]) -> Result<DecodedHistoryNode> {
+    if body.len() < 1 + 8 + 32 + 4 {
         bail!("Electrum history value is truncated or has an invalid operation");
     }
     let script_hash: [u8; 32] = body[9..41]
@@ -2786,13 +2993,41 @@ fn decode_history_value_limited(
     if script_hash != expected_script_hash {
         bail!("Electrum history value key does not match its index");
     }
+    let (previous, count_offset, entries_offset) = match body[0] {
+        HISTORY_PUT => (None, 41, 45),
+        HISTORY_APPEND => {
+            if body.len() < 1 + 8 + 32 + 8 + 4 + 4 {
+                bail!("Electrum history append value is truncated");
+            }
+            let previous_offset = u64::from_le_bytes(
+                body[41..49]
+                    .try_into()
+                    .expect("Electrum history previous offset has fixed width"),
+            );
+            let previous_length = u32::from_le_bytes(
+                body[49..53]
+                    .try_into()
+                    .expect("Electrum history previous length has fixed width"),
+            );
+            let previous = match (previous_offset, previous_length) {
+                (0, 0) => None,
+                (_, 0) => bail!("Electrum history append has an invalid previous location"),
+                (offset, length) => Some(HistoryLocation::new(offset, length)?),
+            };
+            (previous, 53, 57)
+        }
+        _ => bail!("Electrum history value has an invalid operation"),
+    };
     let count = usize::try_from(u32::from_le_bytes(
-        body[41..45]
+        body[count_offset..entries_offset]
             .try_into()
             .expect("Electrum history count has fixed width"),
     ))
     .context("Electrum history count does not fit usize")?;
-    let expected_len = 45usize
+    if body[0] == HISTORY_APPEND && count == 0 {
+        bail!("Electrum history append value is empty");
+    }
+    let expected_len = entries_offset
         .checked_add(
             count
                 .checked_mul(36)
@@ -2802,11 +3037,8 @@ fn decode_history_value_limited(
     if expected_len != body.len() {
         bail!("Electrum history count does not match value length");
     }
-    if count > limit {
-        return Ok(None);
-    }
     let mut entries = Vec::with_capacity(count);
-    let mut offset = 45usize;
+    let mut offset = entries_offset;
     for _ in 0..count {
         let txid = Txid::from_byte_array(
             body[offset..offset + 32]
@@ -2821,7 +3053,15 @@ fn decode_history_value_limited(
         entries.push((txid, height));
         offset += 36;
     }
-    Ok(Some(entries))
+    Ok(DecodedHistoryNode { previous, entries })
+}
+
+fn extend_history(history: &mut StoredElectrumHistory, additions: &[(Txid, u32)]) {
+    for entry in additions {
+        if history.last() != Some(entry) {
+            history.push(*entry);
+        }
+    }
 }
 
 fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocation>, u64)> {
@@ -2868,7 +3108,7 @@ fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocati
         let body = decode_storage_payload(&body, MAX_STORED_ELECTRUM_HISTORY_SIZE)
             .context("decoding compressed Electrum history record")?;
         match body.first().copied() {
-            Some(HISTORY_PUT) => {
+            Some(HISTORY_PUT) | Some(HISTORY_APPEND) => {
                 if body.len() < 1 + 8 + 32 + 4 {
                     bail!("Electrum history value is truncated");
                 }
@@ -2880,7 +3120,13 @@ fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocati
                 let script_hash: [u8; 32] = body[9..41]
                     .try_into()
                     .context("Electrum history script hash is truncated")?;
-                decode_history_value(&body, script_hash)?;
+                let node = decode_history_node(&body, script_hash)?;
+                if node
+                    .previous
+                    .is_some_and(|previous| !history_location_precedes(previous, record_start))
+                {
+                    bail!("Electrum history append chain does not point backwards");
+                }
                 if pending_batch != Some(batch_id) {
                     if pending_batch.is_some() {
                         bail!("Electrum history log contains interleaved batches");
@@ -3056,27 +3302,15 @@ fn validate_history_data_header(
     expected_script_hash: [u8; 32],
 ) -> Result<()> {
     let body = read_history_data_record(file, location)?;
-    if body.len() < 1 + 8 + 32 + 4 || body[0] != HISTORY_PUT {
+    if body.len() < 1 + 8 + 32 + 4 || !matches!(body[0], HISTORY_PUT | HISTORY_APPEND) {
         bail!("Electrum history index points to a non-value record");
     }
-    if body[9..41] != expected_script_hash {
-        bail!("Electrum history value key does not match its index");
-    }
-    let count = usize::try_from(u32::from_le_bytes(
-        body[41..45]
-            .try_into()
-            .expect("Electrum history count has fixed width"),
-    ))
-    .context("Electrum history count does not fit usize")?;
-    let expected_length = 45usize
-        .checked_add(
-            count
-                .checked_mul(36)
-                .context("Electrum history count overflowed")?,
-        )
-        .context("Electrum history value length overflowed")?;
-    if expected_length != body.len() {
-        bail!("Electrum history count does not match value length");
+    let node = decode_history_node(&body, expected_script_hash)?;
+    if node
+        .previous
+        .is_some_and(|previous| !history_location_precedes(previous, location.offset()))
+    {
+        bail!("Electrum history append chain does not point backwards");
     }
     Ok(())
 }
@@ -5314,10 +5548,52 @@ mod tests {
         store.flush().unwrap();
         assert!(store.pending.is_empty());
         assert!(store.disk_usage().unwrap() > initial_size);
+        let location = store.index[&[31u8; 32]];
+        let body = read_history_data_record(&store.file, location).unwrap();
+        assert_eq!(body.first().copied(), Some(HISTORY_APPEND));
+        drop(store);
+
+        // The data log alone can reconstruct the linked head if the compact
+        // location index is lost or corrupt.
+        std::fs::write(directory.path().join("history.index"), b"corrupt").unwrap();
+        let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.get(&script_hash).unwrap(), vec![first, second]);
+    }
+
+    #[test]
+    fn electrum_history_append_chunks_are_linear_and_replacements_sever_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let script_hash = hex::encode([41u8; 32]);
+        let first = (Txid::from_byte_array([42u8; 32]), 1);
+        let second = (Txid::from_byte_array([43u8; 32]), 2);
+        let replacement = (Txid::from_byte_array([44u8; 32]), 3);
+        let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
+
+        store
+            .append_entries_unsynced(&[(script_hash.clone(), vec![first])])
+            .unwrap();
+        store.flush().unwrap();
+        let after_first = std::fs::metadata(directory.path().join("history.dat"))
+            .unwrap()
+            .len();
+        store
+            .append_entries_unsynced(&[(script_hash.clone(), vec![second])])
+            .unwrap();
+        store.flush().unwrap();
+        let after_second = std::fs::metadata(directory.path().join("history.dat"))
+            .unwrap()
+            .len();
+        assert_eq!(store.get(&script_hash).unwrap(), vec![first, second]);
+        assert!(after_second - after_first < 512);
+
+        store
+            .apply_batch(&[(script_hash.clone(), vec![replacement])])
+            .unwrap();
+        assert_eq!(store.get(&script_hash).unwrap(), vec![replacement]);
         drop(store);
 
         let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
-        assert_eq!(reopened.get(&script_hash).unwrap(), vec![first, second]);
+        assert_eq!(reopened.get(&script_hash).unwrap(), vec![replacement]);
     }
 
     #[test]

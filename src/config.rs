@@ -1625,7 +1625,7 @@ pub struct Args {
 
     #[arg(
         long,
-        default_value = "127.0.0.1:30001",
+        default_value = "0",
         value_parser = parse_electrum_arg
     )]
     pub electrum: String,
@@ -6295,12 +6295,16 @@ mod tests {
     }
 
     #[test]
-    fn electrum_zero_disables_the_default_listener() {
-        let args = Args::try_parse_from(["bitcoind-rs", "--electrum=0"]).unwrap();
-        assert_eq!(args.electrum, "0");
-
+    fn electrum_listener_is_opt_in() {
         let args = Args::try_parse_from(["bitcoind-rs"]).unwrap();
-        assert_eq!(args.electrum, "127.0.0.1:30001");
+        assert_eq!(args.electrum, "0");
+        assert!(Config::from_args(args).unwrap().electrum_bind.is_none());
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--electrum=127.0.0.1:30001"]).unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().electrum_bind,
+            Some("127.0.0.1:30001".parse().unwrap())
+        );
     }
 
     #[test]

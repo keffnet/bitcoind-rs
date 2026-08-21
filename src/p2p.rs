@@ -6675,6 +6675,15 @@ async fn serve_peer_loop(
                 }
             }
             Message::Block(block) => {
+                // Chain connection is serialized. Queue peer bodies on an
+                // async semaphore before any chain-lock access so a burst
+                // from several peers cannot park every Tokio worker behind a
+                // convoy of blocking chain writers.
+                let _peer_block_processing = node
+                    .peer_block_processing
+                    .acquire()
+                    .await
+                    .context("peer block processing gate closed")?;
                 let hash = block.header.block_hash();
                 let parent_hash = block.header.prev_blockhash;
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
@@ -6791,6 +6800,11 @@ async fn serve_peer_loop(
                 }
             }
             Message::CompactBlock(compact) => {
+                let _peer_block_processing = node
+                    .peer_block_processing
+                    .acquire()
+                    .await
+                    .context("peer compact-block processing gate closed")?;
                 let hash = compact.header.block_hash();
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
                 let (already_in_flight, block_requested_from_outbound) =
@@ -7076,6 +7090,11 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::BlockTxn(response) => {
+                let _peer_block_processing = node
+                    .peer_block_processing
+                    .acquire()
+                    .await
+                    .context("peer blocktxn processing gate closed")?;
                 let Some(mut pending) = pending_compact.take() else {
                     if compact_reconstruction_failed == Some(response.block_hash) {
                         debug!("previous compact block reconstruction attempt failed");

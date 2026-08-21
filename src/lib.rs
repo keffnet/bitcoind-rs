@@ -1910,6 +1910,11 @@ pub struct Node {
     /// Serialize RPC mining operations so a block template cannot become
     /// stale between reading the active tip and connecting the mined block.
     pub(crate) mining_lock: Mutex<()>,
+    /// Admit one peer block-body handler at a time before it touches the
+    /// synchronous chain lock. Full block connection is already serialized by
+    /// that lock, so queuing several blocking workers as writers adds no
+    /// throughput; it only starves Tokio workers that need short chain reads.
+    pub(crate) peer_block_processing: tokio::sync::Semaphore,
     pub peer_count: AtomicUsize,
     /// Number of automatic outbound peers admitted under the optional
     /// NODE_REDUCED_DATA compatibility policy.
@@ -2533,6 +2538,7 @@ impl Node {
             block_relay_only_anchors: parking_lot::RwLock::new(block_relay_only_anchors),
             banlist_recreated: !banlist_exists,
             mining_lock: Mutex::new(()),
+            peer_block_processing: tokio::sync::Semaphore::new(1),
             peer_count: AtomicUsize::new(0),
             non_reduced_outbound_count: AtomicUsize::new(0),
             mempool_check_operations: AtomicUsize::new(0),

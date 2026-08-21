@@ -1932,7 +1932,24 @@ async fn dispatch_method_async_for_user(
                 Err(error) => Err(anyhow!("scan RPC task failed: {error}")),
             }
         }
-        _ => dispatch_method_for_user(node, method, &normalized_params, auth_user.as_deref()),
+        _ => {
+            // Most RPC handlers are synchronous and many take the chain
+            // lock. During IBD a long chain writer can make that lock wait;
+            // keep the wait on Tokio's blocking pool so RPC accepts, P2P I/O,
+            // and unrelated asynchronous services remain schedulable.
+            let node = node.clone();
+            let method = method.to_owned();
+            let params = normalized_params.clone();
+            let auth_user = auth_user.clone();
+            match tokio::task::spawn_blocking(move || {
+                dispatch_method_for_user(&node, &method, &params, auth_user.as_deref())
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(error) => Err(anyhow!("RPC task failed: {error}")),
+            }
+        }
     };
     node.end_rpc_command(command_id);
     result

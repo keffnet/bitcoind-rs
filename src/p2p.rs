@@ -1078,6 +1078,14 @@ fn getheaders_should_suppress_for_low_work(
     active_work < minimum_chain_work && !permissions.contains(PeerPermissions::DOWNLOAD)
 }
 
+fn cached_invalid_headers_should_disconnect(connection_type: &str, manual: bool) -> bool {
+    // Core discourages automatic outbound peers for a cached-invalid chain,
+    // but neither inbound nor manually configured peers. In particular, a
+    // local invalidateblock decision must not let an inbound peer tear down a
+    // connection merely by advertising the branch it still considers valid.
+    connection_type != "inbound" && !manual
+}
+
 struct PeerState {
     endpoint: NetworkEndpoint,
     local_address: Option<SocketAddr>,
@@ -5827,15 +5835,19 @@ async fn serve_peer_loop(
                             if error.to_string().contains("is on an invalidated branch")
                                 || error.to_string().contains("has an invalidated parent") =>
                         {
-                            if !peer_state.manual {
+                            node.clear_pending_header_direct_fetches(
+                                peer_id,
+                                &pending_direct_fetch_claims,
+                            );
+                            if cached_invalid_headers_should_disconnect(
+                                peer_state.connection_type,
+                                peer_state.manual,
+                            ) {
                                 return Err(error);
                             }
-                            // A peer can legitimately answer a headers
-                            // request from a branch this node invalidated
-                            // locally while the peer is still catching up.
-                            // Core ignores that response; it does not punish
-                            // or disconnect the peer for repeating known
-                            // invalid history.
+                            // Inbound and manual peers can legitimately answer
+                            // from a branch this node invalidated locally.
+                            // Core ignores that response without punishment.
                             debug!(%error, "ignoring headers from an invalidated branch");
                             Vec::new()
                         }
@@ -12061,6 +12073,23 @@ mod tests {
             minimum_work,
             active_work,
             PeerPermissions::empty()
+        ));
+    }
+
+    #[test]
+    fn cached_invalid_headers_preserve_inbound_and_manual_peers() {
+        assert!(!cached_invalid_headers_should_disconnect("inbound", false));
+        assert!(!cached_invalid_headers_should_disconnect(
+            "outbound-full",
+            true
+        ));
+        assert!(cached_invalid_headers_should_disconnect(
+            "outbound-full",
+            false
+        ));
+        assert!(cached_invalid_headers_should_disconnect(
+            "block-relay-only",
+            false
         ));
     }
 

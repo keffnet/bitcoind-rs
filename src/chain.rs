@@ -1903,6 +1903,7 @@ impl ChainState {
             deployment_parameters,
             true,
             false,
+            true,
         )
     }
 
@@ -1926,6 +1927,7 @@ impl ChainState {
         deployment_parameters: validation::DeploymentParameters,
         electrum_history_index_enabled: bool,
         txospender_index_enabled: bool,
+        preserve_disabled_spender_snapshot: bool,
     ) -> Result<Self> {
         if deployment_parameters.network != network {
             bail!("consensus deployment parameters use a different network");
@@ -2419,6 +2421,10 @@ impl ChainState {
             state.startup_spent_by = snapshot
                 .spent_by
                 .map(|spent_by| (snapshot_chain_len, spent_by));
+            if !state.txospender_index_enabled && !preserve_disabled_spender_snapshot {
+                state.startup_spent_by = None;
+                trim_process_heap();
+            }
             state.active_tx_counts.truncate(snapshot_chain_len);
             state.active_tx_totals.truncate(snapshot_chain_len);
             let headers = state.headers.clone();
@@ -5808,6 +5814,66 @@ impl ChainState {
         ))
     }
 
+    /// Resolve a confirmed spender for Electrum without requiring the
+    /// optional all-history txospender index. A spend records the previous
+    /// output's script hash in Electrum history, so only transactions in that
+    /// script's bounded history can be candidates. This keeps the common IBD
+    /// configuration from retaining one global hash entry per spent output.
+    pub(crate) fn electrum_spending_transaction(
+        &mut self,
+        outpoint: &OutPoint,
+        history_limit: usize,
+    ) -> Result<Option<(Txid, usize, BlockHash, u32)>> {
+        if self.txospender_index_enabled {
+            return Ok(self.spending_transaction(outpoint));
+        }
+        if self.utxo_store.contains(outpoint) {
+            return Ok(None);
+        }
+        let Some((funding_transaction, funding_location)) = self.transaction(&outpoint.txid)?
+        else {
+            return Ok(None);
+        };
+        let Some(output) = funding_transaction.output.get(outpoint.vout as usize) else {
+            return Ok(None);
+        };
+        if is_unspendable_script(&output.script_pubkey) {
+            return Ok(None);
+        }
+        let script_hash = electrum_script_hash(&output.script_pubkey);
+        let history = self
+            .get_history_checked_limited(&script_hash, history_limit)?
+            .context("Electrum outpoint history is too large")?;
+        for entry in history {
+            if entry.height < funding_location.height {
+                continue;
+            }
+            let Some(location) =
+                self.active_transaction_location_at_height(&entry.txid, entry.height)
+            else {
+                continue;
+            };
+            let Some((transaction, location)) =
+                self.transaction_at_location(&entry.txid, location)?
+            else {
+                continue;
+            };
+            if let Some(input_index) = transaction
+                .input
+                .iter()
+                .position(|input| input.previous_output == *outpoint)
+            {
+                return Ok(Some((
+                    entry.txid,
+                    input_index,
+                    location.block_hash,
+                    location.height,
+                )));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn get_history(&self, script_hash: &str) -> Vec<HistoryEntry> {
         self.get_history_checked(script_hash).unwrap_or_default()
     }
@@ -5884,9 +5950,8 @@ impl ChainState {
     /// Return the active-chain outputs that electrs would consider unspent
     /// for a script hash.  Unlike Core's UTXO set, electrs keeps matching
     /// outputs whose scripts are provably unspendable (for example
-    /// `OP_RETURN`) in its scripthash status index.  The Electrum node path
-    /// enables the durable spender index, which lets this projection retain
-    /// those outputs without polluting consensus UTXO accounting.
+    /// `OP_RETURN`) in its scripthash status index. Those outputs can never be
+    /// validly spent, so they do not require a global historical spender map.
     /// Return Electrum's unspent projection while bounding the history scan.
     /// A busy script can have a small current UTXO set but still require a
     /// large history walk, so bounded callers should reject it before doing
@@ -5916,15 +5981,8 @@ impl ChainState {
                     continue;
                 }
                 let outpoint = OutPoint::new(history.txid, vout as u32);
-                let unspent = if self.utxo_store.contains(&outpoint) {
-                    true
-                } else {
-                    // The Electrum integration enables this index before it
-                    // serves requests.  Without it, an output absent from
-                    // the consensus UTXO set cannot be distinguished from a
-                    // spendable output that was already spent.
-                    self.txospender_index_enabled && self.spending_transaction(&outpoint).is_none()
-                };
+                let unspent = self.utxo_store.contains(&outpoint)
+                    || is_unspendable_script(&output.script_pubkey);
                 if unspent {
                     outputs.insert(
                         outpoint,
@@ -13961,6 +14019,14 @@ mod tests {
         }
         state.prune(300).unwrap();
         assert!(state.is_block_pruned(&spending_block_hash));
+        state.configure_txospender_index(false).unwrap();
+        assert_eq!(
+            state
+                .electrum_spending_transaction(&funding_outpoint, usize::MAX)
+                .unwrap(),
+            Some((spend_txid, 0, spending_block_hash, 101))
+        );
+        state.configure_txospender_index(true).unwrap();
         // Leave a durable block suffix after the checkpoint so the restart
         // path also exercises incremental spender indexing.
         let suffix_block = mine_block(&state, 401);
@@ -14275,7 +14341,6 @@ mod tests {
         assert_eq!(stats.total_unspendable_scripts_sat, 500_000_000);
         assert_eq!(stats.total_unspendable_unclaimed_rewards_sat, 500_000_000);
 
-        state.configure_txospender_index(true).unwrap();
         let script_hash = electrum_script_hash(&bitcoin::ScriptBuf::from_bytes(vec![0x6a]));
         assert_eq!(
             state
@@ -14523,6 +14588,7 @@ mod tests {
             validation::DeploymentParameters::for_network(Network::Regtest),
             false,
             false,
+            true,
         )
         .unwrap();
         assert!(!disabled.history_index_enabled);

@@ -1303,6 +1303,8 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
     let mut chain = node.chain.write();
     let mempool = node.mempool.read();
     let mut status = serde_json::Map::new();
+    let confirmed_spender =
+        chain.electrum_spending_transaction(outpoint, MAX_ELECTRUM_HISTORY_RECORDS)?;
 
     let active_funder = chain
         .transaction(&outpoint.txid)?
@@ -1331,7 +1333,7 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
         // A pruned node can retain an unspent output in the UTXO set after
         // its funding block body has been removed.
         status.insert("funder_height".to_owned(), json!(entry.height));
-    } else if chain.spending_transaction(outpoint).is_some()
+    } else if confirmed_spender.is_some()
         && let Some(location) = chain.transaction_location(&outpoint.txid)
     {
         // For a spent output, the durable spender index proves that this
@@ -1339,7 +1341,7 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
         status.insert("funder_height".to_owned(), json!(location.height));
     }
 
-    if let Some((txid, _, _, height)) = chain.spending_transaction(outpoint) {
+    if let Some((txid, _, _, height)) = confirmed_spender {
         status.insert("spender_txhash".to_owned(), json!(txid.to_string()));
         status.insert("spender_height".to_owned(), json!(height));
     } else if let Some(txid) = mempool.spender(outpoint)
@@ -3226,7 +3228,7 @@ mod tests {
         .unwrap();
         assert_eq!(features["protocol_max"], json!("1.7"));
         assert!(node.chain.read().is_pruned());
-        assert!(node.chain.read().txospender_index_enabled());
+        assert!(!node.chain.read().txospender_index_enabled());
         assert_eq!(features["pruning"], Value::Null);
         assert!(features.get("hash_function").is_none());
         assert_eq!(

@@ -2032,7 +2032,8 @@ impl Node {
                 config.blocks_xor,
                 deployment_parameters,
                 config.electrum_bind.is_some(),
-                config.txospenderindex || config.electrum_bind.is_some(),
+                config.txospenderindex,
+                false,
             )
             .map_err(core_startup_chain_error)?;
         chain.set_shutdown_interrupt(shutdown_requested.clone());
@@ -2072,16 +2073,12 @@ impl Node {
                     )
                 })?;
         }
-        // Electrum 1.7 outpoint status needs confirmed spender lookups even
-        // when the standalone Core-style txospenderindex RPC option is off.
-        // Keep this internal index enabled for Electrum without changing the
-        // user-facing getindexinfo reporting for that optional index.
-        // Configure the Electrum sidecar first: a pruned restart can then
-        // rebuild confirmed spenders from its compact transaction records
-        // before the index is exposed to RPC clients.
+        // Configure the Electrum sidecar first so pruned transaction/history
+        // queries are available before RPC clients can connect. Electrum
+        // resolves its rare outpoint-spender queries from script history and
+        // does not require Core's all-history txospenderindex in memory.
         chain.configure_electrum_index(config.electrum_bind.is_some())?;
-        chain
-            .configure_txospender_index(config.txospenderindex || config.electrum_bind.is_some())?;
+        chain.configure_txospender_index(config.txospenderindex)?;
         chain.configure_coinstats_index(config.coinstatsindex)?;
         let signet_challenge = chain.signet_challenge().map(|challenge| challenge.to_vec());
         for path in &config.load_blocks {

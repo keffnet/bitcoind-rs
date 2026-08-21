@@ -8035,10 +8035,14 @@ impl ChainState {
             }
         }
         let block_and_delta_storage_finished = Instant::now();
-        let removals = application
+        // Outputs created and spent within this block were never inserted in
+        // the durable UTXO set. Excluding them lets the normal validated path
+        // update its exact entry count arithmetically instead of probing the
+        // database for every input.
+        let persistent_removals = application
             .spent_entries
             .iter()
-            .map(|(outpoint, _)| *outpoint)
+            .filter_map(|(outpoint, entry)| (entry.height != height).then_some(*outpoint))
             .collect::<Vec<_>>();
         for (outpoint, entry) in &application.spent_entries {
             let was_in_utxo_set = if self.utxos_materialized {
@@ -8054,7 +8058,7 @@ impl ChainState {
                 self.remove_utxo_entry(outpoint, entry);
             }
         }
-        let mut history_updates = HashMap::new();
+        let mut history_updates: HashMap<String, Vec<HistoryEntry>> = HashMap::new();
         let may_overwrite_utxo = is_bip30_repeat(self.network, height, hash);
         for (outpoint, entry) in &delta.created {
             if may_overwrite_utxo {
@@ -8065,13 +8069,9 @@ impl ChainState {
         }
         for (script_hash, entry) in &delta.history {
             if persist {
-                if sync_storage {
-                    self.append_history_update(&mut history_updates, script_hash, entry.clone())?;
-                } else {
-                    let additions = history_updates.entry(script_hash.clone()).or_default();
-                    if additions.last() != Some(entry) {
-                        additions.push(entry.clone());
-                    }
+                let additions = history_updates.entry(script_hash.clone()).or_default();
+                if additions.last() != Some(entry) {
+                    additions.push(entry.clone());
                 }
             } else if self.history_materialized {
                 self.add_history(script_hash, entry.clone());
@@ -8096,18 +8096,26 @@ impl ChainState {
                 .iter()
                 .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
                 .collect::<Vec<_>>();
-            if sync_storage {
-                self.utxo_store.apply_batch(&removals, &additions)?;
+            if may_overwrite_utxo {
+                // The two historical BIP30 duplicate-coinbase exceptions can
+                // replace an existing outpoint, so retain exact key probing
+                // for those blocks only.
+                if sync_storage {
+                    self.utxo_store
+                        .apply_batch(&persistent_removals, &additions)?;
+                } else {
+                    self.utxo_store
+                        .apply_batch_unsynced(&persistent_removals, &additions)?;
+                }
+            } else if sync_storage {
+                self.utxo_store
+                    .apply_validated_batch(&persistent_removals, &additions)?;
             } else {
                 self.utxo_store
-                    .apply_batch_unsynced(&removals, &additions)?;
+                    .apply_validated_batch_unsynced(&persistent_removals, &additions)?;
             }
             if self.history_index_enabled {
-                if sync_storage {
-                    self.persist_history_updates_with_sync(history_updates, true)?;
-                } else {
-                    self.persist_history_appends_unsynced(history_updates)?;
-                }
+                self.persist_history_appends(history_updates, sync_storage)?;
             }
         }
         let chainstate_indexes_finished = Instant::now();
@@ -9789,76 +9797,10 @@ impl ChainState {
         }
     }
 
-    fn history_entries_for_update(&self, script_hash: &str) -> Result<Vec<HistoryEntry>> {
-        if self.history_materialized {
-            return Ok(self.history.get(script_hash).cloned().unwrap_or_default());
-        }
-        Ok(self
-            .electrum_history_store
-            .get(script_hash)?
-            .into_iter()
-            .map(|(txid, height)| HistoryEntry { txid, height })
-            .collect())
-    }
-
-    fn append_history_update(
-        &self,
-        updates: &mut HashMap<String, Vec<HistoryEntry>>,
-        script_hash: &str,
-        entry: HistoryEntry,
-    ) -> Result<()> {
-        if !updates.contains_key(script_hash) {
-            updates.insert(
-                script_hash.to_owned(),
-                self.history_entries_for_update(script_hash)?,
-            );
-        }
-        let history = updates
-            .get_mut(script_hash)
-            .expect("history update was inserted above");
-        if history.last() != Some(&entry) {
-            history.push(entry);
-        }
-        Ok(())
-    }
-
-    fn persist_history_updates_with_sync(
+    fn persist_history_appends(
         &mut self,
         updates: HashMap<String, Vec<HistoryEntry>>,
         sync: bool,
-    ) -> Result<()> {
-        if !self.history_index_enabled || updates.is_empty() {
-            return Ok(());
-        }
-        let store_updates = updates
-            .iter()
-            .map(|(script_hash, entries)| {
-                (
-                    script_hash.clone(),
-                    entries
-                        .iter()
-                        .map(|entry| (entry.txid, entry.height))
-                        .collect(),
-                )
-            })
-            .collect::<Vec<_>>();
-        if sync {
-            self.electrum_history_store.apply_batch(&store_updates)?;
-        } else {
-            self.electrum_history_store
-                .apply_batch_unsynced(&store_updates)?;
-        }
-        if self.history_materialized {
-            for (script_hash, entries) in updates {
-                self.history.insert(script_hash, entries);
-            }
-        }
-        Ok(())
-    }
-
-    fn persist_history_appends_unsynced(
-        &mut self,
-        updates: HashMap<String, Vec<HistoryEntry>>,
     ) -> Result<()> {
         if !self.history_index_enabled || updates.is_empty() {
             return Ok(());
@@ -9876,8 +9818,12 @@ impl ChainState {
                     )
                 })
                 .collect::<Vec<_>>();
-            self.electrum_history_store
-                .append_entries_unsynced(&store_updates)?;
+            if sync {
+                self.electrum_history_store.append_entries(&store_updates)?;
+            } else {
+                self.electrum_history_store
+                    .append_entries_unsynced(&store_updates)?;
+            }
             for (script_hash, entries) in updates {
                 for entry in entries {
                     self.add_history(&script_hash, entry);
@@ -9897,8 +9843,12 @@ impl ChainState {
                 )
             })
             .collect::<Vec<_>>();
-        self.electrum_history_store
-            .append_entries_owned_unsynced(store_updates)
+        if sync {
+            self.electrum_history_store.append_entries(&store_updates)
+        } else {
+            self.electrum_history_store
+                .append_entries_owned_unsynced(store_updates)
+        }
     }
 
     fn active_utxo_entries_for_read(&self) -> Vec<(OutPoint, UtxoEntry)> {
@@ -10028,8 +9978,8 @@ impl ChainState {
             return Ok(());
         }
         if !self.history_materialized {
-            // Normal active-chain connects append exact replacement values to
-            // the durable store. There is no resident map to copy back.
+            // Normal active-chain connects append immutable events directly
+            // to the durable store. There is no resident map to copy back.
             return self.persist_electrum_history_store_tip();
         }
         let entries = self
@@ -10078,12 +10028,10 @@ impl ChainState {
             self.history.len(),
             self.electrum_history_store.generation()
         );
-        if marker_matches && self.electrum_history_store.len() == self.history.len() {
-            return Ok(());
-        }
-        if marker_matches && self.history.is_empty() {
-            // The durable store is complete even when the in-memory snapshot
-            // was produced while history indexing was disabled.
+        if marker_matches {
+            // `len` is the number of immutable history records, while the
+            // optional snapshot map is keyed by script. The durable marker is
+            // the authoritative completeness check for the event index.
             self.history_materialized = false;
             return Ok(());
         }

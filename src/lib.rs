@@ -1741,6 +1741,7 @@ pub struct Node {
     rpc_commands: parking_lot::RwLock<HashMap<usize, (String, Instant)>>,
     headers_sync_peers: AtomicUsize,
     headers_sync_started: parking_lot::Mutex<HashSet<usize>>,
+    header_availability_probed: parking_lot::Mutex<HashSet<usize>>,
     // Core's per-peer fSyncStarted state survives release of the single
     // global initial-sync slot. Keep it separate from the current slot claim
     // so a peer can continue reacting to announcements while another peer
@@ -2322,6 +2323,7 @@ impl Node {
             rpc_commands: parking_lot::RwLock::new(HashMap::new()),
             headers_sync_peers: AtomicUsize::new(0),
             headers_sync_started: parking_lot::Mutex::new(HashSet::new()),
+            header_availability_probed: parking_lot::Mutex::new(HashSet::new()),
             headers_sync_active: parking_lot::Mutex::new(HashSet::new()),
             inv_triggered_headers_sync: parking_lot::Mutex::new(HashSet::new()),
             last_block_inv_triggering_headers_sync: parking_lot::Mutex::new(None),
@@ -4691,6 +4693,39 @@ impl Node {
         self.headers_sync_active.lock().remove(&peer_id);
     }
 
+    /// Once one peer has supplied the header chain, ask every other suitable
+    /// connection for a short overlap response. That response establishes
+    /// block availability so the body scheduler can use all download peers
+    /// instead of remaining pinned to the original header-sync peer.
+    pub(crate) fn probe_peer_header_availability(&self, excluded_peer_id: usize) -> usize {
+        let candidates = self
+            .peer_infos()
+            .into_iter()
+            .filter(|peer| peer.id != excluded_peer_id)
+            .filter(Self::headers_sync_peer_is_eligible)
+            .filter(|peer| peer.best_known_block.is_none())
+            .map(|peer| peer.id)
+            .collect::<Vec<_>>();
+        let mut probed = self.header_availability_probed.lock();
+        let commands = self.peer_commands.read();
+        let mut requested = 0;
+        for peer_id in candidates {
+            if !probed.insert(peer_id) {
+                continue;
+            }
+            let Some(sender) = commands.get(&peer_id) else {
+                continue;
+            };
+            if sender
+                .send(p2p::PeerCommand::ProbeHeaderAvailability)
+                .is_ok()
+            {
+                requested += 1;
+            }
+        }
+        requested
+    }
+
     /// Release body requests that have aged past the short relay race window
     /// when a peer continues making header progress without supplying them.
     /// This only affects missing bodies; requests for bodies already present
@@ -5407,7 +5442,12 @@ impl Node {
                 .skip(first_candidate_height)
                 .map(|(height, hash)| (*hash, u32::try_from(height).unwrap_or(u32::MAX)))
                 .filter(|(hash, _)| !chain.store.contains(hash))
-                .filter(|(hash, _)| !self.block_body_was_rejected(hash))
+                // A structurally invalid or mutated body only proves that
+                // the serving peer supplied a bad serialization.  Another
+                // peer may still have the valid body for this header hash.
+                // Direct-fetch paths suppress immediate re-requests, but
+                // the periodic scheduler must be able to retry it or one
+                // bad body can permanently wedge IBD at this height.
                 .filter(|(hash, _)| !chain.is_block_pruned(hash))
                 .filter(|(_, height)| {
                     !limited_peer
@@ -6319,6 +6359,7 @@ impl Node {
         self.peer_commands.write().remove(&id);
         let replacement = self.release_headers_sync_peer(id);
         self.headers_sync_active.lock().remove(&id);
+        self.header_availability_probed.lock().remove(&id);
         self.inv_triggered_headers_sync.lock().remove(&id);
         self.block_stalling_since.write().remove(&id);
         self.chain_sync_states.write().remove(&id);
@@ -9411,6 +9452,42 @@ mod tests {
     }
 
     #[test]
+    fn completed_header_sync_probes_other_peers_once_for_parallel_downloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let (sender_one, mut receiver_one) = tokio::sync::mpsc::unbounded_channel();
+        let (sender_two, mut receiver_two) = tokio::sync::mpsc::unbounded_channel();
+        let (sender_three, mut receiver_three) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender_one);
+        node.register_peer(2, "192.0.2.2:18444".parse().unwrap(), false, sender_two);
+        node.register_peer(3, "192.0.2.3:18444".parse().unwrap(), false, sender_three);
+        for peer_id in 1..=3 {
+            node.update_peer_version(
+                peer_id,
+                wire::VersionMessage::PROTOCOL_VERSION,
+                wire::NODE_NETWORK | wire::NODE_WITNESS,
+                "/availability-test/",
+                1,
+                true,
+            );
+        }
+
+        assert_eq!(node.probe_peer_header_availability(1), 2);
+        assert!(receiver_one.try_recv().is_err());
+        assert!(matches!(
+            receiver_two.try_recv(),
+            Ok(p2p::PeerCommand::ProbeHeaderAvailability)
+        ));
+        assert!(matches!(
+            receiver_three.try_recv(),
+            Ok(p2p::PeerCommand::ProbeHeaderAvailability)
+        ));
+        assert_eq!(node.probe_peer_header_availability(1), 0);
+        assert!(receiver_two.try_recv().is_err());
+        assert!(receiver_three.try_recv().is_err());
+    }
+
+    #[test]
     fn block_download_queue_resumes_from_persisted_headers() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(test_config(directory.path())).unwrap();
@@ -9573,6 +9650,29 @@ mod tests {
             node.block_stalling_timeout_secs.load(Ordering::Relaxed),
             BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs() * 2
         );
+    }
+
+    #[test]
+    fn periodic_block_download_retries_a_rejected_body_from_another_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 1);
+        node.chain
+            .write()
+            .accept_headers(std::slice::from_ref(&first.header))
+            .unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        node.remember_rejected_block_body(first.block_hash());
+
+        let schedule = node.next_block_download_schedule(
+            1,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
+        assert_eq!(schedule.requests.len(), 1);
+        assert_eq!(schedule.requests[0].hash, first.block_hash());
     }
 
     #[test]

@@ -1755,6 +1755,7 @@ impl PeerReader {
 pub(crate) enum PeerCommand {
     Disconnect,
     RequestHeaders,
+    ProbeHeaderAvailability,
     RequestBlock(BlockHash),
     Ping(u64),
     SendMessage {
@@ -4690,6 +4691,14 @@ async fn serve_peer_loop(
                         request_headers(node, peer_id, writer, peer_state).await?;
                         continue;
                     }
+                    Some(PeerCommand::ProbeHeaderAvailability) => {
+                        // Start one header before our best header so an
+                        // up-to-date peer returns a short, non-empty response
+                        // that records its best-known block for parallel body
+                        // download.
+                        request_initial_headers(node, peer_id, writer, peer_state).await?;
+                        continue;
+                    }
                     Some(PeerCommand::RequestBlock(hash)) => {
                         let request = Inventory {
                             kind: InventoryType::WitnessBlock,
@@ -5772,7 +5781,8 @@ async fn serve_peer_loop(
                 } else if let Some(sync) = headers_sync.as_ref() {
                     node.update_peer_presynced_headers(peer_id, Some(sync.presync_height()));
                 }
-                if sync_finished || !request_more_headers {
+                let header_sync_round_finished = sync_finished || !request_more_headers;
+                if header_sync_round_finished {
                     // A non-full headers response is the end of this
                     // initial synchronization round.  Release the global
                     // claim so a later peer can receive its own getheaders.
@@ -5858,6 +5868,9 @@ async fn serve_peer_loop(
                 }
                 if let Some(hash) = last_hash {
                     node.update_peer_best_known_block(peer_id, hash);
+                }
+                if header_sync_round_finished {
+                    node.probe_peer_header_availability(peer_id);
                 }
                 let peer_best_known = node
                     .peer_infos()
@@ -7978,7 +7991,17 @@ async fn handle_received_block(
                 )
             };
             if active {
-                info!(%hash, height = tip.height, "accepted peer block");
+                // A parent arrival can recursively connect bodies that were
+                // received earlier. Log this body's own indexed height and
+                // the resulting tip separately; using only `tip.height`
+                // made concurrent IBD lines appear to assign the wrong
+                // height to a block hash.
+                info!(
+                    %hash,
+                    height = block_height.unwrap_or(tip.height),
+                    active_tip_height = tip.height,
+                    "accepted peer block"
+                );
             } else {
                 debug!(
                     %hash,

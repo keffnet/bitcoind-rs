@@ -35,7 +35,6 @@ const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_FILTER_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_CHAINSTATE_DELTA_SIZE: usize = 64 * 1024 * 1024;
 const MAX_STORED_ELECTRUM_BLOCK_SIZE: usize = 4 * 1024 * 1024;
-const MAX_STORED_ELECTRUM_HISTORY_SIZE: usize = 16 * 1024 * 1024;
 const MAX_STORED_TRANSACTION_INDEX_SIZE: usize = 8 * 1024 * 1024;
 const MAX_STORED_UTXO_SIZE: usize = 100 * 1024;
 const XOR_KEY_SIZE: usize = 8;
@@ -164,12 +163,6 @@ impl UtxoReadCache {
 
 fn stored_utxo_cache_bytes(entry: &StoredUtxo) -> usize {
     64usize.saturating_add(entry.output.script_pubkey.len())
-}
-
-#[derive(Clone, Debug)]
-enum PendingElectrumHistory {
-    Replace(StoredElectrumHistory),
-    Append(StoredElectrumHistory),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2205,6 +2198,39 @@ impl UtxoStore {
         self.apply_batch_with_sync(removals, additions, false)
     }
 
+    /// Apply a consensus-validated transition whose removals are known to
+    /// exist and whose additions are known to be fresh. This avoids one LSM
+    /// point lookup per affected output on the normal block-connect path.
+    pub fn apply_validated_batch(
+        &mut self,
+        removals: &[OutPoint],
+        additions: &[(OutPoint, StoredUtxo)],
+    ) -> Result<()> {
+        self.apply_validated_batch_with_sync(removals, additions, true)
+    }
+
+    pub fn apply_validated_batch_unsynced(
+        &mut self,
+        removals: &[OutPoint],
+        additions: &[(OutPoint, StoredUtxo)],
+    ) -> Result<()> {
+        self.apply_validated_batch_with_sync(removals, additions, false)
+    }
+
+    fn apply_validated_batch_with_sync(
+        &mut self,
+        removals: &[OutPoint],
+        additions: &[(OutPoint, StoredUtxo)],
+        sync: bool,
+    ) -> Result<()> {
+        let next_count = self
+            .entry_count
+            .checked_sub(removals.len())
+            .and_then(|count| count.checked_add(additions.len()))
+            .context("validated UTXO batch entry count overflow")?;
+        self.commit_batch_with_count(removals, additions, next_count, sync)
+    }
+
     fn apply_batch_with_sync(
         &mut self,
         removals: &[OutPoint],
@@ -2232,6 +2258,20 @@ impl UtxoStore {
                 (true, false) => next_count = next_count.saturating_sub(1),
                 _ => {}
             }
+        }
+
+        self.commit_batch_with_count(removals, additions, next_count, sync)
+    }
+
+    fn commit_batch_with_count(
+        &mut self,
+        removals: &[OutPoint],
+        additions: &[(OutPoint, StoredUtxo)],
+        next_count: usize,
+        sync: bool,
+    ) -> Result<()> {
+        if removals.is_empty() && additions.is_empty() {
+            return Ok(());
         }
 
         let mut batch = self
@@ -2372,33 +2412,22 @@ fn read_usize_metadata(partition: &PartitionHandle, key: &[u8]) -> Result<Option
         .transpose()
 }
 
-const HISTORY_HEADS_PARTITION_NAME: &str = "heads";
-const HISTORY_CHUNKS_PARTITION_NAME: &str = "chunks";
+const HISTORY_EVENTS_PARTITION_NAME: &str = "events";
 const HISTORY_META_PARTITION_NAME: &str = "metadata";
-const HISTORY_CHUNK_ENTRIES: usize = 4096;
-
-#[derive(Clone, Copy)]
-struct HistoryHead {
-    chunks: u32,
-    entries: u64,
-}
 
 /// Disk-backed Electrum history index.
 ///
-/// Each script hash has a tiny head record and a sequence of independently
-/// zstd-compressed history chunks. Appending ordinary IBD history rewrites at
-/// most the final partial chunk; it does not retain one hash-table entry per
-/// script and does not repeatedly rewrite a heavily reused script's complete
-/// history.
+/// Every confirmed history item is an immutable event keyed by script hash,
+/// height, and its order within that height. Prefix scans answer Electrum
+/// queries directly. Normal IBD therefore performs insert-only batches: it
+/// never reads a per-script head or rewrites an existing history value.
 pub struct ElectrumHistoryStore {
     path: PathBuf,
     keyspace: Keyspace,
-    heads: PartitionHandle,
-    chunks: PartitionHandle,
+    events: PartitionHandle,
     metadata: PartitionHandle,
     entry_count: usize,
     generation: u64,
-    pending: FastHashMap<[u8; 32], PendingElectrumHistory>,
 }
 
 impl ElectrumHistoryStore {
@@ -2410,27 +2439,28 @@ impl ElectrumHistoryStore {
         let directory = directory.as_ref();
         create_dir_all(directory)
             .with_context(|| format!("creating Electrum history store {}", directory.display()))?;
-        let path = directory.join("history");
+        // Storage is intentionally versioned by directory. There has been no
+        // public release, so the former head/chunk schema is not opened or
+        // migrated; a rebuild starts with this event-oriented layout.
+        let path = directory.join("history-v2");
         let keyspace = FjallConfig::new(&path)
             .cache_size(cache_bytes.max(1024 * 1024))
             .max_write_buffer_size(DISK_INDEX_DEFAULT_WRITE_BUFFER_BYTES)
             .manual_journal_persist(true)
             .open()
             .with_context(|| format!("opening disk-backed Electrum database {}", path.display()))?;
-        let heads = keyspace.open_partition(
-            HISTORY_HEADS_PARTITION_NAME,
-            PartitionCreateOptions::default().compression(CompressionType::None),
-        )?;
-        let chunks = keyspace.open_partition(
-            HISTORY_CHUNKS_PARTITION_NAME,
-            PartitionCreateOptions::default().compression(CompressionType::None),
+        let events = keyspace.open_partition(
+            HISTORY_EVENTS_PARTITION_NAME,
+            // Segment compression exploits the shared 32-byte script prefix
+            // while retaining inexpensive decompression for query serving.
+            PartitionCreateOptions::default().compression(CompressionType::Lz4),
         )?;
         let metadata = keyspace.open_partition(
             HISTORY_META_PARTITION_NAME,
             PartitionCreateOptions::default().compression(CompressionType::None),
         )?;
         let entry_count = read_usize_metadata(&metadata, META_ENTRY_COUNT)?.unwrap_or(0);
-        if entry_count == 0 && !heads.is_empty()? {
+        if entry_count == 0 && !events.is_empty()? {
             bail!("Electrum history database is missing its exact entry-count metadata");
         }
         let generation = match read_u64_metadata(&metadata, META_GENERATION)? {
@@ -2446,12 +2476,10 @@ impl ElectrumHistoryStore {
         Ok(Self {
             path,
             keyspace,
-            heads,
-            chunks,
+            events,
             metadata,
             entry_count,
             generation,
-            pending: FastHashMap::new(),
         })
     }
 
@@ -2464,16 +2492,11 @@ impl ElectrumHistoryStore {
     }
 
     pub fn len(&self) -> usize {
-        self.entry_count.saturating_add(
-            self.pending
-                .keys()
-                .filter(|key| self.head(**key).ok().flatten().is_none())
-                .count(),
-        )
+        self.entry_count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entry_count == 0 && self.pending.is_empty()
+        self.entry_count == 0
     }
 
     pub fn generation(&self) -> u64 {
@@ -2484,31 +2507,23 @@ impl ElectrumHistoryStore {
         encode_history_script_hash(script_hash)
             .ok()
             .is_some_and(|key| {
-                self.pending.contains_key(&key) || self.head(key).ok().flatten().is_some()
+                self.events
+                    .prefix(key)
+                    .next()
+                    .is_some_and(|item| item.is_ok())
             })
     }
 
     pub fn disk_usage(&self) -> Result<u64> {
         Ok(self
-            .heads
+            .events
             .disk_space()
-            .saturating_add(self.chunks.disk_space())
             .saturating_add(self.metadata.disk_space()))
     }
 
     pub fn get(&self, script_hash: &str) -> Result<StoredElectrumHistory> {
-        let script_hash = encode_history_script_hash(script_hash)?;
-        if let Some(pending) = self.pending.get(&script_hash) {
-            return match pending {
-                PendingElectrumHistory::Replace(entries) => Ok(entries.clone()),
-                PendingElectrumHistory::Append(entries) => {
-                    let mut history = self.read_history(script_hash)?;
-                    extend_history(&mut history, entries);
-                    Ok(history)
-                }
-            };
-        }
-        self.read_history(script_hash)
+        self.get_limited(script_hash, usize::MAX)
+            .map(|history| history.expect("unlimited history limit cannot be exceeded"))
     }
 
     pub fn get_limited(
@@ -2517,64 +2532,13 @@ impl ElectrumHistoryStore {
         limit: usize,
     ) -> Result<Option<StoredElectrumHistory>> {
         let script_hash = encode_history_script_hash(script_hash)?;
-        if let Some(pending) = self.pending.get(&script_hash) {
-            return match pending {
-                PendingElectrumHistory::Replace(entries) => {
-                    Ok((entries.len() <= limit).then(|| entries.clone()))
-                }
-                PendingElectrumHistory::Append(entries) => {
-                    let Some(mut history) = self.read_history_limited(script_hash, limit)? else {
-                        return Ok(None);
-                    };
-                    extend_history(&mut history, entries);
-                    Ok((history.len() <= limit).then_some(history))
-                }
-            };
-        }
-        self.read_history_limited(script_hash, limit)
-    }
-
-    fn head(&self, script_hash: [u8; 32]) -> Result<Option<HistoryHead>> {
-        self.heads
-            .get(script_hash)
-            .context("reading Electrum history head")?
-            .map(|bytes| decode_history_head(&bytes))
-            .transpose()
-    }
-
-    fn read_chunk(&self, script_hash: [u8; 32], chunk: u32) -> Result<StoredElectrumHistory> {
-        let key = history_chunk_key(script_hash, chunk);
-        let bytes = self
-            .chunks
-            .get(key)
-            .context("reading Electrum history chunk")?
-            .context("Electrum history head references a missing chunk")?;
-        decode_history_chunk(&bytes)
-    }
-
-    fn read_history(&self, script_hash: [u8; 32]) -> Result<StoredElectrumHistory> {
-        self.read_history_limited(script_hash, usize::MAX)
-            .map(|history| history.expect("unlimited history limit cannot be exceeded"))
-    }
-
-    fn read_history_limited(
-        &self,
-        script_hash: [u8; 32],
-        limit: usize,
-    ) -> Result<Option<StoredElectrumHistory>> {
-        let Some(head) = self.head(script_hash)? else {
-            return Ok(Some(Vec::new()));
-        };
-        let entry_count = usize::try_from(head.entries).unwrap_or(usize::MAX);
-        if entry_count > limit {
-            return Ok(None);
-        }
-        let mut history = Vec::with_capacity(entry_count);
-        for chunk in 0..head.chunks {
-            extend_history(&mut history, &self.read_chunk(script_hash, chunk)?);
-        }
-        if history.len() != entry_count {
-            bail!("Electrum history head entry count does not match its chunks");
+        let mut history = Vec::new();
+        for item in self.events.prefix(script_hash) {
+            let (key, _) = item.context("scanning Electrum history events")?;
+            history.push(decode_history_event_key(&key)?.1);
+            if history.len() > limit {
+                return Ok(None);
+            }
         }
         Ok(Some(history))
     }
@@ -2590,25 +2554,30 @@ impl ElectrumHistoryStore {
     }
 
     pub fn keys(&self) -> Vec<String> {
-        let mut keys = self
-            .heads
+        self.events
             .keys()
             .filter_map(|key| key.ok())
-            .filter_map(|key| <[u8; 32]>::try_from(key.as_ref()).ok())
-            .chain(self.pending.keys().copied())
-            .collect::<HashSet<_>>();
-        keys.drain().map(hex::encode).collect()
-    }
-
-    pub fn entries(&self) -> Result<Vec<(String, StoredElectrumHistory)>> {
-        self.keys()
+            .filter_map(|key| decode_history_event_key(&key).ok().map(|entry| entry.0))
+            .collect::<HashSet<_>>()
             .into_iter()
-            .map(|script_hash| Ok((script_hash.clone(), self.get(&script_hash)?)))
+            .map(hex::encode)
             .collect()
     }
 
+    pub fn entries(&self) -> Result<Vec<(String, StoredElectrumHistory)>> {
+        let mut histories: HashMap<[u8; 32], StoredElectrumHistory> = HashMap::new();
+        for item in self.events.iter() {
+            let (key, _) = item.context("scanning Electrum history database")?;
+            let (script_hash, entry) = decode_history_event_key(&key)?;
+            histories.entry(script_hash).or_default().push(entry);
+        }
+        Ok(histories
+            .into_iter()
+            .map(|(script_hash, history)| (hex::encode(script_hash), history))
+            .collect())
+    }
+
     pub fn apply_batch(&mut self, updates: &[(String, StoredElectrumHistory)]) -> Result<()> {
-        self.flush_pending()?;
         self.apply_batch_with_sync(updates, true)
     }
 
@@ -2616,66 +2585,29 @@ impl ElectrumHistoryStore {
         &mut self,
         updates: &[(String, StoredElectrumHistory)],
     ) -> Result<()> {
-        for (script_hash, entries) in updates {
-            self.pending.insert(
-                encode_history_script_hash(script_hash)?,
-                PendingElectrumHistory::Replace(entries.clone()),
-            );
-        }
-        Ok(())
+        self.apply_batch_with_sync(updates, false)
+    }
+
+    pub fn append_entries(&mut self, updates: &[(String, StoredElectrumHistory)]) -> Result<()> {
+        self.append_entries_with_sync(updates, true)
     }
 
     pub fn append_entries_unsynced(
         &mut self,
         updates: &[(String, StoredElectrumHistory)],
     ) -> Result<()> {
-        for (script_hash, additions) in updates {
-            self.append_pending(encode_history_script_hash(script_hash)?, additions.clone());
-        }
-        Ok(())
+        self.append_entries_with_sync(updates, false)
     }
 
     pub fn append_entries_owned_unsynced(
         &mut self,
         updates: Vec<(String, StoredElectrumHistory)>,
     ) -> Result<()> {
-        for (script_hash, additions) in updates {
-            self.append_pending(encode_history_script_hash(&script_hash)?, additions);
-        }
-        Ok(())
-    }
-
-    fn append_pending(&mut self, script_hash: [u8; 32], mut additions: StoredElectrumHistory) {
-        if additions.is_empty() {
-            return;
-        }
-        additions.dedup();
-        match self.pending.entry(script_hash) {
-            hashbrown::hash_map::Entry::Vacant(entry) => {
-                entry.insert(PendingElectrumHistory::Append(additions));
-            }
-            hashbrown::hash_map::Entry::Occupied(mut entry) => {
-                let current = match entry.get_mut() {
-                    PendingElectrumHistory::Replace(entries)
-                    | PendingElectrumHistory::Append(entries) => entries,
-                };
-                extend_history(current, &additions);
-            }
-        }
-    }
-
-    fn flush_pending(&mut self) -> Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-        let updates = std::mem::take(&mut self.pending)
+        let updates = updates
             .into_iter()
-            .collect::<Vec<_>>();
-        if let Err(error) = self.apply_encoded_batch_with_sync(&updates, true) {
-            self.pending = updates.into_iter().collect();
-            return Err(error);
-        }
-        Ok(())
+            .map(|(script_hash, entries)| Ok((encode_history_script_hash(&script_hash)?, entries)))
+            .collect::<Result<Vec<_>>>()?;
+        self.append_encoded_entries(&updates, false)
     }
 
     fn apply_batch_with_sync(
@@ -2683,56 +2615,97 @@ impl ElectrumHistoryStore {
         updates: &[(String, StoredElectrumHistory)],
         sync: bool,
     ) -> Result<()> {
-        let updates = updates
-            .iter()
-            .map(|(script_hash, entries)| {
-                Ok((
-                    encode_history_script_hash(script_hash)?,
-                    PendingElectrumHistory::Replace(entries.clone()),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        self.apply_encoded_batch_with_sync(&updates, sync)
+        let mut encoded = FastHashMap::new();
+        for (script_hash, entries) in updates {
+            encoded.insert(encode_history_script_hash(script_hash)?, entries.clone());
+        }
+        let mut encoded = encoded.into_iter().collect::<Vec<_>>();
+        encoded.sort_unstable_by_key(|(script_hash, _)| *script_hash);
+        self.replace_encoded_entries(&encoded, sync)
     }
 
-    fn apply_encoded_batch_with_sync(
+    fn append_entries_with_sync(
         &mut self,
-        updates: &[([u8; 32], PendingElectrumHistory)],
+        updates: &[(String, StoredElectrumHistory)],
+        sync: bool,
+    ) -> Result<()> {
+        let mut encoded = FastHashMap::new();
+        for (script_hash, additions) in updates {
+            let history = encoded
+                .entry(encode_history_script_hash(script_hash)?)
+                .or_insert_with(Vec::new);
+            extend_history(history, additions);
+        }
+        let mut encoded = encoded.into_iter().collect::<Vec<_>>();
+        encoded.sort_unstable_by_key(|(script_hash, _)| *script_hash);
+        self.append_encoded_entries(&encoded, sync)
+    }
+
+    fn replace_encoded_entries(
+        &mut self,
+        updates: &[([u8; 32], StoredElectrumHistory)],
         sync: bool,
     ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
-        let mut next_count = self.entry_count;
-        let next_generation = self
-            .generation
-            .checked_add(1)
-            .context("Electrum history generation exhausted")?;
         let mut batch = self
             .keyspace
             .batch()
             .durability(sync.then_some(PersistMode::SyncData));
-
-        for (script_hash, update) in updates {
-            let previous = self.head(*script_hash)?;
-            match update {
-                PendingElectrumHistory::Replace(entries) => {
-                    self.batch_replace_history(&mut batch, *script_hash, previous, entries)?;
-                    match (previous.is_some(), entries.is_empty()) {
-                        (false, false) => next_count = next_count.saturating_add(1),
-                        (true, true) => next_count = next_count.saturating_sub(1),
-                        _ => {}
-                    }
-                }
-                PendingElectrumHistory::Append(entries) => {
-                    let added =
-                        self.batch_append_history(&mut batch, *script_hash, previous, entries)?;
-                    if previous.is_none() && added != 0 {
-                        next_count = next_count.saturating_add(1);
-                    }
-                }
+        let mut next_count = self.entry_count;
+        for (script_hash, entries) in updates {
+            let previous_keys = self
+                .events
+                .prefix(script_hash)
+                .map(|item| item.map(|(key, _)| key.to_vec()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for key in &previous_keys {
+                batch.remove(&self.events, key.clone());
             }
+            let inserted = insert_history_events(&mut batch, &self.events, *script_hash, entries)?;
+            next_count = next_count
+                .checked_sub(previous_keys.len())
+                .and_then(|count| count.checked_add(inserted))
+                .context("Electrum history entry count overflow")?;
         }
+        self.commit_history_batch(batch, next_count)
+    }
+
+    /// Append consensus-validated history events. Active-chain connection
+    /// guarantees these `(script, height, transaction)` positions are fresh,
+    /// so the IBD path needs no existence probes.
+    fn append_encoded_entries(
+        &mut self,
+        updates: &[([u8; 32], StoredElectrumHistory)],
+        sync: bool,
+    ) -> Result<()> {
+        let additions = updates
+            .iter()
+            .map(|(_, entries)| deduplicated_history_len(entries))
+            .sum::<usize>();
+        if additions == 0 {
+            return Ok(());
+        }
+        let next_count = self
+            .entry_count
+            .checked_add(additions)
+            .context("Electrum history entry count overflow")?;
+        let mut batch = self
+            .keyspace
+            .batch()
+            .durability(sync.then_some(PersistMode::SyncData));
+        for (script_hash, entries) in updates {
+            insert_history_events(&mut batch, &self.events, *script_hash, entries)?;
+        }
+        self.commit_history_batch(batch, next_count)
+    }
+
+    fn commit_history_batch(&mut self, mut batch: fjall::Batch, next_count: usize) -> Result<()> {
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .context("Electrum history generation exhausted")?;
         batch.insert(
             &self.metadata,
             META_ENTRY_COUNT.to_vec(),
@@ -2752,102 +2725,6 @@ impl ElectrumHistoryStore {
         self.entry_count = next_count;
         self.generation = next_generation;
         Ok(())
-    }
-
-    fn batch_replace_history(
-        &self,
-        batch: &mut fjall::Batch,
-        script_hash: [u8; 32],
-        previous: Option<HistoryHead>,
-        entries: &StoredElectrumHistory,
-    ) -> Result<()> {
-        let new_chunks = entries.len().div_ceil(HISTORY_CHUNK_ENTRIES);
-        for (chunk, values) in entries.chunks(HISTORY_CHUNK_ENTRIES).enumerate() {
-            let chunk = u32::try_from(chunk).context("Electrum history has too many chunks")?;
-            batch.insert(
-                &self.chunks,
-                history_chunk_key(script_hash, chunk).to_vec(),
-                encode_history_chunk(values)?,
-            );
-        }
-        for chunk in
-            u32::try_from(new_chunks).unwrap_or(u32::MAX)..previous.map_or(0, |head| head.chunks)
-        {
-            batch.remove(&self.chunks, history_chunk_key(script_hash, chunk).to_vec());
-        }
-        if entries.is_empty() {
-            batch.remove(&self.heads, script_hash.to_vec());
-        } else {
-            batch.insert(
-                &self.heads,
-                script_hash.to_vec(),
-                encode_history_head(HistoryHead {
-                    chunks: u32::try_from(new_chunks)
-                        .context("Electrum history has too many chunks")?,
-                    entries: u64::try_from(entries.len())
-                        .context("Electrum history has too many entries")?,
-                }),
-            );
-        }
-        Ok(())
-    }
-
-    fn batch_append_history(
-        &self,
-        batch: &mut fjall::Batch,
-        script_hash: [u8; 32],
-        previous: Option<HistoryHead>,
-        additions: &StoredElectrumHistory,
-    ) -> Result<usize> {
-        if additions.is_empty() {
-            return Ok(0);
-        }
-        let mut additions = additions.clone();
-        additions.dedup();
-        let mut head = previous.unwrap_or(HistoryHead {
-            chunks: 0,
-            entries: 0,
-        });
-        let mut added = 0usize;
-        let mut cursor = 0usize;
-        if head.chunks != 0 {
-            let last_index = head.chunks - 1;
-            let mut last = self.read_chunk(script_hash, last_index)?;
-            additions.retain(|entry| last.last() != Some(entry));
-            let available = HISTORY_CHUNK_ENTRIES.saturating_sub(last.len());
-            let take = available.min(additions.len());
-            if take != 0 {
-                extend_history(&mut last, &additions[..take]);
-                added = added.saturating_add(take);
-                cursor = take;
-                batch.insert(
-                    &self.chunks,
-                    history_chunk_key(script_hash, last_index).to_vec(),
-                    encode_history_chunk(&last)?,
-                );
-            }
-        }
-        for values in additions[cursor..].chunks(HISTORY_CHUNK_ENTRIES) {
-            batch.insert(
-                &self.chunks,
-                history_chunk_key(script_hash, head.chunks).to_vec(),
-                encode_history_chunk(values)?,
-            );
-            head.chunks = head
-                .chunks
-                .checked_add(1)
-                .context("Electrum history has too many chunks")?;
-            added = added.saturating_add(values.len());
-        }
-        if added == 0 {
-            return Ok(0);
-        }
-        head.entries = head
-            .entries
-            .checked_add(u64::try_from(added).context("history append count does not fit u64")?)
-            .context("Electrum history entry count overflowed")?;
-        batch.insert(&self.heads, script_hash.to_vec(), encode_history_head(head));
-        Ok(added)
     }
 
     pub fn replace_all<I>(&mut self, entries: I) -> Result<()>
@@ -2871,8 +2748,7 @@ impl ElectrumHistoryStore {
 
     pub fn compact(&mut self) -> Result<()> {
         self.flush()?;
-        self.heads.major_compact()?;
-        self.chunks.major_compact()?;
+        self.events.major_compact()?;
         Ok(())
     }
 
@@ -2881,9 +2757,7 @@ impl ElectrumHistoryStore {
     }
 
     pub fn clear(&mut self) -> Result<()> {
-        self.pending.clear();
-        clear_partition(&self.keyspace, &self.heads)?;
-        clear_partition(&self.keyspace, &self.chunks)?;
+        clear_partition(&self.keyspace, &self.events)?;
         self.entry_count = 0;
         self.generation = self
             .generation
@@ -2908,7 +2782,6 @@ impl ElectrumHistoryStore {
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.flush_pending()?;
         self.keyspace
             .persist(PersistMode::SyncData)
             .context("flushing Electrum history database")
@@ -2921,69 +2794,82 @@ impl Drop for ElectrumHistoryStore {
     }
 }
 
-fn encode_history_head(head: HistoryHead) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(12);
-    bytes.extend_from_slice(&head.chunks.to_le_bytes());
-    bytes.extend_from_slice(&head.entries.to_le_bytes());
-    bytes
-}
+const HISTORY_EVENT_KEY_SIZE: usize = 32 + 4 + 4 + 32;
 
-fn decode_history_head(bytes: &[u8]) -> Result<HistoryHead> {
-    if bytes.len() != 12 {
-        bail!("invalid Electrum history head length");
-    }
-    Ok(HistoryHead {
-        chunks: u32::from_le_bytes(bytes[..4].try_into().expect("head chunk count is fixed")),
-        entries: u64::from_le_bytes(bytes[4..].try_into().expect("head entry count is fixed")),
-    })
-}
-
-fn history_chunk_key(script_hash: [u8; 32], chunk: u32) -> [u8; 36] {
-    let mut key = [0u8; 36];
+fn history_event_key(
+    script_hash: [u8; 32],
+    txid: Txid,
+    height: u32,
+    ordinal: u32,
+) -> [u8; HISTORY_EVENT_KEY_SIZE] {
+    let mut key = [0u8; HISTORY_EVENT_KEY_SIZE];
     key[..32].copy_from_slice(&script_hash);
-    key[32..].copy_from_slice(&chunk.to_be_bytes());
+    key[32..36].copy_from_slice(&height.to_be_bytes());
+    key[36..40].copy_from_slice(&ordinal.to_be_bytes());
+    key[40..].copy_from_slice(&txid.to_byte_array());
     key
 }
 
-fn encode_history_chunk(entries: &[(Txid, u32)]) -> Result<Vec<u8>> {
-    let mut raw = Vec::with_capacity(4usize.saturating_add(entries.len().saturating_mul(36)));
-    raw.extend_from_slice(
-        &u32::try_from(entries.len())
-            .context("Electrum history chunk is too large")?
-            .to_le_bytes(),
-    );
-    for (txid, height) in entries {
-        raw.extend_from_slice(&txid.to_byte_array());
-        raw.extend_from_slice(&height.to_le_bytes());
+fn decode_history_event_key(bytes: &[u8]) -> Result<([u8; 32], (Txid, u32))> {
+    if bytes.len() != HISTORY_EVENT_KEY_SIZE {
+        bail!("invalid Electrum history event key length");
     }
-    encode_storage_payload(&raw, MAX_STORED_ELECTRUM_HISTORY_SIZE)
+    let script_hash = bytes[..32]
+        .try_into()
+        .expect("history event script hash has a fixed length");
+    let height = u32::from_be_bytes(
+        bytes[32..36]
+            .try_into()
+            .expect("history event height has a fixed length"),
+    );
+    let txid = Txid::from_byte_array(
+        bytes[40..]
+            .try_into()
+            .expect("history event txid has a fixed length"),
+    );
+    Ok((script_hash, (txid, height)))
 }
 
-fn decode_history_chunk(bytes: &[u8]) -> Result<StoredElectrumHistory> {
-    let raw = decode_storage_payload(bytes, MAX_STORED_ELECTRUM_HISTORY_SIZE)?;
-    if raw.len() < 4 {
-        bail!("truncated Electrum history chunk");
+fn deduplicated_history_len(entries: &StoredElectrumHistory) -> usize {
+    usize::from(!entries.is_empty()).saturating_add(
+        entries
+            .windows(2)
+            .filter(|window| window[0] != window[1])
+            .count(),
+    )
+}
+
+fn insert_history_events(
+    batch: &mut fjall::Batch,
+    events: &PartitionHandle,
+    script_hash: [u8; 32],
+    entries: &StoredElectrumHistory,
+) -> Result<usize> {
+    let mut previous_height = None;
+    let mut previous_entry = None;
+    let mut ordinal = 0u32;
+    let mut inserted = 0usize;
+    for (txid, height) in entries {
+        if previous_entry == Some((*txid, *height)) {
+            continue;
+        }
+        if previous_height == Some(*height) {
+            ordinal = ordinal
+                .checked_add(1)
+                .context("too many Electrum history entries at one height")?;
+        } else {
+            previous_height = Some(*height);
+            ordinal = 0;
+        }
+        batch.insert(
+            events,
+            history_event_key(script_hash, *txid, *height, ordinal).to_vec(),
+            Vec::new(),
+        );
+        previous_entry = Some((*txid, *height));
+        inserted = inserted.saturating_add(1);
     }
-    let count = u32::from_le_bytes(raw[..4].try_into().expect("history count is fixed")) as usize;
-    let expected = 4usize
-        .checked_add(
-            count
-                .checked_mul(36)
-                .context("history chunk size overflowed")?,
-        )
-        .context("history chunk size overflowed")?;
-    if raw.len() != expected {
-        bail!("Electrum history chunk length does not match its entry count");
-    }
-    raw[4..]
-        .chunks_exact(36)
-        .map(|entry| {
-            Ok((
-                Txid::from_byte_array(entry[..32].try_into().expect("txid length is fixed")),
-                u32::from_le_bytes(entry[32..].try_into().expect("height length is fixed")),
-            ))
-        })
-        .collect()
+    Ok(inserted)
 }
 
 fn clear_partition(keyspace: &Keyspace, partition: &PartitionHandle) -> Result<()> {
@@ -4290,7 +4176,7 @@ mod tests {
     }
 
     #[test]
-    fn electrum_history_appends_are_published_as_one_durability_batch() {
+    fn electrum_history_appends_are_insert_only_and_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let script_hash = hex::encode([31u8; 32]);
         let first = (Txid::from_byte_array([32u8; 32]), 1);
@@ -4306,11 +4192,10 @@ mod tests {
             .unwrap();
         assert_eq!(store.get(&script_hash).unwrap(), vec![first, second]);
         assert_eq!(store.disk_usage().unwrap(), initial_size);
-        assert_eq!(store.len(), 1);
+        assert_eq!(store.len(), 2);
 
         store.flush().unwrap();
-        assert!(store.pending.is_empty());
-        assert_eq!(store.head([31u8; 32]).unwrap().unwrap().entries, 2);
+        assert_eq!(store.events.prefix([31u8; 32]).count(), 2);
         drop(store);
 
         let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
@@ -4318,7 +4203,7 @@ mod tests {
     }
 
     #[test]
-    fn electrum_history_append_chunks_are_linear_and_replacements_sever_them() {
+    fn electrum_history_events_append_and_replacements_remove_old_events() {
         let directory = tempfile::tempdir().unwrap();
         let script_hash = hex::encode([41u8; 32]);
         let first = (Txid::from_byte_array([42u8; 32]), 1);

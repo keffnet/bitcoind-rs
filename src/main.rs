@@ -170,7 +170,9 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     if shutdown_requested.load(Ordering::Acquire) {
         node.request_shutdown();
     }
-    let _pid_file = PidFile::create(node.config.pid_path.clone())?;
+    let _pid_file = (!node.config.pid_path.as_os_str().is_empty())
+        .then(|| PidFile::create(node.config.pid_path.clone()))
+        .transpose()?;
     let (best_height, best_hash) = {
         let chain = node.chain.read();
         (chain.height(), chain.best_hash())

@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use serde_json::{Map, Value, json};
 
-const CLIENT_NAME: &str = "bitcoind-rs";
-const CLIENT_VERSION: &str = "0.1.0";
+const CLIENT_NAME: &str = "Bitcoin Core";
+const CLIENT_VERSION: &str = "31.1.0";
 const DEFAULT_RPC_CONNECT: &str = "127.0.0.1";
 const DEFAULT_RPC_CLIENT_TIMEOUT: u64 = 900;
 const DEFAULT_RPC_WAIT_TIMEOUT: u64 = 0;

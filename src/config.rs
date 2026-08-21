@@ -2204,6 +2204,11 @@ impl Args {
             .cloned()
             .map(normalize_core_style_argument)
             .collect::<Vec<_>>();
+        if raw_bool_option(&raw, "help-debug") {
+            let mut command = Self::command().mut_args(|argument| argument.hide(false));
+            let help = command.render_long_help().to_string();
+            return Err(clap::Error::raw(clap::error::ErrorKind::DisplayHelp, help).into());
+        }
         let datadir_explicit = raw_option_value(&raw, "datadir").is_some();
         let command_line_include = raw
             .iter()
@@ -2584,6 +2589,19 @@ fn normalize_core_style_argument(argument: OsString) -> OsString {
     let Some(value) = argument.to_str() else {
         return argument;
     };
+    if matches!(value, "-nopid" | "--nopid") {
+        return OsString::from("--pid=0");
+    }
+    if let Some(enabled) = value
+        .strip_prefix("-nopid=")
+        .or_else(|| value.strip_prefix("--nopid="))
+    {
+        return OsString::from(if is_true(enabled) {
+            "--pid=0"
+        } else {
+            "--pid=bitcoind.pid"
+        });
+    }
     if matches!(value, "-noblocksonly" | "--noblocksonly") {
         return OsString::from("--blocksonly=false");
     }
@@ -2889,13 +2907,20 @@ fn config_entry_to_arg(entry: ConfigFileEntry) -> Option<OsString> {
             canonical_network_name(&entry.value)
         )));
     }
+    if entry.key == "nopid" {
+        return Some(OsString::from(if is_true(&entry.value) {
+            "--pid=0"
+        } else {
+            "--pid=bitcoind.pid"
+        }));
+    }
     Some(OsString::from(format!("--{}={}", entry.key, entry.value)))
 }
 
 pub fn is_known_config_option(key: &str) -> bool {
     matches!(
         key,
-        "chain" | "signetchallenge" | "maxconnections" | "peerbloomfilters"
+        "chain" | "signetchallenge" | "maxconnections" | "nopid" | "peerbloomfilters"
     ) || Args::command()
         .get_arguments()
         .any(|argument| argument.get_long().is_some_and(|long| long == key))
@@ -3425,7 +3450,9 @@ impl Config {
         if args.pid_file.as_os_str().is_empty() {
             bail!("--pid must not be empty");
         }
-        let pid_path = if args.pid_file.is_absolute() {
+        let pid_path = if args.pid_file == Path::new("0") {
+            PathBuf::new()
+        } else if args.pid_file.is_absolute() {
             args.pid_file.clone()
         } else {
             let network_dir = network_data_dir_name(network);
@@ -4727,6 +4754,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn help_debug_reveals_hidden_node_options() {
+        let regular_help = Args::command().render_long_help().to_string();
+        assert!(!regular_help.contains("--dbbatchsize"));
+
+        let error = Args::parse_from_with_config(["bitcoind-rs", "-help-debug"]).unwrap_err();
+        let clap_error = error.downcast_ref::<clap::Error>().unwrap();
+        assert_eq!(clap_error.kind(), clap::error::ErrorKind::DisplayHelp);
+        let debug_help = clap_error.to_string();
+        assert!(debug_help.contains("--dbbatchsize"));
+        assert!(debug_help.contains("--rpcdoccheck"));
+    }
+
+    #[test]
+    fn nopid_config_and_command_line_precedence_match_core() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("bitcoin.conf"), "nopid=1\n").unwrap();
+        let datadir = format!("-datadir={}", directory.path().display());
+
+        let args = Args::parse_from_with_config(["bitcoind-rs", datadir.as_str()]).unwrap();
+        assert!(
+            Config::from_args(args)
+                .unwrap()
+                .pid_path
+                .as_os_str()
+                .is_empty()
+        );
+
+        let args =
+            Args::parse_from_with_config(["bitcoind-rs", datadir.as_str(), "-pid=run/custom.pid"])
+                .unwrap();
+        assert_eq!(
+            Config::from_args(args).unwrap().pid_path,
+            directory.path().join("run/custom.pid")
+        );
+    }
+
+    #[test]
     fn reads_network_sections_and_preserves_command_line_precedence() {
         let directory = tempfile::tempdir().unwrap();
         let included = directory.path().join("included.conf");
@@ -5275,6 +5339,23 @@ mod tests {
         assert!(!Config::from_args(args).unwrap().logging.log_rate_limit);
 
         assert!(Args::try_parse_from(["bitcoind-rs", "--pid="]).is_err());
+
+        for disabled_pid_argument in ["-pid=0", "-nopid"] {
+            let args = Args::parse_from_with_config(vec![
+                "bitcoind-rs".to_owned(),
+                "-noconf".to_owned(),
+                format!("-datadir={}", directory.path().display()),
+                disabled_pid_argument.to_owned(),
+            ])
+            .unwrap();
+            assert!(
+                Config::from_args(args)
+                    .unwrap()
+                    .pid_path
+                    .as_os_str()
+                    .is_empty()
+            );
+        }
 
         let args = Args::try_parse_from([
             "bitcoind-rs",

@@ -2007,7 +2007,9 @@ impl Node {
                 },
             )?;
         }
-        let coinstats_unclean_startup = config.coinstatsindex && config.pid_path.exists();
+        let coinstats_unclean_startup = config.coinstatsindex
+            && !config.pid_path.as_os_str().is_empty()
+            && config.pid_path.exists();
         let lock_path = network_datadir.join(".lock");
         let data_dir_lock = OpenOptions::new()
             .create(true)

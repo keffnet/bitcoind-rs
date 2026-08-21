@@ -882,6 +882,9 @@ fn rest_error_message(error: &anyhow::Error) -> String {
 }
 
 fn rest_error_status(error: &anyhow::Error) -> &'static str {
+    if error.downcast_ref::<std::io::Error>().is_some() {
+        return "500 Internal Server Error";
+    }
     let message = error.to_string().to_ascii_lowercase();
     if message.starts_with(&REST_BAD_REQUEST_PREFIX.to_ascii_lowercase()) {
         return "400 Bad Request";
@@ -1139,16 +1142,15 @@ fn rest_block_part(
     if size == 0 {
         bail!("block part offset/size is outside the block")
     }
-    let mut chain = node.chain.write();
-    let bytes = match chain.block(&hash)? {
+    let block = match node.block_store_reader.get(&hash)? {
         Some(block) => block,
-        None if chain.block_height_by_hash(&hash).is_some() => {
+        None if node.chain.read().block_height_by_hash(&hash).is_some() => {
+            let chain = node.chain.read();
             return Err(missing_block_data_rest_error(&chain, &hash));
         }
         None => return Err(anyhow!("block not found")),
     };
-    drop(chain);
-    let bytes = serialize(&bytes);
+    let bytes = serialize(&block);
     let end = offset
         .checked_add(size)
         .ok_or_else(|| anyhow!("block part range overflows"))?;
@@ -21499,6 +21501,38 @@ mod tests {
         let (_, empty_utxos) =
             dispatch_rest_with_body(&node, "/rest/getutxos.bin", &[0, 0]).unwrap();
         assert_eq!(empty_utxos.len(), 38);
+
+        // REST block reads are authoritative storage probes. In particular,
+        // blockpart must not keep serving a decoded body from ChainState's
+        // cache after the indexed record becomes unreadable.
+        let block_path = directory.path().join("blocks/blocks.dat");
+        let stored_blocks = std::fs::read(&block_path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&block_path)
+            .unwrap();
+        let block_error =
+            dispatch_rest(&node, &format!("/rest/block/{genesis_hash}.bin")).unwrap_err();
+        assert_eq!(rest_error_status(&block_error), "500 Internal Server Error");
+        let block_part_error = dispatch_rest(
+            &node,
+            &format!("/rest/blockpart/{genesis_hash}.bin?offset=0&size=4"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            rest_error_status(&block_part_error),
+            "500 Internal Server Error"
+        );
+
+        std::fs::write(&block_path, stored_blocks).unwrap();
+        assert!(
+            dispatch_rest(
+                &node,
+                &format!("/rest/blockpart/{genesis_hash}.bin?offset=0&size=4"),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

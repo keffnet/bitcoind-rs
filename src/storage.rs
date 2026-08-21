@@ -613,16 +613,17 @@ impl BlockStore {
     }
 
     /// Configure the in-memory block-record cache used by the custom storage
-    /// backend. Core's `-dbcache` is split across several LevelDB caches; this
-    /// implementation keeps the UTXO state in memory already, so its useful
-    /// equivalent is a bounded cache for decoded historical blocks.
+    /// backend. Keep one quarter of `-dbcache` for decoded historical blocks;
+    /// the UTXO value cache receives the other three quarters because random
+    /// prevout reads dominate IBD and newly accepted blocks are rarely read
+    /// again before they leave this cache.
     pub fn configure_cache_size_mib(&mut self, mib: i64) {
         const MIN_CACHE_MIB: u64 = 4;
         const MIB: u64 = 1024 * 1024;
         let mib = u64::try_from(mib.max(0)).unwrap_or(u64::MAX);
         let bytes = mib.max(MIN_CACHE_MIB).saturating_mul(MIB);
         let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
-        self.block_cache_limit = bytes.saturating_mul(3) / 4;
+        self.block_cache_limit = bytes / 4;
         self.trim_block_cache();
     }
 
@@ -1671,16 +1672,60 @@ impl UtxoStore {
         self.generation
     }
 
-    /// Allocate one quarter of the configured storage cache to decoded UTXO
-    /// values. The remaining three quarters are reserved for block records,
-    /// matching the split used by the custom backend's block cache.
+    /// Allocate three quarters of the configured storage cache to decoded
+    /// UTXO values. The remaining quarter is reserved for historical block
+    /// records by `BlockStore`.
     pub fn configure_cache_size_mib(&self, mib: i64) {
         const MIN_CACHE_MIB: u64 = 4;
         const MIB: u64 = 1024 * 1024;
         let mib = u64::try_from(mib.max(0)).unwrap_or(u64::MAX);
         let total_bytes = mib.max(MIN_CACHE_MIB).saturating_mul(MIB);
-        let limit = usize::try_from(total_bytes / 4).unwrap_or(usize::MAX);
+        let limit = usize::try_from(total_bytes.saturating_mul(3) / 4).unwrap_or(usize::MAX);
         self.read_cache.lock().configure_limit(limit);
+    }
+
+    /// Populate the configured cache with the most recently written live
+    /// coins. Startup has already validated these records in file order; a
+    /// bounded second sequential pass is still much cheaper than issuing
+    /// random reads as every cold prevout is spent during IBD.
+    pub fn warm_cache(&self) -> Result<(usize, usize)> {
+        let limit = self.read_cache.lock().limit;
+        if limit == 0 || self.index.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let mut locations = self
+            .index
+            .iter()
+            .map(|(outpoint, location)| (*outpoint, *location))
+            .collect::<Vec<_>>();
+        locations.sort_unstable_by_key(|(_, location)| std::cmp::Reverse(location.offset()));
+        let mut selected_bytes = 0usize;
+        let selected_count = locations
+            .iter()
+            .position(|(_, location)| {
+                selected_bytes = selected_bytes
+                    .saturating_add(location.length() as usize)
+                    .saturating_add(64);
+                selected_bytes >= limit
+            })
+            .map_or(locations.len(), |position| position.saturating_add(1));
+        locations.truncate(selected_count);
+        locations.sort_unstable_by_key(|(_, location)| location.offset());
+
+        let mut cache = self.read_cache.lock();
+        for (outpoint, location) in locations {
+            let body = read_utxo_data_record(&self.file, location)?;
+            if body.first().copied() != Some(UTXO_PUT) || body.len() < 1 + 8 + 36 {
+                bail!("UTXO location points to a non-value record");
+            }
+            let stored_outpoint = decode_outpoint(&body[9..45])?;
+            if stored_outpoint != outpoint {
+                bail!("UTXO value key does not match its index");
+            }
+            cache.insert(outpoint, decode_stored_utxo(&body[45..])?);
+        }
+        Ok((cache.entries.len(), cache.bytes))
     }
 
     pub fn contains(&self, outpoint: &OutPoint) -> bool {
@@ -5128,8 +5173,12 @@ mod tests {
             .apply_batch(&[outpoint], &[(outpoint, second.clone())])
             .unwrap();
         assert!(store.read_cache.lock().entries.contains_key(&outpoint));
-        assert_eq!(store.get(&outpoint).unwrap(), Some(second));
+        assert_eq!(store.get(&outpoint).unwrap(), Some(second.clone()));
         assert_eq!(store.read_cache.lock().entries.len(), 1);
+
+        store.read_cache.lock().clear();
+        assert_eq!(store.warm_cache().unwrap().0, 1);
+        assert_eq!(store.get(&outpoint).unwrap(), Some(second));
 
         store.clear().unwrap();
         assert_eq!(store.get(&outpoint).unwrap(), None);

@@ -107,7 +107,8 @@ const ELECTRUM_REBUILD_BATCH_SCRIPTS: usize = 4_096;
 // Peer/IBD writes use append-only records and publish a bounded durability
 // boundary instead of forcing several fsyncs for every block. Direct API and
 // mining paths retain their immediate-sync behavior.
-const PEER_STORAGE_FLUSH_BLOCKS: u32 = 64;
+const PEER_STORAGE_FLUSH_BLOCKS: u32 = 4_096;
+const PEER_STORAGE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
 const IBD_BENCH_BLOCKS: u32 = 256;
 
 #[derive(Default)]
@@ -1444,6 +1445,7 @@ pub struct ChainState {
     // ChainState users keep the default flag, which is never set.
     shutdown_interrupt: Arc<AtomicBool>,
     peer_storage_blocks_since_flush: u32,
+    peer_storage_bytes_since_flush: u64,
     ibd_connect_bench: IbdConnectBench,
 }
 
@@ -2230,6 +2232,7 @@ impl ChainState {
             script_cache: Mutex::new(ScriptValidationCache::default()),
             shutdown_interrupt: Arc::new(AtomicBool::new(false)),
             peer_storage_blocks_since_flush: 0,
+            peer_storage_bytes_since_flush: 0,
             ibd_connect_bench: IbdConnectBench::default(),
         };
         let snapshot_load_started = Instant::now();
@@ -2685,10 +2688,13 @@ impl ChainState {
     }
 
     fn flush_peer_storage_if_needed(&mut self) -> Result<()> {
-        if self.peer_storage_blocks_since_flush < PEER_STORAGE_FLUSH_BLOCKS {
+        if self.peer_storage_blocks_since_flush < PEER_STORAGE_FLUSH_BLOCKS
+            && self.peer_storage_bytes_since_flush < PEER_STORAGE_FLUSH_BYTES
+        {
             return Ok(());
         }
         let blocks = self.peer_storage_blocks_since_flush;
+        let bytes = self.peer_storage_bytes_since_flush;
         let flush_started = Instant::now();
         self.flush_append_only_stores()?;
         // Publish the advisory markers only after every append-only record in
@@ -2700,8 +2706,9 @@ impl ChainState {
             self.persist_electrum_history_store_tip()?;
         }
         self.peer_storage_blocks_since_flush = 0;
+        self.peer_storage_bytes_since_flush = 0;
         info!(
-            "Flushed peer storage: blocks={blocks} elapsed={:.3}s",
+            "Flushed peer storage: blocks={blocks} bytes={bytes} elapsed={:.3}s",
             flush_started.elapsed().as_secs_f64()
         );
         Ok(())
@@ -4024,6 +4031,10 @@ impl ChainState {
     pub fn configure_storage_cache_size_mib(&mut self, mib: i64) {
         self.store.configure_cache_size_mib(mib);
         self.utxo_store.configure_cache_size_mib(mib);
+    }
+
+    pub fn warm_utxo_cache(&self) -> Result<(usize, usize)> {
+        self.utxo_store.warm_cache()
     }
 
     /// Configure chainstate write batching from Core's debug-only
@@ -8396,6 +8407,9 @@ impl ChainState {
             if !sync_storage {
                 self.peer_storage_blocks_since_flush =
                     self.peer_storage_blocks_since_flush.saturating_add(1);
+                self.peer_storage_bytes_since_flush = self
+                    .peer_storage_bytes_since_flush
+                    .saturating_add(u64::try_from(block.total_size()).unwrap_or(u64::MAX));
             }
             self.utxo_store.maybe_simulate_crash()?;
         }
@@ -10928,6 +10942,7 @@ impl ChainState {
         self.chainstate_store.clear()?;
         self.persist_active_chain_tip()?;
         self.peer_storage_blocks_since_flush = 0;
+        self.peer_storage_bytes_since_flush = 0;
         Ok(())
     }
 
@@ -11502,6 +11517,7 @@ fn open_background_replay_state(
         )),
         shutdown_interrupt: Arc::new(AtomicBool::new(false)),
         peer_storage_blocks_since_flush: 0,
+        peer_storage_bytes_since_flush: 0,
         ibd_connect_bench: IbdConnectBench::default(),
     })
 }
@@ -14061,7 +14077,10 @@ mod tests {
         }
         let tip = state.best_hash();
         assert_eq!(state.height(), 70);
-        state.flush().unwrap();
+        state.peer_storage_bytes_since_flush = PEER_STORAGE_FLUSH_BYTES;
+        state.flush_peer_storage_if_needed().unwrap();
+        assert_eq!(state.peer_storage_blocks_since_flush, 0);
+        assert_eq!(state.peer_storage_bytes_since_flush, 0);
         drop(state);
 
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();

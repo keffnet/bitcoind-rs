@@ -2048,6 +2048,13 @@ impl Node {
         chain.configure_script_check_threads(config.script_check_threads);
         chain.configure_script_cache_size_mib(config.max_sig_cache_mib);
         chain.configure_storage_cache_size_mib(config.db_cache_mib);
+        let utxo_cache_started = Instant::now();
+        let (cached_utxos, cached_utxo_bytes) =
+            chain.warm_utxo_cache().map_err(core_startup_chain_error)?;
+        info!(
+            "Warmed UTXO cache: entries={cached_utxos} bytes={cached_utxo_bytes} in {:.2}s",
+            utxo_cache_started.elapsed().as_secs_f64()
+        );
         chain.configure_storage_batch_size_bytes(config.db_batch_size_bytes);
         #[cfg(not(test))]
         chain.configure_storage_crash_ratio(config.db_crash_ratio);

@@ -2179,12 +2179,25 @@ impl ChainState {
             .last()
             .copied()
             .context("active chain has no tip")?;
+        let durable_utxo_tip_matches = state.utxo_store_tip_matches(expected_active_tip);
+        let durable_history_tip_matches = !state.history_index_enabled
+            || state.electrum_history_store_tip_matches(expected_active_tip);
         let restore_from_durable_indexes = !rebuild_chainstate
             && snapshot.is_none()
             && !state.txospender_index_enabled
-            && state.utxo_store_tip_matches(expected_active_tip)
-            && (!state.history_index_enabled
-                || state.electrum_history_store_tip_matches(expected_active_tip));
+            && durable_utxo_tip_matches
+            && durable_history_tip_matches;
+        // Electrum is a service index, not consensus state. If the durable
+        // UTXO database already matches the active tip, a missing Electrum
+        // marker must not force consensus validation and UTXO reconstruction
+        // from genesis. Restore the authoritative chainstate directly and
+        // rebuild only script history from block plus undo records.
+        let rebuild_only_electrum_history = !rebuild_chainstate
+            && snapshot.is_none()
+            && !state.txospender_index_enabled
+            && durable_utxo_tip_matches
+            && state.history_index_enabled
+            && !durable_history_tip_matches;
         let chainstate_restore_started = Instant::now();
         info!("Restoring chainstate indexes");
         if rebuild_chainstate {
@@ -2310,51 +2323,27 @@ impl ChainState {
                     replay_started.elapsed().as_secs_f64()
                 );
             }
-        } else if restore_from_durable_indexes {
+        } else if restore_from_durable_indexes || rebuild_only_electrum_history {
             // Clean IBD shutdowns intentionally avoid serializing a gigantic
             // UTXO/history snapshot: the disk indexes and their tip markers
             // are already the authoritative state. Rebuild only the compact
             // in-memory header index instead of materializing every full block
             // and every historical Electrum event.
-            let mut persisted_by_hash = persisted_headers
-                .iter()
-                .map(|header| (header.block_hash(), *header))
-                .collect::<HashMap<_, _>>();
-            let mut active_headers = Vec::with_capacity(active_chain.len());
-            for (height, hash) in active_chain.iter().copied().enumerate() {
-                let header = if let Some(header) = persisted_by_hash.remove(&hash) {
-                    header
-                } else {
-                    state
-                        .store
-                        .get(&hash)?
-                        .with_context(|| {
-                            format!("active block {hash} is missing from block store")
-                        })?
-                        .header
-                };
-                if header.block_hash() != hash {
-                    bail!("persisted active header does not match block hash {hash}");
-                }
-                if height > 0 && header.prev_blockhash != active_chain[height - 1] {
-                    bail!("persisted active header {hash} does not connect to its parent");
-                }
-                active_headers.push(header);
+            state.restore_active_chain_from_durable_indexes(&active_chain, &persisted_headers)?;
+            if rebuild_only_electrum_history {
+                info!(
+                    "Restored durable UTXO state at height {}; rebuilding only the Electrum history index",
+                    state.height()
+                );
+                state.rebuild_electrum_history_index()?;
+            } else {
+                info!(
+                    "Restored clean IBD state from durable indexes: height={} utxos={} history_events={}",
+                    state.height(),
+                    state.utxo_store.len(),
+                    state.electrum_history_store.len()
+                );
             }
-            state.active_chain = active_chain.clone();
-            state.headers = active_headers;
-            let headers = state.headers.clone();
-            state.index_active_headers(&headers)?;
-            state.utxos.clear();
-            state.utxos_materialized = false;
-            state.history.clear();
-            state.history_materialized = false;
-            info!(
-                "Restored clean IBD state from durable indexes: height={} utxos={} history_events={}",
-                state.height(),
-                state.utxo_store.len(),
-                state.electrum_history_store.len()
-            );
         } else {
             state.snapshot_base = None;
             state.snapshot_validated = true;
@@ -2517,6 +2506,44 @@ impl ChainState {
         state.release_materialized_utxos();
         state.release_materialized_history();
         Ok(state)
+    }
+
+    fn restore_active_chain_from_durable_indexes(
+        &mut self,
+        active_chain: &[BlockHash],
+        persisted_headers: &[bitcoin::block::Header],
+    ) -> Result<()> {
+        let mut persisted_by_hash = persisted_headers
+            .iter()
+            .map(|header| (header.block_hash(), *header))
+            .collect::<HashMap<_, _>>();
+        let mut active_headers = Vec::with_capacity(active_chain.len());
+        for (height, hash) in active_chain.iter().copied().enumerate() {
+            let header = if let Some(header) = persisted_by_hash.remove(&hash) {
+                header
+            } else {
+                self.store
+                    .get(&hash)?
+                    .with_context(|| format!("active block {hash} is missing from block store"))?
+                    .header
+            };
+            if header.block_hash() != hash {
+                bail!("persisted active header does not match block hash {hash}");
+            }
+            if height > 0 && header.prev_blockhash != active_chain[height - 1] {
+                bail!("persisted active header {hash} does not connect to its parent");
+            }
+            active_headers.push(header);
+        }
+        self.active_chain = active_chain.to_vec();
+        self.headers = active_headers;
+        let headers = self.headers.clone();
+        self.index_active_headers(&headers)?;
+        self.utxos.clear();
+        self.utxos_materialized = false;
+        self.history.clear();
+        self.history_materialized = false;
+        Ok(())
     }
 
     pub fn tip(&self) -> ChainTip {
@@ -3123,26 +3150,44 @@ impl ChainState {
     /// outputs in transaction-input order, so this can reconstruct both output
     /// and spending histories without keeping a second full UTXO set in RAM.
     ///
-    /// The active chain is preflighted before replacing the durable history
-    /// values. That makes a later enable fail cleanly on a pruned node whose
-    /// historical bodies or undo records are unavailable instead of silently
-    /// publishing a partial index.
+    /// The active chain's native indexes are preflighted before replacing the
+    /// durable history values. Record decoding and undo-shape validation are
+    /// folded into the one rebuild pass, avoiding a second read and
+    /// decompression of the full blockchain. A failed rebuild never publishes
+    /// its tip marker, so an incomplete service index cannot be served.
     fn rebuild_electrum_history_index(&mut self) -> Result<()> {
         let active_chain = self.active_chain.clone();
-        for hash in &active_chain {
-            let block = self
-                .store
-                .get(hash)?
-                .with_context(|| format!("Electrum history rebuild is missing block {hash}"))?;
-            let undo = self
-                .store
-                .get_undo(hash)?
-                .with_context(|| format!("Electrum history rebuild is missing undo for {hash}"))?;
-            self.validate_block_undo(&block, &undo)
-                .with_context(|| format!("invalid undo data while rebuilding block {hash}"))?;
+        let total = active_chain.len();
+        let target_height = total.saturating_sub(1);
+        let preflight_started = Instant::now();
+        info!(
+            "Preflighting Electrum history rebuild: height={} blocks={total}",
+            self.height()
+        );
+        for (height, hash) in active_chain.iter().enumerate() {
+            if !self.store.contains(hash) {
+                bail!("Electrum history rebuild is missing block {hash}");
+            }
+            if self.store.undo_location(hash).is_none() {
+                bail!("Electrum history rebuild is missing undo for {hash}");
+            }
+            log_replay_progress(
+                "electrum-preflight",
+                height + 1,
+                total,
+                height,
+                target_height,
+                preflight_started,
+            );
         }
+        info!(
+            "Preflighted {total} blocks for Electrum history rebuild in {:.2}s",
+            preflight_started.elapsed().as_secs_f64()
+        );
 
         self.electrum_history_store.clear()?;
+        let rebuild_started = Instant::now();
+        info!("Rebuilding Electrum history from native block and undo storage");
         for (height, hash) in active_chain.iter().copied().enumerate() {
             let height = u32::try_from(height).context("active chain height does not fit u32")?;
             let block = self
@@ -3153,6 +3198,8 @@ impl ChainState {
                 .store
                 .get_undo(&hash)?
                 .with_context(|| format!("Electrum history rebuild is missing undo for {hash}"))?;
+            self.validate_block_undo(&block, &undo)
+                .with_context(|| format!("invalid undo data while rebuilding block {hash}"))?;
             self.check_shutdown_interrupt()?;
             let mut updates: HashMap<String, Vec<(Txid, u32)>> = HashMap::new();
             for (transaction_index, transaction) in block.txdata.iter().enumerate() {
@@ -3178,11 +3225,25 @@ impl ChainState {
                 self.electrum_history_store
                     .append_entries_owned_unsynced(updates.into_iter().collect())?;
             }
+            log_replay_progress(
+                "electrum-history",
+                height as usize + 1,
+                total,
+                height as usize,
+                target_height,
+                rebuild_started,
+            );
         }
         self.electrum_history_store.flush()?;
         self.history.clear();
         self.history_materialized = false;
-        self.persist_electrum_history_store_tip()
+        self.persist_electrum_history_store_tip()?;
+        info!(
+            "Rebuilt Electrum history: events={} blocks={total} elapsed={:.2}s",
+            self.electrum_history_store.len(),
+            rebuild_started.elapsed().as_secs_f64()
+        );
+        Ok(())
     }
 
     /// Enable or disable the durable coinstats index. Enabling it builds any
@@ -12868,6 +12929,37 @@ mod tests {
         let (cached_entries, cached_bytes) = reopened.warm_utxo_cache().unwrap();
         assert!(cached_entries >= 3);
         assert!(cached_bytes > 0);
+    }
+
+    #[test]
+    fn missing_electrum_index_rebuilds_from_a_complete_durable_utxo_tip() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        let expected_tip = state.best_hash();
+        let script_hash = electrum_script_hash(&Builder::new().push_int(1).into_script());
+        let expected_history = state.get_history(&script_hash);
+        let expected_events = state.electrum_history_store.len();
+        let expected_utxos = state.utxo_store.len();
+        let utxo_generation = state.utxo_store.generation();
+        state.checkpoint_for_shutdown().unwrap();
+
+        // Model loss of only the non-consensus service index while the
+        // authoritative UTXO store and its tip marker remain complete.
+        state.electrum_history_store.clear().unwrap();
+        state.electrum_history_store.flush().unwrap();
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), expected_tip);
+        assert_eq!(reopened.utxo_store.generation(), utxo_generation);
+        assert_eq!(reopened.utxo_store.len(), expected_utxos);
+        assert_eq!(reopened.electrum_history_store.len(), expected_events);
+        assert_eq!(reopened.get_history(&script_hash), expected_history);
+        assert!(!reopened.utxos_materialized);
+        assert!(!reopened.history_materialized);
     }
 
     #[test]

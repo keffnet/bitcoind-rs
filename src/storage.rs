@@ -1019,7 +1019,7 @@ impl BlockStore {
         let undo_index = match load_index(&mut undo_index_file, undo_data_len)? {
             Some(index) => index,
             None => {
-                let index = scan_undo_index(&mut undo_file, xor_key)
+                let index = scan_undo_index(&mut undo_file, xor_key, true)
                     .with_context(|| format!("scanning {}", undo_path.display()))?;
                 rewrite_index(&mut undo_index_file, undo_file.metadata()?.len(), &index)?;
                 index
@@ -1092,7 +1092,7 @@ impl BlockStore {
         let undo_data_len = undo_file.metadata()?.len();
         let undo_index = match load_index(&mut undo_index_file, undo_data_len)? {
             Some(index) => index,
-            None => scan_undo_index(&mut undo_file, xor_key)
+            None => scan_undo_index(&mut undo_file, xor_key, false)
                 .with_context(|| format!("scanning {}", undo_path.display()))?,
         };
 
@@ -5054,7 +5054,11 @@ fn scan_index(
     Ok(index)
 }
 
-fn scan_undo_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash, Record>> {
+fn scan_undo_index(
+    file: &mut File,
+    xor_key: XorKey,
+    repair_truncated_tail: bool,
+) -> Result<HashMap<BlockHash, Record>> {
     file.seek(SeekFrom::Start(0))?;
     let mut index = HashMap::new();
     let mut max_end = 0u64;
@@ -5065,7 +5069,11 @@ fn scan_undo_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash
         match file.read_exact(&mut length_bytes) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                file.set_len(offset)?;
+                if offset < data_len && repair_truncated_tail {
+                    file.set_len(offset)?;
+                } else if offset < data_len {
+                    bail!("truncated undo record at offset {offset}");
+                }
                 break;
             }
             Err(error) => return Err(error.into()),
@@ -5074,7 +5082,11 @@ fn scan_undo_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash
         let length = u32::from_le_bytes(length_bytes);
         let end = offset.saturating_add(4).saturating_add(u64::from(length));
         if end > data_len {
-            file.set_len(offset)?;
+            if repair_truncated_tail {
+                file.set_len(offset)?;
+            } else {
+                bail!("truncated undo record at offset {offset}");
+            }
             break;
         }
         if length == 0 || length as usize > MAX_STORED_UNDO_SIZE {
@@ -6126,6 +6138,25 @@ mod tests {
                 "missing native file {name}"
             );
         }
+    }
+
+    #[test]
+    fn read_only_store_scans_a_clean_unpublished_suffix_without_mutating_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let block = genesis_block(Network::Regtest);
+        let hash = block.block_hash();
+        {
+            let mut store = BlockStore::open(directory.path()).unwrap();
+            store.insert_unsynced(&block).unwrap();
+            store.insert_undo_unsynced(hash, &[Vec::new()]).unwrap();
+        }
+
+        // Unsynced appends deliberately leave the index-header lengths at
+        // their previous durability boundary. A read-only consumer may scan
+        // a complete suffix, but must not try to truncate either data file.
+        let mut reopened = BlockStore::open_read_only(directory.path()).unwrap();
+        assert_eq!(reopened.get(&hash).unwrap(), Some(block));
+        assert_eq!(reopened.get_undo(&hash).unwrap(), Some(vec![Vec::new()]));
     }
 
     #[test]

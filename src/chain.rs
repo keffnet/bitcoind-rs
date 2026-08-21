@@ -908,6 +908,14 @@ struct BackgroundValidation {
     cancel: Arc<AtomicBool>,
     progress: Arc<AtomicU32>,
     outcome: Arc<Mutex<Option<BackgroundValidationOutcome>>>,
+    started: Instant,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BackgroundBodyCursor {
+    snapshot_base: Option<BlockHash>,
+    height: u32,
+    hash: Option<BlockHash>,
 }
 
 struct BackgroundValidationJob {
@@ -1379,6 +1387,11 @@ pub struct ChainState {
     snapshot_validated: bool,
     snapshot_validation_error: Option<String>,
     background_validation: Option<BackgroundValidation>,
+    // AssumeUTXO makes the snapshot base and its descendants active before
+    // the historical bodies between the old validated tip and that base are
+    // available. Cache the contiguous body prefix so the P2P scheduler can
+    // request that gap without rescanning from genesis every 100 ms.
+    background_body_cursor: Mutex<BackgroundBodyCursor>,
     block_index: HashMap<BlockHash, BlockNode>,
     // Core's candidate ordering uses a memory-only sequence ID after
     // chainwork.  Keep the same ordering for equal-work forks; this is not
@@ -2186,6 +2199,7 @@ impl ChainState {
                 .as_ref()
                 .and_then(|provenance| provenance.failure.clone()),
             background_validation: None,
+            background_body_cursor: Mutex::new(BackgroundBodyCursor::default()),
             block_index: HashMap::new(),
             block_sequence_ids: HashMap::new(),
             next_block_sequence_id: 1,
@@ -3948,6 +3962,54 @@ impl ChainState {
         self.snapshot_validation_error.clone()
     }
 
+    /// Return the highest active-chain height whose complete historical body
+    /// prefix is available while an AssumeUTXO snapshot is pending.
+    fn background_body_common_height(&self) -> Option<u32> {
+        let snapshot_base = self
+            .snapshot_base
+            .filter(|_| !self.snapshot_validated && self.snapshot_validation_error.is_none())?;
+        let mut cursor = self.background_body_cursor.lock();
+        let cursor_index = usize::try_from(cursor.height).ok();
+        let cursor_is_current = cursor.snapshot_base == Some(snapshot_base)
+            && cursor_index
+                .and_then(|index| self.active_chain.get(index))
+                .copied()
+                == cursor.hash
+            && (cursor.height == 0 || cursor.hash.is_some_and(|hash| self.store.contains(&hash)));
+        if !cursor_is_current {
+            cursor.snapshot_base = Some(snapshot_base);
+            cursor.height = 0;
+            cursor.hash = self.active_chain.first().copied();
+        }
+
+        let start = usize::try_from(cursor.height)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        for (height, hash) in self.active_chain.iter().enumerate().skip(start) {
+            if !self.store.contains(hash) {
+                break;
+            }
+            cursor.height = u32::try_from(height).unwrap_or(u32::MAX);
+            cursor.hash = Some(*hash);
+        }
+        Some(cursor.height.min(self.height()))
+    }
+
+    /// Return the AssumeUTXO historical-body cursor when `path` extends the
+    /// current active chain and still has a missing body below its tip.
+    pub(crate) fn assumeutxo_download_common_height_for_path(
+        &self,
+        path: &[BlockHash],
+    ) -> Option<u32> {
+        let common_height = self.background_body_common_height()?;
+        let active_height = self.height();
+        if common_height >= active_height {
+            return None;
+        }
+        let active_index = usize::try_from(active_height).ok()?;
+        (path.get(active_index) == Some(&self.best_hash())).then_some(common_height)
+    }
+
     /// Return the background validation chainstate's current replay point.
     /// The active snapshot chainstate remains the serving tip while this
     /// point advances independently.
@@ -3960,13 +4022,7 @@ impl ChainState {
             .background_validation
             .as_ref()
             .map(|validation| validation.progress.load(Ordering::Acquire))
-            .or_else(|| {
-                if self.is_active_block(&base_hash) {
-                    Some(self.block_height_by_hash(&base_hash).unwrap_or_default())
-                } else {
-                    Some(self.height())
-                }
-            })
+            .or_else(|| self.background_body_common_height())
             .unwrap_or_default()
             .min(self.height());
         let progress_hash = self
@@ -4009,6 +4065,7 @@ impl ChainState {
             | BackgroundValidationOutcome::Failed { target_tip, .. } => *target_tip,
         };
         let base_hash = validation.base_hash;
+        let elapsed = validation.started.elapsed().as_secs_f64();
         let target_is_current = target_tip == self.best_hash()
             && self
                 .block_height_by_hash(&target_tip)
@@ -4028,6 +4085,12 @@ impl ChainState {
             BackgroundValidationOutcome::Complete {
                 base_matches: true, ..
             } => {
+                info!(
+                    base = %base_hash,
+                    target = %target_tip,
+                    elapsed,
+                    "Completed background AssumeUTXO validation"
+                );
                 // Snapshot activation can leave the historical prefix with
                 // header-only transaction counts. The background worker
                 // validates those block bodies in an isolated chainstate,
@@ -4049,6 +4112,12 @@ impl ChainState {
                 utxos,
                 ..
             } => {
+                warn!(
+                    base = %base_hash,
+                    target = %target_tip,
+                    elapsed,
+                    "AssumeUTXO snapshot mismatch; promoting independently replayed chainstate"
+                );
                 self.rebuild_active_tx_counts()?;
                 self.utxos = utxos;
                 self.utxos_materialized = true;
@@ -4061,6 +4130,13 @@ impl ChainState {
                 self.persist_snapshot_provenance()?;
             }
             BackgroundValidationOutcome::Failed { error, utxos, .. } => {
+                warn!(
+                    base = %base_hash,
+                    target = %target_tip,
+                    elapsed,
+                    error = %error,
+                    "Background AssumeUTXO validation failed"
+                );
                 if let Some(utxos) = utxos {
                     self.rebuild_active_tx_counts()?;
                     self.utxos = utxos;
@@ -11257,9 +11333,8 @@ impl ChainState {
             return Ok(());
         }
         if self
-            .active_chain
-            .iter()
-            .any(|hash| !self.store.contains(hash))
+            .background_body_common_height()
+            .is_none_or(|height| height < self.height())
         {
             // Historical bodies may still be downloading on a pruned node.
             // Starting the replay before they arrive would permanently turn
@@ -11267,6 +11342,12 @@ impl ChainState {
             return Ok(());
         }
         let target_tip = self.best_hash();
+        // Peer block batches append their location entries before publishing
+        // the corresponding data lengths in the index headers.  A separate
+        // replay chainstate must never mistake that normal pending batch for
+        // a stale index and rescan the complete block/undo files. Publish the
+        // native indexes once before its read-only descriptors are opened.
+        self.store.flush()?;
         let active_chain = self.active_chain.clone();
         let block_index = self.block_index.clone();
         let data_dir = self.data_dir.clone();
@@ -11309,7 +11390,15 @@ impl ChainState {
             cancel,
             progress: progress.clone(),
             outcome: outcome.clone(),
+            started: Instant::now(),
         });
+        info!(
+            base = %base_hash,
+            base_height,
+            target = %target_tip,
+            target_height = self.height(),
+            "Starting background AssumeUTXO validation"
+        );
         let worker = thread::Builder::new()
             .name("assumeutxo-validation".to_owned())
             .spawn(move || {
@@ -11709,6 +11798,7 @@ fn open_background_replay_state(
         snapshot_validated: true,
         snapshot_validation_error: None,
         background_validation: None,
+        background_body_cursor: Mutex::new(BackgroundBodyCursor::default()),
         block_index: block_index.clone(),
         block_sequence_ids: HashMap::new(),
         next_block_sequence_id: 1,
@@ -11800,6 +11890,8 @@ fn run_background_validation(
             bail!("AssumeUTXO checkpoint crossed its base without a comparison")
         }
         progress.store(start_height, Ordering::Release);
+        let replay_started = Instant::now();
+        let replay_total = target_height.saturating_sub(start_height) as usize;
 
         let mut state = open_background_replay_state(
             network,
@@ -11874,6 +11966,14 @@ fn run_background_validation(
                 base_matches = Some(utxos == expected);
             }
             progress.store(height, Ordering::Release);
+            log_replay_progress(
+                "assumeutxo-background",
+                height.saturating_sub(start_height) as usize,
+                replay_total,
+                height as usize,
+                target_height as usize,
+                replay_started,
+            );
             if height % ASSUMEUTXO_CHECKPOINT_INTERVAL == 0
                 || height == base_height
                 || height == target_height
@@ -11906,7 +12006,7 @@ fn run_background_validation(
         },
         Err(error) => BackgroundValidationOutcome::Failed {
             target_tip,
-            error: error.to_string(),
+            error: format!("{error:#}"),
             utxos: None,
         },
     }
@@ -12965,6 +13065,44 @@ mod tests {
     }
 
     #[test]
+    fn assumeutxo_download_cursor_advances_across_a_historical_body_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let first = mine_block(&state, 1);
+        state.connect_block(first.clone()).unwrap();
+        let second = mine_block(&state, 2);
+        state.connect_block(second.clone()).unwrap();
+        let third = mine_block(&state, 3);
+        state.connect_block(third.clone()).unwrap();
+
+        let retained = [
+            state.block_hash(0).unwrap(),
+            first.block_hash(),
+            third.block_hash(),
+        ]
+        .into_iter()
+        .collect::<HashSet<_>>();
+        state.store.prune(&retained, &retained).unwrap();
+        state.snapshot_base = Some(third.block_hash());
+        state.snapshot_validated = false;
+        let path = state.active_chain.clone();
+
+        assert_eq!(state.background_body_common_height(), Some(1));
+        assert_eq!(
+            state.assumeutxo_download_common_height_for_path(&path),
+            Some(1)
+        );
+        assert_eq!(state.background_chainstate().unwrap().0, 1);
+
+        state.store.insert(&second).unwrap();
+        assert_eq!(state.background_body_common_height(), Some(3));
+        assert_eq!(
+            state.assumeutxo_download_common_height_for_path(&path),
+            None
+        );
+    }
+
+    #[test]
     fn reopens_from_a_prefix_snapshot_without_old_block_bodies() {
         let directory = tempfile::tempdir().unwrap();
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
@@ -13019,7 +13157,26 @@ mod tests {
         state.active_tx_counts.fill(0);
         state.active_tx_totals = cumulative_tx_counts(&state.active_tx_counts);
         state.persist_snapshot_provenance().unwrap();
+
+        // Reproduce the peer-batch state that previously made the background
+        // read-only store rescan blocks.dat and fail while scanning undo.dat:
+        // records are complete, but their index-header lengths are not yet
+        // published. Starting the worker must establish that boundary first.
+        let pending = mine_block(&state, 4);
+        let pending_hash = pending.block_hash();
+        state.store.insert_unsynced(&pending).unwrap();
+        state
+            .store
+            .insert_undo_unsynced(pending_hash, &[Vec::new()])
+            .unwrap();
+        let index_path = directory.path().join("blocks/blocks.index");
+        let before = fs::read(&index_path).unwrap();
+        let before_len = u64::from_le_bytes(before[..8].try_into().unwrap());
+        assert_ne!(before_len, state.store.data_size().unwrap());
         state.start_background_validation().unwrap();
+        let after = fs::read(index_path).unwrap();
+        let after_len = u64::from_le_bytes(after[..8].try_into().unwrap());
+        assert_eq!(after_len, state.store.data_size().unwrap());
 
         for _ in 0..200 {
             state.poll_background_validation().unwrap();

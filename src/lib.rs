@@ -5862,16 +5862,19 @@ impl Node {
             debug_assert_eq!(cached_path.hashes.get(target_index), Some(&target_hash));
             let hashes = &cached_path.hashes[..=target_index];
             let active_common_height = chain.common_active_height_for_hash_path(hashes);
-            let initial_common_height = peer_last_common
-                .and_then(|hash| {
-                    let height = chain.block_height_by_hash(&hash)?;
-                    let index = usize::try_from(height).ok()?;
-                    (height >= active_common_height
-                        && hashes.get(index) == Some(&hash)
-                        && chain.store.contains(&hash))
-                    .then_some(height)
-                })
-                .unwrap_or(active_common_height);
+            let assumeutxo_common_height = chain.assumeutxo_download_common_height_for_path(hashes);
+            let initial_common_height = assumeutxo_common_height.unwrap_or_else(|| {
+                peer_last_common
+                    .and_then(|hash| {
+                        let height = chain.block_height_by_hash(&hash)?;
+                        let index = usize::try_from(height).ok()?;
+                        (height >= active_common_height
+                            && hashes.get(index) == Some(&hash)
+                            && chain.store.contains(&hash))
+                        .then_some(height)
+                    })
+                    .unwrap_or(active_common_height)
+            });
             // Core advances pindexLastCommonBlock over each contiguous
             // BLOCK_HAVE_DATA entry, even when those blocks are on a fork
             // that cannot activate until more bodies arrive.

@@ -31,7 +31,7 @@ const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_FILTER_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_CHAINSTATE_DELTA_SIZE: usize = 64 * 1024 * 1024;
 const MAX_STORED_ELECTRUM_BLOCK_SIZE: usize = 4 * 1024 * 1024;
-const MAX_STORED_ELECTRUM_HISTORY_SIZE: usize = 4 * 1024 * 1024;
+const MAX_STORED_ELECTRUM_HISTORY_SIZE: usize = 16 * 1024 * 1024;
 const MAX_STORED_TRANSACTION_INDEX_SIZE: usize = 8 * 1024 * 1024;
 const MAX_STORED_UTXO_SIZE: usize = 100 * 1024;
 const MIN_UTXO_COMPACTION_DATA_SIZE: u64 = 16 * 1024 * 1024;
@@ -204,15 +204,15 @@ fn stored_utxo_cache_bytes(entry: &StoredUtxo) -> usize {
 
 /// Compact in-memory pointer into the append-only Electrum history log.
 ///
-/// History records are capped at 4 MiB.  Storing `length - 1` in 22 bits
-/// represents that full range, leaving 42 bits for a history log up to 4 TiB.
+/// History records are capped at 16 MiB.  Storing `length - 1` in 24 bits
+/// represents that full range, leaving 40 bits for a history log up to 1 TiB.
 /// The durable history index deliberately keeps its existing u64 offset and
 /// u32 length fields, so this optimization only changes resident memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HistoryLocation(u64);
 
 impl HistoryLocation {
-    const LENGTH_BITS: u32 = 22;
+    const LENGTH_BITS: u32 = 24;
     const LENGTH_MASK: u64 = (1 << Self::LENGTH_BITS) - 1;
     const MAX_LENGTH: u32 = (Self::LENGTH_MASK + 1) as u32;
     const MAX_OFFSET: u64 = (1 << (u64::BITS - Self::LENGTH_BITS)) - 1;
@@ -5017,6 +5017,9 @@ mod tests {
         let location = HistoryLocation::new(123_456_789, HistoryLocation::MAX_LENGTH).unwrap();
         assert_eq!(location.offset(), 123_456_789);
         assert_eq!(location.length(), HistoryLocation::MAX_LENGTH);
+        let previously_oversized = HistoryLocation::new(123, 4_792_689).unwrap();
+        assert_eq!(previously_oversized.offset(), 123);
+        assert_eq!(previously_oversized.length(), 4_792_689);
         assert!(HistoryLocation::new(HistoryLocation::MAX_OFFSET + 1, 1).is_err());
         assert!(HistoryLocation::new(0, HistoryLocation::MAX_LENGTH + 1).is_err());
     }

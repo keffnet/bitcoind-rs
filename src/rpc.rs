@@ -17422,6 +17422,7 @@ fn rpc_help(method: &str) -> String {
                 "utxoupdatepsbt",
             ],
         ),
+        ("Signer", &["enumeratesigners"]),
         (
             "Util",
             &[
@@ -17444,7 +17445,6 @@ fn rpc_help(method: &str) -> String {
         "echo",
         "echoipc",
         "echojson",
-        "enumeratesigners",
         "estimaterawfee",
         "generate",
         "generateblock",
@@ -19583,7 +19583,7 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_zmq_category() {
+    fn help_lists_core_wallet_free_categories() {
         let help = rpc_help("");
         let categories = help
             .lines()
@@ -19598,6 +19598,7 @@ mod tests {
                 "Mining",
                 "Network",
                 "Rawtransactions",
+                "Signer",
                 "Util",
                 "Zmq",
             ]
@@ -19798,6 +19799,8 @@ mod tests {
             dispatch_method(&node, "echoipc", &json!(["hello"])).unwrap(),
             json!("hello")
         );
+        let help = rpc_help("");
+        assert!(help.contains("== Signer ==\nenumeratesigners\n"));
         let general = dispatch_method(&node, "getgeneralinfo", &json!([])).unwrap();
         assert_eq!(general["clientversion"], json!("31.1.0"));
         assert_eq!(general["useragent"], json!("/bitcoind-rs:0.1.0/"));

@@ -10164,12 +10164,12 @@ impl ChainState {
     }
 
     fn release_materialized_utxos(&mut self) {
-        self.utxos.clear();
+        self.utxos = HashMap::new();
         self.utxos_materialized = false;
     }
 
     fn release_materialized_history(&mut self) {
-        self.history.clear();
+        self.history = HashMap::new();
         self.history_materialized = false;
     }
 

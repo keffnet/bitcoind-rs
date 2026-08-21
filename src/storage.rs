@@ -9,7 +9,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions, create_dir_all, remove_file};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+use std::thread;
 
 #[cfg(unix)]
 use std::os::unix::fs::FileExt;
@@ -40,7 +44,7 @@ const MAX_STORED_UTXO_SIZE: usize = 100 * 1024;
 const XOR_KEY_SIZE: usize = 8;
 const STORAGE_COMPRESSION_MAGIC: &[u8] = b"bitcoind-rs-zstd-v1\0";
 const STORAGE_COMPRESSION_HEADER_SIZE: usize = STORAGE_COMPRESSION_MAGIC.len() + 4;
-const STORAGE_COMPRESSION_LEVEL: i32 = 6;
+pub const STORAGE_COMPRESSION_LEVEL: i32 = 6;
 const STORAGE_COMPRESSION_MIN_SIZE: usize = 256;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
@@ -49,6 +53,115 @@ const INDEX_RECORD_SIZE: u64 = 44;
 struct Record {
     offset: u64,
     length: u32,
+}
+
+/// Exact compression accounting for one native append-only record file.
+///
+/// `uncompressed_size_bytes` and `stored_size_bytes` both include the
+/// unchanged four-byte framing prefix for every record. The payload-specific
+/// fields make the small framing overhead explicit for diagnostic tools.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct StorageCompressionInfo {
+    pub records: u64,
+    pub compressed_records: u64,
+    pub uncompressed_records: u64,
+    pub original_payload_bytes: u64,
+    pub stored_payload_bytes: u64,
+    pub framing_bytes: u64,
+    pub uncompressed_size_bytes: u64,
+    pub stored_size_bytes: u64,
+    pub saved_bytes: u64,
+    pub space_saved_percent: f64,
+    pub compression_ratio: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StorageCompressionCounts {
+    records: u64,
+    compressed_records: u64,
+    original_payload_bytes: u64,
+    stored_payload_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingCompressionRecord {
+    original_length: u64,
+    stored_length: u64,
+}
+
+#[derive(Debug, Default)]
+struct StorageCompressionCache {
+    counts: Option<StorageCompressionCounts>,
+    tracking_from: Option<u64>,
+    tracking_end: u64,
+    pending: Vec<PendingCompressionRecord>,
+}
+
+impl StorageCompressionCounts {
+    fn add_record(&mut self, original_length: u64, stored_length: u64, compressed: bool) {
+        self.records = self.records.saturating_add(1);
+        self.compressed_records = self
+            .compressed_records
+            .saturating_add(u64::from(compressed));
+        self.original_payload_bytes = self.original_payload_bytes.saturating_add(original_length);
+        self.stored_payload_bytes = self.stored_payload_bytes.saturating_add(stored_length);
+    }
+
+    fn stored_size_bytes(self) -> u64 {
+        self.stored_payload_bytes
+            .saturating_add(self.records.saturating_mul(4))
+    }
+
+    fn into_info(self) -> StorageCompressionInfo {
+        let framing_bytes = self.records.saturating_mul(4);
+        let uncompressed_size_bytes = self.original_payload_bytes.saturating_add(framing_bytes);
+        let stored_size_bytes = self.stored_payload_bytes.saturating_add(framing_bytes);
+        let saved_bytes = uncompressed_size_bytes.saturating_sub(stored_size_bytes);
+        let (space_saved_percent, compression_ratio) = if uncompressed_size_bytes == 0 {
+            (0.0, 1.0)
+        } else {
+            (
+                saved_bytes as f64 * 100.0 / uncompressed_size_bytes as f64,
+                uncompressed_size_bytes as f64 / stored_size_bytes as f64,
+            )
+        };
+        StorageCompressionInfo {
+            records: self.records,
+            compressed_records: self.compressed_records,
+            uncompressed_records: self.records.saturating_sub(self.compressed_records),
+            original_payload_bytes: self.original_payload_bytes,
+            stored_payload_bytes: self.stored_payload_bytes,
+            framing_bytes,
+            uncompressed_size_bytes,
+            stored_size_bytes,
+            saved_bytes,
+            space_saved_percent,
+            compression_ratio,
+        }
+    }
+
+    fn combine(self, other: Self) -> Self {
+        Self {
+            records: self.records.saturating_add(other.records),
+            compressed_records: self
+                .compressed_records
+                .saturating_add(other.compressed_records),
+            original_payload_bytes: self
+                .original_payload_bytes
+                .saturating_add(other.original_payload_bytes),
+            stored_payload_bytes: self
+                .stored_payload_bytes
+                .saturating_add(other.stored_payload_bytes),
+        }
+    }
+}
+
+/// Compression accounting for the authoritative block and undo stores.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+pub struct BlockStoreCompressionInfo {
+    pub blocks: StorageCompressionInfo,
+    pub undo: StorageCompressionInfo,
+    pub total: StorageCompressionInfo,
 }
 
 /// The serialized value kept by the durable UTXO store.
@@ -341,6 +454,250 @@ fn decode_storage_payload(encoded: &[u8], max_size: usize) -> Result<Vec<u8>> {
     Ok(decoded)
 }
 
+/// Inspect one native length-prefixed append-only file without decompressing
+/// or reading complete record payloads. If no XOR-key path is supplied, an
+/// adjacent `xor.dat` is used when present; otherwise a zero key is assumed.
+pub fn inspect_storage_file_compression(
+    path: impl AsRef<Path>,
+    xor_key_path: Option<&Path>,
+) -> Result<StorageCompressionInfo> {
+    let path = path.as_ref();
+    let file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("opening native storage file {}", path.display()))?;
+    let automatic_xor_path = path.parent().map(|parent| parent.join("xor.dat"));
+    let xor_path = xor_key_path
+        .map(Path::to_path_buf)
+        .or_else(|| automatic_xor_path.filter(|candidate| candidate.is_file()));
+    let xor_key = xor_path
+        .as_deref()
+        .map(read_xor_key)
+        .transpose()?
+        .unwrap_or_default();
+    let data_len = file.metadata()?.len();
+    let counts = match load_storage_compression_index(path, data_len)? {
+        Some(records) => scan_indexed_storage_compression(&file, xor_key, &records)?,
+        None => scan_storage_compression(&file, xor_key, data_len)?,
+    };
+    Ok(counts.into_info())
+}
+
+fn load_storage_compression_index(path: &Path, data_len: u64) -> Result<Option<Vec<Record>>> {
+    let index_path = path.with_extension("index");
+    if !index_path.is_file() {
+        return Ok(None);
+    }
+    // Indexes are compact (44 bytes per record). One buffered read avoids a
+    // syscall per record, which is especially important on network filesystems.
+    let index_bytes = std::fs::read(&index_path)
+        .with_context(|| format!("reading native storage index {}", index_path.display()))?;
+    let index_len = index_bytes.len() as u64;
+    if index_len < INDEX_HEADER_SIZE || (index_len - INDEX_HEADER_SIZE) % INDEX_RECORD_SIZE != 0 {
+        return Ok(None);
+    }
+    let record_count = (index_len - INDEX_HEADER_SIZE) / INDEX_RECORD_SIZE;
+    let mut records = Vec::with_capacity(
+        usize::try_from(record_count).context("native storage index is too large")?,
+    );
+    for bytes in index_bytes[INDEX_HEADER_SIZE as usize..].chunks_exact(INDEX_RECORD_SIZE as usize)
+    {
+        let offset = u64::from_le_bytes(
+            bytes[32..40]
+                .try_into()
+                .expect("native index offset has fixed width"),
+        );
+        let length = u32::from_le_bytes(
+            bytes[40..44]
+                .try_into()
+                .expect("native index length has fixed width"),
+        );
+        if length == 0 {
+            return Ok(None);
+        }
+        let Some(end) = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(u64::from(length)))
+        else {
+            return Ok(None);
+        };
+        if end <= data_len {
+            records.push(Record { offset, length });
+        } else if offset < data_len {
+            return Ok(None);
+        }
+    }
+    records.sort_unstable_by_key(|record| record.offset);
+    let mut expected_offset = 0u64;
+    for record in &records {
+        if record.offset != expected_offset {
+            return Ok(None);
+        }
+        expected_offset = record.offset + 4 + u64::from(record.length);
+    }
+    if expected_offset != data_len {
+        return Ok(None);
+    }
+    Ok(Some(records))
+}
+
+fn scan_indexed_storage_compression(
+    file: &File,
+    xor_key: XorKey,
+    records: &[Record],
+) -> Result<StorageCompressionCounts> {
+    if records.is_empty() {
+        return Ok(StorageCompressionCounts::default());
+    }
+    const MAX_INSPECTION_THREADS: usize = 16;
+    let worker_count = thread::available_parallelism()
+        .map_or(1, |parallelism| parallelism.get())
+        .min(MAX_INSPECTION_THREADS)
+        .min(records.len());
+    let next_record = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        let workers = (0..worker_count)
+            .map(|_| {
+                let next_record = &next_record;
+                scope.spawn(move || {
+                    let mut counts = StorageCompressionCounts::default();
+                    loop {
+                        let index = next_record.fetch_add(1, Ordering::Relaxed);
+                        let Some(record) = records.get(index) else {
+                            break;
+                        };
+                        let (original_length, compressed) =
+                            inspect_storage_record_header(file, xor_key, *record)?;
+                        counts.add_record(original_length, u64::from(record.length), compressed);
+                    }
+                    Ok::<_, anyhow::Error>(counts)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut counts = StorageCompressionCounts::default();
+        for worker in workers {
+            let partial = worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("native storage inspection worker panicked"))??;
+            counts = counts.combine(partial);
+        }
+        Ok(counts)
+    })
+}
+
+fn inspect_storage_record_header(
+    file: &File,
+    xor_key: XorKey,
+    record: Record,
+) -> Result<(u64, bool)> {
+    let header_length = usize::try_from(record.length)
+        .unwrap_or(usize::MAX)
+        .min(STORAGE_COMPRESSION_HEADER_SIZE);
+    let mut prefix = [0u8; 4 + STORAGE_COMPRESSION_HEADER_SIZE];
+    let prefix_length = 4 + header_length;
+    read_block_exact_at(file, &mut prefix[..prefix_length], record.offset)
+        .with_context(|| format!("reading native storage record at offset {}", record.offset))?;
+    xor_key.apply(&mut prefix[..prefix_length], record.offset);
+    let actual_length = u32::from_le_bytes(
+        prefix[..4]
+            .try_into()
+            .expect("native storage length has fixed width"),
+    );
+    if actual_length != record.length {
+        bail!(
+            "native storage index disagrees with record length at offset {}",
+            record.offset
+        )
+    }
+    let header = &prefix[4..prefix_length];
+    if header_length < STORAGE_COMPRESSION_HEADER_SIZE
+        || !header.starts_with(STORAGE_COMPRESSION_MAGIC)
+    {
+        return Ok((u64::from(record.length), false));
+    }
+    let length_start = STORAGE_COMPRESSION_MAGIC.len();
+    let original_length = u32::from_le_bytes(
+        header[length_start..STORAGE_COMPRESSION_HEADER_SIZE]
+            .try_into()
+            .expect("zstd storage length has fixed width"),
+    );
+    if original_length <= record.length {
+        bail!(
+            "invalid zstd storage lengths at offset {}: original {}, stored {}",
+            record.offset,
+            original_length,
+            record.length
+        )
+    }
+    Ok((u64::from(original_length), true))
+}
+
+fn scan_storage_compression(
+    file: &File,
+    xor_key: XorKey,
+    data_len: u64,
+) -> Result<StorageCompressionCounts> {
+    const PREFIX_SIZE: usize = 4 + STORAGE_COMPRESSION_HEADER_SIZE;
+    let mut counts = StorageCompressionCounts::default();
+    let mut offset = 0u64;
+    while offset < data_len {
+        let remaining = data_len.saturating_sub(offset);
+        if remaining < 4 {
+            bail!("truncated native storage length at offset {offset}")
+        }
+        let prefix_length = usize::try_from(remaining.min(PREFIX_SIZE as u64))
+            .context("native storage prefix length does not fit usize")?;
+        let mut prefix = [0u8; PREFIX_SIZE];
+        read_block_exact_at(file, &mut prefix[..prefix_length], offset)
+            .with_context(|| format!("reading native storage record at offset {offset}"))?;
+        xor_key.apply(&mut prefix[..prefix_length], offset);
+
+        let stored_length = u32::from_le_bytes(
+            prefix[..4]
+                .try_into()
+                .expect("native record length has fixed width"),
+        );
+        if stored_length == 0 {
+            bail!("invalid zero-length native storage record at offset {offset}")
+        }
+        let record_end = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(u64::from(stored_length)))
+            .context("native storage record offset overflowed")?;
+        if record_end > data_len {
+            bail!(
+                "truncated native storage record at offset {offset}: expected end {record_end}, file size is {data_len}"
+            )
+        }
+
+        let stored_length_u64 = u64::from(stored_length);
+        let has_compression_header = usize::try_from(stored_length)
+            .ok()
+            .is_some_and(|length| length >= STORAGE_COMPRESSION_HEADER_SIZE)
+            && prefix[4..4 + STORAGE_COMPRESSION_MAGIC.len()]
+                .starts_with(STORAGE_COMPRESSION_MAGIC);
+        let original_length = if has_compression_header {
+            let length_start = 4 + STORAGE_COMPRESSION_MAGIC.len();
+            let original_length = u32::from_le_bytes(
+                prefix[length_start..length_start + 4]
+                    .try_into()
+                    .expect("zstd storage length has fixed width"),
+            );
+            if u64::from(original_length) <= stored_length_u64 {
+                bail!(
+                    "invalid zstd storage lengths at offset {offset}: original {original_length}, stored {stored_length}"
+                )
+            }
+            u64::from(original_length)
+        } else {
+            stored_length_u64
+        };
+        counts.add_record(original_length, stored_length_u64, has_compression_header);
+        offset = record_end;
+    }
+    Ok(counts)
+}
+
 fn read_xor_key(path: &Path) -> Result<XorKey> {
     let bytes = std::fs::read(path)
         .with_context(|| format!("reading blocksdir XOR key {}", path.display()))?;
@@ -448,6 +805,129 @@ pub struct BlockStore {
     block_cache_order: VecDeque<BlockHash>,
     block_cache_bytes: usize,
     block_cache_limit: usize,
+    block_compression_cache: Arc<Mutex<StorageCompressionCache>>,
+    undo_compression_cache: Arc<Mutex<StorageCompressionCache>>,
+}
+
+struct StorageCompressionSnapshot {
+    file: File,
+    data_len: u64,
+    xor_key: XorKey,
+    records: Vec<Record>,
+    cache: Arc<Mutex<StorageCompressionCache>>,
+}
+
+/// A consistent pair of append-only file snapshots. Creating this object is
+/// quick enough to do under the chain read lock; the potentially longer
+/// header scan happens after that lock has been released.
+pub struct BlockStoreCompressionInspector {
+    blocks: StorageCompressionSnapshot,
+    undo: StorageCompressionSnapshot,
+}
+
+impl BlockStoreCompressionInspector {
+    pub fn inspect(self) -> Result<BlockStoreCompressionInfo> {
+        let blocks = inspect_compression_snapshot(self.blocks)?;
+        let undo = inspect_compression_snapshot(self.undo)?;
+        let total = blocks.combine(undo);
+        Ok(BlockStoreCompressionInfo {
+            blocks: blocks.into_info(),
+            undo: undo.into_info(),
+            total: total.into_info(),
+        })
+    }
+}
+
+fn inspect_compression_snapshot(
+    mut snapshot: StorageCompressionSnapshot,
+) -> Result<StorageCompressionCounts> {
+    if let Some(cached) = snapshot.cache.lock().counts
+        && cached.stored_size_bytes() == snapshot.data_len
+    {
+        return Ok(cached);
+    }
+    let inspected = if snapshot.records.is_empty() && snapshot.data_len != 0 {
+        scan_storage_compression(&snapshot.file, snapshot.xor_key, snapshot.data_len)?
+    } else {
+        snapshot
+            .records
+            .sort_unstable_by_key(|record| record.offset);
+        scan_indexed_storage_compression(&snapshot.file, snapshot.xor_key, &snapshot.records)?
+    };
+    let mut cache = snapshot.cache.lock();
+    if cache.tracking_from == Some(snapshot.data_len) {
+        let mut current = inspected;
+        for pending in &cache.pending {
+            current.add_record(
+                pending.original_length,
+                pending.stored_length,
+                pending.original_length > pending.stored_length,
+            );
+        }
+        cache.counts = Some(current);
+        cache.tracking_from = None;
+        cache.tracking_end = 0;
+        cache.pending.clear();
+        return Ok(current);
+    }
+    if let Some(cached) = cache.counts
+        && cached.stored_size_bytes() >= snapshot.data_len
+    {
+        return Ok(cached);
+    }
+    Ok(inspected)
+}
+
+fn prepare_compression_scan(cache: &Mutex<StorageCompressionCache>, data_len: u64) -> bool {
+    let mut cache = cache.lock();
+    if cache
+        .counts
+        .is_some_and(|cached| cached.stored_size_bytes() == data_len)
+    {
+        return true;
+    }
+    cache.counts = None;
+    if cache.tracking_from.is_none() {
+        cache.tracking_from = Some(data_len);
+        cache.tracking_end = data_len;
+        cache.pending.clear();
+    }
+    false
+}
+
+fn note_compressed_record_append(
+    cache: &Mutex<StorageCompressionCache>,
+    offset: u64,
+    original_length: usize,
+    stored_length: usize,
+) {
+    let mut cache = cache.lock();
+    let original_length = u64::try_from(original_length).unwrap_or(u64::MAX);
+    let stored_length = u64::try_from(stored_length).unwrap_or(u64::MAX);
+    if let Some(counts) = cache.counts.as_mut() {
+        if counts.stored_size_bytes() == offset {
+            counts.add_record(
+                original_length,
+                stored_length,
+                original_length > stored_length,
+            );
+            return;
+        }
+        cache.counts = None;
+    }
+    if cache.tracking_from.is_some() {
+        if cache.tracking_end == offset {
+            cache.pending.push(PendingCompressionRecord {
+                original_length,
+                stored_length,
+            });
+            cache.tracking_end = offset.saturating_add(4).saturating_add(stored_length);
+        } else {
+            cache.tracking_from = None;
+            cache.tracking_end = 0;
+            cache.pending.clear();
+        }
+    }
 }
 
 pub(crate) struct PreparedBlockRecord {
@@ -561,6 +1041,8 @@ impl BlockStore {
             block_cache_order: VecDeque::new(),
             block_cache_bytes: 0,
             block_cache_limit: 0,
+            block_compression_cache: Arc::new(Mutex::new(StorageCompressionCache::default())),
+            undo_compression_cache: Arc::new(Mutex::new(StorageCompressionCache::default())),
         })
     }
 
@@ -630,6 +1112,8 @@ impl BlockStore {
             block_cache_order: VecDeque::new(),
             block_cache_bytes: 0,
             block_cache_limit: 0,
+            block_compression_cache: Arc::new(Mutex::new(StorageCompressionCache::default())),
+            undo_compression_cache: Arc::new(Mutex::new(StorageCompressionCache::default())),
         })
     }
 
@@ -714,6 +1198,44 @@ impl BlockStore {
 
     pub fn undo_size(&self) -> Result<u64> {
         Ok(self.undo_file.metadata()?.len())
+    }
+
+    /// Capture block and undo descriptors plus their current lengths for an
+    /// exact header-only compression scan. The returned inspector owns cloned
+    /// descriptors, allowing callers to release the chain lock before doing
+    /// any filesystem work.
+    pub fn compression_inspector(&self) -> Result<BlockStoreCompressionInspector> {
+        let block_data_len = self.file.metadata()?.len();
+        let undo_data_len = self.undo_file.metadata()?.len();
+        let blocks_are_cached =
+            prepare_compression_scan(&self.block_compression_cache, block_data_len);
+        let undo_is_cached = prepare_compression_scan(&self.undo_compression_cache, undo_data_len);
+        let block_records = if blocks_are_cached {
+            Vec::new()
+        } else {
+            self.index.values().copied().collect()
+        };
+        let undo_records = if undo_is_cached {
+            Vec::new()
+        } else {
+            self.undo_index.values().copied().collect()
+        };
+        Ok(BlockStoreCompressionInspector {
+            blocks: StorageCompressionSnapshot {
+                file: self.file.try_clone()?,
+                data_len: block_data_len,
+                xor_key: self.xor_key,
+                records: block_records,
+                cache: Arc::clone(&self.block_compression_cache),
+            },
+            undo: StorageCompressionSnapshot {
+                file: self.undo_file.try_clone()?,
+                data_len: undo_data_len,
+                xor_key: self.xor_key,
+                records: undo_records,
+                cache: Arc::clone(&self.undo_compression_cache),
+            },
+        })
     }
 
     pub fn contains(&self, hash: &BlockHash) -> bool {
@@ -847,6 +1369,12 @@ impl BlockStore {
         self.index.insert(hash, Record { offset, length });
         self.serving_reader.insert(hash, Record { offset, length });
         self.cache_block(hash, block.clone(), prepared.raw_length);
+        note_compressed_record_append(
+            &self.block_compression_cache,
+            offset,
+            prepared.raw_length,
+            bytes.len(),
+        );
         Ok(hash)
     }
 
@@ -958,6 +1486,12 @@ impl BlockStore {
             sync,
         )?;
         self.undo_index.insert(hash, Record { offset, length });
+        note_compressed_record_append(
+            &self.undo_compression_cache,
+            offset,
+            raw_bytes.len(),
+            bytes.len(),
+        );
         Ok(())
     }
 
@@ -1024,6 +1558,8 @@ impl BlockStore {
         self.undo_file = undo_file;
         self.undo_index = undo_index;
         rewrite_index(&mut self.undo_index_file, undo_data_len, &self.undo_index)?;
+        *self.block_compression_cache.lock() = StorageCompressionCache::default();
+        *self.undo_compression_cache.lock() = StorageCompressionCache::default();
         self.clear_block_cache();
         Ok(())
     }
@@ -4374,6 +4910,90 @@ mod tests {
             decode_storage_payload(&raw, MAX_STORED_BLOCK_SIZE).unwrap(),
             small
         );
+    }
+
+    #[test]
+    fn compression_inspector_counts_xored_records_without_decompression() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("records.dat");
+        let xor_key = XorKey([1, 2, 3, 4, 5, 6, 7, 8]);
+        std::fs::write(directory.path().join("xor.dat"), xor_key.0).unwrap();
+        let payloads = [
+            vec![0x11; STORAGE_COMPRESSION_MIN_SIZE - 1],
+            vec![0x42; 16 * 1024],
+        ];
+        let mut expected_original = 0u64;
+        let mut expected_stored = 0u64;
+        let mut file = File::create(&path).unwrap();
+        let mut offset = 0u64;
+        for payload in &payloads {
+            let encoded = encode_storage_payload(payload, MAX_STORED_BLOCK_SIZE).unwrap();
+            expected_original += payload.len() as u64;
+            expected_stored += encoded.len() as u64;
+            let mut record = (encoded.len() as u32).to_le_bytes().to_vec();
+            record.extend_from_slice(&encoded);
+            xor_key.apply(&mut record, offset);
+            file.write_all(&record).unwrap();
+            offset += record.len() as u64;
+        }
+        drop(file);
+
+        let info = inspect_storage_file_compression(&path, None).unwrap();
+        assert_eq!(info.records, 2);
+        assert_eq!(info.compressed_records, 1);
+        assert_eq!(info.uncompressed_records, 1);
+        assert_eq!(info.original_payload_bytes, expected_original);
+        assert_eq!(info.stored_payload_bytes, expected_stored);
+        assert_eq!(info.framing_bytes, 8);
+        assert_eq!(
+            info.stored_size_bytes,
+            std::fs::metadata(path).unwrap().len()
+        );
+        assert_eq!(
+            info.saved_bytes,
+            expected_original.saturating_sub(expected_stored)
+        );
+        assert!(info.space_saved_percent > 0.0);
+        assert!(info.compression_ratio > 1.0);
+    }
+
+    #[test]
+    fn block_store_compression_cache_tracks_appended_and_pruned_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = genesis_block(Network::Regtest);
+        let first_hash = first.block_hash();
+        let mut second = first.clone();
+        second.header.nonce = 1;
+        let second_hash = second.block_hash();
+        let mut store = BlockStore::open_with_xor(directory.path(), true).unwrap();
+        let initial_inspector = store.compression_inspector().unwrap();
+        store.insert(&first).unwrap();
+        store.insert_undo(first_hash, &[Vec::new()]).unwrap();
+
+        // Appends that race a first long-running inspection are folded into
+        // its result instead of making the new cache stale immediately.
+        let initial = initial_inspector.inspect().unwrap();
+        assert_eq!(initial.blocks.records, 1);
+        assert_eq!(initial.undo.records, 1);
+
+        store.insert(&second).unwrap();
+        store.insert_undo(second_hash, &[Vec::new()]).unwrap();
+        let appended = store.compression_inspector().unwrap().inspect().unwrap();
+        assert_eq!(appended.blocks.records, 2);
+        assert_eq!(appended.undo.records, 2);
+        assert_eq!(
+            appended.blocks.stored_size_bytes,
+            store.data_size().unwrap()
+        );
+        assert_eq!(appended.undo.stored_size_bytes, store.undo_size().unwrap());
+
+        store
+            .prune(&HashSet::from([second_hash]), &HashSet::from([second_hash]))
+            .unwrap();
+        let pruned = store.compression_inspector().unwrap().inspect().unwrap();
+        assert_eq!(pruned.blocks.records, 1);
+        assert_eq!(pruned.undo.records, 1);
+        assert_eq!(pruned.total.records, 2);
     }
 
     #[test]

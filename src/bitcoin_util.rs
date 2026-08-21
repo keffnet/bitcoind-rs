@@ -1,11 +1,12 @@
 //! Wallet-free implementation of Core's `bitcoin-util` utility.
 //!
-//! Bitcoin Core currently exposes one command from this binary: `grind`,
-//! which searches the nonce field of a serialized block header for a proof of
-//! work.  The command is deliberately independent of a running node and of
-//! any wallet state.
+//! Bitcoin Core exposes `grind`, which searches the nonce field of a
+//! serialized block header for proof of work. This implementation also adds
+//! `compressioninfo`, a node-independent inspector for native append-only
+//! storage files.
 
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{
     Arc,
@@ -15,6 +16,8 @@ use std::thread;
 
 use bitcoin::block::Header;
 use bitcoin::consensus::{deserialize, serialize};
+use bitcoind_rs::storage::{STORAGE_COMPRESSION_LEVEL, inspect_storage_file_compression};
+use serde_json::json;
 
 const VERSION: &str = "31.1.0";
 
@@ -88,12 +91,13 @@ fn run(arguments: Vec<String>) -> Result<String, String> {
     let Some(command) = command_arguments.first() else {
         return Err(format!("{}\nError: must specify a command", help_text()));
     };
-    if command != "grind" {
-        return Err(format!(
+    match command.as_str() {
+        "grind" => grind(&command_arguments[1..]),
+        "compressioninfo" => compression_info(&command_arguments[1..]),
+        _ => Err(format!(
             "Error parsing command line arguments: Invalid command '{command}'"
-        ));
+        )),
     }
-    grind(&command_arguments[1..])
 }
 
 fn grind(arguments: &[String]) -> Result<String, String> {
@@ -153,24 +157,56 @@ fn grind(arguments: &[String]) -> Result<String, String> {
     Ok(hex::encode(serialize(&header)))
 }
 
+fn compression_info(arguments: &[String]) -> Result<String, String> {
+    if !(1..=2).contains(&arguments.len()) {
+        return Err("Usage: bitcoin-util compressioninfo <storage-file> [xor-key-file]".to_owned());
+    }
+    let path = PathBuf::from(&arguments[0]);
+    let xor_key_path = arguments.get(1).map(Path::new);
+    let info = inspect_storage_file_compression(&path, xor_key_path)
+        .map_err(|error| format!("Could not inspect native storage file: {error:#}"))?;
+    serde_json::to_string_pretty(&json!({
+        "path": path,
+        "codec": "zstd",
+        "compression_level": STORAGE_COMPRESSION_LEVEL,
+        "records": info.records,
+        "compressed_records": info.compressed_records,
+        "uncompressed_records": info.uncompressed_records,
+        "original_payload_bytes": info.original_payload_bytes,
+        "stored_payload_bytes": info.stored_payload_bytes,
+        "framing_bytes": info.framing_bytes,
+        "uncompressed_size_bytes": info.uncompressed_size_bytes,
+        "stored_size_bytes": info.stored_size_bytes,
+        "saved_bytes": info.saved_bytes,
+        "space_saved_percent": info.space_saved_percent,
+        "compression_ratio": info.compression_ratio,
+    }))
+    .map_err(|error| format!("Could not encode compression report: {error}"))
+}
+
 fn help_text() -> String {
     format!(
         "Bitcoin Core bitcoin-util utility version {VERSION}\n\n\
 The bitcoin-util tool provides bitcoin related functionality that does not rely on a running node.\n\n\
 Usage: bitcoin-util [options] [command]\n\
-       bitcoin-util [options] grind <hex-block-header>\n\n\
+       bitcoin-util [options] grind <hex-block-header>\n\
+       bitcoin-util compressioninfo <storage-file> [xor-key-file]\n\n\
 Commands:\n\
-  grind   Perform proof of work on a serialized block header"
+  grind             Perform proof of work on a serialized block header\n\
+  compressioninfo   Report native append-only Zstandard storage savings"
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{grind, run};
+    use super::{compression_info, grind, run};
+    use bitcoin::Network;
     use bitcoin::block::{Header, Version};
+    use bitcoin::blockdata::constants::genesis_block;
     use bitcoin::consensus::serialize;
     use bitcoin::hashes::Hash;
     use bitcoin::pow::CompactTarget;
+    use bitcoind_rs::storage::BlockStore;
 
     #[test]
     fn rejects_unknown_commands_like_core() {
@@ -206,5 +242,32 @@ mod tests {
         let solved: Header =
             bitcoin::consensus::deserialize(&hex::decode(output).unwrap()).unwrap();
         assert!(solved.target().is_met_by(solved.block_hash()));
+    }
+
+    #[test]
+    fn reports_compression_for_a_native_xored_storage_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let block = genesis_block(Network::Regtest);
+        let mut store = BlockStore::open_with_xor(directory.path(), true).unwrap();
+        store.insert(&block).unwrap();
+        drop(store);
+
+        let output = compression_info(&[directory
+            .path()
+            .join("blocks.dat")
+            .to_string_lossy()
+            .into_owned()])
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(report["codec"], serde_json::json!("zstd"));
+        assert_eq!(report["records"], serde_json::json!(1));
+        assert_eq!(
+            report["stored_size_bytes"],
+            serde_json::json!(
+                std::fs::metadata(directory.path().join("blocks.dat"))
+                    .unwrap()
+                    .len()
+            )
+        );
     }
 }

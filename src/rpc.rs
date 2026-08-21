@@ -1916,7 +1916,7 @@ async fn dispatch_method_async_for_user(
         "waitforblockheight" => wait_for_block_height(node, &normalized_params).await,
         "addnode" => add_node_async(node, &normalized_params).await,
         "getblocktemplate" => get_block_template_async(node, &normalized_params).await,
-        "scantxoutset" | "scanblocks" => {
+        "scantxoutset" | "scanblocks" | "getcompressioninfo" => {
             let node = node.clone();
             let method = method.to_owned();
             let params = normalized_params.clone();
@@ -2127,6 +2127,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         "getblockfilter" => Some(&["blockhash", "filtertype"]),
         "getblockstats" => Some(&["hash_or_height", "stats"]),
         "getblockfileinfo" => Some(&["file_number"]),
+        "getcompressioninfo" => Some(&[]),
         "getblocklocations" => Some(&["blockhash", "nblocks"]),
         "getchaintxstats" => Some(&["nblocks", "blockhash"]),
         "getnetworkhashps" => Some(&["nblocks", "height"]),
@@ -2714,6 +2715,7 @@ fn dispatch_method_for_user(
         "loadtxoutset" => load_txoutset(node, params),
         "pruneblockchain" => prune_blockchain(node, params),
         "getblockfileinfo" => get_block_file_info(node, params),
+        "getcompressioninfo" => get_compression_info(node),
         "getblocklocations" => get_block_locations(node, params),
         "listprunelocks" => list_prune_locks(node),
         "setprunelock" => set_prune_lock(node, params),
@@ -6196,6 +6198,21 @@ fn get_block_file_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "highest_block": heights.last().copied().unwrap_or_default(),
         "data_size": chain.store.data_size()?,
         "undo_size": chain.store.undo_size()?,
+    }))
+}
+
+fn get_compression_info(node: &Arc<Node>) -> Result<Value> {
+    // Clone stable append-only file snapshots under the chain read lock, then
+    // release it before scanning record headers so IBD validation can keep
+    // advancing concurrently.
+    let inspector = { node.chain.read().store.compression_inspector()? };
+    let info = inspector.inspect()?;
+    Ok(json!({
+        "codec": "zstd",
+        "compression_level": crate::storage::STORAGE_COMPRESSION_LEVEL,
+        "blocks": info.blocks,
+        "undo": info.undo,
+        "total": info.total,
     }))
 }
 
@@ -17279,6 +17296,7 @@ fn rpc_help(method: &str) -> String {
                 "getchainstates",
                 "getchaintips",
                 "getchaintxstats",
+                "getcompressioninfo",
                 "getdeploymentinfo",
                 "getdescriptoractivity",
                 "getdifficulty",
@@ -19805,6 +19823,18 @@ mod tests {
         assert_eq!(file_info["lowest_block"], json!(0));
         assert_eq!(file_info["highest_block"], json!(0));
         assert!(file_info["data_size"].as_u64().is_some_and(|size| size > 0));
+        let compression = dispatch_method(&node, "getcompressioninfo", &json!([])).unwrap();
+        assert_eq!(compression["codec"], json!("zstd"));
+        assert_eq!(compression["blocks"]["records"], json!(1));
+        assert_eq!(
+            compression["blocks"]["stored_size_bytes"],
+            file_info["data_size"]
+        );
+        assert_eq!(
+            compression["total"]["records"],
+            compression["blocks"]["records"].as_u64().unwrap()
+                + compression["undo"]["records"].as_u64().unwrap()
+        );
         assert_eq!(
             dispatch_method(&node, "listprunelocks", &json!([])).unwrap(),
             json!({"prune_locks": []})

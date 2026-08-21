@@ -5940,7 +5940,6 @@ impl Node {
                 // Direct-fetch paths suppress immediate re-requests, but
                 // the periodic scheduler must be able to retry it or one
                 // bad body can permanently wedge IBD at this height.
-                .filter(|(hash, _)| !chain.is_block_pruned(hash))
                 .filter(|(_, height)| {
                     !limited_peer
                         || peer_best_height.saturating_sub(*height)
@@ -10308,6 +10307,45 @@ mod tests {
     }
 
     #[test]
+    fn block_download_scheduler_refetches_pruned_higher_work_ancestors() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let genesis = *node.chain.read().header(0).unwrap();
+
+        let mut main_header = genesis;
+        for height in 1..=1_001 {
+            let block = mine_test_block(&main_header, height, 1);
+            main_header = block.header;
+            node.connect_block_from_peer(block).unwrap();
+        }
+        assert_eq!(node.chain.write().prune(700).unwrap(), 700);
+
+        let mut side_header = genesis;
+        let mut side_headers = Vec::with_capacity(1_002);
+        let mut side_hashes = Vec::with_capacity(1_002);
+        for height in 1..=1_002 {
+            let block = mine_test_block(&side_header, height, 2);
+            side_header = block.header;
+            side_hashes.push(block.block_hash());
+            side_headers.push(block.header);
+        }
+        node.chain.write().accept_headers(&side_headers).unwrap();
+        assert!(node.chain.read().is_block_pruned(&side_hashes[0]));
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        node.update_peer_best_known_block(1, *side_hashes.last().unwrap());
+        let schedule = node.next_block_download_schedule(
+            1,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
+
+        assert_eq!(schedule.requests.len(), MAX_BLOCKS_IN_TRANSIT_PER_PEER);
+        assert_eq!(schedule.requests[0].hash, side_hashes[0]);
+    }
+
+    #[test]
     fn block_download_window_advances_across_stored_fork_bodies() {
         let hashes = (0..=BLOCK_DOWNLOAD_WINDOW + 2)
             .map(|height| {
@@ -10779,7 +10817,10 @@ mod tests {
                     witness: Witness::default(),
                 }],
                 output: vec![TxOut {
-                    value: Amount::from_sat(5_000_000_000),
+                    value: Amount::from_sat(validation::block_subsidy_for_network(
+                        Network::Regtest,
+                        height,
+                    )),
                     script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
                 }],
             }],

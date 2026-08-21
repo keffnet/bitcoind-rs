@@ -4863,11 +4863,32 @@ impl ChainState {
         if !self.block_index.contains_key(hash) {
             return Ok(None);
         }
-        let Some(block) = self.store.get(hash)? else {
+        let Some(block) = self.store.get_readonly(hash)? else {
             return Ok(None);
         };
-        let Some(undo) = self.spent_outputs_by_transaction(hash)? else {
+        self.block_fee_stats_from_storage(hash, &block)
+    }
+
+    /// Compute fee statistics from the supplied authoritative block body and
+    /// the authoritative undo record. Unlike the validation/estimation path,
+    /// this never accepts a recently-connected-block cache entry or rebuilds
+    /// missing undo by replaying the UTXO set: Core's `getblockstats` exposes
+    /// the availability and readability of both records on disk.
+    pub fn block_fee_stats_from_storage(
+        &mut self,
+        hash: &BlockHash,
+        block: &Block,
+    ) -> Result<Option<BlockFeeStats>> {
+        let Some(node) = self.block_index.get(hash).copied() else {
             return Ok(None);
+        };
+        let undo = if node.height == 0 {
+            vec![Vec::new()]
+        } else {
+            let Some(undo) = self.store.get_undo(hash)? else {
+                return Ok(None);
+            };
+            Self::undo_outputs(&undo)
         };
         if undo.len() != block.txdata.len() {
             bail!("block undo transaction count does not match block");

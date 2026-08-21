@@ -7247,33 +7247,55 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         .as_array()
         .and_then(|values| values.first())
         .ok_or_else(|| anyhow!("missing block selector"))?;
-    let mut chain = node.chain.write();
-    let hash = if let Some(hash) = selector.as_str() {
-        hash.parse::<BlockHash>()?
-    } else if let Some(height) = selector.as_i64() {
-        if height < 0 {
-            bail!("Target block height {height} is negative")
-        }
-        let current_tip = chain.height();
-        if height > i64::from(current_tip) {
-            bail!("Target block height {height} after current tip {current_tip}")
-        }
-        let height = u32::try_from(height).expect("height is within the active chain");
-        chain
-            .block_hash(height)
-            .ok_or_else(|| anyhow!("block height out of range"))?
-    } else {
-        bail!("block selector must be a hash or height")
+    let (hash, height) = {
+        let chain = node.chain.read();
+        let hash = if let Some(hash) = selector.as_str() {
+            hash.parse::<BlockHash>()?
+        } else if let Some(height) = selector.as_i64() {
+            if height < 0 {
+                bail!("Target block height {height} is negative")
+            }
+            let current_tip = chain.height();
+            if height > i64::from(current_tip) {
+                bail!("Target block height {height} after current tip {current_tip}")
+            }
+            let height = u32::try_from(height).expect("height is within the active chain");
+            chain
+                .block_hash(height)
+                .ok_or_else(|| anyhow!("block height out of range"))?
+        } else {
+            bail!("block selector must be a hash or height")
+        };
+        let height = chain
+            .block_height_by_hash(&hash)
+            .ok_or_else(|| anyhow!("Block not found"))?;
+        (hash, height)
     };
-    let height = chain
-        .block_height_by_hash(&hash)
-        .ok_or_else(|| anyhow!("Block not found"))?;
-    let block = chain
-        .block(&hash)?
-        .ok_or_else(|| missing_block_data_error(&chain, &hash))?;
-    let fee_stats = chain
-        .block_fee_stats(&hash)?
-        .ok_or_else(|| anyhow!("Undo data not available"))?;
+    let block = match node.block_store_reader.get(&hash) {
+        Ok(Some(block)) => block,
+        Ok(None) => {
+            let chain = node.chain.read();
+            return Err(missing_block_data_error(&chain, &hash));
+        }
+        Err(_) => bail!("Block not found on disk"),
+    };
+    let (fee_stats, median_time, network) = {
+        let mut chain = node.chain.write();
+        let undo_expected = chain.expects_undo_data(&hash);
+        let fee_stats = match chain.block_fee_stats_from_storage(&hash, &block) {
+            Ok(Some(fee_stats)) => fee_stats,
+            Ok(None) => bail!("Undo data not available"),
+            Err(_) if undo_expected => bail!("Can't read undo data from disk"),
+            Err(error) => return Err(error),
+        };
+        (
+            fee_stats,
+            chain
+                .median_time_past_for_hash(&hash)
+                .unwrap_or(block.header.time),
+            chain.network,
+        )
+    };
     let height = Some(height);
     let transaction_fees = fee_stats.transaction_fees_sat;
     let mut total_out = 0u64;
@@ -7293,7 +7315,7 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let mut spent_output_index = 0usize;
     let mut transaction_index = 0usize;
     let is_bip30_repeat =
-        height.is_some_and(|height| chain::is_bip30_repeat(chain.network, height, hash));
+        height.is_some_and(|height| chain::is_bip30_repeat(network, height, hash));
     for transaction in &block.txdata {
         outputs = outputs.saturating_add(transaction.output.len());
         for output in &transaction.output {
@@ -7364,12 +7386,12 @@ fn get_block_stats(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "height": height,
         "txs": block.txdata.len(),
         "time": block.header.time,
-        "mediantime": chain.median_time_past_for_hash(&hash).unwrap_or(block.header.time),
+        "mediantime": median_time,
         "total_size": total_size,
         "total_weight": total_weight,
         "total_out": total_out,
         "subsidy": height
-            .map(|height| validation::block_subsidy_for_network(chain.network, height))
+            .map(|height| validation::block_subsidy_for_network(network, height))
             .unwrap_or_default(),
         "totalfee": total_fee,
         "ins": inputs,
@@ -18888,6 +18910,34 @@ mod tests {
         let stats = get_block_stats(&node, &json!([block["hash"].clone()])).unwrap();
         assert_eq!(stats["totalfee"], json!(1_000));
         assert_eq!(stats["utxo_increase_actual"], json!(1));
+
+        // getblockstats must not let its decoded block/undo caches conceal
+        // loss of either authoritative record after the successful query.
+        let block_hash: BlockHash = block["hash"].as_str().unwrap().parse().unwrap();
+        let undo_path = directory.path().join("blocks/undo.dat");
+        let stored_undo = std::fs::read(&undo_path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&undo_path)
+            .unwrap();
+        let undo_error = get_block_stats(&node, &json!([block_hash.to_string()])).unwrap_err();
+        assert_eq!(undo_error.to_string(), "Can't read undo data from disk");
+        assert_eq!(rpc_error(&undo_error)["code"], json!(-1));
+        std::fs::write(&undo_path, stored_undo).unwrap();
+
+        let block_path = directory.path().join("blocks/blocks.dat");
+        let stored_blocks = std::fs::read(&block_path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&block_path)
+            .unwrap();
+        let block_error = get_block_stats(&node, &json!([block_hash.to_string()])).unwrap_err();
+        assert_eq!(block_error.to_string(), "Block not found on disk");
+        assert_eq!(rpc_error(&block_error)["code"], json!(-1));
+        std::fs::write(&block_path, stored_blocks).unwrap();
+        assert!(get_block_stats(&node, &json!([block_hash.to_string()])).is_ok());
     }
 
     #[test]

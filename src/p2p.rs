@@ -5808,14 +5808,16 @@ async fn serve_peer_loop(
                     peer_block_download_allowed_for_node(node, peer_id, peer_services);
                 let direct_fetch_limit = MAX_BLOCKS_IN_TRANSIT_PER_PEER
                     .saturating_sub(node.peer_inflight_block_count(peer_id));
+                let inflight_block_hashes = node.inflight_block_hashes();
                 // Claim candidate bodies before publishing these headers to
                 // the global block index. A duplicate INV handler can run as
                 // soon as the chain lock is released; without this claim it
                 // can send GETDATA before this headers peer installs its
                 // direct-fetch reservations. Do not walk a historical
                 // header-only branch unless it is actually eligible for
-                // direct fetch, and never claim more than this peer can put
-                // in flight immediately.
+                // direct fetch. Already-requested ancestors do not consume
+                // Core's candidate limit, while the claim itself remains
+                // bounded by what this peer can put in flight immediately.
                 let pending_direct_fetch_claims = {
                     let chain = node.chain.read();
                     pending_header_direct_fetch_claims(
@@ -5823,7 +5825,9 @@ async fn serve_peer_loop(
                         &headers_to_accept,
                         request_block_bodies,
                         crate::time::unix_time_i64(),
+                        MAX_BLOCKS_IN_TRANSIT_PER_PEER,
                         direct_fetch_limit,
+                        &inflight_block_hashes,
                     )
                 };
                 node.claim_pending_header_direct_fetches(peer_id, &pending_direct_fetch_claims);
@@ -5908,8 +5912,7 @@ async fn serve_peer_loop(
                     .into_iter()
                     .find(|peer| peer.id == peer_id)
                     .and_then(|peer| peer.best_known_block);
-                let direct_fetch_limit = MAX_BLOCKS_IN_TRANSIT_PER_PEER
-                    .saturating_sub(node.peer_inflight_block_count(peer_id));
+                let inflight_block_hashes = node.inflight_block_hashes();
                 let requests = {
                     let chain = node.chain.read();
                     let peer_best_height =
@@ -5952,7 +5955,12 @@ async fn serve_peer_loop(
                         hashes
                             .last()
                             .and_then(|hash| {
-                                direct_fetch_missing_branch(&chain, *hash, direct_fetch_limit)
+                                direct_fetch_missing_branch(
+                                    &chain,
+                                    *hash,
+                                    MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+                                    &inflight_block_hashes,
+                                )
                             })
                             .unwrap_or_default()
                     } else {
@@ -10329,47 +10337,48 @@ fn pending_header_direct_fetch_claims(
     headers: &[BlockHeader],
     request_block_bodies: bool,
     now: i64,
-    limit: usize,
+    candidate_limit: usize,
+    request_capacity: usize,
+    inflight: &HashSet<BlockHash>,
 ) -> Vec<BlockHash> {
-    if limit == 0
+    if request_capacity == 0
         || !header_batch_is_direct_fetch_candidate(chain, headers, request_block_bodies, now)
     {
         return Vec::new();
     }
 
-    if headers.len() > limit {
-        return Vec::new();
-    }
-    let mut claims = Vec::with_capacity(limit.min(headers.len()));
-    let mut seen = HashSet::with_capacity(limit);
-    for header in headers {
+    // Mirror Core's backwards walk before the headers enter the block index:
+    // only missing, globally unrequested bodies count toward the limit.
+    // Requested ancestors are still walked so a branch with two bodies
+    // already in flight can fill the peer's remaining fourteen slots.
+    let mut candidates = Vec::with_capacity(candidate_limit.saturating_add(1));
+    let mut seen = HashSet::with_capacity(candidate_limit.saturating_add(1));
+    for header in headers.iter().rev() {
+        if candidates.len() > candidate_limit {
+            return Vec::new();
+        }
         let hash = header.block_hash();
-        if !chain.store.contains(&hash) && seen.insert(hash) {
-            if claims.len() == limit {
-                return Vec::new();
-            }
-            claims.push(hash);
+        if !chain.store.contains(&hash) && !inflight.contains(&hash) && seen.insert(hash) {
+            candidates.push(hash);
         }
     }
 
-    let mut walked = headers.len();
     let mut cursor = headers[0].prev_blockhash;
-    loop {
-        if chain.is_active_block(&cursor) {
-            return claims;
-        }
-        if walked == limit {
-            return Vec::new();
-        }
+    while !chain.is_active_block(&cursor) && candidates.len() <= candidate_limit {
         let Some(header) = chain.header_by_hash(&cursor) else {
             return Vec::new();
         };
-        walked += 1;
-        if seen.insert(cursor) && !chain.store.contains(&cursor) {
-            claims.push(cursor);
+        if !chain.store.contains(&cursor) && !inflight.contains(&cursor) && seen.insert(cursor) {
+            candidates.push(cursor);
         }
         cursor = header.prev_blockhash;
     }
+    if !chain.is_active_block(&cursor) {
+        return Vec::new();
+    }
+    candidates.reverse();
+    candidates.truncate(request_capacity);
+    candidates
 }
 
 /// Find a complete missing branch for Core-style direct fetch. Returning
@@ -10380,25 +10389,22 @@ fn direct_fetch_missing_branch(
     chain: &crate::chain::ChainState,
     tip: BlockHash,
     limit: usize,
+    inflight: &HashSet<BlockHash>,
 ) -> Option<Vec<BlockHash>> {
-    let mut branch = Vec::with_capacity(limit);
-    let mut walked = 0usize;
+    let mut branch = Vec::with_capacity(limit.saturating_add(1));
     let mut cursor = tip;
-    loop {
-        if chain.is_active_block(&cursor) {
-            branch.reverse();
-            return Some(branch);
-        }
-        if walked == limit {
-            return None;
-        }
+    while !chain.is_active_block(&cursor) && branch.len() <= limit {
         let header = chain.header_by_hash(&cursor)?;
-        walked += 1;
-        if !chain.store.contains(&cursor) {
+        if !chain.store.contains(&cursor) && !inflight.contains(&cursor) {
             branch.push(cursor);
         }
         cursor = header.prev_blockhash;
     }
+    if !chain.is_active_block(&cursor) {
+        return None;
+    }
+    branch.reverse();
+    Some(branch)
 }
 
 #[cfg(test)]
@@ -12064,6 +12070,8 @@ mod tests {
                 true,
                 i64::MAX / 2,
                 MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+                &HashSet::new(),
             )
             .is_empty()
         );
@@ -12076,10 +12084,13 @@ mod tests {
                 &chain,
                 headers[47].block_hash(),
                 MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+                &HashSet::new(),
             )
             .is_none()
         );
-        let complete = direct_fetch_missing_branch(&chain, headers[47].block_hash(), 48).unwrap();
+        let complete =
+            direct_fetch_missing_branch(&chain, headers[47].block_hash(), 48, &HashSet::new())
+                .unwrap();
         assert_eq!(
             complete,
             headers[..48]
@@ -12100,6 +12111,8 @@ mod tests {
             true,
             i64::from(genesis.time),
             MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            &HashSet::new(),
         );
         assert_eq!(
             claims.into_iter().collect::<HashSet<_>>(),
@@ -12107,6 +12120,67 @@ mod tests {
                 .iter()
                 .map(BlockHeader::block_hash)
                 .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn direct_fetch_limit_excludes_bodies_already_in_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = crate::chain::ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let (genesis, headers) = mined_regtest_headers(18);
+        chain.accept_headers(&headers).unwrap();
+
+        // Core walks through requested ancestors without counting them
+        // against MAX_BLOCKS_IN_TRANSIT_PER_PEER. With the first two bodies
+        // already requested, all sixteen later bodies remain direct-fetch
+        // candidates; without those reservations, this branch is too large.
+        let inflight = headers[..2]
+            .iter()
+            .map(BlockHeader::block_hash)
+            .collect::<HashSet<_>>();
+        assert!(
+            direct_fetch_missing_branch(
+                &chain,
+                headers[17].block_hash(),
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+                &HashSet::new(),
+            )
+            .is_none()
+        );
+        assert_eq!(
+            direct_fetch_missing_branch(
+                &chain,
+                headers[17].block_hash(),
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+                &inflight,
+            )
+            .unwrap(),
+            headers[2..]
+                .iter()
+                .map(BlockHeader::block_hash)
+                .collect::<Vec<_>>()
+        );
+
+        // Before those sixteen headers are published, reserve exactly the
+        // fourteen oldest bodies that fit beside the two existing requests.
+        let prefix_directory = tempfile::tempdir().unwrap();
+        let mut prefix_chain =
+            crate::chain::ChainState::open(Network::Regtest, prefix_directory.path()).unwrap();
+        prefix_chain.accept_headers(&headers[..2]).unwrap();
+        assert_eq!(
+            pending_header_direct_fetch_claims(
+                &prefix_chain,
+                &headers[2..],
+                true,
+                i64::from(genesis.time),
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER - inflight.len(),
+                &inflight,
+            ),
+            headers[2..16]
+                .iter()
+                .map(BlockHeader::block_hash)
+                .collect::<Vec<_>>()
         );
     }
 

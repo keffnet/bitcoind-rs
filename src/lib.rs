@@ -5734,6 +5734,20 @@ impl Node {
         })
     }
 
+    /// Take a coherent snapshot of globally requested block bodies.
+    ///
+    /// Headers direct fetch walks a short competing branch while holding the
+    /// chain read lock. Snapshotting first avoids repeatedly taking the peer
+    /// lock in the opposite order and lets already-requested ancestors be
+    /// excluded from Core's direct-fetch candidate limit.
+    pub(crate) fn inflight_block_hashes(&self) -> HashSet<BlockHash> {
+        self.peers
+            .read()
+            .values()
+            .flat_map(|peer| peer.inflight_blocks.iter().map(|inflight| inflight.hash))
+            .collect()
+    }
+
     /// Return true when the oldest validated block request for a peer has
     /// exceeded Core's block-interval timeout. The timeout is extended for
     /// each other peer that is actively downloading validated blocks so a

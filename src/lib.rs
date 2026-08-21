@@ -4615,6 +4615,7 @@ impl Node {
             return false;
         }
         started.insert(peer_id);
+        self.header_availability_probed.lock().insert(peer_id);
         self.headers_sync_active.lock().insert(peer_id);
         self.headers_sync_peers.fetch_add(1, Ordering::Relaxed);
         self.initialize_chain_sync_timeout(peer_id);
@@ -4680,6 +4681,7 @@ impl Node {
             .map(|peer| peer.id)?;
         let sender = self.peer_commands.read().get(&candidate).cloned()?;
         started.insert(candidate);
+        self.header_availability_probed.lock().insert(candidate);
         self.headers_sync_active.lock().insert(candidate);
         self.headers_sync_peers.fetch_add(1, Ordering::Relaxed);
         self.initialize_chain_sync_timeout(candidate);
@@ -4714,11 +4716,16 @@ impl Node {
         self.headers_sync_active.lock().remove(&peer_id);
     }
 
-    /// Once one peer has supplied the header chain, ask every other suitable
-    /// connection for a short overlap response. That response establishes
-    /// block availability so the body scheduler can use all download peers
-    /// instead of remaining pinned to the original header-sync peer.
+    /// Once the best header is recent, ask every other suitable connection for
+    /// a short overlap response. Core keeps initial header synchronization on
+    /// one peer while the best header is stale, then starts it on all peers
+    /// when the best header is within a day of the node clock. The overlap
+    /// response establishes block availability so the body scheduler can use
+    /// all download peers instead of remaining pinned to the original peer.
     pub(crate) fn probe_peer_header_availability(&self, excluded_peer_id: usize) -> usize {
+        if !self.best_header_is_recent() {
+            return 0;
+        }
         let candidates = self
             .peer_infos()
             .into_iter()
@@ -9577,7 +9584,9 @@ mod tests {
     }
 
     #[test]
-    fn completed_header_sync_probes_other_peers_once_for_parallel_downloads() {
+    fn completed_header_sync_probes_only_untried_peers_once_when_recent() {
+        let _guard = time::mock_time_test_guard();
+        time::set_mock_time(0);
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(test_config(directory.path())).unwrap();
         let (sender_one, mut receiver_one) = tokio::sync::mpsc::unbounded_channel();
@@ -9597,12 +9606,26 @@ mod tests {
             );
         }
 
-        assert_eq!(node.probe_peer_header_availability(1), 2);
+        // A peer that already received its initial getheaders keeps Core's
+        // fSyncStarted-equivalent history even after the active sync claim is
+        // released. Do not query it again merely because another peer
+        // completed a header round.
+        assert!(node.start_initial_headers_sync(2));
+        assert!(node.clear_headers_sync_peer(2));
+
+        // Match Core's single-peer initial header synchronization while the
+        // best header is stale. In particular, a response from one peer must
+        // not cause unrelated inbound peers to be queried for old test data.
+        assert_eq!(node.probe_peer_header_availability(1), 0);
         assert!(receiver_one.try_recv().is_err());
-        assert!(matches!(
-            receiver_two.try_recv(),
-            Ok(p2p::PeerCommand::ProbeHeaderAvailability)
-        ));
+        assert!(receiver_two.try_recv().is_err());
+        assert!(receiver_three.try_recv().is_err());
+
+        let genesis_time = i64::from(node.chain.read().header(0).unwrap().time);
+        time::set_mock_time(genesis_time + 1);
+        assert_eq!(node.probe_peer_header_availability(1), 1);
+        assert!(receiver_one.try_recv().is_err());
+        assert!(receiver_two.try_recv().is_err());
         assert!(matches!(
             receiver_three.try_recv(),
             Ok(p2p::PeerCommand::ProbeHeaderAvailability)

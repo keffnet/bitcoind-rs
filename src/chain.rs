@@ -6407,8 +6407,9 @@ impl ChainState {
         let utxos = if target_hash == self.best_hash() {
             self.load_utxo_map_from_store()?
         } else {
-            self.replay_utxos_for_block(target_hash, false)?
-                .context("could not reconstruct the historical UTXO set")?
+            self.replay_utxos_for_block(target_hash, false)
+                .context("Could not roll back to requested height.")?
+                .context("Could not roll back to requested height.")?
         };
         let active_history = self.active_history_map_for_read()?;
         let history = active_history
@@ -7784,18 +7785,16 @@ impl ChainState {
         };
         for height in (target_height + 1..=tip_height).rev() {
             let block_hash = self.active_chain[height as usize];
-            let Some(block) = self.store.get(&block_hash)? else {
+            // Historical snapshots are integrity probes, not consensus hot
+            // paths. Re-read both records so recently connected cache entries
+            // cannot conceal missing or corrupt authoritative storage.
+            let Some(block) = self.store.get_readonly(&block_hash)? else {
                 return Ok(None);
             };
-            let undo = if let Some(undo) = self.block_undo_cache.get(&block_hash) {
-                undo.clone()
-            } else {
-                let Some(undo) = self.store.get_undo(&block_hash)? else {
-                    return Ok(None);
-                };
-                self.remember_block_undo(block_hash, undo.clone());
-                undo
+            let Some(undo) = self.store.get_undo(&block_hash)? else {
+                return Ok(None);
             };
+            self.remember_block_undo(block_hash, undo.clone());
             self.disconnect_block_from_utxos(&mut utxos, &block, height, &undo)?;
         }
         Ok(Some(utxos))

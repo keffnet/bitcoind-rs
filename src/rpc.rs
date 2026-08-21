@@ -6037,11 +6037,18 @@ fn dump_txoutset(node: &Arc<Node>, params: &Value) -> Result<Value> {
             .chain
             .write()
             .dump_utxo_set_at(&path, target)
-            .map_err(|_| {
-                anyhow!(
-                    "Couldn't open file {}.incomplete for writing",
-                    path.display()
-                )
+            .map_err(|error| {
+                if error
+                    .to_string()
+                    .starts_with("Could not roll back to requested height.")
+                {
+                    anyhow!("Could not roll back to requested height.")
+                } else {
+                    anyhow!(
+                        "Couldn't open file {}.incomplete for writing",
+                        path.display()
+                    )
+                }
             })?;
         return Ok(json!({
             "coins_written": coins_written,
@@ -30071,6 +30078,43 @@ mod tests {
         assert_eq!(named_dump["base_height"], 1);
         assert_eq!(named_dump["base_hash"], target_hash.to_string());
         assert_eq!(node.chain.read().height(), live_height);
+
+        let undo_path = directory.path().join("blocks/undo.dat");
+        let stored_undo = std::fs::read(&undo_path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&undo_path)
+            .unwrap();
+        let failed_path = directory
+            .path()
+            .join("historical-utxos-missing-undo.snapshot");
+        let rollback_error = dump_txoutset(
+            &node,
+            &json!([
+                failed_path.to_string_lossy(),
+                "rollback",
+                {"rollback": 1}
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            rollback_error.to_string(),
+            "Could not roll back to requested height."
+        );
+        assert_eq!(rpc_error(&rollback_error)["code"], json!(-1));
+        std::fs::write(&undo_path, stored_undo).unwrap();
+        assert!(
+            dump_txoutset(
+                &node,
+                &json!([
+                    failed_path.to_string_lossy(),
+                    "rollback",
+                    {"rollback": 1}
+                ]),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

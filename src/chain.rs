@@ -128,6 +128,9 @@ const ELECTRUM_REBUILD_BATCH_SCRIPTS: usize = 4_096;
 const PEER_STORAGE_FLUSH_BLOCKS: u32 = 4_096;
 const PEER_STORAGE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
 const IBD_BENCH_BLOCKS: u32 = 256;
+const UTXO_CACHE_WARM_BLOCKS: usize = 4_096;
+const UTXO_CACHE_WARM_DELTA_BYTES: usize = 512 * 1024 * 1024;
+const UTXO_CACHE_WARM_ENTRY_BYTES: usize = 512 * 1024 * 1024;
 
 #[derive(Default)]
 struct IbdConnectBench {
@@ -2111,6 +2114,16 @@ impl ChainState {
             );
         }
         let loaded_snapshot = snapshot.is_some();
+        let expected_active_tip = active_chain
+            .last()
+            .copied()
+            .context("active chain has no tip")?;
+        let restore_from_durable_indexes = !rebuild_chainstate
+            && snapshot.is_none()
+            && !state.txospender_index_enabled
+            && state.utxo_store_tip_matches(expected_active_tip)
+            && (!state.history_index_enabled
+                || state.electrum_history_store_tip_matches(expected_active_tip));
         let chainstate_restore_started = Instant::now();
         info!("Restoring chainstate indexes");
         if rebuild_chainstate {
@@ -2236,6 +2249,51 @@ impl ChainState {
                     replay_started.elapsed().as_secs_f64()
                 );
             }
+        } else if restore_from_durable_indexes {
+            // Clean IBD shutdowns intentionally avoid serializing a gigantic
+            // UTXO/history snapshot: the disk indexes and their tip markers
+            // are already the authoritative state. Rebuild only the compact
+            // in-memory header index instead of materializing every full block
+            // and every historical Electrum event.
+            let mut persisted_by_hash = persisted_headers
+                .iter()
+                .map(|header| (header.block_hash(), *header))
+                .collect::<HashMap<_, _>>();
+            let mut active_headers = Vec::with_capacity(active_chain.len());
+            for (height, hash) in active_chain.iter().copied().enumerate() {
+                let header = if let Some(header) = persisted_by_hash.remove(&hash) {
+                    header
+                } else {
+                    state
+                        .store
+                        .get(&hash)?
+                        .with_context(|| {
+                            format!("active block {hash} is missing from block store")
+                        })?
+                        .header
+                };
+                if header.block_hash() != hash {
+                    bail!("persisted active header does not match block hash {hash}");
+                }
+                if height > 0 && header.prev_blockhash != active_chain[height - 1] {
+                    bail!("persisted active header {hash} does not connect to its parent");
+                }
+                active_headers.push(header);
+            }
+            state.active_chain = active_chain.clone();
+            state.headers = active_headers;
+            let headers = state.headers.clone();
+            state.index_active_headers(&headers)?;
+            state.utxos.clear();
+            state.utxos_materialized = false;
+            state.history.clear();
+            state.history_materialized = false;
+            info!(
+                "Restored clean IBD state from durable indexes: height={} utxos={} history_events={}",
+                state.height(),
+                state.utxo_store.len(),
+                state.electrum_history_store.len()
+            );
         } else {
             state.snapshot_base = None;
             state.snapshot_validated = true;
@@ -2250,29 +2308,18 @@ impl ChainState {
                     "Replaying blocks without a chainstate snapshot: height=0 target={target_height} blocks={replay_blocks}"
                 );
             }
-            let mut blocks = Vec::with_capacity(active_chain.len());
-            let load_started = Instant::now();
-            for (height, hash) in active_chain.iter().enumerate() {
+            let genesis_hash = active_chain[0];
+            let genesis = state.store.get(&genesis_hash)?.with_context(|| {
+                format!("active genesis block {genesis_hash} is missing from block store")
+            })?;
+            state.initialize_genesis(&genesis)?;
+            let apply_started = Instant::now();
+            for (offset, hash) in active_chain.iter().skip(1).enumerate() {
                 let block = state
                     .store
                     .get(hash)?
                     .with_context(|| format!("active block {hash} is missing from block store"))?;
-                blocks.push(block);
-                if height > 0 {
-                    log_replay_progress(
-                        "load-blocks",
-                        height,
-                        replay_blocks,
-                        height,
-                        target_height,
-                        load_started,
-                    );
-                }
-            }
-            state.initialize_genesis(&blocks[0])?;
-            let apply_started = Instant::now();
-            for (offset, block) in blocks.iter().skip(1).enumerate() {
-                state.connect_block_internal(block, false)?;
+                state.connect_block_internal(&block, false)?;
                 log_replay_progress(
                     "apply-blocks",
                     offset + 1,
@@ -2961,7 +3008,7 @@ impl ChainState {
             // the intentionally empty in-memory map from the disabled mode.
             self.history.clear();
             self.history_materialized = false;
-            if !self.electrum_history_store_tip_matches() {
+            if !self.electrum_history_store_tip_matches(self.best_hash()) {
                 self.rebuild_electrum_history_index()?;
             }
         }
@@ -3873,8 +3920,68 @@ impl ChainState {
         self.utxo_store.configure_cache_size_mib(mib);
     }
 
-    pub fn warm_utxo_cache(&self) -> Result<(usize, usize)> {
-        self.utxo_store.warm_cache()
+    pub fn warm_utxo_cache(&mut self) -> Result<(usize, usize)> {
+        let capacity = self.utxo_store.cache_capacity_bytes();
+        let target_bytes = capacity.min(UTXO_CACHE_WARM_ENTRY_BYTES);
+        if target_bytes == 0 || self.active_chain.len() <= 1 {
+            return self.utxo_store.warm_cache();
+        }
+        if let Some(warmed) = self.utxo_store.warm_complete_cache_if_fits()? {
+            info!(
+                "Selected complete UTXO set for cache: entries={} bytes={}",
+                warmed.0, warmed.1
+            );
+            return Ok(warmed);
+        }
+
+        // Walk checksummed active-chain deltas backwards. A created output is
+        // still unspent at the tip exactly when no later delta spends it. This
+        // reconstructs a bounded cache of the newest live coins without a full
+        // UTXO database scan or an unsafe negative/existence assumption.
+        let hashes = self
+            .active_chain
+            .iter()
+            .rev()
+            .take(UTXO_CACHE_WARM_BLOCKS)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut spent_after = HashSet::new();
+        let mut selected = HashSet::new();
+        let mut candidates = Vec::new();
+        let mut candidate_bytes = 0usize;
+        let mut delta_bytes = 0usize;
+        let mut scanned_blocks = 0usize;
+        for hash in hashes {
+            let Some(bytes) = self.chainstate_store.get(&hash)? else {
+                break;
+            };
+            delta_bytes = delta_bytes.saturating_add(bytes.len());
+            let delta = deserialize_chainstate_delta(&bytes)?;
+            for (outpoint, entry) in delta.created {
+                if spent_after.remove(&outpoint) || !selected.insert(outpoint) {
+                    continue;
+                }
+                candidate_bytes = candidate_bytes
+                    .saturating_add(64usize.saturating_add(entry.output.script_pubkey.len()));
+                candidates.push((outpoint, Self::stored_utxo(&entry)));
+            }
+            for (outpoint, _) in delta.spent {
+                if !selected.contains(&outpoint) {
+                    spent_after.insert(outpoint);
+                }
+            }
+            scanned_blocks = scanned_blocks.saturating_add(1);
+            if candidate_bytes >= target_bytes || delta_bytes >= UTXO_CACHE_WARM_DELTA_BYTES {
+                break;
+            }
+        }
+        candidates.reverse();
+        let warmed = self.utxo_store.seed_cache(candidates);
+        info!(
+            "Selected recent UTXOs for cache: blocks={scanned_blocks} delta_bytes={delta_bytes} entries={} bytes={}",
+            warmed.0, warmed.1
+        );
+        Ok(warmed)
     }
 
     /// Configure chainstate write batching from Core's debug-only
@@ -9913,6 +10020,20 @@ impl ChainState {
         persist_advisory_atomic_file_with_sync(&path, &temp, contents.as_bytes(), sync)
     }
 
+    fn utxo_store_tip_matches(&self, expected_tip: BlockHash) -> bool {
+        let tip = fs::read_to_string(self.utxo_store_tip_path()).ok();
+        let expected_tip = expected_tip.to_string();
+        tip.as_deref().is_some_and(|tip| {
+            let mut lines = tip.lines();
+            lines.next().map(str::trim) == Some(expected_tip.as_str())
+                && lines
+                    .next()
+                    .and_then(|generation| generation.trim().parse::<u64>().ok())
+                    == Some(self.utxo_store.generation())
+                && lines.next().is_none()
+        })
+    }
+
     fn sync_utxo_store(&mut self) -> Result<()> {
         if !self.utxos_materialized {
             // Normal active-chain connects already commit the exact mutation
@@ -9930,24 +10051,15 @@ impl ChainState {
     }
 
     fn reconcile_utxo_store(&mut self) -> Result<()> {
-        let tip = fs::read_to_string(self.utxo_store_tip_path()).ok();
-        let expected_tip = self.best_hash().to_string();
-        let marker_matches = tip.as_deref().is_some_and(|tip| {
-            let mut lines = tip.lines();
-            lines.next().map(str::trim) == Some(expected_tip.as_str())
-                && lines
-                    .next()
-                    .and_then(|generation| generation.trim().parse::<u64>().ok())
-                    == Some(self.utxo_store.generation())
-                && lines.next().is_none()
-        });
+        let marker_matches = self.utxo_store_tip_matches(self.best_hash());
         info!(
             "UTXO index state: marker_matches={marker_matches} durable_entries={} snapshot_entries={} generation={}",
             self.utxo_store.len(),
             self.utxos.len(),
             self.utxo_store.generation()
         );
-        if marker_matches && self.utxo_store.len() == self.utxos.len() {
+        if marker_matches && (!self.utxos_materialized || self.utxo_store.len() == self.utxos.len())
+        {
             return Ok(());
         }
         self.sync_utxo_store()
@@ -9999,9 +10111,9 @@ impl ChainState {
         self.persist_electrum_history_store_tip()
     }
 
-    fn electrum_history_store_tip_matches(&self) -> bool {
+    fn electrum_history_store_tip_matches(&self, expected_tip: BlockHash) -> bool {
         let tip = fs::read_to_string(self.electrum_history_store_tip_path()).ok();
-        let expected_tip = self.best_hash().to_string();
+        let expected_tip = expected_tip.to_string();
         tip.as_deref().is_some_and(|tip| {
             let mut lines = tip.lines();
             lines.next().map(str::trim) == Some(expected_tip.as_str())
@@ -10021,7 +10133,7 @@ impl ChainState {
         if !self.history_index_enabled {
             return Ok(());
         }
-        let marker_matches = self.electrum_history_store_tip_matches();
+        let marker_matches = self.electrum_history_store_tip_matches(self.best_hash());
         info!(
             "Electrum history index state: marker_matches={marker_matches} durable_entries={} snapshot_entries={} generation={}",
             self.electrum_history_store.len(),
@@ -12590,6 +12702,40 @@ mod tests {
 
         let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.height(), 1);
+    }
+
+    #[test]
+    fn clean_snapshotless_ibd_restart_uses_durable_indexes_without_old_bodies() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        let expected_tip = state.best_hash();
+        let expected_utxos = state.utxo_store.len();
+        state.checkpoint_for_shutdown().unwrap();
+        assert!(!directory.path().join("chainstate.snapshot").exists());
+
+        // A snapshotless durable-index restart must not replay old full block
+        // bodies. Keep only genesis and the tip to make accidental replay an
+        // immediate test failure instead of a hidden performance regression.
+        let retained = [state.block_hash(0).unwrap(), expected_tip]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        state.store.prune(&retained, &retained).unwrap();
+        assert!(!state.store.contains(&state.block_hash(1).unwrap()));
+        drop(state);
+
+        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.best_hash(), expected_tip);
+        assert_eq!(reopened.height(), 3);
+        assert_eq!(reopened.utxo_store.len(), expected_utxos);
+        assert!(!reopened.utxos_materialized);
+        assert!(!reopened.history_materialized);
+        reopened.configure_storage_cache_size_mib(4);
+        let (cached_entries, cached_bytes) = reopened.warm_utxo_cache().unwrap();
+        assert!(cached_entries >= 3);
+        assert!(cached_bytes > 0);
     }
 
     #[test]

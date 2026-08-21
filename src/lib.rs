@@ -1508,6 +1508,30 @@ struct BlockDownloadPathCache {
     hashes: Vec<BlockHash>,
 }
 
+/// Advance Core's per-peer last-common cursor across the contiguous prefix
+/// whose bodies are already present. A higher-work fork may need more than
+/// one download window before it can activate; anchoring every window at the
+/// active-chain fork point would stop permanently after the first 1,024
+/// replacement blocks.
+fn advance_download_common_height(
+    hashes: &[BlockHash],
+    initial_height: u32,
+    mut have_body: impl FnMut(&BlockHash) -> bool,
+) -> u32 {
+    let mut height = initial_height;
+    for (index, hash) in hashes.iter().enumerate().skip(
+        usize::try_from(initial_height)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1),
+    ) {
+        if !have_body(hash) {
+            break;
+        }
+        height = u32::try_from(index).unwrap_or(u32::MAX);
+    }
+    height
+}
+
 impl PeerInfo {
     pub(crate) fn ping_wait(&self) -> Option<f64> {
         self.ping_sent_mocktime
@@ -5771,14 +5795,16 @@ impl Node {
             )
         };
         let limited_peer = peer_services & wire::NODE_NETWORK == 0;
-        let peer_best_known = peer_id.and_then(|id| {
-            self.peers
-                .read()
-                .get(&id)
-                .and_then(|peer| peer.best_known_block)
-        });
+        let (peer_best_known, peer_last_common) = peer_id
+            .and_then(|id| {
+                self.peers
+                    .read()
+                    .get(&id)
+                    .map(|peer| (peer.best_known_block, peer.last_common_block))
+            })
+            .unwrap_or((None, None));
         let peer_has_known_tip = peer_best_known.is_some();
-        let (candidates, window_end_height) = {
+        let (candidates, window_end_height, last_common_hash) = {
             let chain = self.chain.read();
             let target_hash = if let Some(peer_best_known) = peer_best_known {
                 let Some(peer_work) = chain.chain_work_by_hash(&peer_best_known) else {
@@ -5835,7 +5861,28 @@ impl Node {
                 .expect("block download path cache was initialized");
             debug_assert_eq!(cached_path.hashes.get(target_index), Some(&target_hash));
             let hashes = &cached_path.hashes[..=target_index];
-            let last_common_height = chain.common_active_height_for_hash_path(hashes);
+            let active_common_height = chain.common_active_height_for_hash_path(hashes);
+            let initial_common_height = peer_last_common
+                .and_then(|hash| {
+                    let height = chain.block_height_by_hash(&hash)?;
+                    let index = usize::try_from(height).ok()?;
+                    (height >= active_common_height
+                        && hashes.get(index) == Some(&hash)
+                        && chain.store.contains(&hash))
+                    .then_some(height)
+                })
+                .unwrap_or(active_common_height);
+            // Core advances pindexLastCommonBlock over each contiguous
+            // BLOCK_HAVE_DATA entry, even when those blocks are on a fork
+            // that cannot activate until more bodies arrive.
+            let last_common_height =
+                advance_download_common_height(hashes, initial_common_height, |hash| {
+                    chain.store.contains(hash)
+                });
+            let last_common_hash = usize::try_from(last_common_height)
+                .ok()
+                .and_then(|index| hashes.get(index))
+                .copied();
             let window_end_height = last_common_height.saturating_add(BLOCK_DOWNLOAD_WINDOW);
             let first_candidate_height = usize::try_from(last_common_height)
                 .unwrap_or(usize::MAX)
@@ -5872,8 +5919,20 @@ impl Node {
                 // merely waiting for an in-window block.
                 .take(max_scan.saturating_add(1))
                 .collect::<Vec<_>>();
-            (candidates, window_end_height)
+            (candidates, window_end_height, last_common_hash)
         };
+        if let (Some(peer_id), Some(last_common_hash)) = (peer_id, last_common_hash) {
+            if let Some(peer) = self.peers.write().get_mut(&peer_id) {
+                // Avoid replacing a newer cursor if peer availability or a
+                // concurrent scheduler pass advanced while the chain was
+                // being inspected.
+                if peer.best_known_block == peer_best_known
+                    && peer.last_common_block == peer_last_common
+                {
+                    peer.last_common_block = Some(last_common_hash);
+                }
+            }
+        }
         if candidates.is_empty() {
             return BlockDownloadSchedule {
                 requests: Vec::new(),
@@ -10087,6 +10146,87 @@ mod tests {
                 .and_then(|cache| cache.hashes.last().copied()),
             Some(second.block_hash())
         );
+    }
+
+    #[test]
+    fn block_download_scheduler_follows_a_higher_work_side_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let genesis = *node.chain.read().header(0).unwrap();
+        let main_one = mine_test_block(&genesis, 1, 1);
+        node.connect_block(main_one.clone()).unwrap();
+        let main_two = mine_test_block(&main_one.header, 2, 2);
+        node.connect_block(main_two).unwrap();
+
+        let side_one = mine_test_block(&genesis, 1, 3);
+        let side_two = mine_test_block(&side_one.header, 2, 4);
+        let side_three = mine_test_block(&side_two.header, 3, 5);
+        node.chain
+            .write()
+            .accept_headers(&[side_one.header, side_two.header, side_three.header])
+            .unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        node.update_peer_best_known_block(1, side_three.block_hash());
+        let schedule = node.next_block_download_schedule(
+            1,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
+        assert_eq!(
+            schedule
+                .requests
+                .into_iter()
+                .map(|request| request.hash)
+                .collect::<Vec<_>>(),
+            vec![
+                side_one.block_hash(),
+                side_two.block_hash(),
+                side_three.block_hash(),
+            ]
+        );
+
+        node.connect_block(side_one).unwrap();
+        node.connect_block(side_two.clone()).unwrap();
+        let schedule = node.next_block_download_schedule(
+            1,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
+        assert_eq!(
+            schedule
+                .requests
+                .into_iter()
+                .map(|request| request.hash)
+                .collect::<Vec<_>>(),
+            vec![side_three.block_hash()]
+        );
+        assert_eq!(
+            node.peers.read().get(&1).unwrap().last_common_block,
+            Some(side_two.block_hash())
+        );
+    }
+
+    #[test]
+    fn block_download_window_advances_across_stored_fork_bodies() {
+        let hashes = (0..=BLOCK_DOWNLOAD_WINDOW + 2)
+            .map(|height| {
+                let mut bytes = [0; 32];
+                bytes[..4].copy_from_slice(&height.to_le_bytes());
+                BlockHash::from_byte_array(bytes)
+            })
+            .collect::<Vec<_>>();
+        let stored_through = BLOCK_DOWNLOAD_WINDOW;
+        let advanced = advance_download_common_height(&hashes, 0, |hash| {
+            hashes
+                .iter()
+                .position(|candidate| candidate == hash)
+                .is_some_and(|height| height <= stored_through as usize)
+        });
+
+        assert_eq!(advanced, stored_through);
+        assert!(advanced.saturating_add(BLOCK_DOWNLOAD_WINDOW) > stored_through);
     }
 
     #[test]

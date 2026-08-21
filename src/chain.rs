@@ -1383,6 +1383,7 @@ pub struct ChainState {
     // only stored, not-yet-connected children here so completing a gap can
     // walk the available suffix without scanning the global header index.
     pending_body_children: HashMap<BlockHash, Vec<BlockHash>>,
+    processing_known_children: bool,
     // Preserve the arrival order of bodies whose parent data is not yet
     // available. Core replays these bodies in insertion order when the
     // missing parent arrives, which determines equal-work chain selection.
@@ -2196,6 +2197,7 @@ impl ChainState {
             block_sequence_ids: HashMap::new(),
             next_block_sequence_id: 1,
             pending_body_children: HashMap::new(),
+            processing_known_children: false,
             unlinked_body_order: HashMap::new(),
             next_unlinked_body_order: 1,
             header_sequence_ids: HashMap::new(),
@@ -2555,7 +2557,7 @@ impl ChainState {
             state.initialize_pending_body_children_after_load();
             let recovery_height = state.height();
             let recovery_tip = state.best_hash();
-            state.process_known_children(recovery_tip, false);
+            state.process_known_children(recovery_tip, false)?;
             if state.height() != recovery_height {
                 state.flush_append_only_stores()?;
             }
@@ -6914,7 +6916,7 @@ impl ChainState {
                 return Err(error);
             }
             self.process_orphans(hash, sync_storage);
-            self.process_known_children(hash, sync_storage);
+            self.process_known_children(hash, sync_storage)?;
             self.update_ibd_status();
             return Ok(self.tip());
         }
@@ -7017,7 +7019,7 @@ impl ChainState {
             }
             let active_tip = self.best_hash();
             self.process_orphans(hash, sync_storage);
-            self.process_known_children(active_tip, sync_storage);
+            self.process_known_children(active_tip, sync_storage)?;
             self.update_ibd_status();
             return Ok(self.tip());
         }
@@ -7163,7 +7165,7 @@ impl ChainState {
             self.activate_chain(hash)?;
         }
         self.process_orphans(hash, sync_storage);
-        self.process_known_children(hash, sync_storage);
+        self.process_known_children(hash, sync_storage)?;
         self.update_ibd_status();
         Ok(self.tip())
     }
@@ -7220,30 +7222,67 @@ impl ChainState {
         self.next_unlinked_body_order = self.next_unlinked_body_order.saturating_add(1);
     }
 
-    fn process_known_children(&mut self, parent_hash: BlockHash, sync_storage: bool) {
-        let Some(mut children) = self.pending_body_children.remove(&parent_hash) else {
-            return;
-        };
-        children.sort_by(|left, right| {
-            self.unlinked_body_order
-                .get(left)
-                .copied()
-                .unwrap_or(u64::MAX)
-                .cmp(
-                    &self
-                        .unlinked_body_order
-                        .get(right)
-                        .copied()
-                        .unwrap_or(u64::MAX),
-                )
-                .then_with(|| left.to_string().cmp(&right.to_string()))
-        });
-        for child_hash in children {
-            let Ok(Some(child)) = self.store.get(&child_hash) else {
-                continue;
-            };
-            let _ = self.connect_block_with_existing_body(child, true, false, sync_storage);
+    fn process_known_children(&mut self, parent_hash: BlockHash, sync_storage: bool) -> Result<()> {
+        if self.processing_known_children {
+            return Ok(());
         }
+        self.processing_known_children = true;
+        let result = (|| -> Result<()> {
+            let mut parents = VecDeque::from([parent_hash]);
+            let mut connected = 0u64;
+            while let Some(parent_hash) = parents.pop_front() {
+                let Some(mut children) = self.pending_body_children.remove(&parent_hash) else {
+                    continue;
+                };
+                children.sort_by(|left, right| {
+                    self.unlinked_body_order
+                        .get(left)
+                        .copied()
+                        .unwrap_or(u64::MAX)
+                        .cmp(
+                            &self
+                                .unlinked_body_order
+                                .get(right)
+                                .copied()
+                                .unwrap_or(u64::MAX),
+                        )
+                        .then_with(|| left.to_string().cmp(&right.to_string()))
+                });
+                for child_hash in children {
+                    let Ok(Some(child)) = self.store.get(&child_hash) else {
+                        continue;
+                    };
+                    if self
+                        .connect_block_with_existing_body(child, true, false, sync_storage)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    parents.push_back(child_hash);
+                    let active_tip = self.best_hash();
+                    if active_tip != child_hash {
+                        parents.push_back(active_tip);
+                    }
+                    connected = connected.saturating_add(1);
+                    if !sync_storage {
+                        // This path can drain tens of thousands of bodies
+                        // under one peer call. Keep the same byte-bounded
+                        // durability and memory limit as ordinary arrivals.
+                        self.flush_peer_storage_if_needed()?;
+                    }
+                    if connected % 256 == 0 {
+                        info!(
+                            blocks = connected,
+                            height = self.height(),
+                            "Connected stored peer block suffix"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })();
+        self.processing_known_children = false;
+        result
     }
 
     fn initialize_pending_body_children_after_load(&mut self) {
@@ -11481,6 +11520,7 @@ fn open_background_replay_state(
         block_sequence_ids: HashMap::new(),
         next_block_sequence_id: 1,
         pending_body_children: HashMap::new(),
+        processing_known_children: false,
         unlinked_body_order: HashMap::new(),
         next_unlinked_body_order: 1,
         header_sequence_ids: HashMap::new(),
@@ -15409,13 +15449,19 @@ mod tests {
         let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
         let parent = mine_block(&state, 1);
         let child = mine_block_from_header(&parent.header, 2, 10);
+        let grandchild = mine_block_from_header(&child.header, 3, 11);
         state
-            .accept_headers(&[parent.header, child.header])
+            .accept_headers(&[parent.header, child.header, grandchild.header])
             .unwrap();
-        assert!(state.connect_block(child).is_err());
+        assert!(state.connect_block_from_peer(grandchild).is_err());
+        assert!(state.connect_block_from_peer(child).is_err());
         assert_eq!(state.height(), 0);
-        state.connect_block(parent).unwrap();
-        assert_eq!(state.height(), 2);
+        state.peer_storage_bytes_since_flush = PEER_STORAGE_FLUSH_BYTES;
+        state.connect_block_from_peer(parent).unwrap();
+        assert_eq!(state.height(), 3);
+        assert!(!state.processing_known_children);
+        assert_eq!(state.peer_storage_blocks_since_flush, 1);
+        assert!(state.peer_storage_bytes_since_flush < PEER_STORAGE_FLUSH_BYTES);
     }
 
     #[test]

@@ -74,7 +74,7 @@ use rand::{random, seq::SliceRandom};
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::address::{NetworkEndpoint, is_core_routable_ip};
 use crate::asmap::{AsMap, EMBEDDED_ASMAP_PATH};
@@ -88,6 +88,29 @@ use crate::mempool::{
     Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
 };
 use crate::storage::BlockStoreReader;
+
+/// Match Bitcoin Core's emergency free-space reserve. Additional write
+/// estimates are added on top of this floor before a mutation starts.
+pub(crate) const MIN_DISK_SPACE_BYTES: u64 = 50 * 1024 * 1024;
+const PERIODIC_DISK_SPACE_RESERVE_BYTES: u64 = 50 * 1024 * 1024;
+const DISK_SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+fn disk_space_is_sufficient(available: u64, additional: u64) -> bool {
+    available >= MIN_DISK_SPACE_BYTES.saturating_add(additional)
+}
+
+pub(crate) fn ensure_disk_space(path: &Path, additional: u64) -> Result<()> {
+    let available = fs2::available_space(path)
+        .with_context(|| format!("checking available disk space for {}", path.display()))?;
+    let required = MIN_DISK_SPACE_BYTES.saturating_add(additional);
+    if !disk_space_is_sufficient(available, additional) {
+        bail!(
+            "Disk space is too low for \"{}\": available {available} bytes, required {required} bytes",
+            path.display()
+        );
+    }
+    Ok(())
+}
 
 // Core assigns live peer IDs from zero. Address-manager entries use a
 // separate sentinel so peer 0 remains distinguishable from an unconnected
@@ -1723,6 +1746,8 @@ pub struct Node {
     pub config: Config,
     _data_dir_lock: File,
     _blocks_dir_lock: Option<File>,
+    chain_data_dir: std::path::PathBuf,
+    blocks_dir: std::path::PathBuf,
     asmap: Option<Arc<AsMap>>,
     pub chain: Arc<RwLock<ChainState>>,
     pub(crate) block_store_reader: BlockStoreReader,
@@ -1951,6 +1976,11 @@ impl Node {
             fs::create_dir_all(&blocks_dir)
                 .with_context(|| format!("creating blocks directory {}", blocks_dir.display()))?;
         }
+        // Refuse to open mutable databases when either storage root has
+        // already consumed Core's emergency reserve. This runs before any
+        // chain or service index can append a record.
+        ensure_disk_space(&network_datadir, 0)?;
+        ensure_disk_space(&blocks_dir, 0)?;
         let blocks_dir_lock = if blocks_dir == config.datadir {
             None
         } else {
@@ -2044,6 +2074,7 @@ impl Node {
         } else {
             legacy_chain_data_dir
         };
+        ensure_disk_space(&chain_data_dir, 0)?;
         let coinstats_clean_shutdown_height_path = chain_data_dir
             .join("indexes/coinstatsindex")
             .join(COINSTATS_CLEAN_SHUTDOWN_HEIGHT_FILE);
@@ -2055,7 +2086,7 @@ impl Node {
             ChainState::open_with_options_and_tx_index_in_dirs_with_minimum_chain_work_and_assume_valid_and_blocks_xor_and_deployment_parameters_and_electrum_index_and_shutdown_interrupt(
                 config.network,
                 &chain_data_dir,
-                blocks_dir,
+                &blocks_dir,
                 config.signet_challenge.as_deref(),
                 config.blockfilterindex,
                 config.reindex,
@@ -2332,6 +2363,8 @@ impl Node {
             config,
             _data_dir_lock: data_dir_lock,
             _blocks_dir_lock: blocks_dir_lock,
+            chain_data_dir,
+            blocks_dir,
             asmap,
             chain: Arc::new(RwLock::new(chain)),
             block_store_reader,
@@ -2465,10 +2498,23 @@ impl Node {
         let previous_tip = self.chain.read().best_hash();
         let (tip, activated_blocks, disconnected_blocks, affected_script_hashes) = {
             let mut chain = self.chain.write();
-            let tip = if retain_invalid_body {
-                chain.connect_block_from_peer(block)?
+            let tip_result = if retain_invalid_body {
+                chain.connect_block_from_peer(block)
             } else {
-                chain.connect_block(block)?
+                chain.connect_block(block)
+            };
+            let tip = match tip_result {
+                Ok(tip) => tip,
+                Err(error) => {
+                    if self.shutdown_requested.load(Ordering::Acquire) {
+                        self.set_warning(
+                            NodeWarningKind::FatalInternal,
+                            format!("chainstate persistence failed: {error}"),
+                        );
+                        self.shutdown.notify_waiters();
+                    }
+                    return Err(error);
+                }
             };
             chain.maybe_auto_prune()?;
             let activated_blocks = if tip.hash != previous_tip {
@@ -7758,6 +7804,33 @@ impl Node {
                 }
             }
         });
+        let disk_space_node = self.clone();
+        let disk_space_task = tokio::spawn(async move {
+            let first_check = tokio::time::Instant::now() + DISK_SPACE_CHECK_INTERVAL;
+            let mut ticker = tokio::time::interval_at(first_check, DISK_SPACE_CHECK_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let result = ensure_disk_space(&disk_space_node.chain_data_dir, 0)
+                            .and_then(|()| ensure_disk_space(
+                                &disk_space_node.blocks_dir,
+                                PERIODIC_DISK_SPACE_RESERVE_BYTES,
+                            ));
+                        if let Err(error) = result {
+                            error!(%error, "Shutting down due to lack of disk space");
+                            disk_space_node.set_warning(
+                                NodeWarningKind::FatalInternal,
+                                format!("Disk space is too low: {error}"),
+                            );
+                            disk_space_node.request_shutdown();
+                            break;
+                        }
+                    }
+                    _ = disk_space_node.wait_for_shutdown() => break,
+                }
+            }
+        });
         let unbroadcast_node = self.clone();
         let unbroadcast_retry_task = tokio::spawn(async move {
             let retry_interval = Duration::from_secs(MAX_INITIAL_BROADCAST_DELAY_SECS);
@@ -7845,6 +7918,7 @@ impl Node {
         background_validation_task.abort();
         mempool_expiry_task.abort();
         fee_estimator_task.abort();
+        disk_space_task.abort();
         unbroadcast_retry_task.abort();
         tokio::time::timeout(Duration::from_secs(10), self.wait_for_peer_tasks())
             .await
@@ -8608,6 +8682,20 @@ mod tests {
     use bitcoin::blockdata::witness::Witness;
     use bitcoin::hashes::Hash;
     use clap::Parser;
+
+    #[test]
+    fn disk_space_reserve_includes_additional_write_budget() {
+        assert!(!disk_space_is_sufficient(
+            MIN_DISK_SPACE_BYTES.saturating_sub(1),
+            0
+        ));
+        assert!(disk_space_is_sufficient(MIN_DISK_SPACE_BYTES, 0));
+        assert!(!disk_space_is_sufficient(MIN_DISK_SPACE_BYTES + 99, 100));
+        assert!(disk_space_is_sufficient(MIN_DISK_SPACE_BYTES + 100, 100));
+
+        let directory = tempfile::tempdir().unwrap();
+        ensure_disk_space(directory.path(), 0).unwrap();
+    }
 
     #[test]
     fn core_startup_recovery_errors_match_core_messages() {

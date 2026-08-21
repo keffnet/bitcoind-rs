@@ -126,6 +126,11 @@ const HEADER_JOURNAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 // mining paths retain their immediate-sync behavior.
 const PEER_STORAGE_FLUSH_BLOCKS: u32 = 4_096;
 const PEER_STORAGE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
+// Native persistence writes the compressed body, undo, chainstate delta,
+// UTXO/index keys, and optional Electrum history events. Reserve a generous
+// multiple of incoming body bytes so an LSM journal or compaction cannot
+// consume Core's 50 MiB emergency floor mid-batch.
+const NATIVE_STORAGE_WRITE_RESERVE_MULTIPLIER: u64 = 10;
 const IBD_BENCH_BLOCKS: u32 = 256;
 const UTXO_CACHE_WARM_BLOCKS: usize = 4_096;
 const UTXO_CACHE_WARM_DELTA_BYTES: usize = 512 * 1024 * 1024;
@@ -2639,6 +2644,7 @@ impl ChainState {
     }
 
     fn flush_append_only_stores(&mut self) -> Result<()> {
+        self.ensure_disk_space_for_pending_flush()?;
         self.store.flush()?;
         self.chainstate_store.flush()?;
         self.utxo_store.flush()?;
@@ -2652,6 +2658,48 @@ impl ChainState {
             store.flush()?;
         }
         Ok(())
+    }
+
+    fn ensure_disk_space_for_paths(&self, additional: u64) -> Result<()> {
+        let result = crate::ensure_disk_space(&self.data_dir, additional)
+            .and_then(|()| crate::ensure_disk_space(&self.blocks_dir, additional));
+        if result.is_err() {
+            // The daemon shares this flag with chainstate. Wakeup of its async
+            // supervisor is performed by the Node wrapper that observes the
+            // failed mutation.
+            self.shutdown_interrupt.store(true, Ordering::Release);
+        }
+        result
+    }
+
+    fn ensure_disk_space_for_pending_flush(&self) -> Result<()> {
+        let additional = self
+            .peer_storage_bytes_since_flush
+            .saturating_mul(NATIVE_STORAGE_WRITE_RESERVE_MULTIPLIER);
+        self.ensure_disk_space_for_paths(additional)
+    }
+
+    fn ensure_disk_space_for_persisted_block(
+        &self,
+        block: &Block,
+        sync_storage: bool,
+    ) -> Result<()> {
+        // Unsynced peer blocks are committed in bounded batches. Check once
+        // before opening a fresh batch rather than issuing statvfs for every
+        // IBD block; the five-minute node supervisor covers external disk use
+        // while a batch is in flight.
+        if !sync_storage && self.peer_storage_blocks_since_flush != 0 {
+            return Ok(());
+        }
+        let body_bytes = u64::try_from(block.total_size()).unwrap_or(u64::MAX);
+        let estimated_batch_bytes = if sync_storage {
+            body_bytes
+        } else {
+            PEER_STORAGE_FLUSH_BYTES.max(body_bytes)
+        };
+        self.ensure_disk_space_for_paths(
+            estimated_batch_bytes.saturating_mul(NATIVE_STORAGE_WRITE_RESERVE_MULTIPLIER),
+        )
     }
 
     fn flush_peer_storage_if_needed(&mut self) -> Result<()> {
@@ -6951,6 +6999,7 @@ impl ChainState {
                 node.height,
                 Amount::MAX_MONEY.to_sat(),
             )?;
+            self.ensure_disk_space_for_persisted_block(&block, true)?;
             self.store.insert(&block)?;
             self.index_active_transactions(&block, node.height)?;
             self.index_all_transactions(&block, node.height)?;
@@ -7012,6 +7061,11 @@ impl ChainState {
             self.update_ibd_status();
             return Ok(self.tip());
         }
+
+        // Side-chain and unlinked bodies are durable even though they do not
+        // mutate the active UTXO set yet. Protect those append paths with the
+        // same reserve as an active-chain write.
+        self.ensure_disk_space_for_persisted_block(&block, sync_storage)?;
 
         // Core writes a block body once its parent header is known, even when
         // the parent body (and therefore its UTXO state) is not available.
@@ -8206,6 +8260,9 @@ impl ChainState {
         persist: bool,
         sync_storage: bool,
     ) -> Result<()> {
+        if persist {
+            self.ensure_disk_space_for_persisted_block(block, sync_storage)?;
+        }
         let connect_started = Instant::now();
         let height = self.height().saturating_add(1);
         let transaction_ids = block_transaction_ids(block);
@@ -14227,6 +14284,15 @@ mod tests {
         assert_eq!(reopened.height(), 70);
         assert_eq!(reopened.best_hash(), tip);
         assert_eq!(reopened.block_hash(70), Some(tip));
+    }
+
+    #[test]
+    fn low_disk_preflight_requests_chainstate_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+
+        assert!(state.ensure_disk_space_for_paths(u64::MAX).is_err());
+        assert!(state.shutdown_interrupt.load(Ordering::Acquire));
     }
 
     #[test]

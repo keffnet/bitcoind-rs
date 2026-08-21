@@ -2606,6 +2606,134 @@ mod tests {
     }
 
     #[test]
+    fn consensus_engine_matches_core_bip341_keypath_vector() {
+        // Bitcoin Core v31.1 src/test/data/bip341_wallet_vectors.json. This
+        // transaction mixes seven Taproot key-path spends with one P2PKH and
+        // one P2WPKH spend, exercising all Taproot sighash modes and the full
+        // spent-output context passed across the libbitcoinconsensus boundary.
+        let raw = concat!(
+            "020000000001097de20cbff686da83a54981d2b9bab3586f4ca7e48f57f5b55963115f3b334e9c010000000000000000d7b7cab57b1393ace2d064f4d4a2cb8af6def61273e127517d44759b6dafdd990000000000fffffffff8e1f583384333689228c5d28eac13366be082dc57441760d957275419a41842000000006b4830450221008f3b8f8f0537c420654d2283673a761b7ee2ea3c130753103e08ce79201cf32a022079e7ab904a1980ef1c5890b648c8783f4d10103dd62f740d13daa79e298d50c201210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798fffffffff0689180aa63b30cb162a73c6d2a38b7eeda2a83ece74310fda0843ad604853b0100000000feffffffaa5202bdf6d8ccd2ee0f0202afbbb7461d9264a25e5bfd3c5a52ee1239e0ba6c0000000000feffffff956149bdc66faa968eb2be2d2faa29718acbfe3941215893a2a3446d32acd050000000000000000000e664b9773b88c09c32cb70a2a3e4da0ced63b7ba3b22f848531bbb1d5d5f4c94010000000000000000e9aa6b8e6c9de67619e6a3924ae25696bb7b694bb677a632a74ef7eadfd4eabf0000000000ffffffff",
+            "a778eb6a263dc090464cd125c466b5a99667720b1c110468831d058aa1b82af10100000000ffffffff0200ca9a3b000000001976a91406afd46bcdfd22ef94ac122aa11f241244a37ecc88ac807840cb0000000020ac9a87f5594be208f8532db38cff670c450ed2fea8fcdefcc9a663f78bab962b0141ed7c1647cb97379e76892be0cacff57ec4a7102aa24296ca39af7541246d8ff14d38958d4cc1e2e478e4d4a764bbfd835b16d4e314b72937b29833060b87276c030141052aedffc554b41f52b521071793a6b88d6dbca9dba94cf34c83696de0c1ec35ca9c5ed4ab28059bd606a4f3a657eec0bb96661d42921b5f50a95ad33675b54f83000141ff45f742a876139946a149ab4d9185574b98dc919d2eb6754f8abaa59d18b025637a3aa043b91817739554f4ed2026cf8022dbd83e351ce1fabc272841d2510a010140b4010dd48a617db09926f729e79c33ae0b4e94b79f04a1ae93ede6315eb3669de185a17d2b0ac9ee09fd4c64b678a0b61a0a86fa888a273c8511be83bfd6810f0247304402202b795e4de72646d76eab3f0ab27dfa30b810e856ff3a46c9a702df53bb0d8cc302203ccc4d822edab5f35caddb10af1be93583526ccfbade4b4ead350781e2f8adcd012102f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+            "0141a3785919a2ce3c4ce26f298c3d51619bc474ae24014bcdd31328cd8cfbab2eff3395fa0a16fe5f486d12f22a9cedded5ae74feb4bbe5351346508c5405bcfee0020141ea0c6ba90763c2d3a296ad82ba45881abb4f426b3f87af162dd24d5109edc1cdd11915095ba47c3a9963dc1e6c432939872bc49212fe34c632cd3ab9fed429c4820141bbc9584a11074e83bc8c6759ec55401f0ae7b03ef290c3139814f545b58a9f8127258000874f44bc46db7646322107d4d86aec8e73b8719a61fff761d75b5dd9810065cd1d"
+        );
+        let transaction: Transaction =
+            bitcoin::consensus::deserialize(&hex::decode(raw).unwrap()).unwrap();
+        let previous_outputs = [
+            (
+                420_000_000,
+                "512053a1f6e454df1aa2776a2814a721372d6258050de330b3c6d10ee8f4e0dda343",
+            ),
+            (
+                462_000_000,
+                "5120147c9c57132f6e7ecddba9800bb0c4449251c92a1e60371ee77557b6620f3ea3",
+            ),
+            (
+                294_000_000,
+                "76a914751e76e8199196d454941c45d1b3a323f1433bd688ac",
+            ),
+            (
+                504_000_000,
+                "5120e4d810fd50586274face62b8a807eb9719cef49c04177cc6b76a9a4251d5450e",
+            ),
+            (
+                630_000_000,
+                "512091b64d5324723a985170e4dc5a0f84c041804f2cd12660fa5dec09fc21783605",
+            ),
+            (378_000_000, "00147dd65592d0ab2fe0d0257d571abf032cd9db93dc"),
+            (
+                672_000_000,
+                "512075169f4001aa68f15bbed28b218df1d0a62cbbcf1188c6665110c293c907b831",
+            ),
+            (
+                546_000_000,
+                "5120712447206d7a5238acc7ff53fbe94a3b64539ad291c7cdbc490b7577e4b17df5",
+            ),
+            (
+                588_000_000,
+                "512077e30a5522dd9f894c3f8b8bd4c4b2cf82ca7da8a3ea6a239655c39c050ab220",
+            ),
+        ]
+        .map(|(value, script)| TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::from_bytes(hex::decode(script).unwrap()),
+        });
+        let flags = bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT | bitcoinconsensus::VERIFY_TAPROOT;
+
+        validate_transaction_scripts_with_flags(&transaction, &previous_outputs, flags).unwrap();
+
+        let mut corrupted = transaction;
+        let mut signature = corrupted.input[0].witness.iter().next().unwrap().to_vec();
+        signature[0] ^= 1;
+        corrupted.input[0].witness = Witness::from_slice(&[signature]);
+        assert!(
+            validate_transaction_scripts_with_flags(&corrupted, &previous_outputs, flags).is_err()
+        );
+    }
+
+    #[test]
+    #[ignore = "generate with contrib/generate_core_taproot_assets.py and set CORE_TAPROOT_ASSETS"]
+    fn consensus_engine_matches_generated_core_taproot_assets() {
+        let path = std::env::var("CORE_TAPROOT_ASSETS").expect("CORE_TAPROOT_ASSETS is required");
+        let vectors: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let vectors = vectors.as_array().unwrap();
+
+        for vector in vectors {
+            let comment = vector["comment"].as_str().unwrap();
+            let raw = hex::decode(vector["tx"].as_str().unwrap()).unwrap();
+            let transaction: Transaction = bitcoin::consensus::deserialize(&raw).unwrap();
+            let previous_outputs = vector["prevouts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|output| {
+                    bitcoin::consensus::deserialize(&hex::decode(output.as_str().unwrap()).unwrap())
+                        .unwrap()
+                })
+                .collect::<Vec<TxOut>>();
+            let input = usize::try_from(vector["index"].as_u64().unwrap()).unwrap();
+            let flags = bitcoinconsensus::VERIFY_ALL_PRE_TAPROOT
+                | if vector["flags"].as_str().unwrap().contains("TAPROOT") {
+                    bitcoinconsensus::VERIFY_TAPROOT
+                } else {
+                    0
+                };
+
+            let apply_satisfaction = |name: &str| {
+                let mut candidate = transaction.clone();
+                let satisfaction = &vector[name];
+                candidate.input[input].script_sig = ScriptBuf::from_bytes(
+                    hex::decode(satisfaction["scriptSig"].as_str().unwrap()).unwrap(),
+                );
+                let witness = satisfaction["witness"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| hex::decode(item.as_str().unwrap()).unwrap())
+                    .collect::<Vec<_>>();
+                candidate.input[input].witness = Witness::from_slice(&witness);
+                candidate
+            };
+
+            let success = apply_satisfaction("success");
+            assert!(
+                validate_transaction_scripts_with_flags(&success, &previous_outputs, flags).is_ok(),
+                "Core Taproot success vector failed: {comment}"
+            );
+            if vector.get("failure").is_some() {
+                let failure = apply_satisfaction("failure");
+                assert!(
+                    validate_transaction_scripts_with_flags(&failure, &previous_outputs, flags)
+                        .is_err(),
+                    "Core Taproot failure vector passed: {comment}"
+                );
+            }
+        }
+
+        assert!(vectors.len() >= 2_800);
+    }
+
+    #[test]
     fn p2sh_sigops_ignore_non_push_only_script_sigs() {
         let redeem_script = ScriptBuf::from_bytes(vec![bitcoin::opcodes::all::OP_CHECKSIG.to_u8()]);
         let previous = TxOut {

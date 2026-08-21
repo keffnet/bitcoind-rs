@@ -1958,6 +1958,7 @@ impl PeerManager {
             "loaded native block-relay-only anchors"
         );
         for endpoint in anchor_endpoints {
+            info!("Trying to make an anchor connection to {endpoint}");
             spawn_outbound_loop(
                 self.node.clone(),
                 endpoint,

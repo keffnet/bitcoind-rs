@@ -4929,7 +4929,8 @@ fn add_connection(node: &Arc<Node>, params: &Value) -> Result<Value> {
         bail!("addconnection is only available on regtest")
     }
     let address_string = param::<String>(params, 0)?;
-    let address = parse_socket_address(&address_string)?;
+    let endpoint = parse_node_endpoint(node, &address_string)
+        .map_err(|error| anyhow!("invalid network address {address_string}: {error}"))?;
     let requested_connection_type = param::<String>(params, 1)?;
     if !matches!(
         requested_connection_type.as_str(),
@@ -4948,7 +4949,7 @@ fn add_connection(node: &Arc<Node>, params: &Value) -> Result<Value> {
         "feeler" => "feeler",
         _ => unreachable!("connection type was validated above"),
     };
-    node.request_add_connection_with_type(address, transport_v2, connection_type);
+    node.request_add_connection_with_type(endpoint, transport_v2, connection_type);
     Ok(json!({
         "address": address_string,
         "connection_type": requested_connection_type,
@@ -5224,12 +5225,6 @@ fn clear_banned(node: &Arc<Node>) -> Result<Value> {
         node.unban_network_address(&entry.endpoint)?;
     }
     Ok(Value::Null)
-}
-
-fn parse_socket_address(value: &str) -> Result<SocketAddr> {
-    value
-        .parse()
-        .map_err(|error| anyhow!("invalid network address {value}: {error}"))
 }
 
 fn parse_node_endpoint(node: &Arc<Node>, value: &str) -> Result<NetworkEndpoint> {
@@ -25372,6 +25367,18 @@ mod tests {
                 &node,
                 "addconnection",
                 &json!(["127.0.0.1:18446", "feeler", true]),
+            )
+            .is_ok()
+        );
+        assert!(
+            dispatch_method(
+                &node,
+                "addconnection",
+                &json!([
+                    "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:18446",
+                    "block-relay-only",
+                    false
+                ]),
             )
             .is_ok()
         );

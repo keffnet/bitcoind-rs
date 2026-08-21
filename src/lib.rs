@@ -7516,12 +7516,12 @@ impl Node {
 
     pub(crate) fn request_add_connection_with_type(
         &self,
-        address: SocketAddr,
+        endpoint: NetworkEndpoint,
         transport_v2: bool,
         connection_type: &'static str,
     ) {
         self.request_one_try_endpoint_with_connection_type_mode(
-            NetworkEndpoint::from_socket(address),
+            endpoint,
             Some(transport_v2),
             connection_type,
             true,

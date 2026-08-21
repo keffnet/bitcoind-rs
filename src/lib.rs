@@ -95,6 +95,110 @@ pub(crate) const MIN_DISK_SPACE_BYTES: u64 = 50 * 1024 * 1024;
 const PERIODIC_DISK_SPACE_RESERVE_BYTES: u64 = 50 * 1024 * 1024;
 const DISK_SPACE_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
+// Bitcoin Core reserves 150 descriptors for LevelDB and one for message
+// capture on Unix. Keep the same baseline even though the native storage
+// engine has a different descriptor profile, so -maxconnections behaves
+// predictably under the same process limits.
+#[cfg(windows)]
+const MIN_DATABASE_FILE_DESCRIPTORS: usize = 0;
+#[cfg(not(windows))]
+const MIN_DATABASE_FILE_DESCRIPTORS: usize = 150;
+const MESSAGE_CAPTURE_FILE_DESCRIPTORS: usize = 1;
+
+fn minimum_required_file_descriptors(bind_count: usize) -> usize {
+    MIN_DATABASE_FILE_DESCRIPTORS
+        .saturating_add(MESSAGE_CAPTURE_FILE_DESCRIPTORS)
+        .saturating_add(p2p::MAX_ADDNODE_CONNECTIONS)
+        .saturating_add(bind_count.max(1))
+}
+
+fn requested_file_descriptor_limit(
+    max_peers: usize,
+    bind_count: usize,
+    private_broadcast: bool,
+) -> usize {
+    let private_descriptors = if private_broadcast {
+        p2p::MAX_PRIVATE_BROADCAST_CONNECTIONS
+    } else {
+        0
+    };
+    minimum_required_file_descriptors(bind_count)
+        .saturating_add(max_peers)
+        .saturating_add(private_descriptors)
+}
+
+fn max_peers_for_file_descriptor_limit(
+    available: usize,
+    requested_max_peers: usize,
+    bind_count: usize,
+) -> Result<usize> {
+    let required = minimum_required_file_descriptors(bind_count);
+    if available < required {
+        bail!("Not enough file descriptors available. {available} available, {required} required.");
+    }
+    Ok(requested_max_peers.min(available - required))
+}
+
+#[cfg(unix)]
+fn raise_file_descriptor_limit(minimum: usize) -> usize {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` points to a valid writable rlimit structure.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        // Match Core's fallback: if the limit cannot be queried, assume the
+        // requested capacity is available and let individual opens report a
+        // concrete operating-system error if that assumption is wrong.
+        return minimum;
+    }
+    let requested = libc::rlim_t::try_from(minimum).unwrap_or(libc::RLIM_INFINITY);
+    if limit.rlim_cur < requested {
+        limit.rlim_cur = requested.min(limit.rlim_max);
+        // SAFETY: both calls use the valid RLIMIT_NOFILE resource and a live
+        // rlimit structure. Failure is intentionally followed by a readback.
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) };
+        let _ = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    }
+    usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX)
+}
+
+#[cfg(windows)]
+fn raise_file_descriptor_limit(_minimum: usize) -> usize {
+    // Match Core's Windows compatibility value.
+    2_048
+}
+
+#[cfg(not(any(unix, windows)))]
+fn raise_file_descriptor_limit(minimum: usize) -> usize {
+    minimum
+}
+
+fn configure_file_descriptor_limit(config: &mut Config) -> Result<()> {
+    let bind_count = if config.listen {
+        config
+            .p2p_binds
+            .len()
+            .saturating_add(config.peer_permissions.whitebind.len())
+    } else {
+        0
+    };
+    let requested_max_peers = config.max_peers;
+    let target =
+        requested_file_descriptor_limit(requested_max_peers, bind_count, config.private_broadcast);
+    let available = raise_file_descriptor_limit(target);
+    info!("Using {available} file descriptors");
+    config.max_peers =
+        max_peers_for_file_descriptor_limit(available, requested_max_peers, bind_count)?;
+    if config.max_peers < requested_max_peers {
+        warn!(
+            "Reducing -maxconnections from {requested_max_peers} to {}, because of system limitations.",
+            config.max_peers
+        );
+    }
+    Ok(())
+}
+
 fn disk_space_is_sufficient(available: u64, additional: u64) -> bool {
     available >= MIN_DISK_SPACE_BYTES.saturating_add(additional)
 }
@@ -1870,9 +1974,10 @@ impl Node {
     /// set during startup. The daemon uses this to make synchronous storage
     /// recovery and block replay interruptible before services are running.
     pub fn open_with_shutdown(
-        config: Config,
+        mut config: Config,
         shutdown_requested: Arc<AtomicBool>,
     ) -> Result<Arc<Self>> {
+        configure_file_descriptor_limit(&mut config)?;
         fs::create_dir_all(&config.datadir)
             .with_context(|| format!("creating data directory {}", config.datadir.display()))?;
         let network_datadir = if network_data_dir_name(config.network).is_empty() {
@@ -8696,6 +8801,27 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         ensure_disk_space(directory.path(), 0).unwrap();
+    }
+
+    #[test]
+    fn file_descriptor_limits_match_core_connection_reservations() {
+        assert_eq!(minimum_required_file_descriptors(0), 160);
+        assert_eq!(minimum_required_file_descriptors(3), 162);
+        assert_eq!(requested_file_descriptor_limit(125, 3, false), 287);
+        assert_eq!(requested_file_descriptor_limit(125, 3, true), 351);
+        assert_eq!(
+            max_peers_for_file_descriptor_limit(256, 125, 3).unwrap(),
+            94
+        );
+        assert_eq!(
+            max_peers_for_file_descriptor_limit(512, 125, 3).unwrap(),
+            125
+        );
+        let error = max_peers_for_file_descriptor_limit(159, 125, 0).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Not enough file descriptors available. 159 available, 160 required."
+        );
     }
 
     #[test]

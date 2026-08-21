@@ -306,13 +306,13 @@ const FEELER_INTERVAL: Duration = Duration::from_secs(2 * 60);
 const AUTOMATIC_OUTBOUND_RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Core keeps manually added connections in a separate, bounded pool rather
 /// than consuming automatic `-maxconnections` slots.
-const MAX_ADDNODE_CONNECTIONS: usize = 8;
+pub(crate) const MAX_ADDNODE_CONNECTIONS: usize = 8;
 const MAX_OUTBOUND_FULL_RELAY_CONNECTIONS: usize = 8;
 const MAX_BLOCK_RELAY_ONLY_CONNECTIONS: usize = 2;
 const MAX_FEELER_CONNECTIONS: usize = 1;
 /// Private broadcast connections are short-lived and have their own limit in
 /// Core, independent of ordinary peer slots.
-const MAX_PRIVATE_BROADCAST_CONNECTIONS: usize = 64;
+pub(crate) const MAX_PRIVATE_BROADCAST_CONNECTIONS: usize = 64;
 const INVENTORY_BROADCAST_TARGET: usize = 70;
 const INVENTORY_BROADCAST_MAX: usize = 1_000;
 const BLOCK_RELAY_INTERVAL: Duration = Duration::from_millis(100);

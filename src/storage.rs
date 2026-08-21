@@ -89,6 +89,7 @@ struct UtxoReadCache {
     bytes: usize,
     limit: usize,
     next_generation: u64,
+    complete: bool,
 }
 
 impl Default for UtxoReadCache {
@@ -100,6 +101,7 @@ impl Default for UtxoReadCache {
             bytes: 0,
             limit: 0,
             next_generation: 0,
+            complete: false,
         }
     }
 }
@@ -114,7 +116,6 @@ impl UtxoReadCache {
         self.entry_count
     }
 
-    #[cfg(test)]
     fn contains_key(&self, outpoint: &OutPoint) -> bool {
         self.entries[Self::shard_index(outpoint)].contains_key(outpoint)
     }
@@ -195,6 +196,7 @@ impl UtxoReadCache {
         self.order.clear();
         self.entry_count = 0;
         self.bytes = 0;
+        self.complete = false;
     }
 
     fn trim(&mut self) {
@@ -211,6 +213,7 @@ impl UtxoReadCache {
             if is_current && let Some((entry, _)) = self.entries[shard].remove(&outpoint) {
                 self.bytes = self.bytes.saturating_sub(stored_utxo_cache_bytes(&entry));
                 self.entry_count = self.entry_count.saturating_sub(1);
+                self.complete = false;
             }
         }
         if self.bytes > self.limit {
@@ -235,6 +238,7 @@ impl UtxoReadCache {
                     }
                 });
             }
+            self.complete = false;
         }
         self.compact_order_if_needed();
     }
@@ -2352,6 +2356,7 @@ impl UtxoStore {
             cache.insert_stationary(decode_outpoint(&key)?, decode_stored_utxo(&value)?);
         }
         cache.trim();
+        cache.complete = self.pending.is_empty() && cache.len() == self.entry_count;
         Ok(Some((cache.len(), cache.bytes)))
     }
 
@@ -2373,6 +2378,14 @@ impl UtxoStore {
         if let Some(entry) = self.pending.get(outpoint) {
             return Ok(entry.is_some());
         }
+        let read_cache = self.read_cache.lock();
+        if read_cache.contains_key(outpoint) {
+            return Ok(true);
+        }
+        if read_cache.complete {
+            return Ok(false);
+        }
+        drop(read_cache);
         self.coins
             .contains_key(encode_outpoint(outpoint))
             .context("looking up UTXO key")
@@ -2389,9 +2402,14 @@ impl UtxoStore {
         if let Some(entry) = self.pending.get(outpoint) {
             return Ok(entry.clone());
         }
-        if let Some(entry) = self.read_cache.lock().get(outpoint) {
+        let mut read_cache = self.read_cache.lock();
+        if let Some(entry) = read_cache.get(outpoint) {
             return Ok(Some(entry));
         }
+        if read_cache.complete {
+            return Ok(None);
+        }
+        drop(read_cache);
         let Some(bytes) = self
             .coins
             .get(encode_outpoint(outpoint))
@@ -4576,9 +4594,11 @@ mod tests {
         }
         assert!(cache.order.is_empty());
         assert!(cache.bytes > cache.limit);
+        cache.complete = true;
 
         cache.trim();
         assert!(cache.order.is_empty());
+        assert!(!cache.complete);
         assert!(cache.bytes <= cache.limit.saturating_mul(7) / 8);
         assert_eq!(
             cache.len(),
@@ -4593,6 +4613,43 @@ mod tests {
                 .map(|(entry, _)| stored_utxo_cache_bytes(entry))
                 .sum::<usize>()
         );
+    }
+
+    #[test]
+    fn complete_utxo_cache_answers_absence_and_tracks_pending_mutations() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = OutPoint::new(Txid::from_byte_array([21; 32]), 0);
+        let second = OutPoint::new(Txid::from_byte_array([22; 32]), 1);
+        let missing = OutPoint::new(Txid::from_byte_array([23; 32]), 0);
+        let entry = |height| StoredUtxo {
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            },
+            height,
+            median_time_past: height,
+            coinbase: false,
+        };
+        let mut store = UtxoStore::open(directory.path()).unwrap();
+        store.configure_cache_size_mib(4);
+        store.apply_batch(&[], &[(first, entry(1))]).unwrap();
+        store.read_cache.lock().clear();
+        assert_eq!(store.warm_complete_cache_if_fits().unwrap().unwrap().0, 1);
+        assert!(store.read_cache.lock().complete);
+        assert!(store.contains(&first).unwrap());
+        assert!(!store.contains(&missing).unwrap());
+        assert_eq!(store.get(&missing).unwrap(), None);
+
+        store
+            .apply_validated_batch_unsynced(&[first], &[(second, entry(2))])
+            .unwrap();
+        assert!(!store.contains(&first).unwrap());
+        assert!(store.contains(&second).unwrap());
+        assert_eq!(store.get(&second).unwrap(), Some(entry(2)));
+        store.flush().unwrap();
+        assert!(store.read_cache.lock().complete);
+        assert!(!store.contains(&first).unwrap());
+        assert!(store.contains(&second).unwrap());
     }
 
     #[test]

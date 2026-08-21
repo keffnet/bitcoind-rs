@@ -10,6 +10,7 @@ pub mod fee_estimator;
 pub mod i2p;
 mod ipc;
 pub mod mempool;
+mod metrics;
 pub mod muhash;
 pub mod p2p;
 pub mod portmap;
@@ -1925,6 +1926,7 @@ pub struct Node {
     peer_manager_requests:
         parking_lot::RwLock<Option<tokio::sync::mpsc::UnboundedSender<p2p::PeerManagerRequest>>>,
     pub(crate) electrum_peers: parking_lot::Mutex<electrum::ElectrumPeerRegistry>,
+    pub(crate) electrum_metrics: metrics::ElectrumMetrics,
     private_broadcasts: parking_lot::Mutex<HashMap<Wtxid, PrivateBroadcastEntry>>,
     compact_extra_transactions: parking_lot::Mutex<CompactExtraTransactions>,
     recently_rejected_transactions: parking_lot::Mutex<RecentlyRejectedTransactions>,
@@ -2468,6 +2470,7 @@ impl Node {
         };
         let mempool_stats = MempoolStats::new(config.stats_enable, config.stats_max_memory_target);
         let electrum_address = config.electrum_bind;
+        let electrum_metrics = metrics::ElectrumMetrics::new()?;
         let node = Arc::new(Self {
             config,
             _data_dir_lock: data_dir_lock,
@@ -2533,6 +2536,7 @@ impl Node {
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
             peer_manager_requests: parking_lot::RwLock::new(None),
             electrum_peers: parking_lot::Mutex::new(electrum::ElectrumPeerRegistry::default()),
+            electrum_metrics,
             private_broadcasts: parking_lot::Mutex::new(HashMap::new()),
             compact_extra_transactions: parking_lot::Mutex::new(CompactExtraTransactions::new(
                 compact_extra_limit,
@@ -7836,7 +7840,9 @@ impl Node {
         self: Arc<Self>,
         startup_sender: Option<oneshot::Sender<()>>,
     ) -> Result<()> {
-        let startup_services = 4 + usize::from(!self.config.ipc_bind.is_empty());
+        let startup_services = 4
+            + usize::from(!self.config.ipc_bind.is_empty())
+            + usize::from(self.config.electrum_monitoring_bind().is_some());
         let startup = startup_sender.map(|sender| StartupLatch::new(sender, startup_services));
         info!("scheduler thread start");
         info!("Loading banlist");
@@ -7859,6 +7865,7 @@ impl Node {
         let p2p = p2p::PeerManager::new(self.clone());
         let rpc = rpc::RpcServer::new(self.clone());
         let electrum = electrum::ElectrumServer::new(self.clone());
+        let monitoring = metrics::MonitoringServer::new(self.clone());
         let mut ipc_task = ipc.map(|server| tokio::task::spawn_local(server.run()));
         let mut zmq_task = tokio::spawn(zmq::run_with_startup(
             self.config.zmq.clone(),
@@ -7871,6 +7878,7 @@ impl Node {
             p2p = %self.config.p2p_bind,
             rpc = ?self.config.rpc_bind,
             electrum = ?self.config.electrum_bind,
+            monitoring = ?self.config.electrum_monitoring_bind(),
             ipc = ?self.config.ipc_bind,
             "starting wallet-free Bitcoin node"
         );
@@ -7878,7 +7886,8 @@ impl Node {
         info!("init message: Starting network threads");
         let mut p2p_task = tokio::spawn(p2p.run_with_startup(startup.clone()));
         let mut rpc_task = tokio::spawn(rpc.run_with_startup(startup.clone()));
-        let mut electrum_task = tokio::spawn(electrum.run_with_startup(startup));
+        let mut electrum_task = tokio::spawn(electrum.run_with_startup(startup.clone()));
+        let mut monitoring_task = tokio::spawn(monitoring.run_with_startup(startup));
         run_notify_command(self.config.startup_notify.as_deref(), None);
         let background_node = self.clone();
         let background_validation_task = tokio::spawn(async move {
@@ -7975,6 +7984,9 @@ impl Node {
             result = &mut electrum_task => result
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result),
+            result = &mut monitoring_task => result
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result),
             result = &mut zmq_task => result
                 .map_err(anyhow::Error::from)
                 .and_then(|result| result),
@@ -8025,6 +8037,7 @@ impl Node {
         }
         rpc_task.abort();
         electrum_task.abort();
+        monitoring_task.abort();
         zmq_task.abort();
         background_validation_task.abort();
         mempool_expiry_task.abort();

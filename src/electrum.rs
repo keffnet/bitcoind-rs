@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
@@ -353,9 +354,11 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
     let mut last_chain_tip = node.chain.read().best_hash();
     loop {
         line.clear();
+        let _select_timer = node.electrum_metrics.server_loop_timer("select");
         tokio::select! {
             _ = node.wait_for_shutdown() => return Ok(()),
             event = events.recv() => {
+                let _notify_timer = node.electrum_metrics.server_loop_timer("notify");
                 let (tip, affected_script_hashes) = match event {
                     Ok(event) => (event.tip, event.affected_script_hashes),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -405,6 +408,7 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                     .await?;
             }
             event = mempool_events.recv() => {
+                let _notify_timer = node.electrum_metrics.server_loop_timer("notify");
                 match event {
                     Ok(event) => {
                         send_status_notifications(
@@ -430,8 +434,10 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                 }
             }
             read = read_line_limited(&mut reader, &mut line, MAX_LINE_SIZE) => {
+                let _handle_timer = node.electrum_metrics.server_loop_timer("handle");
                 let bytes = read?;
                 if bytes == 0 { return Ok(()); }
+                node.electrum_metrics.observe_server_batch_size("recv", 1);
                 let requests: Value = match serde_json::from_slice(&line) {
                     Ok(requests) => requests,
                     Err(_) => {
@@ -454,12 +460,19 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         let mut encoded_batch = vec![b'['];
                         let mut response_count = 0usize;
                         let mut response_too_large = false;
+                        let optimized_started = Instant::now();
                         let optimized = process_scripthash_subscription_batch(
                             &node,
                             batch,
                             &mut subscriptions,
                             &session,
                         );
+                        if optimized.is_some() {
+                            node.electrum_metrics.observe_rpc_duration(
+                                "blockchain.scripthash.subscribe:multi",
+                                optimized_started.elapsed(),
+                            );
+                        }
                         if let Some(responses) = optimized {
                             for response in responses.into_iter().flatten() {
                                 let encoded_response = encode_bounded_electrum_response(response)?;
@@ -747,6 +760,7 @@ fn process_electrum_request(
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return Ok(Some(invalid_request_response()));
     };
+    let _rpc_timer = node.electrum_metrics.rpc_timer(method);
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let params = request
         .get("params")

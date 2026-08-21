@@ -28,6 +28,7 @@ num-bigint = "0.4"
 num-traits = "0.2"
 miniscript = "13.1"
 parking_lot = "0.12"
+prometheus = "0.14"
 rand = "0.9"
 rayon = "1.11"
 serde = { version = "1.0", features = ["derive"] }

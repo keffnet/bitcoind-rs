@@ -1630,6 +1630,15 @@ pub struct Args {
     )]
     pub electrum: String,
 
+    /// Prometheus monitoring listener compatible with electrs.
+    #[arg(
+        long = "monitoring-addr",
+        alias = "monitoring_addr",
+        value_name = "IP:PORT",
+        value_parser = parse_socket_addr
+    )]
+    pub monitoring_addr: Option<SocketAddr>,
+
     #[arg(long, default_value_t = false)]
     pub rest: bool,
 
@@ -2914,13 +2923,21 @@ fn config_entry_to_arg(entry: ConfigFileEntry) -> Option<OsString> {
             "--pid=bitcoind.pid"
         }));
     }
+    if entry.key == "monitoring_addr" {
+        return Some(OsString::from(format!("--monitoring-addr={}", entry.value)));
+    }
     Some(OsString::from(format!("--{}={}", entry.key, entry.value)))
 }
 
 pub fn is_known_config_option(key: &str) -> bool {
     matches!(
         key,
-        "chain" | "signetchallenge" | "maxconnections" | "nopid" | "peerbloomfilters"
+        "chain"
+            | "signetchallenge"
+            | "maxconnections"
+            | "nopid"
+            | "peerbloomfilters"
+            | "monitoring_addr"
     ) || Args::command()
         .get_arguments()
         .any(|argument| argument.get_long().is_some_and(|long| long == key))
@@ -3184,6 +3201,8 @@ pub struct Config {
     pub rpc_threads: usize,
     pub rpc_work_queue: usize,
     pub electrum_bind: Option<SocketAddr>,
+    #[cfg(not(test))]
+    pub(crate) electrum_monitoring_bind: SocketAddr,
     pub rest: bool,
     pub ipc_bind: Vec<String>,
     pub seed_nodes: Vec<NetworkEndpoint>,
@@ -3363,6 +3382,17 @@ fn parse_truc_policy(value: Option<&str>) -> Result<TrucPolicy> {
 }
 
 impl Config {
+    pub(crate) fn electrum_monitoring_bind(&self) -> Option<SocketAddr> {
+        #[cfg(not(test))]
+        {
+            Some(self.electrum_monitoring_bind)
+        }
+        #[cfg(test)]
+        {
+            None
+        }
+    }
+
     pub(crate) fn max_stale_outbound(&self) -> Option<usize> {
         #[cfg(test)]
         {
@@ -3414,6 +3444,10 @@ impl Config {
             .then(|| parse_socket_addr(&args.electrum))
             .transpose()
             .map_err(|error| anyhow!("Invalid Electrum address: {error}"))?;
+        #[cfg(not(test))]
+        let electrum_monitoring_bind = args
+            .monitoring_addr
+            .unwrap_or_else(|| default_electrum_monitoring_addr(network));
         if args.datadir_explicit && !args.datadir.is_dir() {
             bail!(
                 "Specified data directory \"{}\" does not exist.",
@@ -4117,6 +4151,8 @@ impl Config {
             rpc_threads,
             rpc_work_queue,
             electrum_bind,
+            #[cfg(not(test))]
+            electrum_monitoring_bind,
             rest: args.rest,
             ipc_bind: args.ipc_bind,
             seed_nodes,
@@ -4301,6 +4337,17 @@ fn default_rpc_port(network: Network) -> u16 {
         Network::Signet => 38332,
         Network::Regtest => 18443,
     }
+}
+
+pub(crate) fn default_electrum_monitoring_addr(network: Network) -> SocketAddr {
+    let port = match network {
+        Network::Bitcoin => 4_224,
+        Network::Testnet => 14_224,
+        Network::Testnet4 => 44_224,
+        Network::Regtest => 24_224,
+        Network::Signet => 34_224,
+    };
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)
 }
 
 fn parse_check_blocks(value: &str) -> std::result::Result<u32, String> {
@@ -6254,6 +6301,37 @@ mod tests {
 
         let args = Args::try_parse_from(["bitcoind-rs"]).unwrap();
         assert_eq!(args.electrum, "127.0.0.1:30001");
+    }
+
+    #[test]
+    fn electrs_monitoring_addresses_are_network_scoped_and_configurable() {
+        assert_eq!(
+            default_electrum_monitoring_addr(Network::Bitcoin),
+            "127.0.0.1:4224".parse().unwrap()
+        );
+        assert_eq!(
+            default_electrum_monitoring_addr(Network::Testnet),
+            "127.0.0.1:14224".parse().unwrap()
+        );
+        assert_eq!(
+            default_electrum_monitoring_addr(Network::Testnet4),
+            "127.0.0.1:44224".parse().unwrap()
+        );
+        assert_eq!(
+            default_electrum_monitoring_addr(Network::Regtest),
+            "127.0.0.1:24224".parse().unwrap()
+        );
+        assert_eq!(
+            default_electrum_monitoring_addr(Network::Signet),
+            "127.0.0.1:34224".parse().unwrap()
+        );
+
+        let args =
+            Args::try_parse_from(["bitcoind-rs", "--monitoring-addr=127.0.0.1:19422"]).unwrap();
+        assert_eq!(
+            args.monitoring_addr,
+            Some("127.0.0.1:19422".parse().unwrap())
+        );
     }
 
     #[test]

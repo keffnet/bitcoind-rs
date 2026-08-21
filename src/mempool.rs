@@ -1166,6 +1166,10 @@ impl Mempool {
         self.entries.get(txid)
     }
 
+    pub(crate) fn iter_entries(&self) -> impl Iterator<Item = &MempoolEntry> {
+        self.entries.values()
+    }
+
     fn scripthash_index_memory_usage_for(&self, txid: &Txid) -> usize {
         let Some(scripts) = self.scripts_by_transaction.get(txid) else {
             return 0;

@@ -61,7 +61,7 @@ fn main() -> ExitCode {
 
     let invocation = match command_invocation(command_line) {
         Ok(invocation) => invocation,
-        Err(error) => return wrapper_error(&error),
+        Err(error) => return invocation_error(&error),
     };
     let executable = executable_path(invocation.executable);
     match Command::new(&executable)
@@ -82,6 +82,15 @@ fn main() -> ExitCode {
 fn wrapper_error(error: &str) -> ExitCode {
     eprintln!("Error: {error}\nTry 'bitcoin --help' for more information.");
     ExitCode::from(1)
+}
+
+fn invocation_error(error: &str) -> ExitCode {
+    if error.starts_with("Error parsing command line arguments: Invalid parameter ") {
+        eprintln!("Error: {error}");
+        ExitCode::from(1)
+    } else {
+        wrapper_error(error)
+    }
 }
 
 fn parse_command_line(

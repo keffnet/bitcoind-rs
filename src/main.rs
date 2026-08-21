@@ -29,6 +29,8 @@ use bitcoind_rs::{
     config::{Args, Config, ConfigFileArg, is_known_config_option, network_data_dir_name},
 };
 
+const CORE_NODE_VERSION: &str = "31.1.0";
+
 fn nested_core_startup_error(error: &anyhow::Error) -> Option<&bitcoind_rs::CoreStartupError> {
     error
         .chain()
@@ -91,14 +93,18 @@ fn run() -> Result<()> {
     let args = match Args::parse_with_config() {
         Ok(args) => args,
         Err(error) => {
-            if let Some(clap_error) = error.downcast_ref::<clap::Error>()
-                && matches!(
-                    clap_error.kind(),
-                    ClapErrorKind::DisplayHelp | ClapErrorKind::DisplayVersion
-                )
-            {
-                clap_error.print()?;
-                return Ok(());
+            if let Some(clap_error) = error.downcast_ref::<clap::Error>() {
+                match clap_error.kind() {
+                    ClapErrorKind::DisplayVersion => {
+                        print!("{}", daemon_version_banner(env!("CARGO_BIN_NAME")));
+                        return Ok(());
+                    }
+                    ClapErrorKind::DisplayHelp => {
+                        clap_error.print()?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
             }
             return Err(error);
         }
@@ -123,6 +129,10 @@ fn run() -> Result<()> {
         }
     };
     runtime.block_on(tokio::task::LocalSet::new().run_until(run_node(config, readiness)))
+}
+
+fn daemon_version_banner(executable: &str) -> String {
+    format!("Bitcoin Core daemon version v{CORE_NODE_VERSION} {executable}\n")
 }
 
 async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()> {
@@ -1011,6 +1021,17 @@ impl Drop for PidFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_banner_identifies_the_selected_node_executable() {
+        assert_eq!(
+            daemon_version_banner(env!("CARGO_BIN_NAME")),
+            format!(
+                "Bitcoin Core daemon version v31.1.0 {}\n",
+                env!("CARGO_BIN_NAME")
+            )
+        );
+    }
 
     #[test]
     fn pid_file_is_written_and_removed_by_owner() {

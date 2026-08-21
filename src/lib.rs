@@ -3562,6 +3562,8 @@ impl Node {
         let chain = self.chain.read();
         chain
             .transaction_location(&txid)
+            .ok()
+            .flatten()
             .is_some_and(|location| location.height >= chain.height().saturating_sub(1))
     }
 

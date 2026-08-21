@@ -16697,7 +16697,7 @@ fn add_prevout_details(
             .get(input_index)
             .ok_or_else(|| anyhow!("transaction undo is missing input {input_index}"))?;
         let (height, generated) =
-            if let Some(location) = chain.transaction_location(&input.previous_output.txid) {
+            if let Some(location) = chain.transaction_location(&input.previous_output.txid)? {
                 (location.height, location.transaction_index == 0)
             } else {
                 let (previous_transaction, location) = chain

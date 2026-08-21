@@ -1334,7 +1334,7 @@ fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
         // its funding block body has been removed.
         status.insert("funder_height".to_owned(), json!(entry.height));
     } else if confirmed_spender.is_some()
-        && let Some(location) = chain.transaction_location(&outpoint.txid)
+        && let Some(location) = chain.transaction_location(&outpoint.txid)?
     {
         // For a spent output, the durable spender index proves that this
         // outpoint existed even when pruning removed the funding transaction.

@@ -6,7 +6,7 @@
 //! corrupt index files fall back to a complete record scan.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions, create_dir_all, remove_file, rename};
+use std::fs::{File, OpenOptions, create_dir_all, remove_file};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,11 +21,14 @@ use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use fjall::{
+    CompressionType, Config as FjallConfig, Keyspace, PartitionCreateOptions, PartitionHandle,
+    PersistMode,
+};
 use hashbrown::HashMap as FastHashMap;
 use parking_lot::{Mutex, RwLock};
 use rand::random;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
 
 const MAX_STORED_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_UNDO_SIZE: usize = 4 * 1024 * 1024;
@@ -35,10 +38,6 @@ const MAX_STORED_ELECTRUM_BLOCK_SIZE: usize = 4 * 1024 * 1024;
 const MAX_STORED_ELECTRUM_HISTORY_SIZE: usize = 16 * 1024 * 1024;
 const MAX_STORED_TRANSACTION_INDEX_SIZE: usize = 8 * 1024 * 1024;
 const MAX_STORED_UTXO_SIZE: usize = 100 * 1024;
-const MIN_UTXO_COMPACTION_DATA_SIZE: u64 = 16 * 1024 * 1024;
-const MIN_UTXO_COMPACTION_STALE_SIZE: u64 = 8 * 1024 * 1024;
-const MIN_ELECTRUM_HISTORY_COMPACTION_DATA_SIZE: u64 = 16 * 1024 * 1024;
-const MIN_ELECTRUM_HISTORY_COMPACTION_STALE_SIZE: u64 = 8 * 1024 * 1024;
 const XOR_KEY_SIZE: usize = 8;
 const STORAGE_COMPRESSION_MAGIC: &[u8] = b"bitcoind-rs-zstd-v1\0";
 const STORAGE_COMPRESSION_HEADER_SIZE: usize = STORAGE_COMPRESSION_MAGIC.len() + 4;
@@ -46,16 +45,6 @@ const STORAGE_COMPRESSION_LEVEL: i32 = 6;
 const STORAGE_COMPRESSION_MIN_SIZE: usize = 256;
 const INDEX_HEADER_SIZE: u64 = 8;
 const INDEX_RECORD_SIZE: u64 = 44;
-const UTXO_DATA_MAGIC: &[u8] = b"bitcoind-rs-utxo-v1\0";
-const UTXO_INDEX_MAGIC: &[u8] = b"bitcoind-rs-utxo-index-v1\0";
-const ELECTRUM_HISTORY_DATA_MAGIC: &[u8] = b"bitcoind-rs-electrum-history-v1\0";
-const ELECTRUM_HISTORY_INDEX_MAGIC: &[u8] = b"bitcoind-rs-electrum-history-index-v1\0";
-const UTXO_PUT: u8 = 1;
-const UTXO_DELETE: u8 = 2;
-const UTXO_COMMIT: u8 = 3;
-const HISTORY_PUT: u8 = 1;
-const HISTORY_COMMIT: u8 = 2;
-const HISTORY_APPEND: u8 = 3;
 
 #[derive(Clone, Copy, Debug)]
 struct Record {
@@ -76,46 +65,19 @@ pub struct StoredUtxo {
     pub coinbase: bool,
 }
 
-pub type StoredElectrumHistory = Vec<(Txid, u32)>;
-
-/// Compact in-memory pointer into the append-only UTXO value log.
-///
-/// A normal UTXO record is below 100 KiB, so 17 bits are sufficient for its
-/// encoded length.  The remaining 47 bits address a value log up to 128 TiB.
-/// Keeping the pointer in one word matters at mainnet scale: the UTXO index
-/// has one entry per live outpoint, and the pointer is present in every hash
-/// table value.  The on-disk index format remains the existing u64 offset +
-/// u32 length encoding.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct UtxoLocation(u64);
-
-impl UtxoLocation {
-    const LENGTH_BITS: u32 = 17;
-    const LENGTH_MASK: u64 = (1 << Self::LENGTH_BITS) - 1;
-    const MAX_OFFSET: u64 = (1 << (u64::BITS - Self::LENGTH_BITS)) - 1;
-
-    fn new(offset: u64, length: u32) -> Result<Self> {
-        if length == 0 || u64::from(length) > Self::LENGTH_MASK {
-            bail!("UTXO record length does not fit compact location: {length}");
-        }
-        if offset > Self::MAX_OFFSET {
-            bail!("UTXO record offset does not fit compact location: {offset}");
-        }
-        Ok(Self((offset << Self::LENGTH_BITS) | u64::from(length)))
-    }
-
-    #[inline]
-    fn offset(self) -> u64 {
-        self.0 >> Self::LENGTH_BITS
-    }
-
-    #[inline]
-    fn length(self) -> u32 {
-        (self.0 & Self::LENGTH_MASK) as u32
-    }
+/// Complete coin metadata required to restore a spent output during a reorg.
+/// Keeping this in undo data avoids consulting a historical transaction
+/// index, matching the role of Core's undo coins while retaining the median
+/// time field used by this implementation's sequence-lock validation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredUndo {
+    pub output: TxOut,
+    pub height: u32,
+    pub median_time_past: u32,
+    pub coinbase: bool,
 }
 
-type UtxoIndexState = (FastHashMap<OutPoint, UtxoLocation>, u64, u64);
+pub type StoredElectrumHistory = Vec<(Txid, u32)>;
 
 #[derive(Default)]
 struct UtxoReadCache {
@@ -204,60 +166,10 @@ fn stored_utxo_cache_bytes(entry: &StoredUtxo) -> usize {
     64usize.saturating_add(entry.output.script_pubkey.len())
 }
 
-/// Compact in-memory pointer into the append-only Electrum history log.
-///
-/// History records are capped at 16 MiB.  Storing `length - 1` in 24 bits
-/// represents that full range, leaving 40 bits for a history log up to 1 TiB.
-/// The durable history index deliberately keeps its existing u64 offset and
-/// u32 length fields, so this optimization only changes resident memory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HistoryLocation(u64);
-
-impl HistoryLocation {
-    const LENGTH_BITS: u32 = 24;
-    const LENGTH_MASK: u64 = (1 << Self::LENGTH_BITS) - 1;
-    const MAX_LENGTH: u32 = (Self::LENGTH_MASK + 1) as u32;
-    const MAX_OFFSET: u64 = (1 << (u64::BITS - Self::LENGTH_BITS)) - 1;
-
-    fn new(offset: u64, length: u32) -> Result<Self> {
-        if length == 0 || length > Self::MAX_LENGTH {
-            bail!("Electrum history record length does not fit compact location: {length}");
-        }
-        if offset > Self::MAX_OFFSET {
-            bail!("Electrum history record offset does not fit compact location: {offset}");
-        }
-        Ok(Self((offset << Self::LENGTH_BITS) | u64::from(length - 1)))
-    }
-
-    #[inline]
-    fn offset(self) -> u64 {
-        self.0 >> Self::LENGTH_BITS
-    }
-
-    #[inline]
-    fn length(self) -> u32 {
-        ((self.0 & Self::LENGTH_MASK) + 1) as u32
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PendingHistoryOperation {
-    script_hash: [u8; 32],
-    location: HistoryLocation,
-}
-
-type HistoryIndexState = (FastHashMap<[u8; 32], HistoryLocation>, u64);
-
 #[derive(Clone, Debug)]
 enum PendingElectrumHistory {
     Replace(StoredElectrumHistory),
     Append(StoredElectrumHistory),
-}
-
-#[derive(Debug)]
-struct DecodedHistoryNode {
-    previous: Option<HistoryLocation>,
-    entries: StoredElectrumHistory,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -278,8 +190,8 @@ impl XorKey {
 /// still address records directly.  Compression is therefore applied before
 /// XOR obfuscation and independently for each record, which preserves random
 /// reads and makes a torn tail recoverable without a global decompression
-/// stream.  Small or incompressible values stay raw; the decoder accepts both
-/// forms so existing stores upgrade in place as new records are appended.
+/// stream. Small or incompressible values stay raw as part of the current
+/// record format.
 fn encode_storage_payload(payload: &[u8], max_size: usize) -> Result<Vec<u8>> {
     if payload.len() > max_size {
         bail!("storage payload is too large: {} bytes", payload.len());
@@ -895,7 +807,7 @@ impl BlockStore {
         self.serving_reader.get(hash)
     }
 
-    pub fn get_undo(&mut self, hash: &BlockHash) -> Result<Option<Vec<Vec<TxOut>>>> {
+    pub fn get_undo(&mut self, hash: &BlockHash) -> Result<Option<Vec<Vec<StoredUndo>>>> {
         let Some(record) = self.undo_index.get(hash).copied() else {
             return Ok(None);
         };
@@ -913,21 +825,25 @@ impl BlockStore {
         Ok(Some(undo))
     }
 
-    pub fn insert_undo(&mut self, hash: BlockHash, undo: &[Vec<TxOut>]) -> Result<()> {
+    pub fn insert_undo(&mut self, hash: BlockHash, undo: &[Vec<StoredUndo>]) -> Result<()> {
         self.insert_undo_with_sync(hash, undo, true)
     }
 
     /// Append undo data without forcing a filesystem sync for every record.
     /// Chain activation writes a complete candidate suffix as one batch and
     /// flushes the store after the new active state is durable.
-    pub fn insert_undo_unsynced(&mut self, hash: BlockHash, undo: &[Vec<TxOut>]) -> Result<()> {
+    pub fn insert_undo_unsynced(
+        &mut self,
+        hash: BlockHash,
+        undo: &[Vec<StoredUndo>],
+    ) -> Result<()> {
         self.insert_undo_with_sync(hash, undo, false)
     }
 
     fn insert_undo_with_sync(
         &mut self,
         hash: BlockHash,
-        undo: &[Vec<TxOut>],
+        undo: &[Vec<StoredUndo>],
         sync: bool,
     ) -> Result<()> {
         if self.undo_index.contains_key(&hash) {
@@ -1356,18 +1272,476 @@ pub struct CoinStatsStore {
     index: HashMap<BlockHash, Record>,
 }
 
-/// Durable transaction-ID lists keyed by block hash.
+const TXINDEX_BLOCKS_PARTITION_NAME: &str = "blocks";
+const TXINDEX_ALL_BLOCKS_PARTITION_NAME: &str = "all-indexed-blocks";
+const TXINDEX_ALL_PARTITION_NAME: &str = "all-transactions";
+const TXINDEX_ACTIVE_PARTITION_NAME: &str = "active-transactions";
+const TXINDEX_META_PARTITION_NAME: &str = "metadata";
+const META_BLOCK_COUNT: &[u8] = b"block-count";
+const META_ACTIVE_TIP: &[u8] = b"active-tip";
+
+/// A transaction's durable location. The block body remains authoritative
+/// for transaction bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoredTxLocation {
+    pub block_hash: BlockHash,
+    pub height: u32,
+    pub transaction_index: u32,
+}
+
+/// Optional, fully disk-backed transaction index.
 ///
-/// The optional Core-style txindex needs a transaction location for every
-/// stored block, but it does not need to duplicate transaction bodies. Keeping
-/// only the txids in a separate native sidecar lets a normal restart rebuild
-/// the in-memory location map without decoding every block record. The block
-/// store remains authoritative for the transaction bytes.
+/// The `all_transactions` partition implements Core-style `-txindex`.
+/// `active_transactions` provides best-chain lookups for wallet-free RPC,
+/// REST, and Electrum methods. Neither partition is loaded into a
+/// process-wide hash map.
 pub struct TransactionIndexStore {
     path: PathBuf,
-    file: File,
-    index_file: File,
-    index: HashMap<BlockHash, Record>,
+    keyspace: Keyspace,
+    blocks: PartitionHandle,
+    all_indexed_blocks: PartitionHandle,
+    all_transactions: PartitionHandle,
+    active_transactions: PartitionHandle,
+    metadata: PartitionHandle,
+    block_count: usize,
+}
+
+impl TransactionIndexStore {
+    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_cache(directory, DISK_INDEX_DEFAULT_CACHE_BYTES)
+    }
+
+    pub fn open_with_cache(directory: impl AsRef<Path>, cache_bytes: u64) -> Result<Self> {
+        let directory = directory.as_ref();
+        create_dir_all(directory).with_context(|| {
+            format!(
+                "creating transaction index directory {}",
+                directory.display()
+            )
+        })?;
+        let path = directory.join("database");
+        let keyspace = FjallConfig::new(&path)
+            .cache_size(cache_bytes.max(1024 * 1024))
+            .max_write_buffer_size(DISK_INDEX_DEFAULT_WRITE_BUFFER_BYTES)
+            .manual_journal_persist(true)
+            .open()
+            .with_context(|| format!("opening transaction database {}", path.display()))?;
+        let uncompressed = || PartitionCreateOptions::default().compression(CompressionType::None);
+        let blocks = keyspace.open_partition(TXINDEX_BLOCKS_PARTITION_NAME, uncompressed())?;
+        let all_indexed_blocks =
+            keyspace.open_partition(TXINDEX_ALL_BLOCKS_PARTITION_NAME, uncompressed())?;
+        let all_transactions =
+            keyspace.open_partition(TXINDEX_ALL_PARTITION_NAME, uncompressed())?;
+        let active_transactions =
+            keyspace.open_partition(TXINDEX_ACTIVE_PARTITION_NAME, uncompressed())?;
+        let metadata = keyspace.open_partition(TXINDEX_META_PARTITION_NAME, uncompressed())?;
+        let block_count = read_usize_metadata(&metadata, META_BLOCK_COUNT)?.unwrap_or(0);
+        if block_count == 0 && !blocks.is_empty()? {
+            bail!("transaction database is missing its exact block-count metadata");
+        }
+        if read_u64_metadata(&metadata, META_BLOCK_COUNT)?.is_none() {
+            metadata.insert(META_BLOCK_COUNT, 0u64.to_le_bytes().to_vec())?;
+            keyspace.persist(PersistMode::SyncAll)?;
+        }
+        Ok(Self {
+            path,
+            keyspace,
+            blocks,
+            all_indexed_blocks,
+            all_transactions,
+            active_transactions,
+            metadata,
+            block_count,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn len(&self) -> usize {
+        self.block_count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.block_count == 0
+    }
+
+    pub fn contains(&self, hash: &BlockHash) -> Result<bool> {
+        self.blocks
+            .contains_key(hash.to_byte_array())
+            .context("looking up transaction-index block")
+    }
+
+    pub fn hashes(&self) -> Result<Vec<BlockHash>> {
+        self.blocks
+            .keys()
+            .map(|key| {
+                let key = key.context("scanning transaction-index block keys")?;
+                let bytes: [u8; 32] = key
+                    .as_ref()
+                    .try_into()
+                    .context("transaction-index block key has invalid length")?;
+                Ok(BlockHash::from_byte_array(bytes))
+            })
+            .collect()
+    }
+
+    pub fn disk_usage(&self) -> Result<u64> {
+        Ok(self
+            .blocks
+            .disk_space()
+            .saturating_add(self.all_indexed_blocks.disk_space())
+            .saturating_add(self.all_transactions.disk_space())
+            .saturating_add(self.active_transactions.disk_space())
+            .saturating_add(self.metadata.disk_space()))
+    }
+
+    pub fn get(&self, hash: &BlockHash) -> Result<Option<Vec<Txid>>> {
+        self.blocks
+            .get(hash.to_byte_array())?
+            .map(|bytes| decode_txid_list(&bytes))
+            .transpose()
+    }
+
+    pub fn all_indexed_hashes(&self) -> Result<Vec<BlockHash>> {
+        self.all_indexed_blocks
+            .keys()
+            .map(|key| {
+                let key = key.context("scanning all-transaction-index block keys")?;
+                let bytes: [u8; 32] = key
+                    .as_ref()
+                    .try_into()
+                    .context("all-transaction-index block key has invalid length")?;
+                Ok(BlockHash::from_byte_array(bytes))
+            })
+            .collect()
+    }
+
+    pub fn transaction(&self, txid: &Txid) -> Result<Option<StoredTxLocation>> {
+        self.all_transactions
+            .get(txid.to_byte_array())?
+            .map(|bytes| decode_stored_tx_location(&bytes))
+            .transpose()
+    }
+
+    pub fn active_locations(&self, txid: &Txid) -> Result<Vec<StoredTxLocation>> {
+        self.active_transactions
+            .prefix(txid.to_byte_array())
+            .map(|item| {
+                let (_, value) = item.context("scanning active transaction locations")?;
+                decode_stored_tx_location(&value)
+            })
+            .collect()
+    }
+
+    pub fn active_tip(&self) -> Result<Option<(BlockHash, u32)>> {
+        let Some(bytes) = self.metadata.get(META_ACTIVE_TIP)? else {
+            return Ok(None);
+        };
+        if bytes.len() != 36 {
+            bail!("transaction database has an invalid active-tip marker");
+        }
+        Ok(Some((
+            BlockHash::from_byte_array(
+                bytes[..32]
+                    .try_into()
+                    .expect("active tip hash has fixed width"),
+            ),
+            u32::from_le_bytes(
+                bytes[32..]
+                    .try_into()
+                    .expect("active tip height has fixed width"),
+            ),
+        )))
+    }
+
+    pub fn insert(&mut self, hash: BlockHash, txids: &[Txid]) -> Result<()> {
+        self.insert_with_sync(hash, txids, true)
+    }
+
+    pub fn insert_unsynced(&mut self, hash: BlockHash, txids: &[Txid]) -> Result<()> {
+        self.insert_with_sync(hash, txids, false)
+    }
+
+    fn insert_with_sync(&mut self, hash: BlockHash, txids: &[Txid], sync: bool) -> Result<()> {
+        if self.contains(&hash)? {
+            return Ok(());
+        }
+        let next_count = self.block_count.saturating_add(1);
+        let mut batch = self
+            .keyspace
+            .batch()
+            .durability(sync.then_some(PersistMode::SyncData));
+        batch.insert(
+            &self.blocks,
+            hash.to_byte_array().to_vec(),
+            encode_txid_list(txids)?,
+        );
+        batch.insert(
+            &self.metadata,
+            META_BLOCK_COUNT.to_vec(),
+            u64::try_from(next_count)
+                .context("transaction-index block count does not fit u64")?
+                .to_le_bytes()
+                .to_vec(),
+        );
+        batch.commit()?;
+        self.block_count = next_count;
+        Ok(())
+    }
+
+    pub fn index_all_block(
+        &mut self,
+        hash: BlockHash,
+        height: u32,
+        txids: &[Txid],
+        sync: bool,
+    ) -> Result<()> {
+        let block_exists = self.contains(&hash)?;
+        let mut batch = self
+            .keyspace
+            .batch()
+            .durability(sync.then_some(PersistMode::SyncData));
+        if !block_exists {
+            batch.insert(
+                &self.blocks,
+                hash.to_byte_array().to_vec(),
+                encode_txid_list(txids)?,
+            );
+        }
+        for (transaction_index, txid) in txids.iter().enumerate() {
+            let candidate = StoredTxLocation {
+                block_hash: hash,
+                height,
+                transaction_index: u32::try_from(transaction_index)
+                    .context("transaction index does not fit u32")?,
+            };
+            let replace = self.transaction(txid)?.is_none_or(|current| {
+                (
+                    candidate.height,
+                    candidate.block_hash.to_byte_array(),
+                    candidate.transaction_index,
+                ) >= (
+                    current.height,
+                    current.block_hash.to_byte_array(),
+                    current.transaction_index,
+                )
+            });
+            if replace {
+                batch.insert(
+                    &self.all_transactions,
+                    txid.to_byte_array().to_vec(),
+                    encode_stored_tx_location(candidate),
+                );
+            }
+        }
+        batch.insert(
+            &self.all_indexed_blocks,
+            hash.to_byte_array().to_vec(),
+            vec![1],
+        );
+        let next_count = self.block_count.saturating_add(usize::from(!block_exists));
+        if !block_exists {
+            batch.insert(
+                &self.metadata,
+                META_BLOCK_COUNT.to_vec(),
+                u64::try_from(next_count)
+                    .context("transaction-index block count does not fit u64")?
+                    .to_le_bytes()
+                    .to_vec(),
+            );
+        }
+        batch.commit()?;
+        self.block_count = next_count;
+        Ok(())
+    }
+
+    pub fn connect_active_block(
+        &mut self,
+        hash: BlockHash,
+        height: u32,
+        txids: &[Txid],
+        sync: bool,
+    ) -> Result<()> {
+        let block_exists = self.contains(&hash)?;
+        let next_count = self.block_count.saturating_add(usize::from(!block_exists));
+        let mut batch = self
+            .keyspace
+            .batch()
+            .durability(sync.then_some(PersistMode::SyncData));
+        if !block_exists {
+            batch.insert(
+                &self.blocks,
+                hash.to_byte_array().to_vec(),
+                encode_txid_list(txids)?,
+            );
+            batch.insert(
+                &self.metadata,
+                META_BLOCK_COUNT.to_vec(),
+                u64::try_from(next_count)
+                    .context("transaction-index block count does not fit u64")?
+                    .to_le_bytes()
+                    .to_vec(),
+            );
+        }
+        for (transaction_index, txid) in txids.iter().enumerate() {
+            let location = StoredTxLocation {
+                block_hash: hash,
+                height,
+                transaction_index: u32::try_from(transaction_index)
+                    .context("transaction index does not fit u32")?,
+            };
+            batch.insert(
+                &self.active_transactions,
+                active_transaction_key(*txid, height, location.transaction_index).to_vec(),
+                encode_stored_tx_location(location),
+            );
+        }
+        let mut active_tip = Vec::with_capacity(36);
+        active_tip.extend_from_slice(&hash.to_byte_array());
+        active_tip.extend_from_slice(&height.to_le_bytes());
+        batch.insert(&self.metadata, META_ACTIVE_TIP.to_vec(), active_tip);
+        batch.commit()?;
+        self.block_count = next_count;
+        Ok(())
+    }
+
+    pub fn disconnect_active_block(
+        &mut self,
+        hash: BlockHash,
+        txids: &[Txid],
+        sync: bool,
+    ) -> Result<()> {
+        let mut batch = self
+            .keyspace
+            .batch()
+            .durability(sync.then_some(PersistMode::SyncData));
+        for txid in txids {
+            for location in self.active_locations(txid)? {
+                if location.block_hash == hash {
+                    batch.remove(
+                        &self.active_transactions,
+                        active_transaction_key(*txid, location.height, location.transaction_index)
+                            .to_vec(),
+                    );
+                }
+            }
+        }
+        batch.commit()?;
+        Ok(())
+    }
+
+    pub fn set_active_tip(&mut self, hash: BlockHash, height: u32, sync: bool) -> Result<()> {
+        let mut marker = Vec::with_capacity(36);
+        marker.extend_from_slice(&hash.to_byte_array());
+        marker.extend_from_slice(&height.to_le_bytes());
+        self.metadata.insert(META_ACTIVE_TIP, marker)?;
+        if sync {
+            self.keyspace.persist(PersistMode::SyncData)?;
+        }
+        Ok(())
+    }
+
+    pub fn clear_active(&mut self) -> Result<()> {
+        clear_partition(&self.keyspace, &self.active_transactions)?;
+        self.metadata.remove(META_ACTIVE_TIP)?;
+        Ok(())
+    }
+
+    pub fn clear_all_index(&mut self) -> Result<()> {
+        clear_partition(&self.keyspace, &self.all_indexed_blocks)?;
+        clear_partition(&self.keyspace, &self.all_transactions)?;
+        Ok(())
+    }
+
+    pub fn clear(&mut self) -> Result<()> {
+        clear_partition(&self.keyspace, &self.blocks)?;
+        clear_partition(&self.keyspace, &self.all_indexed_blocks)?;
+        clear_partition(&self.keyspace, &self.all_transactions)?;
+        clear_partition(&self.keyspace, &self.active_transactions)?;
+        self.metadata.remove(META_ACTIVE_TIP)?;
+        self.block_count = 0;
+        self.metadata
+            .insert(META_BLOCK_COUNT, 0u64.to_le_bytes().to_vec())?;
+        self.flush()
+    }
+
+    pub fn flush(&mut self) -> Result<()> {
+        self.keyspace.persist(PersistMode::SyncData)?;
+        Ok(())
+    }
+}
+
+impl Drop for TransactionIndexStore {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+fn encode_txid_list(txids: &[Txid]) -> Result<Vec<u8>> {
+    let mut raw = Vec::with_capacity(4usize.saturating_add(txids.len().saturating_mul(32)));
+    raw.extend_from_slice(
+        &u32::try_from(txids.len())
+            .context("transaction-ID list is too large")?
+            .to_le_bytes(),
+    );
+    for txid in txids {
+        raw.extend_from_slice(&txid.to_byte_array());
+    }
+    encode_storage_payload(&raw, MAX_STORED_TRANSACTION_INDEX_SIZE)
+}
+
+fn decode_txid_list(bytes: &[u8]) -> Result<Vec<Txid>> {
+    let raw = decode_storage_payload(bytes, MAX_STORED_TRANSACTION_INDEX_SIZE)?;
+    if raw.len() < 4 {
+        bail!("truncated transaction-ID list");
+    }
+    let count = u32::from_le_bytes(raw[..4].try_into().expect("txid count is fixed")) as usize;
+    if raw.len() != 4usize.saturating_add(count.saturating_mul(32)) {
+        bail!("transaction-ID list length does not match its count");
+    }
+    raw[4..]
+        .chunks_exact(32)
+        .map(|txid| {
+            Ok(Txid::from_byte_array(
+                txid.try_into().expect("txid length is fixed"),
+            ))
+        })
+        .collect()
+}
+
+fn encode_stored_tx_location(location: StoredTxLocation) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(40);
+    bytes.extend_from_slice(&location.block_hash.to_byte_array());
+    bytes.extend_from_slice(&location.height.to_le_bytes());
+    bytes.extend_from_slice(&location.transaction_index.to_le_bytes());
+    bytes
+}
+
+fn decode_stored_tx_location(bytes: &[u8]) -> Result<StoredTxLocation> {
+    if bytes.len() != 40 {
+        bail!("invalid stored transaction location length");
+    }
+    Ok(StoredTxLocation {
+        block_hash: BlockHash::from_byte_array(
+            bytes[..32].try_into().expect("block hash length is fixed"),
+        ),
+        height: u32::from_le_bytes(bytes[32..36].try_into().expect("height length is fixed")),
+        transaction_index: u32::from_le_bytes(
+            bytes[36..]
+                .try_into()
+                .expect("transaction index length is fixed"),
+        ),
+    })
+}
+
+fn active_transaction_key(txid: Txid, height: u32, transaction_index: u32) -> [u8; 40] {
+    let mut key = [0u8; 40];
+    key[..32].copy_from_slice(&txid.to_byte_array());
+    key[32..36].copy_from_slice(&height.to_be_bytes());
+    key[36..].copy_from_slice(&transaction_index.to_be_bytes());
+    key
 }
 
 /// Durable active-chain mutation records.
@@ -1603,116 +1977,91 @@ impl Drop for ChainstateStore {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum PendingUtxoOperation {
-    Put {
-        outpoint: OutPoint,
-        location: UtxoLocation,
-    },
-    Delete {
-        outpoint: OutPoint,
-    },
-}
-
 /// Crash-recoverable, batched UTXO storage.
 ///
-/// The value log is append-only and each mutation batch ends with a commit
-/// marker.  A torn final record or an uncommitted batch is discarded on the
-/// next open.  A separate append-only location index avoids decoding the
-/// value log during ordinary restarts; if the index is stale or damaged, the
-/// value log is replayed and the index is rebuilt.
+/// Coins are keyed directly by outpoint in the LSM database. Fjall's journal
+/// and atomic batches provide recovery without a second location index or a
+/// startup replay of the complete UTXO set.
+const DISK_INDEX_DEFAULT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const DISK_INDEX_DEFAULT_WRITE_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+const UTXO_PARTITION_NAME: &str = "coins";
+const UTXO_META_PARTITION_NAME: &str = "metadata";
+const META_ENTRY_COUNT: &[u8] = b"entry-count";
+const META_GENERATION: &[u8] = b"generation";
+
+/// Disk-backed UTXO set with a bounded decoded-value cache.
+///
+/// Outpoints are stored directly in an LSM tree; only the configured database
+/// block cache, write buffers, and decoded-value cache remain resident.
 pub struct UtxoStore {
     path: PathBuf,
     recovery_marker_path: PathBuf,
     recovery_attempt_path: PathBuf,
-    index_path: PathBuf,
-    file: File,
-    index_file: File,
-    index: FastHashMap<OutPoint, UtxoLocation>,
-    next_batch_id: u64,
+    keyspace: Keyspace,
+    coins: PartitionHandle,
+    metadata: PartitionHandle,
+    entry_count: usize,
     generation: u64,
-    pending_write_bytes: usize,
     crash_ratio: Option<u64>,
     read_cache: Mutex<UtxoReadCache>,
 }
 
 impl UtxoStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_cache(directory, DISK_INDEX_DEFAULT_CACHE_BYTES)
+    }
+
+    pub fn open_with_cache(directory: impl AsRef<Path>, cache_bytes: u64) -> Result<Self> {
         let directory = directory.as_ref();
         create_dir_all(directory)
             .with_context(|| format!("creating UTXO store {}", directory.display()))?;
-        let path = directory.join("utxos.dat");
-        let recovery_marker_path = directory.join("utxos.recovery.pending");
-        let recovery_attempt_path = directory.join("utxos.recovery.attempted");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening UTXO store {}", path.display()))?;
-        if file.metadata()?.len() == 0 {
-            file.write_all(UTXO_DATA_MAGIC)?;
-            file.sync_data()?;
-        } else {
-            let mut magic = vec![0u8; UTXO_DATA_MAGIC.len()];
-            file.seek(SeekFrom::Start(0))?;
-            file.read_exact(&mut magic)?;
-            if magic != UTXO_DATA_MAGIC {
-                bail!("UTXO store has an unknown format");
-            }
+        let path = directory.join("coins");
+        let keyspace = FjallConfig::new(&path)
+            .cache_size(cache_bytes.max(1024 * 1024))
+            .max_write_buffer_size(DISK_INDEX_DEFAULT_WRITE_BUFFER_BYTES)
+            .manual_journal_persist(true)
+            .open()
+            .with_context(|| format!("opening disk-backed UTXO database {}", path.display()))?;
+        let coins = keyspace
+            .open_partition(
+                UTXO_PARTITION_NAME,
+                PartitionCreateOptions::default().compression(CompressionType::Lz4),
+            )
+            .context("opening UTXO partition")?;
+        let metadata = keyspace
+            .open_partition(
+                UTXO_META_PARTITION_NAME,
+                PartitionCreateOptions::default().compression(CompressionType::None),
+            )
+            .context("opening UTXO metadata partition")?;
+        let entry_count = read_usize_metadata(&metadata, META_ENTRY_COUNT)?.unwrap_or(0);
+        if entry_count == 0 && !coins.is_empty()? {
+            bail!("UTXO database is missing its exact entry-count metadata");
         }
-
-        let index_path = directory.join("utxos.index");
-        let mut index_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&index_path)
-            .with_context(|| format!("opening UTXO index {}", index_path.display()))?;
-        let data_len = file.metadata()?.len();
-        // A published chainstate tip means the owning node completed a
-        // durability boundary after producing this structural journal.
-        // Routine startup can trust its committed key/location records and
-        // validate compressed values lazily when they are read. Standalone
-        // stores and recovery paths retain the exhaustive value scan.
-        let validate_live_values = directory
-            .parent()
-            .is_none_or(|parent| !parent.join("utxos.tip").is_file());
-        let loaded_index = load_utxo_index(&mut index_file, &file, data_len, validate_live_values)?;
-        let (index, next_batch_id, generation) = if let Some(index) = loaded_index {
-            index
-        } else {
-            let (index, next_batch_id) = scan_utxo_data(&mut file)?;
-            // A rebuilt index must not reuse a tip marker from an interrupted
-            // replacement, even if the resulting data happens to have the
-            // same length as the old value log.
-            let generation = random::<u64>().max(1);
-            rewrite_utxo_index(
-                &mut index_file,
-                data_len_after(&file)?,
-                next_batch_id,
-                generation,
-                &index,
-            )?;
-            (index, next_batch_id, generation)
+        let generation = match read_u64_metadata(&metadata, META_GENERATION)? {
+            Some(generation) if generation != 0 => generation,
+            _ => {
+                let generation = random::<u64>().max(1);
+                metadata.insert(META_GENERATION, generation.to_le_bytes().to_vec())?;
+                metadata.insert(META_ENTRY_COUNT, 0u64.to_le_bytes().to_vec())?;
+                keyspace.persist(PersistMode::SyncAll)?;
+                generation
+            }
         };
         Ok(Self {
+            recovery_marker_path: directory.join("utxos.recovery.pending"),
+            recovery_attempt_path: directory.join("utxos.recovery.attempted"),
             path,
-            recovery_marker_path,
-            recovery_attempt_path,
-            index_path,
-            file,
-            index_file,
-            index,
-            next_batch_id,
+            keyspace,
+            coins,
+            metadata,
+            entry_count,
             generation,
-            pending_write_bytes: 0,
             crash_ratio: None,
             read_cache: Mutex::new(UtxoReadCache::default()),
         })
     }
 
-    /// Configure Core's debug-only crash-injection hook.
     pub fn configure_crash_ratio(&mut self, ratio: Option<u64>) {
         self.crash_ratio = ratio.filter(|ratio| *ratio > 0);
     }
@@ -1728,10 +2077,6 @@ impl UtxoStore {
         Ok(())
     }
 
-    /// Reproduce the restart-time part of Core's interrupted coins flush.
-    /// The first startup after an injected write crash exits once; the next
-    /// startup consumes the attempted marker and proceeds with the durable
-    /// state.
     pub fn maybe_simulate_recovery_crash(&self) -> Result<()> {
         if self.recovery_attempt_path.exists() {
             match remove_file(&self.recovery_attempt_path) {
@@ -1770,138 +2115,80 @@ impl UtxoStore {
     }
 
     pub fn index_path(&self) -> &Path {
-        &self.index_path
+        &self.path
     }
 
     pub fn len(&self) -> usize {
-        self.index.len()
+        self.entry_count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
+        self.entry_count == 0
     }
 
     pub fn generation(&self) -> u64 {
         self.generation
     }
 
-    /// Allocate three quarters of the configured storage cache to decoded
-    /// UTXO values. The remaining quarter is reserved for historical block
-    /// records by `BlockStore`.
+    /// The LSM block cache and write buffers are bounded independently.  Use
+    /// the remaining storage allocation for decoded hot UTXOs, with a floor
+    /// suitable for tests and very small nodes.
     pub fn configure_cache_size_mib(&self, mib: i64) {
         const MIN_CACHE_MIB: u64 = 4;
         const MIB: u64 = 1024 * 1024;
         let mib = u64::try_from(mib.max(0)).unwrap_or(u64::MAX);
         let total_bytes = mib.max(MIN_CACHE_MIB).saturating_mul(MIB);
-        let limit = usize::try_from(total_bytes.saturating_mul(3) / 4).unwrap_or(usize::MAX);
+        let limit = usize::try_from(total_bytes / 2).unwrap_or(usize::MAX);
         self.read_cache.lock().configure_limit(limit);
     }
 
-    /// Populate the configured cache with the most recently written live
-    /// coins. Startup has already validated these records in file order; a
-    /// bounded second sequential pass is still much cheaper than issuing
-    /// random reads as every cold prevout is spent during IBD.
+    /// New outputs populate the decoded cache as they are connected.  A full
+    /// startup scan would defeat the disk-backed design, so this store does
+    /// not materialize the UTXO set merely to warm it.
     pub fn warm_cache(&self) -> Result<(usize, usize)> {
-        let limit = self.read_cache.lock().limit;
-        if limit == 0 || self.index.is_empty() {
-            return Ok((0, 0));
-        }
-
-        let mut locations = self
-            .index
-            .iter()
-            .map(|(outpoint, location)| (*outpoint, *location))
-            .collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(_, location)| std::cmp::Reverse(location.offset()));
-        let mut selected_bytes = 0usize;
-        let selected_count = locations
-            .iter()
-            .position(|(_, location)| {
-                selected_bytes = selected_bytes
-                    .saturating_add(location.length() as usize)
-                    .saturating_add(64);
-                selected_bytes >= limit
-            })
-            .map_or(locations.len(), |position| position.saturating_add(1));
-        locations.truncate(selected_count);
-        locations.sort_unstable_by_key(|(_, location)| location.offset());
-
-        let mut cache = self.read_cache.lock();
-        for (outpoint, location) in locations {
-            let body = read_utxo_data_record(&self.file, location)?;
-            if body.first().copied() != Some(UTXO_PUT) || body.len() < 1 + 8 + 36 {
-                bail!("UTXO location points to a non-value record");
-            }
-            let stored_outpoint = decode_outpoint(&body[9..45])?;
-            if stored_outpoint != outpoint {
-                bail!("UTXO value key does not match its index");
-            }
-            cache.insert(outpoint, decode_stored_utxo(&body[45..])?);
-        }
+        let cache = self.read_cache.lock();
         Ok((cache.entries.len(), cache.bytes))
     }
 
-    pub fn contains(&self, outpoint: &OutPoint) -> bool {
-        self.index.contains_key(outpoint)
+    pub fn contains(&self, outpoint: &OutPoint) -> Result<bool> {
+        self.coins
+            .contains_key(encode_outpoint(outpoint))
+            .context("looking up UTXO key")
     }
 
     pub fn disk_usage(&self) -> Result<u64> {
-        self.file
-            .metadata()?
-            .len()
-            .checked_add(self.index_file.metadata()?.len())
-            .context("UTXO store disk usage overflowed")
+        Ok(self
+            .coins
+            .disk_space()
+            .saturating_add(self.metadata.disk_space()))
     }
 
     pub fn get(&self, outpoint: &OutPoint) -> Result<Option<StoredUtxo>> {
         if let Some(entry) = self.read_cache.lock().get(outpoint) {
             return Ok(Some(entry));
         }
-        let Some(location) = self.index.get(outpoint).copied() else {
+        let Some(bytes) = self
+            .coins
+            .get(encode_outpoint(outpoint))
+            .context("reading UTXO value")?
+        else {
             return Ok(None);
         };
-        let body = read_utxo_data_record(&self.file, location)?;
-        if body.first().copied() != Some(UTXO_PUT) || body.len() < 1 + 8 + 36 {
-            bail!("UTXO location points to a non-value record");
-        }
-        let stored_outpoint = decode_outpoint(&body[9..45])?;
-        if stored_outpoint != *outpoint {
-            bail!("UTXO value key does not match its index");
-        }
-        let entry = decode_stored_utxo(&body[45..])?;
+        let entry = decode_stored_utxo(&bytes)?;
         self.read_cache.lock().insert(*outpoint, entry.clone());
         Ok(Some(entry))
     }
 
-    /// Read all live entries.  This is intentionally explicit: normal block
-    /// validation uses point lookups, while snapshot/export code can opt into
-    /// the full materialization cost.
     pub fn entries(&self) -> Result<Vec<(OutPoint, StoredUtxo)>> {
-        let mut locations = self
-            .index
+        self.coins
             .iter()
-            .map(|(outpoint, location)| (*outpoint, *location))
-            .collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(_, location)| location.offset());
-        locations
-            .into_iter()
-            .map(|(outpoint, location)| {
-                let body = read_utxo_data_record(&self.file, location)?;
-                if body.first().copied() != Some(UTXO_PUT) || body.len() < 1 + 8 + 36 {
-                    bail!("UTXO location points to a non-value record");
-                }
-                let stored_outpoint = decode_outpoint(&body[9..45])?;
-                if stored_outpoint != outpoint {
-                    bail!("UTXO value key does not match its index");
-                }
-                Ok((outpoint, decode_stored_utxo(&body[45..])?))
+            .map(|item| {
+                let (key, value) = item.context("scanning UTXO database")?;
+                Ok((decode_outpoint(&key)?, decode_stored_utxo(&value)?))
             })
             .collect()
     }
 
-    /// Apply removals and additions as one durable mutation batch.  A caller
-    /// may remove and then recreate the same outpoint in one batch, which is
-    /// required for historical duplicate-coinbase (BIP30) handling.
     pub fn apply_batch(
         &mut self,
         removals: &[OutPoint],
@@ -1910,9 +2197,6 @@ impl UtxoStore {
         self.apply_batch_with_sync(removals, additions, true)
     }
 
-    /// Apply a UTXO mutation batch without forcing a filesystem sync. The
-    /// record-level commit marker and append-only index remain intact; the
-    /// owning chainstate performs a bounded flush for peer/IBD writes.
     pub fn apply_batch_unsynced(
         &mut self,
         removals: &[OutPoint],
@@ -1930,87 +2214,50 @@ impl UtxoStore {
         if removals.is_empty() && additions.is_empty() {
             return Ok(());
         }
-        let batch_id = self.next_batch_id;
-        let next_batch_id = batch_id
-            .checked_add(1)
-            .context("UTXO batch identifier exhausted")?;
-        let batch_start = data_len_after(&self.file)?;
-        let mut data_committed = false;
-        let mut operations = Vec::with_capacity(removals.len() + additions.len());
-        let write_result = (|| -> Result<()> {
-            let mut data_bytes = Vec::new();
-            for outpoint in removals {
-                let body = encode_utxo_delete(batch_id, outpoint);
-                let location = buffer_utxo_data_record(&mut data_bytes, batch_start, &body)?;
-                operations.push(PendingUtxoOperation::Delete {
-                    outpoint: *outpoint,
-                });
-                self.pending_write_bytes = self
-                    .pending_write_bytes
-                    .saturating_add(4usize.saturating_add(location.length() as usize));
-            }
-            for (outpoint, entry) in additions {
-                let body = encode_utxo_put(batch_id, outpoint, entry)?;
-                let location = buffer_utxo_data_record(&mut data_bytes, batch_start, &body)?;
-                operations.push(PendingUtxoOperation::Put {
-                    outpoint: *outpoint,
-                    location,
-                });
-                self.pending_write_bytes = self
-                    .pending_write_bytes
-                    .saturating_add(4usize.saturating_add(location.length() as usize));
-            }
-            let commit = encode_utxo_commit(batch_id);
-            let commit_location = buffer_utxo_data_record(&mut data_bytes, batch_start, &commit)?;
-            self.pending_write_bytes = self
-                .pending_write_bytes
-                .saturating_add(4usize.saturating_add(commit_location.length() as usize));
-            self.file.write_all(&data_bytes)?;
-            if sync {
-                self.file.sync_data()?;
-            }
-            data_committed = true;
-            append_utxo_index_batch(
-                &mut self.index_file,
-                batch_id,
-                data_len_after(&self.file)?,
-                next_batch_id,
-                self.generation,
-                &operations,
-            )?;
-            if sync {
-                self.index_file.sync_data()?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = write_result {
-            // If the data commit itself was not durable, remove the partial
-            // tail so the live store can continue to accept writes. Once the
-            // commit marker has been synced, leave the committed value log
-            // intact; a later open can rebuild an index whose append failed.
-            if !data_committed {
-                let current_len = data_len_after(&self.file)?;
-                if current_len > batch_start {
-                    let _ = self.file.set_len(batch_start);
-                    let _ = self.file.seek(SeekFrom::End(0));
-                }
-            }
-            return Err(error);
-        }
-        for operation in operations {
-            match operation {
-                PendingUtxoOperation::Put { outpoint, location } => {
-                    self.index.insert(outpoint, location);
-                }
-                PendingUtxoOperation::Delete { outpoint } => {
-                    self.index.remove(&outpoint);
-                }
+        let addition_keys = additions
+            .iter()
+            .map(|(outpoint, _)| *outpoint)
+            .collect::<HashSet<_>>();
+        let affected = removals
+            .iter()
+            .copied()
+            .chain(addition_keys.iter().copied())
+            .collect::<HashSet<_>>();
+        let mut next_count = self.entry_count;
+        for outpoint in affected {
+            let existed = self.contains(&outpoint)?;
+            let exists_after = addition_keys.contains(&outpoint);
+            match (existed, exists_after) {
+                (false, true) => next_count = next_count.saturating_add(1),
+                (true, false) => next_count = next_count.saturating_sub(1),
+                _ => {}
             }
         }
-        // Keep newly created coins in the configured dbcache allocation.
-        // Previously only disk reads populated this cache and the same block
-        // connection immediately removed those spent entries, making IBD do
-        // a random value-log read and decompression for nearly every input.
+
+        let mut batch = self
+            .keyspace
+            .batch()
+            .durability(sync.then_some(PersistMode::SyncData));
+        for outpoint in removals {
+            batch.remove(&self.coins, encode_outpoint(outpoint).to_vec());
+        }
+        for (outpoint, entry) in additions {
+            batch.insert(
+                &self.coins,
+                encode_outpoint(outpoint).to_vec(),
+                encode_stored_utxo(entry)?,
+            );
+        }
+        batch.insert(
+            &self.metadata,
+            META_ENTRY_COUNT.to_vec(),
+            u64::try_from(next_count)
+                .context("UTXO entry count does not fit u64")?
+                .to_le_bytes()
+                .to_vec(),
+        );
+        batch.commit().context("committing UTXO database batch")?;
+
         let mut read_cache = self.read_cache.lock();
         for outpoint in removals {
             read_cache.remove(outpoint);
@@ -2018,212 +2265,87 @@ impl UtxoStore {
         for (outpoint, entry) in additions {
             read_cache.insert(*outpoint, entry.clone());
         }
-        self.next_batch_id = next_batch_id;
+        self.entry_count = next_count;
         Ok(())
     }
 
-    /// Replace the live set in bounded batches.  This is used when importing
-    /// a snapshot or migrating the legacy in-memory chainstate format.
     pub fn replace_all<I>(&mut self, entries: I) -> Result<()>
     where
         I: IntoIterator<Item = (OutPoint, StoredUtxo)>,
     {
         self.clear()?;
-        let mut batch = Vec::with_capacity(10_000);
+        let mut pending = Vec::with_capacity(10_000);
         for entry in entries {
-            batch.push(entry);
-            if batch.len() == 10_000 {
-                self.apply_batch(&[], &batch)?;
-                batch.clear();
+            pending.push(entry);
+            if pending.len() == 10_000 {
+                self.apply_batch_unsynced(&[], &pending)?;
+                pending.clear();
             }
         }
-        if !batch.is_empty() {
-            self.apply_batch(&[], &batch)?;
+        if !pending.is_empty() {
+            self.apply_batch_unsynced(&[], &pending)?;
         }
-        Ok(())
+        self.flush()
     }
 
-    /// Rewrite the live UTXO set into a compact value log and atomically
-    /// replace the location index.  The data and index are written and synced
-    /// before either rename, so an interrupted compaction is recovered by the
-    /// normal index rebuild path on the next open.
     pub fn compact(&mut self) -> Result<()> {
         self.flush()?;
-        let mut locations = self
-            .index
-            .iter()
-            .map(|(outpoint, location)| (*outpoint, *location))
-            .collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(_, location)| location.offset());
-        let compact_data_path = self.path.with_extension("dat.compact");
-        let compact_index_path = self.index_path.with_extension("index.compact");
-        for path in [&compact_data_path, &compact_index_path] {
-            match remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        let result = (|| -> Result<()> {
-            let mut compact_data = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&compact_data_path)
-                .with_context(|| {
-                    format!(
-                        "creating compacted UTXO store {}",
-                        compact_data_path.display()
-                    )
-                })?;
-            compact_data.write_all(UTXO_DATA_MAGIC)?;
-            let batch_id = self.next_batch_id;
-            let next_batch_id = batch_id
-                .checked_add(1)
-                .context("UTXO batch identifier exhausted during compaction")?;
-            let entries_empty = locations.is_empty();
-            let mut compact_index = FastHashMap::with_capacity(locations.len());
-            if !entries_empty {
-                for (outpoint, location) in &locations {
-                    let body = read_utxo_data_record(&self.file, *location)?;
-                    if body.first().copied() != Some(UTXO_PUT) || body.len() < 1 + 8 + 36 {
-                        bail!("UTXO location points to a non-value record");
-                    }
-                    let stored_outpoint = decode_outpoint(&body[9..45])?;
-                    if stored_outpoint != *outpoint {
-                        bail!("UTXO value key does not match its index");
-                    }
-                    let entry = decode_stored_utxo(&body[45..])?;
-                    let body = encode_utxo_put(batch_id, outpoint, &entry)?;
-                    let location = append_utxo_data_record(&mut compact_data, &body)?;
-                    compact_index.insert(*outpoint, location);
-                }
-                let commit = encode_utxo_commit(batch_id);
-                append_utxo_data_record(&mut compact_data, &commit)?;
-            }
-            compact_data.sync_data()?;
-            let data_end = data_len_after(&compact_data)?;
-
-            let mut compact_index_file = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&compact_index_path)
-                .with_context(|| {
-                    format!(
-                        "creating compacted UTXO index {}",
-                        compact_index_path.display()
-                    )
-                })?;
-            rewrite_utxo_index(
-                &mut compact_index_file,
-                data_end,
-                if entries_empty {
-                    self.next_batch_id
-                } else {
-                    next_batch_id
-                },
-                self.generation,
-                &compact_index,
-            )?;
-            drop(compact_index_file);
-            drop(compact_data);
-
-            rename(&compact_data_path, &self.path).with_context(|| {
-                format!("installing compacted UTXO store {}", self.path.display())
-            })?;
-            rename(&compact_index_path, &self.index_path).with_context(|| {
-                format!(
-                    "installing compacted UTXO index {}",
-                    self.index_path.display()
-                )
-            })?;
-
-            self.file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&self.path)
-                .with_context(|| {
-                    format!("reopening compacted UTXO store {}", self.path.display())
-                })?;
-            self.index_file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&self.index_path)
-                .with_context(|| {
-                    format!(
-                        "reopening compacted UTXO index {}",
-                        self.index_path.display()
-                    )
-                })?;
-            self.index = compact_index;
-            self.next_batch_id = if entries_empty {
-                self.next_batch_id
-            } else {
-                next_batch_id
-            };
-            self.pending_write_bytes = 0;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = remove_file(&compact_data_path);
-            let _ = remove_file(&compact_index_path);
-        }
-        result
+        self.coins
+            .major_compact()
+            .context("compacting UTXO database")
     }
 
-    /// Compact only when stale mutation records are large enough to justify a
-    /// full live-set rewrite.  Snapshot boundaries call this method so normal
-    /// operation gets LevelDB-like reclamation without a rewrite per block.
     pub fn compact_if_needed(&mut self) -> Result<bool> {
-        let data_len = data_len_after(&self.file)?;
-        if data_len < MIN_UTXO_COMPACTION_DATA_SIZE {
-            return Ok(false);
-        }
-        let live_bytes = UTXO_DATA_MAGIC.len() as u64
-            + self
-                .index
-                .values()
-                .map(|location| 4u64.saturating_add(u64::from(location.length())))
-                .sum::<u64>()
-            + if self.index.is_empty() { 0 } else { 13 };
-        let stale_bytes = data_len.saturating_sub(live_bytes);
-        if stale_bytes < MIN_UTXO_COMPACTION_STALE_SIZE || stale_bytes < live_bytes / 4 {
-            return Ok(false);
-        }
-        self.compact()?;
-        Ok(true)
+        // Fjall performs leveled background compaction and reclaims
+        // tombstoned entries without materializing the keyspace.
+        Ok(false)
     }
 
     pub fn clear(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(UTXO_DATA_MAGIC)?;
-        self.file.sync_data()?;
-        self.index.clear();
-        self.read_cache.lock().clear();
-        self.next_batch_id = 1;
+        loop {
+            let keys = self
+                .coins
+                .keys()
+                .take(10_000)
+                .map(|key| key.map(|key| key.to_vec()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            if keys.is_empty() {
+                break;
+            }
+            let mut batch = self.keyspace.batch();
+            for key in keys {
+                batch.remove(&self.coins, key);
+            }
+            batch.commit()?;
+        }
+        self.entry_count = 0;
         self.generation = self
             .generation
             .checked_add(1)
             .context("UTXO store generation exhausted")?;
-        rewrite_utxo_index(
-            &mut self.index_file,
-            UTXO_DATA_MAGIC.len() as u64,
-            self.next_batch_id,
-            self.generation,
-            &self.index,
-        )?;
-        self.pending_write_bytes = 0;
+        let mut batch = self
+            .keyspace
+            .batch()
+            .durability(Some(PersistMode::SyncData));
+        batch.insert(
+            &self.metadata,
+            META_ENTRY_COUNT.to_vec(),
+            0u64.to_le_bytes().to_vec(),
+        );
+        batch.insert(
+            &self.metadata,
+            META_GENERATION.to_vec(),
+            self.generation.to_le_bytes().to_vec(),
+        );
+        batch.commit()?;
+        self.read_cache.lock().clear();
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
-        self.file.sync_data()?;
-        self.index_file.sync_data()?;
-        self.pending_write_bytes = 0;
-        Ok(())
+        self.keyspace
+            .persist(PersistMode::SyncData)
+            .context("flushing UTXO database")
     }
 }
 
@@ -2233,84 +2355,103 @@ impl Drop for UtxoStore {
     }
 }
 
-/// Durable Electrum script history.
+fn read_u64_metadata(partition: &PartitionHandle, key: &[u8]) -> Result<Option<u64>> {
+    let Some(bytes) = partition.get(key)? else {
+        return Ok(None);
+    };
+    let bytes: [u8; 8] = bytes
+        .as_ref()
+        .try_into()
+        .context("database metadata value is not a u64")?;
+    Ok(Some(u64::from_le_bytes(bytes)))
+}
+
+fn read_usize_metadata(partition: &PartitionHandle, key: &[u8]) -> Result<Option<usize>> {
+    read_u64_metadata(partition, key)?
+        .map(|value| usize::try_from(value).context("database count does not fit usize"))
+        .transpose()
+}
+
+const HISTORY_HEADS_PARTITION_NAME: &str = "heads";
+const HISTORY_CHUNKS_PARTITION_NAME: &str = "chunks";
+const HISTORY_META_PARTITION_NAME: &str = "metadata";
+const HISTORY_CHUNK_ENTRIES: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct HistoryHead {
+    chunks: u32,
+    entries: u64,
+}
+
+/// Disk-backed Electrum history index.
 ///
-/// Replacement records contain a complete history for one script hash, while
-/// normal active-chain updates append bounded chunks linked to the previous
-/// head. The in-memory index keeps only the latest record location. This keeps
-/// ordinary IBD growth linear even for heavily reused scripts while ordinary
-/// restarts avoid loading every history vector into memory.
+/// Each script hash has a tiny head record and a sequence of independently
+/// zstd-compressed history chunks. Appending ordinary IBD history rewrites at
+/// most the final partial chunk; it does not retain one hash-table entry per
+/// script and does not repeatedly rewrite a heavily reused script's complete
+/// history.
 pub struct ElectrumHistoryStore {
     path: PathBuf,
-    index_path: PathBuf,
-    file: File,
-    index_file: File,
-    index: FastHashMap<[u8; 32], HistoryLocation>,
-    next_batch_id: u64,
+    keyspace: Keyspace,
+    heads: PartitionHandle,
+    chunks: PartitionHandle,
+    metadata: PartitionHandle,
+    entry_count: usize,
+    generation: u64,
     pending: FastHashMap<[u8; 32], PendingElectrumHistory>,
-    contains_linked_histories: bool,
 }
 
 impl ElectrumHistoryStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_cache(directory, DISK_INDEX_DEFAULT_CACHE_BYTES)
+    }
+
+    pub fn open_with_cache(directory: impl AsRef<Path>, cache_bytes: u64) -> Result<Self> {
         let directory = directory.as_ref();
         create_dir_all(directory)
             .with_context(|| format!("creating Electrum history store {}", directory.display()))?;
-        let path = directory.join("history.dat");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening Electrum history store {}", path.display()))?;
-        if file.metadata()?.len() == 0 {
-            file.write_all(ELECTRUM_HISTORY_DATA_MAGIC)?;
-            file.sync_data()?;
-        } else {
-            let mut magic = vec![0u8; ELECTRUM_HISTORY_DATA_MAGIC.len()];
-            file.seek(SeekFrom::Start(0))?;
-            file.read_exact(&mut magic)?;
-            if magic != ELECTRUM_HISTORY_DATA_MAGIC {
-                bail!("Electrum history store has an unknown format");
-            }
+        let path = directory.join("history");
+        let keyspace = FjallConfig::new(&path)
+            .cache_size(cache_bytes.max(1024 * 1024))
+            .max_write_buffer_size(DISK_INDEX_DEFAULT_WRITE_BUFFER_BYTES)
+            .manual_journal_persist(true)
+            .open()
+            .with_context(|| format!("opening disk-backed Electrum database {}", path.display()))?;
+        let heads = keyspace.open_partition(
+            HISTORY_HEADS_PARTITION_NAME,
+            PartitionCreateOptions::default().compression(CompressionType::None),
+        )?;
+        let chunks = keyspace.open_partition(
+            HISTORY_CHUNKS_PARTITION_NAME,
+            PartitionCreateOptions::default().compression(CompressionType::None),
+        )?;
+        let metadata = keyspace.open_partition(
+            HISTORY_META_PARTITION_NAME,
+            PartitionCreateOptions::default().compression(CompressionType::None),
+        )?;
+        let entry_count = read_usize_metadata(&metadata, META_ENTRY_COUNT)?.unwrap_or(0);
+        if entry_count == 0 && !heads.is_empty()? {
+            bail!("Electrum history database is missing its exact entry-count metadata");
         }
-
-        let index_path = directory.join("history.index");
-        let mut index_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&index_path)
-            .with_context(|| format!("opening Electrum history index {}", index_path.display()))?;
-        let data_len = file.metadata()?.len();
-        let contains_history_values = data_len > ELECTRUM_HISTORY_DATA_MAGIC.len() as u64;
-        let validate_live_values = !directory.with_extension("tip").is_file();
-        let loaded_index =
-            load_history_index(&mut index_file, &file, data_len, validate_live_values)?;
-        let (index, next_batch_id) = if let Some(index) = loaded_index {
-            index
-        } else {
-            let (index, next_batch_id) = scan_history_data(&mut file)?;
-            rewrite_history_index(
-                &mut index_file,
-                data_len_after(&file)?,
-                next_batch_id,
-                &index,
-            )?;
-            (index, next_batch_id)
+        let generation = match read_u64_metadata(&metadata, META_GENERATION)? {
+            Some(generation) if generation != 0 => generation,
+            _ => {
+                let generation = 1u64;
+                metadata.insert(META_GENERATION, generation.to_le_bytes().to_vec())?;
+                metadata.insert(META_ENTRY_COUNT, 0u64.to_le_bytes().to_vec())?;
+                keyspace.persist(PersistMode::SyncAll)?;
+                generation
+            }
         };
         Ok(Self {
             path,
-            index_path,
-            file,
-            index_file,
-            index,
-            next_batch_id,
+            keyspace,
+            heads,
+            chunks,
+            metadata,
+            entry_count,
+            generation,
             pending: FastHashMap::new(),
-            // Existing v1 stores may contain append nodes after this binary
-            // has written them. Conservatively disable automatic stale-byte
-            // estimation until a future index version persists chain sizes.
-            contains_linked_histories: contains_history_values,
         })
     }
 
@@ -2319,44 +2460,43 @@ impl ElectrumHistoryStore {
     }
 
     pub fn index_path(&self) -> &Path {
-        &self.index_path
+        &self.path
     }
 
     pub fn len(&self) -> usize {
-        self.index
-            .keys()
-            .chain(self.pending.keys())
-            .collect::<HashSet<_>>()
-            .len()
+        self.entry_count.saturating_add(
+            self.pending
+                .keys()
+                .filter(|key| self.head(**key).ok().flatten().is_none())
+                .count(),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
-        self.index.is_empty() && self.pending.is_empty()
+        self.entry_count == 0 && self.pending.is_empty()
     }
 
-    /// Monotonically increasing checkpoint used by chainstate to detect a
-    /// history store write that was not followed by metadata publication.
     pub fn generation(&self) -> u64 {
-        self.next_batch_id
+        self.generation
     }
 
     pub fn contains(&self, script_hash: &str) -> bool {
         encode_history_script_hash(script_hash)
             .ok()
-            .is_some_and(|script_hash| {
-                self.pending.contains_key(&script_hash) || self.index.contains_key(&script_hash)
+            .is_some_and(|key| {
+                self.pending.contains_key(&key) || self.head(key).ok().flatten().is_some()
             })
     }
 
     pub fn disk_usage(&self) -> Result<u64> {
-        self.file
-            .metadata()?
-            .len()
-            .checked_add(self.index_file.metadata()?.len())
-            .context("Electrum history store size overflowed")
+        Ok(self
+            .heads
+            .disk_space()
+            .saturating_add(self.chunks.disk_space())
+            .saturating_add(self.metadata.disk_space()))
     }
 
-    pub fn get(&self, script_hash: &str) -> Result<Vec<(Txid, u32)>> {
+    pub fn get(&self, script_hash: &str) -> Result<StoredElectrumHistory> {
         let script_hash = encode_history_script_hash(script_hash)?;
         if let Some(pending) = self.pending.get(&script_hash) {
             return match pending {
@@ -2371,11 +2511,11 @@ impl ElectrumHistoryStore {
         self.read_history(script_hash)
     }
 
-    /// Read one script history while refusing to allocate more than `limit`
-    /// entries. The normal full-history reader remains available for chain
-    /// rebuilds, but bounded Electrum requests should reject an oversized
-    /// history before copying it into a temporary vector.
-    pub fn get_limited(&self, script_hash: &str, limit: usize) -> Result<Option<Vec<(Txid, u32)>>> {
+    pub fn get_limited(
+        &self,
+        script_hash: &str,
+        limit: usize,
+    ) -> Result<Option<StoredElectrumHistory>> {
         let script_hash = encode_history_script_hash(script_hash)?;
         if let Some(pending) = self.pending.get(&script_hash) {
             return match pending {
@@ -2394,6 +2534,24 @@ impl ElectrumHistoryStore {
         self.read_history_limited(script_hash, limit)
     }
 
+    fn head(&self, script_hash: [u8; 32]) -> Result<Option<HistoryHead>> {
+        self.heads
+            .get(script_hash)
+            .context("reading Electrum history head")?
+            .map(|bytes| decode_history_head(&bytes))
+            .transpose()
+    }
+
+    fn read_chunk(&self, script_hash: [u8; 32], chunk: u32) -> Result<StoredElectrumHistory> {
+        let key = history_chunk_key(script_hash, chunk);
+        let bytes = self
+            .chunks
+            .get(key)
+            .context("reading Electrum history chunk")?
+            .context("Electrum history head references a missing chunk")?;
+        decode_history_chunk(&bytes)
+    }
+
     fn read_history(&self, script_hash: [u8; 32]) -> Result<StoredElectrumHistory> {
         self.read_history_limited(script_hash, usize::MAX)
             .map(|history| history.expect("unlimited history limit cannot be exceeded"))
@@ -2404,120 +2562,60 @@ impl ElectrumHistoryStore {
         script_hash: [u8; 32],
         limit: usize,
     ) -> Result<Option<StoredElectrumHistory>> {
-        let Some(mut location) = self.index.get(&script_hash).copied() else {
+        let Some(head) = self.head(script_hash)? else {
             return Ok(Some(Vec::new()));
         };
-        let mut chunks = Vec::new();
-        let mut entry_count = 0usize;
-        loop {
-            let body = read_history_data_record(&self.file, location)?;
-            let node = decode_history_node(&body, script_hash)?;
-            entry_count = entry_count
-                .checked_add(node.entries.len())
-                .context("Electrum history entry count overflowed")?;
-            if entry_count > limit {
-                return Ok(None);
-            }
-            chunks.push(node.entries);
-            let Some(previous) = node.previous else {
-                break;
-            };
-            if !history_location_precedes(previous, location.offset()) {
-                bail!("Electrum history append chain does not point backwards");
-            }
-            location = previous;
+        let entry_count = usize::try_from(head.entries).unwrap_or(usize::MAX);
+        if entry_count > limit {
+            return Ok(None);
         }
         let mut history = Vec::with_capacity(entry_count);
-        for entries in chunks.into_iter().rev() {
-            extend_history(&mut history, &entries);
+        for chunk in 0..head.chunks {
+            extend_history(&mut history, &self.read_chunk(script_hash, chunk)?);
+        }
+        if history.len() != entry_count {
+            bail!("Electrum history head entry count does not match its chunks");
         }
         Ok(Some(history))
     }
 
-    /// Read several script histories in data-file order. Reorgs commonly
-    /// touch thousands of scripts whose latest values were appended close
-    /// together; sorting by record offset turns that workload into a mostly
-    /// sequential scan instead of issuing one random seek per script.
-    pub fn get_batch(&self, script_hashes: &[String]) -> Result<HashMap<String, Vec<(Txid, u32)>>> {
-        let mut requests = script_hashes
+    pub fn get_batch(
+        &self,
+        script_hashes: &[String],
+    ) -> Result<HashMap<String, StoredElectrumHistory>> {
+        script_hashes
             .iter()
-            .map(|script_hash| {
-                let encoded = encode_history_script_hash(script_hash)?;
-                Ok((
-                    script_hash.clone(),
-                    encoded,
-                    self.pending.get(&encoded).cloned(),
-                    self.index.get(&encoded).copied(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        requests.sort_unstable_by_key(|(_, _, _, location)| {
-            location.map_or(u64::MAX, HistoryLocation::offset)
-        });
-
-        let mut histories = HashMap::with_capacity(requests.len());
-        for (script_hash, encoded, pending, location) in requests {
-            let entries = match pending {
-                Some(PendingElectrumHistory::Replace(entries)) => entries,
-                Some(PendingElectrumHistory::Append(additions)) => {
-                    let mut history = if location.is_some() {
-                        self.read_history(encoded)?
-                    } else {
-                        Vec::new()
-                    };
-                    extend_history(&mut history, &additions);
-                    history
-                }
-                None if location.is_some() => self.read_history(encoded)?,
-                None => Vec::new(),
-            };
-            histories.insert(script_hash, entries);
-        }
-        Ok(histories)
-    }
-
-    pub fn keys(&self) -> Vec<String> {
-        self.index
-            .keys()
-            .chain(self.pending.keys())
-            .copied()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .map(hex::encode)
+            .map(|script_hash| Ok((script_hash.clone(), self.get(script_hash)?)))
             .collect()
     }
 
-    pub fn entries(&self) -> Result<Vec<(String, StoredElectrumHistory)>> {
-        let mut locations = self
-            .index
-            .iter()
-            .map(|(script_hash, location)| (*script_hash, *location))
-            .collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(_, location)| location.offset());
-        let mut entries = locations
-            .into_iter()
-            .map(|(script_hash, _)| {
-                let encoded = hex::encode(script_hash);
-                Ok((encoded.clone(), self.get(&encoded)?))
-            })
-            .collect::<Result<HashMap<_, _>>>()?;
-        for script_hash in self.pending.keys() {
-            if !self.index.contains_key(script_hash) {
-                let encoded = hex::encode(script_hash);
-                entries.insert(encoded.clone(), self.get(&encoded)?);
-            }
-        }
-        Ok(entries.into_iter().collect())
+    pub fn keys(&self) -> Vec<String> {
+        let mut keys = self
+            .heads
+            .keys()
+            .filter_map(|key| key.ok())
+            .filter_map(|key| <[u8; 32]>::try_from(key.as_ref()).ok())
+            .chain(self.pending.keys().copied())
+            .collect::<HashSet<_>>();
+        keys.drain().map(hex::encode).collect()
     }
 
-    /// Apply complete replacement values for the scripts touched by a block.
-    /// The caller supplies each script's new chronological history.
-    pub fn apply_batch(&mut self, updates: &[(String, Vec<(Txid, u32)>)]) -> Result<()> {
+    pub fn entries(&self) -> Result<Vec<(String, StoredElectrumHistory)>> {
+        self.keys()
+            .into_iter()
+            .map(|script_hash| Ok((script_hash.clone(), self.get(&script_hash)?)))
+            .collect()
+    }
+
+    pub fn apply_batch(&mut self, updates: &[(String, StoredElectrumHistory)]) -> Result<()> {
         self.flush_pending()?;
         self.apply_batch_with_sync(updates, true)
     }
 
-    pub fn apply_batch_unsynced(&mut self, updates: &[(String, Vec<(Txid, u32)>)]) -> Result<()> {
+    pub fn apply_batch_unsynced(
+        &mut self,
+        updates: &[(String, StoredElectrumHistory)],
+    ) -> Result<()> {
         for (script_hash, entries) in updates {
             self.pending.insert(
                 encode_history_script_hash(script_hash)?,
@@ -2527,76 +2625,53 @@ impl ElectrumHistoryStore {
         Ok(())
     }
 
-    /// Accumulate active-chain history additions until the owning chainstate
-    /// reaches its bounded durability flush. Reused scripts are read and
-    /// rewritten once per batch instead of once per block.
     pub fn append_entries_unsynced(
         &mut self,
-        updates: &[(String, Vec<(Txid, u32)>)],
+        updates: &[(String, StoredElectrumHistory)],
     ) -> Result<()> {
         for (script_hash, additions) in updates {
-            if additions.is_empty() {
-                continue;
-            }
-            let encoded = encode_history_script_hash(script_hash)?;
-            let pending = self
-                .pending
-                .entry(encoded)
-                .or_insert_with(|| PendingElectrumHistory::Append(Vec::new()));
-            let entries = match pending {
-                PendingElectrumHistory::Replace(entries)
-                | PendingElectrumHistory::Append(entries) => entries,
-            };
-            for entry in additions {
-                if entries.last() != Some(entry) {
-                    entries.push(*entry);
-                }
-            }
+            self.append_pending(encode_history_script_hash(script_hash)?, additions.clone());
         }
         Ok(())
     }
 
-    /// Move active-chain history additions into the pending durability batch.
-    /// The ordinary IBD caller no longer needs the per-block map afterwards,
-    /// so taking ownership avoids cloning every script string and entry before
-    /// the much larger byte-bounded store flush.
     pub fn append_entries_owned_unsynced(
         &mut self,
-        updates: Vec<(String, Vec<(Txid, u32)>)>,
+        updates: Vec<(String, StoredElectrumHistory)>,
     ) -> Result<()> {
-        for (script_hash, mut additions) in updates {
-            if additions.is_empty() {
-                continue;
-            }
-            additions.dedup();
-            let encoded = encode_history_script_hash(&script_hash)?;
-            match self.pending.entry(encoded) {
-                hashbrown::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(PendingElectrumHistory::Append(additions));
-                }
-                hashbrown::hash_map::Entry::Occupied(mut entry) => {
-                    let entries = match entry.get_mut() {
-                        PendingElectrumHistory::Replace(entries)
-                        | PendingElectrumHistory::Append(entries) => entries,
-                    };
-                    for addition in additions {
-                        if entries.last() != Some(&addition) {
-                            entries.push(addition);
-                        }
-                    }
-                }
-            }
+        for (script_hash, additions) in updates {
+            self.append_pending(encode_history_script_hash(&script_hash)?, additions);
         }
         Ok(())
+    }
+
+    fn append_pending(&mut self, script_hash: [u8; 32], mut additions: StoredElectrumHistory) {
+        if additions.is_empty() {
+            return;
+        }
+        additions.dedup();
+        match self.pending.entry(script_hash) {
+            hashbrown::hash_map::Entry::Vacant(entry) => {
+                entry.insert(PendingElectrumHistory::Append(additions));
+            }
+            hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                let current = match entry.get_mut() {
+                    PendingElectrumHistory::Replace(entries)
+                    | PendingElectrumHistory::Append(entries) => entries,
+                };
+                extend_history(current, &additions);
+            }
+        }
     }
 
     fn flush_pending(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let pending = std::mem::take(&mut self.pending);
-        let updates = pending.into_iter().collect::<Vec<_>>();
-        if let Err(error) = self.apply_pending_encoded_batch_with_sync(&updates, true) {
+        let updates = std::mem::take(&mut self.pending)
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Err(error) = self.apply_encoded_batch_with_sync(&updates, true) {
             self.pending = updates.into_iter().collect();
             return Err(error);
         }
@@ -2605,36 +2680,22 @@ impl ElectrumHistoryStore {
 
     fn apply_batch_with_sync(
         &mut self,
-        updates: &[(String, Vec<(Txid, u32)>)],
+        updates: &[(String, StoredElectrumHistory)],
         sync: bool,
     ) -> Result<()> {
         let updates = updates
             .iter()
             .map(|(script_hash, entries)| {
-                (
-                    script_hash.clone(),
+                Ok((
+                    encode_history_script_hash(script_hash)?,
                     PendingElectrumHistory::Replace(entries.clone()),
-                )
-            })
-            .collect::<Vec<_>>();
-        self.apply_pending_batch_with_sync(&updates, sync)
-    }
-
-    fn apply_pending_batch_with_sync(
-        &mut self,
-        updates: &[(String, PendingElectrumHistory)],
-        sync: bool,
-    ) -> Result<()> {
-        let encoded_updates = updates
-            .iter()
-            .map(|(script_hash, update)| {
-                Ok((encode_history_script_hash(script_hash)?, update.clone()))
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.apply_pending_encoded_batch_with_sync(&encoded_updates, sync)
+        self.apply_encoded_batch_with_sync(&updates, sync)
     }
 
-    fn apply_pending_encoded_batch_with_sync(
+    fn apply_encoded_batch_with_sync(
         &mut self,
         updates: &[([u8; 32], PendingElectrumHistory)],
         sync: bool,
@@ -2642,292 +2703,215 @@ impl ElectrumHistoryStore {
         if updates.is_empty() {
             return Ok(());
         }
-        let batch_id = self.next_batch_id;
-        let next_batch_id = batch_id
+        let mut next_count = self.entry_count;
+        let next_generation = self
+            .generation
             .checked_add(1)
-            .context("Electrum history batch identifier exhausted")?;
-        let batch_start = data_len_after(&self.file)?;
-        let mut operations = Vec::with_capacity(updates.len());
-        let mut data_committed = false;
-        let write_result = (|| -> Result<()> {
-            let mut data_bytes = Vec::new();
-            for (script_hash_bytes, update) in updates {
-                let location = match update {
-                    PendingElectrumHistory::Replace(entries) => buffer_history_replacement_records(
-                        &mut data_bytes,
-                        batch_start,
-                        batch_id,
-                        *script_hash_bytes,
-                        entries,
-                    )?,
-                    PendingElectrumHistory::Append(entries) => buffer_history_append_records(
-                        &mut data_bytes,
-                        batch_start,
-                        batch_id,
-                        *script_hash_bytes,
-                        self.index.get(script_hash_bytes).copied(),
-                        entries,
-                    )?,
-                };
-                operations.push(PendingHistoryOperation {
-                    script_hash: *script_hash_bytes,
-                    location,
-                });
-            }
-            let commit = encode_history_commit(batch_id);
-            buffer_history_data_record(&mut data_bytes, batch_start, &commit)?;
-            self.file.write_all(&data_bytes)?;
-            if sync {
-                self.file.sync_data()?;
-            }
-            data_committed = true;
-            append_history_index_batch(
-                &mut self.index_file,
-                batch_id,
-                data_len_after(&self.file)?,
-                next_batch_id,
-                &operations,
-            )?;
-            if sync {
-                self.index_file.sync_data()?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = write_result {
-            if !data_committed {
-                let current_len = data_len_after(&self.file)?;
-                if current_len > batch_start {
-                    let _ = self.file.set_len(batch_start);
-                    let _ = self.file.seek(SeekFrom::End(0));
+            .context("Electrum history generation exhausted")?;
+        let mut batch = self
+            .keyspace
+            .batch()
+            .durability(sync.then_some(PersistMode::SyncData));
+
+        for (script_hash, update) in updates {
+            let previous = self.head(*script_hash)?;
+            match update {
+                PendingElectrumHistory::Replace(entries) => {
+                    self.batch_replace_history(&mut batch, *script_hash, previous, entries)?;
+                    match (previous.is_some(), entries.is_empty()) {
+                        (false, false) => next_count = next_count.saturating_add(1),
+                        (true, true) => next_count = next_count.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                PendingElectrumHistory::Append(entries) => {
+                    let added =
+                        self.batch_append_history(&mut batch, *script_hash, previous, entries)?;
+                    if previous.is_none() && added != 0 {
+                        next_count = next_count.saturating_add(1);
+                    }
                 }
             }
-            return Err(error);
         }
-        for operation in operations {
-            self.index.insert(operation.script_hash, operation.location);
-        }
-        self.contains_linked_histories |= updates.iter().any(|(_, update)| match update {
-            PendingElectrumHistory::Append(_) => true,
-            PendingElectrumHistory::Replace(entries) => {
-                entries.len().saturating_mul(36).saturating_add(45)
-                    > MAX_STORED_ELECTRUM_HISTORY_SIZE
-            }
-        });
-        self.next_batch_id = next_batch_id;
+        batch.insert(
+            &self.metadata,
+            META_ENTRY_COUNT.to_vec(),
+            u64::try_from(next_count)
+                .context("Electrum history count does not fit u64")?
+                .to_le_bytes()
+                .to_vec(),
+        );
+        batch.insert(
+            &self.metadata,
+            META_GENERATION.to_vec(),
+            next_generation.to_le_bytes().to_vec(),
+        );
+        batch
+            .commit()
+            .context("committing Electrum history batch")?;
+        self.entry_count = next_count;
+        self.generation = next_generation;
         Ok(())
+    }
+
+    fn batch_replace_history(
+        &self,
+        batch: &mut fjall::Batch,
+        script_hash: [u8; 32],
+        previous: Option<HistoryHead>,
+        entries: &StoredElectrumHistory,
+    ) -> Result<()> {
+        let new_chunks = entries.len().div_ceil(HISTORY_CHUNK_ENTRIES);
+        for (chunk, values) in entries.chunks(HISTORY_CHUNK_ENTRIES).enumerate() {
+            let chunk = u32::try_from(chunk).context("Electrum history has too many chunks")?;
+            batch.insert(
+                &self.chunks,
+                history_chunk_key(script_hash, chunk).to_vec(),
+                encode_history_chunk(values)?,
+            );
+        }
+        for chunk in
+            u32::try_from(new_chunks).unwrap_or(u32::MAX)..previous.map_or(0, |head| head.chunks)
+        {
+            batch.remove(&self.chunks, history_chunk_key(script_hash, chunk).to_vec());
+        }
+        if entries.is_empty() {
+            batch.remove(&self.heads, script_hash.to_vec());
+        } else {
+            batch.insert(
+                &self.heads,
+                script_hash.to_vec(),
+                encode_history_head(HistoryHead {
+                    chunks: u32::try_from(new_chunks)
+                        .context("Electrum history has too many chunks")?,
+                    entries: u64::try_from(entries.len())
+                        .context("Electrum history has too many entries")?,
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    fn batch_append_history(
+        &self,
+        batch: &mut fjall::Batch,
+        script_hash: [u8; 32],
+        previous: Option<HistoryHead>,
+        additions: &StoredElectrumHistory,
+    ) -> Result<usize> {
+        if additions.is_empty() {
+            return Ok(0);
+        }
+        let mut additions = additions.clone();
+        additions.dedup();
+        let mut head = previous.unwrap_or(HistoryHead {
+            chunks: 0,
+            entries: 0,
+        });
+        let mut added = 0usize;
+        let mut cursor = 0usize;
+        if head.chunks != 0 {
+            let last_index = head.chunks - 1;
+            let mut last = self.read_chunk(script_hash, last_index)?;
+            additions.retain(|entry| last.last() != Some(entry));
+            let available = HISTORY_CHUNK_ENTRIES.saturating_sub(last.len());
+            let take = available.min(additions.len());
+            if take != 0 {
+                extend_history(&mut last, &additions[..take]);
+                added = added.saturating_add(take);
+                cursor = take;
+                batch.insert(
+                    &self.chunks,
+                    history_chunk_key(script_hash, last_index).to_vec(),
+                    encode_history_chunk(&last)?,
+                );
+            }
+        }
+        for values in additions[cursor..].chunks(HISTORY_CHUNK_ENTRIES) {
+            batch.insert(
+                &self.chunks,
+                history_chunk_key(script_hash, head.chunks).to_vec(),
+                encode_history_chunk(values)?,
+            );
+            head.chunks = head
+                .chunks
+                .checked_add(1)
+                .context("Electrum history has too many chunks")?;
+            added = added.saturating_add(values.len());
+        }
+        if added == 0 {
+            return Ok(0);
+        }
+        head.entries = head
+            .entries
+            .checked_add(u64::try_from(added).context("history append count does not fit u64")?)
+            .context("Electrum history entry count overflowed")?;
+        batch.insert(&self.heads, script_hash.to_vec(), encode_history_head(head));
+        Ok(added)
     }
 
     pub fn replace_all<I>(&mut self, entries: I) -> Result<()>
     where
-        I: IntoIterator<Item = (String, Vec<(Txid, u32)>)>,
+        I: IntoIterator<Item = (String, StoredElectrumHistory)>,
     {
         self.clear()?;
-        let mut batch = Vec::with_capacity(1_000);
+        let mut pending = Vec::with_capacity(1000);
         for entry in entries {
-            batch.push(entry);
-            if batch.len() == 1_000 {
-                self.apply_batch(&batch)?;
-                batch.clear();
+            pending.push(entry);
+            if pending.len() == 1000 {
+                self.apply_batch_with_sync(&pending, false)?;
+                pending.clear();
             }
         }
-        if !batch.is_empty() {
-            self.apply_batch(&batch)?;
+        if !pending.is_empty() {
+            self.apply_batch_with_sync(&pending, false)?;
         }
+        self.flush()
+    }
+
+    pub fn compact(&mut self) -> Result<()> {
+        self.flush()?;
+        self.heads.major_compact()?;
+        self.chunks.major_compact()?;
         Ok(())
     }
 
-    /// Rewrite the latest history value for every script into a compact data
-    /// log and atomically replace the location index.  Both replacement files
-    /// are synced before installation; an interrupted two-file replacement is
-    /// detected by the index/data consistency checks during the next open.
-    pub fn compact(&mut self) -> Result<()> {
-        self.flush()?;
-        let mut locations = self
-            .index
-            .iter()
-            .map(|(script_hash, location)| (*script_hash, *location))
-            .collect::<Vec<_>>();
-        locations.sort_unstable_by_key(|(_, location)| location.offset());
-        let compact_data_path = self.path.with_extension("dat.compact");
-        let compact_index_path = self.index_path.with_extension("index.compact");
-        for path in [&compact_data_path, &compact_index_path] {
-            match remove_file(path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-
-        let result = (|| -> Result<()> {
-            let mut compact_data = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&compact_data_path)
-                .with_context(|| {
-                    format!(
-                        "creating compacted Electrum history store {}",
-                        compact_data_path.display()
-                    )
-                })?;
-            compact_data.write_all(ELECTRUM_HISTORY_DATA_MAGIC)?;
-            let batch_id = self.next_batch_id;
-            let next_batch_id = batch_id
-                .checked_add(1)
-                .context("Electrum history batch identifier exhausted during compaction")?;
-            let mut compact_index = FastHashMap::with_capacity(locations.len());
-            let mut copied_entries = 0usize;
-            for (script_hash_bytes, _) in &locations {
-                let history = self.read_history(*script_hash_bytes)?;
-                if history.is_empty() {
-                    // Reorg deltas may leave an empty replacement value for a
-                    // script that no longer has any active-chain history.
-                    // Keep the append-only log readable, but do not carry a
-                    // phantom key into the compacted index.
-                    continue;
-                }
-                let data_start = data_len_after(&compact_data)?;
-                let mut record_bytes = Vec::new();
-                let location = buffer_history_replacement_records(
-                    &mut record_bytes,
-                    data_start,
-                    batch_id,
-                    *script_hash_bytes,
-                    &history,
-                )?;
-                compact_data.write_all(&record_bytes)?;
-                compact_index.insert(*script_hash_bytes, location);
-                copied_entries = copied_entries.saturating_add(1);
-            }
-            if copied_entries != 0 {
-                let commit = encode_history_commit(batch_id);
-                append_history_data_record(&mut compact_data, &commit)?;
-            }
-            compact_data.sync_data()?;
-            let data_end = data_len_after(&compact_data)?;
-
-            let mut compact_index_file = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&compact_index_path)
-                .with_context(|| {
-                    format!(
-                        "creating compacted Electrum history index {}",
-                        compact_index_path.display()
-                    )
-                })?;
-            rewrite_history_index(
-                &mut compact_index_file,
-                data_end,
-                if copied_entries == 0 {
-                    self.next_batch_id
-                } else {
-                    next_batch_id
-                },
-                &compact_index,
-            )?;
-            drop(compact_index_file);
-            drop(compact_data);
-
-            rename(&compact_data_path, &self.path).with_context(|| {
-                format!(
-                    "installing compacted Electrum history store {}",
-                    self.path.display()
-                )
-            })?;
-            rename(&compact_index_path, &self.index_path).with_context(|| {
-                format!(
-                    "installing compacted Electrum history index {}",
-                    self.index_path.display()
-                )
-            })?;
-
-            self.file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&self.path)
-                .with_context(|| {
-                    format!(
-                        "reopening compacted Electrum history store {}",
-                        self.path.display()
-                    )
-                })?;
-            self.index_file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&self.index_path)
-                .with_context(|| {
-                    format!(
-                        "reopening compacted Electrum history index {}",
-                        self.index_path.display()
-                    )
-                })?;
-            self.index = compact_index;
-            self.next_batch_id = if copied_entries == 0 {
-                self.next_batch_id
-            } else {
-                next_batch_id
-            };
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = remove_file(&compact_data_path);
-            let _ = remove_file(&compact_index_path);
-        }
-        result
-    }
-
-    /// Compact only when enough historical replacement data is dead to make a
-    /// full rewrite worthwhile.  Chainstate snapshots invoke this hook so
-    /// long-running Electrum nodes reclaim old script-history versions.
     pub fn compact_if_needed(&mut self) -> Result<bool> {
-        if self.contains_linked_histories {
-            // The old latest-value estimate does not include predecessor
-            // chunks that remain logically live. Never reclaim them as stale.
-            return Ok(false);
-        }
-        let data_len = data_len_after(&self.file)?;
-        if data_len < MIN_ELECTRUM_HISTORY_COMPACTION_DATA_SIZE {
-            return Ok(false);
-        }
-        let live_bytes = ELECTRUM_HISTORY_DATA_MAGIC.len() as u64
-            + self
-                .index
-                .values()
-                .map(|location| 4u64.saturating_add(u64::from(location.length())))
-                .sum::<u64>()
-            + if self.index.is_empty() { 0 } else { 13 };
-        let stale_bytes = data_len.saturating_sub(live_bytes);
-        if stale_bytes < MIN_ELECTRUM_HISTORY_COMPACTION_STALE_SIZE || stale_bytes < live_bytes / 4
-        {
-            return Ok(false);
-        }
-        self.compact()?;
-        Ok(true)
+        Ok(false)
     }
 
     pub fn clear(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(ELECTRUM_HISTORY_DATA_MAGIC)?;
-        self.file.sync_data()?;
-        self.index.clear();
         self.pending.clear();
-        self.contains_linked_histories = false;
-        self.next_batch_id = 1;
-        self.index_file.set_len(0)?;
-        self.index_file.seek(SeekFrom::End(0))?;
-        self.index_file.write_all(ELECTRUM_HISTORY_INDEX_MAGIC)?;
-        self.index_file.sync_data()?;
+        clear_partition(&self.keyspace, &self.heads)?;
+        clear_partition(&self.keyspace, &self.chunks)?;
+        self.entry_count = 0;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .context("Electrum history generation exhausted")?;
+        let mut batch = self
+            .keyspace
+            .batch()
+            .durability(Some(PersistMode::SyncData));
+        batch.insert(
+            &self.metadata,
+            META_ENTRY_COUNT.to_vec(),
+            0u64.to_le_bytes().to_vec(),
+        );
+        batch.insert(
+            &self.metadata,
+            META_GENERATION.to_vec(),
+            self.generation.to_le_bytes().to_vec(),
+        );
+        batch.commit()?;
         Ok(())
     }
 
     pub fn flush(&mut self) -> Result<()> {
         self.flush_pending()?;
-        self.file.sync_data()?;
-        self.index_file.sync_data()?;
-        Ok(())
+        self.keyspace
+            .persist(PersistMode::SyncData)
+            .context("flushing Electrum history database")
     }
 }
 
@@ -2937,15 +2921,91 @@ impl Drop for ElectrumHistoryStore {
     }
 }
 
-fn data_len_after(file: &File) -> Result<u64> {
-    Ok(file.metadata()?.len())
+fn encode_history_head(head: HistoryHead) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(12);
+    bytes.extend_from_slice(&head.chunks.to_le_bytes());
+    bytes.extend_from_slice(&head.entries.to_le_bytes());
+    bytes
 }
 
-fn append_length_prefixed_bytes(destination: &mut Vec<u8>, body: &[u8]) -> Result<()> {
-    let length = u32::try_from(body.len()).context("storage record length does not fit u32")?;
-    destination.extend_from_slice(&length.to_le_bytes());
-    destination.extend_from_slice(body);
-    Ok(())
+fn decode_history_head(bytes: &[u8]) -> Result<HistoryHead> {
+    if bytes.len() != 12 {
+        bail!("invalid Electrum history head length");
+    }
+    Ok(HistoryHead {
+        chunks: u32::from_le_bytes(bytes[..4].try_into().expect("head chunk count is fixed")),
+        entries: u64::from_le_bytes(bytes[4..].try_into().expect("head entry count is fixed")),
+    })
+}
+
+fn history_chunk_key(script_hash: [u8; 32], chunk: u32) -> [u8; 36] {
+    let mut key = [0u8; 36];
+    key[..32].copy_from_slice(&script_hash);
+    key[32..].copy_from_slice(&chunk.to_be_bytes());
+    key
+}
+
+fn encode_history_chunk(entries: &[(Txid, u32)]) -> Result<Vec<u8>> {
+    let mut raw = Vec::with_capacity(4usize.saturating_add(entries.len().saturating_mul(36)));
+    raw.extend_from_slice(
+        &u32::try_from(entries.len())
+            .context("Electrum history chunk is too large")?
+            .to_le_bytes(),
+    );
+    for (txid, height) in entries {
+        raw.extend_from_slice(&txid.to_byte_array());
+        raw.extend_from_slice(&height.to_le_bytes());
+    }
+    encode_storage_payload(&raw, MAX_STORED_ELECTRUM_HISTORY_SIZE)
+}
+
+fn decode_history_chunk(bytes: &[u8]) -> Result<StoredElectrumHistory> {
+    let raw = decode_storage_payload(bytes, MAX_STORED_ELECTRUM_HISTORY_SIZE)?;
+    if raw.len() < 4 {
+        bail!("truncated Electrum history chunk");
+    }
+    let count = u32::from_le_bytes(raw[..4].try_into().expect("history count is fixed")) as usize;
+    let expected = 4usize
+        .checked_add(
+            count
+                .checked_mul(36)
+                .context("history chunk size overflowed")?,
+        )
+        .context("history chunk size overflowed")?;
+    if raw.len() != expected {
+        bail!("Electrum history chunk length does not match its entry count");
+    }
+    raw[4..]
+        .chunks_exact(36)
+        .map(|entry| {
+            Ok((
+                Txid::from_byte_array(entry[..32].try_into().expect("txid length is fixed")),
+                u32::from_le_bytes(entry[32..].try_into().expect("height length is fixed")),
+            ))
+        })
+        .collect()
+}
+
+fn clear_partition(keyspace: &Keyspace, partition: &PartitionHandle) -> Result<()> {
+    loop {
+        let keys = partition
+            .keys()
+            .take(10_000)
+            .map(|key| key.map(|key| key.to_vec()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut batch = keyspace.batch();
+        for key in keys {
+            batch.remove(partition, key);
+        }
+        batch.commit()?;
+    }
+}
+
+fn data_len_after(file: &File) -> Result<u64> {
+    Ok(file.metadata()?.len())
 }
 
 fn encode_history_script_hash(script_hash: &str) -> Result<[u8; 32]> {
@@ -2955,597 +3015,12 @@ fn encode_history_script_hash(script_hash: &str) -> Result<[u8; 32]> {
         .map_err(|_| anyhow::anyhow!("Electrum script hash must be exactly 32 bytes"))
 }
 
-fn encode_history_value(
-    batch_id: u64,
-    script_hash: [u8; 32],
-    entries: &[(Txid, u32)],
-) -> Result<Vec<u8>> {
-    let entry_bytes = entries
-        .len()
-        .checked_mul(36)
-        .context("Electrum history entry count overflowed")?;
-    let body_len = 1usize
-        .checked_add(8)
-        .and_then(|length| length.checked_add(32))
-        .and_then(|length| length.checked_add(4))
-        .and_then(|length| length.checked_add(entry_bytes))
-        .context("Electrum history record length overflowed")?;
-    if body_len > MAX_STORED_ELECTRUM_HISTORY_SIZE {
-        bail!("Electrum history record is too large: {body_len} bytes");
-    }
-    let count =
-        u32::try_from(entries.len()).context("Electrum history entry count is too large")?;
-    let mut body = Vec::with_capacity(body_len);
-    body.push(HISTORY_PUT);
-    body.extend_from_slice(&batch_id.to_le_bytes());
-    body.extend_from_slice(&script_hash);
-    body.extend_from_slice(&count.to_le_bytes());
-    for (txid, height) in entries {
-        body.extend_from_slice(&txid.to_byte_array());
-        body.extend_from_slice(&height.to_le_bytes());
-    }
-    Ok(body)
-}
-
-fn encode_history_append(
-    batch_id: u64,
-    script_hash: [u8; 32],
-    previous: Option<HistoryLocation>,
-    entries: &[(Txid, u32)],
-) -> Result<Vec<u8>> {
-    if entries.is_empty() {
-        bail!("Electrum history append record cannot be empty");
-    }
-    let entry_bytes = entries
-        .len()
-        .checked_mul(36)
-        .context("Electrum history append entry count overflowed")?;
-    let body_len = 1usize
-        .checked_add(8)
-        .and_then(|length| length.checked_add(32))
-        .and_then(|length| length.checked_add(8 + 4 + 4))
-        .and_then(|length| length.checked_add(entry_bytes))
-        .context("Electrum history append record length overflowed")?;
-    if body_len > MAX_STORED_ELECTRUM_HISTORY_SIZE {
-        bail!("Electrum history append record is too large: {body_len} bytes");
-    }
-    let count =
-        u32::try_from(entries.len()).context("Electrum history append count is too large")?;
-    let mut body = Vec::with_capacity(body_len);
-    body.push(HISTORY_APPEND);
-    body.extend_from_slice(&batch_id.to_le_bytes());
-    body.extend_from_slice(&script_hash);
-    body.extend_from_slice(&previous.map_or(0, HistoryLocation::offset).to_le_bytes());
-    body.extend_from_slice(&previous.map_or(0, HistoryLocation::length).to_le_bytes());
-    body.extend_from_slice(&count.to_le_bytes());
-    for (txid, height) in entries {
-        body.extend_from_slice(&txid.to_byte_array());
-        body.extend_from_slice(&height.to_le_bytes());
-    }
-    Ok(body)
-}
-
-fn buffer_history_replacement_records(
-    destination: &mut Vec<u8>,
-    data_start: u64,
-    batch_id: u64,
-    script_hash: [u8; 32],
-    entries: &[(Txid, u32)],
-) -> Result<HistoryLocation> {
-    const PUT_HEADER_SIZE: usize = 1 + 8 + 32 + 4;
-    let put_entries = (MAX_STORED_ELECTRUM_HISTORY_SIZE - PUT_HEADER_SIZE) / 36;
-    let first_end = entries.len().min(put_entries);
-    let body = encode_history_value(batch_id, script_hash, &entries[..first_end])?;
-    let mut head = buffer_history_data_record(destination, data_start, &body)?;
-    if first_end < entries.len() {
-        head = buffer_history_append_records(
-            destination,
-            data_start,
-            batch_id,
-            script_hash,
-            Some(head),
-            &entries[first_end..],
-        )?;
-    }
-    Ok(head)
-}
-
-fn buffer_history_append_records(
-    destination: &mut Vec<u8>,
-    data_start: u64,
-    batch_id: u64,
-    script_hash: [u8; 32],
-    mut previous: Option<HistoryLocation>,
-    entries: &[(Txid, u32)],
-) -> Result<HistoryLocation> {
-    const APPEND_HEADER_SIZE: usize = 1 + 8 + 32 + 8 + 4 + 4;
-    let chunk_entries = (MAX_STORED_ELECTRUM_HISTORY_SIZE - APPEND_HEADER_SIZE) / 36;
-    if entries.is_empty() {
-        return previous.context("Electrum history append has no prior value or new entries");
-    }
-    for chunk in entries.chunks(chunk_entries) {
-        let body = encode_history_append(batch_id, script_hash, previous, chunk)?;
-        previous = Some(buffer_history_data_record(destination, data_start, &body)?);
-    }
-    previous.context("Electrum history append did not produce a record")
-}
-
-fn encode_history_commit(batch_id: u64) -> Vec<u8> {
-    let mut body = Vec::with_capacity(1 + 8);
-    body.push(HISTORY_COMMIT);
-    body.extend_from_slice(&batch_id.to_le_bytes());
-    body
-}
-
-fn append_history_data_record(file: &mut File, body: &[u8]) -> Result<HistoryLocation> {
-    let offset = data_len_after(file)?;
-    let mut record_bytes = Vec::new();
-    let location = buffer_history_data_record(&mut record_bytes, offset, body)?;
-    file.write_all(&record_bytes)?;
-    Ok(location)
-}
-
-fn buffer_history_data_record(
-    destination: &mut Vec<u8>,
-    data_start: u64,
-    body: &[u8],
-) -> Result<HistoryLocation> {
-    if body.is_empty() || body.len() > MAX_STORED_ELECTRUM_HISTORY_SIZE {
-        bail!("Electrum history log record is too large");
-    }
-    let encoded_body = encode_storage_payload(body, MAX_STORED_ELECTRUM_HISTORY_SIZE)?;
-    let offset = data_start
-        .checked_add(
-            u64::try_from(destination.len())
-                .context("Electrum history batch length does not fit u64")?,
-        )
-        .context("Electrum history log offset overflowed")?;
-    let length =
-        u32::try_from(encoded_body.len()).context("Electrum history record is too large")?;
-    destination.extend_from_slice(&length.to_le_bytes());
-    destination.extend_from_slice(&encoded_body);
-    HistoryLocation::new(offset, length)
-}
-
-fn read_history_data_record(file: &File, location: HistoryLocation) -> Result<Vec<u8>> {
-    read_storage_record(
-        file,
-        Record {
-            offset: location.offset(),
-            length: location.length(),
-        },
-        XorKey::default(),
-        MAX_STORED_ELECTRUM_HISTORY_SIZE,
-        "Electrum history",
-    )
-}
-
-fn history_location_precedes(previous: HistoryLocation, current_offset: u64) -> bool {
-    previous.offset() >= ELECTRUM_HISTORY_DATA_MAGIC.len() as u64
-        && previous
-            .offset()
-            .checked_add(4)
-            .and_then(|end| end.checked_add(u64::from(previous.length())))
-            .is_some_and(|end| end <= current_offset)
-}
-
-fn decode_history_node(body: &[u8], expected_script_hash: [u8; 32]) -> Result<DecodedHistoryNode> {
-    if body.len() < 1 + 8 + 32 + 4 {
-        bail!("Electrum history value is truncated or has an invalid operation");
-    }
-    let script_hash: [u8; 32] = body[9..41]
-        .try_into()
-        .expect("Electrum history script hash has fixed width");
-    if script_hash != expected_script_hash {
-        bail!("Electrum history value key does not match its index");
-    }
-    let (previous, count_offset, entries_offset) = match body[0] {
-        HISTORY_PUT => (None, 41, 45),
-        HISTORY_APPEND => {
-            if body.len() < 1 + 8 + 32 + 8 + 4 + 4 {
-                bail!("Electrum history append value is truncated");
-            }
-            let previous_offset = u64::from_le_bytes(
-                body[41..49]
-                    .try_into()
-                    .expect("Electrum history previous offset has fixed width"),
-            );
-            let previous_length = u32::from_le_bytes(
-                body[49..53]
-                    .try_into()
-                    .expect("Electrum history previous length has fixed width"),
-            );
-            let previous = match (previous_offset, previous_length) {
-                (0, 0) => None,
-                (_, 0) => bail!("Electrum history append has an invalid previous location"),
-                (offset, length) => Some(HistoryLocation::new(offset, length)?),
-            };
-            (previous, 53, 57)
-        }
-        _ => bail!("Electrum history value has an invalid operation"),
-    };
-    let count = usize::try_from(u32::from_le_bytes(
-        body[count_offset..entries_offset]
-            .try_into()
-            .expect("Electrum history count has fixed width"),
-    ))
-    .context("Electrum history count does not fit usize")?;
-    if body[0] == HISTORY_APPEND && count == 0 {
-        bail!("Electrum history append value is empty");
-    }
-    let expected_len = entries_offset
-        .checked_add(
-            count
-                .checked_mul(36)
-                .context("Electrum history count overflowed")?,
-        )
-        .context("Electrum history value length overflowed")?;
-    if expected_len != body.len() {
-        bail!("Electrum history count does not match value length");
-    }
-    let mut entries = Vec::with_capacity(count);
-    let mut offset = entries_offset;
-    for _ in 0..count {
-        let txid = Txid::from_byte_array(
-            body[offset..offset + 32]
-                .try_into()
-                .expect("Electrum history txid has fixed width"),
-        );
-        let height = u32::from_le_bytes(
-            body[offset + 32..offset + 36]
-                .try_into()
-                .expect("Electrum history height has fixed width"),
-        );
-        entries.push((txid, height));
-        offset += 36;
-    }
-    Ok(DecodedHistoryNode { previous, entries })
-}
-
 fn extend_history(history: &mut StoredElectrumHistory, additions: &[(Txid, u32)]) {
     for entry in additions {
         if history.last() != Some(entry) {
             history.push(*entry);
         }
     }
-}
-
-fn scan_history_data(file: &mut File) -> Result<(FastHashMap<[u8; 32], HistoryLocation>, u64)> {
-    let data_len = data_len_after(file)?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut magic = vec![0u8; ELECTRUM_HISTORY_DATA_MAGIC.len()];
-    file.read_exact(&mut magic)?;
-    if magic != ELECTRUM_HISTORY_DATA_MAGIC {
-        bail!("Electrum history store has an unknown format");
-    }
-    let mut position = ELECTRUM_HISTORY_DATA_MAGIC.len() as u64;
-    let mut committed_end = position;
-    let mut pending_batch = None;
-    let mut pending = Vec::new();
-    let mut index = FastHashMap::new();
-    let mut max_batch = 0u64;
-    while position < data_len {
-        let record_start = position;
-        let mut length_bytes = [0u8; 4];
-        if let Err(error) = file.read_exact(&mut length_bytes) {
-            if error.kind() == ErrorKind::UnexpectedEof {
-                break;
-            }
-            return Err(error.into());
-        }
-        let length = u32::from_le_bytes(length_bytes);
-        let next = position
-            .checked_add(4)
-            .and_then(|value| value.checked_add(u64::from(length)))
-            .context("Electrum history log position overflowed")?;
-        if length == 0
-            || usize::try_from(length).unwrap_or(usize::MAX) > MAX_STORED_ELECTRUM_HISTORY_SIZE
-        {
-            if next > data_len {
-                break;
-            }
-            bail!("Electrum history log record has an invalid length");
-        }
-        if next > data_len {
-            break;
-        }
-        let mut body = vec![0u8; length as usize];
-        file.read_exact(&mut body)?;
-        let body = decode_storage_payload(&body, MAX_STORED_ELECTRUM_HISTORY_SIZE)
-            .context("decoding compressed Electrum history record")?;
-        match body.first().copied() {
-            Some(HISTORY_PUT) | Some(HISTORY_APPEND) => {
-                if body.len() < 1 + 8 + 32 + 4 {
-                    bail!("Electrum history value is truncated");
-                }
-                let batch_id = u64::from_le_bytes(
-                    body[1..9]
-                        .try_into()
-                        .context("Electrum history batch identifier is truncated")?,
-                );
-                let script_hash: [u8; 32] = body[9..41]
-                    .try_into()
-                    .context("Electrum history script hash is truncated")?;
-                let node = decode_history_node(&body, script_hash)?;
-                if node
-                    .previous
-                    .is_some_and(|previous| !history_location_precedes(previous, record_start))
-                {
-                    bail!("Electrum history append chain does not point backwards");
-                }
-                if pending_batch != Some(batch_id) {
-                    if pending_batch.is_some() {
-                        bail!("Electrum history log contains interleaved batches");
-                    }
-                    pending_batch = Some(batch_id);
-                }
-                pending.push(PendingHistoryOperation {
-                    script_hash,
-                    location: HistoryLocation::new(record_start, length)?,
-                });
-                max_batch = max_batch.max(batch_id);
-            }
-            Some(HISTORY_COMMIT) => {
-                if body.len() != 1 + 8 {
-                    bail!("Electrum history commit record has an invalid length");
-                }
-                let batch_id = u64::from_le_bytes(
-                    body[1..9]
-                        .try_into()
-                        .expect("Electrum history batch identifier has fixed width"),
-                );
-                if pending_batch != Some(batch_id) || pending.is_empty() {
-                    bail!("Electrum history commit does not match a pending batch");
-                }
-                for operation in pending.drain(..) {
-                    index.insert(operation.script_hash, operation.location);
-                }
-                pending_batch = None;
-                committed_end = next;
-                max_batch = max_batch.max(batch_id);
-            }
-            _ => bail!("Electrum history log contains an unknown operation"),
-        }
-        position = next;
-    }
-    if pending_batch.is_some() || position != committed_end {
-        file.set_len(committed_end)?;
-        file.seek(SeekFrom::End(0))?;
-    }
-    Ok((
-        index,
-        max_batch
-            .checked_add(1)
-            .context("Electrum history batch identifier exhausted")?,
-    ))
-}
-
-fn load_history_index(
-    file: &mut File,
-    data_file: &File,
-    data_len: u64,
-    validate_live_values: bool,
-) -> Result<Option<HistoryIndexState>> {
-    let index_len = file.metadata()?.len();
-    if index_len < ELECTRUM_HISTORY_INDEX_MAGIC.len() as u64 {
-        return Ok(None);
-    }
-    file.seek(SeekFrom::Start(0))?;
-    let mut magic = vec![0u8; ELECTRUM_HISTORY_INDEX_MAGIC.len()];
-    file.read_exact(&mut magic)?;
-    if magic != ELECTRUM_HISTORY_INDEX_MAGIC {
-        return Ok(None);
-    }
-    let mut position = ELECTRUM_HISTORY_INDEX_MAGIC.len() as u64;
-    let mut pending_batch = None;
-    let mut pending = Vec::new();
-    let mut index = FastHashMap::new();
-    let mut last_data_end = None;
-    let mut stored_next_batch_id = None;
-    let mut max_batch = 0u64;
-    while position < index_len {
-        let mut length_bytes = [0u8; 4];
-        if file.read_exact(&mut length_bytes).is_err() {
-            return Ok(None);
-        }
-        let length = u32::from_le_bytes(length_bytes);
-        let next = position
-            .checked_add(4)
-            .and_then(|value| value.checked_add(u64::from(length)))
-            .context("Electrum history index position overflowed")?;
-        if next > index_len || length == 0 || length > 128 {
-            return Ok(None);
-        }
-        let mut body = vec![0u8; length as usize];
-        file.read_exact(&mut body)?;
-        match body.first().copied() {
-            Some(HISTORY_PUT) => {
-                if body.len() != 1 + 8 + 8 + 4 + 32 {
-                    return Ok(None);
-                }
-                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
-                let offset = u64::from_le_bytes(body[9..17].try_into().unwrap());
-                let value_length = u32::from_le_bytes(body[17..21].try_into().unwrap());
-                if value_length == 0
-                    || value_length as usize > MAX_STORED_ELECTRUM_HISTORY_SIZE
-                    || offset < ELECTRUM_HISTORY_DATA_MAGIC.len() as u64
-                    || offset
-                        .checked_add(4)
-                        .and_then(|end| end.checked_add(u64::from(value_length)))
-                        .is_none_or(|end| end > data_len)
-                {
-                    return Ok(None);
-                }
-                let script_hash: [u8; 32] = body[21..53].try_into().unwrap();
-                if pending_batch != Some(batch_id) {
-                    if pending_batch.is_some() {
-                        return Ok(None);
-                    }
-                    pending_batch = Some(batch_id);
-                }
-                let Ok(location) = HistoryLocation::new(offset, value_length) else {
-                    return Ok(None);
-                };
-                pending.push(PendingHistoryOperation {
-                    script_hash,
-                    location,
-                });
-                max_batch = max_batch.max(batch_id);
-            }
-            Some(HISTORY_COMMIT) => {
-                if body.len() != 1 + 8 + 8 + 8 {
-                    return Ok(None);
-                }
-                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
-                let data_end = u64::from_le_bytes(body[9..17].try_into().unwrap());
-                let next_batch_id = u64::from_le_bytes(body[17..25].try_into().unwrap());
-                if next_batch_id == 0
-                    || data_end < ELECTRUM_HISTORY_DATA_MAGIC.len() as u64
-                    || data_end > data_len
-                    || last_data_end.is_some_and(|previous| data_end < previous)
-                    || pending_batch != Some(batch_id)
-                    || (pending.is_empty() && batch_id != 0)
-                {
-                    return Ok(None);
-                }
-                for operation in pending.drain(..) {
-                    index.insert(operation.script_hash, operation.location);
-                }
-                pending_batch = None;
-                last_data_end = Some(data_end);
-                stored_next_batch_id = Some(next_batch_id);
-                max_batch = max_batch.max(batch_id);
-            }
-            _ => return Ok(None),
-        }
-        position = next;
-    }
-    if pending_batch.is_some() || last_data_end != Some(data_len) {
-        return Ok(None);
-    }
-    if validate_live_values {
-        let mut live_values = index
-            .iter()
-            .map(|(script_hash, location)| (*script_hash, *location))
-            .collect::<Vec<_>>();
-        live_values.sort_unstable_by_key(|(_, location)| location.offset());
-        for (script_hash, location) in live_values {
-            if validate_history_data_header(data_file, location, script_hash).is_err() {
-                return Ok(None);
-            }
-        }
-    }
-    Ok(Some((
-        index,
-        stored_next_batch_id.unwrap_or(
-            max_batch
-                .checked_add(1)
-                .context("Electrum history batch identifier exhausted")?,
-        ),
-    )))
-}
-
-fn validate_history_data_header(
-    file: &File,
-    location: HistoryLocation,
-    expected_script_hash: [u8; 32],
-) -> Result<()> {
-    let body = read_history_data_record(file, location)?;
-    if body.len() < 1 + 8 + 32 + 4 || !matches!(body[0], HISTORY_PUT | HISTORY_APPEND) {
-        bail!("Electrum history index points to a non-value record");
-    }
-    let node = decode_history_node(&body, expected_script_hash)?;
-    if node
-        .previous
-        .is_some_and(|previous| !history_location_precedes(previous, location.offset()))
-    {
-        bail!("Electrum history append chain does not point backwards");
-    }
-    Ok(())
-}
-
-fn append_history_index_batch(
-    file: &mut File,
-    batch_id: u64,
-    data_end: u64,
-    next_batch_id: u64,
-    operations: &[PendingHistoryOperation],
-) -> Result<()> {
-    file.seek(SeekFrom::End(0))?;
-    let mut bytes = Vec::with_capacity(
-        operations
-            .len()
-            .saturating_mul(4 + 1 + 8 + 8 + 4 + 32)
-            .saturating_add(4 + 25),
-    );
-    for operation in operations {
-        let body = encode_history_index_operation(batch_id, operation)?;
-        append_length_prefixed_bytes(&mut bytes, &body)?;
-    }
-    let mut commit = Vec::with_capacity(25);
-    commit.push(HISTORY_COMMIT);
-    commit.extend_from_slice(&batch_id.to_le_bytes());
-    commit.extend_from_slice(&data_end.to_le_bytes());
-    commit.extend_from_slice(&next_batch_id.to_le_bytes());
-    append_length_prefixed_bytes(&mut bytes, &commit)?;
-    file.write_all(&bytes)?;
-    Ok(())
-}
-
-fn append_history_index_operation(
-    file: &mut File,
-    batch_id: u64,
-    operation: &PendingHistoryOperation,
-) -> Result<()> {
-    let body = encode_history_index_operation(batch_id, operation)?;
-    let mut bytes = Vec::with_capacity(4 + body.len());
-    append_length_prefixed_bytes(&mut bytes, &body)?;
-    file.write_all(&bytes)?;
-    Ok(())
-}
-
-fn encode_history_index_operation(
-    batch_id: u64,
-    operation: &PendingHistoryOperation,
-) -> Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(64);
-    body.push(HISTORY_PUT);
-    body.extend_from_slice(&batch_id.to_le_bytes());
-    body.extend_from_slice(&operation.location.offset().to_le_bytes());
-    body.extend_from_slice(&operation.location.length().to_le_bytes());
-    body.extend_from_slice(&operation.script_hash);
-    u32::try_from(body.len()).context("Electrum history index record too large")?;
-    Ok(body)
-}
-
-fn rewrite_history_index(
-    file: &mut File,
-    data_end: u64,
-    next_batch_id: u64,
-    index: &FastHashMap<[u8; 32], HistoryLocation>,
-) -> Result<()> {
-    file.set_len(0)?;
-    file.seek(SeekFrom::End(0))?;
-    file.write_all(ELECTRUM_HISTORY_INDEX_MAGIC)?;
-    for (script_hash, location) in index {
-        append_history_index_operation(
-            file,
-            0,
-            &PendingHistoryOperation {
-                script_hash: *script_hash,
-                location: *location,
-            },
-        )?;
-    }
-    let mut commit = Vec::with_capacity(25);
-    commit.push(HISTORY_COMMIT);
-    commit.extend_from_slice(&0u64.to_le_bytes());
-    commit.extend_from_slice(&data_end.to_le_bytes());
-    commit.extend_from_slice(&next_batch_id.to_le_bytes());
-    file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
-    file.write_all(&commit)?;
-    file.sync_data()?;
-    Ok(())
 }
 
 fn encode_stored_utxo(entry: &StoredUtxo) -> Result<Vec<u8>> {
@@ -3605,534 +3080,6 @@ fn decode_outpoint(bytes: &[u8]) -> Result<OutPoint> {
         bail!("stored UTXO outpoint is not 36 bytes");
     }
     deserialize(bytes).context("decoding stored UTXO outpoint")
-}
-
-fn encode_utxo_put(batch_id: u64, outpoint: &OutPoint, entry: &StoredUtxo) -> Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(1 + 8 + 36 + MAX_STORED_UTXO_SIZE.min(128));
-    body.push(UTXO_PUT);
-    body.extend_from_slice(&batch_id.to_le_bytes());
-    body.extend_from_slice(&encode_outpoint(outpoint));
-    body.extend_from_slice(&encode_stored_utxo(entry)?);
-    Ok(body)
-}
-
-fn encode_utxo_delete(batch_id: u64, outpoint: &OutPoint) -> Vec<u8> {
-    let mut body = Vec::with_capacity(1 + 8 + 36);
-    body.push(UTXO_DELETE);
-    body.extend_from_slice(&batch_id.to_le_bytes());
-    body.extend_from_slice(&encode_outpoint(outpoint));
-    body
-}
-
-fn encode_utxo_commit(batch_id: u64) -> Vec<u8> {
-    let mut body = Vec::with_capacity(1 + 8);
-    body.push(UTXO_COMMIT);
-    body.extend_from_slice(&batch_id.to_le_bytes());
-    body
-}
-
-fn append_utxo_data_record(file: &mut File, body: &[u8]) -> Result<UtxoLocation> {
-    let offset = data_len_after(file)?;
-    let mut record_bytes = Vec::new();
-    let location = buffer_utxo_data_record(&mut record_bytes, offset, body)?;
-    file.write_all(&record_bytes)?;
-    Ok(location)
-}
-
-fn buffer_utxo_data_record(
-    destination: &mut Vec<u8>,
-    data_start: u64,
-    body: &[u8],
-) -> Result<UtxoLocation> {
-    if body.is_empty() || body.len() > MAX_STORED_UTXO_SIZE + 64 {
-        bail!("UTXO log record is too large");
-    }
-    let encoded_body = encode_storage_payload(body, MAX_STORED_UTXO_SIZE + 64)?;
-    let offset = data_start
-        .checked_add(
-            u64::try_from(destination.len()).context("UTXO batch length does not fit u64")?,
-        )
-        .context("UTXO log offset overflowed")?;
-    let length =
-        u32::try_from(encoded_body.len()).context("UTXO log record length does not fit u32")?;
-    let location = UtxoLocation::new(offset, length)?;
-    destination.extend_from_slice(&length.to_le_bytes());
-    destination.extend_from_slice(&encoded_body);
-    Ok(location)
-}
-
-fn read_utxo_data_record(file: &File, location: UtxoLocation) -> Result<Vec<u8>> {
-    read_storage_record(
-        file,
-        Record {
-            offset: location.offset(),
-            length: location.length(),
-        },
-        XorKey::default(),
-        MAX_STORED_UTXO_SIZE + 64,
-        "UTXO",
-    )
-}
-
-fn scan_utxo_data(file: &mut File) -> Result<(FastHashMap<OutPoint, UtxoLocation>, u64)> {
-    let data_len = data_len_after(file)?;
-    file.seek(SeekFrom::Start(0))?;
-    let mut magic = vec![0u8; UTXO_DATA_MAGIC.len()];
-    file.read_exact(&mut magic)?;
-    if magic != UTXO_DATA_MAGIC {
-        bail!("UTXO store has an unknown format");
-    }
-    let mut position = UTXO_DATA_MAGIC.len() as u64;
-    let mut committed_end = position;
-    let mut pending_batch = None;
-    let mut pending = Vec::new();
-    let mut index = FastHashMap::new();
-    let mut max_batch = 0u64;
-    while position < data_len {
-        let record_start = position;
-        let mut length_bytes = [0u8; 4];
-        if let Err(error) = file.read_exact(&mut length_bytes) {
-            if error.kind() == ErrorKind::UnexpectedEof {
-                break;
-            }
-            return Err(error.into());
-        }
-        let length = u32::from_le_bytes(length_bytes);
-        let next = position
-            .checked_add(4)
-            .and_then(|value| value.checked_add(u64::from(length)))
-            .context("UTXO log position overflowed")?;
-        if length == 0 || usize::try_from(length).unwrap_or(usize::MAX) > MAX_STORED_UTXO_SIZE + 64
-        {
-            if next > data_len {
-                break;
-            }
-            bail!("UTXO log record has an invalid length");
-        }
-        if next > data_len {
-            break;
-        }
-        let mut body = vec![0u8; length as usize];
-        file.read_exact(&mut body)?;
-        let body = decode_storage_payload(&body, MAX_STORED_UTXO_SIZE + 64)
-            .context("decoding compressed UTXO log record")?;
-        let operation = body.first().copied().context("UTXO log record is empty")?;
-        match operation {
-            UTXO_PUT => {
-                if body.len() < 1 + 8 + 36 + 13 {
-                    bail!("UTXO put record is truncated");
-                }
-                let batch_id =
-                    u64::from_le_bytes(body[1..9].try_into().expect("fixed UTXO batch identifier"));
-                let outpoint = decode_outpoint(&body[9..45])?;
-                decode_stored_utxo(&body[45..])?;
-                let location = UtxoLocation::new(record_start, length)?;
-                if pending_batch != Some(batch_id) {
-                    if pending_batch.is_some() {
-                        bail!("UTXO log contains interleaved mutation batches");
-                    }
-                    pending_batch = Some(batch_id);
-                }
-                pending.push(PendingUtxoOperation::Put { outpoint, location });
-                max_batch = max_batch.max(batch_id);
-            }
-            UTXO_DELETE => {
-                if body.len() != 1 + 8 + 36 {
-                    bail!("UTXO delete record has an invalid length");
-                }
-                let batch_id =
-                    u64::from_le_bytes(body[1..9].try_into().expect("fixed UTXO batch identifier"));
-                let outpoint = decode_outpoint(&body[9..45])?;
-                if pending_batch != Some(batch_id) {
-                    if pending_batch.is_some() {
-                        bail!("UTXO log contains interleaved mutation batches");
-                    }
-                    pending_batch = Some(batch_id);
-                }
-                pending.push(PendingUtxoOperation::Delete { outpoint });
-                max_batch = max_batch.max(batch_id);
-            }
-            UTXO_COMMIT => {
-                if body.len() != 1 + 8 {
-                    bail!("UTXO commit record has an invalid length");
-                }
-                let batch_id =
-                    u64::from_le_bytes(body[1..9].try_into().expect("fixed UTXO batch identifier"));
-                if pending_batch != Some(batch_id) || pending.is_empty() {
-                    bail!("UTXO commit does not match a pending batch");
-                }
-                for operation in pending.drain(..) {
-                    match operation {
-                        PendingUtxoOperation::Put { outpoint, location } => {
-                            index.insert(outpoint, location);
-                        }
-                        PendingUtxoOperation::Delete { outpoint } => {
-                            index.remove(&outpoint);
-                        }
-                    }
-                }
-                pending_batch = None;
-                committed_end = next;
-                max_batch = max_batch.max(batch_id);
-            }
-            _ => bail!("UTXO log contains an unknown operation"),
-        }
-        position = next;
-    }
-    if pending_batch.is_some() || position != committed_end {
-        file.set_len(committed_end)?;
-        file.seek(SeekFrom::End(0))?;
-    }
-    Ok((
-        index,
-        max_batch
-            .checked_add(1)
-            .context("UTXO batch identifier exhausted")?,
-    ))
-}
-
-fn load_utxo_index(
-    file: &mut File,
-    data_file: &File,
-    data_len: u64,
-    validate_live_values: bool,
-) -> Result<Option<UtxoIndexState>> {
-    let index_len = file.metadata()?.len();
-    if index_len < UTXO_INDEX_MAGIC.len() as u64 {
-        warn!("UTXO index is missing or truncated; rebuilding from the value log");
-        return Ok(None);
-    }
-    file.seek(SeekFrom::Start(0))?;
-    let mut magic = vec![0u8; UTXO_INDEX_MAGIC.len()];
-    file.read_exact(&mut magic)?;
-    if magic != UTXO_INDEX_MAGIC {
-        warn!("UTXO index has an unknown format; rebuilding from the value log");
-        return Ok(None);
-    }
-    let mut position = UTXO_INDEX_MAGIC.len() as u64;
-    let mut pending_batch = None;
-    let mut pending = Vec::new();
-    let mut index = FastHashMap::new();
-    let mut last_data_end = None;
-    let mut max_batch = 0u64;
-    let mut stored_next_batch_id = None;
-    let mut stored_generation = None;
-    while position < index_len {
-        let mut length_bytes = [0u8; 4];
-        if file.read_exact(&mut length_bytes).is_err() {
-            warn!("UTXO index has a truncated record length; rebuilding from the value log");
-            return Ok(None);
-        }
-        let length = u32::from_le_bytes(length_bytes);
-        let next = position
-            .checked_add(4)
-            .and_then(|value| value.checked_add(u64::from(length)))
-            .context("UTXO index position overflowed")?;
-        if next > index_len || length == 0 || length > 128 {
-            warn!(
-                position,
-                length,
-                index_len,
-                "UTXO index has invalid record bounds; rebuilding from the value log"
-            );
-            return Ok(None);
-        }
-        let mut body = vec![0u8; length as usize];
-        file.read_exact(&mut body)?;
-        let operation = body
-            .first()
-            .copied()
-            .context("UTXO index record is empty")?;
-        match operation {
-            UTXO_PUT => {
-                if body.len() != 1 + 8 + 8 + 4 + 36 {
-                    warn!("UTXO index has an invalid put record; rebuilding from the value log");
-                    return Ok(None);
-                }
-                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
-                let offset = u64::from_le_bytes(body[9..17].try_into().unwrap());
-                let value_length = u32::from_le_bytes(body[17..21].try_into().unwrap());
-                let outpoint = decode_outpoint(&body[21..57])?;
-                if value_length == 0
-                    || value_length as usize > MAX_STORED_UTXO_SIZE + 64
-                    || offset < UTXO_DATA_MAGIC.len() as u64
-                    || offset
-                        .checked_add(4)
-                        .and_then(|end| end.checked_add(u64::from(value_length)))
-                        .is_none_or(|end| end > data_len)
-                {
-                    warn!(
-                        offset,
-                        value_length,
-                        data_len,
-                        "UTXO index points outside the value log; rebuilding"
-                    );
-                    return Ok(None);
-                }
-                if pending_batch != Some(batch_id) {
-                    if pending_batch.is_some() {
-                        warn!(
-                            batch_id,
-                            "UTXO index interleaves uncommitted batches; rebuilding from the value log"
-                        );
-                        return Ok(None);
-                    }
-                    pending_batch = Some(batch_id);
-                }
-                let Ok(location) = UtxoLocation::new(offset, value_length) else {
-                    warn!(
-                        offset,
-                        value_length,
-                        "UTXO index location cannot be represented; rebuilding from the value log"
-                    );
-                    return Ok(None);
-                };
-                pending.push(PendingUtxoOperation::Put { outpoint, location });
-                max_batch = max_batch.max(batch_id);
-            }
-            UTXO_DELETE => {
-                if body.len() != 1 + 8 + 36 {
-                    warn!("UTXO index has an invalid delete record; rebuilding from the value log");
-                    return Ok(None);
-                }
-                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
-                let outpoint = decode_outpoint(&body[9..45])?;
-                if pending_batch != Some(batch_id) {
-                    if pending_batch.is_some() {
-                        warn!(
-                            batch_id,
-                            "UTXO index interleaves uncommitted delete batches; rebuilding from the value log"
-                        );
-                        return Ok(None);
-                    }
-                    pending_batch = Some(batch_id);
-                }
-                pending.push(PendingUtxoOperation::Delete { outpoint });
-                max_batch = max_batch.max(batch_id);
-            }
-            UTXO_COMMIT => {
-                if body.len() != 1 + 8 + 8 + 8 + 8 {
-                    warn!("UTXO index has an invalid commit record; rebuilding from the value log");
-                    return Ok(None);
-                }
-                let batch_id = u64::from_le_bytes(body[1..9].try_into().unwrap());
-                let data_end = u64::from_le_bytes(body[9..17].try_into().unwrap());
-                let next_batch_id = u64::from_le_bytes(body[17..25].try_into().unwrap());
-                let generation = u64::from_le_bytes(body[25..33].try_into().unwrap());
-                if next_batch_id == 0 {
-                    warn!("UTXO index has an invalid next batch ID; rebuilding from the value log");
-                    return Ok(None);
-                }
-                if generation == 0
-                    || data_end < UTXO_DATA_MAGIC.len() as u64
-                    || data_end > data_len
-                    || last_data_end.is_some_and(|previous| data_end < previous)
-                    || stored_generation.is_some_and(|previous| previous != generation)
-                {
-                    warn!(
-                        batch_id,
-                        data_end,
-                        data_len,
-                        generation,
-                        "UTXO index commit metadata is inconsistent; rebuilding from the value log"
-                    );
-                    return Ok(None);
-                }
-                let batch_matches = if batch_id == 0 {
-                    pending_batch.is_none() || pending_batch == Some(0)
-                } else {
-                    pending_batch == Some(batch_id) && !pending.is_empty()
-                };
-                if !batch_matches {
-                    warn!(
-                        batch_id,
-                        pending_batch = ?pending_batch,
-                        pending_operations = pending.len(),
-                        "UTXO index commit does not match its operations; rebuilding from the value log"
-                    );
-                    return Ok(None);
-                }
-                for operation in pending.drain(..) {
-                    match operation {
-                        PendingUtxoOperation::Put { outpoint, location } => {
-                            index.insert(outpoint, location);
-                        }
-                        PendingUtxoOperation::Delete { outpoint } => {
-                            index.remove(&outpoint);
-                        }
-                    }
-                }
-                pending_batch = None;
-                last_data_end = Some(data_end);
-                stored_next_batch_id = Some(next_batch_id);
-                stored_generation = Some(generation);
-                max_batch = max_batch.max(batch_id);
-            }
-            _ => {
-                warn!(
-                    operation,
-                    "UTXO index contains an unknown operation; rebuilding from the value log"
-                );
-                return Ok(None);
-            }
-        }
-        position = next;
-    }
-    if pending_batch.is_some() || last_data_end != Some(data_len) {
-        warn!(
-            pending_batch = ?pending_batch,
-            last_data_end = ?last_data_end,
-            data_len,
-            "UTXO index does not cover the complete value log; rebuilding"
-        );
-        return Ok(None);
-    }
-    // The durable index is an append journal, so hash-map iteration turns
-    // value verification into millions of random reads. Validate live values
-    // in log order instead; this preserves the same corruption checks while
-    // allowing local and network filesystems to issue forward readahead.
-    if validate_live_values {
-        let mut live_values = index
-            .iter()
-            .map(|(outpoint, location)| (*outpoint, *location))
-            .collect::<Vec<_>>();
-        live_values.sort_unstable_by_key(|(_, location)| location.offset());
-        for (outpoint, location) in live_values {
-            if let Err(error) = validate_utxo_data_header(data_file, location, outpoint) {
-                warn!(
-                    %error,
-                    %outpoint,
-                    offset = location.offset(),
-                    value_length = location.length(),
-                    "UTXO index value validation failed; rebuilding from the value log"
-                );
-                return Ok(None);
-            }
-        }
-    }
-    Ok(Some((
-        index,
-        stored_next_batch_id.unwrap_or(
-            max_batch
-                .checked_add(1)
-                .context("UTXO batch identifier exhausted")?,
-        ),
-        stored_generation.context("UTXO index has no generation checkpoint")?,
-    )))
-}
-
-fn validate_utxo_data_header(
-    file: &File,
-    location: UtxoLocation,
-    expected_outpoint: OutPoint,
-) -> Result<()> {
-    let body = read_utxo_data_record(file, location)?;
-    if body.len() < 1 + 8 + 36 + 13 || body[0] != UTXO_PUT {
-        bail!("UTXO index points to a non-value record");
-    }
-    if u64::from_le_bytes(body[1..9].try_into().expect("UTXO batch has fixed width")) == 0 {
-        bail!("UTXO value batch identifier is invalid");
-    }
-    if decode_outpoint(&body[9..45])? != expected_outpoint {
-        bail!("UTXO value key does not match its index");
-    }
-    decode_stored_utxo(&body[45..])?;
-    Ok(())
-}
-
-fn append_utxo_index_batch(
-    file: &mut File,
-    batch_id: u64,
-    data_end: u64,
-    next_batch_id: u64,
-    generation: u64,
-    operations: &[PendingUtxoOperation],
-) -> Result<()> {
-    file.seek(SeekFrom::End(0))?;
-    let mut bytes = Vec::with_capacity(
-        operations
-            .len()
-            .saturating_mul(4 + 1 + 8 + 8 + 4 + 36)
-            .saturating_add(4 + 33),
-    );
-    for operation in operations {
-        let body = encode_utxo_index_operation(batch_id, operation)?;
-        append_length_prefixed_bytes(&mut bytes, &body)?;
-    }
-    let mut commit = Vec::with_capacity(33);
-    commit.push(UTXO_COMMIT);
-    commit.extend_from_slice(&batch_id.to_le_bytes());
-    commit.extend_from_slice(&data_end.to_le_bytes());
-    commit.extend_from_slice(&next_batch_id.to_le_bytes());
-    commit.extend_from_slice(&generation.to_le_bytes());
-    append_length_prefixed_bytes(&mut bytes, &commit)?;
-    file.write_all(&bytes)?;
-    Ok(())
-}
-
-fn append_utxo_index_operation(
-    file: &mut File,
-    batch_id: u64,
-    operation: &PendingUtxoOperation,
-) -> Result<()> {
-    let body = encode_utxo_index_operation(batch_id, operation)?;
-    let mut bytes = Vec::with_capacity(4 + body.len());
-    append_length_prefixed_bytes(&mut bytes, &body)?;
-    file.write_all(&bytes)?;
-    Ok(())
-}
-
-fn encode_utxo_index_operation(batch_id: u64, operation: &PendingUtxoOperation) -> Result<Vec<u8>> {
-    let mut body = Vec::with_capacity(64);
-    match operation {
-        PendingUtxoOperation::Put { outpoint, location } => {
-            body.push(UTXO_PUT);
-            body.extend_from_slice(&batch_id.to_le_bytes());
-            body.extend_from_slice(&location.offset().to_le_bytes());
-            body.extend_from_slice(&location.length().to_le_bytes());
-            body.extend_from_slice(&encode_outpoint(outpoint));
-        }
-        PendingUtxoOperation::Delete { outpoint } => {
-            body.push(UTXO_DELETE);
-            body.extend_from_slice(&batch_id.to_le_bytes());
-            body.extend_from_slice(&encode_outpoint(outpoint));
-        }
-    }
-    u32::try_from(body.len()).context("UTXO index record is too large")?;
-    Ok(body)
-}
-
-fn rewrite_utxo_index(
-    file: &mut File,
-    data_end: u64,
-    next_batch_id: u64,
-    generation: u64,
-    index: &FastHashMap<OutPoint, UtxoLocation>,
-) -> Result<()> {
-    file.set_len(0)?;
-    file.seek(SeekFrom::End(0))?;
-    file.write_all(UTXO_INDEX_MAGIC)?;
-    let checkpoint_batch = 0u64;
-    for (outpoint, location) in index {
-        append_utxo_index_operation(
-            file,
-            checkpoint_batch,
-            &PendingUtxoOperation::Put {
-                outpoint: *outpoint,
-                location: *location,
-            },
-        )?;
-    }
-    let mut commit = Vec::with_capacity(33);
-    commit.push(UTXO_COMMIT);
-    commit.extend_from_slice(&checkpoint_batch.to_le_bytes());
-    commit.extend_from_slice(&data_end.to_le_bytes());
-    commit.extend_from_slice(&next_batch_id.to_le_bytes());
-    commit.extend_from_slice(&generation.to_le_bytes());
-    file.write_all(&(u32::try_from(commit.len()).unwrap()).to_le_bytes())?;
-    file.write_all(&commit)?;
-    file.sync_data()?;
-    Ok(())
 }
 
 impl CoinStatsStore {
@@ -4238,171 +3185,6 @@ impl CoinStatsStore {
         self.file.sync_data()?;
         publish_index_data_len(&mut self.index_file, data_len_after(&self.file)?)?;
         Ok(())
-    }
-}
-
-impl TransactionIndexStore {
-    pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
-        let directory = directory.as_ref();
-        create_dir_all(directory).with_context(|| {
-            format!(
-                "creating transaction index directory {}",
-                directory.display()
-            )
-        })?;
-        let path = directory.join("txindex.dat");
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("opening transaction index store {}", path.display()))?;
-        let index_path = directory.join("txindex.index");
-        let mut index_file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&index_path)
-            .with_context(|| format!("opening transaction index {}", index_path.display()))?;
-        let data_len = file.metadata()?.len();
-        let index = match load_index_with_limit(
-            &mut index_file,
-            data_len,
-            MAX_STORED_TRANSACTION_INDEX_SIZE,
-        )? {
-            Some(index) => index,
-            None => {
-                let index = scan_transaction_index(&mut file)?;
-                rewrite_index(&mut index_file, file.metadata()?.len(), &index)?;
-                index
-            }
-        };
-        Ok(Self {
-            path,
-            file,
-            index_file,
-            index,
-        })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn len(&self) -> usize {
-        self.index.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.index.is_empty()
-    }
-
-    pub fn contains(&self, hash: &BlockHash) -> bool {
-        self.index.contains_key(hash)
-    }
-
-    pub fn hashes(&self) -> impl Iterator<Item = &BlockHash> {
-        self.index.keys()
-    }
-
-    pub fn disk_usage(&self) -> Result<u64> {
-        self.file
-            .metadata()?
-            .len()
-            .checked_add(self.index_file.metadata()?.len())
-            .context("transaction index store size overflowed")
-    }
-
-    pub fn get(&mut self, hash: &BlockHash) -> Result<Option<Vec<Txid>>> {
-        let Some(record) = self.index.get(hash).copied() else {
-            return Ok(None);
-        };
-        let bytes = read_storage_record(
-            &self.file,
-            record,
-            XorKey::default(),
-            MAX_STORED_TRANSACTION_INDEX_SIZE,
-            "transaction index",
-        )?;
-        let (stored_hash, txids) = decode_transaction_index_value(&bytes)?;
-        if stored_hash != *hash {
-            bail!("stored transaction index hash does not match its index");
-        }
-        Ok(Some(txids))
-    }
-
-    pub fn insert(&mut self, hash: BlockHash, txids: &[Txid]) -> Result<()> {
-        self.insert_with_sync(hash, txids, true)
-    }
-
-    /// Append a transaction-ID record without forcing a filesystem sync.
-    /// Block relay batches side-chain bodies this way; the owning chainstate
-    /// flushes the sidecar when the corresponding block store is flushed.
-    pub fn insert_unsynced(&mut self, hash: BlockHash, txids: &[Txid]) -> Result<()> {
-        self.insert_with_sync(hash, txids, false)
-    }
-
-    fn insert_with_sync(&mut self, hash: BlockHash, txids: &[Txid], sync: bool) -> Result<()> {
-        if self.index.contains_key(&hash) {
-            return Ok(());
-        }
-        let count = u32::try_from(txids.len()).context("transaction index count is too large")?;
-        let txid_bytes = txids
-            .len()
-            .checked_mul(32)
-            .context("transaction index size overflowed")?;
-        let raw_len = 32usize
-            .checked_add(4)
-            .and_then(|len| len.checked_add(txid_bytes))
-            .context("transaction index size overflowed")?;
-        let mut raw = Vec::with_capacity(raw_len);
-        raw.extend_from_slice(&hash.to_byte_array());
-        raw.extend_from_slice(&count.to_le_bytes());
-        for txid in txids {
-            raw.extend_from_slice(&txid.to_byte_array());
-        }
-        let bytes = encode_storage_payload(&raw, MAX_STORED_TRANSACTION_INDEX_SIZE)?;
-        let offset = self.file.seek(SeekFrom::End(0))?;
-        let length = u32::try_from(bytes.len()).context("transaction index record is too large")?;
-        let mut record_bytes = Vec::with_capacity(4 + bytes.len());
-        record_bytes.extend_from_slice(&length.to_le_bytes());
-        record_bytes.extend_from_slice(&bytes);
-        self.file.write_all(&record_bytes)?;
-        let record = Record { offset, length };
-        if sync {
-            self.file.sync_data()?;
-        }
-        persist_index_entry_with_sync(
-            &mut self.index_file,
-            offset + 4 + bytes.len() as u64,
-            hash,
-            record,
-            sync,
-        )?;
-        self.index.insert(hash, record);
-        Ok(())
-    }
-
-    pub fn flush(&mut self) -> Result<()> {
-        self.file.sync_data()?;
-        publish_index_data_len(&mut self.index_file, data_len_after(&self.file)?)?;
-        Ok(())
-    }
-
-    /// Remove all sidecar records before a full txindex rebuild.
-    pub fn clear(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.sync_data()?;
-        self.index.clear();
-        rewrite_index(&mut self.index_file, 0, &self.index)
-    }
-}
-
-impl Drop for TransactionIndexStore {
-    fn drop(&mut self) {
-        let _ = self.flush();
     }
 }
 
@@ -4848,89 +3630,6 @@ fn scan_coinstats_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
     Ok(index)
 }
 
-fn decode_transaction_index_value(bytes: &[u8]) -> Result<(BlockHash, Vec<Txid>)> {
-    if bytes.len() < 32 + 4 {
-        bail!("transaction index record is truncated");
-    }
-    let hash = BlockHash::from_byte_array(
-        bytes[..32]
-            .try_into()
-            .expect("transaction index block hash has fixed width"),
-    );
-    let count = usize::try_from(u32::from_le_bytes(
-        bytes[32..36]
-            .try_into()
-            .expect("transaction index count has fixed width"),
-    ))
-    .context("transaction index count does not fit usize")?;
-    let txid_bytes = count
-        .checked_mul(32)
-        .context("transaction index count overflows its record")?;
-    let expected_len = 36usize
-        .checked_add(txid_bytes)
-        .context("transaction index record length overflowed")?;
-    if expected_len != bytes.len() {
-        bail!("transaction index count does not match record length");
-    }
-    let mut txids = Vec::with_capacity(count);
-    for chunk in bytes[36..].chunks_exact(32) {
-        txids.push(Txid::from_byte_array(
-            chunk
-                .try_into()
-                .expect("transaction index txid has fixed width"),
-        ));
-    }
-    Ok((hash, txids))
-}
-
-fn scan_transaction_index(file: &mut File) -> Result<HashMap<BlockHash, Record>> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut index = HashMap::new();
-    let data_len = file.metadata()?.len();
-    loop {
-        let offset = file.stream_position()?;
-        let mut length_bytes = [0u8; 4];
-        match file.read_exact(&mut length_bytes) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                file.set_len(offset)?;
-                break;
-            }
-            Err(error) => return Err(error.into()),
-        }
-        let length = u32::from_le_bytes(length_bytes);
-        let end = offset.saturating_add(4).saturating_add(u64::from(length));
-        if end > data_len {
-            file.set_len(offset)?;
-            break;
-        }
-        if length == 0 || length as usize > MAX_STORED_TRANSACTION_INDEX_SIZE {
-            bail!(
-                "invalid transaction index record length {} at offset {}",
-                length,
-                offset
-            );
-        }
-        let mut encoded = vec![0u8; length as usize];
-        file.read_exact(&mut encoded).map_err(|error| {
-            anyhow::anyhow!(
-                "truncated transaction index record at offset {}: {}",
-                offset,
-                error
-            )
-        })?;
-        let bytes = decode_storage_payload(&encoded, MAX_STORED_TRANSACTION_INDEX_SIZE)
-            .context("decoding compressed transaction index record")?;
-        let (hash, _) = decode_transaction_index_value(&bytes)
-            .with_context(|| format!("decoding transaction index record at offset {offset}"))?;
-        if index.insert(hash, Record { offset, length }).is_some() {
-            bail!("duplicate block hash in transaction index store");
-        }
-    }
-    file.seek(SeekFrom::End(0))?;
-    Ok(index)
-}
-
 fn load_filter_index(file: &mut File, data_len: u64) -> Result<Option<HashMap<BlockHash, Record>>> {
     let index_len = file.metadata()?.len();
     if index_len < INDEX_HEADER_SIZE || (index_len - INDEX_HEADER_SIZE) % INDEX_RECORD_SIZE != 0 {
@@ -5305,19 +4004,22 @@ fn scan_undo_index(file: &mut File, xor_key: XorKey) -> Result<HashMap<BlockHash
     Ok(index)
 }
 
-fn encode_undo_record(hash: BlockHash, undo: &[Vec<TxOut>]) -> Result<Vec<u8>> {
+fn encode_undo_record(hash: BlockHash, undo: &[Vec<StoredUndo>]) -> Result<Vec<u8>> {
     let mut bytes = serialize(&hash);
     bytes.extend_from_slice(&serialize(&VarInt(undo.len() as u64)));
-    for outputs in undo {
-        bytes.extend_from_slice(&serialize(&VarInt(outputs.len() as u64)));
-        for output in outputs {
-            bytes.extend_from_slice(&serialize(output));
+    for coins in undo {
+        bytes.extend_from_slice(&serialize(&VarInt(coins.len() as u64)));
+        for coin in coins {
+            bytes.extend_from_slice(&coin.height.to_le_bytes());
+            bytes.extend_from_slice(&coin.median_time_past.to_le_bytes());
+            bytes.push(u8::from(coin.coinbase));
+            bytes.extend_from_slice(&serialize(&coin.output));
         }
     }
     Ok(bytes)
 }
 
-fn decode_undo_record(bytes: &[u8]) -> Result<(BlockHash, Vec<Vec<TxOut>>)> {
+fn decode_undo_record(bytes: &[u8]) -> Result<(BlockHash, Vec<Vec<StoredUndo>>)> {
     let (hash, mut consumed) =
         deserialize_partial::<BlockHash>(bytes).context("decoding stored block undo hash")?;
     let (transaction_count, count_consumed) = deserialize_partial::<VarInt>(&bytes[consumed..])
@@ -5340,10 +4042,37 @@ fn decode_undo_record(bytes: &[u8]) -> Result<(BlockHash, Vec<Vec<TxOut>>)> {
         }
         let mut outputs = Vec::with_capacity(output_count);
         for _ in 0..output_count {
+            let metadata_end = consumed
+                .checked_add(9)
+                .context("stored undo coin metadata offset overflowed")?;
+            if metadata_end > bytes.len() {
+                bail!("stored undo coin metadata is truncated")
+            }
+            let height = u32::from_le_bytes(
+                bytes[consumed..consumed + 4]
+                    .try_into()
+                    .expect("undo height has fixed width"),
+            );
+            let median_time_past = u32::from_le_bytes(
+                bytes[consumed + 4..consumed + 8]
+                    .try_into()
+                    .expect("undo median time has fixed width"),
+            );
+            let coinbase = match bytes[consumed + 8] {
+                0 => false,
+                1 => true,
+                _ => bail!("stored undo coin has an invalid coinbase flag"),
+            };
+            consumed = metadata_end;
             let (output, output_consumed) = deserialize_partial::<TxOut>(&bytes[consumed..])
                 .context("decoding stored block undo output")?;
             consumed = consumed.saturating_add(output_consumed);
-            outputs.push(output);
+            outputs.push(StoredUndo {
+                output,
+                height,
+                median_time_past,
+                coinbase,
+            });
         }
         undo.push(outputs);
     }
@@ -5379,35 +4108,6 @@ mod tests {
             decode_storage_payload(&raw, MAX_STORED_BLOCK_SIZE).unwrap(),
             small
         );
-    }
-
-    #[test]
-    fn utxo_locations_use_one_word_without_changing_disk_coordinates() {
-        assert_eq!(
-            std::mem::size_of::<UtxoLocation>(),
-            std::mem::size_of::<u64>()
-        );
-        let location = UtxoLocation::new(123_456_789, 98_765).unwrap();
-        assert_eq!(location.offset(), 123_456_789);
-        assert_eq!(location.length(), 98_765);
-        assert!(UtxoLocation::new(UtxoLocation::MAX_OFFSET + 1, 1).is_err());
-        assert!(UtxoLocation::new(0, (UtxoLocation::LENGTH_MASK + 1) as u32).is_err());
-    }
-
-    #[test]
-    fn history_locations_use_one_word_without_changing_disk_coordinates() {
-        assert_eq!(
-            std::mem::size_of::<HistoryLocation>(),
-            std::mem::size_of::<u64>()
-        );
-        let location = HistoryLocation::new(123_456_789, HistoryLocation::MAX_LENGTH).unwrap();
-        assert_eq!(location.offset(), 123_456_789);
-        assert_eq!(location.length(), HistoryLocation::MAX_LENGTH);
-        let previously_oversized = HistoryLocation::new(123, 4_792_689).unwrap();
-        assert_eq!(previously_oversized.offset(), 123);
-        assert_eq!(previously_oversized.length(), 4_792_689);
-        assert!(HistoryLocation::new(HistoryLocation::MAX_OFFSET + 1, 1).is_err());
-        assert!(HistoryLocation::new(0, HistoryLocation::MAX_LENGTH + 1).is_err());
     }
 
     #[test]
@@ -5455,76 +4155,40 @@ mod tests {
     }
 
     #[test]
-    fn utxo_batches_reopen_and_recover_an_uncommitted_tail() {
+    fn utxo_batches_are_atomic_and_reopen() {
         let directory = tempfile::tempdir().unwrap();
         let first = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
         let second = OutPoint::new(Txid::from_byte_array([2; 32]), 1);
-        let first_entry = StoredUtxo {
+        let entry = |value, height| StoredUtxo {
             output: TxOut {
-                value: bitcoin::Amount::from_sat(50_000),
+                value: bitcoin::Amount::from_sat(value),
                 script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
             },
-            height: 12,
-            median_time_past: 11,
-            coinbase: true,
+            height,
+            median_time_past: height.saturating_sub(1),
+            coinbase: height == 12,
         };
-        let second_entry = StoredUtxo {
-            output: TxOut {
-                value: bitcoin::Amount::from_sat(40_000),
-                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x52]),
-            },
-            height: 13,
-            median_time_past: 12,
-            coinbase: false,
-        };
+        let first_entry = entry(50_000, 12);
+        let second_entry = entry(40_000, 13);
         let generation = {
             let mut store = UtxoStore::open(directory.path()).unwrap();
             store
                 .apply_batch(&[], &[(first, first_entry.clone())])
                 .unwrap();
-            assert_eq!(store.get(&first).unwrap(), Some(first_entry.clone()));
             store
                 .apply_batch(&[first], &[(second, second_entry.clone())])
                 .unwrap();
-            assert!(!store.contains(&first));
+            assert!(!store.contains(&first).unwrap());
             assert_eq!(store.get(&second).unwrap(), Some(second_entry.clone()));
+            assert_eq!(store.len(), 1);
             store.generation()
         };
 
-        let data_path = directory.path().join("utxos.dat");
-        let committed_len = std::fs::metadata(&data_path).unwrap().len();
-        {
-            let reopened = UtxoStore::open(directory.path()).unwrap();
-            assert_eq!(reopened.generation(), generation);
-            assert_eq!(reopened.len(), 1);
-            assert_eq!(reopened.get(&second).unwrap(), Some(second_entry.clone()));
-        }
-
-        let mut file = OpenOptions::new().append(true).open(&data_path).unwrap();
-        let uncommitted = encode_utxo_put(
-            99,
-            &first,
-            &StoredUtxo {
-                output: TxOut {
-                    value: bitcoin::Amount::from_sat(1),
-                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x53]),
-                },
-                height: 14,
-                median_time_past: 13,
-                coinbase: false,
-            },
-        )
-        .unwrap();
-        file.write_all(&(u32::try_from(uncommitted.len()).unwrap()).to_le_bytes())
-            .unwrap();
-        file.write_all(&uncommitted).unwrap();
-        file.sync_data().unwrap();
-        drop(file);
-
-        let recovered = UtxoStore::open(directory.path()).unwrap();
-        assert_eq!(recovered.get(&first).unwrap(), None);
-        assert_eq!(recovered.get(&second).unwrap(), Some(second_entry));
-        assert_eq!(std::fs::metadata(data_path).unwrap().len(), committed_len);
+        let reopened = UtxoStore::open(directory.path()).unwrap();
+        assert_eq!(reopened.generation(), generation);
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.get(&first).unwrap(), None);
+        assert_eq!(reopened.get(&second).unwrap(), Some(second_entry));
     }
 
     #[test]
@@ -5566,8 +4230,9 @@ mod tests {
         assert_eq!(store.read_cache.lock().entries.len(), 1);
 
         store.read_cache.lock().clear();
-        assert_eq!(store.warm_cache().unwrap().0, 1);
+        assert_eq!(store.warm_cache().unwrap().0, 0);
         assert_eq!(store.get(&outpoint).unwrap(), Some(second));
+        assert_eq!(store.warm_cache().unwrap().0, 1);
 
         store.clear().unwrap();
         assert_eq!(store.get(&outpoint).unwrap(), None);
@@ -5616,66 +4281,12 @@ mod tests {
             store.apply_batch(&removals, &additions).unwrap();
             entries = additions;
         }
-        let before = std::fs::metadata(directory.path().join("utxos.dat"))
-            .unwrap()
-            .len();
         store.compact().unwrap();
-        let after = std::fs::metadata(directory.path().join("utxos.dat"))
-            .unwrap()
-            .len();
-        assert!(after < before);
         assert_eq!(store.entries().unwrap(), entries);
         drop(store);
 
         let reopened = UtxoStore::open(directory.path()).unwrap();
         assert_eq!(reopened.entries().unwrap(), entries);
-        assert_eq!(reopened.next_batch_id, 9);
-
-        let index_path = directory.path().join("utxos.index");
-        let mut index_bytes = std::fs::read(&index_path).unwrap();
-        let offset_start = UTXO_INDEX_MAGIC.len() + 4 + 1 + 8;
-        index_bytes[offset_start..offset_start + 8]
-            .copy_from_slice(&(UTXO_DATA_MAGIC.len() as u64).to_le_bytes());
-        std::fs::write(&index_path, index_bytes).unwrap();
-        let repaired = UtxoStore::open(directory.path()).unwrap();
-        assert_eq!(repaired.entries().unwrap(), entries);
-    }
-
-    #[test]
-    fn electrum_history_batches_reopen_and_recover_an_uncommitted_tail() {
-        let directory = tempfile::tempdir().unwrap();
-        let script_hash = hex::encode([1u8; 32]);
-        let first_txid = Txid::from_byte_array([2u8; 32]);
-        let second_txid = Txid::from_byte_array([3u8; 32]);
-        let first_history = vec![(first_txid, 7)];
-        let second_history = vec![(first_txid, 7), (second_txid, 8)];
-        {
-            let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
-            store
-                .apply_batch(&[(script_hash.clone(), first_history.clone())])
-                .unwrap();
-            assert_eq!(store.get(&script_hash).unwrap(), first_history);
-            store
-                .apply_batch(&[(script_hash.clone(), second_history.clone())])
-                .unwrap();
-            assert_eq!(store.get(&script_hash).unwrap(), second_history);
-            assert_eq!(store.keys(), vec![script_hash.clone()]);
-        }
-
-        let data_path = directory.path().join("history.dat");
-        let committed_len = std::fs::metadata(&data_path).unwrap().len();
-        let uncommitted =
-            encode_history_value(99, [1u8; 32], &[(Txid::from_byte_array([4u8; 32]), 9)]).unwrap();
-        let mut file = OpenOptions::new().append(true).open(&data_path).unwrap();
-        file.write_all(&(u32::try_from(uncommitted.len()).unwrap()).to_le_bytes())
-            .unwrap();
-        file.write_all(&uncommitted).unwrap();
-        file.sync_data().unwrap();
-        drop(file);
-
-        let recovered = ElectrumHistoryStore::open(directory.path()).unwrap();
-        assert_eq!(recovered.get(&script_hash).unwrap(), second_history);
-        assert_eq!(std::fs::metadata(data_path).unwrap().len(), committed_len);
     }
 
     #[test]
@@ -5699,15 +4310,9 @@ mod tests {
 
         store.flush().unwrap();
         assert!(store.pending.is_empty());
-        assert!(store.disk_usage().unwrap() > initial_size);
-        let location = store.index[&[31u8; 32]];
-        let body = read_history_data_record(&store.file, location).unwrap();
-        assert_eq!(body.first().copied(), Some(HISTORY_APPEND));
+        assert_eq!(store.head([31u8; 32]).unwrap().unwrap().entries, 2);
         drop(store);
 
-        // The data log alone can reconstruct the linked head if the compact
-        // location index is lost or corrupt.
-        std::fs::write(directory.path().join("history.index"), b"corrupt").unwrap();
         let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
         assert_eq!(reopened.get(&script_hash).unwrap(), vec![first, second]);
     }
@@ -5725,18 +4330,14 @@ mod tests {
             .append_entries_unsynced(&[(script_hash.clone(), vec![first])])
             .unwrap();
         store.flush().unwrap();
-        let after_first = std::fs::metadata(directory.path().join("history.dat"))
-            .unwrap()
-            .len();
+        let after_first = store.disk_usage().unwrap();
         store
             .append_entries_unsynced(&[(script_hash.clone(), vec![second])])
             .unwrap();
         store.flush().unwrap();
-        let after_second = std::fs::metadata(directory.path().join("history.dat"))
-            .unwrap()
-            .len();
+        let after_second = store.disk_usage().unwrap();
         assert_eq!(store.get(&script_hash).unwrap(), vec![first, second]);
-        assert!(after_second - after_first < 512);
+        assert!(after_second >= after_first);
 
         store
             .apply_batch(&[(script_hash.clone(), vec![replacement])])
@@ -5800,7 +4401,7 @@ mod tests {
     }
 
     #[test]
-    fn electrum_history_rebuilds_a_corrupt_index_and_replaces_all_values() {
+    fn electrum_history_replaces_all_values_and_reopens() {
         let directory = tempfile::tempdir().unwrap();
         let first_script = hex::encode([5u8; 32]);
         let second_script = hex::encode([6u8; 32]);
@@ -5814,14 +4415,6 @@ mod tests {
             let mut store = ElectrumHistoryStore::open(directory.path()).unwrap();
             store.replace_all(entries.clone()).unwrap();
         }
-        let index_path = directory.path().join("history.index");
-        let mut index_bytes = std::fs::read(&index_path).unwrap();
-        let first_put_body = ELECTRUM_HISTORY_INDEX_MAGIC.len() + 4;
-        let offset_start = first_put_body + 1 + 8;
-        index_bytes[offset_start..offset_start + 8]
-            .copy_from_slice(&(ELECTRUM_HISTORY_DATA_MAGIC.len() as u64).to_le_bytes());
-        std::fs::write(&index_path, index_bytes).unwrap();
-
         let mut reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
         assert_eq!(reopened.entries().unwrap().len(), 2);
         assert_eq!(reopened.get(&first_script).unwrap(), entries[0].1);
@@ -5864,20 +4457,13 @@ mod tests {
                 .apply_batch(&[(script_hash.clone(), history.clone())])
                 .unwrap();
         }
-        let before = std::fs::metadata(directory.path().join("history.dat"))
-            .unwrap()
-            .len();
         store.compact().unwrap();
-        let after = std::fs::metadata(directory.path().join("history.dat"))
-            .unwrap()
-            .len();
-        assert!(after < before);
         assert_eq!(store.get(&script_hash).unwrap(), history);
         drop(store);
 
         let reopened = ElectrumHistoryStore::open(directory.path()).unwrap();
         assert_eq!(reopened.get(&script_hash).unwrap(), history);
-        assert_eq!(reopened.generation(), 10);
+        assert_eq!(reopened.generation(), 9);
     }
 
     #[test]
@@ -5897,7 +4483,7 @@ mod tests {
         store
             .apply_batch(&[(removed_script.clone(), Vec::new())])
             .unwrap();
-        assert_eq!(store.len(), 2);
+        assert_eq!(store.len(), 1);
 
         store.compact().unwrap();
         assert_eq!(store.len(), 1);
@@ -6078,9 +4664,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let block = genesis_block(Network::Regtest);
         let hash = block.block_hash();
-        let undo = vec![vec![TxOut {
-            value: bitcoin::Amount::from_sat(42),
-            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+        let undo = vec![vec![StoredUndo {
+            output: TxOut {
+                value: bitcoin::Amount::from_sat(42),
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            },
+            height: 7,
+            median_time_past: 6,
+            coinbase: false,
         }]];
         {
             let mut store = BlockStore::open_with_xor(directory.path(), true).unwrap();
@@ -6323,9 +4914,14 @@ mod tests {
         let hash = BlockHash::from_byte_array([7; 32]);
         let undo = vec![
             Vec::new(),
-            vec![TxOut {
-                value: bitcoin::Amount::from_sat(42),
-                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+            vec![StoredUndo {
+                output: TxOut {
+                    value: bitcoin::Amount::from_sat(42),
+                    script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+                },
+                height: 11,
+                median_time_past: 10,
+                coinbase: true,
             }],
         ];
         {

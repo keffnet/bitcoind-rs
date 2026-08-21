@@ -38,8 +38,8 @@ use crate::config::{
 use crate::muhash::MuHash3072;
 use crate::storage::{
     BlockStore, BlockStoreReader, ChainstateStore, CoinStatsRecord, CoinStatsStore,
-    ElectrumBlockStore, ElectrumHistoryStore, FilterStore, StoredTxLocation, StoredUndo,
-    StoredUtxo, TransactionIndexStore, UtxoStore,
+    ElectrumBlockStore, ElectrumBlockStoreReader, ElectrumHistoryStore, FilterStore,
+    StoredTxLocation, StoredUndo, StoredUtxo, TransactionIndexStore, UtxoStore,
 };
 use crate::validation::{self, ValidationError};
 
@@ -5510,6 +5510,10 @@ impl ChainState {
         self.store.reader()
     }
 
+    pub fn electrum_block_store_reader(&self) -> Option<ElectrumBlockStoreReader> {
+        self.electrum_store.as_ref().map(ElectrumBlockStore::reader)
+    }
+
     pub fn disconnected_suffix_has_non_coinbase_transactions(
         &mut self,
         previous_tip: BlockHash,
@@ -5594,17 +5598,17 @@ impl ChainState {
     }
 
     fn transaction_at_location(
-        &mut self,
+        &self,
         txid: &Txid,
         location: TxLocation,
     ) -> Result<Option<(Transaction, TxLocation)>> {
-        if let Some(block) = self.store.get(&location.block_hash)? {
+        if let Some(block) = self.store.get_readonly(&location.block_hash)? {
             let Some(transaction) = block.txdata.get(location.transaction_index).cloned() else {
                 bail!("transaction index is inconsistent with stored block");
             };
             return Ok(Some((transaction, location)));
         }
-        let Some(store) = self.electrum_store.as_mut() else {
+        let Some(store) = self.electrum_store.as_ref() else {
             return Ok(None);
         };
         let Some(transaction) =
@@ -5623,7 +5627,7 @@ impl ChainState {
     /// Electrum indexes the best chain, whereas [`Self::transaction`] also
     /// serves side-chain transactions when the optional Core-style `-txindex`
     /// is enabled.
-    pub fn active_transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
+    pub fn active_transaction(&self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
         for location in self.active_transaction_locations(txid)? {
             if let Some((transaction, location)) = self.transaction_at_location(txid, location)? {
                 if transaction.compute_txid() == *txid {
@@ -5639,8 +5643,9 @@ impl ChainState {
     /// same block; resolving each txid independently would decode that block
     /// once per request, which is especially expensive for compressed native
     /// records and pruned Electrum sidecar records.
+    #[cfg(test)]
     pub(crate) fn active_transactions(
-        &mut self,
+        &self,
         txids: &[Txid],
     ) -> Result<HashMap<Txid, (Transaction, TxLocation)>> {
         let mut locations = HashMap::with_capacity(txids.len());
@@ -5668,7 +5673,7 @@ impl ChainState {
             HashMap::with_capacity(by_block.len());
         let mut pruned_blocks = Vec::new();
         for (block_hash, entries) in by_block {
-            if let Some(block) = self.store.get(&block_hash)? {
+            if let Some(block) = self.store.get_readonly(&block_hash)? {
                 for (txid, location) in entries {
                     let Some(transaction) = block.txdata.get(location.transaction_index).cloned()
                     else {
@@ -5688,7 +5693,7 @@ impl ChainState {
             pruned_blocks.push((block_hash, entries));
         }
 
-        let Some(store) = self.electrum_store.as_mut() else {
+        let Some(store) = self.electrum_store.as_ref() else {
             return Ok(transactions);
         };
         let block_hashes = pruned_blocks
@@ -5747,7 +5752,7 @@ impl ChainState {
         })
     }
 
-    pub fn transaction(&mut self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
+    pub fn transaction(&self, txid: &Txid) -> Result<Option<(Transaction, TxLocation)>> {
         let Some(store) = self.tx_index_store.as_ref() else {
             return Ok(None);
         };
@@ -5804,7 +5809,7 @@ impl ChainState {
     /// script's bounded history can be candidates. This keeps the common IBD
     /// configuration from retaining one global hash entry per spent output.
     pub(crate) fn electrum_spending_transaction(
-        &mut self,
+        &self,
         outpoint: &OutPoint,
         history_limit: usize,
     ) -> Result<Option<(Txid, usize, BlockHash, u32)>> {
@@ -5941,7 +5946,7 @@ impl ChainState {
     /// large history walk, so bounded callers should reject it before doing
     /// that work.
     pub(crate) fn electrum_unspent_for_script_limited(
-        &mut self,
+        &self,
         script_hash: &str,
         history_limit: usize,
     ) -> Result<Option<Vec<ElectrumUnspent>>> {
@@ -6857,7 +6862,7 @@ impl ChainState {
         Some(hex::encode(hasher.finalize()))
     }
 
-    pub fn merkle_branch(&mut self, txid: &Txid) -> Result<Option<(Vec<Txid>, usize, u32)>> {
+    pub fn merkle_branch(&self, txid: &Txid) -> Result<Option<(Vec<Txid>, usize, u32)>> {
         let Some(location) = self
             .active_transaction_locations(txid)?
             .into_iter()
@@ -6865,10 +6870,10 @@ impl ChainState {
         else {
             return Ok(None);
         };
-        let branch = if let Some(block) = self.store.get(&location.block_hash)? {
+        let branch = if let Some(block) = self.store.get_readonly(&location.block_hash)? {
             merkle_branch_for_block(&block, location.transaction_index)
         } else {
-            let Some(store) = self.electrum_store.as_mut() else {
+            let Some(store) = self.electrum_store.as_ref() else {
                 return Ok(None);
             };
             let Some(branch) =
@@ -6887,14 +6892,16 @@ impl ChainState {
     /// height here prevents a stale or incorrect height from silently
     /// producing a proof for another block.
     pub fn merkle_branch_at_height(
-        &mut self,
+        &self,
         txid: &Txid,
         height: u32,
     ) -> Result<Option<(Vec<Txid>, usize, u32)>> {
         let Some(block_hash) = self.block_hash(height) else {
             return Ok(None);
         };
-        let (transaction_index, branch) = if let Some(block) = self.store.get(&block_hash)? {
+        let (transaction_index, branch) = if let Some(block) =
+            self.store.get_readonly(&block_hash)?
+        {
             let Some(transaction_index) = block
                 .txdata
                 .iter()
@@ -6913,7 +6920,7 @@ impl ChainState {
             if location.block_hash != block_hash || location.height != height {
                 return Ok(None);
             }
-            let Some(store) = self.electrum_store.as_mut() else {
+            let Some(store) = self.electrum_store.as_ref() else {
                 return Ok(None);
             };
             let Some(branch) = store.merkle_branch(&block_hash, location.transaction_index)? else {
@@ -6926,19 +6933,20 @@ impl ChainState {
 
     /// Return an Electrum-indexed transaction by active-chain height and
     /// position when the ordinary block body has been pruned.
+    #[cfg(test)]
     pub(crate) fn electrum_transaction_at_height(
-        &mut self,
+        &self,
         height: u32,
         transaction_index: usize,
     ) -> Result<Option<Transaction>> {
         let Some(block_hash) = self.block_hash(height) else {
             return Ok(None);
         };
-        if let Some(block) = self.store.get(&block_hash)? {
+        if let Some(block) = self.store.get_readonly(&block_hash)? {
             return Ok(block.txdata.get(transaction_index).cloned());
         }
         self.electrum_store
-            .as_mut()
+            .as_ref()
             .map(|store| store.transaction(&block_hash, transaction_index))
             .transpose()
             .map(|value| value.flatten())
@@ -13190,7 +13198,7 @@ mod tests {
         assert!(directory.path().join("indexes/txindex/database").exists());
         drop(state);
 
-        let mut reopened = ChainState::open_with_options_and_tx_index(
+        let reopened = ChainState::open_with_options_and_tx_index(
             Network::Regtest,
             directory.path(),
             None,
@@ -13203,7 +13211,7 @@ mod tests {
         assert!(reopened.transaction(&side_txid).unwrap().is_some());
         drop(reopened);
 
-        let mut rebuilt = ChainState::open_with_options_and_tx_index(
+        let rebuilt = ChainState::open_with_options_and_tx_index(
             Network::Regtest,
             directory.path(),
             None,
@@ -14572,7 +14580,7 @@ mod tests {
         assert!(state.transaction(&side_txid).unwrap().is_none());
 
         drop(state);
-        let mut reopened = ChainState::open_with_options_and_tx_index(
+        let reopened = ChainState::open_with_options_and_tx_index(
             Network::Regtest,
             directory.path(),
             None,
@@ -14612,7 +14620,7 @@ mod tests {
         assert!(state.active_transaction(&side_txid).unwrap().is_none());
 
         drop(state);
-        let mut reopened = ChainState::open_with_options_and_tx_index(
+        let reopened = ChainState::open_with_options_and_tx_index(
             Network::Regtest,
             directory.path(),
             None,
@@ -14683,7 +14691,7 @@ mod tests {
 
         state.persist_snapshot().unwrap();
         drop(state);
-        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         let (_, earliest) = reopened
             .active_transaction(&duplicate_txid)
             .unwrap()
@@ -14762,7 +14770,7 @@ mod tests {
         assert_eq!(tips[1].status, "valid-fork");
 
         drop(state);
-        let mut reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
         assert_eq!(reopened.best_hash(), side_three_hash);
         assert_eq!(reopened.block_hash(1), Some(side_one_hash));
         assert!(reopened.transaction(&main_two_coinbase).unwrap().is_some());

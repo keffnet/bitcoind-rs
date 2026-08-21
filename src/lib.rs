@@ -87,7 +87,7 @@ use crate::fee_estimator::{FeeEstimator, RawFeeEstimate};
 use crate::mempool::{
     Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
 };
-use crate::storage::BlockStoreReader;
+use crate::storage::{BlockStoreReader, ElectrumBlockStoreReader};
 
 /// Match Bitcoin Core's emergency free-space reserve. Additional write
 /// estimates are added on top of this floor before a mutation starts.
@@ -1855,6 +1855,7 @@ pub struct Node {
     asmap: Option<Arc<AsMap>>,
     pub chain: Arc<RwLock<ChainState>>,
     pub(crate) block_store_reader: BlockStoreReader,
+    pub(crate) electrum_block_store_reader: Option<ElectrumBlockStoreReader>,
     pub mempool: Arc<RwLock<Mempool>>,
     mempool_stats: Mutex<MempoolStats>,
     pub events: broadcast::Sender<ChainEvent>,
@@ -2223,6 +2224,7 @@ impl Node {
         })?;
 
         let block_store_reader = chain.block_store_reader();
+        let electrum_block_store_reader = chain.electrum_block_store_reader();
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
         chain.configure_script_cache_size_mib(config.max_sig_cache_mib);
@@ -2475,6 +2477,7 @@ impl Node {
             asmap,
             chain: Arc::new(RwLock::new(chain)),
             block_store_reader,
+            electrum_block_store_reader,
             mempool: Arc::new(RwLock::new(mempool)),
             mempool_stats: Mutex::new(mempool_stats),
             events,

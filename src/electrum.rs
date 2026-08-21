@@ -1410,7 +1410,7 @@ fn mempool_transaction_height(transaction: &Transaction, mempool: &crate::mempoo
 }
 
 fn outpoint_status(node: &Arc<Node>, outpoint: &OutPoint) -> Result<Value> {
-    let mut chain = node.chain.write();
+    let chain = node.chain.read();
     let mempool = node.mempool.read();
     let mut status = serde_json::Map::new();
     let confirmed_spender =
@@ -1597,10 +1597,131 @@ fn block_chunk(node: &Arc<Node>, params: &Value) -> Result<Value> {
     Ok(json!(hex::encode(bytes)))
 }
 
+/// Resolve active-chain transaction bodies without retaining the global
+/// chain read lock while reading or decompressing append-only records. The
+/// active locations are snapshotted first and checked against the active
+/// chain again after I/O, so a concurrent reorg cannot leak a stale result.
+fn active_transactions_for_serving(
+    node: &Arc<Node>,
+    txids: &[Txid],
+) -> Result<HashMap<Txid, (Transaction, chain::TxLocation)>> {
+    let locations = {
+        let chain = node.chain.read();
+        let mut locations = HashMap::with_capacity(txids.len());
+        for txid in txids {
+            if locations.contains_key(txid) {
+                continue;
+            }
+            let candidates = chain.active_transaction_locations(txid)?;
+            if !candidates.is_empty() {
+                locations.insert(*txid, candidates);
+            }
+        }
+        locations
+    };
+
+    let mut by_block: HashMap<BlockHash, Vec<(Txid, chain::TxLocation)>> = HashMap::new();
+    for (txid, locations) in locations {
+        for location in locations {
+            by_block
+                .entry(location.block_hash)
+                .or_default()
+                .push((txid, location));
+        }
+    }
+
+    let mut transactions = HashMap::with_capacity(txids.len());
+    let mut pruned_blocks = Vec::new();
+    for (block_hash, entries) in by_block {
+        if let Some(block) = node.block_store_reader.get(&block_hash)? {
+            for (txid, location) in entries {
+                let Some(transaction) = block.txdata.get(location.transaction_index).cloned()
+                else {
+                    bail!("transaction index is inconsistent with stored block");
+                };
+                if transaction.compute_txid() == txid
+                    && transactions.get(&txid).is_none_or(
+                        |(_, current): &(Transaction, chain::TxLocation)| {
+                            (location.height, location.transaction_index)
+                                < (current.height, current.transaction_index)
+                        },
+                    )
+                {
+                    transactions.insert(txid, (transaction, location));
+                }
+            }
+        } else {
+            pruned_blocks.push((block_hash, entries));
+        }
+    }
+
+    if let Some(store) = node.electrum_block_store_reader.as_ref() {
+        let block_hashes = pruned_blocks
+            .iter()
+            .map(|(block_hash, _)| *block_hash)
+            .collect::<Vec<_>>();
+        let block_transactions = store.transactions_for_blocks(&block_hashes)?;
+        for (block_hash, entries) in pruned_blocks {
+            let Some(block_transactions) = block_transactions.get(&block_hash) else {
+                continue;
+            };
+            for (txid, location) in entries {
+                let Some(transaction) = block_transactions.get(location.transaction_index).cloned()
+                else {
+                    continue;
+                };
+                if transaction.compute_txid() != txid {
+                    bail!("Electrum transaction sidecar does not match transaction index");
+                }
+                if transactions.get(&txid).is_none_or(
+                    |(_, current): &(Transaction, chain::TxLocation)| {
+                        (location.height, location.transaction_index)
+                            < (current.height, current.transaction_index)
+                    },
+                ) {
+                    transactions.insert(txid, (transaction, location));
+                }
+            }
+        }
+    }
+
+    let chain = node.chain.read();
+    transactions
+        .retain(|_, (_, location)| chain.block_hash(location.height) == Some(location.block_hash));
+    Ok(transactions)
+}
+
+/// Materialize one active block's transaction list with no chain lock held
+/// over storage I/O. Retrying only matters during a reorg; ordinary IBD tip
+/// extensions leave the hash at the requested historical height unchanged.
+fn active_block_transactions_for_serving(
+    node: &Arc<Node>,
+    height: u32,
+) -> Result<Option<(BlockHash, Vec<Transaction>)>> {
+    const MAX_REORG_RETRIES: usize = 3;
+    for _ in 0..MAX_REORG_RETRIES {
+        let Some(block_hash) = node.chain.read().block_hash(height) else {
+            return Ok(None);
+        };
+        let transactions = if let Some(block) = node.block_store_reader.get(&block_hash)? {
+            Some(block.txdata)
+        } else if let Some(store) = node.electrum_block_store_reader.as_ref() {
+            store.transactions(&block_hash)?
+        } else {
+            None
+        };
+        let still_active = node.chain.read().block_hash(height) == Some(block_hash);
+        if still_active {
+            return Ok(transactions.map(|transactions| (block_hash, transactions)));
+        }
+    }
+    bail!("active chain changed repeatedly while reading block at height {height}")
+}
+
 fn transaction_get(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid = txid_param(params, 0)?;
     let verbose = crate::rpc::optional_bool(params, 1, false, "verbose")?;
-    let chain_transaction = { node.chain.write().active_transaction(&txid)? };
+    let chain_transaction = active_transactions_for_serving(node, &[txid])?.remove(&txid);
     if let Some((transaction, location)) = chain_transaction {
         if verbose {
             let chain = node.chain.read();
@@ -1662,7 +1783,7 @@ fn transaction_get_batch(node: &Arc<Node>, params: &Value) -> Result<Value> {
     // Resolve all confirmed requests before touching the mempool. The chain
     // lookup groups txids by block, so a batch containing many transactions
     // from one compressed block decodes that block only once.
-    let active = node.chain.write().active_transactions(&parsed_txids)?;
+    let active = active_transactions_for_serving(node, &parsed_txids)?;
     let active_metadata = if verbose {
         let chain = node.chain.read();
         let tip_height = chain.height();
@@ -1814,15 +1935,19 @@ fn electrum_transaction_json(
 fn transaction_merkle(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let txid = txid_param(params, 0)?;
     let requested_height = param::<u32>(params, 1)?;
-    let Some((branch, position, height)) = node
-        .chain
-        .write()
-        .merkle_branch_at_height(&txid, requested_height)?
+    let Some((_, transactions)) = active_block_transactions_for_serving(node, requested_height)?
     else {
         bail!("transaction not found")
     };
+    let Some(position) = transactions
+        .iter()
+        .position(|transaction| transaction.compute_txid() == txid)
+    else {
+        bail!("transaction not found")
+    };
+    let branch = crate::storage::merkle_branch_for_transactions(&transactions, position);
     Ok(json!({
-        "block_height": height,
+        "block_height": requested_height,
         "pos": position,
         "merkle": branch.iter().map(ToString::to_string).collect::<Vec<_>>(),
     }))
@@ -1832,18 +1957,17 @@ fn transaction_id_from_pos(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let height = param::<u32>(params, 0)?;
     let position = param::<u32>(params, 1)?;
     let include_merkle = crate::rpc::optional_bool(params, 2, false, "include_merkle")?;
-    let mut chain = node.chain.write();
-    let transaction = chain
-        .electrum_transaction_at_height(height, position as usize)?
+    let (_, transactions) = active_block_transactions_for_serving(node, height)?
+        .ok_or_else(|| anyhow!("transaction position out of range"))?;
+    let transaction = transactions
+        .get(position as usize)
         .ok_or_else(|| anyhow!("transaction position out of range"))?;
     let txid = transaction.compute_txid();
     if !include_merkle {
         // Electrum returns the bare hash unless a merkle proof was requested.
         return Ok(json!(txid.to_string()));
     }
-    let (branch, _, _) = chain
-        .merkle_branch_at_height(&txid, height)?
-        .ok_or_else(|| anyhow!("transaction not found"))?;
+    let branch = crate::storage::merkle_branch_for_transactions(&transactions, position as usize);
     Ok(json!({
         "tx_hash": txid.to_string(),
         "merkle": branch.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -2234,7 +2358,7 @@ fn sort_mempool_records(records: &mut [(Txid, i64)]) {
 }
 
 fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> Result<(u64, i64)> {
-    let mut chain = node.chain.write();
+    let chain = node.chain.read();
     let mempool = node.mempool.read();
     let confirmed = chain
         .electrum_unspent_for_script_limited(script_hash, MAX_ELECTRUM_HISTORY_RECORDS)?
@@ -2259,7 +2383,7 @@ fn balance_for_script(node: &Arc<Node>, script_hash: &str) -> Result<(u64, i64)>
 }
 
 fn unspent_for_script(node: &Arc<Node>, script_hash: &str) -> Result<Vec<Value>> {
-    let mut chain = node.chain.write();
+    let chain = node.chain.read();
     let mempool = node.mempool.read();
     let mut spent = HashSet::new();
     for txid in mempool_transaction_ids_for_script(&mempool, script_hash)? {

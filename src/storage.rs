@@ -4059,11 +4059,109 @@ impl CoinStatsStore {
 /// for historical active-chain transactions. Records are keyed by block hash
 /// so chainstate can validate the active location before reading them, and the
 /// index remains compact because it does not duplicate the transaction index.
+#[derive(Clone)]
+pub struct ElectrumBlockStoreReader {
+    state: Arc<RwLock<ElectrumBlockStoreReaderState>>,
+}
+
+struct ElectrumBlockStoreReaderState {
+    file: Arc<File>,
+    index: HashMap<BlockHash, Record>,
+}
+
+impl ElectrumBlockStoreReader {
+    fn new(file: File, index: HashMap<BlockHash, Record>) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(ElectrumBlockStoreReaderState {
+                file: Arc::new(file),
+                index,
+            })),
+        }
+    }
+
+    pub fn transaction(
+        &self,
+        block_hash: &BlockHash,
+        transaction_index: usize,
+    ) -> Result<Option<Transaction>> {
+        let transactions = self.transactions(block_hash)?;
+        Ok(transactions.and_then(|transactions| transactions.into_iter().nth(transaction_index)))
+    }
+
+    pub fn merkle_branch(
+        &self,
+        block_hash: &BlockHash,
+        transaction_index: usize,
+    ) -> Result<Option<Vec<Txid>>> {
+        let Some(transactions) = self.transactions(block_hash)? else {
+            return Ok(None);
+        };
+        if transaction_index >= transactions.len() {
+            return Ok(None);
+        }
+        Ok(Some(merkle_branch_for_transactions(
+            &transactions,
+            transaction_index,
+        )))
+    }
+
+    /// Read several pruned block transaction lists in append-log order. The
+    /// file descriptor and records are snapshotted together before doing any
+    /// disk I/O, so a concurrent sidecar rewrite cannot mix old offsets with
+    /// the replacement file.
+    pub(crate) fn transactions_for_blocks(
+        &self,
+        block_hashes: &[BlockHash],
+    ) -> Result<HashMap<BlockHash, Vec<Transaction>>> {
+        let (file, mut records) = {
+            let state = self.state.read();
+            let records = block_hashes
+                .iter()
+                .filter_map(|hash| state.index.get(hash).copied().map(|record| (*hash, record)))
+                .collect::<Vec<_>>();
+            (Arc::clone(&state.file), records)
+        };
+        records.sort_unstable_by_key(|(_, record)| record.offset);
+        records.dedup_by_key(|(hash, _)| *hash);
+
+        records
+            .into_iter()
+            .map(|(hash, record)| {
+                read_electrum_transactions_from_record(&file, hash, record)
+                    .map(|transactions| (hash, transactions))
+            })
+            .collect()
+    }
+
+    pub(crate) fn transactions(&self, block_hash: &BlockHash) -> Result<Option<Vec<Transaction>>> {
+        let (file, record) = {
+            let state = self.state.read();
+            let Some(record) = state.index.get(block_hash).copied() else {
+                return Ok(None);
+            };
+            (Arc::clone(&state.file), record)
+        };
+        read_electrum_transactions_from_record(&file, *block_hash, record).map(Some)
+    }
+
+    fn insert(&self, hash: BlockHash, record: Record) {
+        self.state.write().index.insert(hash, record);
+    }
+
+    fn replace(&self, file: File, index: HashMap<BlockHash, Record>) {
+        *self.state.write() = ElectrumBlockStoreReaderState {
+            file: Arc::new(file),
+            index,
+        };
+    }
+}
+
 pub struct ElectrumBlockStore {
     path: PathBuf,
     file: File,
     index_file: File,
     index: HashMap<BlockHash, Record>,
+    serving_reader: ElectrumBlockStoreReader,
 }
 
 impl ElectrumBlockStore {
@@ -4104,12 +4202,18 @@ impl ElectrumBlockStore {
                 index
             }
         };
+        let serving_reader = ElectrumBlockStoreReader::new(file.try_clone()?, index.clone());
         Ok(Self {
             path,
             file,
             index_file,
             index,
+            serving_reader,
         })
+    }
+
+    pub fn reader(&self) -> ElectrumBlockStoreReader {
+        self.serving_reader.clone()
     }
 
     pub fn path(&self) -> &Path {
@@ -4170,6 +4274,7 @@ impl ElectrumBlockStore {
             sync,
         )?;
         self.index.insert(hash, record);
+        self.serving_reader.insert(hash, record);
         Ok(hash)
     }
 
@@ -4202,6 +4307,8 @@ impl ElectrumBlockStore {
         self.file = file;
         self.index = index;
         rewrite_index(&mut self.index_file, data_len, &self.index)?;
+        self.serving_reader
+            .replace(self.file.try_clone()?, self.index.clone());
         Ok(true)
     }
 
@@ -4212,29 +4319,21 @@ impl ElectrumBlockStore {
     }
 
     pub fn transaction(
-        &mut self,
+        &self,
         block_hash: &BlockHash,
         transaction_index: usize,
     ) -> Result<Option<Transaction>> {
-        let transactions = self.transactions(block_hash)?;
-        Ok(transactions.and_then(|transactions| transactions.into_iter().nth(transaction_index)))
+        self.serving_reader
+            .transaction(block_hash, transaction_index)
     }
 
     pub fn merkle_branch(
-        &mut self,
+        &self,
         block_hash: &BlockHash,
         transaction_index: usize,
     ) -> Result<Option<Vec<Txid>>> {
-        let Some(transactions) = self.transactions(block_hash)? else {
-            return Ok(None);
-        };
-        if transaction_index >= transactions.len() {
-            return Ok(None);
-        }
-        Ok(Some(merkle_branch_for_transactions(
-            &transactions,
-            transaction_index,
-        )))
+        self.serving_reader
+            .merkle_branch(block_hash, transaction_index)
     }
 
     /// Read several pruned block transaction lists in append-log order.  The
@@ -4243,59 +4342,43 @@ impl ElectrumBlockStore {
     /// the requests by record offset so restart-time index rebuilds perform
     /// mostly forward reads from the sidecar.
     pub(crate) fn transactions_for_blocks(
-        &mut self,
+        &self,
         block_hashes: &[BlockHash],
     ) -> Result<HashMap<BlockHash, Vec<Transaction>>> {
-        let mut records = block_hashes
-            .iter()
-            .filter_map(|hash| self.index.get(hash).copied().map(|record| (*hash, record)))
-            .collect::<Vec<_>>();
-        records.sort_unstable_by_key(|(_, record)| record.offset);
-        records.dedup_by_key(|(hash, _)| *hash);
-
-        records
-            .into_iter()
-            .map(|(hash, record)| {
-                self.transactions_from_record(hash, record)
-                    .map(|transactions| (hash, transactions))
-            })
-            .collect()
+        self.serving_reader.transactions_for_blocks(block_hashes)
     }
 
-    fn transactions(&mut self, block_hash: &BlockHash) -> Result<Option<Vec<Transaction>>> {
-        let Some(record) = self.index.get(block_hash).copied() else {
-            return Ok(None);
-        };
-        self.transactions_from_record(*block_hash, record).map(Some)
+    fn transactions(&self, block_hash: &BlockHash) -> Result<Option<Vec<Transaction>>> {
+        self.serving_reader.transactions(block_hash)
     }
+}
 
-    fn transactions_from_record(
-        &self,
-        block_hash: BlockHash,
-        record: Record,
-    ) -> Result<Vec<Transaction>> {
-        let bytes = read_storage_record(
-            &self.file,
-            record,
-            XorKey::default(),
-            MAX_STORED_ELECTRUM_BLOCK_SIZE + 32,
-            "Electrum transaction",
-        )?;
-        if bytes.len() < 32 {
-            bail!("stored Electrum transaction record is truncated")
-        }
-        let stored_hash = BlockHash::from_byte_array(
-            bytes[..32]
-                .try_into()
-                .expect("Electrum block hash has fixed width"),
-        );
-        if stored_hash != block_hash {
-            bail!("stored Electrum block hash does not match its index")
-        }
-        let transactions: Vec<Transaction> =
-            deserialize(&bytes[32..]).context("decoding stored Electrum transactions")?;
-        Ok(transactions)
+fn read_electrum_transactions_from_record(
+    file: &File,
+    block_hash: BlockHash,
+    record: Record,
+) -> Result<Vec<Transaction>> {
+    let bytes = read_storage_record(
+        file,
+        record,
+        XorKey::default(),
+        MAX_STORED_ELECTRUM_BLOCK_SIZE + 32,
+        "Electrum transaction",
+    )?;
+    if bytes.len() < 32 {
+        bail!("stored Electrum transaction record is truncated")
     }
+    let stored_hash = BlockHash::from_byte_array(
+        bytes[..32]
+            .try_into()
+            .expect("Electrum block hash has fixed width"),
+    );
+    if stored_hash != block_hash {
+        bail!("stored Electrum block hash does not match its index")
+    }
+    let transactions: Vec<Transaction> =
+        deserialize(&bytes[32..]).context("decoding stored Electrum transactions")?;
+    Ok(transactions)
 }
 
 fn encode_electrum_block_record(hash: BlockHash, transactions: &[Transaction]) -> Result<Vec<u8>> {
@@ -4357,7 +4440,7 @@ fn validate_electrum_data_header(
     Ok(())
 }
 
-fn merkle_branch_for_transactions(
+pub(crate) fn merkle_branch_for_transactions(
     transactions: &[Transaction],
     transaction_index: usize,
 ) -> Vec<Txid> {
@@ -5714,6 +5797,7 @@ mod tests {
         let txid = block.txdata[0].compute_txid();
         {
             let mut store = ElectrumBlockStore::open(directory.path()).unwrap();
+            let reader = store.reader();
             assert_eq!(store.insert(&block).unwrap(), hash);
             assert!(store.contains(&hash));
             assert_eq!(
@@ -5722,10 +5806,18 @@ mod tests {
             );
             assert_eq!(store.merkle_branch(&hash, 0).unwrap(), Some(Vec::new()));
             assert_eq!(store.transaction(&hash, 1).unwrap(), None);
+            assert_eq!(
+                reader
+                    .transaction(&hash, 0)
+                    .unwrap()
+                    .unwrap()
+                    .compute_txid(),
+                txid
+            );
         }
 
         std::fs::write(directory.path().join("txblocks.index"), b"corrupt").unwrap();
-        let mut reopened = ElectrumBlockStore::open(directory.path()).unwrap();
+        let reopened = ElectrumBlockStore::open(directory.path()).unwrap();
         assert_eq!(
             reopened
                 .transaction(&hash, 0)
@@ -5778,6 +5870,7 @@ mod tests {
         let mut store = ElectrumBlockStore::open(directory.path()).unwrap();
         store.insert(&first).unwrap();
         store.insert(&second).unwrap();
+        let reader = store.reader();
         let before = store.disk_usage().unwrap();
 
         assert!(store.retain_only(&HashSet::from([first_hash])).unwrap());
@@ -5786,6 +5879,8 @@ mod tests {
         assert!(!store.contains(&second_hash));
         assert!(store.transaction(&first_hash, 0).unwrap().is_some());
         assert!(store.transaction(&second_hash, 0).unwrap().is_none());
+        assert!(reader.transaction(&first_hash, 0).unwrap().is_some());
+        assert!(reader.transaction(&second_hash, 0).unwrap().is_none());
     }
 
     #[test]
@@ -5808,7 +5903,7 @@ mod tests {
         index[second_offset..second_offset + 8].copy_from_slice(&0u64.to_le_bytes());
         std::fs::write(index_path, index).unwrap();
 
-        let mut reopened = ElectrumBlockStore::open(directory.path()).unwrap();
+        let reopened = ElectrumBlockStore::open(directory.path()).unwrap();
         assert_eq!(
             reopened
                 .transaction(&first_hash, 0)

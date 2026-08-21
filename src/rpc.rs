@@ -1075,15 +1075,14 @@ fn rest_block(
         .strip_prefix(prefix)
         .ok_or_else(|| anyhow!("invalid block path"))?;
     let hash = parse_rest_block_hash(hash_text)?;
-    let mut chain = node.chain.write();
-    let block = match chain.block(&hash)? {
+    let block = match node.block_store_reader.get(&hash)? {
         Some(block) => block,
-        None if chain.block_height_by_hash(&hash).is_some() => {
+        None if node.chain.read().block_height_by_hash(&hash).is_some() => {
+            let chain = node.chain.read();
             return Err(missing_block_data_rest_error(&chain, &hash));
         }
         None => return Err(anyhow!("block not found")),
     };
-    drop(chain);
     match format {
         "json" if details => rest_json(get_block(
             node,
@@ -11405,7 +11404,7 @@ fn lookup_psbt_prevout(
     {
         return Ok(Some((output.clone(), Some(entry.transaction.clone()))));
     }
-    let mut chain = node.chain.write();
+    let chain = node.chain.read();
     let transaction = chain
         .transaction(&outpoint.txid)?
         .map(|(transaction, _)| transaction);

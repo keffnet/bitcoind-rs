@@ -6435,7 +6435,7 @@ async fn serve_peer_loop(
                             .await?;
                         }
                         InventoryType::CompactBlock => {
-                            let (block, recent, direct_fetch_allowed) = {
+                            let (recent, direct_fetch_allowed) = {
                                 let chain = node.chain.read();
                                 if !chain
                                     .block_request_allowed(&item.hash, STALE_RELAY_AGE_LIMIT_SECS)
@@ -6454,10 +6454,10 @@ async fn serve_peer_loop(
                                             chain.network.params().pow_target_spacing,
                                         )
                                     });
-                                let Some(block) = chain.block_for_serving(&item.hash)? else {
-                                    continue;
-                                };
-                                (block, recent, direct_fetch_allowed)
+                                (recent, direct_fetch_allowed)
+                            };
+                            let Some(block) = node.block_store_reader.get(&item.hash)? else {
+                                continue;
                             };
                             if node.historical_block_serving_limit_reached(
                                 &item.hash,
@@ -10091,7 +10091,7 @@ fn compact_block_for_inventory(
     ) {
         return Ok(None);
     }
-    let block = node.chain.read().block_for_serving(&item.hash)?;
+    let block = node.block_store_reader.get(&item.hash)?;
     block
         .map(|block| {
             HeaderAndShortIds::from_block(&block, random(), version as u32, &[]).map_err(Into::into)

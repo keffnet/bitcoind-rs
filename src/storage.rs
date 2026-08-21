@@ -78,7 +78,7 @@ pub struct StoredUndo {
 
 pub type StoredElectrumHistory = Vec<(Txid, u32)>;
 
-const UTXO_CACHE_SHARDS: usize = 320;
+const UTXO_CACHE_SHARDS: usize = 384;
 
 struct UtxoReadCache {
     // Generation zero marks entries loaded by the complete sequential warm.
@@ -634,8 +634,8 @@ impl BlockStore {
     }
 
     /// Configure the in-memory block-record cache used by the custom storage
-    /// backend. Keep one quarter of `-dbcache` for decoded historical blocks;
-    /// the UTXO value cache receives the other three quarters because random
+    /// backend. Keep one eighth of `-dbcache` for decoded historical blocks;
+    /// the UTXO value cache receives the other seven eighths because random
     /// prevout reads dominate IBD and newly accepted blocks are rarely read
     /// again before they leave this cache.
     pub fn configure_cache_size_mib(&mut self, mib: i64) {
@@ -644,7 +644,7 @@ impl BlockStore {
         let mib = u64::try_from(mib.max(0)).unwrap_or(u64::MAX);
         let bytes = mib.max(MIN_CACHE_MIB).saturating_mul(MIB);
         let bytes = usize::try_from(bytes).unwrap_or(usize::MAX);
-        self.block_cache_limit = bytes / 4;
+        self.block_cache_limit = bytes / 8;
         self.trim_block_cache();
     }
 
@@ -2315,7 +2315,7 @@ impl UtxoStore {
         const MIB: u64 = 1024 * 1024;
         let mib = u64::try_from(mib.max(0)).unwrap_or(u64::MAX);
         let total_bytes = mib.max(MIN_CACHE_MIB).saturating_mul(MIB);
-        let limit = usize::try_from(total_bytes.saturating_mul(3) / 4).unwrap_or(usize::MAX);
+        let limit = usize::try_from(total_bytes.saturating_mul(7) / 8).unwrap_or(usize::MAX);
         self.read_cache.lock().configure_limit(limit);
     }
 
@@ -2340,7 +2340,7 @@ impl UtxoStore {
         // script bytes; live mainnet sets average about 90 bytes per coin.
         // Leave a small margin while allowing the final trim to enforce the
         // exact byte limit if a particular UTXO set has larger scripts.
-        const ESTIMATED_CACHE_BYTES_PER_COIN: usize = 92;
+        const ESTIMATED_CACHE_BYTES_PER_COIN: usize = 90;
         let mut cache = self.read_cache.lock();
         if self
             .entry_count

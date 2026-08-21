@@ -2303,13 +2303,14 @@ impl Node {
             )?;
         }
         chain.maybe_auto_prune()?;
-        if config.check_blocks.is_some() || config.check_level.is_some() {
-            let check_blocks = config.check_blocks.unwrap_or(6);
-            let check_level = config.check_level.unwrap_or(3);
-            chain
-                .verify_active_chain_with_level(check_level, check_blocks)
-                .context("startup block verification failed")?;
-        }
+        // Core verifies the six most recent blocks through disconnect level
+        // three by default. Explicit options override those defaults rather
+        // than enabling an otherwise-disabled check.
+        let check_blocks = config.check_blocks.unwrap_or(6);
+        let check_level = config.check_level.unwrap_or(3);
+        chain
+            .verify_active_chain_with_level(check_level, check_blocks)
+            .context("startup block verification failed")?;
         fs::create_dir_all(&network_datadir).with_context(|| {
             format!(
                 "creating network data directory {}",
@@ -2653,11 +2654,24 @@ impl Node {
                 Ok(tip) => tip,
                 Err(error) => {
                     if self.shutdown_requested.load(Ordering::Acquire) {
-                        self.set_warning(
-                            NodeWarningKind::FatalInternal,
-                            format!("chainstate persistence failed: {error}"),
-                        );
-                        self.shutdown.notify_waiters();
+                        let failed_to_disconnect = error
+                            .chain()
+                            .any(|cause| cause.to_string() == "Failed to disconnect block");
+                        let disk_space_failure = error.chain().any(|cause| {
+                            let cause = cause.to_string();
+                            cause.starts_with("Disk space is too low")
+                                || cause.starts_with("checking available disk space")
+                        });
+                        if failed_to_disconnect || disk_space_failure {
+                            let message = if failed_to_disconnect {
+                                "Failed to disconnect block.".to_owned()
+                            } else {
+                                format!("chainstate persistence failed: {error:#}")
+                            };
+                            error!(%error, "{message}");
+                            self.set_warning(NodeWarningKind::FatalInternal, message);
+                            self.shutdown.notify_waiters();
+                        }
                     }
                     return Err(error);
                 }
@@ -6641,6 +6655,14 @@ impl Node {
         warnings.into_iter().map(|(_, message)| message).collect()
     }
 
+    fn warning_message(&self, kind: NodeWarningKind) -> Option<String> {
+        self.warnings
+            .read()
+            .iter()
+            .find(|warning| warning.kind == kind)
+            .map(|warning| warning.message.clone())
+    }
+
     pub(crate) fn enable_peer_address_relay(&self, id: usize) {
         if let Some(peer) = self.peers.write().get_mut(&id)
             && peer.inbound
@@ -8117,31 +8139,37 @@ impl Node {
         tokio::time::timeout(Duration::from_secs(10), self.wait_for_peer_tasks())
             .await
             .map_err(|_| anyhow!("timed out waiting for peer handlers during shutdown"))?;
-        info!("Flushing chainstate for clean shutdown");
-        let checkpoint_started = Instant::now();
-        self.chain
-            .write()
-            .checkpoint_for_shutdown()
-            .context("checkpointing chainstate during shutdown")?;
-        info!(
-            "Flushed chainstate for clean shutdown in {:.2}s",
-            checkpoint_started.elapsed().as_secs_f64()
-        );
-        run_notify_command(self.config.shutdown_notify.as_deref(), None);
-        if let Err(error) = self.flush_fee_estimates(true) {
-            warn!(%error, "unable to flush fee estimates during shutdown");
+        let fatal_internal = self.warning_message(NodeWarningKind::FatalInternal);
+        if fatal_internal.is_none() {
+            info!("Flushing chainstate for clean shutdown");
+            let checkpoint_started = Instant::now();
+            self.chain
+                .write()
+                .checkpoint_for_shutdown()
+                .context("checkpointing chainstate during shutdown")?;
+            info!(
+                "Flushed chainstate for clean shutdown in {:.2}s",
+                checkpoint_started.elapsed().as_secs_f64()
+            );
+            run_notify_command(self.config.shutdown_notify.as_deref(), None);
+            if let Err(error) = self.flush_fee_estimates(true) {
+                warn!(%error, "unable to flush fee estimates during shutdown");
+            }
+            if self.config.persist_mempool {
+                self.persist_mempool()?;
+            }
+            if run_result.is_ok() && self.config.coinstatsindex {
+                self.persist_coinstats_clean_shutdown_height()?;
+            }
+            if let Some(anchors) = anchors_to_persist {
+                self.persist_block_relay_only_anchors(&anchors)?;
+            }
+            self.persist_known_addresses()?;
         }
-        if self.config.persist_mempool {
-            self.persist_mempool()?;
-        }
-        if run_result.is_ok() && self.config.coinstatsindex {
-            self.persist_coinstats_clean_shutdown_height()?;
-        }
-        if let Some(anchors) = anchors_to_persist {
-            self.persist_block_relay_only_anchors(&anchors)?;
-        }
-        self.persist_known_addresses()?;
         self.remove_rpc_cookie();
+        if let Some(message) = fatal_internal {
+            bail!("A fatal internal error occurred, see debug.log for details: {message}")
+        }
         run_result
     }
 
@@ -9614,6 +9642,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fatal_internal_shutdown_returns_an_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        node.set_warning(
+            NodeWarningKind::FatalInternal,
+            "Failed to disconnect block.".to_owned(),
+        );
+        node.request_shutdown();
+
+        let error = tokio::time::timeout(Duration::from_secs(2), node.run())
+            .await
+            .expect("fatal shutdown should wake the node")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "A fatal internal error occurred, see debug.log for details: Failed to disconnect block."
+        );
+    }
+
+    #[tokio::test]
     async fn shutdown_waits_for_peer_handlers_before_flushing_chainstate() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(test_config(directory.path())).unwrap();
@@ -9648,6 +9696,7 @@ mod tests {
         node.request_shutdown();
         assert!(node.connect_block_from_peer(block).is_err());
         assert_eq!(node.chain.read().height(), 0);
+        assert!(node.warning_messages().is_empty());
     }
 
     #[tokio::test]
@@ -9863,6 +9912,33 @@ mod tests {
         ])
         .unwrap();
         Node::open(Config::from_args(args).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn default_startup_checks_reject_missing_recent_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        for height in 1..=3 {
+            let previous = *node.chain.read().header(height - 1).unwrap();
+            node.connect_block(mine_test_block(&previous, height, height as u8))
+                .unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(node.blocks_dir.join("undo.dat"))
+            .unwrap();
+        drop(node);
+
+        let error = match Node::open(test_config(directory.path())) {
+            Ok(_) => panic!("startup unexpectedly accepted missing recent undo"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("startup block verification failed")
+        );
     }
 
     #[test]

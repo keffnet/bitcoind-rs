@@ -6888,10 +6888,57 @@ impl ChainState {
             return Ok(());
         }
 
-        let original_utxos = if self.utxos_materialized {
-            self.utxos.clone()
+        let contains_bip30_repeat = blocks
+            .iter()
+            .any(|(height, block, _)| is_bip30_repeat(self.network, *height, block.block_hash()));
+        let original_utxos = if contains_bip30_repeat {
+            // The historical duplicate-coinbase exceptions overwrite keys
+            // outside the ordinary touched-output model. A caller explicitly
+            // checking that deep range keeps the conservative full view.
+            if self.utxos_materialized {
+                self.utxos.clone()
+            } else {
+                self.load_utxo_map_from_store()?
+            }
         } else {
-            self.load_utxo_map_from_store()?
+            // Core's default level-three startup check touches only six
+            // blocks. Materializing the complete mainnet UTXO set here would
+            // make startup memory scale with chain history rather than the
+            // requested verification depth. Every key disconnect/reconnect
+            // can inspect is either an output or an input of this suffix, so
+            // a point-in-time sparse view preserves the exact consistency
+            // checks while bounding memory to the checked blocks.
+            let mut relevant = HashSet::new();
+            for (_, block, _) in &blocks {
+                for transaction in &block.txdata {
+                    let txid = transaction.compute_txid();
+                    for output_index in 0..transaction.output.len() {
+                        relevant.insert(OutPoint::new(txid, output_index as u32));
+                    }
+                    for input in &transaction.input {
+                        relevant.insert(input.previous_output);
+                    }
+                }
+            }
+            if self.utxos_materialized {
+                relevant
+                    .into_iter()
+                    .filter_map(|outpoint| {
+                        self.utxos
+                            .get(&outpoint)
+                            .cloned()
+                            .map(|entry| (outpoint, entry))
+                    })
+                    .collect()
+            } else {
+                let relevant = relevant.into_iter().collect::<Vec<_>>();
+                self.utxo_store
+                    .query(&relevant)
+                    .execute()?
+                    .into_iter()
+                    .map(|(outpoint, entry)| (outpoint, Self::decoded_utxo(entry)))
+                    .collect()
+            }
         };
         let mut working_utxos = original_utxos.clone();
         for (height, block, undo) in blocks.iter().rev() {
@@ -6912,10 +6959,7 @@ impl ChainState {
         // represented in this node's compact undo format.  Reconstruct the
         // prefix independently in that rare full-depth case, then perform
         // the same reconnect check as ordinary blocks.
-        if blocks
-            .iter()
-            .any(|(height, block, _)| is_bip30_repeat(self.network, *height, block.block_hash()))
-        {
+        if contains_bip30_repeat {
             let base_height = first_height.saturating_sub(1);
             let base_hash = self
                 .active_chain
@@ -9380,16 +9424,19 @@ impl ChainState {
             let Some(hash) = self.active_chain.get(height as usize).copied() else {
                 return Ok(false);
             };
-            let Some(block) = self.store.get(&hash)? else {
-                return Ok(false);
+            let block = match self.store.get(&hash) {
+                Ok(Some(block)) => block,
+                Ok(None) => return Ok(false),
+                Err(error) => return self.fatal_disconnect_error(error),
             };
-            let undo = if let Some(undo) = self.block_undo_cache.get(&hash) {
-                undo.clone()
-            } else {
-                let Some(undo) = self.store.get_undo(&hash)? else {
-                    return Ok(false);
-                };
-                undo
+            // A reorg must verify the authoritative undo record even when a
+            // recently connected block still has a decoded copy in RAM.
+            // Otherwise external corruption can stay hidden until restart
+            // while the node commits a transition it can no longer undo.
+            let undo = match self.store.get_undo(&hash) {
+                Ok(Some(undo)) => undo,
+                Ok(None) => return Ok(false),
+                Err(error) => return self.fatal_disconnect_error(error),
             };
             disconnected.push((height, block, undo));
         }
@@ -9641,6 +9688,11 @@ impl ChainState {
         self.release_materialized_history();
         self.update_ibd_status();
         Ok(true)
+    }
+
+    fn fatal_disconnect_error<T>(&self, error: anyhow::Error) -> Result<T> {
+        self.shutdown_interrupt.store(true, Ordering::Release);
+        Err(error).context("Failed to disconnect block")
     }
 
     fn move_index_prune_locks_back(&mut self, max_height_first: u32) {
@@ -15937,6 +15989,37 @@ mod tests {
         assert_eq!(state.height(), 3);
         assert_eq!(state.best_hash(), side_tip.block_hash());
         assert!(!state.processing_known_children);
+    }
+
+    #[test]
+    fn reorg_undo_io_failure_latches_a_fatal_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        for height in 1..=3 {
+            state.connect_block(mine_block(&state, height)).unwrap();
+        }
+        let original_tip = state.best_hash();
+
+        let genesis = *state.header(0).unwrap();
+        let side_one = mine_block_from_header(&genesis, 1, 81);
+        let side_two = mine_block_from_header(&side_one.header, 2, 82);
+        let side_three = mine_block_from_header(&side_two.header, 3, 83);
+        let side_four = mine_block_from_header(&side_three.header, 4, 84);
+        state.connect_block(side_one).unwrap();
+        state.connect_block(side_two).unwrap();
+        state.connect_block(side_three).unwrap();
+        assert_eq!(state.best_hash(), original_tip);
+
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(directory.path().join("blocks/undo.dat"))
+            .unwrap();
+        let error = state.connect_block(side_four).unwrap_err();
+
+        assert_eq!(error.to_string(), "Failed to disconnect block");
+        assert!(state.shutdown_interrupt.load(Ordering::Acquire));
+        assert_eq!(state.best_hash(), original_tip);
     }
 
     #[test]

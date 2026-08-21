@@ -7976,11 +7976,22 @@ async fn handle_received_block(
             return Ok(false);
         }
     }
-    let result = if disconnect_on_invalid {
-        node.connect_block_from_peer(block)
-    } else {
-        node.connect_block(block)
-    };
+    // Full block connection performs synchronous consensus, database, and
+    // compression work while holding the serialized chain writer. Running it
+    // directly on a Tokio worker lets several peer handlers occupy every
+    // runtime thread while they wait for that lock, starving RPC accepts and
+    // unrelated network I/O during IBD. The blocking pool preserves the same
+    // chain ordering without consuming async scheduler workers.
+    let validation_node = Arc::clone(node);
+    let result = tokio::task::spawn_blocking(move || {
+        if disconnect_on_invalid {
+            validation_node.connect_block_from_peer(block)
+        } else {
+            validation_node.connect_block(block)
+        }
+    })
+    .await
+    .context("peer block validation task failed")?;
     match result {
         Ok(tip) => {
             let (active, block_height) = {

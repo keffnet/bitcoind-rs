@@ -6171,6 +6171,7 @@ fn set_max_mempool(node: &Arc<Node>, params: &Value) -> Result<Value> {
             })
             .collect::<Vec<_>>();
         node.notify_mempool_removals(removed);
+        node.announce_electrum_mempool_changes(&changes);
         node.notify_zmq_mempool_changes(changes);
         node.maybe_check_mempool();
     }
@@ -15209,6 +15210,7 @@ fn commit_submitted_package(
         &fee_estimator_exclusions,
     );
     node.maybe_check_mempool();
+    node.announce_electrum_mempool_changes(&changes);
     node.notify_zmq_mempool_changes(changes);
     node.notify_mempool_removals(removed);
     for transaction in accepted {

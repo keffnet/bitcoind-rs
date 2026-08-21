@@ -506,6 +506,10 @@ pub(crate) struct MempoolChange {
     pub transaction: Transaction,
     pub sequence: u64,
     pub kind: MempoolChangeKind,
+    /// Electrum histories touched by this change. `None` means the original
+    /// input-script metadata was unavailable and consumers must refresh
+    /// conservatively.
+    pub affected_script_hashes: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -3366,7 +3370,7 @@ impl Mempool {
         self.bytes += size;
         self.vbytes = self.vbytes.saturating_add(vsize);
         self.entries.insert(txid, entry);
-        self.index_transaction_scripts(txid, affected_scripts, input_script_values);
+        self.index_transaction_scripts(txid, affected_scripts.clone(), input_script_values);
         self.adjusted_weights.insert(txid, adjusted_weight);
         self.wtxids.insert(wtxid, txid);
         self.relay_sequences.insert(txid, self.sequence);
@@ -3383,6 +3387,7 @@ impl Mempool {
                     .clone(),
                 sequence,
                 kind: MempoolChangeKind::Added,
+                affected_script_hashes: Some(affected_scripts),
             });
         }
         Ok(txid)
@@ -3408,13 +3413,19 @@ impl Mempool {
         }
     }
 
-    fn record_removal(&mut self, transaction: Transaction, notify_zmq: bool) {
+    fn record_removal(
+        &mut self,
+        transaction: Transaction,
+        notify_zmq: bool,
+        affected_script_hashes: Option<Vec<String>>,
+    ) {
         let sequence = self.sequence;
         self.sequence = self.sequence.saturating_add(1);
         self.changes.push(MempoolChange {
             transaction,
             sequence,
             kind: MempoolChangeKind::Removed { notify_zmq },
+            affected_script_hashes,
         });
     }
 
@@ -4001,7 +4012,7 @@ impl Mempool {
                         %error,
                         "mempool transaction rejected during chain revalidation"
                     );
-                    self.record_removal(transaction, true);
+                    self.record_removal(transaction, true, None);
                 }
                 Ok(_) => {
                     if let Some(sequence) = relay_sequences.get(&txid) {
@@ -4056,6 +4067,7 @@ impl Mempool {
 
     fn remove_with_notification(&mut self, txid: &Txid, notify_zmq: bool) -> Option<MempoolEntry> {
         let index_memory_usage = self.scripthash_index_memory_usage_for(txid);
+        let affected_script_hashes = self.scripts_by_transaction.get(txid).cloned();
         let entry = self.entries.remove(txid)?;
         self.remove_transaction_scripts(txid);
         self.adjusted_weights.remove(txid);
@@ -4078,7 +4090,11 @@ impl Mempool {
             }
         }
         self.children.remove(txid);
-        self.record_removal(entry.transaction.clone(), notify_zmq);
+        self.record_removal(
+            entry.transaction.clone(),
+            notify_zmq,
+            affected_script_hashes,
+        );
         self.invalidate_graph_optimality();
         Some(entry)
     }
@@ -6025,6 +6041,34 @@ mod tests {
             utxo.output.value.to_sat()
         );
         pool.check_consistency().unwrap();
+
+        let added = pool.take_changes();
+        assert_eq!(added.len(), 1);
+        assert_eq!(
+            added[0]
+                .affected_script_hashes
+                .as_ref()
+                .expect("admission retains affected scripts")
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from([spent_script_hash.clone(), created_script_hash.clone()])
+        );
+
+        pool.remove(&txid)
+            .expect("admitted transaction is removable");
+        let removed = pool.take_changes();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(
+            removed[0]
+                .affected_script_hashes
+                .as_ref()
+                .expect("removal retains affected scripts")
+                .iter()
+                .cloned()
+                .collect::<HashSet<_>>(),
+            HashSet::from([spent_script_hash, created_script_hash])
+        );
     }
 
     fn mine_regtest_block(previous: &Header, height: u32) -> bitcoin::Block {

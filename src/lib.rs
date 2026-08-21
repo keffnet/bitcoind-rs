@@ -1174,6 +1174,22 @@ pub type ChainEvent = chain::ChainTip;
 pub type MempoolEvent = Txid;
 
 #[derive(Clone, Debug)]
+pub(crate) struct ElectrumChainEvent {
+    pub(crate) tip: ChainEvent,
+    /// `None` requests a conservative full subscription refresh. A populated
+    /// set allows Electrum clients to skip histories untouched by this chain
+    /// transition.
+    pub(crate) affected_script_hashes: Option<Arc<HashSet<String>>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ElectrumMempoolEvent {
+    /// `None` requests a conservative full refresh. Ordinary admission and
+    /// removal events retain the exact scripts touched by the transaction.
+    pub(crate) affected_script_hashes: Option<Arc<HashSet<String>>>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct PeerMempoolEvent {
     pub txid: Txid,
     pub excluded_peers: Vec<usize>,
@@ -1713,7 +1729,9 @@ pub struct Node {
     pub mempool: Arc<RwLock<Mempool>>,
     mempool_stats: Mutex<MempoolStats>,
     pub events: broadcast::Sender<ChainEvent>,
+    electrum_chain_events: broadcast::Sender<ElectrumChainEvent>,
     pub mempool_events: broadcast::Sender<MempoolEvent>,
+    electrum_mempool_events: broadcast::Sender<ElectrumMempoolEvent>,
     peer_mempool_events: broadcast::Sender<PeerMempoolEvent>,
     pub(crate) zmq_events: zmq::EventBus,
     pub(crate) txout_scan: Arc<ScanState>,
@@ -2273,7 +2291,9 @@ impl Node {
             }
         };
         let (events, _) = broadcast::channel(256);
+        let (electrum_chain_events, _) = broadcast::channel(256);
         let (mempool_events, _) = broadcast::channel(256);
+        let (electrum_mempool_events, _) = broadcast::channel(256);
         let (peer_mempool_events, _) = broadcast::channel(256);
         let zmq_events = zmq::EventBus::new(&config.zmq);
         let zmq_mempool_sequence = mempool.sequence();
@@ -2318,7 +2338,9 @@ impl Node {
             mempool: Arc::new(RwLock::new(mempool)),
             mempool_stats: Mutex::new(mempool_stats),
             events,
+            electrum_chain_events,
             mempool_events,
+            electrum_mempool_events,
             peer_mempool_events,
             zmq_events,
             txout_scan: Arc::new(ScanState::default()),
@@ -2441,7 +2463,7 @@ impl Node {
         retain_invalid_body: bool,
     ) -> Result<ChainEvent> {
         let previous_tip = self.chain.read().best_hash();
-        let (tip, activated_blocks, disconnected_blocks) = {
+        let (tip, activated_blocks, disconnected_blocks, affected_script_hashes) = {
             let mut chain = self.chain.write();
             let tip = if retain_invalid_body {
                 chain.connect_block_from_peer(block)?
@@ -2459,7 +2481,17 @@ impl Node {
             } else {
                 Vec::new()
             };
-            (tip, activated_blocks, disconnected_blocks)
+            let affected_script_hashes = self.electrum_affected_script_hashes(
+                &mut chain,
+                &activated_blocks,
+                &disconnected_blocks,
+            )?;
+            (
+                tip,
+                activated_blocks,
+                disconnected_blocks,
+                affected_script_hashes,
+            )
         };
         if tip.hash != previous_tip {
             // Core's peer manager records every active-tip change for stale
@@ -2482,7 +2514,7 @@ impl Node {
                 false,
             );
             self.announce_zmq_block_events(&[], &activated_blocks);
-            let _ = self.events.send(tip.clone());
+            self.announce_chain_event(tip.clone(), affected_script_hashes);
 
             self.log_ipc_wait_cancellation();
 
@@ -2957,6 +2989,7 @@ impl Node {
             &fee_estimator_exclusions,
         );
         self.announce_mempool_diff(mempool_before, mempool_after);
+        self.announce_electrum_mempool_changes(&mempool_changes);
         self.notify_zmq_mempool_changes(mempool_changes);
         self.record_mempool_stats();
     }
@@ -2994,6 +3027,7 @@ impl Node {
     fn chain_change_needs_block_bodies(&self) -> bool {
         !self.mempool.read().is_empty()
             || self.orphan_count() != 0
+            || self.electrum_chain_events.receiver_count() != 0
             || (self.config.zmq.is_enabled() && self.zmq_events.receiver_count() != 0)
     }
 
@@ -3546,6 +3580,7 @@ impl Node {
             })
             .collect::<Vec<_>>();
         self.announce_mempool_changes(removed_ids);
+        self.announce_electrum_mempool_changes(&changes);
         self.notify_zmq_mempool_changes(changes);
         self.maybe_check_mempool();
         self.record_mempool_stats();
@@ -3682,6 +3717,7 @@ impl Node {
             }
         }
         self.announce_mempool_changes(removed_ids);
+        self.announce_electrum_mempool_changes(&changes);
         self.notify_zmq_mempool_changes(changes.clone());
         self.maybe_check_mempool();
         let accepted = result.map(|txid| (txid, changes));
@@ -3721,6 +3757,25 @@ impl Node {
         }
     }
 
+    pub(crate) fn announce_electrum_mempool_changes(&self, changes: &[MempoolChange]) {
+        if changes.is_empty() || self.electrum_mempool_events.receiver_count() == 0 {
+            return;
+        }
+        let mut affected = HashSet::new();
+        for change in changes {
+            let Some(script_hashes) = change.affected_script_hashes.as_ref() else {
+                let _ = self.electrum_mempool_events.send(ElectrumMempoolEvent {
+                    affected_script_hashes: None,
+                });
+                return;
+            };
+            affected.extend(script_hashes.iter().cloned());
+        }
+        let _ = self.electrum_mempool_events.send(ElectrumMempoolEvent {
+            affected_script_hashes: Some(Arc::new(affected)),
+        });
+    }
+
     pub(crate) fn expire_mempool(&self) {
         let changes = {
             let mut mempool = self.mempool.write();
@@ -3742,6 +3797,7 @@ impl Node {
             })
             .collect();
         self.announce_mempool_changes(removed);
+        self.announce_electrum_mempool_changes(&changes);
         self.notify_zmq_mempool_changes(changes);
         self.maybe_check_mempool();
         self.record_mempool_stats();
@@ -3779,6 +3835,7 @@ impl Node {
             transaction,
             sequence,
             kind,
+            ..
         } = change;
         let notify_zmq = !matches!(&kind, MempoolChangeKind::Removed { notify_zmq: false });
         self.zmq_mempool_sequence
@@ -3953,7 +4010,7 @@ impl Node {
     }
 
     pub fn invalidate_block(&self, hash: bitcoin::BlockHash) -> Result<ChainEvent> {
-        let (tip, changed, activated_blocks, disconnected_blocks) = {
+        let (tip, changed, activated_blocks, disconnected_blocks, affected_script_hashes) = {
             let mut chain = self.chain.write();
             let previous = chain.best_hash();
             let tip = chain.invalidate_block(&hash)?;
@@ -3972,7 +4029,18 @@ impl Node {
             } else {
                 Vec::new()
             };
-            (tip, changed, activated_blocks, disconnected_blocks)
+            let affected_script_hashes = self.electrum_affected_script_hashes(
+                &mut chain,
+                &activated_blocks,
+                &disconnected_blocks,
+            )?;
+            (
+                tip,
+                changed,
+                activated_blocks,
+                disconnected_blocks,
+                affected_script_hashes,
+            )
         };
         if changed {
             self.announce_zmq_block_events(&disconnected_blocks, &[]);
@@ -3983,7 +4051,7 @@ impl Node {
             );
             self.announce_zmq_block_events(&[], &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
-            let _ = self.events.send(tip.clone());
+            self.announce_chain_event(tip.clone(), affected_script_hashes);
         }
         self.refresh_large_work_invalid_chain_warning();
         self.refresh_versionbits_warning();
@@ -3992,7 +4060,7 @@ impl Node {
     }
 
     pub fn reconsider_block(&self, hash: bitcoin::BlockHash) -> Result<ChainEvent> {
-        let (tip, changed, activated_blocks, disconnected_blocks) = {
+        let (tip, changed, activated_blocks, disconnected_blocks, affected_script_hashes) = {
             let mut chain = self.chain.write();
             let previous = chain.best_hash();
             let tip = chain.reconsider_block(&hash)?;
@@ -4011,7 +4079,18 @@ impl Node {
             } else {
                 Vec::new()
             };
-            (tip, changed, activated_blocks, disconnected_blocks)
+            let affected_script_hashes = self.electrum_affected_script_hashes(
+                &mut chain,
+                &activated_blocks,
+                &disconnected_blocks,
+            )?;
+            (
+                tip,
+                changed,
+                activated_blocks,
+                disconnected_blocks,
+                affected_script_hashes,
+            )
         };
         if changed {
             self.announce_zmq_block_events(&disconnected_blocks, &[]);
@@ -4022,7 +4101,7 @@ impl Node {
             );
             self.announce_zmq_block_events(&[], &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
-            let _ = self.events.send(tip.clone());
+            self.announce_chain_event(tip.clone(), affected_script_hashes);
         }
         self.refresh_versionbits_warning();
         self.maybe_check_block_index();
@@ -4030,7 +4109,7 @@ impl Node {
     }
 
     pub fn precious_block(&self, hash: bitcoin::BlockHash) -> Result<ChainEvent> {
-        let (tip, changed, activated_blocks, disconnected_blocks) = {
+        let (tip, changed, activated_blocks, disconnected_blocks, affected_script_hashes) = {
             let mut chain = self.chain.write();
             let previous = chain.best_hash();
             let tip = chain.precious_block(&hash)?;
@@ -4049,7 +4128,18 @@ impl Node {
             } else {
                 Vec::new()
             };
-            (tip, changed, activated_blocks, disconnected_blocks)
+            let affected_script_hashes = self.electrum_affected_script_hashes(
+                &mut chain,
+                &activated_blocks,
+                &disconnected_blocks,
+            )?;
+            (
+                tip,
+                changed,
+                activated_blocks,
+                disconnected_blocks,
+                affected_script_hashes,
+            )
         };
         if changed {
             self.announce_zmq_block_events(&disconnected_blocks, &[]);
@@ -4060,19 +4150,59 @@ impl Node {
             );
             self.announce_zmq_block_events(&[], &activated_blocks);
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
-            let _ = self.events.send(tip.clone());
+            self.announce_chain_event(tip.clone(), affected_script_hashes);
         }
         self.refresh_versionbits_warning();
         self.maybe_check_block_index();
         Ok(tip)
     }
 
+    fn electrum_affected_script_hashes(
+        &self,
+        chain: &mut ChainState,
+        activated_blocks: &[Block],
+        disconnected_blocks: &[Block],
+    ) -> Result<Option<Arc<HashSet<String>>>> {
+        if self.electrum_chain_events.receiver_count() == 0 {
+            return Ok(None);
+        }
+        let Some(mut affected) = chain.electrum_script_hashes_for_blocks(activated_blocks)? else {
+            return Ok(None);
+        };
+        let Some(disconnected) = chain.electrum_script_hashes_for_blocks(disconnected_blocks)?
+        else {
+            return Ok(None);
+        };
+        affected.extend(disconnected);
+        Ok(Some(Arc::new(affected)))
+    }
+
+    fn announce_chain_event(
+        &self,
+        tip: ChainEvent,
+        affected_script_hashes: Option<Arc<HashSet<String>>>,
+    ) {
+        let _ = self.events.send(tip.clone());
+        let _ = self.electrum_chain_events.send(ElectrumChainEvent {
+            tip,
+            affected_script_hashes,
+        });
+    }
+
     pub fn subscribe_chain(&self) -> broadcast::Receiver<ChainEvent> {
         self.events.subscribe()
     }
 
+    pub(crate) fn subscribe_electrum_chain(&self) -> broadcast::Receiver<ElectrumChainEvent> {
+        self.electrum_chain_events.subscribe()
+    }
+
     pub fn subscribe_mempool(&self) -> broadcast::Receiver<MempoolEvent> {
         self.mempool_events.subscribe()
+    }
+
+    pub(crate) fn subscribe_electrum_mempool(&self) -> broadcast::Receiver<ElectrumMempoolEvent> {
+        self.electrum_mempool_events.subscribe()
     }
 
     pub(crate) fn subscribe_peer_mempool(&self) -> broadcast::Receiver<PeerMempoolEvent> {
@@ -7904,6 +8034,7 @@ impl Node {
         if result.is_ok() {
             self.update_fee_estimator_for_changes(&changes, current_height);
             self.maybe_check_mempool();
+            self.announce_electrum_mempool_changes(&changes);
             self.notify_zmq_mempool_changes(changes);
             self.record_mempool_stats();
             let mut changed = changed;

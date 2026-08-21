@@ -5121,6 +5121,35 @@ impl ChainState {
         Ok(Some(spent_outputs))
     }
 
+    /// Return the Electrum script hashes whose confirmed histories can change
+    /// when the supplied blocks connect or disconnect. Block outputs cover
+    /// received coins and undo outputs cover every spent previous output.
+    ///
+    /// `None` is a conservative signal that undo data was unavailable. The
+    /// caller must then refresh every subscription rather than risk missing a
+    /// notification.
+    pub(crate) fn electrum_script_hashes_for_blocks(
+        &mut self,
+        blocks: &[Block],
+    ) -> Result<Option<HashSet<String>>> {
+        let mut script_hashes = HashSet::new();
+        for block in blocks {
+            for transaction in &block.txdata {
+                for output in &transaction.output {
+                    script_hashes.insert(electrum_script_hash(&output.script_pubkey));
+                }
+            }
+            let Some(spent_outputs) = self.spent_outputs_by_transaction(&block.block_hash())?
+            else {
+                return Ok(None);
+            };
+            for output in spent_outputs.into_iter().flatten() {
+                script_hashes.insert(electrum_script_hash(&output.script_pubkey));
+            }
+        }
+        Ok(Some(script_hashes))
+    }
+
     pub fn chain_work_by_hash(&self, hash: &BlockHash) -> Option<Work> {
         self.block_index.get(hash).map(|node| node.chain_work)
     }

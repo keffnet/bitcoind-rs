@@ -25,6 +25,7 @@ use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use fjall::compaction::{SizeTiered, Strategy as CompactionStrategy};
 use fjall::{
     CompressionType, Config as FjallConfig, Keyspace, PartitionCreateOptions, PartitionHandle,
     PersistMode,
@@ -3261,6 +3262,21 @@ fn history_events_partition_name(epoch: u64) -> String {
     format!("{HISTORY_EVENTS_PARTITION_PREFIX}{epoch}")
 }
 
+fn history_events_partition_options() -> PartitionCreateOptions {
+    // History recovery inserts hundreds of millions of immutable, randomly
+    // ordered event keys. Leveled compaction repeatedly rewrites overlapping
+    // lower levels during that bulk load. Size-tiered compaction trades a
+    // small amount of temporary read amplification for much lower write
+    // amplification; history prefixes remain efficient after background
+    // compaction. Larger data blocks improve LZ4's shared-script-prefix ratio
+    // and match the range/prefix-heavy Electrum query workload.
+    PartitionCreateOptions::default()
+        .compression(CompressionType::Lz4)
+        .compaction_strategy(CompactionStrategy::SizeTiered(SizeTiered::default()))
+        .max_memtable_size(32 * 1024 * 1024)
+        .block_size(64 * 1024)
+}
+
 /// Disk-backed Electrum history index.
 ///
 /// Every confirmed history item is an immutable event keyed by script hash,
@@ -3338,9 +3354,7 @@ impl ElectrumHistoryStore {
             };
         let events = keyspace.open_partition(
             &history_events_partition_name(event_partition_epoch),
-            // Segment compression exploits the shared 32-byte script prefix
-            // while retaining inexpensive decompression for query serving.
-            PartitionCreateOptions::default().compression(CompressionType::Lz4),
+            history_events_partition_options(),
         )?;
         if events.len()? != entry_count {
             bail!("Electrum history database entry count does not match its active partition");
@@ -3720,7 +3734,7 @@ impl ElectrumHistoryStore {
             .context("Electrum history generation exhausted")?;
         let next_events = self.keyspace.open_partition(
             &history_events_partition_name(next_epoch),
-            PartitionCreateOptions::default().compression(CompressionType::Lz4),
+            history_events_partition_options(),
         )?;
         let mut batch = self
             .keyspace

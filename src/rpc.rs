@@ -1901,6 +1901,7 @@ async fn dispatch_method_async_for_user(
     debug!("ThreadRPCServer method={method}");
     let command_id = node.begin_rpc_command(method);
     let result = match method {
+        "echoipc" => echo_ipc_async(&normalized_params).await,
         "stop" => match stop_wait(&normalized_params) {
             Ok(wait) => {
                 if let Some(wait) = wait {
@@ -1933,6 +1934,25 @@ async fn dispatch_method_async_for_user(
     };
     node.end_rpc_command(command_id);
     result
+}
+
+async fn echo_ipc_async(params: &Value) -> Result<Value> {
+    let value = param::<String>(params, 0)?;
+    #[cfg(unix)]
+    {
+        if !crate::ipc::current_process_is_bitcoin_node() {
+            return Ok(json!(value));
+        }
+        let echoed =
+            tokio::task::spawn_blocking(move || crate::ipc::echo_through_spawned_process(&value))
+                .await
+                .map_err(|error| anyhow!("spawned echo IPC task failed: {error}"))??;
+        Ok(json!(echoed))
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(json!(value))
+    }
 }
 
 fn successful_stop_request(request_body: &[u8], response: Option<&Value>) -> bool {

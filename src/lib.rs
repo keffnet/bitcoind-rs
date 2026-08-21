@@ -23,6 +23,14 @@ pub mod validation;
 pub mod wire;
 pub mod zmq;
 
+/// Internal entry point used by Core-compatible `bitcoin-node -ipcfd N`
+/// children spawned over a Unix socketpair.
+#[doc(hidden)]
+#[cfg(unix)]
+pub fn run_spawned_ipc(fd: std::os::unix::io::RawFd) -> anyhow::Result<()> {
+    ipc::run_spawned_process(fd)
+}
+
 // The generated modules use crate-root paths for cross-schema references.
 // Keep these private: the wire protocol is a Core compatibility surface, not
 // a Rust API exposed by the node library.

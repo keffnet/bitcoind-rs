@@ -5,6 +5,8 @@
 //! Electrum, and P2P services do not need to know about Cap'n Proto details.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::process::Command;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -29,12 +31,220 @@ use tracing::{debug, warn};
 
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use crate::Node;
 use crate::config::network_data_dir_name;
 
 const DEFAULT_SOCKET_NAME: &str = "node.sock";
 const MAX_UNIX_SOCKET_PATH: usize = 107;
+
+#[cfg(unix)]
+fn set_close_on_exec(fd: RawFd, close_on_exec: bool) -> Result<()> {
+    // SAFETY: F_GETFD and F_SETFD only inspect/update descriptor flags and do
+    // not retain pointers. The descriptor comes from socketpair or the
+    // process command line and is validated by the syscall result.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error()).context("reading IPC descriptor flags");
+    }
+    let flags = if close_on_exec {
+        flags | libc::FD_CLOEXEC
+    } else {
+        flags & !libc::FD_CLOEXEC
+    };
+    // SAFETY: The descriptor was validated above and F_SETFD takes an integer
+    // flag value without retaining any borrowed memory.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("setting IPC descriptor flags");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_stream_socket_fd(fd: RawFd) -> Result<()> {
+    if fd < 0 {
+        bail!("IPC file descriptor must be non-negative");
+    }
+    let mut socket_type = 0i32;
+    let mut length = std::mem::size_of_val(&socket_type) as libc::socklen_t;
+    // SAFETY: socket_type and length point to initialized writable storage for
+    // getsockopt, and the syscall does not retain either pointer.
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&raw mut socket_type).cast(),
+            &raw mut length,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error()).context("validating IPC file descriptor");
+    }
+    if socket_type != libc::SOCK_STREAM {
+        bail!("IPC file descriptor is not a stream socket");
+    }
+    let mut address: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut address_length = std::mem::size_of_val(&address) as libc::socklen_t;
+    // SAFETY: address and address_length provide initialized writable storage
+    // large enough for any socket address and are not retained by getsockname.
+    if unsafe { libc::getsockname(fd, (&raw mut address).cast(), &raw mut address_length) } == -1 {
+        return Err(std::io::Error::last_os_error()).context("reading IPC socket family");
+    }
+    if i32::from(address.ss_family) != libc::AF_UNIX {
+        bail!("IPC file descriptor is not a Unix-domain socket");
+    }
+    Ok(())
+}
+
+/// Serve Core's internal `bitcoin-node -ipcfd N` socketpair mode until the
+/// controlling process closes its endpoint.
+#[cfg(unix)]
+pub(crate) fn run_spawned_process(fd: RawFd) -> Result<()> {
+    validate_stream_socket_fd(fd)?;
+    // SAFETY: validate_stream_socket_fd established that fd is an owned stream
+    // socket inherited specifically for this child process. From this point
+    // the standard UnixStream is responsible for closing it exactly once.
+    let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    stream
+        .set_nonblocking(true)
+        .context("configuring spawned IPC socket")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("creating spawned IPC runtime")?;
+    runtime.block_on(tokio::task::LocalSet::new().run_until(async move {
+        let stream = UnixStream::from_std(stream).context("adopting spawned IPC socket")?;
+        serve_connection_with_node(stream, None).await
+    }))
+}
+
+#[cfg(unix)]
+fn create_ipc_socket_pair() -> Result<(OwnedFd, OwnedFd)> {
+    let mut descriptors = [-1; 2];
+    // SAFETY: descriptors points to storage for exactly two file descriptors;
+    // socketpair initializes both entries or returns an error.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM,
+            0,
+            descriptors.as_mut_ptr(),
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error()).context("creating IPC socket pair");
+    }
+    // SAFETY: socketpair succeeded, so both descriptors are fresh and owned by
+    // this process. OwnedFd takes responsibility for closing each exactly once.
+    let parent = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    // SAFETY: See the ownership argument above for the second fresh descriptor.
+    let child = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    set_close_on_exec(parent.as_raw_fd(), true)?;
+    set_close_on_exec(child.as_raw_fd(), false)?;
+    Ok((parent, child))
+}
+
+#[cfg(unix)]
+fn bitcoin_node_executable() -> Result<PathBuf> {
+    let current = std::env::current_exe().context("locating current executable")?;
+    if current.file_name().and_then(|name| name.to_str()) == Some("bitcoin-node") {
+        return Ok(current);
+    }
+    let candidate = current
+        .parent()
+        .map(|parent| parent.join("bitcoin-node"))
+        .unwrap_or_else(|| PathBuf::from("bitcoin-node"));
+    Ok(candidate)
+}
+
+#[cfg(unix)]
+pub(crate) fn current_process_is_bitcoin_node() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name == "bitcoin-node"))
+        .unwrap_or(false)
+}
+
+/// Match Core's test-only `echoipc` behavior by passing the value through a
+/// newly spawned bitcoin-node process over an inherited socketpair.
+#[cfg(unix)]
+pub(crate) fn echo_through_spawned_process(value: &str) -> Result<String> {
+    let (parent_fd, child_fd) = create_ipc_socket_pair()?;
+    let mut child = Command::new(bitcoin_node_executable()?)
+        .arg("-ipcfd")
+        .arg(child_fd.as_raw_fd().to_string())
+        .spawn()
+        .context("spawning bitcoin-node IPC process")?;
+    drop(child_fd);
+
+    // Once the child exists, always close our endpoint and reap it, including
+    // local runtime/setup failures, so echoipc cannot accumulate zombies.
+    let result = (|| -> Result<String> {
+        let stream = std::os::unix::net::UnixStream::from(parent_fd);
+        stream
+            .set_nonblocking(true)
+            .context("configuring parent IPC socket")?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("creating parent IPC runtime")?;
+        runtime.block_on(tokio::task::LocalSet::new().run_until(async move {
+            let stream = UnixStream::from_std(stream).context("adopting parent IPC socket")?;
+            echo_over_ipc_stream(stream, value).await
+        }))
+    })();
+
+    let status = child.wait().context("waiting for spawned bitcoin-node")?;
+    if result.is_ok() && !status.success() {
+        bail!("spawned bitcoin-node exited with status {status}");
+    }
+    result
+}
+
+#[cfg(unix)]
+async fn echo_over_ipc_stream(stream: UnixStream, value: &str) -> Result<String> {
+    let (reader, writer) = stream.into_split();
+    let network = VatNetwork::new(
+        BufReader::new(reader.compat()),
+        BufWriter::new(writer.compat_write()),
+        Side::Client,
+        ReaderOptions::new(),
+    );
+    let mut rpc_system = RpcSystem::new(Box::new(network), None);
+    let init: crate::init_capnp::init::Client = rpc_system.bootstrap(Side::Server);
+    let rpc_task = tokio::task::spawn_local(rpc_system);
+    let echo_response = init
+        .make_echo_request()
+        .send()
+        .promise
+        .await
+        .context("requesting spawned echo interface")?;
+    let echo = echo_response
+        .get()
+        .context("reading spawned echo interface")?
+        .get_result()
+        .context("accessing spawned echo interface")?;
+    let mut request = echo.echo_request();
+    request.get().set_echo(value);
+    let response = request
+        .send()
+        .promise
+        .await
+        .context("calling spawned echo interface")?;
+    let output = response
+        .get()
+        .context("reading spawned echo response")?
+        .get_result()
+        .context("accessing spawned echo response")?
+        .to_str()
+        .context("decoding spawned echo response")?
+        .to_owned();
+    rpc_task.abort();
+    Ok(output)
+}
 
 #[derive(Clone, Default)]
 struct InterruptHandle {
@@ -130,7 +340,7 @@ impl crate::echo_capnp::echo::Server for EchoService {
 }
 
 struct InitService {
-    node: Arc<Node>,
+    node: Option<Arc<Node>>,
 }
 
 impl crate::init_capnp::init::Server for InitService {
@@ -168,8 +378,11 @@ impl crate::init_capnp::init::Server for InitService {
         _params: crate::init_capnp::init::MakeMiningParams,
         mut results: crate::init_capnp::init::MakeMiningResults,
     ) -> Result<(), capnp::Error> {
+        let node = self.node.clone().ok_or_else(|| {
+            capnp::Error::failed("mining is unavailable in a spawned echo process".to_owned())
+        })?;
         results.get().set_result(new_client(MiningService {
-            node: self.node.clone(),
+            node,
             interrupt: InterruptHandle::default(),
         }));
         Ok(())
@@ -1016,6 +1229,10 @@ impl IpcServer {
 }
 
 async fn serve_connection(stream: UnixStream, node: Arc<Node>) -> Result<()> {
+    serve_connection_with_node(stream, Some(node)).await
+}
+
+async fn serve_connection_with_node(stream: UnixStream, node: Option<Arc<Node>>) -> Result<()> {
     let (reader, writer) = stream.into_split();
     let network = VatNetwork::new(
         BufReader::new(reader.compat()),
@@ -1025,12 +1242,16 @@ async fn serve_connection(stream: UnixStream, node: Arc<Node>) -> Result<()> {
     );
     let bootstrap: crate::init_capnp::init::Client = new_client(InitService { node: node.clone() });
     let rpc_system = RpcSystem::new(Box::new(network), Some(bootstrap.client));
-    tokio::select! {
-        result = rpc_system => {
-            result.context("serving IPC connection")?;
-            Ok(())
+    if let Some(node) = node {
+        tokio::select! {
+            result = rpc_system => {
+                result.context("serving IPC connection")?;
+                Ok(())
+            }
+            _ = node.wait_for_shutdown() => Ok(()),
         }
-        _ = node.wait_for_shutdown() => Ok(()),
+    } else {
+        rpc_system.await.context("serving spawned IPC connection")
     }
 }
 
@@ -1056,6 +1277,8 @@ fn parse_socket_path(address: &str, datadir: &Path, network: bitcoin::Network) -
 mod tests {
     use super::IpcServer;
     use super::parse_socket_path;
+    #[cfg(unix)]
+    use super::{create_ipc_socket_pair, echo_over_ipc_stream, run_spawned_process};
     use bitcoin::Network;
     use bitcoin::consensus::encode::deserialize;
     use bitcoin::hashes::Hash as _;
@@ -1066,6 +1289,8 @@ mod tests {
     use capnp_rpc::twoparty::VatNetwork;
     use clap::Parser;
     use futures::io::{BufReader, BufWriter};
+    #[cfg(unix)]
+    use std::os::unix::io::IntoRawFd;
     use std::path::Path;
     use tokio::net::UnixStream;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -1097,6 +1322,29 @@ mod tests {
         assert!(
             parse_socket_path("tcp:127.0.0.1:1", Path::new("/tmp/node"), Network::Regtest).is_err()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inherited_fd_ipc_echo_round_trip() {
+        let (client_fd, server_fd) = create_ipc_socket_pair().unwrap();
+        let server = std::thread::spawn(move || run_spawned_process(server_fd.into_raw_fd()));
+        let stream = std::os::unix::net::UnixStream::from(client_fd);
+        stream.set_nonblocking(true).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let echoed = runtime
+            .block_on(tokio::task::LocalSet::new().run_until(async move {
+                let stream = UnixStream::from_std(stream).unwrap();
+                echo_over_ipc_stream(stream, "inherited-fd").await
+            }))
+            .unwrap();
+        drop(runtime);
+
+        assert_eq!(echoed, "inherited-fd");
+        server.join().unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]

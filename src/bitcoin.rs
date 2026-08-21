@@ -1,7 +1,7 @@
 //! Core-compatible launcher for the wallet-free command suite.
 //!
-//! The Rust implementation uses one native daemon for Core's monolithic and
-//! multiprocess node modes because IPC is hosted directly by that process.
+//! The Rust implementation uses one native daemon implementation for Core's
+//! monolithic `bitcoind-rs` and multiprocess `bitcoin-node` entry points.
 //! Wallet and GUI commands are intentionally absent from this wallet-free
 //! build; RPC, transaction, utility, and chainstate tools remain available.
 
@@ -13,8 +13,8 @@ const VERSION: &str = "31.1.0";
 const HELP_USAGE: &str = r#"Usage: bitcoin [OPTIONS] COMMAND...
 
 Options:
-  -m, --multiprocess     Run the IPC-capable node mode.
-  -M, --monolithic       Run the monolithic node mode. (Default behavior)
+  -m, --multiprocess     Run the IPC-capable bitcoin-node entry point.
+  -M, --monolithic       Run the monolithic bitcoind-rs entry point. (Default behavior)
   -v, --version          Show version information
   -h, --help             Show full help message
 Commands:
@@ -152,7 +152,20 @@ fn node_invocation(command_line: WrapperCommandLine) -> Result<Invocation, Strin
     if command_line.use_multiprocess == Some(false) && ipc_requested {
         let invalid = arguments
             .iter()
-            .find(|argument| argument.starts_with("-ipcbind") || argument.starts_with("--ipcbind"))
+            .find(|argument| {
+                matches!(
+                    argument
+                        .split_once('=')
+                        .map(|(name, _)| name)
+                        .unwrap_or(argument),
+                    "-ipcbind"
+                        | "--ipcbind"
+                        | "-ipcconnect"
+                        | "--ipcconnect"
+                        | "-ipcfd"
+                        | "--ipcfd"
+                )
+            })
             .map(String::as_str)
             .unwrap_or("-ipcbind");
         return Err(format!(
@@ -166,8 +179,13 @@ fn node_invocation(command_line: WrapperCommandLine) -> Result<Invocation, Strin
     {
         arguments.push("--electrum=0".to_owned());
     }
+    let use_multiprocess = command_line.use_multiprocess.unwrap_or(ipc_requested);
     Ok(Invocation {
-        executable: "bitcoind-rs",
+        executable: if use_multiprocess {
+            "bitcoin-node"
+        } else {
+            "bitcoind-rs"
+        },
         arguments,
     })
 }
@@ -223,7 +241,7 @@ fn config_requests_electrum(arguments: &[String]) -> bool {
 }
 
 fn executable_path(executable: &str) -> PathBuf {
-    if executable == "bitcoind-rs"
+    if matches!(executable, "bitcoind-rs" | "bitcoin-node")
         && let Some(path) = env::var_os("BITCOIND_RS_BIN")
     {
         return PathBuf::from(path);
@@ -306,6 +324,14 @@ mod tests {
 
     #[test]
     fn ipc_node_launches_disable_only_the_implicit_electrum_listener() {
+        let default = command_invocation(parse_command_line(["node".to_owned()]).unwrap()).unwrap();
+        assert_eq!(default.executable, "bitcoind-rs");
+
+        let explicit =
+            command_invocation(parse_command_line(["-m".to_owned(), "node".to_owned()]).unwrap())
+                .unwrap();
+        assert_eq!(explicit.executable, "bitcoin-node");
+
         let invocation = command_invocation(
             parse_command_line([
                 "node".to_owned(),
@@ -315,7 +341,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert_eq!(invocation.executable, "bitcoind-rs");
+        assert_eq!(invocation.executable, "bitcoin-node");
         assert!(invocation.arguments.contains(&"--electrum=0".to_owned()));
 
         let error = command_invocation(

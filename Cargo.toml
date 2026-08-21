@@ -63,6 +63,10 @@ name = "bitcoind-rs"
 path = "src/main.rs"
 
 [[bin]]
+name = "bitcoin-node"
+path = "src/bitcoin_node.rs"
+
+[[bin]]
 name = "bitcoin-cli"
 path = "src/bitcoin_cli.rs"
 

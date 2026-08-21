@@ -43,7 +43,21 @@ fn main() {
     unsafe {
         libc::umask(0o077);
     }
-    if let Err(error) = run() {
+    let result = {
+        #[cfg(unix)]
+        {
+            match spawned_ipc_fd() {
+                Ok(Some(fd)) => bitcoind_rs::run_spawned_ipc(fd),
+                Ok(None) => run(),
+                Err(error) => Err(error),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            run()
+        }
+    };
+    if let Err(error) = result {
         if let Some(core_error) = nested_core_startup_error(&error) {
             // Core prints the non-interactive recovery message verbatim.
             eprintln!("{core_error}");
@@ -52,6 +66,25 @@ fn main() {
         }
         std::process::exit(1);
     }
+}
+
+#[cfg(unix)]
+fn spawned_ipc_fd() -> Result<Option<std::os::unix::io::RawFd>> {
+    if env!("CARGO_BIN_NAME") != "bitcoin-node" {
+        return Ok(None);
+    }
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if arguments.len() != 3 || arguments.get(1).and_then(|arg| arg.to_str()) != Some("-ipcfd") {
+        return Ok(None);
+    }
+    let value = arguments
+        .get(2)
+        .and_then(|arg| arg.to_str())
+        .unwrap_or_default();
+    let fd = value
+        .parse::<std::os::unix::io::RawFd>()
+        .map_err(|_| anyhow::anyhow!("Invalid -ipcfd number '{value}'"))?;
+    Ok(Some(fd))
 }
 
 fn run() -> Result<()> {

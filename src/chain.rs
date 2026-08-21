@@ -5707,9 +5707,8 @@ impl ChainState {
         &mut self,
         previous_tip: BlockHash,
     ) -> Result<bool> {
-        let active = self.active_chain.iter().copied().collect::<HashSet<_>>();
         let mut cursor = previous_tip;
-        while !active.contains(&cursor) {
+        while !self.is_active_block(&cursor) {
             if self
                 .store
                 .transaction_count(&cursor)?
@@ -5731,10 +5730,9 @@ impl ChainState {
         if previous_tip == self.best_hash() {
             return Ok(Vec::new());
         }
-        let active: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
         let mut cursor = previous_tip;
         let common = loop {
-            if active.contains(&cursor) {
+            if self.is_active_block(&cursor) {
                 break cursor;
             }
             cursor = self
@@ -5744,11 +5742,13 @@ impl ChainState {
                 .header
                 .prev_blockhash;
         };
-        let start = self
-            .active_chain
-            .iter()
-            .position(|hash| *hash == common)
-            .expect("common active ancestor is in active chain")
+        let common_height = self
+            .block_index
+            .get(&common)
+            .expect("common active ancestor is indexed")
+            .height;
+        let start = usize::try_from(common_height)
+            .expect("block height fits the active-chain index")
             .saturating_add(1);
         self.active_chain[start..]
             .iter()
@@ -5761,13 +5761,12 @@ impl ChainState {
     }
 
     pub fn disconnected_blocks_after(&mut self, previous_tip: BlockHash) -> Result<Vec<Block>> {
-        let active: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
-        if active.contains(&previous_tip) {
+        if self.is_active_block(&previous_tip) {
             return Ok(Vec::new());
         }
         let mut path = Vec::new();
         let mut cursor = previous_tip;
-        while !active.contains(&cursor) {
+        while !self.is_active_block(&cursor) {
             path.push(cursor);
             cursor = self
                 .block_index

@@ -4990,41 +4990,14 @@ async fn serve_peer_loop(
                 if node.peer_block_download_timed_out(peer_id) {
                     anyhow::bail!("peer timed out downloading blocks");
                 }
-                let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER
-                    .saturating_sub(node.peer_inflight_block_count(peer_id));
-                let peer_has_block_availability = node
-                    .peer_infos()
-                    .into_iter()
-                    .find(|peer| peer.id == peer_id)
-                    .and_then(|peer| peer.best_known_block)
-                    .is_some();
-                // Do not assign headers-first bodies to a peer that has not
-                // announced any block yet. Core waits for block availability
-                // before using a newly connected relay peer for download;
-                // otherwise test and relay-only peers can be mistaken for a
-                // source and later disconnected as stalled downloaders.
-                if available > 0 && peer_has_block_availability {
-                    let schedule = node.next_block_download_schedule(
-                        peer_id,
-                        available,
-                        peer_services,
-                    );
-                    let staller = schedule.staller;
-                    queue_block_requests(&mut pending_block_requests, schedule.requests);
-                    flush_pending_block_requests(
-                        node,
-                        peer_id,
-                        writer,
-                        node.config.network,
-                        &mut pending_block_requests,
-                    )
-                    .await?;
-                    if pending_block_requests.is_empty()
-                        && let Some(staller) = staller
-                    {
-                        node.note_block_staller(staller);
-                    }
-                }
+                replenish_peer_block_download(
+                    node,
+                    peer_id,
+                    peer_services,
+                    writer,
+                    &mut pending_block_requests,
+                )
+                .await?;
                 continue;
             }
             _ = getdata_flush_interval.tick(), if !pending_block_requests.is_empty() => {
@@ -6773,11 +6746,16 @@ async fn serve_peer_loop(
                 // relay task from racing the download loop in the brief gap
                 // between validation and scheduling the next body.
                 node.clear_peer_block_request(peer_id, hash);
-                flush_pending_block_requests(
+                // Core refills a peer's bounded in-flight window from its
+                // SendMessages path as soon as block processing frees a
+                // slot. Waiting for our 100 ms maintenance tick imposed a
+                // hard ceiling of 16 / 0.1s = 160 blocks/s on a fast peer,
+                // even when validation and storage could sustain far more.
+                replenish_peer_block_download(
                     node,
                     peer_id,
+                    peer_services,
                     writer,
-                    node.config.network,
                     &mut pending_block_requests,
                 )
                 .await?;
@@ -8325,6 +8303,45 @@ async fn flush_pending_block_requests(
     }
     *pending = remaining;
     send_getdata_batches(node, peer_id, writer, network, &requests).await
+}
+
+async fn replenish_peer_block_download(
+    node: &Arc<Node>,
+    peer_id: usize,
+    peer_services: u64,
+    writer: &PeerWriter,
+    pending: &mut Vec<Inventory>,
+) -> Result<()> {
+    if !peer_block_download_allowed_for_node(node, peer_id, peer_services) {
+        return Ok(());
+    }
+
+    let available =
+        MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(node.peer_inflight_block_count(peer_id));
+    let peer_has_block_availability = node
+        .peer_infos()
+        .into_iter()
+        .find(|peer| peer.id == peer_id)
+        .and_then(|peer| peer.best_known_block)
+        .is_some();
+    // Do not assign headers-first bodies to a peer that has not announced
+    // any block yet. Core waits for block availability before using a newly
+    // connected relay peer for download; otherwise test and relay-only peers
+    // can be mistaken for a source and later disconnected as stalled.
+    if available == 0 || !peer_has_block_availability {
+        return Ok(());
+    }
+
+    let schedule = node.next_block_download_schedule(peer_id, available, peer_services);
+    let staller = schedule.staller;
+    queue_block_requests(pending, schedule.requests);
+    flush_pending_block_requests(node, peer_id, writer, node.config.network, pending).await?;
+    if pending.is_empty()
+        && let Some(staller) = staller
+    {
+        node.note_block_staller(staller);
+    }
+    Ok(())
 }
 
 async fn flush_preferred_block_requests(

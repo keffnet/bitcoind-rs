@@ -1355,9 +1355,14 @@ pub struct ChainState {
     history_materialized: bool,
     history_index_enabled: bool,
     spent_by: FastHashMap<OutPoint, ActiveSpender>,
-    // Exceptional callers can defer stale-height cleanup until the next
-    // persisted block. Ordinary reorgs remove the disconnected suffix before
-    // indexing the replacement branch, so normal IBD never scans this map.
+    // Core's txospender index updates asynchronously. Preserve block hashes
+    // only for entries in a just-disconnected suffix so RPC can expose the
+    // old indexed result until the next block notification reconciles it.
+    // Keeping this separate avoids adding 32 bytes to every active spender.
+    stale_spender_block_hashes: FastHashMap<OutPoint, BlockHash>,
+    // Set while disconnected spender entries remain visible. The next
+    // persisted block notification removes exactly the transient stale keys;
+    // normal IBD never scans the complete spender map.
     spent_by_needs_reconciliation: bool,
     // The node enables the optional spender index after chainstate startup
     // configuration is known. Preserve a snapshot copy so that enabling the
@@ -2092,6 +2097,7 @@ impl ChainState {
             history_materialized: true,
             history_index_enabled: electrum_history_index_enabled,
             spent_by: FastHashMap::new(),
+            stale_spender_block_hashes: FastHashMap::new(),
             spent_by_needs_reconciliation: false,
             startup_spent_by: None,
             precious_blocks: HashMap::new(),
@@ -2946,6 +2952,7 @@ impl ChainState {
         self.txospender_index_enabled = enabled;
         if !enabled {
             self.spent_by.clear();
+            self.stale_spender_block_hashes.clear();
             self.spent_by_needs_reconciliation = false;
             self.startup_spent_by = None;
             return Ok(());
@@ -2960,6 +2967,7 @@ impl ChainState {
         if !self.restore_startup_spent_index()? {
             self.rebuild_spent_index()?;
         }
+        self.stale_spender_block_hashes.clear();
         self.spent_by_needs_reconciliation = false;
         Ok(())
     }
@@ -5590,7 +5598,11 @@ impl ChainState {
             return None;
         }
         let spender = self.spent_by.get(outpoint)?;
-        let block_hash = *self.active_chain.get(spender.height as usize)?;
+        let block_hash = self
+            .stale_spender_block_hashes
+            .get(outpoint)
+            .copied()
+            .or_else(|| self.active_chain.get(spender.height as usize).copied())?;
         Some((
             spender.txid,
             spender.input_index as usize,
@@ -8262,12 +8274,13 @@ impl ChainState {
                 // next connected block. Reorgs are exceptional; normal IBD
                 // must not rebuild this active-chain set and scan the entire
                 // spender map for every connected block.
-                let active_height = self.active_chain.len().saturating_sub(1) as u32;
+                let stale = std::mem::take(&mut self.stale_spender_block_hashes);
                 self.spent_by
-                    .retain(|_, spender| spender.height <= active_height);
+                    .retain(|outpoint, _| !stale.contains_key(outpoint));
                 self.spent_by_needs_reconciliation = false;
             }
             for (outpoint, spender) in &delta.spent_by {
+                self.stale_spender_block_hashes.remove(outpoint);
                 self.spent_by
                     .insert(*outpoint, ActiveSpender::from_stored(*spender)?);
             }
@@ -8823,6 +8836,7 @@ impl ChainState {
         let old_history = std::mem::take(&mut self.history);
         let old_history_materialized = self.history_materialized;
         let old_spent_by = std::mem::take(&mut self.spent_by);
+        let old_stale_spender_block_hashes = std::mem::take(&mut self.stale_spender_block_hashes);
         let old_spent_by_needs_reconciliation = self.spent_by_needs_reconciliation;
         let old_basic_filter_cache = std::mem::take(&mut self.basic_filter_cache);
         let old_block_undo_cache = std::mem::take(&mut self.block_undo_cache);
@@ -8840,6 +8854,7 @@ impl ChainState {
         self.history.clear();
         self.history_materialized = true;
         self.spent_by.clear();
+        self.stale_spender_block_hashes.clear();
         self.spent_by_needs_reconciliation = false;
         self.coin_stats = self.coinstats_index_enabled.then(CoinStatsState::default);
         let replay = (|| -> Result<()> {
@@ -8917,6 +8932,7 @@ impl ChainState {
             self.history = old_history;
             self.history_materialized = old_history_materialized;
             self.spent_by = old_spent_by;
+            self.stale_spender_block_hashes = old_stale_spender_block_hashes;
             self.spent_by_needs_reconciliation = old_spent_by_needs_reconciliation;
             self.basic_filter_cache = old_basic_filter_cache;
             self.block_undo_cache = old_block_undo_cache;
@@ -9001,6 +9017,12 @@ impl ChainState {
                 })
             })
             .collect::<Result<Vec<Block>>>()?;
+        let disconnected_spender_hashes = self.txospender_index_enabled.then(|| {
+            disconnected
+                .iter()
+                .map(|(height, block, _)| (*height, block.block_hash()))
+                .collect::<HashMap<_, _>>()
+        });
 
         // Reorgs change Electrum history only for scripts appearing in the
         // disconnected or candidate suffix.  Keep that working set small so
@@ -9141,14 +9163,26 @@ impl ChainState {
         }
         if !self.txospender_index_enabled {
             self.spent_by.clear();
+            self.stale_spender_block_hashes.clear();
             self.spent_by_needs_reconciliation = false;
         } else if !disconnected.is_empty() {
-            // Heights above the fork point all belong to the disconnected
-            // branch. Remove them before candidate blocks are indexed so the
-            // compact runtime value does not need to retain a block hash.
-            self.spent_by
-                .retain(|_, spender| spender.height <= common_height);
-            self.spent_by_needs_reconciliation = false;
+            // Core's txospender index is notified asynchronously. Preserve
+            // disconnected results until the next persisted block arrives,
+            // while candidate spends of the same outpoint overwrite them
+            // immediately below. Only the short stale suffix needs explicit
+            // block hashes; active entries continue to derive theirs by
+            // height from the active chain.
+            for (outpoint, spender) in &self.spent_by {
+                if spender.height > common_height
+                    && let Some(block_hash) = disconnected_spender_hashes
+                        .as_ref()
+                        .and_then(|hashes| hashes.get(&spender.height))
+                {
+                    self.stale_spender_block_hashes
+                        .insert(*outpoint, *block_hash);
+                }
+            }
+            self.spent_by_needs_reconciliation = true;
         }
 
         if self.coinstats_index_enabled {
@@ -9696,6 +9730,8 @@ impl ChainState {
             let txid = transaction.compute_txid();
             for (input_index, input) in transaction.input.iter().enumerate() {
                 if !input.previous_output.is_null() {
+                    self.stale_spender_block_hashes
+                        .remove(&input.previous_output);
                     self.spent_by.insert(
                         input.previous_output,
                         ActiveSpender {
@@ -9712,6 +9748,7 @@ impl ChainState {
 
     fn rebuild_spent_index(&mut self) -> Result<()> {
         self.spent_by.clear();
+        self.stale_spender_block_hashes.clear();
         if !self.txospender_index_enabled {
             return Ok(());
         }
@@ -10772,6 +10809,7 @@ impl ChainState {
         }
         if self.txospender_index_enabled {
             for (outpoint, spender) in delta.spent_by {
+                self.stale_spender_block_hashes.remove(&outpoint);
                 self.spent_by
                     .insert(outpoint, ActiveSpender::from_stored(spender)?);
             }
@@ -11030,16 +11068,24 @@ impl ChainState {
             spent_by: self.txospender_index_enabled.then(|| {
                 self.spent_by
                     .iter()
-                    .map(|(outpoint, spender)| {
-                        (
-                            *outpoint,
-                            (
-                                spender.txid,
-                                spender.input_index as usize,
-                                self.active_chain[spender.height as usize],
-                                spender.height,
-                            ),
-                        )
+                    .filter_map(|(outpoint, spender)| {
+                        if self.stale_spender_block_hashes.contains_key(outpoint) {
+                            return None;
+                        }
+                        self.active_chain
+                            .get(spender.height as usize)
+                            .copied()
+                            .map(|block_hash| {
+                                (
+                                    *outpoint,
+                                    (
+                                        spender.txid,
+                                        spender.input_index as usize,
+                                        block_hash,
+                                        spender.height,
+                                    ),
+                                )
+                            })
                     })
                     .collect()
             }),
@@ -11372,6 +11418,7 @@ fn open_background_replay_state(
         history_materialized: true,
         history_index_enabled: true,
         spent_by: FastHashMap::new(),
+        stale_spender_block_hashes: FastHashMap::new(),
         spent_by_needs_reconciliation: false,
         startup_spent_by: None,
         precious_blocks: HashMap::new(),
@@ -13570,6 +13617,14 @@ mod tests {
                 height: 3,
             },
         );
+        let stale_block_hash = BlockHash::from_byte_array([55; 32]);
+        state
+            .stale_spender_block_hashes
+            .insert(stale_outpoint, stale_block_hash);
+        assert_eq!(
+            state.spending_transaction(&stale_outpoint),
+            Some((first_txid, 0, stale_block_hash, 3))
+        );
 
         state.connect_block(mine_block(&state, 2)).unwrap();
         assert!(state.spent_by.contains_key(&stale_outpoint));
@@ -13578,6 +13633,11 @@ mod tests {
         state.connect_block(mine_block(&state, 3)).unwrap();
         assert!(state.spent_by.contains_key(&active_outpoint));
         assert!(!state.spent_by.contains_key(&stale_outpoint));
+        assert!(
+            !state
+                .stale_spender_block_hashes
+                .contains_key(&stale_outpoint)
+        );
         assert!(!state.spent_by_needs_reconciliation);
     }
 

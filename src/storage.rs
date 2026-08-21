@@ -2928,10 +2928,12 @@ impl UtxoStore {
     }
 
     pub fn disk_usage(&self) -> Result<u64> {
-        Ok(self
-            .coins
-            .disk_space()
-            .saturating_add(self.metadata.disk_space()))
+        // Partition sizes exclude Fjall's active journal. Fresh and
+        // write-heavy chainstates can therefore have a substantial physical
+        // footprint while both partitions still report zero. Core's
+        // `disk_size` describes the whole UTXO database, so include the
+        // keyspace journal as well as all partition tables.
+        Ok(self.keyspace.disk_space())
     }
 
     pub fn get(&self, outpoint: &OutPoint) -> Result<Option<StoredUtxo>> {
@@ -5139,6 +5141,7 @@ mod tests {
             assert!(!store.contains(&first).unwrap());
             assert_eq!(store.get(&second).unwrap(), Some(second_entry.clone()));
             assert_eq!(store.len(), 1);
+            assert!(store.disk_usage().unwrap() > 0);
             store.generation()
         };
 

@@ -115,6 +115,7 @@ pub(crate) const EXTRA_PEER_CHECK_INTERVAL: Duration = Duration::from_secs(45);
 const STALE_TIP_CHECK_INTERVAL_SECS: u64 = 10 * 60;
 const EXTRA_BLOCK_RELAY_ONLY_PEER_INTERVAL_SECS: u64 = 5 * 60;
 const MINIMUM_EXTRA_PEER_CONNECT_TIME_SECS: u64 = 30;
+const MAX_FUTURE_BLOCK_TIME_SECS: u64 = 2 * 60 * 60;
 const COINSTATS_CLEAN_SHUTDOWN_HEIGHT_FILE: &str = "clean_shutdown_height";
 const LARGE_WORK_INVALID_CHAIN_WARNING: &str = "Warning: Found invalid chain more than 6 blocks longer than our best chain. This could be due to database corruption or consensus incompatibility with peers.";
 
@@ -2042,6 +2043,12 @@ impl Node {
                 false,
             )
             .map_err(core_startup_chain_error)?;
+        if chain
+            .header(chain.height())
+            .is_some_and(|header| startup_tip_is_too_new(header.time, time::unix_time()))
+        {
+            return Err(CoreStartupError::future().into());
+        }
         chain.set_shutdown_interrupt(shutdown_requested.clone());
 
         fs::create_dir_all(&network_datadir).with_context(|| {
@@ -8440,6 +8447,10 @@ fn core_startup_chain_error(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+fn startup_tip_is_too_new(tip_time: u32, now: u64) -> bool {
+    u64::from(tip_time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME_SECS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8462,6 +8473,19 @@ mod tests {
                 .to_string()
                 .starts_with("Witness data for blocks after height 5 requires validation.")
         );
+    }
+
+    #[test]
+    fn startup_future_tip_check_matches_core_boundary() {
+        let now = 1_296_800_801;
+        assert!(!startup_tip_is_too_new(
+            u32::try_from(now + MAX_FUTURE_BLOCK_TIME_SECS).unwrap(),
+            now,
+        ));
+        assert!(startup_tip_is_too_new(
+            u32::try_from(now + MAX_FUTURE_BLOCK_TIME_SECS + 1).unwrap(),
+            now,
+        ));
     }
 
     #[test]

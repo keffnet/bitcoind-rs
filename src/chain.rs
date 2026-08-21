@@ -6757,6 +6757,16 @@ impl ChainState {
         result
     }
 
+    /// Validate the context-free block body before a peer path admits a new
+    /// header. Core deliberately keeps failures here out of its block index
+    /// because a malformed body can share a header with a valid body.
+    pub(crate) fn validate_block_before_header(
+        &self,
+        block: &Block,
+    ) -> Result<(), ValidationError> {
+        validation::validate_block_before_header(block, self.signet_challenge.as_deref())
+    }
+
     fn connect_block_with_existing_body(
         &mut self,
         block: Block,

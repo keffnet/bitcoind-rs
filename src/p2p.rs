@@ -4238,6 +4238,7 @@ async fn serve_peer(
     next_peer_id: Option<Arc<AtomicUsize>>,
 ) -> Result<()> {
     let _peer_count = PeerCountGuard::new(&node);
+    info!("Added connection peer={peer_id}");
     stream.set_nodelay(true)?;
     let socket = SockRef::from(&stream);
     socket.set_recv_buffer_size(node.config.max_receive_buffer as usize)?;
@@ -5803,6 +5804,37 @@ async fn serve_peer_loop(
                     node.forget_rejected_block_body(&hash);
                 }
 
+                // Claim candidate bodies before publishing these headers to
+                // the global block index. A duplicate INV handler can run as
+                // soon as the chain lock is released; without this claim it
+                // can send GETDATA before this headers peer installs its
+                // direct-fetch reservations. Include missing bodies on the
+                // already-known parent branch because direct fetch walks back
+                // to the active chain below.
+                let pending_direct_fetch_claims = {
+                    let chain = node.chain.read();
+                    let mut claims = headers_to_accept
+                        .iter()
+                        .map(BlockHeader::block_hash)
+                        .collect::<Vec<_>>();
+                    let mut cursor = headers_to_accept
+                        .first()
+                        .map(|header| header.prev_blockhash);
+                    while let Some(hash) = cursor {
+                        if chain.is_active_block(&hash) {
+                            break;
+                        }
+                        if !chain.store.contains(&hash) && !claims.contains(&hash) {
+                            claims.push(hash);
+                        }
+                        cursor = chain
+                            .header_by_hash(&hash)
+                            .map(|header| header.prev_blockhash);
+                    }
+                    claims
+                };
+                node.claim_pending_header_direct_fetches(peer_id, &pending_direct_fetch_claims);
+
                 let (last_hash, hashes) = {
                     let mut chain = node.chain.write();
                     // A headers response can repeat headers that are already
@@ -5836,7 +5868,13 @@ async fn serve_peer_loop(
                             debug!(%error, "ignoring headers from an invalidated branch");
                             Vec::new()
                         }
-                        Err(error) => return Err(error),
+                        Err(error) => {
+                            node.clear_pending_header_direct_fetches(
+                                peer_id,
+                                &pending_direct_fetch_claims,
+                            );
+                            return Err(error);
+                        }
                     };
                     let mut hashes = accepted
                         .into_iter()
@@ -5981,37 +6019,24 @@ async fn serve_peer_loop(
                 };
                 let forced_compact_body = pending_compact_body_request.take();
                 if !requests.is_empty() {
-                    // Reassign a single compact direct-fetch candidate to the
-                    // peer that announced it, but keep a multi-block
-                    // headers-first window owned by its existing peers.  A
-                    // headers response can arrive from several peers at
-                    // once; moving the whole window for each response
-                    // creates duplicate block downloads and breaks Core's
-                    // bounded in-flight accounting.
-                    if requests.len() == 1
-                        && matches!(
-                            requests.first().map(|request| request.kind),
-                            Some(InventoryType::CompactBlock)
-                        )
-                    {
-                        for request in &requests {
-                            // A duplicate INV can race a connecting headers
-                            // announcement from another peer. Prefer the peer
-                            // that supplied the headers, as Core's direct-fetch
-                            // path does, instead of leaving the body owned by
-                            // the stale inventory announcer.
-                            node.clear_other_peer_block_requests(peer_id, request.hash);
-                        }
-                    }
+                    // Reserve connecting direct-fetch bodies atomically for
+                    // the peer that supplied the headers. Duplicate INVs can
+                    // race this handler; a separate clear followed by track
+                    // leaves a window in which the inventory peer can steal
+                    // the whole batch.
                     queue_block_requests(&mut pending_block_requests, requests);
-                    flush_pending_block_requests(
+                    let result = flush_preferred_block_requests(
                         node,
                         peer_id,
                         writer,
                         node.config.network,
                         &mut pending_block_requests,
                     )
-                    .await?;
+                    .await;
+                    node.clear_pending_header_direct_fetches(peer_id, &pending_direct_fetch_claims);
+                    result?;
+                } else {
+                    node.clear_pending_header_direct_fetches(peer_id, &pending_direct_fetch_claims);
                 }
                 if let Some(hash) = forced_compact_body {
                     // The compact announcement may have raced the first
@@ -6150,6 +6175,9 @@ async fn serve_peer_loop(
                                     unknown_block = Some(item.hash);
                                 } else if chain.block_height_by_hash(&item.hash).is_some()
                                     && !node.peer_has_inflight_block_request(peer_id, item.hash)
+                                    && !node.pending_header_direct_fetch_owned_by_other(
+                                        peer_id, item.hash,
+                                    )
                                 {
                                     // An announcement can refer to a header
                                     // retained from an earlier headers-first
@@ -7922,6 +7950,16 @@ async fn handle_received_block(
 ) -> Result<bool> {
     let hash = block.block_hash();
     if enforce_unrequested_gate && !requested {
+        let prevalidation = node.chain.read().validate_block_before_header(&block);
+        if let Err(error) = prevalidation {
+            return handle_peer_block_validation_error(
+                node,
+                hash,
+                anyhow::Error::new(error),
+                disconnect_on_invalid,
+                false,
+            );
+        }
         let header_work = {
             let chain = node.chain.read();
             chain
@@ -8026,81 +8064,92 @@ async fn handle_received_block(
             Ok(true)
         }
         Err(error) => {
-            if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
-                let reject_reason = block_validation_log_reason(validation_error);
-                debug!("Block validation error: {reject_reason}");
-            }
-            let should_mark_invalid = error
-                .downcast_ref::<ValidationError>()
-                .is_some_and(ValidationError::should_mark_block_invalid);
-            let rejected_body = error
-                .downcast_ref::<ValidationError>()
-                .is_some_and(|error| {
-                    matches!(
-                        error,
-                        ValidationError::EmptyBlock
-                            | ValidationError::OversizedBlockBase
-                            | ValidationError::OversizedTransaction(_)
-                            | ValidationError::TooManySigops
-                            | ValidationError::BadCoinbase
-                            | ValidationError::FirstTransactionNotCoinbase
-                            | ValidationError::ExtraCoinbase(_)
-                            | ValidationError::NullPrevout(_)
-                            | ValidationError::EmptyInputs(_)
-                            | ValidationError::EmptyOutputs(_)
-                            | ValidationError::DuplicateInput(_)
-                            | ValidationError::DuplicateTransaction(_)
-                            | ValidationError::NegativeOutputValue(_)
-                            | ValidationError::BadOutputValue(_)
-                            | ValidationError::OutputTotalOverflow
-                            | ValidationError::BadMerkleRoot
-                            | ValidationError::BadWitnessNonceSize
-                            | ValidationError::BadWitnessMerkleMatch
-                    )
-                });
-            let is_mutated = error
-                .downcast_ref::<ValidationError>()
-                .is_some_and(|error| {
-                    matches!(
-                        error,
-                        ValidationError::BadMerkleRoot
-                            | ValidationError::BadWitnessNonceSize
-                            | ValidationError::BadWitnessMerkleMatch
-                    )
-                });
-            if should_mark_invalid {
-                if let Err(mark_error) = node.chain.write().mark_block_invalid(&hash) {
-                    debug!(%hash, %mark_error, "failed to cache invalid peer block");
-                }
-                node.refresh_large_work_invalid_chain_warning();
-            }
-            if rejected_body {
-                node.remember_rejected_block_body(hash);
-            }
-            if disconnect_on_invalid && is_mutated {
-                if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
-                    let reason = validation_error.bip22_reject_reason();
-                    let detail = if matches!(validation_error, ValidationError::BadMerkleRoot) {
-                        "hashMerkleRoot mismatch"
-                    } else {
-                        "witness commitment mismatch"
-                    };
-                    debug!("Block mutated: {reason}, {detail}");
-                }
-                anyhow::bail!("invalid peer block {hash}: {error}");
-            }
-            if disconnect_on_invalid && (should_mark_invalid || rejected_body) {
-                anyhow::bail!("invalid peer block {hash}: {error}");
-            }
-            let reject_reason = error
-                .downcast_ref::<ValidationError>()
-                .map(ValidationError::bip22_reject_reason)
-                .unwrap_or_default();
-            debug!("{hash}, {reject_reason}");
-            debug!(%hash, %error, reject_reason, "rejected peer block");
-            Ok(false)
+            handle_peer_block_validation_error(node, hash, error, disconnect_on_invalid, true)
         }
     }
+}
+
+fn handle_peer_block_validation_error(
+    node: &Arc<Node>,
+    hash: BlockHash,
+    error: anyhow::Error,
+    disconnect_on_invalid: bool,
+    header_was_accepted: bool,
+) -> Result<bool> {
+    if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
+        let reject_reason = block_validation_log_reason(validation_error);
+        debug!("Block validation error: {reject_reason}");
+    }
+    let should_mark_invalid = header_was_accepted
+        && error
+            .downcast_ref::<ValidationError>()
+            .is_some_and(ValidationError::should_mark_block_invalid);
+    let rejected_body = error
+        .downcast_ref::<ValidationError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                ValidationError::EmptyBlock
+                    | ValidationError::OversizedBlockBase
+                    | ValidationError::OversizedTransaction(_)
+                    | ValidationError::TooManySigops
+                    | ValidationError::BadCoinbase
+                    | ValidationError::FirstTransactionNotCoinbase
+                    | ValidationError::ExtraCoinbase(_)
+                    | ValidationError::NullPrevout(_)
+                    | ValidationError::EmptyInputs(_)
+                    | ValidationError::EmptyOutputs(_)
+                    | ValidationError::DuplicateInput(_)
+                    | ValidationError::DuplicateTransaction(_)
+                    | ValidationError::NegativeOutputValue(_)
+                    | ValidationError::BadOutputValue(_)
+                    | ValidationError::OutputTotalOverflow
+                    | ValidationError::BadMerkleRoot
+                    | ValidationError::BadWitnessNonceSize
+                    | ValidationError::BadWitnessMerkleMatch
+            )
+        });
+    let is_mutated = error
+        .downcast_ref::<ValidationError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                ValidationError::BadMerkleRoot
+                    | ValidationError::BadWitnessNonceSize
+                    | ValidationError::BadWitnessMerkleMatch
+            )
+        });
+    if should_mark_invalid {
+        if let Err(mark_error) = node.chain.write().mark_block_invalid(&hash) {
+            debug!(%hash, %mark_error, "failed to cache invalid peer block");
+        }
+        node.refresh_large_work_invalid_chain_warning();
+    }
+    if rejected_body {
+        node.remember_rejected_block_body(hash);
+    }
+    if disconnect_on_invalid && is_mutated {
+        if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
+            let reason = validation_error.bip22_reject_reason();
+            let detail = if matches!(validation_error, ValidationError::BadMerkleRoot) {
+                "hashMerkleRoot mismatch"
+            } else {
+                "witness commitment mismatch"
+            };
+            debug!("Block mutated: {reason}, {detail}");
+        }
+        anyhow::bail!("invalid peer block {hash}: {error}");
+    }
+    if disconnect_on_invalid && (should_mark_invalid || rejected_body) {
+        anyhow::bail!("invalid peer block {hash}: {error}");
+    }
+    let reject_reason = error
+        .downcast_ref::<ValidationError>()
+        .map(ValidationError::bip22_reject_reason)
+        .unwrap_or_default();
+    debug!("{hash}, {reject_reason}");
+    debug!(%hash, %error, reject_reason, "rejected peer block");
+    Ok(false)
 }
 
 fn block_validation_log_reason(error: &ValidationError) -> String {
@@ -8265,6 +8314,36 @@ async fn flush_pending_block_requests(
             continue;
         }
         if node.track_peer_block_request(peer_id, request.hash) {
+            requests.push(request);
+        }
+    }
+    *pending = remaining;
+    send_getdata_batches(node, peer_id, writer, network, &requests).await
+}
+
+async fn flush_preferred_block_requests(
+    node: &Arc<Node>,
+    peer_id: usize,
+    writer: &PeerWriter,
+    network: Network,
+    pending: &mut Vec<Inventory>,
+) -> Result<()> {
+    node.clear_peer_block_requests_for_stored_blocks(peer_id);
+    let inflight = node.peer_inflight_block_count(peer_id);
+    let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(inflight);
+    if available == 0 || pending.is_empty() {
+        return Ok(());
+    }
+
+    let queued = std::mem::take(pending);
+    let mut requests = Vec::with_capacity(available);
+    let mut remaining = Vec::new();
+    for request in queued {
+        if requests.len() >= available {
+            remaining.push(request);
+            continue;
+        }
+        if node.reassign_peer_block_request(peer_id, request.hash) {
             requests.push(request);
         }
     }

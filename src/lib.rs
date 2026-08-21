@@ -1763,6 +1763,11 @@ pub struct Node {
     extra_block_relay_peers_enabled: AtomicBool,
     next_extra_block_relay_at: AtomicU64,
     rejected_block_bodies: parking_lot::RwLock<HashSet<BlockHash>>,
+    /// Header handlers claim their candidate block bodies before publishing
+    /// newly accepted headers. This prevents a concurrent duplicate INV from
+    /// sending GETDATA in the interval before direct-fetch reservations are
+    /// installed for the peer that supplied the headers.
+    pending_header_direct_fetches: Mutex<HashMap<BlockHash, HashSet<usize>>>,
     block_download_path_cache: Mutex<Option<BlockDownloadPathCache>>,
     shutdown_requested: Arc<AtomicBool>,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
@@ -2341,6 +2346,7 @@ impl Node {
             extra_block_relay_peers_enabled: AtomicBool::new(false),
             next_extra_block_relay_at: AtomicU64::new(0),
             rejected_block_bodies: parking_lot::RwLock::new(HashSet::new()),
+            pending_header_direct_fetches: Mutex::new(HashMap::new()),
             block_download_path_cache: Mutex::new(None),
             shutdown_requested,
             peers: parking_lot::RwLock::new(HashMap::new()),
@@ -5148,6 +5154,87 @@ impl Node {
         self.track_peer_block_request_with_limit(peer_id, hash, true)
     }
 
+    pub(crate) fn claim_pending_header_direct_fetches(&self, peer_id: usize, hashes: &[BlockHash]) {
+        let mut claims = self.pending_header_direct_fetches.lock();
+        for hash in hashes {
+            claims.entry(*hash).or_default().insert(peer_id);
+        }
+    }
+
+    pub(crate) fn pending_header_direct_fetch_owned_by_other(
+        &self,
+        peer_id: usize,
+        hash: BlockHash,
+    ) -> bool {
+        self.pending_header_direct_fetches
+            .lock()
+            .get(&hash)
+            .is_some_and(|owners| !owners.contains(&peer_id))
+    }
+
+    pub(crate) fn clear_pending_header_direct_fetches(&self, peer_id: usize, hashes: &[BlockHash]) {
+        let mut claims = self.pending_header_direct_fetches.lock();
+        for hash in hashes {
+            let remove = claims.get_mut(hash).is_some_and(|owners| {
+                owners.remove(&peer_id);
+                owners.is_empty()
+            });
+            if remove {
+                claims.remove(hash);
+            }
+        }
+    }
+
+    /// Atomically move a full-block reservation to the peer that supplied the
+    /// connecting headers. A duplicate inventory announcement can otherwise
+    /// claim the body between a separate clear and track operation, causing
+    /// direct fetch to ask the inventory peer instead of the header peer.
+    pub(crate) fn reassign_peer_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
+        let Some(height) = self.chain.read().block_height_by_hash(&hash) else {
+            return false;
+        };
+        let mut cleared_peers = Vec::new();
+        {
+            let mut peers = self.peers.write();
+            let Some(target) = peers.get(&peer_id) else {
+                return false;
+            };
+            if target
+                .inflight_blocks
+                .iter()
+                .any(|inflight| inflight.hash == hash)
+                || target.inflight_blocks.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
+            {
+                return false;
+            }
+            for (candidate_id, peer) in peers.iter_mut() {
+                if *candidate_id == peer_id {
+                    continue;
+                }
+                let before = peer.inflight_blocks.len();
+                peer.inflight_blocks
+                    .retain(|inflight| inflight.hash != hash);
+                if peer.inflight_blocks.len() != before {
+                    cleared_peers.push(*candidate_id);
+                }
+            }
+            peers
+                .get_mut(&peer_id)
+                .expect("target peer remains registered while locked")
+                .inflight_blocks
+                .push(InflightBlock {
+                    hash,
+                    height,
+                    requested_at: Instant::now(),
+                });
+        }
+        let mut stalling = self.block_stalling_since.write();
+        for candidate_id in cleared_peers {
+            stalling.remove(&candidate_id);
+        }
+        true
+    }
+
     /// Reserve one of Core's parallel compact-block reconstruction attempts.
     /// Unlike a full block download, several peers may be asked for the same
     /// block's missing transactions at once. Keep the reservation in the
@@ -6363,6 +6450,12 @@ impl Node {
         self.inv_triggered_headers_sync.lock().remove(&id);
         self.block_stalling_since.write().remove(&id);
         self.chain_sync_states.write().remove(&id);
+        self.pending_header_direct_fetches
+            .lock()
+            .retain(|_, owners| {
+                owners.remove(&id);
+                !owners.is_empty()
+            });
         if let Some(endpoint) = endpoint {
             if let Some(address) = endpoint.legacy_socket_addr()
                 && let Some(known) = self.known_addresses.write().get_mut(&address)
@@ -9588,6 +9681,49 @@ mod tests {
         assert!(!node.track_peer_block_request(2, first.block_hash()));
         node.clear_peer_block_request(1, first.block_hash());
         assert!(node.track_peer_block_request(2, first.block_hash()));
+    }
+
+    #[test]
+    fn direct_header_request_atomically_reassigns_inventory_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 5);
+        node.chain
+            .write()
+            .accept_headers(std::slice::from_ref(&first.header))
+            .unwrap();
+
+        let (sender_one, _receiver_one) = tokio::sync::mpsc::unbounded_channel();
+        let (sender_two, _receiver_two) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender_one);
+        node.register_peer(2, "192.0.2.2:18444".parse().unwrap(), false, sender_two);
+
+        let hash = first.block_hash();
+        assert!(node.track_peer_block_request(1, hash));
+        assert!(node.reassign_peer_block_request(2, hash));
+        assert_eq!(node.peer_inflight_block_count(1), 0);
+        assert_eq!(node.peer_inflight_block_count(2), 1);
+        assert!(!node.track_peer_block_request(1, hash));
+    }
+
+    #[test]
+    fn pending_header_direct_fetch_suppresses_other_inventory_peers() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let hash =
+            mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 8).block_hash();
+
+        node.claim_pending_header_direct_fetches(2, &[hash]);
+        assert!(node.pending_header_direct_fetch_owned_by_other(1, hash));
+        assert!(!node.pending_header_direct_fetch_owned_by_other(2, hash));
+
+        node.claim_pending_header_direct_fetches(3, &[hash]);
+        node.clear_pending_header_direct_fetches(2, &[hash]);
+        assert!(node.pending_header_direct_fetch_owned_by_other(1, hash));
+        assert!(!node.pending_header_direct_fetch_owned_by_other(3, hash));
+
+        node.clear_pending_header_direct_fetches(3, &[hash]);
+        assert!(!node.pending_header_direct_fetch_owned_by_other(1, hash));
     }
 
     #[test]

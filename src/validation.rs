@@ -1168,6 +1168,120 @@ pub fn validate_block_structure(
     )
 }
 
+/// Run the context-free body checks that Core performs before admitting a
+/// block header through `AcceptBlockHeader`.
+///
+/// In particular, merkle-root failures must not leave the otherwise valid
+/// header indexed: another body with the same header may be valid. Witness
+/// commitment, full-weight, height, finality, and UTXO-dependent checks are
+/// intentionally deferred until after the header has been accepted because
+/// those checks require chain context.
+pub(crate) fn validate_block_before_header(
+    block: &Block,
+    signet_challenge: Option<&[u8]>,
+) -> Result<(), ValidationError> {
+    if block.txdata.is_empty() {
+        return Err(ValidationError::EmptyBlock);
+    }
+    if let Some(challenge) = signet_challenge {
+        validate_signet_block_solution(block, challenge)?;
+    }
+
+    let transaction_ids = block
+        .txdata
+        .iter()
+        .map(Transaction::compute_txid)
+        .collect::<Vec<_>>();
+    let (merkle_root, mutated_txid) = merkle_root_and_mutated_txid(&transaction_ids);
+    if merkle_root != Some(block.header.merkle_root) {
+        return Err(ValidationError::BadMerkleRoot);
+    }
+    if let Some(txid) = mutated_txid {
+        return Err(ValidationError::DuplicateTransaction(txid));
+    }
+
+    let base_size = serialize(&block.header).len()
+        + VarInt::from(block.txdata.len()).size()
+        + block
+            .txdata
+            .iter()
+            .map(|transaction| transaction.base_size())
+            .sum::<usize>();
+    if base_size.saturating_mul(4) > MAX_BLOCK_WEIGHT {
+        return Err(ValidationError::OversizedBlockBase);
+    }
+
+    let first = &block.txdata[0];
+    if !first.is_coinbase() {
+        return Err(ValidationError::FirstTransactionNotCoinbase);
+    }
+    let mut legacy_sigop_cost = 0usize;
+    for (position, (transaction, txid)) in block
+        .txdata
+        .iter()
+        .zip(transaction_ids.iter().copied())
+        .enumerate()
+    {
+        if transaction.base_size().saturating_mul(4) > MAX_BLOCK_WEIGHT {
+            return Err(ValidationError::OversizedTransaction(txid));
+        }
+        if position > 0 && transaction.is_coinbase() {
+            return Err(ValidationError::ExtraCoinbase(txid));
+        }
+        if transaction.input.is_empty() {
+            return Err(ValidationError::EmptyInputs(txid));
+        }
+        if transaction.output.is_empty() {
+            return Err(ValidationError::EmptyOutputs(txid));
+        }
+
+        let mut transaction_output_total = 0u64;
+        for output in &transaction.output {
+            let value = output.value.to_sat();
+            if value > i64::MAX as u64 {
+                return Err(ValidationError::NegativeOutputValue(txid));
+            }
+            if output.value > Amount::MAX_MONEY {
+                return Err(ValidationError::BadOutputValue(txid));
+            }
+            transaction_output_total = transaction_output_total
+                .checked_add(value)
+                .ok_or(ValidationError::OutputTotalOverflow)?;
+        }
+        if transaction_output_total > Amount::MAX_MONEY.to_sat() {
+            return Err(ValidationError::OutputTotalOverflow);
+        }
+
+        let mut inputs = HashSet::with_capacity(transaction.input.len());
+        for input in &transaction.input {
+            if !inputs.insert(input.previous_output) {
+                return Err(ValidationError::DuplicateInput(txid));
+            }
+        }
+        if !transaction.is_coinbase()
+            && transaction
+                .input
+                .iter()
+                .any(|input| input.previous_output.is_null())
+        {
+            return Err(ValidationError::NullPrevout(txid));
+        }
+        if transaction.is_coinbase()
+            && (transaction.input[0].script_sig.len() < 2
+                || transaction.input[0].script_sig.len() > 100)
+        {
+            return Err(ValidationError::BadCoinbase);
+        }
+
+        legacy_sigop_cost =
+            legacy_sigop_cost.saturating_add(legacy_sigop_cost_for_transaction(transaction));
+        if legacy_sigop_cost > MAX_BLOCK_SIGOP_COST {
+            return Err(ValidationError::TooManySigops);
+        }
+    }
+    Ok(())
+}
+
 fn validate_witness_commitment(
     block: &Block,
     expect_witness_commitment: bool,
@@ -2429,6 +2543,43 @@ mod tests {
             merkle_root_and_mutated_txid(&mutated_ids),
             (expected, Some(third))
         );
+    }
+
+    #[test]
+    fn pre_header_validation_rejects_mutation_but_defers_witness_context() {
+        let coinbase = Transaction {
+            version: Version::ONE,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::null(),
+                script_sig: Builder::new().push_int(1).push_int(0).into_script(),
+                sequence: bitcoin::Sequence::MAX,
+                witness: Witness::from_slice(&[vec![7]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::ZERO,
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        let mut block = Block {
+            header: Header {
+                version: BlockVersion::from_consensus(4),
+                prev_blockhash: BlockHash::all_zeros(),
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1,
+                bits: bitcoin::pow::CompactTarget::from_consensus(0x207f_ffff),
+                nonce: 0,
+            },
+            txdata: vec![coinbase],
+        };
+        block.header.merkle_root = block.compute_merkle_root().unwrap();
+
+        assert!(validate_block_before_header(&block, None).is_ok());
+        block.header.merkle_root = TxMerkleNode::all_zeros();
+        assert!(matches!(
+            validate_block_before_header(&block, None),
+            Err(ValidationError::BadMerkleRoot)
+        ));
     }
 
     #[test]

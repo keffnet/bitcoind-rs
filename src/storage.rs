@@ -78,18 +78,54 @@ pub struct StoredUndo {
 
 pub type StoredElectrumHistory = Vec<(Txid, u32)>;
 
-#[derive(Default)]
+const UTXO_CACHE_SHARDS: usize = 320;
+
 struct UtxoReadCache {
     // Generation zero marks entries loaded by the complete sequential warm.
     // Those entries need no second copy of every outpoint in the FIFO queue.
-    entries: FastHashMap<OutPoint, (StoredUtxo, u64)>,
+    entries: Vec<FastHashMap<OutPoint, (StoredUtxo, u64)>>,
     order: VecDeque<(OutPoint, u64)>,
+    entry_count: usize,
     bytes: usize,
     limit: usize,
     next_generation: u64,
 }
 
+impl Default for UtxoReadCache {
+    fn default() -> Self {
+        Self {
+            entries: (0..UTXO_CACHE_SHARDS).map(|_| FastHashMap::new()).collect(),
+            order: VecDeque::new(),
+            entry_count: 0,
+            bytes: 0,
+            limit: 0,
+            next_generation: 0,
+        }
+    }
+}
+
 impl UtxoReadCache {
+    fn shard_index(outpoint: &OutPoint) -> usize {
+        let txid = outpoint.txid.to_byte_array();
+        usize::from(u16::from_le_bytes([txid[0], txid[1]])) % UTXO_CACHE_SHARDS
+    }
+
+    fn len(&self) -> usize {
+        self.entry_count
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, outpoint: &OutPoint) -> bool {
+        self.entries[Self::shard_index(outpoint)].contains_key(outpoint)
+    }
+
+    fn reserve(&mut self, entries: usize) {
+        let per_shard = entries.div_ceil(UTXO_CACHE_SHARDS);
+        for shard in &mut self.entries {
+            shard.reserve(per_shard.saturating_sub(shard.len()));
+        }
+    }
+
     fn configure_limit(&mut self, limit: usize) {
         self.limit = limit;
         self.trim();
@@ -99,7 +135,9 @@ impl UtxoReadCache {
         // Outputs are normally read once, immediately before being spent.
         // FIFO retention avoids an O(cache size) LRU-list update in that hot
         // path while still keeping recently created outputs resident.
-        self.entries.get(outpoint).map(|(entry, _)| entry.clone())
+        self.entries[Self::shard_index(outpoint)]
+            .get(outpoint)
+            .map(|(entry, _)| entry.clone())
     }
 
     fn insert(&mut self, outpoint: OutPoint, entry: StoredUtxo) {
@@ -109,10 +147,13 @@ impl UtxoReadCache {
         }
         self.next_generation = self.next_generation.saturating_add(1).max(1);
         let generation = self.next_generation;
-        if let Some((old_entry, _)) = self.entries.insert(outpoint, (entry, generation)) {
+        let shard = Self::shard_index(&outpoint);
+        if let Some((old_entry, _)) = self.entries[shard].insert(outpoint, (entry, generation)) {
             self.bytes = self
                 .bytes
                 .saturating_sub(stored_utxo_cache_bytes(&old_entry));
+        } else {
+            self.entry_count = self.entry_count.saturating_add(1);
         }
         self.bytes = self.bytes.saturating_add(bytes);
         self.order.push_back((outpoint, generation));
@@ -127,24 +168,32 @@ impl UtxoReadCache {
         if self.limit == 0 || bytes > self.limit {
             return;
         }
-        if let Some((old_entry, _)) = self.entries.insert(outpoint, (entry, 0)) {
+        let shard = Self::shard_index(&outpoint);
+        if let Some((old_entry, _)) = self.entries[shard].insert(outpoint, (entry, 0)) {
             self.bytes = self
                 .bytes
                 .saturating_sub(stored_utxo_cache_bytes(&old_entry));
+        } else {
+            self.entry_count = self.entry_count.saturating_add(1);
         }
         self.bytes = self.bytes.saturating_add(bytes);
     }
 
     fn remove(&mut self, outpoint: &OutPoint) {
-        if let Some((entry, _)) = self.entries.remove(outpoint) {
+        let shard = Self::shard_index(outpoint);
+        if let Some((entry, _)) = self.entries[shard].remove(outpoint) {
             self.bytes = self.bytes.saturating_sub(stored_utxo_cache_bytes(&entry));
+            self.entry_count = self.entry_count.saturating_sub(1);
         }
         self.compact_order_if_needed();
     }
 
     fn clear(&mut self) {
-        self.entries.clear();
+        for shard in &mut self.entries {
+            shard.clear();
+        }
         self.order.clear();
+        self.entry_count = 0;
         self.bytes = 0;
     }
 
@@ -153,12 +202,15 @@ impl UtxoReadCache {
             let Some((outpoint, generation)) = self.order.pop_front() else {
                 break;
             };
+            let shard = Self::shard_index(&outpoint);
             let is_current = self
                 .entries
-                .get(&outpoint)
+                .get(shard)
+                .and_then(|entries| entries.get(&outpoint))
                 .is_some_and(|(_, current)| *current == generation);
-            if is_current && let Some((entry, _)) = self.entries.remove(&outpoint) {
+            if is_current && let Some((entry, _)) = self.entries[shard].remove(&outpoint) {
                 self.bytes = self.bytes.saturating_sub(stored_utxo_cache_bytes(&entry));
+                self.entry_count = self.entry_count.saturating_sub(1);
             }
         }
         if self.bytes > self.limit {
@@ -168,26 +220,33 @@ impl UtxoReadCache {
             // avoid scanning the full map again on every subsequent insert.
             let target = self.limit.saturating_mul(7) / 8;
             let bytes = &mut self.bytes;
-            self.entries.retain(|_, (entry, generation)| {
-                if *bytes > target && *generation == 0 {
-                    *bytes = bytes.saturating_sub(stored_utxo_cache_bytes(entry));
-                    false
-                } else {
-                    true
+            let entry_count = &mut self.entry_count;
+            for shard in &mut self.entries {
+                if *bytes <= target {
+                    break;
                 }
-            });
+                shard.retain(|_, (entry, generation)| {
+                    if *bytes > target && *generation == 0 {
+                        *bytes = bytes.saturating_sub(stored_utxo_cache_bytes(entry));
+                        *entry_count = entry_count.saturating_sub(1);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
         }
         self.compact_order_if_needed();
     }
 
     fn compact_order_if_needed(&mut self) {
-        let maximum_entries = self.entries.len().saturating_mul(2).saturating_add(1_024);
+        let maximum_entries = self.len().saturating_mul(2).saturating_add(1_024);
         if self.order.len() <= maximum_entries {
             return;
         }
         let entries = &self.entries;
         self.order.retain(|(outpoint, generation)| {
-            entries
+            entries[Self::shard_index(outpoint)]
                 .get(outpoint)
                 .is_some_and(|(_, current)| current == generation)
         });
@@ -2261,7 +2320,7 @@ impl UtxoStore {
     /// not materialize the UTXO set merely to warm it.
     pub fn warm_cache(&self) -> Result<(usize, usize)> {
         let cache = self.read_cache.lock();
-        Ok((cache.entries.len(), cache.bytes))
+        Ok((cache.len(), cache.bytes))
     }
 
     pub fn cache_capacity_bytes(&self) -> usize {
@@ -2273,7 +2332,11 @@ impl UtxoStore {
     /// iteration is substantially cheaper than rediscovering the same coins
     /// through random prevout reads after a mid-IBD restart.
     pub fn warm_complete_cache_if_fits(&self) -> Result<Option<(usize, usize)>> {
-        const ESTIMATED_CACHE_BYTES_PER_COIN: usize = 96;
+        // The cache's accounting includes fixed outpoint/value overhead and
+        // script bytes; live mainnet sets average about 90 bytes per coin.
+        // Leave a small margin while allowing the final trim to enforce the
+        // exact byte limit if a particular UTXO set has larger scripts.
+        const ESTIMATED_CACHE_BYTES_PER_COIN: usize = 92;
         let mut cache = self.read_cache.lock();
         if self
             .entry_count
@@ -2283,13 +2346,13 @@ impl UtxoStore {
             return Ok(None);
         }
         cache.clear();
-        cache.entries.reserve(self.entry_count);
+        cache.reserve(self.entry_count);
         for item in self.coins.iter() {
             let (key, value) = item.context("scanning UTXO database for cache warming")?;
             cache.insert_stationary(decode_outpoint(&key)?, decode_stored_utxo(&value)?);
         }
         cache.trim();
-        Ok(Some((cache.entries.len(), cache.bytes)))
+        Ok(Some((cache.len(), cache.bytes)))
     }
 
     /// Seed consensus-validated current coins into the decoded read cache.
@@ -2303,7 +2366,7 @@ impl UtxoStore {
         for (outpoint, entry) in entries {
             cache.insert(outpoint, entry);
         }
-        (cache.entries.len(), cache.bytes)
+        (cache.len(), cache.bytes)
     }
 
     pub fn contains(&self, outpoint: &OutPoint) -> Result<bool> {
@@ -4518,10 +4581,15 @@ mod tests {
         assert!(cache.order.is_empty());
         assert!(cache.bytes <= cache.limit.saturating_mul(7) / 8);
         assert_eq!(
+            cache.len(),
+            cache.entries.iter().map(FastHashMap::len).sum::<usize>()
+        );
+        assert_eq!(
             cache.bytes,
             cache
                 .entries
-                .values()
+                .iter()
+                .flat_map(FastHashMap::values)
                 .map(|(entry, _)| stored_utxo_cache_bytes(entry))
                 .sum::<usize>()
         );
@@ -4554,16 +4622,16 @@ mod tests {
         store
             .apply_batch(&[], &[(outpoint, first.clone())])
             .unwrap();
-        assert!(store.read_cache.lock().entries.contains_key(&outpoint));
+        assert!(store.read_cache.lock().contains_key(&outpoint));
         assert_eq!(store.get(&outpoint).unwrap(), Some(first));
-        assert_eq!(store.read_cache.lock().entries.len(), 1);
+        assert_eq!(store.read_cache.lock().len(), 1);
 
         store
             .apply_batch(&[outpoint], &[(outpoint, second.clone())])
             .unwrap();
-        assert!(store.read_cache.lock().entries.contains_key(&outpoint));
+        assert!(store.read_cache.lock().contains_key(&outpoint));
         assert_eq!(store.get(&outpoint).unwrap(), Some(second.clone()));
-        assert_eq!(store.read_cache.lock().entries.len(), 1);
+        assert_eq!(store.read_cache.lock().len(), 1);
 
         store.read_cache.lock().clear();
         assert_eq!(store.warm_cache().unwrap().0, 0);
@@ -4572,7 +4640,7 @@ mod tests {
 
         store.clear().unwrap();
         assert_eq!(store.get(&outpoint).unwrap(), None);
-        assert!(store.read_cache.lock().entries.is_empty());
+        assert_eq!(store.read_cache.lock().len(), 0);
     }
 
     #[test]

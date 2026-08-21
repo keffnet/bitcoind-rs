@@ -5250,13 +5250,41 @@ impl ChainState {
         &mut self,
         hash: &BlockHash,
     ) -> Result<Option<Vec<Vec<TxOut>>>> {
-        if let Some(undo) = self.block_undo_cache.get(hash) {
+        self.spent_outputs_by_transaction_impl(hash, true)
+    }
+
+    /// Read undo from the authoritative store before considering derived
+    /// data. RPC callers use this to avoid masking an unreadable record with
+    /// the recently-connected-block cache.
+    pub fn spent_outputs_by_transaction_from_storage(
+        &mut self,
+        hash: &BlockHash,
+    ) -> Result<Option<Vec<Vec<TxOut>>>> {
+        self.spent_outputs_by_transaction_impl(hash, false)
+    }
+
+    pub fn expects_undo_data(&self, hash: &BlockHash) -> bool {
+        self.store.has_undo(hash)
+            || self.block_index.get(hash).is_some_and(|node| {
+                node.height > 0 && self.is_active_block(hash) && !self.is_block_pruned(hash)
+            })
+    }
+
+    fn spent_outputs_by_transaction_impl(
+        &mut self,
+        hash: &BlockHash,
+        allow_cache: bool,
+    ) -> Result<Option<Vec<Vec<TxOut>>>> {
+        if allow_cache && let Some(undo) = self.block_undo_cache.get(hash) {
             return Ok(Some(Self::undo_outputs(undo)));
         }
         if let Some(undo) = self.store.get_undo(hash)? {
             let outputs = Self::undo_outputs(&undo);
             self.remember_block_undo(*hash, undo.clone());
             return Ok(Some(outputs));
+        }
+        if !allow_cache && self.expects_undo_data(hash) {
+            return Ok(None);
         }
         let Some(block) = self.store.get(hash)? else {
             return Ok(None);

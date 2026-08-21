@@ -1443,6 +1443,10 @@ impl BlockStore {
         Ok(Some(undo))
     }
 
+    pub fn has_undo(&self, hash: &BlockHash) -> bool {
+        self.undo_index.contains_key(hash)
+    }
+
     pub fn insert_undo(&mut self, hash: BlockHash, undo: &[Vec<StoredUndo>]) -> Result<()> {
         self.insert_undo_with_sync(hash, undo, true)
     }

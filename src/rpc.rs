@@ -5792,23 +5792,41 @@ fn missing_block_data_rest_error(chain: &chain::ChainState, hash: &BlockHash) ->
 fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     let hash: BlockHash = param::<String>(params, 0)?.parse()?;
     let verbosity = parse_verbosity(params.get(1), 1)?;
-    let mut chain = node.chain.write();
-    let height = chain
+    let height = node
+        .chain
+        .read()
         .block_height_by_hash(&hash)
         .ok_or_else(|| anyhow!("Block not found"))?;
-    let block = chain
-        .block(&hash)?
-        .ok_or_else(|| missing_block_data_error(&chain, &hash))?;
+    let block = match node.block_store_reader.get(&hash) {
+        Ok(Some(block)) => block,
+        Ok(None) => {
+            let chain = node.chain.read();
+            return Err(missing_block_data_error(&chain, &hash));
+        }
+        Err(_) => bail!("Block not found on disk"),
+    };
     if verbosity <= 0 {
         return Ok(json!(hex::encode(serialize(&block))));
     }
+    let mut chain = node.chain.write();
     let confirmations = if chain.is_active_block(&hash) {
         chain.height().saturating_sub(height) as i64 + 1
     } else {
         -1
     };
     let undo = if verbosity >= 2 {
-        chain.spent_outputs_by_transaction(&hash)?
+        let undo_expected = chain.expects_undo_data(&hash);
+        match chain.spent_outputs_by_transaction_from_storage(&hash) {
+            Ok(Some(undo)) => Some(undo),
+            Ok(None) if undo_expected => bail!(
+                "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event."
+            ),
+            Ok(None) => None,
+            Err(_) if undo_expected => bail!(
+                "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event."
+            ),
+            Err(error) => return Err(error),
+        }
     } else {
         None
     };
@@ -22721,6 +22739,36 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(unexpected_option_key.to_string(), "Unexpected key unknown");
+
+        // Recently served blocks and undo records are cached, but getblock
+        // must still surface loss of the authoritative on-disk data.
+        let undo_path = directory.path().join("blocks/undo.dat");
+        let stored_undo = std::fs::read(&undo_path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&undo_path)
+            .unwrap();
+        let undo_error = get_block(&node, &json!([block_hash.to_string(), 2])).unwrap_err();
+        assert_eq!(
+            undo_error.to_string(),
+            "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event."
+        );
+        assert_eq!(rpc_error(&undo_error)["code"], json!(-32603));
+        std::fs::write(&undo_path, stored_undo).unwrap();
+
+        let block_path = directory.path().join("blocks/blocks.dat");
+        let stored_blocks = std::fs::read(&block_path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&block_path)
+            .unwrap();
+        let block_error = get_block(&node, &json!([block_hash.to_string(), 0])).unwrap_err();
+        assert_eq!(block_error.to_string(), "Block not found on disk");
+        assert_eq!(rpc_error(&block_error)["code"], json!(-1));
+        std::fs::write(&block_path, stored_blocks).unwrap();
+        assert!(get_block(&node, &json!([block_hash.to_string(), 3])).is_ok());
     }
 
     #[test]

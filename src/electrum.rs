@@ -8,6 +8,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::{deserialize, serialize};
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -432,15 +433,14 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                         let mut encoded_batch = vec![b'['];
                         let mut response_count = 0usize;
                         let mut response_too_large = false;
-                        for request in batch {
-                            if let Some(response) = process_electrum_request(
-                                &node,
-                                request,
-                                &mut subscriptions,
-                                &mut session,
-                                &mut headers_subscribed,
-                                &mut numblocks_subscribed,
-                            )? {
+                        let optimized = process_scripthash_subscription_batch(
+                            &node,
+                            batch,
+                            &mut subscriptions,
+                            &session,
+                        );
+                        if let Some(responses) = optimized {
+                            for response in responses.into_iter().flatten() {
                                 let encoded_response = encode_bounded_electrum_response(response)?;
                                 if !append_electrum_batch_response(
                                     &mut encoded_batch,
@@ -452,6 +452,28 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
                                     // batch once its output budget is known
                                     // to be exceeded.
                                     break;
+                                }
+                            }
+                        } else {
+                            for request in batch {
+                                if let Some(response) = process_electrum_request(
+                                    &node,
+                                    request,
+                                    &mut subscriptions,
+                                    &mut session,
+                                    &mut headers_subscribed,
+                                    &mut numblocks_subscribed,
+                                )? {
+                                    let encoded_response =
+                                        encode_bounded_electrum_response(response)?;
+                                    if !append_electrum_batch_response(
+                                        &mut encoded_batch,
+                                        &mut response_count,
+                                        &encoded_response,
+                                    ) {
+                                        response_too_large = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
@@ -486,6 +508,73 @@ async fn handle_client(node: Arc<Node>, stream: TcpStream) -> Result<()> {
             }
         }
     }
+}
+
+/// Electrs treats an all-scripthash-subscription JSON batch as one parallel
+/// index operation. Wallets commonly open by subscribing to hundreds of
+/// scripts at once, so serial prefix scans leave most cores idle exactly when
+/// startup latency matters most. Keep parsing and state mutation ordered, but
+/// run the independent status reads on the bounded global Rayon pool.
+fn process_scripthash_subscription_batch(
+    node: &Arc<Node>,
+    batch: &[Value],
+    subscriptions: &mut HashMap<String, Subscription>,
+    session: &ElectrumSession,
+) -> Option<Vec<Option<Value>>> {
+    if !session.request_seen || !session.version_negotiated {
+        return None;
+    }
+
+    let calls = batch
+        .iter()
+        .map(|request| {
+            let request = request.as_object()?;
+            let method = request.get("method")?.as_str()?;
+            if method != "blockchain.scripthash.subscribe" {
+                return None;
+            }
+            let params = request
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            let params = normalize_electrum_params(method, &params).ok()?;
+            let script_hash = script_hash_param(&params, 0).ok()?;
+            Some((
+                request.get("id").cloned().unwrap_or(Value::Null),
+                !request.contains_key("id"),
+                script_hash,
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let statuses = calls
+        .par_iter()
+        .map(|(_, _, script_hash)| {
+            history_status_for_script(node, script_hash)
+                .map(|status| status.map(Value::String).unwrap_or(Value::Null))
+        })
+        .collect::<Vec<_>>();
+
+    Some(
+        calls
+            .into_iter()
+            .zip(statuses)
+            .map(|((id, notification, script_hash), result)| match result {
+                Ok(status) => {
+                    subscriptions.insert(
+                        format!("scripthash:{script_hash}"),
+                        Subscription::Scripthash {
+                            script_hash,
+                            status: status.clone(),
+                        },
+                    );
+                    (!notification).then(|| json!({"jsonrpc": "2.0", "id": id, "result": status}))
+                }
+                Err(error) => (!notification)
+                    .then(|| electrum_error_response(id, "blockchain.scripthash.subscribe", error)),
+            })
+            .collect(),
+    )
 }
 
 async fn read_line_limited<R: AsyncBufRead + Unpin>(
@@ -2307,6 +2396,83 @@ mod tests {
         let params = json!(["AA".repeat(32)]);
         assert_eq!(script_hash_param(&params, 0).unwrap(), "aa".repeat(32));
         assert!(script_hash_param(&json!(["00"]), 0).is_err());
+    }
+
+    #[test]
+    fn scripthash_subscription_batches_preserve_order_and_notifications() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let args = crate::config::Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--regtest",
+            "--electrum=0",
+            "--listen=false",
+            "--connect=0",
+            "--dnsseed=false",
+            "--fixedseeds=false",
+        ])?;
+        let node = Node::open(Config::from_args(args)?)?;
+        let session = ElectrumSession {
+            protocol_version: MAX_PROTOCOL_VERSION,
+            version_negotiated: true,
+            request_seen: true,
+            peer_address: None,
+        };
+        let first = "11".repeat(32);
+        let second_uppercase = "AA".repeat(32);
+        let second = second_uppercase.to_ascii_lowercase();
+        let batch = vec![
+            json!({
+                "jsonrpc": "2.0",
+                "id": 20,
+                "method": "blockchain.scripthash.subscribe",
+                "params": [first],
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "method": "blockchain.scripthash.subscribe",
+                "params": {"scripthash": second_uppercase},
+            }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "blockchain.scripthash.subscribe",
+                "params": {"scripthash": second},
+            }),
+        ];
+        let mut subscriptions = HashMap::new();
+
+        let responses =
+            process_scripthash_subscription_batch(&node, &batch, &mut subscriptions, &session)
+                .expect("homogeneous subscription batch uses the optimized path");
+
+        assert_eq!(
+            responses,
+            vec![
+                Some(json!({"jsonrpc": "2.0", "id": 20, "result": null})),
+                None,
+                Some(json!({"jsonrpc": "2.0", "id": 10, "result": null})),
+            ]
+        );
+        assert_eq!(subscriptions.len(), 2);
+        assert!(subscriptions.contains_key(&format!("scripthash:{first}")));
+        assert!(subscriptions.contains_key(&format!("scripthash:{second}")));
+
+        let mixed_batch = vec![
+            batch[0].clone(),
+            json!({"id": 30, "method": "server.ping", "params": []}),
+        ];
+        assert!(
+            process_scripthash_subscription_batch(
+                &node,
+                &mixed_batch,
+                &mut subscriptions,
+                &session,
+            )
+            .is_none()
+        );
+        Ok(())
     }
 
     #[test]

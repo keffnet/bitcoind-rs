@@ -1,11 +1,12 @@
 //! Core-compatible ZeroMQ publisher notifications.
 //!
-//! The publisher uses one PUB socket for all configured endpoints and keeps
-//! the per-topic message sequence counters required by Bitcoin Core. Events
-//! are delivered through independent bounded per-topic channels so a slow
-//! external subscriber never blocks validation or mempool admission.
+//! Each configured address owns one PUB socket, matching Bitcoin Core's
+//! socket-sharing boundary: topics configured at the same address share a
+//! socket, while distinct endpoints are isolated. Events are delivered
+//! through independent bounded per-topic channels so a slow external
+//! subscriber never blocks validation or mempool admission.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
@@ -172,6 +173,42 @@ impl EventBus {
     }
 }
 
+impl EventReceivers {
+    fn resubscribe(&self) -> Self {
+        Self {
+            hash_tx: self.hash_tx.as_ref().map(broadcast::Receiver::resubscribe),
+            hash_block: self
+                .hash_block
+                .as_ref()
+                .map(broadcast::Receiver::resubscribe),
+            raw_tx: self.raw_tx.as_ref().map(broadcast::Receiver::resubscribe),
+            raw_block: self
+                .raw_block
+                .as_ref()
+                .map(broadcast::Receiver::resubscribe),
+            sequence: self.sequence.as_ref().map(broadcast::Receiver::resubscribe),
+        }
+    }
+
+    fn retain_topics(&mut self, topics: &HashSet<Topic>) {
+        if !topics.contains(&Topic::HashTx) {
+            self.hash_tx = None;
+        }
+        if !topics.contains(&Topic::HashBlock) {
+            self.hash_block = None;
+        }
+        if !topics.contains(&Topic::RawTx) {
+            self.raw_tx = None;
+        }
+        if !topics.contains(&Topic::RawBlock) {
+            self.raw_block = None;
+        }
+        if !topics.contains(&Topic::Sequence) {
+            self.sequence = None;
+        }
+    }
+}
+
 fn topic_sender(enabled: bool, hwm: u32) -> Option<broadcast::Sender<Event>> {
     enabled.then(|| broadcast::channel(topic_event_capacity(hwm)).0)
 }
@@ -203,10 +240,9 @@ impl TopicSequences {
 
 pub(crate) async fn run_with_startup(
     config: ZmqConfig,
-    mut events: EventReceivers,
+    events: EventReceivers,
     startup: Option<Arc<StartupLatch>>,
 ) -> Result<()> {
-    let notifications = config.notifications();
     if !config.is_enabled() {
         if let Some(startup) = startup.as_deref() {
             startup.service_ready();
@@ -214,27 +250,72 @@ pub(crate) async fn run_with_startup(
         return std::future::pending::<Result<()>>().await;
     }
 
-    let mut socket = PubSocket::new();
-    let mut bound = HashSet::new();
-    for notification in &notifications {
-        if bound.insert(notification.address.clone()) {
-            if let Err(error) = socket.bind(&notification.address).await {
+    let mut endpoint_tasks = tokio::task::JoinSet::new();
+    for endpoint in endpoint_publishers(&config) {
+        let mut socket = PubSocket::new();
+        match socket.bind(&endpoint.address).await {
+            Ok(_) => {
+                let mut endpoint_events = events.resubscribe();
+                endpoint_events.retain_topics(&endpoint.topics);
+                endpoint_tasks.spawn(run_endpoint(socket, endpoint_events));
+            }
+            Err(error) => {
                 warn!(
-                    address = %notification.address,
+                    address = %endpoint.address,
                     %error,
                     "unable to bind ZMQ publisher; ignoring endpoint"
                 );
-                bound.remove(&notification.address);
             }
         }
     }
+    drop(events);
     if let Some(startup) = startup.as_deref() {
         startup.service_ready();
     }
-    if bound.is_empty() {
+    if endpoint_tasks.is_empty() {
         return std::future::pending::<Result<()>>().await;
     }
 
+    // A failed endpoint is isolated from every other configured publisher.
+    // Core likewise owns sockets per address rather than allowing one broken
+    // or slow destination to disable unrelated endpoints.
+    while let Some(result) = endpoint_tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => warn!(%error, "ZMQ publisher endpoint stopped"),
+            Err(error) => warn!(%error, "ZMQ publisher endpoint task failed"),
+        }
+        if endpoint_tasks.is_empty() {
+            return std::future::pending::<Result<()>>().await;
+        }
+    }
+    std::future::pending::<Result<()>>().await
+}
+
+struct EndpointPublisher {
+    address: String,
+    topics: HashSet<Topic>,
+}
+
+fn endpoint_publishers(config: &ZmqConfig) -> Vec<EndpointPublisher> {
+    let mut publishers = Vec::<EndpointPublisher>::new();
+    let mut positions = HashMap::<String, usize>::new();
+    for notification in config.notifications() {
+        let topic = Topic::from_notification_kind(notification.kind);
+        if let Some(position) = positions.get(&notification.address).copied() {
+            publishers[position].topics.insert(topic);
+            continue;
+        }
+        positions.insert(notification.address.clone(), publishers.len());
+        publishers.push(EndpointPublisher {
+            address: notification.address,
+            topics: HashSet::from([topic]),
+        });
+    }
+    publishers
+}
+
+async fn run_endpoint(mut socket: PubSocket, mut events: EventReceivers) -> Result<()> {
     let mut sequences = TopicSequences::default();
 
     loop {
@@ -258,13 +339,26 @@ pub(crate) async fn run_with_startup(
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Topic {
     HashTx,
     HashBlock,
     RawTx,
     RawBlock,
     Sequence,
+}
+
+impl Topic {
+    fn from_notification_kind(kind: &str) -> Self {
+        match kind {
+            "pubhashblock" => Self::HashBlock,
+            "pubhashtx" => Self::HashTx,
+            "pubrawblock" => Self::RawBlock,
+            "pubrawtx" => Self::RawTx,
+            "pubsequence" => Self::Sequence,
+            _ => unreachable!("unknown ZMQ notification kind {kind}"),
+        }
+    }
 }
 
 async fn receive_event(
@@ -460,6 +554,13 @@ mod tests {
     use tokio::time::{sleep, timeout};
     use zeromq::{Socket, SocketRecv, SubSocket};
 
+    fn unused_tcp_endpoint() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("tcp://127.0.0.1:{port}")
+    }
+
     #[test]
     fn event_buffer_capacity_tracks_active_message_hwms() {
         let mut config = ZmqConfig::default();
@@ -512,6 +613,77 @@ mod tests {
         assert!(receivers.sequence.as_mut().unwrap().try_recv().is_ok());
         assert!(receivers.hash_block.is_none());
         assert!(receivers.raw_block.is_none());
+    }
+
+    #[test]
+    fn endpoint_publishers_share_only_topics_at_the_same_address() {
+        let mut config = ZmqConfig::default();
+        config.pub_hash_tx.push("tcp://127.0.0.1:28001".to_owned());
+        config.pub_sequence.push("tcp://127.0.0.1:28001".to_owned());
+        config.pub_raw_tx.push("tcp://127.0.0.1:28002".to_owned());
+
+        let publishers = endpoint_publishers(&config);
+        assert_eq!(publishers.len(), 2);
+        let shared = publishers
+            .iter()
+            .find(|publisher| publisher.address.ends_with("28001"))
+            .unwrap();
+        assert_eq!(
+            shared.topics,
+            HashSet::from([Topic::HashTx, Topic::Sequence])
+        );
+        let isolated = publishers
+            .iter()
+            .find(|publisher| publisher.address.ends_with("28002"))
+            .unwrap();
+        assert_eq!(isolated.topics, HashSet::from([Topic::RawTx]));
+    }
+
+    #[tokio::test]
+    async fn distinct_endpoints_publish_only_their_configured_topics() {
+        let hash_endpoint = unused_tcp_endpoint();
+        let mut raw_endpoint = unused_tcp_endpoint();
+        while raw_endpoint == hash_endpoint {
+            raw_endpoint = unused_tcp_endpoint();
+        }
+        let mut config = ZmqConfig::default();
+        config.pub_hash_tx.push(hash_endpoint.clone());
+        config.pub_raw_tx.push(raw_endpoint.clone());
+        let bus = EventBus::new(&config);
+        let publisher = tokio::spawn(run_with_startup(config, bus.subscribe_topics(), None));
+
+        let mut hash_subscriber = SubSocket::new();
+        hash_subscriber.subscribe("").await.unwrap();
+        hash_subscriber.connect(&hash_endpoint).await.unwrap();
+        let mut raw_subscriber = SubSocket::new();
+        raw_subscriber.subscribe("").await.unwrap();
+        raw_subscriber.connect(&raw_endpoint).await.unwrap();
+        sleep(Duration::from_millis(100)).await;
+
+        bus.send(Event::TransactionAdded {
+            transaction: Arc::new(Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: Vec::new(),
+                output: Vec::new(),
+            }),
+            mempool_sequence: 0,
+        });
+
+        let hash_message = timeout(Duration::from_secs(1), hash_subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_vec();
+        let raw_message = timeout(Duration::from_secs(1), raw_subscriber.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .into_vec();
+        assert_eq!(hash_message[0].as_ref(), b"hashtx");
+        assert_eq!(raw_message[0].as_ref(), b"rawtx");
+
+        publisher.abort();
     }
 
     #[test]

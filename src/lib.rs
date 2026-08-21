@@ -3932,6 +3932,7 @@ impl Node {
                 .send(zmq::Event::BlockConnected(Arc::new(block.clone())));
         }
         if (!self.config.zmq.pub_hash_block.is_empty() || !self.config.zmq.pub_raw_block.is_empty())
+            && !self.chain.read().is_initial_block_download()
             && let Some(block) = connected.last()
         {
             self.zmq_events
@@ -10128,6 +10129,33 @@ mod tests {
         assert_eq!(
             node.zmq_mempool_sequence.load(Ordering::Relaxed),
             initial + 2
+        );
+    }
+
+    #[test]
+    fn zmq_block_tip_topics_are_suppressed_during_initial_download() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config(directory.path());
+        config.zmq.pub_hash_block = vec!["tcp://127.0.0.1:0".to_owned()];
+        config.zmq.pub_sequence = vec!["tcp://127.0.0.1:0".to_owned()];
+        let node = Node::open(config).unwrap();
+        assert!(node.chain.read().is_initial_block_download());
+        let mut notifications = node.subscribe_zmq();
+
+        let previous = *node.chain.read().header(0).unwrap();
+        node.connect_block(mine_test_block(&previous, 1, 1))
+            .unwrap();
+
+        let events = std::iter::from_fn(|| notifications.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, zmq::Event::BlockConnected(_)))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, zmq::Event::BlockTip(_)))
         );
     }
 

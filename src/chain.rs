@@ -6948,9 +6948,12 @@ impl ChainState {
                 self.flush_transaction_index_store()?;
                 self.activate_chain(hash)?;
             }
-            let active_tip = self.best_hash();
             self.process_orphans(hash, sync_storage);
-            self.process_known_children(active_tip, sync_storage)?;
+            // This block can fill a missing body below an already-stored
+            // side-chain suffix without itself becoming the active tip. Walk
+            // children from the body that just became available so the
+            // complete higher-work candidate can be validated and activated.
+            self.process_known_children(hash, sync_storage)?;
             self.update_ibd_status();
             return Ok(self.tip());
         }
@@ -15291,6 +15294,32 @@ mod tests {
         assert!(!state.processing_known_children);
         assert_eq!(state.peer_storage_blocks_since_flush, 1);
         assert!(state.peer_storage_bytes_since_flush < PEER_STORAGE_FLUSH_BYTES);
+    }
+
+    #[test]
+    fn replays_known_side_chain_suffix_after_missing_ancestor_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        state.connect_block(mine_block(&state, 2)).unwrap();
+
+        let genesis = *state.header(0).unwrap();
+        let side_parent = mine_block_from_header(&genesis, 1, 77);
+        let side_child = mine_block_from_header(&side_parent.header, 2, 78);
+        let side_tip = mine_block_from_header(&side_child.header, 3, 79);
+        state
+            .accept_headers(&[side_parent.header, side_child.header, side_tip.header])
+            .unwrap();
+
+        assert!(state.connect_block_from_peer(side_tip.clone()).is_err());
+        assert!(state.connect_block_from_peer(side_child).is_err());
+        assert_eq!(state.height(), 2);
+
+        state.connect_block_from_peer(side_parent).unwrap();
+
+        assert_eq!(state.height(), 3);
+        assert_eq!(state.best_hash(), side_tip.block_hash());
+        assert!(!state.processing_known_children);
     }
 
     #[test]

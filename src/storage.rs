@@ -2985,8 +2985,13 @@ fn load_history_index(
     if pending_batch.is_some() || last_data_end != Some(data_len) {
         return Ok(None);
     }
-    for (script_hash, location) in &index {
-        if validate_history_data_header(data_file, *location, *script_hash).is_err() {
+    let mut live_values = index
+        .iter()
+        .map(|(script_hash, location)| (*script_hash, *location))
+        .collect::<Vec<_>>();
+    live_values.sort_unstable_by_key(|(_, location)| location.offset());
+    for (script_hash, location) in live_values {
+        if validate_history_data_header(data_file, location, script_hash).is_err() {
             return Ok(None);
         }
     }
@@ -3454,16 +3459,6 @@ fn load_utxo_index(
                     return Ok(None);
                 };
                 pending.push(PendingUtxoOperation::Put { outpoint, location });
-                if let Err(error) = validate_utxo_data_header(data_file, location, outpoint) {
-                    warn!(
-                        %error,
-                        %outpoint,
-                        offset,
-                        value_length,
-                        "UTXO index value validation failed; rebuilding from the value log"
-                    );
-                    return Ok(None);
-                }
                 max_batch = max_batch.max(batch_id);
             }
             UTXO_DELETE => {
@@ -3562,6 +3557,27 @@ fn load_utxo_index(
             "UTXO index does not cover the complete value log; rebuilding"
         );
         return Ok(None);
+    }
+    // The durable index is an append journal, so hash-map iteration turns
+    // value verification into millions of random reads. Validate live values
+    // in log order instead; this preserves the same corruption checks while
+    // allowing local and network filesystems to issue forward readahead.
+    let mut live_values = index
+        .iter()
+        .map(|(outpoint, location)| (*outpoint, *location))
+        .collect::<Vec<_>>();
+    live_values.sort_unstable_by_key(|(_, location)| location.offset());
+    for (outpoint, location) in live_values {
+        if let Err(error) = validate_utxo_data_header(data_file, location, outpoint) {
+            warn!(
+                %error,
+                %outpoint,
+                offset = location.offset(),
+                value_length = location.length(),
+                "UTXO index value validation failed; rebuilding from the value log"
+            );
+            return Ok(None);
+        }
     }
     Ok(Some((
         index,

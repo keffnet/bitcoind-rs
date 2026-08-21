@@ -1630,7 +1630,7 @@ pub struct Args {
     )]
     pub electrum: String,
 
-    /// Prometheus monitoring listener compatible with electrs.
+    /// Prometheus monitoring listener compatible with electrs. Port zero disables it.
     #[arg(
         long = "monitoring-addr",
         alias = "monitoring_addr",
@@ -3385,7 +3385,7 @@ impl Config {
     pub(crate) fn electrum_monitoring_bind(&self) -> Option<SocketAddr> {
         #[cfg(not(test))]
         {
-            Some(self.electrum_monitoring_bind)
+            (self.electrum_monitoring_bind.port() != 0).then_some(self.electrum_monitoring_bind)
         }
         #[cfg(test)]
         {
@@ -6332,6 +6332,8 @@ mod tests {
             args.monitoring_addr,
             Some("127.0.0.1:19422".parse().unwrap())
         );
+        let args = Args::try_parse_from(["bitcoind-rs", "--monitoring-addr=127.0.0.1:0"]).unwrap();
+        assert_eq!(args.monitoring_addr.unwrap().port(), 0);
     }
 
     #[test]

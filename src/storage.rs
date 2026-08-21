@@ -21,6 +21,7 @@ use bitcoin::bip158::FilterHeader;
 use bitcoin::consensus::encode::{VarInt, deserialize, deserialize_partial, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
 use bitcoin::{Block, BlockHash, OutPoint, Transaction, TxOut, Txid};
+use hashbrown::HashMap as FastHashMap;
 use parking_lot::{Mutex, RwLock};
 use rand::random;
 use serde::{Deserialize, Serialize};
@@ -114,11 +115,11 @@ impl UtxoLocation {
     }
 }
 
-type UtxoIndexState = (HashMap<OutPoint, UtxoLocation>, u64, u64);
+type UtxoIndexState = (FastHashMap<OutPoint, UtxoLocation>, u64, u64);
 
 #[derive(Default)]
 struct UtxoReadCache {
-    entries: HashMap<OutPoint, (StoredUtxo, usize, u64)>,
+    entries: FastHashMap<OutPoint, (StoredUtxo, usize, u64)>,
     order: VecDeque<(OutPoint, u64)>,
     bytes: usize,
     limit: usize,
@@ -245,7 +246,7 @@ struct PendingHistoryOperation {
     location: HistoryLocation,
 }
 
-type HistoryIndexState = (HashMap<[u8; 32], HistoryLocation>, u64);
+type HistoryIndexState = (FastHashMap<[u8; 32], HistoryLocation>, u64);
 
 #[derive(Clone, Debug)]
 enum PendingElectrumHistory {
@@ -446,6 +447,12 @@ pub struct BlockStore {
     block_cache_order: VecDeque<BlockHash>,
     block_cache_bytes: usize,
     block_cache_limit: usize,
+}
+
+pub(crate) struct PreparedBlockRecord {
+    hash: BlockHash,
+    encoded: Vec<u8>,
+    raw_length: usize,
 }
 
 impl BlockStore {
@@ -773,9 +780,52 @@ impl BlockStore {
         if self.index.contains_key(&hash) {
             return Ok(hash);
         }
-        self.ensure_block_file_writable()?;
+        let prepared = Self::prepare_record(block)?;
+        self.insert_prepared_with_sync(block, prepared, sync)
+    }
+
+    pub(crate) fn prepare_record(block: &Block) -> Result<PreparedBlockRecord> {
+        let hash = block.block_hash();
         let raw_bytes = serialize(block);
-        let bytes = encode_storage_payload(&raw_bytes, MAX_STORED_BLOCK_SIZE)?;
+        let encoded = encode_storage_payload(&raw_bytes, MAX_STORED_BLOCK_SIZE)?;
+        Ok(PreparedBlockRecord {
+            hash,
+            encoded,
+            raw_length: raw_bytes.len(),
+        })
+    }
+
+    pub(crate) fn insert_prepared(
+        &mut self,
+        block: &Block,
+        prepared: PreparedBlockRecord,
+    ) -> Result<BlockHash> {
+        self.insert_prepared_with_sync(block, prepared, true)
+    }
+
+    pub(crate) fn insert_prepared_unsynced(
+        &mut self,
+        block: &Block,
+        prepared: PreparedBlockRecord,
+    ) -> Result<BlockHash> {
+        self.insert_prepared_with_sync(block, prepared, false)
+    }
+
+    fn insert_prepared_with_sync(
+        &mut self,
+        block: &Block,
+        prepared: PreparedBlockRecord,
+        sync: bool,
+    ) -> Result<BlockHash> {
+        let hash = block.block_hash();
+        if self.index.contains_key(&hash) {
+            return Ok(hash);
+        }
+        if prepared.hash != hash {
+            bail!("prepared block record does not match block")
+        }
+        self.ensure_block_file_writable()?;
+        let bytes = prepared.encoded;
         let offset = self.file.seek(SeekFrom::End(0))?;
         let length = u32::try_from(bytes.len()).context("block length does not fit u32")?;
         let mut record = Vec::with_capacity(4 + bytes.len());
@@ -795,7 +845,7 @@ impl BlockStore {
         )?;
         self.index.insert(hash, Record { offset, length });
         self.serving_reader.insert(hash, Record { offset, length });
-        self.cache_block(hash, block.clone(), raw_bytes.len());
+        self.cache_block(hash, block.clone(), prepared.raw_length);
         Ok(hash)
     }
 
@@ -1336,6 +1386,11 @@ pub struct ChainstateStore {
     pending_write_bytes: usize,
 }
 
+pub(crate) struct PreparedChainstateRecord {
+    hash: BlockHash,
+    encoded_payload: Vec<u8>,
+}
+
 impl ChainstateStore {
     pub fn open(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
@@ -1465,7 +1520,44 @@ impl ChainstateStore {
         if payload.len() > MAX_STORED_CHAINSTATE_DELTA_SIZE {
             bail!("chainstate delta is too large: {} bytes", payload.len());
         }
-        let encoded_payload = encode_storage_payload(payload, MAX_STORED_CHAINSTATE_DELTA_SIZE)?;
+        let prepared = Self::prepare_record(hash, payload)?;
+        self.insert_prepared_with_index_sync(prepared, sync_index)
+    }
+
+    pub(crate) fn prepare_record(
+        hash: BlockHash,
+        payload: &[u8],
+    ) -> Result<PreparedChainstateRecord> {
+        if payload.len() > MAX_STORED_CHAINSTATE_DELTA_SIZE {
+            bail!("chainstate delta is too large: {} bytes", payload.len());
+        }
+        Ok(PreparedChainstateRecord {
+            hash,
+            encoded_payload: encode_storage_payload(payload, MAX_STORED_CHAINSTATE_DELTA_SIZE)?,
+        })
+    }
+
+    pub(crate) fn insert_prepared(&mut self, prepared: PreparedChainstateRecord) -> Result<()> {
+        self.insert_prepared_with_index_sync(prepared, true)
+    }
+
+    pub(crate) fn insert_prepared_unsynced(
+        &mut self,
+        prepared: PreparedChainstateRecord,
+    ) -> Result<()> {
+        self.insert_prepared_with_index_sync(prepared, false)
+    }
+
+    fn insert_prepared_with_index_sync(
+        &mut self,
+        prepared: PreparedChainstateRecord,
+        sync_index: bool,
+    ) -> Result<()> {
+        let hash = prepared.hash;
+        if self.index.contains_key(&hash) {
+            return Ok(());
+        }
+        let encoded_payload = prepared.encoded_payload;
         let length = 32usize
             .checked_add(encoded_payload.len())
             .context("chainstate delta length overflow")?;
@@ -1536,7 +1628,7 @@ pub struct UtxoStore {
     index_path: PathBuf,
     file: File,
     index_file: File,
-    index: HashMap<OutPoint, UtxoLocation>,
+    index: FastHashMap<OutPoint, UtxoLocation>,
     next_batch_id: u64,
     generation: u64,
     pending_write_bytes: usize,
@@ -1578,7 +1670,15 @@ impl UtxoStore {
             .open(&index_path)
             .with_context(|| format!("opening UTXO index {}", index_path.display()))?;
         let data_len = file.metadata()?.len();
-        let loaded_index = load_utxo_index(&mut index_file, &file, data_len)?;
+        // A published chainstate tip means the owning node completed a
+        // durability boundary after producing this structural journal.
+        // Routine startup can trust its committed key/location records and
+        // validate compressed values lazily when they are read. Standalone
+        // stores and recovery paths retain the exhaustive value scan.
+        let validate_live_values = directory
+            .parent()
+            .is_none_or(|parent| !parent.join("utxos.tip").is_file());
+        let loaded_index = load_utxo_index(&mut index_file, &file, data_len, validate_live_values)?;
         let (index, next_batch_id, generation) = if let Some(index) = loaded_index {
             index
         } else {
@@ -1983,7 +2083,7 @@ impl UtxoStore {
                 .checked_add(1)
                 .context("UTXO batch identifier exhausted during compaction")?;
             let entries_empty = locations.is_empty();
-            let mut compact_index = HashMap::with_capacity(locations.len());
+            let mut compact_index = FastHashMap::with_capacity(locations.len());
             if !entries_empty {
                 for (outpoint, location) in &locations {
                     let body = read_utxo_data_record(&self.file, *location)?;
@@ -2145,9 +2245,9 @@ pub struct ElectrumHistoryStore {
     index_path: PathBuf,
     file: File,
     index_file: File,
-    index: HashMap<[u8; 32], HistoryLocation>,
+    index: FastHashMap<[u8; 32], HistoryLocation>,
     next_batch_id: u64,
-    pending: HashMap<[u8; 32], PendingElectrumHistory>,
+    pending: FastHashMap<[u8; 32], PendingElectrumHistory>,
     contains_linked_histories: bool,
 }
 
@@ -2184,7 +2284,9 @@ impl ElectrumHistoryStore {
             .with_context(|| format!("opening Electrum history index {}", index_path.display()))?;
         let data_len = file.metadata()?.len();
         let contains_history_values = data_len > ELECTRUM_HISTORY_DATA_MAGIC.len() as u64;
-        let loaded_index = load_history_index(&mut index_file, &file, data_len)?;
+        let validate_live_values = !directory.with_extension("tip").is_file();
+        let loaded_index =
+            load_history_index(&mut index_file, &file, data_len, validate_live_values)?;
         let (index, next_batch_id) = if let Some(index) = loaded_index {
             index
         } else {
@@ -2204,7 +2306,7 @@ impl ElectrumHistoryStore {
             index_file,
             index,
             next_batch_id,
-            pending: HashMap::new(),
+            pending: FastHashMap::new(),
             // Existing v1 stores may contain append nodes after this binary
             // has written them. Conservatively disable automatic stale-byte
             // estimation until a future index version persists chain sizes.
@@ -2454,17 +2556,48 @@ impl ElectrumHistoryStore {
         Ok(())
     }
 
+    /// Move active-chain history additions into the pending durability batch.
+    /// The ordinary IBD caller no longer needs the per-block map afterwards,
+    /// so taking ownership avoids cloning every script string and entry before
+    /// the much larger byte-bounded store flush.
+    pub fn append_entries_owned_unsynced(
+        &mut self,
+        updates: Vec<(String, Vec<(Txid, u32)>)>,
+    ) -> Result<()> {
+        for (script_hash, mut additions) in updates {
+            if additions.is_empty() {
+                continue;
+            }
+            additions.dedup();
+            let encoded = encode_history_script_hash(&script_hash)?;
+            match self.pending.entry(encoded) {
+                hashbrown::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingElectrumHistory::Append(additions));
+                }
+                hashbrown::hash_map::Entry::Occupied(mut entry) => {
+                    let entries = match entry.get_mut() {
+                        PendingElectrumHistory::Replace(entries)
+                        | PendingElectrumHistory::Append(entries) => entries,
+                    };
+                    for addition in additions {
+                        if entries.last() != Some(&addition) {
+                            entries.push(addition);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn flush_pending(&mut self) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
         let pending = std::mem::take(&mut self.pending);
-        let updates = pending
-            .iter()
-            .map(|(script_hash, update)| (hex::encode(script_hash), update.clone()))
-            .collect::<Vec<_>>();
-        if let Err(error) = self.apply_pending_batch_with_sync(&updates, true) {
-            self.pending = pending;
+        let updates = pending.into_iter().collect::<Vec<_>>();
+        if let Err(error) = self.apply_pending_encoded_batch_with_sync(&updates, true) {
+            self.pending = updates.into_iter().collect();
             return Err(error);
         }
         Ok(())
@@ -2492,6 +2625,20 @@ impl ElectrumHistoryStore {
         updates: &[(String, PendingElectrumHistory)],
         sync: bool,
     ) -> Result<()> {
+        let encoded_updates = updates
+            .iter()
+            .map(|(script_hash, update)| {
+                Ok((encode_history_script_hash(script_hash)?, update.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        self.apply_pending_encoded_batch_with_sync(&encoded_updates, sync)
+    }
+
+    fn apply_pending_encoded_batch_with_sync(
+        &mut self,
+        updates: &[([u8; 32], PendingElectrumHistory)],
+        sync: bool,
+    ) -> Result<()> {
         if updates.is_empty() {
             return Ok(());
         }
@@ -2504,27 +2651,26 @@ impl ElectrumHistoryStore {
         let mut data_committed = false;
         let write_result = (|| -> Result<()> {
             let mut data_bytes = Vec::new();
-            for (script_hash, update) in updates {
-                let script_hash_bytes = encode_history_script_hash(script_hash)?;
+            for (script_hash_bytes, update) in updates {
                 let location = match update {
                     PendingElectrumHistory::Replace(entries) => buffer_history_replacement_records(
                         &mut data_bytes,
                         batch_start,
                         batch_id,
-                        script_hash_bytes,
+                        *script_hash_bytes,
                         entries,
                     )?,
                     PendingElectrumHistory::Append(entries) => buffer_history_append_records(
                         &mut data_bytes,
                         batch_start,
                         batch_id,
-                        script_hash_bytes,
-                        self.index.get(&script_hash_bytes).copied(),
+                        *script_hash_bytes,
+                        self.index.get(script_hash_bytes).copied(),
                         entries,
                     )?,
                 };
                 operations.push(PendingHistoryOperation {
-                    script_hash: script_hash_bytes,
+                    script_hash: *script_hash_bytes,
                     location,
                 });
             }
@@ -2629,7 +2775,7 @@ impl ElectrumHistoryStore {
             let next_batch_id = batch_id
                 .checked_add(1)
                 .context("Electrum history batch identifier exhausted during compaction")?;
-            let mut compact_index = HashMap::with_capacity(locations.len());
+            let mut compact_index = FastHashMap::with_capacity(locations.len());
             let mut copied_entries = 0usize;
             for (script_hash_bytes, _) in &locations {
                 let history = self.read_history(*script_hash_bytes)?;
@@ -3064,7 +3210,7 @@ fn extend_history(history: &mut StoredElectrumHistory, additions: &[(Txid, u32)]
     }
 }
 
-fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocation>, u64)> {
+fn scan_history_data(file: &mut File) -> Result<(FastHashMap<[u8; 32], HistoryLocation>, u64)> {
     let data_len = data_len_after(file)?;
     file.seek(SeekFrom::Start(0))?;
     let mut magic = vec![0u8; ELECTRUM_HISTORY_DATA_MAGIC.len()];
@@ -3076,7 +3222,7 @@ fn scan_history_data(file: &mut File) -> Result<(HashMap<[u8; 32], HistoryLocati
     let mut committed_end = position;
     let mut pending_batch = None;
     let mut pending = Vec::new();
-    let mut index = HashMap::new();
+    let mut index = FastHashMap::new();
     let mut max_batch = 0u64;
     while position < data_len {
         let record_start = position;
@@ -3178,6 +3324,7 @@ fn load_history_index(
     file: &mut File,
     data_file: &File,
     data_len: u64,
+    validate_live_values: bool,
 ) -> Result<Option<HistoryIndexState>> {
     let index_len = file.metadata()?.len();
     if index_len < ELECTRUM_HISTORY_INDEX_MAGIC.len() as u64 {
@@ -3192,7 +3339,7 @@ fn load_history_index(
     let mut position = ELECTRUM_HISTORY_INDEX_MAGIC.len() as u64;
     let mut pending_batch = None;
     let mut pending = Vec::new();
-    let mut index = HashMap::new();
+    let mut index = FastHashMap::new();
     let mut last_data_end = None;
     let mut stored_next_batch_id = None;
     let mut max_batch = 0u64;
@@ -3276,14 +3423,16 @@ fn load_history_index(
     if pending_batch.is_some() || last_data_end != Some(data_len) {
         return Ok(None);
     }
-    let mut live_values = index
-        .iter()
-        .map(|(script_hash, location)| (*script_hash, *location))
-        .collect::<Vec<_>>();
-    live_values.sort_unstable_by_key(|(_, location)| location.offset());
-    for (script_hash, location) in live_values {
-        if validate_history_data_header(data_file, location, script_hash).is_err() {
-            return Ok(None);
+    if validate_live_values {
+        let mut live_values = index
+            .iter()
+            .map(|(script_hash, location)| (*script_hash, *location))
+            .collect::<Vec<_>>();
+        live_values.sort_unstable_by_key(|(_, location)| location.offset());
+        for (script_hash, location) in live_values {
+            if validate_history_data_header(data_file, location, script_hash).is_err() {
+                return Ok(None);
+            }
         }
     }
     Ok(Some((
@@ -3373,7 +3522,7 @@ fn rewrite_history_index(
     file: &mut File,
     data_end: u64,
     next_batch_id: u64,
-    index: &HashMap<[u8; 32], HistoryLocation>,
+    index: &FastHashMap<[u8; 32], HistoryLocation>,
 ) -> Result<()> {
     file.set_len(0)?;
     file.seek(SeekFrom::End(0))?;
@@ -3525,7 +3674,7 @@ fn read_utxo_data_record(file: &File, location: UtxoLocation) -> Result<Vec<u8>>
     )
 }
 
-fn scan_utxo_data(file: &mut File) -> Result<(HashMap<OutPoint, UtxoLocation>, u64)> {
+fn scan_utxo_data(file: &mut File) -> Result<(FastHashMap<OutPoint, UtxoLocation>, u64)> {
     let data_len = data_len_after(file)?;
     file.seek(SeekFrom::Start(0))?;
     let mut magic = vec![0u8; UTXO_DATA_MAGIC.len()];
@@ -3537,7 +3686,7 @@ fn scan_utxo_data(file: &mut File) -> Result<(HashMap<OutPoint, UtxoLocation>, u
     let mut committed_end = position;
     let mut pending_batch = None;
     let mut pending = Vec::new();
-    let mut index = HashMap::new();
+    let mut index = FastHashMap::new();
     let mut max_batch = 0u64;
     while position < data_len {
         let record_start = position;
@@ -3646,6 +3795,7 @@ fn load_utxo_index(
     file: &mut File,
     data_file: &File,
     data_len: u64,
+    validate_live_values: bool,
 ) -> Result<Option<UtxoIndexState>> {
     let index_len = file.metadata()?.len();
     if index_len < UTXO_INDEX_MAGIC.len() as u64 {
@@ -3662,7 +3812,7 @@ fn load_utxo_index(
     let mut position = UTXO_INDEX_MAGIC.len() as u64;
     let mut pending_batch = None;
     let mut pending = Vec::new();
-    let mut index = HashMap::new();
+    let mut index = FastHashMap::new();
     let mut last_data_end = None;
     let mut max_batch = 0u64;
     let mut stored_next_batch_id = None;
@@ -3841,21 +3991,23 @@ fn load_utxo_index(
     // value verification into millions of random reads. Validate live values
     // in log order instead; this preserves the same corruption checks while
     // allowing local and network filesystems to issue forward readahead.
-    let mut live_values = index
-        .iter()
-        .map(|(outpoint, location)| (*outpoint, *location))
-        .collect::<Vec<_>>();
-    live_values.sort_unstable_by_key(|(_, location)| location.offset());
-    for (outpoint, location) in live_values {
-        if let Err(error) = validate_utxo_data_header(data_file, location, outpoint) {
-            warn!(
-                %error,
-                %outpoint,
-                offset = location.offset(),
-                value_length = location.length(),
-                "UTXO index value validation failed; rebuilding from the value log"
-            );
-            return Ok(None);
+    if validate_live_values {
+        let mut live_values = index
+            .iter()
+            .map(|(outpoint, location)| (*outpoint, *location))
+            .collect::<Vec<_>>();
+        live_values.sort_unstable_by_key(|(_, location)| location.offset());
+        for (outpoint, location) in live_values {
+            if let Err(error) = validate_utxo_data_header(data_file, location, outpoint) {
+                warn!(
+                    %error,
+                    %outpoint,
+                    offset = location.offset(),
+                    value_length = location.length(),
+                    "UTXO index value validation failed; rebuilding from the value log"
+                );
+                return Ok(None);
+            }
         }
     }
     Ok(Some((
@@ -3955,7 +4107,7 @@ fn rewrite_utxo_index(
     data_end: u64,
     next_batch_id: u64,
     generation: u64,
-    index: &HashMap<OutPoint, UtxoLocation>,
+    index: &FastHashMap<OutPoint, UtxoLocation>,
 ) -> Result<()> {
     file.set_len(0)?;
     file.seek(SeekFrom::End(0))?;

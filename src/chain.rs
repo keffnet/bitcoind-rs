@@ -23,8 +23,10 @@ use bitcoin::{
     Amount, Block, BlockHash, Network, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid,
     Witness,
 };
+use hashbrown::HashMap as FastHashMap;
 use num_bigint::BigUint;
 use parking_lot::Mutex;
+use rayon::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -82,6 +84,22 @@ fn log_replay_progress(
         "Replaying blocks: stage={stage} height={height} target={target_height} progress={progress:.1}% rate={rate:.0} blocks/s"
     );
 }
+
+/// Return large transient replay/indexing arenas to the operating system.
+///
+/// glibc otherwise retains the millions of small allocations released after
+/// snapshot replay and Electrum durability batches. On memory-constrained IBD
+/// nodes that retained heap displaces the live indexes and causes swap-driven
+/// multi-second block-connection stalls.
+fn trim_process_heap() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` has no pointer arguments and only asks glibc to
+    // release currently unused allocator pages. All Rust-owned allocations
+    // remain live and valid across the call.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
 const FAST_PRUNE_BLOCKFILE_SIZE: usize = 0x10_000;
 const MAX_ORPHAN_BLOCKS: usize = 128;
 const MAX_TIP_AGE_SECS: u64 = 24 * 60 * 60;
@@ -91,6 +109,7 @@ const CORE_UTXO_SNAPSHOT_VERSION: u16 = 2;
 const CHAIN_METADATA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-v1\0";
 const CHAIN_SNAPSHOT_MAGIC: &[u8] = b"bitcoind-rs-snapshot-v1\0";
 const CHAINSTATE_DELTA_MAGIC: &[u8] = b"bitcoind-rs-chainstate-delta-v1\0";
+const CHAINSTATE_DELTA_V2_MAGIC: &[u8] = b"bitcoind-rs-chainstate-delta-v2\0";
 const CHAIN_TX_COUNTS_MAGIC: &[u8] = b"bitcoind-rs-tx-counts-v1\0";
 const CHAIN_ACTIVE_TIP_MAGIC: &[u8] = b"bitcoind-rs-active-tip-v1\0";
 const CHAIN_HEADERS_JOURNAL_MAGIC: &[u8] = b"bitcoind-rs-headers-journal-v1\0";
@@ -555,6 +574,28 @@ struct CoinStatsBlockMetrics {
 
 type SpentTransaction = (Txid, usize, BlockHash, u32);
 
+/// Runtime representation of an active-chain spender. The block hash is
+/// implied by `height` and the active chain, while consensus block limits make
+/// a 32-bit input position ample. Keeping the persisted tuple unchanged makes
+/// existing snapshots and chainstate deltas backward-compatible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ActiveSpender {
+    txid: Txid,
+    input_index: u32,
+    height: u32,
+}
+
+impl ActiveSpender {
+    fn from_stored(spender: SpentTransaction) -> Result<Self> {
+        Ok(Self {
+            txid: spender.0,
+            input_index: u32::try_from(spender.1)
+                .context("spender input index does not fit u32")?,
+            height: spender.3,
+        })
+    }
+}
+
 #[derive(Clone, Default)]
 struct CoinStatsState {
     transaction_outputs: HashMap<Txid, u64>,
@@ -858,6 +899,13 @@ struct ChainstateDelta {
     #[serde(default)]
     spent_by: Vec<(OutPoint, SpentTransaction)>,
     metrics: CoinStatsBlockMetrics,
+}
+
+struct PreparedTransactionDelta {
+    transaction: (Txid, TxLocation),
+    created: Vec<(OutPoint, UtxoEntry)>,
+    history: Vec<(String, HistoryEntry)>,
+    spent_by: Vec<(OutPoint, SpentTransaction)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1179,20 +1227,66 @@ fn deserialize_chain_snapshot(bytes: &[u8]) -> Result<ChainSnapshot> {
 
 fn serialize_chainstate_delta(delta: &ChainstateDelta) -> Result<Vec<u8>> {
     let body = serialize_binary(delta).context("serializing chainstate delta body")?;
-    let stored = StoredChainstateDelta {
-        delta: delta.clone(),
-        checksum: Sha256::digest(&body).into(),
-    };
-    serialize_internal(CHAINSTATE_DELTA_MAGIC, &stored)
+    let body_length = u64::try_from(body.len()).context("chainstate delta body is too large")?;
+    let checksum: [u8; 32] = Sha256::digest(&body).into();
+    let mut bytes = Vec::with_capacity(
+        CHAINSTATE_DELTA_V2_MAGIC
+            .len()
+            .saturating_add(8)
+            .saturating_add(body.len())
+            .saturating_add(checksum.len()),
+    );
+    bytes.extend_from_slice(CHAINSTATE_DELTA_V2_MAGIC);
+    bytes.extend_from_slice(&body_length.to_le_bytes());
+    bytes.extend_from_slice(&body);
+    bytes.extend_from_slice(&checksum);
+    Ok(bytes)
 }
 
 fn deserialize_chainstate_delta(bytes: &[u8]) -> Result<ChainstateDelta> {
+    if let Some(encoded) = bytes.strip_prefix(CHAINSTATE_DELTA_V2_MAGIC) {
+        if encoded.len() < 8 + 32 {
+            bail!("chainstate delta v2 is truncated")
+        }
+        let body_length = u64::from_le_bytes(
+            encoded[..8]
+                .try_into()
+                .expect("chainstate delta length has fixed width"),
+        );
+        let body_length =
+            usize::try_from(body_length).context("chainstate delta body does not fit usize")?;
+        let expected_length = 8usize
+            .checked_add(body_length)
+            .and_then(|length| length.checked_add(32))
+            .context("chainstate delta encoded length overflowed")?;
+        if encoded.len() != expected_length {
+            bail!("chainstate delta v2 length is invalid")
+        }
+        let body = &encoded[8..8 + body_length];
+        let checksum = &encoded[8 + body_length..];
+        if Sha256::digest(body).as_slice() != checksum {
+            bail!("chainstate delta checksum mismatch")
+        }
+        return deserialize_binary(body).context("decoding chainstate delta v2 body");
+    }
     let stored: StoredChainstateDelta = deserialize_internal(bytes, CHAINSTATE_DELTA_MAGIC)?;
     let body = serialize_binary(&stored.delta).context("serializing stored chainstate delta")?;
     if Sha256::digest(&body).as_slice() != stored.checksum {
         bail!("chainstate delta checksum mismatch")
     }
     Ok(stored.delta)
+}
+
+fn block_transaction_ids(block: &Block) -> Vec<Txid> {
+    if block.txdata.len() >= 32 {
+        block
+            .txdata
+            .par_iter()
+            .map(Transaction::compute_txid)
+            .collect()
+    } else {
+        block.txdata.iter().map(Transaction::compute_txid).collect()
+    }
 }
 
 fn load_active_chain_from_tip(
@@ -1422,11 +1516,10 @@ pub struct ChainState {
     history: HashMap<String, Vec<HistoryEntry>>,
     history_materialized: bool,
     history_index_enabled: bool,
-    spent_by: HashMap<OutPoint, SpentTransaction>,
-    // A reorg deliberately leaves old-branch spenders visible until the next
-    // persisted block notification, matching the asynchronous Core index.
-    // Track that exceptional cleanup explicitly so ordinary block connects
-    // do not scan the complete spender map and active chain on every block.
+    spent_by: FastHashMap<OutPoint, ActiveSpender>,
+    // Exceptional callers can defer stale-height cleanup until the next
+    // persisted block. Ordinary reorgs remove the disconnected suffix before
+    // indexing the replacement branch, so normal IBD never scans this map.
     spent_by_needs_reconciliation: bool,
     // The node enables the optional spender index after chainstate startup
     // configuration is known. Preserve a snapshot copy so that enabling the
@@ -1809,6 +1902,7 @@ impl ChainState {
             blocks_xor,
             deployment_parameters,
             true,
+            false,
         )
     }
 
@@ -1831,6 +1925,7 @@ impl ChainState {
         blocks_xor: bool,
         deployment_parameters: validation::DeploymentParameters,
         electrum_history_index_enabled: bool,
+        txospender_index_enabled: bool,
     ) -> Result<Self> {
         if deployment_parameters.network != network {
             bail!("consensus deployment parameters use a different network");
@@ -2168,7 +2263,7 @@ impl ChainState {
             tx_index_all_enabled,
             tx_index_store,
             coinstats_store,
-            txospender_index_enabled: false,
+            txospender_index_enabled,
             coinstats_index_enabled: false,
             coin_stats: None,
             active_chain: Vec::new(),
@@ -2223,7 +2318,7 @@ impl ChainState {
             history: HashMap::new(),
             history_materialized: true,
             history_index_enabled: electrum_history_index_enabled,
-            spent_by: HashMap::new(),
+            spent_by: FastHashMap::new(),
             spent_by_needs_reconciliation: false,
             startup_spent_by: None,
             precious_blocks: HashMap::new(),
@@ -2330,8 +2425,13 @@ impl ChainState {
             state.index_active_headers(&headers)?;
             if state.txospender_index_enabled {
                 if let Some((_, spent_by)) = state.startup_spent_by.take() {
-                    state.spent_by = spent_by;
-                    state.validate_persisted_spent_index()?;
+                    state.validate_persisted_spent_index(&spent_by)?;
+                    state.spent_by = spent_by
+                        .into_iter()
+                        .map(|(outpoint, spender)| {
+                            Ok((outpoint, ActiveSpender::from_stored(spender)?))
+                        })
+                        .collect::<Result<_>>()?;
                 } else {
                     state.rebuild_spent_index()?;
                 }
@@ -2349,29 +2449,27 @@ impl ChainState {
                     target_height
                 );
             }
-            let loaded_deltas = state.load_chainstate_deltas(&active_chain, snapshot_chain_len);
-            let validated_deltas = match loaded_deltas {
-                Some(deltas) => match state.validate_chainstate_deltas(&deltas) {
-                    Ok(()) => Some(deltas),
-                    Err(error) => {
-                        warn!(
-                            "Chainstate replay records are invalid ({error:#}); falling back to native block replay"
-                        );
-                        None
-                    }
-                },
-                None => {
+            let deltas_valid = match state
+                .validate_chainstate_delta_suffix(&active_chain, snapshot_chain_len)
+            {
+                Ok(()) => true,
+                Err(error) => {
                     if replay_blocks > 0 {
                         warn!(
-                            "Chainstate replay records are missing or incomplete; falling back to native block replay"
+                            "Chainstate replay records are invalid or incomplete ({error:#}); falling back to native block replay"
                         );
                     }
-                    None
+                    false
                 }
             };
-            if let Some(deltas) = validated_deltas {
+            if deltas_valid {
                 let apply_started = Instant::now();
-                for (offset, delta) in deltas.into_iter().enumerate() {
+                for (offset, block_hash) in active_chain.iter().skip(snapshot_chain_len).enumerate()
+                {
+                    let bytes = state.chainstate_store.get(block_hash)?.with_context(|| {
+                        format!("chainstate delta for {block_hash} disappeared")
+                    })?;
+                    let delta = deserialize_chainstate_delta(&bytes)?;
                     state.apply_chainstate_delta(delta)?;
                     log_replay_progress(
                         "apply-deltas",
@@ -2510,7 +2608,6 @@ impl ChainState {
             state.initialize_block_sequence_ids_after_load();
         }
         if loaded_snapshot {
-            let snapshot_utxos = state.utxos.clone();
             let pending_assumeutxo = state.snapshot_base.is_some()
                 && !state.snapshot_validated
                 && state.snapshot_validation_error.is_none();
@@ -2519,8 +2616,13 @@ impl ChainState {
                     .snapshot_base
                     .and_then(|base| state.block_height_by_hash(&base))
                     .unwrap_or_else(|| state.height());
-                state.validate_snapshot_utxo_shape(&snapshot_utxos, snapshot_height)?;
+                state.validate_snapshot_utxo_shape(&state.utxos, snapshot_height)?;
             } else if !snapshot_verified {
+                // Legacy snapshots need a stable copy while full replay uses
+                // the live map as scratch state. Checksummed snapshots have
+                // already been authenticated and must not duplicate millions
+                // of coins merely to skip both validation branches below.
+                let snapshot_utxos = state.utxos.clone();
                 let verification_started = Instant::now();
                 info!("Verifying legacy chainstate snapshot");
                 state.validate_snapshot_utxos(&snapshot_utxos)?;
@@ -2707,6 +2809,7 @@ impl ChainState {
         if self.history_index_enabled {
             self.persist_electrum_history_store_tip()?;
         }
+        trim_process_heap();
         self.peer_storage_blocks_since_flush = 0;
         self.peer_storage_bytes_since_flush = 0;
         info!(
@@ -2769,11 +2872,24 @@ impl ChainState {
         self.persist_metadata()
     }
 
-    /// Publish a complete chainstate snapshot during an orderly shutdown.
-    /// IBD deliberately avoids foreground snapshots, so this checkpoint
-    /// bounds the next startup replay without pausing block acceptance.
+    /// Publish durable append-only tips during IBD and a complete snapshot
+    /// after IBD. Constructing a full snapshot duplicates the UTXO and
+    /// spender maps in memory; on a large IBD chain that can turn an orderly
+    /// shutdown into an out-of-memory failure. The existing snapshot plus
+    /// validated deltas is already a complete restart point.
     pub fn checkpoint_for_shutdown(&mut self) -> Result<()> {
-        self.persist_snapshot_with_compaction(!self.initial_block_download)
+        if self.initial_block_download {
+            self.flush_append_only_stores()?;
+            self.persist_metadata()?;
+            self.sync_utxo_store()?;
+            self.sync_electrum_history_store()?;
+            self.persist_tx_counts()?;
+            self.persist_active_chain_tip()?;
+            self.peer_storage_blocks_since_flush = 0;
+            self.peer_storage_bytes_since_flush = 0;
+            return Ok(());
+        }
+        self.persist_snapshot()
     }
 
     /// Verify the block-index parent links, chain-work accumulation, active
@@ -3056,10 +3172,18 @@ impl ChainState {
     /// Rebuilding it is independent from the active UTXO set and therefore
     /// remains useful for historical `gettxspendingprevout` queries.
     pub fn configure_txospender_index(&mut self, enabled: bool) -> Result<()> {
+        let was_enabled = self.txospender_index_enabled;
         self.txospender_index_enabled = enabled;
         if !enabled {
             self.spent_by.clear();
             self.spent_by_needs_reconciliation = false;
+            self.startup_spent_by = None;
+            return Ok(());
+        }
+        // The owning node now supplies this setting before chainstate replay.
+        // Its later configuration pass must not discard the restored map and
+        // rebuild every historical spend a second time.
+        if was_enabled {
             self.startup_spent_by = None;
             return Ok(());
         }
@@ -3082,11 +3206,14 @@ impl ChainState {
             return Ok(false);
         }
 
-        self.spent_by = spent_by;
-        if self.validate_persisted_spent_index().is_err() {
+        if self.validate_persisted_spent_index(&spent_by).is_err() {
             self.spent_by.clear();
             return Ok(false);
         }
+        self.spent_by = spent_by
+            .into_iter()
+            .map(|(outpoint, spender)| Ok((outpoint, ActiveSpender::from_stored(spender)?)))
+            .collect::<Result<_>>()?;
 
         let suffix = self.active_chain[snapshot_chain_len..].to_vec();
         for (offset, hash) in suffix.into_iter().enumerate() {
@@ -5668,9 +5795,17 @@ impl ChainState {
         &self,
         outpoint: &OutPoint,
     ) -> Option<(Txid, usize, BlockHash, u32)> {
-        self.txospender_index_enabled
-            .then(|| self.spent_by.get(outpoint).copied())
-            .flatten()
+        if !self.txospender_index_enabled {
+            return None;
+        }
+        let spender = self.spent_by.get(outpoint)?;
+        let block_hash = *self.active_chain.get(spender.height as usize)?;
+        Some((
+            spender.txid,
+            spender.input_index as usize,
+            block_hash,
+            spender.height,
+        ))
     }
 
     pub fn get_history(&self, script_hash: &str) -> Vec<HistoryEntry> {
@@ -6068,10 +6203,18 @@ impl ChainState {
         let spent_by = self.txospender_index_enabled.then(|| {
             self.spent_by
                 .iter()
-                .filter(|(_, (_, _, block_hash, height))| {
-                    *height <= target_height && active_hashes.contains(block_hash)
+                .filter(|(_, spender)| spender.height <= target_height)
+                .map(|(outpoint, spender)| {
+                    (
+                        *outpoint,
+                        (
+                            spender.txid,
+                            spender.input_index as usize,
+                            self.active_chain[spender.height as usize],
+                            spender.height,
+                        ),
+                    )
                 })
-                .map(|(outpoint, spender)| (*outpoint, *spender))
                 .collect()
         });
         let snapshot = ChainSnapshot {
@@ -7639,11 +7782,7 @@ impl ChainState {
         utxos: &U,
         block_median_time_past: u32,
     ) -> Result<BlockApplication> {
-        let transaction_ids = block
-            .txdata
-            .iter()
-            .map(Transaction::compute_txid)
-            .collect::<Vec<_>>();
+        let transaction_ids = block_transaction_ids(block);
         self.validate_block_transactions_with_txids(
             block,
             &transaction_ids,
@@ -7697,11 +7836,7 @@ impl ChainState {
         block_median_time_past: u32,
         skip_script_checks: bool,
     ) -> Result<BlockApplication> {
-        let transaction_ids = block
-            .txdata
-            .iter()
-            .map(Transaction::compute_txid)
-            .collect::<Vec<_>>();
+        let transaction_ids = block_transaction_ids(block);
         self.validate_block_transactions_with_options_and_txids(
             block,
             &transaction_ids,
@@ -8175,11 +8310,7 @@ impl ChainState {
     ) -> Result<()> {
         let connect_started = Instant::now();
         let height = self.height().saturating_add(1);
-        let transaction_ids = block
-            .txdata
-            .iter()
-            .map(Transaction::compute_txid)
-            .collect::<Vec<_>>();
+        let transaction_ids = block_transaction_ids(block);
         let previous = self.best_hash();
         let previous_node = self
             .block_index
@@ -8241,31 +8372,54 @@ impl ChainState {
         let hash = block.block_hash();
         let spent_entries: HashMap<OutPoint, UtxoEntry> =
             application.spent_entries.iter().cloned().collect();
-        if persist {
+        // Build all transaction-derived chainstate data once. Transaction
+        // output construction and Electrum script hashing are independent
+        // within a validated block, so larger blocks can use the full CPU
+        // while the final state mutation remains deterministically ordered.
+        let delta = self.chainstate_delta_for_block(
+            block,
+            &transaction_ids,
+            height,
+            block_median_time_past,
+            &spent_entries,
+            application.metrics,
+        );
+        let prepare_block = persist && !self.store.contains(&hash);
+        let prepare_delta = persist && !self.chainstate_store.contains(&hash);
+        let prepare_block_record = || -> Result<_> {
+            prepare_block
+                .then(|| BlockStore::prepare_record(block))
+                .transpose()
+        };
+        let prepare_delta_record = || -> Result<_> {
+            if !prepare_delta {
+                return Ok(None);
+            }
+            let bytes = serialize_chainstate_delta(&delta)?;
+            Ok(Some(ChainstateStore::prepare_record(hash, &bytes)?))
+        };
+        let (block_record, delta_record) = if block.txdata.len() >= 32 {
+            let (block_record, delta_record) =
+                rayon::join(prepare_block_record, prepare_delta_record);
+            (block_record?, delta_record?)
+        } else {
+            (prepare_block_record()?, prepare_delta_record()?)
+        };
+        if let Some(record) = block_record {
             if sync_storage {
-                self.store.insert(block)?;
+                self.store.insert_prepared(block, record)?;
             } else {
-                self.store.insert_unsynced(block)?;
+                self.store.insert_prepared_unsynced(block, record)?;
             }
         }
-        if persist {
-            let delta = self.chainstate_delta_for_block(
-                block,
-                &transaction_ids,
-                height,
-                block_median_time_past,
-                &spent_entries,
-                application.metrics,
-            );
-            let bytes = serialize_chainstate_delta(&delta)?;
+        if let Some(record) = delta_record {
             if sync_storage {
-                self.chainstate_store.insert(hash, &bytes)?;
+                self.chainstate_store.insert_prepared(record)?;
             } else {
-                self.chainstate_store.insert_unsynced(hash, &bytes)?;
+                self.chainstate_store.insert_prepared_unsynced(record)?;
             }
         }
         let block_and_delta_storage_finished = Instant::now();
-        let mut created_utxos = Vec::new();
         let removals = application
             .spent_entries
             .iter()
@@ -8275,88 +8429,67 @@ impl ChainState {
             let was_in_utxo_set = if self.utxos_materialized {
                 self.utxos.remove(outpoint).is_some()
             } else {
-                self.utxo_store.get(outpoint)?.is_some()
+                // Validation sourced every older prevout from the durable
+                // UTXO set. Only an output created and spent within this same
+                // block is absent there, so do not repeat a cache/store lookup
+                // for every input after validation.
+                entry.height != height
             };
             if was_in_utxo_set {
                 self.remove_utxo_entry(outpoint, entry);
             }
         }
-        let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
         let mut history_updates = HashMap::new();
-        for (transaction_index, (transaction, txid)) in block
-            .txdata
-            .iter()
-            .zip(transaction_ids.iter().copied())
-            .enumerate()
-        {
-            for (output_index, output) in transaction.output.iter().enumerate() {
-                let outpoint = OutPoint::new(txid, output_index as u32);
-                if !spent_outpoints.contains(&outpoint)
-                    && !is_unspendable_script(&output.script_pubkey)
-                {
-                    let entry = UtxoEntry {
-                        output: output.clone(),
-                        height,
-                        median_time_past: block_median_time_past,
-                        coinbase: transaction_index == 0,
-                    };
-                    created_utxos.push((outpoint, entry.clone()));
-                    self.insert_utxo(outpoint, entry);
-                }
+        let may_overwrite_utxo = is_bip30_repeat(self.network, height, hash);
+        for (outpoint, entry) in &delta.created {
+            if may_overwrite_utxo {
+                self.insert_utxo(*outpoint, entry.clone());
+            } else {
+                self.insert_fresh_utxo(*outpoint, entry.clone());
             }
-            if self.history_index_enabled {
-                let mut affected_scripts = HashSet::new();
-                for input in &transaction.input {
-                    if let Some(entry) = spent_entries.get(&input.previous_output) {
-                        affected_scripts.insert(electrum_script_hash(&entry.output.script_pubkey));
+        }
+        for (script_hash, entry) in &delta.history {
+            if persist {
+                if sync_storage {
+                    self.append_history_update(&mut history_updates, script_hash, entry.clone())?;
+                } else {
+                    let additions = history_updates.entry(script_hash.clone()).or_default();
+                    if additions.last() != Some(entry) {
+                        additions.push(entry.clone());
                     }
                 }
-                for output in &transaction.output {
-                    affected_scripts.insert(electrum_script_hash(&output.script_pubkey));
-                }
-                for script_hash in affected_scripts {
-                    let entry = HistoryEntry { txid, height };
-                    if persist {
-                        if sync_storage {
-                            self.append_history_update(&mut history_updates, &script_hash, entry)?;
-                        } else {
-                            let additions = history_updates.entry(script_hash).or_default();
-                            if additions.last() != Some(&entry) {
-                                additions.push(entry);
-                            }
-                        }
-                    } else if self.history_materialized {
-                        self.add_history(&script_hash, entry);
-                    }
-                }
+            } else if self.history_materialized {
+                self.add_history(script_hash, entry.clone());
             }
-            let location = TxLocation {
-                block_hash: hash,
-                height,
-                transaction_index,
-            };
-            self.index_active_transaction(txid, location.clone())?;
+        }
+        for (txid, location) in &delta.transactions {
+            self.index_active_transaction(*txid, location.clone())?;
             if self.tx_index_all_enabled {
-                let indexed_location = IndexedTxLocation::from_location(&location)?;
+                let indexed_location = IndexedTxLocation::from_location(location)?;
                 if let Some(changes) = tx_index_all_changes.as_deref_mut()
-                    && !changes.contains_key(&txid)
-                    && self.tx_index_all.get(&txid) != Some(&indexed_location)
+                    && !changes.contains_key(txid)
+                    && self.tx_index_all.get(txid) != Some(&indexed_location)
                 {
                     changes.insert(
-                        txid,
+                        *txid,
                         self.tx_index_all
-                            .get(&txid)
+                            .get(txid)
                             .map(|location| location.to_location()),
                     );
                 }
-                self.tx_index_all.insert(txid, indexed_location);
+                self.tx_index_all.insert(*txid, indexed_location);
             }
         }
         if persist {
-            self.persist_transaction_index_for_block_with_sync(block, sync_storage)?;
+            self.persist_transaction_index_for_block_with_txids_and_sync(
+                block,
+                &transaction_ids,
+                sync_storage,
+            )?;
         }
         if persist {
-            let additions = created_utxos
+            let additions = delta
+                .created
                 .iter()
                 .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
                 .collect::<Vec<_>>();
@@ -8383,12 +8516,15 @@ impl ChainState {
                 // next connected block. Reorgs are exceptional; normal IBD
                 // must not rebuild this active-chain set and scan the entire
                 // spender map for every connected block.
-                let active_blocks: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
+                let active_height = self.active_chain.len().saturating_sub(1) as u32;
                 self.spent_by
-                    .retain(|_, (_, _, block_hash, _)| active_blocks.contains(block_hash));
+                    .retain(|_, spender| spender.height <= active_height);
                 self.spent_by_needs_reconciliation = false;
             }
-            self.index_block_spends(block, height);
+            for (outpoint, spender) in &delta.spent_by {
+                self.spent_by
+                    .insert(*outpoint, ActiveSpender::from_stored(*spender)?);
+            }
         }
         self.active_chain.push(hash);
         if height >= self.deployment_parameters.buried.segwit {
@@ -8482,56 +8618,99 @@ impl ChainState {
     ) -> ChainstateDelta {
         let block_hash = block.block_hash();
         let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
-        let mut created = Vec::new();
-        let mut transactions = Vec::with_capacity(block.txdata.len());
-        let mut history = Vec::new();
-        let mut spent_by = Vec::new();
-        for (transaction_index, (transaction, txid)) in block
-            .txdata
-            .iter()
-            .zip(transaction_ids.iter().copied())
-            .enumerate()
-        {
-            transactions.push((
-                txid,
-                TxLocation {
-                    block_hash,
-                    height,
-                    transaction_index,
-                },
-            ));
-            let mut affected_scripts = HashSet::new();
-            for (input_index, input) in transaction.input.iter().enumerate() {
-                if let Some(entry) = spent_entries.get(&input.previous_output) {
-                    affected_scripts.insert(electrum_script_hash(&entry.output.script_pubkey));
+        let history_index_enabled = self.history_index_enabled;
+        let txospender_index_enabled = self.txospender_index_enabled;
+        let prepare_transaction =
+            |(transaction_index, (transaction, txid)): (usize, (&Transaction, &Txid))| {
+                let txid = *txid;
+                let mut created = Vec::new();
+                let mut affected_scripts = Vec::new();
+                let mut spent_by = Vec::new();
+                for (input_index, input) in transaction.input.iter().enumerate() {
+                    if history_index_enabled
+                        && let Some(entry) = spent_entries.get(&input.previous_output)
+                    {
+                        let script_hash = electrum_script_hash(&entry.output.script_pubkey);
+                        if !affected_scripts.contains(&script_hash) {
+                            affected_scripts.push(script_hash);
+                        }
+                    }
+                    if txospender_index_enabled && !input.previous_output.is_null() {
+                        spent_by.push((
+                            input.previous_output,
+                            (txid, input_index, block_hash, height),
+                        ));
+                    }
                 }
-                if self.txospender_index_enabled && !input.previous_output.is_null() {
-                    spent_by.push((
-                        input.previous_output,
-                        (txid, input_index, block_hash, height),
-                    ));
+                for (output_index, output) in transaction.output.iter().enumerate() {
+                    let outpoint = OutPoint::new(txid, output_index as u32);
+                    if !spent_outpoints.contains(&outpoint)
+                        && !is_unspendable_script(&output.script_pubkey)
+                    {
+                        created.push((
+                            outpoint,
+                            UtxoEntry {
+                                output: output.clone(),
+                                height,
+                                median_time_past,
+                                coinbase: transaction_index == 0,
+                            },
+                        ));
+                    }
+                    if history_index_enabled {
+                        let script_hash = electrum_script_hash(&output.script_pubkey);
+                        if !affected_scripts.contains(&script_hash) {
+                            affected_scripts.push(script_hash);
+                        }
+                    }
                 }
-            }
-            for (output_index, output) in transaction.output.iter().enumerate() {
-                let outpoint = OutPoint::new(txid, output_index as u32);
-                if !spent_outpoints.contains(&outpoint)
-                    && !is_unspendable_script(&output.script_pubkey)
-                {
-                    created.push((
-                        outpoint,
-                        UtxoEntry {
-                            output: output.clone(),
+                let history = affected_scripts
+                    .into_iter()
+                    .map(|script_hash| (script_hash, HistoryEntry { txid, height }))
+                    .collect();
+                PreparedTransactionDelta {
+                    transaction: (
+                        txid,
+                        TxLocation {
+                            block_hash,
                             height,
-                            median_time_past,
-                            coinbase: transaction_index == 0,
+                            transaction_index,
                         },
-                    ));
+                    ),
+                    created,
+                    history,
+                    spent_by,
                 }
-                affected_scripts.insert(electrum_script_hash(&output.script_pubkey));
-            }
-            for script_hash in affected_scripts {
-                history.push((script_hash, HistoryEntry { txid, height }));
-            }
+            };
+        let prepared = if block.txdata.len() >= 32 {
+            block
+                .txdata
+                .par_iter()
+                .zip(transaction_ids.par_iter())
+                .enumerate()
+                .map(prepare_transaction)
+                .collect::<Vec<_>>()
+        } else {
+            block
+                .txdata
+                .iter()
+                .zip(transaction_ids.iter())
+                .enumerate()
+                .map(prepare_transaction)
+                .collect::<Vec<_>>()
+        };
+        let created_capacity = prepared.iter().map(|entry| entry.created.len()).sum();
+        let history_capacity = prepared.iter().map(|entry| entry.history.len()).sum();
+        let spent_by_capacity = prepared.iter().map(|entry| entry.spent_by.len()).sum();
+        let mut created = Vec::with_capacity(created_capacity);
+        let mut transactions = Vec::with_capacity(prepared.len());
+        let mut history = Vec::with_capacity(history_capacity);
+        let mut spent_by = Vec::with_capacity(spent_by_capacity);
+        for prepared_transaction in prepared {
+            transactions.push(prepared_transaction.transaction);
+            created.extend(prepared_transaction.created);
+            history.extend(prepared_transaction.history);
+            spent_by.extend(prepared_transaction.spent_by);
         }
         ChainstateDelta {
             block_hash,
@@ -8971,19 +9150,22 @@ impl ChainState {
                     .unwrap_or_default()
                     .to_vec();
                 self.active_tx_totals = cumulative_tx_counts(&self.active_tx_counts);
-                if self.txospender_index_enabled {
-                    // Core's txospender index rewinds asynchronously.  Keep
-                    // the previous map visible while the chain transition is
-                    // reported, then let the next connected block overwrite
-                    // or remove entries from the disconnected branch.
-                    self.spent_by = old_spent_by.clone();
-                    if self.spent_by.is_empty() {
-                        self.spent_by = snapshot.spent_by.unwrap_or_default();
-                    }
-                    self.spent_by_needs_reconciliation = true;
-                }
+                let snapshot_spent_by = snapshot.spent_by;
                 let headers = self.headers.clone();
                 self.index_active_headers(&headers)?;
+                if self.txospender_index_enabled {
+                    if let Some(spent_by) = snapshot_spent_by {
+                        self.validate_persisted_spent_index(&spent_by)?;
+                        self.spent_by = spent_by
+                            .into_iter()
+                            .map(|(outpoint, spender)| {
+                                Ok((outpoint, ActiveSpender::from_stored(spender)?))
+                            })
+                            .collect::<Result<_>>()?;
+                    } else {
+                        self.rebuild_spent_index()?;
+                    }
+                }
                 if let Some(stats) = self.coin_stats.as_mut() {
                     *stats = CoinStatsState::from_utxos(&self.utxos);
                     if let Some(record) = self.coinstats_store.get(&path[snapshot_chain_len - 1])? {
@@ -9265,14 +9447,13 @@ impl ChainState {
             self.spent_by.clear();
             self.spent_by_needs_reconciliation = false;
         } else if !disconnected.is_empty() {
-            self.spent_by_needs_reconciliation = true;
+            // Heights above the fork point all belong to the disconnected
+            // branch. Remove them before candidate blocks are indexed so the
+            // compact runtime value does not need to retain a block hash.
+            self.spent_by
+                .retain(|_, spender| spender.height <= common_height);
+            self.spent_by_needs_reconciliation = false;
         }
-        // Core's txospender index rewinds asynchronously. Keep entries from
-        // the disconnected suffix visible until the next persisted block
-        // connection, where connect_block_internal reconciles them. Candidate
-        // blocks connected as part of this transition may overwrite matching
-        // outpoints without prematurely hiding the old branch from
-        // gettxspendingprevout.
 
         if self.coinstats_index_enabled {
             let mut stats = CoinStatsState::from_utxos(&self.utxos);
@@ -9744,22 +9925,22 @@ impl ChainState {
     }
 
     fn index_block_spends(&mut self, block: &Block, height: u32) {
-        self.index_transaction_spends(&block.txdata, block.block_hash(), height);
+        self.index_transaction_spends(&block.txdata, height);
     }
 
-    fn index_transaction_spends(
-        &mut self,
-        transactions: &[Transaction],
-        block_hash: BlockHash,
-        height: u32,
-    ) {
+    fn index_transaction_spends(&mut self, transactions: &[Transaction], height: u32) {
         for transaction in transactions {
             let txid = transaction.compute_txid();
             for (input_index, input) in transaction.input.iter().enumerate() {
                 if !input.previous_output.is_null() {
                     self.spent_by.insert(
                         input.previous_output,
-                        (txid, input_index, block_hash, height),
+                        ActiveSpender {
+                            txid,
+                            input_index: u32::try_from(input_index)
+                                .expect("consensus block input index fits u32"),
+                            height,
+                        },
                     );
                 }
             }
@@ -9799,16 +9980,20 @@ impl ChainState {
             let transactions = store.transactions_for_blocks(&hashes)?;
             for (hash, height) in pruned_blocks {
                 if let Some(block_transactions) = transactions.get(&hash) {
-                    self.index_transaction_spends(block_transactions, hash, height);
+                    self.index_transaction_spends(block_transactions, height);
                 }
             }
         }
         Ok(())
     }
 
-    fn validate_persisted_spent_index(&self) -> Result<()> {
+    fn validate_persisted_spent_index(
+        &self,
+        spent_by: &HashMap<OutPoint, SpentTransaction>,
+    ) -> Result<()> {
         let active_chain: HashSet<BlockHash> = self.active_chain.iter().copied().collect();
-        for (outpoint, (txid, _input_index, block_hash, height)) in &self.spent_by {
+        for (outpoint, (txid, input_index, block_hash, height)) in spent_by {
+            u32::try_from(*input_index).context("spender input index does not fit u32")?;
             let node = self
                 .block_index
                 .get(block_hash)
@@ -9917,14 +10102,29 @@ impl ChainState {
             .iter()
             .map(Transaction::compute_txid)
             .collect::<Vec<_>>();
+        self.persist_transaction_index_for_block_with_txids_and_sync(block, &txids, sync)
+    }
+
+    fn persist_transaction_index_for_block_with_txids_and_sync(
+        &mut self,
+        block: &Block,
+        txids: &[Txid],
+        sync: bool,
+    ) -> Result<()> {
+        if !self.tx_index_all_enabled {
+            return Ok(());
+        }
+        if txids.len() != block.txdata.len() {
+            bail!("cached transaction ID count does not match block")
+        }
         let store = self
             .tx_index_store
             .as_mut()
             .context("transaction index store is not initialized")?;
         if sync {
-            store.insert(block.block_hash(), &txids)
+            store.insert(block.block_hash(), txids)
         } else {
-            store.insert_unsynced(block.block_hash(), &txids)
+            store.insert_unsynced(block.block_hash(), txids)
         }
     }
 
@@ -10106,28 +10306,42 @@ impl ChainState {
         if !self.history_index_enabled || updates.is_empty() {
             return Ok(());
         }
+        if self.history_materialized {
+            let store_updates = updates
+                .iter()
+                .map(|(script_hash, entries)| {
+                    (
+                        script_hash.clone(),
+                        entries
+                            .iter()
+                            .map(|entry| (entry.txid, entry.height))
+                            .collect(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.electrum_history_store
+                .append_entries_unsynced(&store_updates)?;
+            for (script_hash, entries) in updates {
+                for entry in entries {
+                    self.add_history(&script_hash, entry);
+                }
+            }
+            return Ok(());
+        }
         let store_updates = updates
-            .iter()
+            .into_iter()
             .map(|(script_hash, entries)| {
                 (
-                    script_hash.clone(),
+                    script_hash,
                     entries
-                        .iter()
+                        .into_iter()
                         .map(|entry| (entry.txid, entry.height))
                         .collect(),
                 )
             })
             .collect::<Vec<_>>();
         self.electrum_history_store
-            .append_entries_unsynced(&store_updates)?;
-        if self.history_materialized {
-            for (script_hash, entries) in updates {
-                for entry in entries {
-                    self.add_history(&script_hash, entry);
-                }
-            }
-        }
-        Ok(())
+            .append_entries_owned_unsynced(store_updates)
     }
 
     fn active_utxo_entries_for_read(&self) -> Vec<(OutPoint, UtxoEntry)> {
@@ -10171,6 +10385,7 @@ impl ChainState {
     fn release_materialized_history(&mut self) {
         self.history = HashMap::new();
         self.history_materialized = false;
+        trim_process_heap();
     }
 
     fn utxo_store_tip_path(&self) -> PathBuf {
@@ -10343,6 +10558,21 @@ impl ChainState {
             if let Some(stats) = self.coin_stats.as_mut() {
                 stats.remove(&outpoint, &Self::decoded_utxo(previous));
             }
+        }
+        if let Some(stats) = self.coin_stats.as_mut() {
+            stats.add(&outpoint, &entry);
+        }
+    }
+
+    /// Insert an output from a block that has already passed BIP30 checks.
+    /// Except for the two explicitly exempt historical mainnet blocks,
+    /// validation guarantees that the outpoint cannot overwrite a live coin.
+    /// Keeping that fact avoids a second UTXO-index/cache lookup per output.
+    fn insert_fresh_utxo(&mut self, outpoint: OutPoint, entry: UtxoEntry) {
+        self.missing_utxo_cache.lock().remove(&outpoint);
+        if self.utxos_materialized {
+            debug_assert!(!self.utxos.contains_key(&outpoint));
+            self.utxos.insert(outpoint, entry.clone());
         }
         if let Some(stats) = self.coin_stats.as_mut() {
             stats.add(&outpoint, &entry);
@@ -10711,62 +10941,35 @@ impl ChainState {
         Ok(Some((snapshot, verified)))
     }
 
-    /// Load the durable mutation suffix after a full chainstate snapshot.
-    /// The log is deliberately advisory: any missing, malformed, or
-    /// mismatched record returns `None`, and startup falls back to ordinary
-    /// consensus replay from the snapshot.
-    fn load_chainstate_deltas(
+    /// Validate a durable mutation suffix without retaining every decoded
+    /// block delta. Long IBD suffixes can contain many gigabytes of expanded
+    /// UTXO and history data even though each record is compressed on disk;
+    /// streaming bounds startup memory to the snapshot plus net UTXO changes.
+    fn validate_chainstate_delta_suffix(
         &mut self,
         active_chain: &[BlockHash],
         start_height: usize,
-    ) -> Option<Vec<ChainstateDelta>> {
+    ) -> Result<()> {
         if start_height >= active_chain.len() {
-            return Some(Vec::new());
+            return Ok(());
         }
-        let mut parent_hash = *active_chain.get(start_height.checked_sub(1)?)?;
+        let mut parent_hash = *active_chain
+            .get(start_height.saturating_sub(1))
+            .context("chainstate delta suffix has no parent")?;
         let total = active_chain.len() - start_height;
         let target_height = active_chain.len().saturating_sub(1);
         let started = Instant::now();
-        let mut deltas = Vec::with_capacity(total);
-        for (height, block_hash) in active_chain.iter().enumerate().skip(start_height) {
-            let bytes = self.chainstate_store.get(block_hash).ok().flatten()?;
-            let delta = deserialize_chainstate_delta(&bytes).ok()?;
-            if delta.block_hash != *block_hash
-                || delta.parent_hash != parent_hash
-                || delta.height != u32::try_from(height).ok()?
-                || delta.transactions.is_empty()
-                || delta.transactions.iter().any(|(_, location)| {
-                    location.block_hash != *block_hash
-                        || location.height != u32::try_from(height).unwrap_or(u32::MAX)
-                })
-            {
-                return None;
-            }
-            parent_hash = *block_hash;
-            deltas.push(delta);
-            log_replay_progress(
-                "load-deltas",
-                deltas.len(),
-                total,
-                height,
-                target_height,
-                started,
-            );
-        }
-        Some(deltas)
-    }
-
-    fn validate_chainstate_deltas(&self, deltas: &[ChainstateDelta]) -> Result<()> {
-        let mut parent_hash = self.best_hash();
-        let mut height = u32::try_from(self.active_chain.len())
-            .context("active chain height does not fit u32")?;
-        let target_height = deltas
-            .last()
-            .map_or_else(|| self.height() as usize, |delta| delta.height as usize);
-        let started = Instant::now();
         let mut touched = HashMap::<OutPoint, Option<UtxoEntry>>::new();
-        for (offset, delta) in deltas.iter().enumerate() {
-            if delta.height != height
+        for (height, block_hash) in active_chain.iter().enumerate().skip(start_height) {
+            let bytes = self
+                .chainstate_store
+                .get(block_hash)?
+                .with_context(|| format!("chainstate delta for {block_hash} is missing"))?;
+            let delta = deserialize_chainstate_delta(&bytes)?;
+            let expected_height =
+                u32::try_from(height).context("chainstate delta height does not fit u32")?;
+            if delta.block_hash != *block_hash
+                || delta.height != expected_height
                 || delta.parent_hash != parent_hash
                 || delta.transactions.is_empty()
             {
@@ -10798,23 +11001,42 @@ impl ChainState {
                     // snapshot-prefix UTXO set.
                     continue;
                 }
-                let current = match touched.get(outpoint) {
-                    Some(current) => current.as_ref(),
-                    None => self.utxos.get(outpoint),
+                match touched.get(outpoint) {
+                    Some(Some(current)) => {
+                        if current != entry {
+                            bail!(
+                                "chainstate delta at height {} spent output metadata does not match for {outpoint}",
+                                delta.height
+                            )
+                        }
+                        // A suffix-created coin that is later spent has no
+                        // net effect relative to the snapshot. Removing it
+                        // keeps the validation map proportional to the live
+                        // state instead of all historical suffix outputs.
+                        touched.remove(outpoint);
+                    }
+                    Some(None) => {
+                        bail!(
+                            "chainstate delta at height {} spends missing output {outpoint}",
+                            delta.height
+                        )
+                    }
+                    None => {
+                        let current = self.utxos.get(outpoint).with_context(|| {
+                            format!(
+                                "chainstate delta at height {} spends missing output {outpoint}",
+                                delta.height
+                            )
+                        })?;
+                        if current != entry {
+                            bail!(
+                                "chainstate delta at height {} spent output metadata does not match for {outpoint}",
+                                delta.height
+                            )
+                        }
+                        touched.insert(*outpoint, None);
+                    }
                 }
-                .with_context(|| {
-                    format!(
-                        "chainstate delta at height {} spends missing output {outpoint}",
-                        delta.height
-                    )
-                })?;
-                if current != entry {
-                    bail!(
-                        "chainstate delta at height {} spent output metadata does not match for {outpoint}",
-                        delta.height
-                    )
-                }
-                touched.insert(*outpoint, None);
             }
             for (outpoint, entry) in &delta.created {
                 if entry.height != delta.height || entry.output.value > Amount::MAX_MONEY {
@@ -10838,11 +11060,10 @@ impl ChainState {
                 }
             }
             parent_hash = delta.block_hash;
-            height = height.saturating_add(1);
             log_replay_progress(
                 "validate-deltas",
-                offset + 1,
-                deltas.len(),
+                height - start_height + 1,
+                total,
                 delta.height as usize,
                 target_height,
                 started,
@@ -10922,7 +11143,8 @@ impl ChainState {
         }
         if self.txospender_index_enabled {
             for (outpoint, spender) in delta.spent_by {
-                self.spent_by.insert(outpoint, spender);
+                self.spent_by
+                    .insert(outpoint, ActiveSpender::from_stored(spender)?);
             }
         }
         self.active_chain.push(delta.block_hash);
@@ -11193,7 +11415,22 @@ impl ChainState {
                 // in the generic chainstate checkpoint.
                 HashMap::new()
             },
-            spent_by: self.txospender_index_enabled.then(|| self.spent_by.clone()),
+            spent_by: self.txospender_index_enabled.then(|| {
+                self.spent_by
+                    .iter()
+                    .map(|(outpoint, spender)| {
+                        (
+                            *outpoint,
+                            (
+                                spender.txid,
+                                spender.input_index as usize,
+                                self.active_chain[spender.height as usize],
+                                spender.height,
+                            ),
+                        )
+                    })
+                    .collect()
+            }),
             prune_height: self.prune_height,
         })
     }
@@ -11548,7 +11785,7 @@ fn open_background_replay_state(
         history: HashMap::new(),
         history_materialized: true,
         history_index_enabled: true,
-        spent_by: HashMap::new(),
+        spent_by: FastHashMap::new(),
         spent_by_needs_reconciliation: false,
         startup_spent_by: None,
         precious_blocks: HashMap::new(),
@@ -12913,6 +13150,24 @@ mod tests {
     }
 
     #[test]
+    fn ibd_shutdown_keeps_the_existing_snapshot_and_durable_delta_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let snapshot_path = directory.path().join("chainstate.snapshot");
+        state.persist_snapshot().unwrap();
+        let snapshot_before = fs::read(&snapshot_path).unwrap();
+
+        state.connect_block(mine_block(&state, 1)).unwrap();
+        assert!(state.is_initial_block_download());
+        state.checkpoint_for_shutdown().unwrap();
+        assert_eq!(fs::read(&snapshot_path).unwrap(), snapshot_before);
+        drop(state);
+
+        let reopened = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        assert_eq!(reopened.height(), 1);
+    }
+
+    #[test]
     fn verification_progress_matches_core_recent_header_adjustment() {
         let directory = tempfile::tempdir().unwrap();
         let state = ChainState::open(Network::Regtest, directory.path()).unwrap();
@@ -13739,18 +13994,27 @@ mod tests {
         state.configure_txospender_index(true).unwrap();
 
         let first = mine_block(&state, 1);
-        let first_hash = first.block_hash();
         let first_txid = first.txdata[0].compute_txid();
         state.connect_block(first).unwrap();
 
         let active_outpoint = OutPoint::new(first_txid, 0);
         let stale_outpoint = OutPoint::new(first_txid, 1);
-        state
-            .spent_by
-            .insert(active_outpoint, (first_txid, 0, first_hash, 1));
-        state
-            .spent_by
-            .insert(stale_outpoint, (first_txid, 0, BlockHash::all_zeros(), 1));
+        state.spent_by.insert(
+            active_outpoint,
+            ActiveSpender {
+                txid: first_txid,
+                input_index: 0,
+                height: 1,
+            },
+        );
+        state.spent_by.insert(
+            stale_outpoint,
+            ActiveSpender {
+                txid: first_txid,
+                input_index: 0,
+                height: 3,
+            },
+        );
 
         state.connect_block(mine_block(&state, 2)).unwrap();
         assert!(state.spent_by.contains_key(&stale_outpoint));
@@ -13760,6 +14024,25 @@ mod tests {
         assert!(state.spent_by.contains_key(&active_outpoint));
         assert!(!state.spent_by.contains_key(&stale_outpoint));
         assert!(!state.spent_by_needs_reconciliation);
+    }
+
+    #[test]
+    fn enabling_an_enabled_spender_index_does_not_rebuild_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        state.configure_txospender_index(true).unwrap();
+        let outpoint = OutPoint::new(Txid::from_byte_array([42; 32]), 0);
+        state.spent_by.insert(
+            outpoint,
+            ActiveSpender {
+                txid: Txid::from_byte_array([43; 32]),
+                input_index: 1,
+                height: 0,
+            },
+        );
+
+        state.configure_txospender_index(true).unwrap();
+        assert!(state.spent_by.contains_key(&outpoint));
     }
 
     #[test]
@@ -14238,6 +14521,7 @@ mod tests {
             None,
             false,
             validation::DeploymentParameters::for_network(Network::Regtest),
+            false,
             false,
         )
         .unwrap();

@@ -2032,6 +2032,7 @@ impl Node {
                 config.blocks_xor,
                 deployment_parameters,
                 config.electrum_bind.is_some(),
+                config.txospenderindex || config.electrum_bind.is_some(),
             )
             .map_err(core_startup_chain_error)?;
         chain.set_shutdown_interrupt(shutdown_requested.clone());

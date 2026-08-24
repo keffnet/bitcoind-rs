@@ -21,8 +21,8 @@ use crate::config::{
     DEFAULT_ACCEPT_DATACARRIER, DEFAULT_BYTES_PER_SIGOP, DEFAULT_CLUSTER_COUNT,
     DEFAULT_CLUSTER_SIZE_KVB, DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
     DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB, DEFAULT_MAX_DATACARRIER_BYTES,
-    DEFAULT_MAX_TX_LEGACY_SIGOPS, DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB,
-    DEFAULT_PERMIT_BARE_MULTISIG, MAX_CLUSTER_COUNT_LIMIT,
+    DEFAULT_MAX_SCRIPT_SIZE_POLICY, DEFAULT_MAX_TX_LEGACY_SIGOPS,
+    DEFAULT_MIN_RELAY_TX_FEE_SAT_PER_KVB, DEFAULT_PERMIT_BARE_MULTISIG, MAX_CLUSTER_COUNT_LIMIT,
 };
 use crate::script::core_multisig_solution;
 use crate::time;
@@ -39,6 +39,9 @@ const ROLLING_FEE_HALFLIFE_SECS: f64 = 12.0 * 60.0 * 60.0;
 const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 const MAX_STANDARD_TX_SIGOPS_COST: usize = validation::MAX_BLOCK_SIGOP_COST / 5;
 const MIN_STANDARD_TX_NONWITNESS_SIZE: usize = 65;
+/// Core's extra descendant count/size allowance for the single-tx CPFP
+/// carve-out. The size value is expressed in virtual bytes.
+const EXTRA_DESCENDANT_TX_SIZE_LIMIT: u64 = 10_000;
 const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1_650;
 const MAX_SCRIPT_SIZE: usize = 10_000;
 /// BIP 431/TRUC transaction version and topology limits.
@@ -90,6 +93,7 @@ pub struct MempoolPolicy {
     pub incremental_relay_fee_sat_per_kvb: u64,
     pub dust_relay_fee_sat_per_kvb: u64,
     pub bytes_per_sigop: u64,
+    pub max_script_size: usize,
     pub max_tx_legacy_sigops: usize,
     pub max_datacarrier_bytes: Option<usize>,
     pub datacarrier_fullcount: bool,
@@ -114,6 +118,8 @@ impl Default for MempoolPolicy {
             incremental_relay_fee_sat_per_kvb: DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB,
             dust_relay_fee_sat_per_kvb: DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB,
             bytes_per_sigop: DEFAULT_BYTES_PER_SIGOP,
+            max_script_size: usize::try_from(DEFAULT_MAX_SCRIPT_SIZE_POLICY)
+                .expect("constant fits usize"),
             max_tx_legacy_sigops: usize::try_from(DEFAULT_MAX_TX_LEGACY_SIGOPS)
                 .expect("constant fits usize"),
             max_datacarrier_bytes: DEFAULT_ACCEPT_DATACARRIER
@@ -517,6 +523,10 @@ pub struct Mempool {
     pub network: Network,
     policy: MempoolPolicy,
     max_bytes: usize,
+    /// Optional Electrum-only scripthash index. Keeping it out of the normal
+    /// mempool avoids charging Core-compatible maxmempool accounting for an
+    /// index that is disabled by default.
+    electrum_index_enabled: bool,
     /// Estimated dynamic memory used by admitted entries and their indexes.
     /// This is separate from `bytes`, which is the serialized transaction
     /// total retained for diagnostics and Core's vsize `bytes` field.
@@ -610,7 +620,7 @@ pub enum MempoolError {
     #[error("bip125-replacement-disallowed")]
     ReplacementDisallowed,
     #[error(
-        "too many potential replacements, rejecting replacement {txid}; too many conflicting clusters ({count} > {limit})"
+        "too many potential replacements, rejecting replacement {txid}; too many potential replacements ({count} > {limit})"
     )]
     TooManyReplacementCandidates {
         txid: Txid,
@@ -627,6 +637,8 @@ pub enum MempoolError {
     ReplacementUnconfirmedInput,
     #[error("package RBF failed: package must be 1-parent-1-child")]
     PackageRbfWrongSize,
+    #[error("package RBF failed: {0}")]
+    PackageRbfConflictTopology(String),
     #[error("insufficient feerate: does not improve feerate diagram")]
     ReplacementFeerateDiagram,
     #[error("transaction {0} input is missing")]
@@ -674,9 +686,8 @@ pub enum MempoolError {
     #[error("too-long-mempool-chain, {0}")]
     MempoolLimits(String),
     // Store Core's stable reject reason together with its human-readable
-    // debug context. Core exposes TRUC policy failures as
-    // `TRUC-violation, <debug>` in RPC errors and uses `TRUC-violation` as
-    // the short reject reason.
+    // debug context. Core exposes these policy failures as
+    // `<reject-reason>, <debug>` in RPC errors.
     #[error("{0}")]
     Truc(String),
 }
@@ -742,8 +753,8 @@ impl MempoolError {
     }
 }
 
-fn truc_error(_reason: &'static str, debug: String) -> MempoolError {
-    MempoolError::Truc(format!("TRUC-violation, {debug}"))
+fn truc_error(reason: &'static str, debug: String) -> MempoolError {
+    MempoolError::Truc(format!("{reason}, {debug}"))
 }
 
 /// The package test-accept path needs to preserve the first transaction that
@@ -796,10 +807,20 @@ impl Mempool {
         max_bytes: usize,
         policy: MempoolPolicy,
     ) -> Self {
+        Self::with_max_bytes_and_policy_and_electrum_index(network, max_bytes, policy, true)
+    }
+
+    pub fn with_max_bytes_and_policy_and_electrum_index(
+        network: Network,
+        max_bytes: usize,
+        policy: MempoolPolicy,
+        electrum_index_enabled: bool,
+    ) -> Self {
         Self {
             network,
             policy,
             max_bytes: max_bytes.max(1),
+            electrum_index_enabled,
             memory_usage: 0,
             bytes: 0,
             vbytes: 0,
@@ -1060,11 +1081,12 @@ impl Mempool {
         if self.wtxids != expected_wtxids {
             bail!("mempool wtxid index is inconsistent");
         }
-        if self.scripts_by_transaction.len() != self.entries.len()
-            || self
-                .scripts_by_transaction
-                .keys()
-                .any(|txid| !self.entries.contains_key(txid))
+        if self.electrum_index_enabled
+            && (self.scripts_by_transaction.len() != self.entries.len()
+                || self
+                    .scripts_by_transaction
+                    .keys()
+                    .any(|txid| !self.entries.contains_key(txid)))
         {
             bail!("mempool scripthash transaction index is inconsistent");
         }
@@ -1091,11 +1113,12 @@ impl Mempool {
                 bail!("mempool scripthash forward index is inconsistent");
             }
         }
-        if self.input_script_values_by_transaction.len() != self.entries.len()
-            || self
-                .input_script_values_by_transaction
-                .keys()
-                .any(|txid| !self.entries.contains_key(txid))
+        if self.electrum_index_enabled
+            && (self.input_script_values_by_transaction.len() != self.entries.len()
+                || self
+                    .input_script_values_by_transaction
+                    .keys()
+                    .any(|txid| !self.entries.contains_key(txid)))
         {
             bail!("mempool scripthash input-value index is inconsistent");
         }
@@ -1171,6 +1194,9 @@ impl Mempool {
     }
 
     fn scripthash_index_memory_usage_for(&self, txid: &Txid) -> usize {
+        if !self.electrum_index_enabled {
+            return 0;
+        }
         let Some(scripts) = self.scripts_by_transaction.get(txid) else {
             return 0;
         };
@@ -1220,6 +1246,9 @@ impl Mempool {
         scripts: Vec<String>,
         input_script_values: Vec<(String, u64)>,
     ) {
+        if !self.electrum_index_enabled {
+            return;
+        }
         for script_hash in &scripts {
             self.transactions_by_script
                 .entry(script_hash.clone())
@@ -1441,11 +1470,41 @@ impl Mempool {
         ordered
     }
 
-    /// Return the topology-aware score order used by Core's mempool
-    /// enumeration APIs. With no practical weight limit this includes every
-    /// entry while still placing ancestors before children.
+    /// Return the topology-aware relay order used by Core's mempool
+    /// enumeration APIs. Core orders by ancestor depth first, then by the
+    /// transaction's own feerate (without prioritisation deltas), with a
+    /// deterministic txid tie-break. This is intentionally separate from
+    /// block assembly, whose package feerate order is exposed by
+    /// `mining_order`.
     pub fn main_order(&self) -> Vec<Txid> {
-        self.mining_order_internal(u64::MAX, 0, false)
+        let mut ancestor_counts = HashMap::with_capacity(self.entries.len());
+        for (txid, entry) in &self.entries {
+            let count = self
+                .ancestors_for_transaction(&entry.transaction)
+                .len()
+                .saturating_add(1);
+            ancestor_counts.insert(*txid, count);
+        }
+
+        let mut transaction_ids: Vec<Txid> = self.entries.keys().copied().collect();
+        transaction_ids.sort_by(|left, right| {
+            ancestor_counts[left]
+                .cmp(&ancestor_counts[right])
+                .then_with(|| {
+                    let left_entry = &self.entries[left];
+                    let right_entry = &self.entries[right];
+                    let left_score = i128::from(left_entry.fee_sat)
+                        .saturating_mul(i128::from(right_entry.vsize));
+                    let right_score = i128::from(right_entry.fee_sat)
+                        .saturating_mul(i128::from(left_entry.vsize));
+                    // Higher feerate sorts first, matching Core's
+                    // CompareTxMemPoolEntryByScore.
+                    right_score.cmp(&left_score)
+                })
+                // Core's equal-feerate tie-break sorts the larger txid first.
+                .then_with(|| right.cmp(left))
+        });
+        transaction_ids
     }
 
     /// Return transactions in ancestor-package feerate order for block
@@ -1856,7 +1915,7 @@ impl Mempool {
         transaction: Transaction,
         chain: &ChainState,
     ) -> Result<Txid, MempoolError> {
-        self.accept_with_sibling(transaction, chain, true)
+        self.accept_with_sibling(transaction, chain, true, true)
     }
 
     /// Validate a transaction without Core's single-transaction TRUC sibling
@@ -1867,7 +1926,7 @@ impl Mempool {
         transaction: Transaction,
         chain: &ChainState,
     ) -> Result<Txid, MempoolError> {
-        self.accept_with_sibling(transaction, chain, false)
+        self.accept_with_sibling(transaction, chain, false, false)
     }
 
     /// Validate a transaction for testmempoolaccept on a cloned mempool.
@@ -1879,7 +1938,7 @@ impl Mempool {
         chain: &ChainState,
     ) -> Result<Txid, MempoolError> {
         let conflicts = self.conflicts_for(&transaction);
-        match self.accept(transaction, chain) {
+        match self.accept_with_sibling(transaction, chain, false, false) {
             // Core's single-transaction testmempoolaccept path permits a
             // replacement attempt, but reports a non-replaceable conflict as
             // txn-mempool-conflict rather than the package-only
@@ -1895,6 +1954,19 @@ impl Mempool {
         }
     }
 
+    /// Validate a transaction using Core's `SingleInPackageAccept` policy.
+    ///
+    /// Package submission keeps the single-transaction replacement and TRUC
+    /// sibling-eviction rules, but disables the ordinary CPFP carve-out while
+    /// deciding whether a package member can be admitted independently.
+    pub(crate) fn accept_for_package(
+        &mut self,
+        transaction: Transaction,
+        chain: &ChainState,
+    ) -> Result<Txid, MempoolError> {
+        self.accept_with_sibling(transaction, chain, true, false)
+    }
+
     /// Admit a transaction while suppressing the standardness checks selected
     /// by Core's `sendrawtransaction(ignore_rejects=...)` compatibility path.
     /// Consensus, fee, replacement, and cluster checks remain enabled.
@@ -1905,7 +1977,7 @@ impl Mempool {
     ) -> Result<Txid, MempoolError> {
         let require_standard = self.policy.require_standard;
         self.policy.require_standard = false;
-        let result = self.accept_with_sibling(transaction, chain, true);
+        let result = self.accept_with_sibling(transaction, chain, true, true);
         self.policy.require_standard = require_standard;
         result
     }
@@ -1915,9 +1987,17 @@ impl Mempool {
         transaction: Transaction,
         chain: &ChainState,
         allow_sibling_eviction: bool,
+        allow_cpfp_carveout: bool,
     ) -> Result<Txid, MempoolError> {
         let added_at = time::unix_time();
-        match self.accept_at(transaction.clone(), chain, added_at) {
+        match self.accept_at_with_options(
+            transaction.clone(),
+            chain,
+            added_at,
+            true,
+            true,
+            allow_cpfp_carveout,
+        ) {
             Err(MempoolError::Conflict(_)) => {
                 let mut conflicts = self.conflicts_for(&transaction);
                 let sibling = allow_sibling_eviction
@@ -2014,6 +2094,12 @@ impl Mempool {
         // Only reconsiderable failures (feerate, replacement economics, or
         // missing inputs) are retried as one package; this preserves valid
         // independent parents when a package child later fails.
+        //
+        // Those individual submissions are held in Core's changeset and are
+        // not size-trimmed until the complete package evaluation finishes.
+        // Keep the diagnostic candidate unbounded for the same reason; the
+        // caller restores the real limit when it commits the accepted prefix.
+        candidate.max_bytes = usize::MAX;
         let mut individually_accepted = Vec::with_capacity(transactions.len());
         let mut package_fallback = Vec::with_capacity(transactions.len());
         let mut first_retryable_error = None;
@@ -2023,7 +2109,11 @@ impl Mempool {
                 individually_accepted.push(txid);
                 continue;
             }
-            match candidate.accept(transaction.clone(), chain) {
+            // Core's SingleInPackageAccept keeps replacement/sibling policy
+            // available but disables the single-transaction CPFP carve-out.
+            // The carve-out is granted only by ordinary admission, not while
+            // deciding whether a package needs aggregate validation.
+            match candidate.accept_for_package(transaction.clone(), chain) {
                 Ok(txid) => individually_accepted.push(txid),
                 Err(error) if package_individual_retryable(&error) => {
                     first_retryable_error.get_or_insert(error);
@@ -2162,10 +2252,17 @@ impl Mempool {
                 .collect::<Vec<_>>();
             direct_conflicts.sort();
             direct_conflicts.dedup();
-            if let Some(transaction) = transactions.first() {
-                candidate.check_replacement_cluster_limit(
+            candidate.check_conflict_topology(&direct_conflicts)?;
+            if let Some(transaction) = transactions.last() {
+                // Core's package-RBF limit is the number of individual
+                // replacement candidates (each direct conflict plus all of
+                // its descendants), not the number of connected clusters.
+                // Use the package child in the diagnostic because that is
+                // the transaction being evaluated as the replacement.
+                candidate.check_replacement_candidate_limit(
                     transaction.compute_txid(),
                     &direct_conflicts,
+                    false,
                 )?;
             }
             if !direct_conflicts.is_empty() {
@@ -2203,7 +2300,10 @@ impl Mempool {
             // aggregate package fee is checked after all members have been
             // staged, allowing a zero-fee parent to be paid for by its child.
             let enforce_fee_rate = !use_package_feerate;
-            let enforce_min_relay = !use_package_feerate;
+            // Core's package feerate can bypass the rolling mempool minimum,
+            // but it never bypasses the static minrelaytxfee for an
+            // individual transaction (TRUC has its own explicit exception).
+            let enforce_min_relay = true;
             let result = if transactions.len() == 1 {
                 // Core's package path still permits a single transaction to
                 // replace an existing mempool conflict, but does not apply
@@ -2472,12 +2572,28 @@ impl Mempool {
                             Err(MempoolError::Truc(_))
                         )
                     };
+                    let standalone_mempool_limit = matches!(&error, MempoolError::MempoolLimits(_))
+                        && {
+                            let mut standalone = self.clone();
+                            matches!(
+                                standalone
+                                    .accept_at_for_test(transaction.clone(), chain, added_at,),
+                                Err(MempoolError::MempoolLimits(_))
+                            )
+                        };
                     let package_error = match &error {
                         MempoolError::ClusterLimit => Some("too-large-cluster".to_owned()),
-                        MempoolError::MempoolLimits(debug) => Some(format!(
-                            "package-mempool-limits, {}",
-                            self.package_mempool_limit_error(transactions, chain, added_at, debug,)
-                        )),
+                        MempoolError::MempoolLimits(debug) if !standalone_mempool_limit => {
+                            Some(format!(
+                                "package-mempool-limits, {}",
+                                self.package_mempool_limit_error(
+                                    transactions,
+                                    chain,
+                                    added_at,
+                                    debug,
+                                )
+                            ))
+                        }
                         MempoolError::Truc(_) if standalone_truc_violation => None,
                         MempoolError::Truc(_) => Some(error.to_string()),
                         _ => None,
@@ -2653,12 +2769,7 @@ impl Mempool {
                 conflict,
             });
         }
-        if !self.improves_feerate_diagram_for_replacement(
-            &candidate,
-            txid,
-            &conflicts,
-            &direct_conflicts,
-        ) {
+        if !self.improves_feerate_diagram_for_replacement(&candidate, txid, &conflicts) {
             return Err(MempoolError::ReplacementFeerateDiagram);
         }
         *self = candidate;
@@ -2747,6 +2858,59 @@ impl Mempool {
         Ok(())
     }
 
+    /// Package RBF's feerate-diagram calculation only supports clusters with
+    /// at most one ancestor and one descendant. Match Core's diagnostics for
+    /// direct conflicts before staging their replacement package.
+    fn check_conflict_topology(&self, direct_conflicts: &[Txid]) -> Result<(), MempoolError> {
+        let mut conflicts = self
+            .conflicts_and_descendants(direct_conflicts)
+            .into_iter()
+            .collect::<Vec<_>>();
+        conflicts.sort_unstable();
+        for conflict in conflicts {
+            let ancestor_count = self.ancestors(&conflict).len().saturating_add(1);
+            let descendant_count = self.descendants(&conflict).len().saturating_add(1);
+            let txid = conflict.to_string();
+            let has_ancestor = ancestor_count > 1;
+            let has_descendant = descendant_count > 1;
+            if ancestor_count > 2 {
+                return Err(MempoolError::PackageRbfConflictTopology(format!(
+                    "{txid} has {} ancestors, max 1 allowed",
+                    ancestor_count.saturating_sub(1)
+                )));
+            }
+            if descendant_count > 2 {
+                return Err(MempoolError::PackageRbfConflictTopology(format!(
+                    "{txid} has {} descendants, max 1 allowed",
+                    descendant_count.saturating_sub(1)
+                )));
+            }
+            if has_ancestor && has_descendant {
+                return Err(MempoolError::PackageRbfConflictTopology(format!(
+                    "{txid} has both ancestor and descendant, exceeding cluster limit of 2"
+                )));
+            }
+            if has_descendant {
+                if let Some(child) = self.children(&conflict).first()
+                    && self.ancestors(child).len().saturating_add(1) > 2
+                {
+                    return Err(MempoolError::PackageRbfConflictTopology(format!(
+                        "{txid} is not the only parent of child {child}"
+                    )));
+                }
+            } else if has_ancestor {
+                if let Some(parent) = self.parents(&conflict).first()
+                    && self.descendants(parent).len().saturating_add(1) > 2
+                {
+                    return Err(MempoolError::PackageRbfConflictTopology(format!(
+                        "{txid} is not the only child of parent {parent}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Count the distinct connected mempool clusters touched by direct
     /// conflicts. Core limits this count rather than the number of individual
     /// transactions so a replacement can still evict a large connected
@@ -2775,7 +2939,7 @@ impl Mempool {
             append_feerate_chunk(
                 &mut chunks,
                 self.modified_fee_sat(&txid, entry.fee_sat),
-                self.adjusted_weight(&txid),
+                entry.vsize,
             );
         }
         chunks
@@ -2796,60 +2960,76 @@ impl Mempool {
         candidate: &Self,
         replacement_id: Txid,
         conflicts: &[Txid],
-        direct_conflicts: &[Txid],
     ) -> bool {
-        // Core compares the complete chunk diagrams of every old cluster
-        // touched by the replacement with the corresponding staged clusters.
-        // Comparing only the direct conflict and its immediate parents loses
-        // retained ancestors from a chain and can reject a replacement that
-        // strictly improves the affected cluster.
+        // Mirror CTxMemPool::ChangeSet::CalculateChunksForRBF.  The old
+        // diagram is built from the exact transactions that will be removed,
+        // while the new diagram contains the retained direct parents plus the
+        // replacement package.  Comparing whole connected components here is
+        // subtly different: it can include unrelated retained descendants or
+        // convexify the new parent/replacement pair in a different order.
+        let removal = self.conflicts_and_descendants(conflicts);
         let mut old_chunks = Vec::new();
-        let mut old_components = Vec::<HashSet<Txid>>::new();
-        for conflict in conflicts.iter().chain(direct_conflicts.iter()) {
-            let component = self.connected_component(conflict);
-            if component.is_empty()
-                || old_components
-                    .iter()
-                    .any(|existing| !existing.is_disjoint(&component))
-            {
+        for txid in &removal {
+            let Some(entry) = self.entries.get(txid) else {
+                continue;
+            };
+            // A transaction with descendants is represented by its last
+            // descendant below, just as Core's descendant-count loop skips
+            // non-leaf entries.
+            if !self.descendants(txid).is_empty() {
                 continue;
             }
-            let order = self
-                .mining_order(u64::MAX, 0)
-                .into_iter()
-                .filter(|txid| component.contains(txid))
-                .collect::<Vec<_>>();
-            old_chunks.extend(component_feerate_diagram(self, &order));
-            old_components.push(component);
+            let individual_fee = self.modified_fee_sat(txid, entry.fee_sat);
+            let individual_size = entry.vsize;
+            let parents = self.parents(txid);
+            if let Some(parent_id) = parents.first()
+                && !removal.contains(parent_id)
+            {
+                let mut package_fee = individual_fee;
+                let mut package_size = individual_size;
+                for ancestor_id in self.ancestors(txid) {
+                    if let Some(ancestor) = self.entries.get(&ancestor_id) {
+                        package_fee = package_fee
+                            .saturating_add(self.modified_fee_sat(&ancestor_id, ancestor.fee_sat));
+                        package_size = package_size.saturating_add(ancestor.vsize);
+                    }
+                }
+                if compare_fee_rate(individual_fee, individual_size, package_fee, package_size)
+                    == Ordering::Greater
+                {
+                    old_chunks.push((package_fee, package_size));
+                } else {
+                    old_chunks.push((
+                        package_fee.saturating_sub(individual_fee),
+                        package_size.saturating_sub(individual_size),
+                    ));
+                    old_chunks.push((individual_fee, individual_size));
+                }
+            } else {
+                old_chunks.push((individual_fee, individual_size));
+            }
         }
 
         let mut new_chunks = Vec::new();
-        let mut new_components = Vec::<HashSet<Txid>>::new();
-        let mut new_seeds = vec![replacement_id];
-        for component in &old_components {
-            new_seeds.extend(
-                component
-                    .iter()
-                    .copied()
-                    .filter(|txid| candidate.entries.contains_key(txid)),
-            );
-        }
-        for seed in new_seeds {
-            let component = candidate.connected_component(&seed);
-            if component.is_empty()
-                || new_components
-                    .iter()
-                    .any(|existing| !existing.is_disjoint(&component))
-            {
+        for txid in &removal {
+            let Some(parent_id) = self.parents(txid).first().copied() else {
+                continue;
+            };
+            if removal.contains(&parent_id) {
                 continue;
             }
-            let order = candidate
-                .mining_order(u64::MAX, 0)
-                .into_iter()
-                .filter(|txid| component.contains(txid))
-                .collect::<Vec<_>>();
-            new_chunks.extend(component_feerate_diagram(candidate, &order));
-            new_components.push(component);
+            if let Some(parent) = self.entries.get(&parent_id) {
+                new_chunks.push((
+                    self.modified_fee_sat(&parent_id, parent.fee_sat),
+                    parent.vsize,
+                ));
+            }
+        }
+        if let Some(replacement) = candidate.entries.get(&replacement_id) {
+            new_chunks.push((
+                candidate.modified_fee_sat(&replacement_id, replacement.fee_sat),
+                replacement.vsize,
+            ));
         }
 
         sort_fee_rate_chunks(&mut old_chunks);
@@ -2895,7 +3075,7 @@ impl Mempool {
         chain: &ChainState,
         added_at: u64,
     ) -> Result<Txid, MempoolError> {
-        self.accept_at_with_options(transaction, chain, added_at, true, true)
+        self.accept_at_with_options(transaction, chain, added_at, true, true, true)
     }
 
     fn accept_at_for_test(
@@ -2920,6 +3100,7 @@ impl Mempool {
             false,
             true,
             true,
+            false,
         )
     }
 
@@ -2945,6 +3126,7 @@ impl Mempool {
             false,
             enforce_min_relay,
             false,
+            false,
         )
     }
 
@@ -2968,6 +3150,7 @@ impl Mempool {
             false,
             false,
             false,
+            false,
         )?;
         self.relay_sequences.insert(txid, 0);
         Ok(txid)
@@ -2980,6 +3163,7 @@ impl Mempool {
         added_at: u64,
         enforce_fee_rate: bool,
         enforce_mempool_policy: bool,
+        allow_cpfp_carveout: bool,
     ) -> Result<Txid, MempoolError> {
         self.accept_at_with_sequence(
             transaction,
@@ -2993,6 +3177,7 @@ impl Mempool {
             false,
             true,
             true,
+            allow_cpfp_carveout,
         )
     }
 
@@ -3014,6 +3199,7 @@ impl Mempool {
             false,
             false,
             true,
+            false,
         )
     }
 
@@ -3036,6 +3222,7 @@ impl Mempool {
             allow_truc_descendant_replacement,
             true,
             true,
+            true,
         )
     }
 
@@ -3053,6 +3240,7 @@ impl Mempool {
         allow_truc_descendant_replacement: bool,
         enforce_min_relay: bool,
         force_truc_min_relay: bool,
+        allow_cpfp_carveout: bool,
     ) -> Result<Txid, MempoolError> {
         // During AssumeUTXO activation the snapshot chainstate serves UTXOs
         // at its base height while the background chainstate is still lower.
@@ -3318,7 +3506,7 @@ impl Mempool {
             return Err(error);
         }
         if enforce_mempool_policy {
-            self.check_ancestor_descendant_limits(&transaction, vsize)?;
+            self.check_ancestor_descendant_limits(&transaction, vsize, allow_cpfp_carveout)?;
         }
         if enforce_mempool_policy && check_ephemeral_spends {
             // Core checks package and single-transaction fee floors before
@@ -3342,12 +3530,20 @@ impl Mempool {
             }
         }
         let size = bitcoin::consensus::encode::serialize(&transaction).len();
-        let affected_scripts = script_hashes_for_transaction(&transaction, &previous_outputs);
-        let input_script_values =
-            input_script_values_for_transaction(&transaction, &previous_outputs);
-        let memory_usage = mempool_entry_memory_usage(&transaction).saturating_add(
-            scripthash_index_memory_usage(&affected_scripts, &input_script_values),
-        );
+        let (affected_scripts, input_script_values) = if self.electrum_index_enabled {
+            (
+                script_hashes_for_transaction(&transaction, &previous_outputs),
+                input_script_values_for_transaction(&transaction, &previous_outputs),
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let index_memory_usage = self
+            .electrum_index_enabled
+            .then(|| scripthash_index_memory_usage(&affected_scripts, &input_script_values))
+            .unwrap_or_default();
+        let memory_usage =
+            mempool_entry_memory_usage(&transaction).saturating_add(index_memory_usage);
         if enforce_mempool_policy {
             self.check_cluster_limits_with_weight(&transaction, adjusted_weight)?;
             let protected = self.ancestors_for_transaction(&transaction);
@@ -3456,11 +3652,12 @@ impl Mempool {
         &self,
         transaction: &Transaction,
         vsize: u64,
+        allow_cpfp_carveout: bool,
     ) -> Result<(), MempoolError> {
         let ancestors = self.ancestors_for_transaction(transaction);
         if ancestors.len().saturating_add(1) > self.policy.ancestor_count_limit {
             return Err(MempoolError::MempoolLimits(format!(
-                "too many unconfirmed parents [limit: {}]",
+                "too many unconfirmed ancestors [limit: {}]",
                 self.policy.ancestor_count_limit
             )));
         }
@@ -3475,13 +3672,39 @@ impl Mempool {
             )));
         }
 
+        // Core's single-transaction CPFP carve-out allows one small child
+        // beyond a parent's descendant count/size limits. It is deliberately
+        // disabled for package evaluation and testmempoolaccept, where Core
+        // does not grant the carve-out. The candidate must have exactly one
+        // in-mempool ancestor and that parent must already be at both limits.
+        let cpfp_parent = ancestors.iter().next().copied();
+        let cpfp_carveout = allow_cpfp_carveout
+            && vsize <= EXTRA_DESCENDANT_TX_SIZE_LIMIT
+            && ancestors.len() == 1
+            && cpfp_parent.is_some_and(|parent_id| {
+                self.descendants(&parent_id).len().saturating_add(1)
+                    == self.policy.descendant_count_limit
+            });
+        let descendant_count_limit = self
+            .policy
+            .descendant_count_limit
+            .saturating_add(usize::from(cpfp_carveout));
+        let descendant_size_limit =
+            self.policy
+                .descendant_size_limit_vbytes
+                .saturating_add(if cpfp_carveout {
+                    EXTRA_DESCENDANT_TX_SIZE_LIMIT
+                } else {
+                    0
+                });
+
         for ancestor_id in ancestors {
             let descendants = self.descendants(&ancestor_id);
             let descendant_count = descendants.len().saturating_add(2);
-            if descendant_count > self.policy.descendant_count_limit {
+            if descendant_count > descendant_count_limit {
                 return Err(MempoolError::MempoolLimits(format!(
                     "too many descendants for tx {ancestor_id} [limit: {}]",
-                    self.policy.descendant_count_limit
+                    descendant_count_limit
                 )));
             }
             let descendant_size = descendants.iter().fold(
@@ -3493,10 +3716,10 @@ impl Mempool {
                     size.saturating_add(self.entries.get(txid).map_or(0, |entry| entry.vsize))
                 },
             );
-            if descendant_size > self.policy.descendant_size_limit_vbytes {
+            if descendant_size > descendant_size_limit {
                 return Err(MempoolError::MempoolLimits(format!(
                     "exceeds descendant size limit for tx {ancestor_id} [limit: {}]",
-                    self.policy.descendant_size_limit_vbytes
+                    descendant_size_limit
                 )));
             }
         }
@@ -3511,7 +3734,15 @@ impl Mempool {
         if additional_memory > self.max_bytes {
             return Err(MempoolError::Full);
         }
-        while self.memory_usage.saturating_add(additional_memory) > self.max_bytes {
+        // Core's limit is based on DynamicMemoryUsage(), which includes the
+        // auxiliary fee-delta and unbroadcast indexes in addition to the
+        // per-entry accounting. Use the same complete figure here so a
+        // package cannot leave the exposed usage above maxmempool.
+        while self
+            .dynamic_memory_usage()
+            .saturating_add(additional_memory)
+            > self.max_bytes
+        {
             let Some((package, package_vsize, package_fee)) =
                 self.lowest_eviction_package(protected)
             else {
@@ -4223,6 +4454,25 @@ impl Mempool {
                 self.remove_recursive(&txid);
             }
         }
+
+        // Transactions resurrected from a block are admitted with the reorg
+        // carve-outs, so a child can temporarily re-enter even when it leaves
+        // one of an ephemeral-dust parent's outputs unspent. Core removes
+        // that child (and its descendants) before the reorg is exposed.
+        let ephemeral_failures = self
+            .entries
+            .iter()
+            .filter_map(|(txid, entry)| {
+                validate_ephemeral_spends(std::slice::from_ref(&entry.transaction), self)
+                    .is_err()
+                    .then_some(*txid)
+            })
+            .collect::<Vec<_>>();
+        for txid in ephemeral_failures {
+            if self.entries.contains_key(&txid) {
+                self.remove_recursive(&txid);
+            }
+        }
     }
 
     pub fn clear_expired(&mut self, now: u64, age: Duration) {
@@ -4475,7 +4725,7 @@ fn component_feerate_diagram(mempool: &Mempool, order: &[Txid]) -> Vec<(i128, u6
         append_feerate_chunk(
             &mut chunks,
             mempool.modified_fee_sat(txid, entry.fee_sat),
-            mempool.adjusted_weight(txid),
+            entry.vsize,
         );
     }
     chunks
@@ -4818,6 +5068,9 @@ fn validate_standard_policy_with_modified_fee_and_policy(
     if dust_outputs == 1 && (base_fee_sat != 0 || modified_fee_sat != 0) {
         return Err(MempoolError::DustWithFee);
     }
+    if data_carrier_outputs > 1 {
+        return Err(MempoolError::NonStandard("multi-op-return".to_owned()));
+    }
     if monetary_outputs == 0 && data_carrier_outputs > 0 && !policy.permit_bare_datacarrier {
         return Err(MempoolError::NonStandard("bare-datacarrier".to_owned()));
     }
@@ -4839,7 +5092,7 @@ fn validate_standard_policy_with_modified_fee_and_policy(
     }
     if legacy_sigops > policy.max_tx_legacy_sigops {
         return Err(MempoolError::NonStandard(
-            "bad-txns-nonstandard-inputs".to_owned(),
+            "bad-txns-input-sigops-toomany-overall".to_owned(),
         ));
     }
     validate_standard_inputs(transaction, previous_outputs)?;
@@ -4853,7 +5106,7 @@ fn validate_standard_policy_with_modified_fee_and_policy(
             "bad-txns-too-many-sigops".to_owned(),
         ));
     }
-    validate_standard_witnesses(transaction, previous_outputs)?;
+    validate_standard_witnesses(transaction, previous_outputs, policy.max_script_size)?;
     validate_standard_simple_ecdsa_spends(transaction, previous_outputs)
 }
 
@@ -5045,7 +5298,11 @@ fn validate_standard_inputs(
                 || is_p2a_script(spending_script))
         {
             return Err(MempoolError::NonStandard(
-                "bad-txns-nonstandard-inputs".to_owned(),
+                // Core's AreInputsStandard prefixes this structural input
+                // policy failure with `bad-txns-input-`; unlike a generic
+                // nonstandard-inputs failure it also places both txid and
+                // wtxid in the recent-reject filter.
+                "bad-txns-input-witness-unknown".to_owned(),
             ));
         }
         if !is_standard_spend_script(&previous.script_pubkey) {
@@ -5124,6 +5381,7 @@ fn is_uncompressed_pubkey(pubkey: &[u8]) -> bool {
 fn validate_standard_witnesses(
     transaction: &Transaction,
     previous_outputs: &[TxOut],
+    max_script_size: usize,
 ) -> Result<(), MempoolError> {
     for (input, previous) in transaction.input.iter().zip(previous_outputs) {
         if input.witness.is_empty() {
@@ -5142,14 +5400,25 @@ fn validate_standard_witnesses(
         let spending_script = redeem_script.as_deref().unwrap_or(&previous.script_pubkey);
         if !spending_script.is_witness_program() {
             return Err(MempoolError::NonStandard(
-                "bad-witness-nonstandard".to_owned(),
+                // Core's IsWitnessStandard uses the witness-specific reason
+                // prefix for witness data attached to a legacy input. This
+                // rejection is witness-mutated and must not poison the
+                // txid reject filter.
+                "bad-witness-nonwitness-input".to_owned(),
             ));
         }
-        // Core treats witness stuffing on a direct P2A output as an ordinary
-        // nonstandard witness rather than exposing an anchor-specific reason.
+        // Keep the same policy-size limit Core applies to the serialized
+        // witness stack before checking the witness-version-specific rules.
+        if input.witness.size() > max_script_size {
+            return Err(MempoolError::NonStandard(
+                "bad-witness-witness-size".to_owned(),
+            ));
+        }
+        // Core has a dedicated reason for witness stuffing on a direct P2A
+        // output. The anchor itself is valid with an empty witness only.
         if is_p2a_script(spending_script) && !previous.script_pubkey.is_p2sh() {
             return Err(MempoolError::NonStandard(
-                "bad-witness-nonstandard".to_owned(),
+                "bad-witness-anchor-not-empty".to_owned(),
             ));
         } else if spending_script.is_p2wpkh() {
             let Some(pubkey) = input.witness.iter().nth(1) else {
@@ -5173,19 +5442,23 @@ fn validate_standard_witnesses(
             };
             if witness_script.len() > 3_600 {
                 return Err(MempoolError::NonStandard(
-                    "bad-witness-nonstandard".to_owned(),
+                    "bad-witness-script-size".to_owned(),
                 ));
             }
             let stack_len = input.witness.len().saturating_sub(1);
-            if stack_len > 100
-                || input
-                    .witness
-                    .iter()
-                    .take(stack_len)
-                    .any(|item| item.len() > 80)
+            if stack_len > 100 {
+                return Err(MempoolError::NonStandard(
+                    "bad-witness-stackitem-count".to_owned(),
+                ));
+            }
+            if input
+                .witness
+                .iter()
+                .take(stack_len)
+                .any(|item| item.len() > 80)
             {
                 return Err(MempoolError::NonStandard(
-                    "bad-witness-nonstandard".to_owned(),
+                    "bad-witness-stackitem-size".to_owned(),
                 ));
             }
             if witness_v0_script_starts_with_nonminimal_if(
@@ -5203,38 +5476,36 @@ fn validate_standard_witnesses(
                 .is_some_and(|item| item.first() == Some(&0x50))
             {
                 return Err(MempoolError::NonStandard(
-                    "bad-witness-nonstandard".to_owned(),
+                    "bad-witness-taproot-annex".to_owned(),
                 ));
             }
             if witness_items.len() >= 2 {
                 let control_block = witness_items[witness_items.len() - 1];
                 if control_block.is_empty() {
                     return Err(MempoolError::NonStandard(
-                        "bad-witness-nonstandard".to_owned(),
+                        "bad-witness-taproot-control-missing".to_owned(),
                     ));
                 }
                 let leaf_version = control_block[0] & 0xfe;
-                if leaf_version != 0xc0 {
-                    return Err(MempoolError::NonStandard(
-                        "bad-witness-nonstandard".to_owned(),
-                    ));
-                }
-                if contains_tapscript_op_success(witness_items[witness_items.len() - 2]) {
-                    return Err(MempoolError::NonStandard(
-                        "bad-witness-nonstandard".to_owned(),
-                    ));
-                }
-                if witness_items[..witness_items.len() - 2]
-                    .iter()
-                    .any(|item| item.len() > 80)
+                if leaf_version == 0xc0
+                    && contains_tapscript_op_success(witness_items[witness_items.len() - 2])
                 {
                     return Err(MempoolError::NonStandard(
                         "bad-witness-nonstandard".to_owned(),
                     ));
                 }
+                if leaf_version == 0xc0
+                    && witness_items[..witness_items.len() - 2]
+                        .iter()
+                        .any(|item| item.len() > 80)
+                {
+                    return Err(MempoolError::NonStandard(
+                        "bad-witness-taproot-stackitem-size".to_owned(),
+                    ));
+                }
             } else if witness_items.is_empty() {
                 return Err(MempoolError::NonStandard(
-                    "bad-witness-nonstandard".to_owned(),
+                    "bad-witness-taproot-witness-missing".to_owned(),
                 ));
             }
         }
@@ -6757,7 +7028,7 @@ mod tests {
             pool.mining_order(4_000_000, 0),
             vec![parent_id, child_id, independent_id]
         );
-        assert_eq!(pool.main_order(), vec![parent_id, child_id, independent_id]);
+        assert_eq!(pool.main_order(), vec![independent_id, parent_id, child_id]);
         assert_eq!(
             pool.mining_order_with_min_fee(4_000_000, 0, 1_000),
             vec![parent_id, child_id]
@@ -6768,7 +7039,7 @@ mod tests {
             pool.mining_order_with_min_fee(4_000_000, 0, 0),
             vec![parent_id, child_id]
         );
-        assert_eq!(pool.main_order(), vec![parent_id, child_id, independent_id]);
+        assert_eq!(pool.main_order(), vec![independent_id, parent_id, child_id]);
     }
 
     #[test]
@@ -6792,7 +7063,7 @@ mod tests {
         insert_policy_entry(&mut pool, left);
 
         assert_eq!(pool.transaction_order(), vec![left_id, right_id]);
-        assert_eq!(pool.main_order(), vec![left_id, right_id]);
+        assert_eq!(pool.main_order(), vec![right_id, left_id]);
     }
 
     #[test]
@@ -7460,14 +7731,10 @@ mod tests {
         future_taproot.input[0].witness = Witness::from_slice(&[vec![0x51], vec![0xc2; 33]]);
         future_taproot.output[0].value = Amount::from_sat(100_000);
         future_taproot.output[0].script_pubkey = taproot_previous.script_pubkey.clone();
-        assert!(matches!(
-            validate_standard_policy(
-                &future_taproot,
-                std::slice::from_ref(&taproot_previous),
-                1,
-            ),
-            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
-        ));
+        assert!(
+            validate_standard_policy(&future_taproot, std::slice::from_ref(&taproot_previous), 1,)
+                .is_ok()
+        );
         future_taproot.input[0].witness = Witness::from_slice(&[vec![0x50], vec![0xc0; 33]]);
         assert!(matches!(
             validate_standard_policy(
@@ -7489,7 +7756,7 @@ mod tests {
         anchor_spend.output[0].script_pubkey = previous.script_pubkey.clone();
         assert!(matches!(
             validate_standard_policy(&anchor_spend, std::slice::from_ref(&anchor_previous), 0),
-            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-nonstandard"
+            Err(MempoolError::NonStandard(reason)) if reason == "bad-witness-anchor-not-empty"
         ));
         anchor_spend.input[0].witness = Witness::default();
         assert!(
@@ -7877,7 +8144,7 @@ mod tests {
         assert!(matches!(
             validate_standard_policy(&transaction, &previous_outputs, 1),
             Err(MempoolError::NonStandard(reason))
-                if reason == "bad-txns-nonstandard-inputs"
+                if reason == "bad-txns-input-sigops-toomany-overall"
         ));
     }
 

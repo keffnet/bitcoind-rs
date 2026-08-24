@@ -1527,7 +1527,7 @@ mod tests {
                     .await
                     .unwrap();
                 let coinbase = coinbase_response.get().unwrap().get_result().unwrap();
-                assert_eq!(coinbase.get_sequence(), 0xffff_fffe);
+                assert_eq!(coinbase.get_sequence(), u32::MAX);
                 assert_eq!(
                     coinbase.get_script_sig_prefix().unwrap().to_vec(),
                     Builder::new().push_int(1).into_script().into_bytes()

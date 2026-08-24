@@ -2181,7 +2181,7 @@ fn rpc_parameter_names(method: &str) -> Option<&'static [&'static str]> {
         }
         "decodescript" => Some(&["hexstring"]),
         "combinerawtransaction" => Some(&["txs"]),
-        "createpsbt" => Some(&["inputs", "outputs", "locktime", "replaceable", "version"]),
+        "createpsbt" => Some(&["inputs", "outputs", "locktime", "replaceable"]),
         "decodepsbt" | "analyzepsbt" => Some(&["psbt"]),
         "finalizepsbt" => Some(&["psbt", "extract"]),
         "converttopsbt" => Some(&["hexstring", "permitsigdata", "iswitness"]),
@@ -2797,16 +2797,14 @@ fn dispatch_method_for_user(
                 // NODE_NETWORK once historical blocks are available.
                 wire::NODE_NETWORK | wire::NODE_NETWORK_LIMITED
             };
-            let subversion = if node.config.user_agent_comments.is_empty() {
-                "/bitcoind-rs:0.1.0/".to_owned()
-            } else {
-                format!(
-                    "/bitcoind-rs:0.1.0({})/",
-                    node.config.user_agent_comments.join("; ")
-                )
-            };
+            let subversion = local_user_agent(&node.config.user_agent_comments);
             let local_services = network_service
                 | wire::NODE_WITNESS
+                | if node.config.advertises_reduced_data_service() {
+                    wire::NODE_REDUCED_DATA
+                } else {
+                    0
+                }
                 | if node.config.v2_transport {
                     wire::NODE_P2P_V2
                 } else {
@@ -2866,12 +2864,11 @@ fn dispatch_method_for_user(
                         "services": format!("{:016x}", peer.services),
                         "servicesnames": peer_services_names(peer.services),
                         "relaytxes": peer.relay_transactions,
-                        "last_inv_sequence": peer.last_inv_sequence,
-                        "inv_to_send": peer.inv_to_send,
                         "lastsend": peer.last_send,
                         "lastrecv": peer.last_recv,
                         "last_transaction": peer.last_transaction,
                         "last_block": peer.last_block,
+                        "last_block_announcement": peer.last_block_announcement,
                         "bytessent": peer.bytes_sent,
                         "bytesrecv": peer.bytes_received,
                         "conntime": peer.connected_at,
@@ -2889,6 +2886,8 @@ fn dispatch_method_for_user(
                         "addr_processed": peer.addr_processed,
                         "addr_rate_limited": peer.addr_rate_limited,
                         "permissions": peer.permissions.to_strings(),
+                        "forced_inbound": peer.forced_inbound,
+                        "misbehavior_score": 0,
                         "minfeefilter": sat_to_btc_signed(peer.min_fee_filter),
                         "bytessent_per_msg": peer.bytes_sent_per_msg,
                         "bytesrecv_per_msg": peer.bytes_received_per_msg,
@@ -2903,9 +2902,7 @@ fn dispatch_method_for_user(
                     if let Some(mapped_as) = node.mapped_as(&peer.endpoint) {
                         info["mapped_as"] = json!(mapped_as);
                     }
-                    if node.config.deprecated_rpcs.contains("startingheight") {
-                        info["startingheight"] = json!(peer.start_height);
-                    }
+                    info["startingheight"] = json!(peer.start_height);
                     if let Some(address) = peer.local_address {
                         info["addrbind"] = json!(address.to_string());
                     }
@@ -2952,19 +2949,27 @@ fn dispatch_method_for_user(
             "logpath": node.config.debug_log_path.to_string_lossy(),
         })),
         "getrpcwhitelist" => get_rpc_whitelist(node, auth_user),
-        "getgeneralinfo" => Ok(json!({
-            "clientversion": "31.1.0",
-            "useragent": "/bitcoind-rs:0.1.0/",
-            "datadir": node.config.datadir.to_string_lossy(),
-            "blocksdir": node
+        "getgeneralinfo" => {
+            let network_dir = network_data_dir_name(node.config.network);
+            let datadir = if network_dir.is_empty() {
+                node.config.datadir.clone()
+            } else {
+                node.config.datadir.join(network_dir)
+            };
+            let blocksdir = node
                 .config
                 .blocks_dir
                 .clone()
-                .unwrap_or_else(|| node.config.datadir.join("blocks"))
-                .to_string_lossy(),
-            "startuptime": crate::time::unix_time()
-                .saturating_sub(node.started_at.elapsed().as_secs()),
-        })),
+                .unwrap_or_else(|| datadir.join("blocks"));
+            Ok(json!({
+                "clientversion": "31.1.0",
+                "useragent": local_user_agent(&node.config.user_agent_comments),
+                "datadir": datadir.to_string_lossy(),
+                "blocksdir": blocksdir.to_string_lossy(),
+                "startuptime": crate::time::unix_time()
+                    .saturating_sub(node.started_at.elapsed().as_secs()),
+            }))
+        }
         "help" => {
             let command = match params.get(0).filter(|value| !value.is_null()) {
                 None => "",
@@ -3861,9 +3866,18 @@ fn peer_services_names(services: u64) -> Vec<String> {
             6 => "COMPACT_FILTERS".to_owned(),
             10 => "NETWORK_LIMITED".to_owned(),
             11 => "P2P_V2".to_owned(),
+            27 => "REDUCED_DATA?".to_owned(),
             bit => format!("UNKNOWN[2^{bit}]"),
         })
         .collect()
+}
+
+fn local_user_agent(comments: &[String]) -> String {
+    if comments.is_empty() {
+        "/bitcoind-rs:0.1.0/".to_owned()
+    } else {
+        format!("/bitcoind-rs:0.1.0({})/", comments.join("; "))
+    }
 }
 
 fn peer_network_name(endpoint: &NetworkEndpoint) -> &'static str {
@@ -5828,7 +5842,7 @@ fn get_block(node: &Arc<Node>, params: &Value) -> Result<Value> {
     };
     let undo = if verbosity >= 2 {
         let undo_expected = chain.expects_undo_data(&hash);
-        match chain.spent_outputs_by_transaction_from_storage(&hash) {
+        match chain.spent_entries_by_transaction_from_storage(&hash) {
             Ok(Some(undo)) => Some(undo),
             Ok(None) if undo_expected => bail!(
                 "Undo data expected but can't be read. This could be due to disk corruption or a conflict with a pruning event."
@@ -6261,10 +6275,10 @@ fn get_block_file_info(node: &Arc<Node>, params: &Value) -> Result<Value> {
 }
 
 fn get_compression_info(node: &Arc<Node>) -> Result<Value> {
-    // Clone stable append-only file snapshots under the chain read lock, then
-    // release it before scanning record headers so IBD validation can keep
-    // advancing concurrently.
-    let inspector = { node.chain.read().store.compression_inspector()? };
+    // Flush any unsynced append buffer while holding the chain write lock,
+    // then release it before scanning record headers so IBD validation can
+    // keep advancing concurrently.
+    let inspector = { node.chain.write().store.compression_inspector()? };
     let info = inspector.inspect()?;
     Ok(json!({
         "codec": "zstd",
@@ -7602,7 +7616,7 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
     if verbosity >= 2
         && location.block_hash != BlockHash::all_zeros()
         && let Some(undo) = chain
-            .spent_outputs_by_transaction(&location.block_hash)?
+            .spent_entries_by_transaction(&location.block_hash)?
             .and_then(|entries| entries.get(location.transaction_index).cloned())
         && undo.len() == transaction.input.len()
     {
@@ -7615,7 +7629,7 @@ fn get_raw_transaction(node: &Arc<Node>, params: &Value) -> Result<Value> {
         )?;
         let input_total = undo
             .iter()
-            .map(|output| output.value.to_sat())
+            .map(|entry| entry.output.value.to_sat())
             .try_fold(0u64, u64::checked_add)
             .ok_or_else(|| anyhow!("transaction input total overflowed"))?;
         let output_total = transaction
@@ -13175,7 +13189,7 @@ pub(crate) fn create_ipc_block_template(
     }
     drop(mempool);
 
-    let mut block = mining_block_with_deployment_parameters(
+    let block = mining_block_with_deployment_parameters(
         MiningBlockTemplate {
             network: chain.network,
             parent,
@@ -13192,17 +13206,6 @@ pub(crate) fn create_ipc_block_template(
         },
         &deployment_parameters,
     )?;
-    if let Some(coinbase) = block.txdata.first_mut()
-        && let Some(input) = coinbase.input.first_mut()
-    {
-        // Core's mining interface uses MAX_SEQUENCE_NONFINAL for its
-        // replaceable coinbase input while keeping the height-only prefix
-        // available to the caller.
-        input.sequence = bitcoin::Sequence::from_consensus(0xffff_fffe);
-        block.header.merkle_root = block
-            .compute_merkle_root()
-            .ok_or_else(|| anyhow!("cannot calculate transaction merkle root"))?;
-    }
     if block.weight().to_wu() > node.config.block_max_weight {
         bail!("generated block exceeds the block weight limit");
     }
@@ -13244,13 +13247,12 @@ fn mining_block_with_deployment_parameters(
     } = template;
     let segwit_active = height >= deployment_parameters.buried.segwit;
     let mut coinbase = Transaction {
-        // Core's CMutableTransaction default is version 2, including for
-        // coinbase transactions assembled by generatetoaddress.
+        // Core's CMutableTransaction defaults are version 2, locktime zero,
+        // and a final input sequence. Keep generated blocks byte-compatible
+        // with Core: these fields are part of the coinbase txid and therefore
+        // affect deterministic chain/test vectors.
         version: Version::TWO,
-        // Core's block assembler commits the preceding height in the
-        // coinbase lock time.  This also makes generated regtest chains match
-        // Core's AssumeUTXO fixtures exactly.
-        lock_time: LockTime::from_consensus(height.saturating_sub(1)),
+        lock_time: LockTime::ZERO,
         input: vec![TxIn {
             previous_output: OutPoint::null(),
             script_sig: {
@@ -13260,9 +13262,7 @@ fn mining_block_with_deployment_parameters(
                 }
                 builder.into_script()
             },
-            // Core's block assembler uses MAX_SEQUENCE_NONFINAL so timelock
-            // semantics remain observable to miners and RPC clients.
-            sequence: bitcoin::Sequence::from_consensus(0xffff_fffe),
+            sequence: bitcoin::Sequence::MAX,
             witness: Witness::default(),
         }],
         output: vec![TxOut {
@@ -13364,6 +13364,7 @@ fn mine_block(mut block: Block, max_tries: u64) -> Option<Block> {
 }
 
 fn ensure_get_block_template_ready(node: &Arc<Node>) -> Result<()> {
+    node.ensure_software_not_expired()?;
     if node.config.network != Network::Bitcoin {
         return Ok(());
     }
@@ -14798,7 +14799,6 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
     let max_fee_rate = parse_max_fee_rate(params.get(1))?;
     let max_burn_amount = parse_max_burn_amount(params.get(2))?;
     let mut transactions = Vec::with_capacity(raw_transactions.len());
-    let mut transaction_ids = HashSet::new();
     for raw in raw_transactions {
         let raw = raw
             .as_str()
@@ -14810,36 +14810,32 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
             format!("TX decode failed: {raw} Make sure the tx has at least one input.")
         })?;
         validate_burn_amount(&transaction, max_burn_amount)?;
-        let txid = transaction.compute_txid();
-        if !transaction_ids.insert(txid) {
-            bail!("package contains duplicate transaction {txid}")
-        }
+        // Keep duplicate txids in the decoded package.  Core reports
+        // `package-contains-duplicates` as a package validation result and
+        // returns one `package-not-validated` entry per submitted wtxid;
+        // rejecting the duplicate while decoding loses that RPC result.
         transactions.push(transaction);
     }
-    if let Some(error) = package_policy_error(&transactions)
-        && error != "package-not-sorted"
-        && error != "package-contains-duplicates"
-    {
-        // Core reports package-wide validation errors as a structured
-        // submitpackage result.  When its package validation pass has no
-        // per-transaction results, the RPC still emits one
-        // `package-not-validated` entry for every submitted transaction.
-        let tx_results = if error == "conflict-in-package" {
-            transactions
-                .iter()
-                .map(|transaction| {
-                    (
-                        transaction.compute_wtxid().to_string(),
-                        json!({
-                            "txid": transaction.compute_txid().to_string(),
-                            "error": "package-not-validated",
-                        }),
-                    )
-                })
-                .collect::<serde_json::Map<_, _>>()
-        } else {
-            serde_json::Map::new()
-        };
+    if let Some(error) = package_policy_error(&transactions) {
+        debug!(
+            package_error = error,
+            "submitpackage package policy rejection"
+        );
+        // Core represents an empty per-transaction validation map as
+        // `package-not-validated` for every submitted transaction.  Keep
+        // those entries keyed by wtxid, including duplicate-txid members.
+        let tx_results = transactions
+            .iter()
+            .map(|transaction| {
+                (
+                    transaction.compute_wtxid().to_string(),
+                    json!({
+                        "txid": transaction.compute_txid().to_string(),
+                        "error": "package-not-validated",
+                    }),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
         return Ok(json!({
             "package_msg": error,
             "tx-results": tx_results,
@@ -14847,6 +14843,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         }));
     }
     if transactions.len() > 1 && !package_is_child_with_parents_tree(&transactions) {
+        debug!("submitpackage package topology rejected");
         bail!(
             "package topology disallowed. not child-with-parents or parents depend on each other."
         );
@@ -14876,7 +14873,7 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
         let txid = transaction.compute_txid();
         if !preexisting.contains(&txid)
             && individual_probe
-                .accept_for_test(transaction.clone(), &chain)
+                .accept_for_package(transaction.clone(), &chain)
                 .is_ok()
         {
             individually_accepted.insert(txid);
@@ -14949,10 +14946,18 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
                     );
                     continue;
                 }
+                let missing_package_input = transaction.input.iter().any(|input| {
+                    transactions[..index].iter().any(|parent| {
+                        parent.compute_txid() == input.previous_output.txid
+                            && candidate.get(&input.previous_output.txid).is_none()
+                    })
+                });
                 let transaction_error = if index == failure_index {
                     max_fee_failure
                         .filter(|max_fee_index| *max_fee_index == failure_index)
                         .map_or_else(|| reason.clone(), |_| "max feerate exceeded".to_owned())
+                } else if missing_package_input {
+                    "bad-txns-inputs-missingorspent".to_owned()
                 } else {
                     "package-not-validated".to_owned()
                 };
@@ -15224,8 +15229,29 @@ pub(crate) fn submit_package(node: &Arc<Node>, params: &Value) -> Result<Value> 
     drop(chain);
     let replaced_transactions =
         commit_submitted_package(node, candidate, before_transactions, accepted);
+    // Core trims the mempool only after package submission. A package can
+    // therefore validate successfully and then have one or more members
+    // evicted immediately; convert those success records to the stable
+    // `mempool full` result before returning the RPC response.
+    let mut package_evicted = false;
+    {
+        let mempool = node.mempool.read();
+        for transaction in &transactions {
+            if mempool.get(&transaction.compute_txid()).is_some() {
+                continue;
+            }
+            package_evicted = true;
+            results.insert(
+                transaction.compute_wtxid().to_string(),
+                json!({
+                    "txid": transaction.compute_txid().to_string(),
+                    "error": "mempool full",
+                }),
+            );
+        }
+    }
     Ok(json!({
-        "package_msg": "success",
+        "package_msg": if package_evicted { "transaction failed" } else { "success" },
         "tx-results": results,
         "replaced-transactions": replaced_transactions,
     }))
@@ -15377,6 +15403,14 @@ fn submit_package_failure_message_with_context(
 ) -> String {
     if matches!(error, MempoolError::Truc(_)) {
         return error.to_string();
+    }
+    if package_rbf {
+        if matches!(error, MempoolError::TooManyReplacementCandidates { .. }) {
+            return format!("package RBF failed: {error}");
+        }
+        if matches!(error, MempoolError::PackageRbfConflictTopology(_)) {
+            return error.to_string();
+        }
     }
     if matches!(
         error,
@@ -16780,8 +16814,8 @@ fn rpc_transaction(
 fn add_prevout_details(
     transaction_json: &mut Value,
     transaction: &Transaction,
-    spent_outputs: &[bitcoin::TxOut],
-    chain: &mut chain::ChainState,
+    spent_entries: &[chain::UtxoEntry],
+    _chain: &mut chain::ChainState,
     network: Network,
 ) -> Result<()> {
     let vin = transaction_json
@@ -16792,40 +16826,31 @@ fn add_prevout_details(
         if input.previous_output.is_null() {
             continue;
         }
-        let output = spent_outputs
+        let entry = spent_entries
             .get(input_index)
             .ok_or_else(|| anyhow!("transaction undo is missing input {input_index}"))?;
-        let (height, generated) =
-            if let Some(location) = chain.transaction_location(&input.previous_output.txid)? {
-                (location.height, location.transaction_index == 0)
-            } else {
-                let (previous_transaction, location) = chain
-                    .transaction(&input.previous_output.txid)?
-                    .ok_or_else(|| anyhow!("previous transaction is unavailable"))?;
-                (location.height, previous_transaction.is_coinbase())
-            };
         let prevout = json!({
-            "generated": generated,
-            "height": height,
-            "value": sat_to_btc(output.value.to_sat()),
-            "scriptPubKey": script_json_with_network(&output.script_pubkey, Some(network)),
+            "generated": entry.coinbase,
+            "height": entry.height,
+            "value": sat_to_btc(entry.output.value.to_sat()),
+            "scriptPubKey": script_json_with_network(&entry.output.script_pubkey, Some(network)),
         });
         let input_json = vin
             .get_mut(input_index)
             .ok_or_else(|| anyhow!("transaction JSON input index is inconsistent"))?;
         input_json["prevout"] = prevout;
     }
-    add_transaction_fee(transaction_json, transaction, spent_outputs)
+    add_transaction_fee(transaction_json, transaction, spent_entries)
 }
 
 fn add_transaction_fee(
     transaction_json: &mut Value,
     transaction: &Transaction,
-    spent_outputs: &[bitcoin::TxOut],
+    spent_entries: &[chain::UtxoEntry],
 ) -> Result<()> {
-    let input_total = spent_outputs
+    let input_total = spent_entries
         .iter()
-        .map(|output| output.value.to_sat())
+        .map(|entry| entry.output.value.to_sat())
         .try_fold(0u64, u64::checked_add)
         .ok_or_else(|| anyhow!("transaction input total overflowed"))?;
     let output_total = transaction
@@ -17004,6 +17029,9 @@ fn rpc_error_code(message: &str) -> i32 {
     }
     if lower == "can only import the mempool after the block download and sync is done." {
         return -28;
+    }
+    if lower == "node software has expired" {
+        return -9;
     }
     if lower == "transaction outputs already in utxo set" {
         return -27;
@@ -18163,6 +18191,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -18253,6 +18282,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -18562,6 +18592,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -18652,6 +18683,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -18745,6 +18777,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -18835,6 +18868,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -19003,6 +19037,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -19093,6 +19128,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -19159,6 +19195,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -19249,6 +19286,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -19307,6 +19345,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -19397,6 +19436,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -19498,6 +19538,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -19588,6 +19629,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -19785,6 +19827,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -19875,6 +19918,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -19895,11 +19939,17 @@ mod tests {
         assert_eq!(general["useragent"], json!("/bitcoind-rs:0.1.0/"));
         assert_eq!(
             general["datadir"],
-            json!(directory.path().to_string_lossy())
+            json!(directory.path().join("regtest").to_string_lossy())
         );
         assert_eq!(
             general["blocksdir"],
-            json!(directory.path().join("blocks").to_string_lossy())
+            json!(
+                directory
+                    .path()
+                    .join("regtest")
+                    .join("blocks")
+                    .to_string_lossy()
+            )
         );
         assert!(general["startuptime"].as_u64().is_some());
         let script_threads = dispatch_method(&node, "scriptthreadsinfo", &json!([])).unwrap();
@@ -20086,6 +20136,12 @@ mod tests {
         let normalized = normalize_rpc_params("getblock", &json!({"verbose": false})).unwrap();
         assert_eq!(normalized, json!([null, false]));
         let normalized = normalize_rpc_params(
+            "createrawtransaction",
+            &json!({"inputs": [], "outputs": {}, "version": 3}),
+        )
+        .unwrap();
+        assert_eq!(normalized, json!([[], {}, null, null, 3]));
+        let normalized = normalize_rpc_params(
             "gettxspendingprevout",
             &json!({"outputs": [], "options": {"return_spending_tx": true}}),
         )
@@ -20146,12 +20202,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(normalized, json!(["utxo.dat", "latest", {}]));
-        let normalized = normalize_rpc_params(
-            "createpsbt",
-            &json!({"inputs": [], "outputs": [], "version": 3}),
-        )
-        .unwrap();
-        assert_eq!(normalized, json!([[], [], null, null, 3]));
+        assert!(
+            normalize_rpc_params(
+                "createpsbt",
+                &json!({"inputs": [], "outputs": [], "version": 3}),
+            )
+            .is_err()
+        );
         let normalized = normalize_rpc_params(
             "addnode",
             &json!({"node": "127.0.0.1:18444", "command": "onetry", "v2transport": false}),
@@ -20286,6 +20343,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -20376,6 +20434,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -20490,6 +20549,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -20580,6 +20640,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -20650,6 +20711,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -20740,6 +20802,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -20810,6 +20873,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -20900,6 +20964,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -20966,6 +21031,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -21056,6 +21122,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -21110,6 +21177,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -21200,6 +21268,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -21262,6 +21331,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -21352,6 +21422,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -21403,6 +21474,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -21493,6 +21565,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -21664,6 +21737,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -21754,6 +21828,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -21844,6 +21919,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -21934,6 +22010,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -22020,6 +22097,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -22110,6 +22188,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -22218,6 +22297,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -22308,6 +22388,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -22380,6 +22461,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -22470,6 +22552,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -22573,6 +22656,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -22663,6 +22747,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -22967,6 +23052,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -23057,6 +23143,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -23109,7 +23196,7 @@ mod tests {
             pre_segwit_block.txdata[0].input[0]
                 .sequence
                 .to_consensus_u32(),
-            0xffff_fffe
+            u32::MAX
         );
         assert_eq!(
             pre_segwit_block.txdata[0].lock_time,
@@ -23259,6 +23346,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -23349,6 +23437,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -23401,6 +23490,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -23491,6 +23581,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -23586,6 +23677,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -23676,6 +23768,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -23735,6 +23828,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -23825,6 +23919,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -23890,6 +23985,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -23980,6 +24076,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -24087,6 +24184,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -24177,6 +24275,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -24247,6 +24346,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -24337,6 +24437,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -24466,6 +24567,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -24556,6 +24658,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -24750,6 +24853,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -24837,6 +24941,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
             signet_challenge: None,
@@ -24894,6 +24999,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -24984,6 +25090,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -25093,15 +25200,14 @@ mod tests {
         .unwrap();
         let unversioned_peer_info = dispatch_method(&node, "getpeerinfo", &json!([])).unwrap();
         assert_eq!(unversioned_peer_info[0]["relaytxes"], json!(false));
-        assert!(
-            unversioned_peer_info[0]
-                .get("last_block_announcement")
-                .is_none()
+        assert_eq!(
+            unversioned_peer_info[0]["last_block_announcement"],
+            json!(0)
         );
-        assert!(unversioned_peer_info[0].get("forced_inbound").is_none());
-        assert!(unversioned_peer_info[0].get("misbehavior_score").is_none());
-        assert_eq!(unversioned_peer_info[0]["last_inv_sequence"], json!(0));
-        assert_eq!(unversioned_peer_info[0]["inv_to_send"], json!(0));
+        assert_eq!(unversioned_peer_info[0]["forced_inbound"], json!(false));
+        assert_eq!(unversioned_peer_info[0]["misbehavior_score"], json!(0));
+        assert!(unversioned_peer_info[0].get("last_inv_sequence").is_none());
+        assert!(unversioned_peer_info[0].get("inv_to_send").is_none());
         assert_eq!(
             unversioned_peer_info[0]["permissions"],
             json!(["forcerelay", "relay"])
@@ -25273,6 +25379,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -25363,6 +25470,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -25530,6 +25638,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -25620,6 +25729,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -25744,6 +25854,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -25834,6 +25945,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -26059,6 +26171,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -26149,6 +26262,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -26453,6 +26567,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -26543,6 +26658,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -26606,6 +26722,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -26696,6 +26813,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -26885,6 +27003,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -26975,6 +27094,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -27042,6 +27162,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -27132,6 +27253,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -27585,6 +27707,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -27675,6 +27798,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -27748,6 +27872,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -27838,6 +27963,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -27999,6 +28125,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -28042,7 +28169,11 @@ mod tests {
             reindex_chainstate: false,
             load_blocks: Vec::new(),
             stop_after_block_import: false,
-            txindex: false,
+            // Core can populate a legacy input's full non-witness
+            // transaction only from an explicitly supplied prevtx, the
+            // mempool, or an enabled txindex. Exercise that indexed path
+            // without relying on the node's default storage configuration.
+            txindex: true,
             txospenderindex: false,
             max_mempool_mb: 300,
             cluster_count: 64,
@@ -28089,6 +28220,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -28468,6 +28600,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -28558,6 +28691,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -29003,6 +29137,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -29093,6 +29228,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -29219,6 +29355,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -29309,6 +29446,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -29466,6 +29604,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -29556,6 +29695,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -29865,6 +30005,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -29955,6 +30096,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -30020,6 +30162,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -30110,6 +30253,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -30234,6 +30378,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -30324,6 +30469,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })

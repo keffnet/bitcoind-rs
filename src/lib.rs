@@ -73,6 +73,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use ::time::{OffsetDateTime, macros::format_description};
 use anyhow::{Context, Result, anyhow, bail};
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::{Hash, sha256d};
@@ -96,7 +97,9 @@ use crate::fee_estimator::{FeeEstimator, RawFeeEstimate};
 use crate::mempool::{
     Mempool, MempoolChange, MempoolChangeKind, MempoolError, MempoolLoadOptions, MempoolPolicy,
 };
-use crate::storage::{BlockStoreReader, ElectrumBlockStoreReader};
+#[cfg(test)]
+use crate::storage::BlockStore;
+use crate::storage::{BlockStoreReader, ElectrumBlockStoreReader, PreparedBlockRecord};
 
 /// Match Bitcoin Core's emergency free-space reserve. Additional write
 /// estimates are added on top of this floor before a mutation starts.
@@ -230,6 +233,7 @@ pub(crate) fn ensure_disk_space(path: &Path, additional: u64) -> Result<()> {
 // address.
 const UNCONNECTED_PEER_ID: usize = usize::MAX;
 const MAX_ORPHAN_TRANSACTION_WEIGHT: u64 = 400_000;
+const MAX_ORPHAN_TRANSACTIONS: usize = 100;
 const MAX_ORPHANAGE_LATENCY_SCORE: usize = 3_000;
 const RESERVED_ORPHAN_WEIGHT_PER_PEER: u64 = 404_000;
 const ORPHAN_TRANSACTION_EXPIRY: Duration = Duration::from_secs(20 * 60);
@@ -350,11 +354,27 @@ fn addrman_tried_slot(key: &[u8; 32], endpoint: &NetworkEndpoint) -> (usize, usi
     (bucket, position)
 }
 pub(crate) const MAX_BLOCKS_IN_TRANSIT_PER_PEER: usize = 16;
+pub(crate) const MAX_IBD_BLOCKS_IN_TRANSIT_PER_PEER: usize = MAX_BLOCKS_IN_TRANSIT_PER_PEER;
 pub(crate) const MAX_CMPCTBLOCKS_INFLIGHT_PER_BLOCK: usize = 3;
+// Keep the asynchronous parsed-body backlog bounded to one Core per-peer
+// download window per active download peer. Bodies release their network
+// reservation on receipt, but the parsed body remains in memory until its
+// chain-state task finishes. A global queue of only one per-peer window makes
+// the next body fall back to synchronous processing in the socket task, which
+// stops that peer from draining its wire pipeline while the chain writer is
+// busy. Four windows keep the reader/validator overlap useful without making
+// the backlog unbounded (64 ordinary mainnet blocks is typically well below
+// 100 MiB of parsed transaction data).
+pub(crate) const PEER_BLOCK_QUEUE_CAPACITY: usize = MAX_BLOCKS_IN_TRANSIT_PER_PEER * 4;
 const BLOCK_DOWNLOAD_WINDOW: u32 = 1024;
 const NODE_NETWORK_LIMITED_MIN_BLOCKS: u32 = 288;
 const BLOCK_STALLING_TIMEOUT_DEFAULT: Duration = Duration::from_secs(2);
 const BLOCK_STALLING_TIMEOUT_MAX: Duration = Duration::from_secs(64);
+
+// Core starts initial headers synchronization with one peer at a time while
+// the best header is stale. New block announcements may still add one peer at
+// a time through the inventory-triggered path below.
+const INITIAL_HEADERS_SYNC_MAX_PEERS: usize = 1;
 const MAX_ADDR_RATE_PER_SECOND: f64 = 0.1;
 const MAX_ADDR_PROCESSING_TOKEN_BUCKET: f64 = 1_000.0;
 const MEMPOOL_EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
@@ -523,6 +543,8 @@ fn run_alert_notify_command(command: Option<&str>, message: &str) {
 
 struct CompactExtraTransactions {
     limit: usize,
+    max_memory_usage: usize,
+    memory_usage: usize,
     transactions: VecDeque<Transaction>,
 }
 
@@ -709,21 +731,38 @@ fn disconnected_transaction_memory_usage(transaction: &Transaction) -> usize {
 }
 
 impl CompactExtraTransactions {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, max_memory_usage: usize) -> Self {
         Self {
             limit,
+            max_memory_usage,
+            memory_usage: 0,
             transactions: VecDeque::with_capacity(limit.min(1_024)),
         }
     }
 
     fn insert(&mut self, transaction: Transaction) {
-        if self.limit == 0 {
+        if self.limit == 0 || self.max_memory_usage == 0 {
             return;
         }
+        let transaction_memory_usage = disconnected_transaction_memory_usage(&transaction);
         if self.transactions.len() == self.limit {
-            self.transactions.pop_front();
+            if let Some(evicted) = self.transactions.pop_front() {
+                self.memory_usage = self
+                    .memory_usage
+                    .saturating_sub(disconnected_transaction_memory_usage(&evicted));
+            }
         }
+        self.memory_usage = self.memory_usage.saturating_add(transaction_memory_usage);
         self.transactions.push_back(transaction);
+        while self.memory_usage > self.max_memory_usage {
+            let Some(evicted) = self.transactions.pop_front() else {
+                self.memory_usage = 0;
+                break;
+            };
+            self.memory_usage = self
+                .memory_usage
+                .saturating_sub(disconnected_transaction_memory_usage(&evicted));
+        }
     }
 
     fn snapshot(&self) -> Vec<Transaction> {
@@ -1265,7 +1304,8 @@ impl OrphanPool {
             let stats = self.peer_stats();
             let peer_count = stats.len().max(1) as u64;
             let max_global_weight = RESERVED_ORPHAN_WEIGHT_PER_PEER.saturating_mul(peer_count);
-            if self.total_latency_score() <= MAX_ORPHANAGE_LATENCY_SCORE
+            if self.entries.len() <= MAX_ORPHAN_TRANSACTIONS
+                && self.total_latency_score() <= MAX_ORPHANAGE_LATENCY_SCORE
                 && self.total_weight() <= max_global_weight
             {
                 return;
@@ -1355,6 +1395,7 @@ pub(crate) enum NodeWarningKind {
     UnknownRulesActive,
     ClockOutOfSync,
     LargeWorkInvalidChain,
+    SoftwareExpiry,
     FatalInternal,
 }
 
@@ -1498,38 +1539,6 @@ pub(crate) enum OutboundEvictionAction {
 pub(crate) struct BlockDownloadSchedule {
     pub(crate) requests: Vec<wire::Inventory>,
     pub(crate) staller: Option<usize>,
-}
-
-/// The body scheduler only needs block hashes and heights, not materialized
-/// headers. Keeping the longest recently used path lets peers whose targets
-/// are ancestors on that path share one cache, instead of rebuilding a nearly
-/// million-entry vector when adjacent peer tips alternate every 100 ms.
-struct BlockDownloadPathCache {
-    hashes: Vec<BlockHash>,
-}
-
-/// Advance Core's per-peer last-common cursor across the contiguous prefix
-/// whose bodies are already present. A higher-work fork may need more than
-/// one download window before it can activate; anchoring every window at the
-/// active-chain fork point would stop permanently after the first 1,024
-/// replacement blocks.
-fn advance_download_common_height(
-    hashes: &[BlockHash],
-    initial_height: u32,
-    mut have_body: impl FnMut(&BlockHash) -> bool,
-) -> u32 {
-    let mut height = initial_height;
-    for (index, hash) in hashes.iter().enumerate().skip(
-        usize::try_from(initial_height)
-            .unwrap_or(usize::MAX)
-            .saturating_add(1),
-    ) {
-        if !have_body(hash) {
-            break;
-        }
-        height = u32::try_from(index).unwrap_or(u32::MAX);
-    }
-    height
 }
 
 impl PeerInfo {
@@ -1910,11 +1919,15 @@ pub struct Node {
     /// Serialize RPC mining operations so a block template cannot become
     /// stale between reading the active tip and connecting the mined block.
     pub(crate) mining_lock: Mutex<()>,
-    /// Admit one peer block-body handler at a time before it touches the
-    /// synchronous chain lock. Full block connection is already serialized by
-    /// that lock, so queuing several blocking workers as writers adds no
-    /// throughput; it only starves Tokio workers that need short chain reads.
+    /// Admit one prepared peer block at a time to synchronous chain mutation.
+    /// Serialization and compression happen before this gate, so CPU-heavy
+    /// preparation remains parallel without a convoy of competing writers.
     pub(crate) peer_block_processing: tokio::sync::Semaphore,
+    /// Bound the number of received IBD bodies that may wait for ordered
+    /// chainstate activation. The peer reader must keep draining the socket
+    /// while the single chain-mutation lane validates an earlier block.
+    pub(crate) peer_block_queue: Arc<tokio::sync::Semaphore>,
+    pub(crate) peer_block_queue_hashes: Mutex<HashSet<BlockHash>>,
     pub peer_count: AtomicUsize,
     /// Number of automatic outbound peers admitted under the optional
     /// NODE_REDUCED_DATA compatibility policy.
@@ -1942,6 +1955,7 @@ pub struct Node {
     network_active: AtomicBool,
     block_stalling_timeout_secs: AtomicU64,
     mock_scheduler_elapsed_secs: AtomicU64,
+    software_expiry_scheduler_start: i64,
     block_stalling_since: parking_lot::RwLock<HashMap<usize, BlockStallingMoment>>,
     chain_sync_states: parking_lot::RwLock<HashMap<usize, ChainSyncTimeoutState>>,
     last_tip_update: AtomicU64,
@@ -1955,7 +1969,10 @@ pub struct Node {
     /// sending GETDATA in the interval before direct-fetch reservations are
     /// installed for the peer that supplied the headers.
     pending_header_direct_fetches: Mutex<HashMap<BlockHash, HashSet<usize>>>,
-    block_download_path_cache: Mutex<Option<BlockDownloadPathCache>>,
+    // The body scheduler only needs block hashes and heights, not materialized
+    // headers. Cache one ancestry view per live peer, sharing the allocation
+    // when another peer's target is already on a cached path.
+    block_download_path_caches: Mutex<HashMap<Option<usize>, Arc<Vec<BlockHash>>>>,
     shutdown_requested: Arc<AtomicBool>,
     peers: parking_lot::RwLock<HashMap<usize, PeerInfo>>,
     peer_commands:
@@ -2167,6 +2184,12 @@ impl Node {
         if let Some(mock_time) = config.mock_time {
             time::set_mock_time(mock_time);
         }
+        #[cfg(not(test))]
+        if config.software_expiry > 0 && time::unix_time_i64() > config.software_expiry {
+            bail!(
+                "This software is expired, and may be out of consensus. You must choose to upgrade or override this expiration."
+            );
+        }
         let network_active = config.network_active;
         let i2p_sam = config.i2p_sam.map(|address| {
             Arc::new(i2p::I2pSam::new(
@@ -2247,8 +2270,12 @@ impl Node {
                 config.txospenderindex,
                 false,
                 shutdown_requested.clone(),
+                Some(config.db_cache_mib),
+                max_mempool_bytes,
             )
             .map_err(core_startup_chain_error)?;
+        #[cfg(not(test))]
+        chain.configure_software_expiry(config.software_expiry);
         if chain
             .header(chain.height())
             .is_some_and(|header| startup_tip_is_too_new(header.time, time::unix_time()))
@@ -2267,7 +2294,7 @@ impl Node {
         chain.configure_max_tip_age(config.max_tip_age_secs);
         chain.configure_script_check_threads(config.script_check_threads);
         chain.configure_script_cache_size_mib(config.max_sig_cache_mib);
-        chain.configure_storage_cache_size_mib(config.db_cache_mib);
+        chain.configure_storage_cache_size_mib_with_mempool(config.db_cache_mib, max_mempool_bytes);
         let utxo_cache_started = Instant::now();
         let (cached_utxos, cached_utxo_bytes) =
             chain.warm_utxo_cache().map_err(core_startup_chain_error)?;
@@ -2329,6 +2356,7 @@ impl Node {
             incremental_relay_fee_sat_per_kvb: config.incremental_relay_fee_sat_per_kvb,
             dust_relay_fee_sat_per_kvb: config.dust_relay_fee_sat_per_kvb,
             bytes_per_sigop: config.bytes_per_sigop,
+            max_script_size: config.max_script_size,
             #[cfg(not(test))]
             max_tx_legacy_sigops: config.max_tx_legacy_sigops,
             #[cfg(test)]
@@ -2358,8 +2386,12 @@ impl Node {
             rbf_policy: config.rbf_policy,
             truc_policy: config.truc_policy,
         };
-        let mut mempool =
-            Mempool::with_max_bytes_and_policy(config.network, max_mempool_bytes, mempool_policy);
+        let mut mempool = Mempool::with_max_bytes_and_policy_and_electrum_index(
+            config.network,
+            max_mempool_bytes,
+            mempool_policy,
+            config.electrum_bind.is_some(),
+        );
         if config.persist_mempool {
             let expiry = Duration::from_secs(config.mempool_expiry_hours.saturating_mul(60 * 60));
             let legacy_mempool_path = config.datadir.join("mempool.json");
@@ -2498,6 +2530,7 @@ impl Node {
                 anyhow::anyhow!("Unable to start HTTP server. See debug log for details.")
             })?;
         let compact_extra_limit = config.block_reconstruction_extra_txn;
+        let compact_extra_memory_limit = config.block_reconstruction_extra_txn_size_bytes;
         let rpc_logging = if config.logging.debug_all {
             crate::config::CORE_LOG_CATEGORIES
                 .iter()
@@ -2539,6 +2572,12 @@ impl Node {
             banlist_recreated: !banlist_exists,
             mining_lock: Mutex::new(()),
             peer_block_processing: tokio::sync::Semaphore::new(1),
+            // Keep parsed bodies bounded separately from Core's wire request
+            // window. A parsed block is much larger than its wire payload;
+            // sixty-four queued bodies preserve reader/validator overlap
+            // without evicting the UTXO cache under the default dbcache.
+            peer_block_queue: Arc::new(tokio::sync::Semaphore::new(PEER_BLOCK_QUEUE_CAPACITY)),
+            peer_block_queue_hashes: Mutex::new(HashSet::new()),
             peer_count: AtomicUsize::new(0),
             non_reduced_outbound_count: AtomicUsize::new(0),
             mempool_check_operations: AtomicUsize::new(0),
@@ -2560,6 +2599,7 @@ impl Node {
             network_active: AtomicBool::new(network_active),
             block_stalling_timeout_secs: AtomicU64::new(BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs()),
             mock_scheduler_elapsed_secs: AtomicU64::new(0),
+            software_expiry_scheduler_start: time::unix_time_i64(),
             block_stalling_since: parking_lot::RwLock::new(HashMap::new()),
             chain_sync_states: parking_lot::RwLock::new(HashMap::new()),
             last_tip_update: AtomicU64::new(0),
@@ -2569,7 +2609,7 @@ impl Node {
             next_extra_block_relay_at: AtomicU64::new(0),
             rejected_block_bodies: parking_lot::RwLock::new(HashSet::new()),
             pending_header_direct_fetches: Mutex::new(HashMap::new()),
-            block_download_path_cache: Mutex::new(None),
+            block_download_path_caches: Mutex::new(HashMap::new()),
             shutdown_requested,
             peers: parking_lot::RwLock::new(HashMap::new()),
             peer_commands: parking_lot::RwLock::new(HashMap::new()),
@@ -2579,6 +2619,7 @@ impl Node {
             private_broadcasts: parking_lot::Mutex::new(HashMap::new()),
             compact_extra_transactions: parking_lot::Mutex::new(CompactExtraTransactions::new(
                 compact_extra_limit,
+                compact_extra_memory_limit,
             )),
             recently_rejected_transactions: parking_lot::Mutex::new(
                 RecentlyRejectedTransactions::new(),
@@ -2617,6 +2658,7 @@ impl Node {
             node.check_addrman_consistency()
                 .context("startup address-manager consistency check failed")?;
         }
+        node.refresh_software_expiry_warning();
         node.refresh_versionbits_warning();
         node.log_asmap_health();
         if node.config.stop_after_block_import {
@@ -2626,7 +2668,7 @@ impl Node {
     }
 
     pub fn connect_block(&self, block: Block) -> Result<ChainEvent> {
-        self.connect_block_with_policy(block, false)
+        self.connect_block_with_policy(block, false, None)
     }
 
     pub(crate) fn note_ipc_wait_cancellation(&self) {
@@ -2639,26 +2681,73 @@ impl Node {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn connect_block_from_peer(&self, block: Block) -> Result<ChainEvent> {
-        self.connect_block_with_policy(block, true)
+        // Serialize and compress before taking the global chain writer. Peer
+        // handlers execute on the blocking pool, so independent block bodies
+        // can prepare in parallel instead of funneling zstd level 6 through
+        // the serialized consensus mutation path.
+        let prepared = BlockStore::prepare_record(&block)?;
+        self.connect_block_with_policy(block, true, Some(prepared))
+    }
+
+    pub(crate) fn connect_prepared_block_from_peer(
+        &self,
+        block: Block,
+        prepared: PreparedBlockRecord,
+    ) -> Result<ChainEvent> {
+        self.connect_block_with_policy(block, true, Some(prepared))
     }
 
     fn connect_block_with_policy(
         &self,
         block: Block,
         retain_invalid_body: bool,
+        prepared_record: Option<PreparedBlockRecord>,
     ) -> Result<ChainEvent> {
-        let previous_tip = self.chain.read().best_hash();
-        let (tip, activated_blocks, disconnected_blocks, affected_script_hashes) = {
+        let processing_started = Instant::now();
+        let block_hash = block.block_hash();
+        let load_chain_bodies = self.chain_change_needs_block_bodies();
+        let tip_read_started = Instant::now();
+        let (previous_tip, previous_tip_height) = {
+            let chain = self.chain.read();
+            (chain.best_hash(), chain.height())
+        };
+        let tip_read_elapsed = tip_read_started.elapsed();
+        let chain_wait_started = Instant::now();
+        let (
+            tip,
+            activated_blocks,
+            disconnected_blocks,
+            affected_script_hashes,
+            active_block_count,
+            in_initial_block_download,
+            chain_wait_elapsed,
+            chain_work_elapsed,
+        ) = {
             let mut chain = self.chain.write();
+            let chain_wait_elapsed = chain_wait_started.elapsed();
+            let chain_work_started = Instant::now();
             let tip_result = if retain_invalid_body {
-                chain.connect_block_from_peer(block)
+                if let Some(prepared) = prepared_record {
+                    chain.connect_prepared_block_from_peer(block, prepared)
+                } else {
+                    chain.connect_block_from_peer(block)
+                }
             } else {
                 chain.connect_block(block)
             };
             let tip = match tip_result {
                 Ok(tip) => tip,
                 Err(error) => {
+                    if error
+                        .downcast_ref::<validation::ValidationError>()
+                        .is_some_and(|error| {
+                            matches!(error, validation::ValidationError::NodeExpired)
+                        })
+                    {
+                        debug!(%block_hash, "node-expired");
+                    }
                     if self.shutdown_requested.load(Ordering::Acquire) {
                         let failed_to_disconnect = error
                             .chain()
@@ -2683,12 +2772,30 @@ impl Node {
                 }
             };
             chain.maybe_auto_prune()?;
-            let activated_blocks = if tip.hash != previous_tip {
+            // Core decays the dynamic block-stalling timeout once for every
+            // block that becomes active. A peer queue can connect a whole
+            // contiguous suffix during one call, so retain that count even
+            // when body notifications remain on the cheap IBD path.
+            let active_block_count = chain.active_block_count_after(previous_tip);
+            let in_initial_block_download = chain.is_initial_block_download();
+            // A reorg can require disconnected block bodies even when the
+            // mempool and all notification consumers were empty before the
+            // connect.  In that case the transactions only become relevant
+            // after the active-chain switch: Core resurrects them into the
+            // mempool from the disconnected suffix.  Keep the cheap,
+            // body-free path for ordinary IBD extensions, but inspect the
+            // old suffix whenever the previous tip is no longer active.
+            let disconnected_has_transactions = tip.hash != previous_tip
+                && !chain.is_active_block(&previous_tip)
+                && chain.disconnected_suffix_has_non_coinbase_transactions(previous_tip)?;
+            let load_block_bodies =
+                tip.hash != previous_tip && (load_chain_bodies || disconnected_has_transactions);
+            let activated_blocks = if load_block_bodies {
                 chain.active_blocks_after(previous_tip)?
             } else {
                 Vec::new()
             };
-            let disconnected_blocks = if tip.hash != previous_tip {
+            let disconnected_blocks = if load_block_bodies {
                 chain.disconnected_blocks_after(previous_tip)?
             } else {
                 Vec::new()
@@ -2703,16 +2810,35 @@ impl Node {
                 activated_blocks,
                 disconnected_blocks,
                 affected_script_hashes,
+                active_block_count,
+                in_initial_block_download,
+                chain_wait_elapsed,
+                chain_work_started.elapsed(),
             )
         };
+        let post_chain_started = Instant::now();
         if tip.hash != previous_tip {
             // Core's peer manager records every active-tip change for stale
             // tip detection. Keep the timestamp in node state rather than in
             // the native chain files; it is deliberately runtime-only.
             self.last_tip_update
                 .store(time::unix_time(), Ordering::Release);
+            if retain_invalid_body && in_initial_block_download {
+                // A single peer body can recursively connect a suffix that
+                // arrived out of order. The P2P handler can therefore emit a
+                // sparse "accepted peer block" stream even while the active
+                // tip advances continuously. Keep an explicit Core-like
+                // progress record for every peer-driven tip change.
+                info!(
+                    previous_height = previous_tip_height,
+                    height = tip.height,
+                    blocks = active_block_count,
+                    source_block = %block_hash,
+                    "IBD tip advanced"
+                );
+            }
         }
-        for _ in &activated_blocks {
+        for _ in 0..active_block_count {
             self.reduce_block_stalling_timeout();
         }
         if !activated_blocks.is_empty() || !disconnected_blocks.is_empty() {
@@ -2731,6 +2857,12 @@ impl Node {
             self.log_ipc_wait_cancellation();
 
             self.promote_orphans_after_chain_change(&activated_blocks, &disconnected_blocks);
+        } else if tip.hash != previous_tip {
+            // IBD with an empty mempool and no Electrum/ZMQ consumers does
+            // not need to read and decompress a just-connected stored suffix
+            // a second time. Tip subscribers still need the same wakeup.
+            self.announce_chain_event(tip.clone(), None);
+            self.log_ipc_wait_cancellation();
         }
         if self.config.stop_at_height != 0 && tip.height >= self.config.stop_at_height {
             self.request_shutdown();
@@ -2741,6 +2873,21 @@ impl Node {
         }
         self.refresh_versionbits_warning();
         self.maybe_check_block_index();
+        let total_elapsed = processing_started.elapsed();
+        if total_elapsed >= Duration::from_secs(1) {
+            info!(
+                %block_hash,
+                previous_tip = %previous_tip,
+                resulting_height = tip.height,
+                activated = activated_blocks.len(),
+                tip_read = ?tip_read_elapsed,
+                chain_wait = ?chain_wait_elapsed,
+                chain_work = ?chain_work_elapsed,
+                post_chain = ?post_chain_started.elapsed(),
+                total = ?total_elapsed,
+                "Slow peer block processing"
+            );
+        }
         Ok(tip)
     }
 
@@ -3670,6 +3817,14 @@ impl Node {
         if matches!(error, MempoolError::MissingInput(_)) {
             return;
         }
+        // Core classifies witness-policy failures as TX_WITNESS_MUTATED:
+        // retain the diagnostic, but do not add the transaction to the
+        // recent-reject filter. A witness-bearing transaction can be
+        // retried without the policy-invalid witness.
+        if matches!(error, MempoolError::NonStandard(reason) if reason.starts_with("bad-witness-"))
+        {
+            return;
+        }
         // A txid is safe to cache only when policy failure is independent of
         // witness data.  Core otherwise caches the wtxid so a different
         // witness can still be downloaded and tried by txid.
@@ -3691,17 +3846,21 @@ impl Node {
                 error,
                 MempoolError::NonStandard(reason)
                     if reason == "bad-txns-nonstandard-inputs"
+                        || reason.starts_with("bad-txns-input-")
             );
         let retryable = matches!(
             error,
             MempoolError::FeeRate
-                | MempoolError::MinRelayFee
-                | MempoolError::MinRelayFeeWithContext(_)
                 | MempoolError::Full
                 | MempoolError::ReplacementFee
                 | MempoolError::ReplacementFeeWithContext(_)
                 | MempoolError::ReplacementFeerateDiagram
         );
+        // Core puts reconsiderable policy failures, including low-fee
+        // non-segwit transactions whose txid equals their wtxid, in a
+        // separate retryable reject set.  A later orphan child may cause the
+        // parent to be fetched again and accepted as a 1p1c package.  Only
+        // consensus/standardness failures are non-retryable here.
         if retryable {
             self.recently_rejected_transactions
                 .lock()
@@ -3829,12 +3988,7 @@ impl Node {
     }
 
     pub(crate) fn recently_confirmed_transaction(&self, txid: Txid) -> bool {
-        let chain = self.chain.read();
-        chain
-            .transaction_location(&txid)
-            .ok()
-            .flatten()
-            .is_some_and(|location| location.height >= chain.height().saturating_sub(1))
+        self.chain.read().recently_confirmed_transaction(&txid)
     }
 
     pub(crate) fn orphan_transaction_by_txid(&self, txid: Txid) -> bool {
@@ -4137,6 +4291,99 @@ impl Node {
             > previous / FEE_ESTIMATOR_FLUSH_INTERVAL.as_secs()
         {
             self.flush_fee_estimates(false)?;
+        }
+        self.refresh_software_expiry_warning();
+        Ok(())
+    }
+
+    fn software_expiry_value(&self) -> i64 {
+        #[cfg(not(test))]
+        {
+            self.config.software_expiry
+        }
+        #[cfg(test)]
+        {
+            0
+        }
+    }
+
+    fn software_expiry_scheduler_time(&self) -> i64 {
+        if time::mock_time() != 0 {
+            self.software_expiry_scheduler_start.saturating_add(
+                i64::try_from(self.mock_scheduler_elapsed_secs.load(Ordering::Relaxed))
+                    .unwrap_or(i64::MAX),
+            )
+        } else {
+            time::unix_time_i64()
+        }
+    }
+
+    fn software_expiry_date(timestamp: i64) -> String {
+        let format = format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]Z");
+        OffsetDateTime::from_unix_timestamp(timestamp)
+            .ok()
+            .and_then(|date| date.format(&format).ok())
+            .unwrap_or_else(|| timestamp.to_string())
+    }
+
+    fn set_software_expiry_warning(&self, message: String, level: &str) {
+        let changed = {
+            let mut warnings = self.warnings.write();
+            if let Some(warning) = warnings
+                .iter_mut()
+                .find(|warning| warning.kind == NodeWarningKind::SoftwareExpiry)
+            {
+                if warning.message == message {
+                    false
+                } else {
+                    warning.message = message.clone();
+                    true
+                }
+            } else {
+                warnings.push(NodeWarning {
+                    kind: NodeWarningKind::SoftwareExpiry,
+                    message: message.clone(),
+                });
+                true
+            }
+        };
+        if changed {
+            run_alert_notify_command(self.config.alert_notify.as_deref(), &message);
+            eprintln!("{level}: {message}");
+        }
+    }
+
+    pub(crate) fn refresh_software_expiry_warning(&self) {
+        let expiry = self.software_expiry_value();
+        if expiry <= 0 {
+            self.unset_warning(NodeWarningKind::SoftwareExpiry);
+            return;
+        }
+        let scheduler_time = self.software_expiry_scheduler_time();
+        if scheduler_time >= expiry {
+            self.set_software_expiry_warning(
+                "This software is expired, and may be out of consensus. You must choose to upgrade or override this expiration.".to_owned(),
+                "Error",
+            );
+        } else if scheduler_time
+            >= expiry.saturating_sub(crate::config::SOFTWARE_EXPIRY_WARN_PERIOD_SECS)
+        {
+            self.set_software_expiry_warning(
+                format!(
+                    "This software expires soon, and may fall out of consensus. Before {}, you must choose to upgrade or override this expiration.",
+                    Self::software_expiry_date(expiry)
+                ),
+                "Warning",
+            );
+        } else {
+            self.unset_warning(NodeWarningKind::SoftwareExpiry);
+        }
+    }
+
+    pub(crate) fn ensure_software_not_expired(&self) -> Result<()> {
+        let expiry = self.software_expiry_value();
+        if expiry > 0 && time::unix_time_i64() > expiry {
+            bail!("node software has expired");
         }
         Ok(())
     }
@@ -4919,33 +5166,17 @@ impl Node {
         u64::from(header.time).saturating_add(24 * 60 * 60) >= time::unix_time()
     }
 
-    /// Claim Core's single initial headers-sync slot for a connected peer.
-    /// Once the node is within a day of the current time Core allows all
-    /// suitable peers to start their own headers requests.
+    /// Claim the initial headers-sync slot for this connection.
+    /// Once the node is within a day of the current time all suitable peers
+    /// may start short overlap requests, matching Core's post-catch-up path.
     pub(crate) fn start_initial_headers_sync(&self, peer_id: usize) -> bool {
         let allow_parallel = self.best_header_is_recent();
         let mut started = self.headers_sync_started.lock();
         if started.contains(&peer_id) {
             return false;
         }
-        let replaces_limited_peer = if allow_parallel {
-            false
-        } else {
-            let peers = self.peers.read();
-            let candidate_is_full = peers
-                .get(&peer_id)
-                .is_some_and(|peer| peer.services & wire::NODE_NETWORK != 0);
-            candidate_is_full
-                && started.iter().any(|started_peer_id| {
-                    peers.get(started_peer_id).is_some_and(|peer| {
-                        peer.services & wire::NODE_NETWORK == 0
-                            && peer.services & wire::NODE_NETWORK_LIMITED != 0
-                    })
-                })
-        };
         if !allow_parallel
-            && !replaces_limited_peer
-            && self.headers_sync_peers.load(Ordering::Relaxed) != 0
+            && self.headers_sync_peers.load(Ordering::Relaxed) >= INITIAL_HEADERS_SYNC_MAX_PEERS
         {
             return false;
         }
@@ -4974,6 +5205,15 @@ impl Node {
         if self.headers_sync_active.lock().contains(&peer_id) {
             return true;
         }
+        // Once the best header is within a day of the local clock, Core has
+        // moved this peer into the normal parallel-sync path.  In that state
+        // an unknown block announcement can request headers again even when
+        // the peer previously triggered the one-shot pre-sync probe.  Keep
+        // the pre-sync admission gate below for stale chains, but do not let
+        // its historical per-peer flag suppress live block relay forever.
+        if self.best_header_is_recent() {
+            return true;
+        }
         let mut triggered = self.inv_triggered_headers_sync.lock();
         let mut last_block = self.last_block_inv_triggering_headers_sync.lock();
         if triggered.contains(&peer_id) {
@@ -4985,14 +5225,6 @@ impl Node {
         triggered.insert(peer_id);
         *last_block = Some(block_hash);
         true
-    }
-
-    pub(crate) fn clear_inv_headers_sync_trigger(&self, peer_id: usize) {
-        let mut triggered = self.inv_triggered_headers_sync.lock();
-        if !triggered.remove(&peer_id) || !triggered.is_empty() {
-            return;
-        }
-        self.last_block_inv_triggering_headers_sync.lock().take();
     }
 
     fn initialize_chain_sync_timeout(&self, peer_id: usize) {
@@ -5010,7 +5242,10 @@ impl Node {
         &self,
         excluded_peer_id: Option<usize>,
     ) -> Option<tokio::sync::mpsc::UnboundedSender<p2p::PeerCommand>> {
-        if self.headers_sync_peers.load(Ordering::Relaxed) != 0 {
+        let allow_parallel = self.best_header_is_recent();
+        if !allow_parallel
+            && self.headers_sync_peers.load(Ordering::Relaxed) >= INITIAL_HEADERS_SYNC_MAX_PEERS
+        {
             return None;
         }
         let mut started = self.headers_sync_started.lock();
@@ -5019,6 +5254,7 @@ impl Node {
             .read()
             .values()
             .filter(|peer| Some(peer.id) != excluded_peer_id)
+            .filter(|peer| !started.contains(&peer.id))
             .filter(|peer| Self::headers_sync_peer_is_eligible(peer))
             .min_by_key(|peer| (!peer.inbound, peer.id))
             .map(|peer| peer.id)?;
@@ -5053,6 +5289,10 @@ impl Node {
             self.headers_sync_peers.fetch_sub(1, Ordering::Relaxed);
         }
         removed
+    }
+
+    pub(crate) fn initial_headers_sync_is_active(&self, peer_id: usize) -> bool {
+        self.headers_sync_active.lock().contains(&peer_id)
     }
 
     pub(crate) fn reset_initial_headers_sync_peer(&self, peer_id: usize) {
@@ -5519,6 +5759,20 @@ impl Node {
         self.track_peer_block_request_with_limit(peer_id, hash, true)
     }
 
+    pub(crate) fn track_ibd_peer_block_request(&self, peer_id: usize, hash: BlockHash) -> bool {
+        let capacity = self.peer_ibd_block_capacity(peer_id);
+        self.track_peer_block_request_with_capacity(peer_id, hash, true, capacity)
+    }
+
+    pub(crate) fn peer_ibd_block_capacity(&self, peer_id: usize) -> usize {
+        let _ = peer_id;
+        // Match Core's fixed per-peer pipeline. Deriving capacity from bytes
+        // divided by total connection age creates a feedback loop: a peer
+        // cannot demonstrate higher throughput until it receives more work,
+        // and an idle but capable peer's measured rate decays toward zero.
+        MAX_IBD_BLOCKS_IN_TRANSIT_PER_PEER
+    }
+
     pub(crate) fn claim_pending_header_direct_fetches(&self, peer_id: usize, hashes: &[BlockHash]) {
         let mut claims = self.pending_header_direct_fetches.lock();
         for hash in hashes {
@@ -5654,6 +5908,24 @@ impl Node {
         hash: BlockHash,
         enforce_limit: bool,
     ) -> bool {
+        self.track_peer_block_request_with_capacity(
+            peer_id,
+            hash,
+            enforce_limit,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+        )
+    }
+
+    fn track_peer_block_request_with_capacity(
+        &self,
+        peer_id: usize,
+        hash: BlockHash,
+        enforce_limit: bool,
+        capacity: usize,
+    ) -> bool {
+        if self.peer_block_queue_hashes.lock().contains(&hash) {
+            return false;
+        }
         let Some(height) = self.chain.read().block_height_by_hash(&hash) else {
             return false;
         };
@@ -5666,7 +5938,7 @@ impl Node {
             return false;
         }
         if let Some(peer) = peers.get_mut(&peer_id) {
-            if enforce_limit && peer.inflight_blocks.len() >= MAX_BLOCKS_IN_TRANSIT_PER_PEER {
+            if enforce_limit && peer.inflight_blocks.len() >= capacity {
                 return false;
             }
             peer.inflight_blocks.push(InflightBlock {
@@ -5687,7 +5959,13 @@ impl Node {
     }
 
     pub(crate) fn clear_peer_block_requests_for_stored_blocks(&self, peer_id: usize) {
-        let chain = self.chain.read();
+        // This is a best-effort scheduler cleanup. During IBD the validation
+        // lane commonly holds the chain write lock; waiting here would stop
+        // the peer socket task from draining already-requested bodies. The
+        // next refill pass retries once the store can be observed.
+        let Some(chain) = self.chain.try_read() else {
+            return;
+        };
         let mut cleared = false;
         if let Some(peer) = self.peers.write().get_mut(&peer_id) {
             let before = peer.inflight_blocks.len();
@@ -5733,6 +6011,9 @@ impl Node {
     }
 
     pub(crate) fn block_request_in_flight(&self, hash: BlockHash) -> bool {
+        if self.peer_block_queue_hashes.lock().contains(&hash) {
+            return true;
+        }
         self.peers.read().values().any(|peer| {
             peer.inflight_blocks
                 .iter()
@@ -5747,11 +6028,22 @@ impl Node {
     /// lock in the opposite order and lets already-requested ancestors be
     /// excluded from Core's direct-fetch candidate limit.
     pub(crate) fn inflight_block_hashes(&self) -> HashSet<BlockHash> {
-        self.peers
-            .read()
-            .values()
-            .flat_map(|peer| peer.inflight_blocks.iter().map(|inflight| inflight.hash))
-            .collect()
+        let mut hashes = self.peer_block_queue_hashes.lock().clone();
+        hashes.extend(
+            self.peers
+                .read()
+                .values()
+                .flat_map(|peer| peer.inflight_blocks.iter().map(|inflight| inflight.hash)),
+        );
+        hashes
+    }
+
+    pub(crate) fn queue_peer_block_hash(&self, hash: BlockHash) -> bool {
+        self.peer_block_queue_hashes.lock().insert(hash)
+    }
+
+    pub(crate) fn finish_queued_peer_block(&self, hash: BlockHash) {
+        self.peer_block_queue_hashes.lock().remove(&hash);
     }
 
     /// Return true when the oldest validated block request for a peer has
@@ -5822,13 +6114,20 @@ impl Node {
                 staller: None,
             };
         }
-        let max_scan = {
-            let peer_count = self.peers.read().len();
-            limit.saturating_add(
-                MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_mul(peer_count.saturating_add(1)),
-            )
-        };
+        // Core walks the complete 1,024-block download window. Limiting this
+        // scan to roughly one 16-block slice per peer prevents fast peers from
+        // reaching the window edge behind an early slow-peer-owned gap, which
+        // also suppresses Core's staller detection indefinitely.
+        let max_scan = usize::try_from(BLOCK_DOWNLOAD_WINDOW)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
         let limited_peer = peer_services & wire::NODE_NETWORK == 0;
+        // A received body leaves the per-peer Core download window
+        // immediately, but remains globally reserved while the asynchronous
+        // IBD queue validates it. Snapshot those reservations before walking
+        // the header path so candidate selection does not repeatedly propose
+        // bodies that flush_pending_block_requests must discard later.
+        let queued_body_hashes = self.peer_block_queue_hashes.lock().clone();
         let (peer_best_known, peer_last_common) = peer_id
             .and_then(|id| {
                 self.peers
@@ -5839,7 +6138,15 @@ impl Node {
             .unwrap_or((None, None));
         let peer_has_known_tip = peer_best_known.is_some();
         let (candidates, window_end_height, last_common_hash) = {
-            let chain = self.chain.read();
+            // Candidate selection is advisory: if validation currently owns
+            // the write lane, let this 25 ms refill pass return immediately
+            // instead of parking a peer reader behind the chain lock.
+            let Some(chain) = self.chain.try_read() else {
+                return BlockDownloadSchedule {
+                    requests: Vec::new(),
+                    staller: None,
+                };
+            };
             let target_hash = if let Some(peer_best_known) = peer_best_known {
                 let Some(peer_work) = chain.chain_work_by_hash(&peer_best_known) else {
                     return BlockDownloadSchedule {
@@ -5876,46 +6183,69 @@ impl Node {
                 };
             };
             let segwit_height = chain.deployment_parameters().buried.segwit;
-            let mut path_cache = self.block_download_path_cache.lock();
-            let target_is_cached = path_cache
-                .as_ref()
-                .and_then(|cache| cache.hashes.get(target_index))
-                == Some(&target_hash);
-            if !target_is_cached {
-                let Some(hashes) = chain.block_hashes_to_hash(&target_hash) else {
-                    return BlockDownloadSchedule {
-                        requests: Vec::new(),
-                        staller: None,
+            let cached_path = {
+                let mut path_caches = self.block_download_path_caches.lock();
+                let own_path = path_caches
+                    .get(&peer_id)
+                    .filter(|path| path.get(target_index) == Some(&target_hash))
+                    .cloned();
+                if let Some(path) = own_path {
+                    path
+                } else if let Some(path) = path_caches
+                    .values()
+                    .find(|path| path.get(target_index) == Some(&target_hash))
+                    .cloned()
+                {
+                    path_caches.insert(peer_id, Arc::clone(&path));
+                    path
+                } else {
+                    let hashes = if let Some(path) = path_caches.get(&peer_id) {
+                        chain.block_hashes_to_hash_reusing_path(&target_hash, path)
+                    } else if let Some(path) = path_caches.values().max_by_key(|path| path.len()) {
+                        chain.block_hashes_to_hash_reusing_path(&target_hash, path)
+                    } else {
+                        chain.block_hashes_to_hash(&target_hash)
                     };
-                };
-                *path_cache = Some(BlockDownloadPathCache { hashes });
-            }
-            let cached_path = path_cache
-                .as_ref()
-                .expect("block download path cache was initialized");
-            debug_assert_eq!(cached_path.hashes.get(target_index), Some(&target_hash));
-            let hashes = &cached_path.hashes[..=target_index];
+                    let Some(hashes) = hashes else {
+                        return BlockDownloadSchedule {
+                            requests: Vec::new(),
+                            staller: None,
+                        };
+                    };
+                    let path = Arc::new(hashes);
+                    path_caches.insert(peer_id, Arc::clone(&path));
+                    path
+                }
+            };
+            debug_assert_eq!(cached_path.get(target_index), Some(&target_hash));
+            let hashes = &cached_path[..=target_index];
             let active_common_height = chain.common_active_height_for_hash_path(hashes);
             let assumeutxo_common_height = chain.assumeutxo_download_common_height_for_path(hashes);
-            let initial_common_height = assumeutxo_common_height.unwrap_or_else(|| {
-                peer_last_common
-                    .and_then(|hash| {
-                        let height = chain.block_height_by_hash(&hash)?;
-                        let index = usize::try_from(height).ok()?;
-                        (height >= active_common_height
-                            && hashes.get(index) == Some(&hash)
-                            && chain.store.contains(&hash))
-                        .then_some(height)
-                    })
-                    .unwrap_or(active_common_height)
-            });
-            // Core advances pindexLastCommonBlock over each contiguous
-            // BLOCK_HAVE_DATA entry, even when those blocks are on a fork
-            // that cannot activate until more bodies arrive.
-            let last_common_height =
-                advance_download_common_height(hashes, initial_common_height, |hash| {
-                    chain.store.contains(hash)
-                });
+            // Core's pindexLastCommonBlock is anchored at the fork point with
+            // the active chain, then advances over a contiguous sequence of
+            // bodies marked BLOCK_VALID_TRANSACTIONS/HaveNumChainTxs.  A body
+            // that is merely present in the native store is not enough: it
+            // may be malformed, invalid, or separated from the fork by a
+            // missing ancestor.  The chain state records the equivalent
+            // status only after a peer body completes admission, so this
+            // remains conservative without pinning the window to the active
+            // tip while out-of-order bodies are already ready.
+            //
+            // AssumeUTXO is the exception: its historical cursor explicitly
+            // identifies the last body available to the background chainstate
+            // and must remain the download anchor for that range.
+            let mut last_common_height = assumeutxo_common_height.unwrap_or(active_common_height);
+            if assumeutxo_common_height.is_none() {
+                let first_ready_height = usize::try_from(active_common_height)
+                    .unwrap_or(usize::MAX)
+                    .saturating_add(1);
+                for (height, hash) in hashes.iter().enumerate().skip(first_ready_height) {
+                    if !chain.peer_body_chain_ready(hash) {
+                        break;
+                    }
+                    last_common_height = u32::try_from(height).unwrap_or(u32::MAX);
+                }
+            }
             let last_common_hash = usize::try_from(last_common_height)
                 .ok()
                 .and_then(|index| hashes.get(index))
@@ -5934,6 +6264,7 @@ impl Node {
                 .skip(first_candidate_height)
                 .map(|(height, hash)| (*hash, u32::try_from(height).unwrap_or(u32::MAX)))
                 .filter(|(hash, _)| !chain.store.contains(hash))
+                .filter(|(hash, _)| !queued_body_hashes.contains(hash))
                 // A structurally invalid or mutated body only proves that
                 // the serving peer supplied a bad serialization.  Another
                 // peer may still have the valid body for this header hash.
@@ -5982,6 +6313,15 @@ impl Node {
                 .get(&id)
                 .is_some_and(|peer| !peer.inflight_blocks.is_empty())
         });
+        // Build the ownership view once.  The scheduler runs after every
+        // accepted body; looking through every peer's in-flight vector for
+        // every candidate made that hot path quadratic in the body window.
+        let mut inflight_owners = HashMap::new();
+        for peer in peers.values() {
+            for inflight in &peer.inflight_blocks {
+                inflight_owners.entry(inflight.hash).or_insert(peer.id);
+            }
+        }
         let mut requests = Vec::with_capacity(limit);
         let mut waiting_for = None;
         let mut window_exceeded = false;
@@ -5990,12 +6330,7 @@ impl Node {
                 window_exceeded = true;
                 break;
             }
-            let owner = peers.values().find_map(|peer| {
-                peer.inflight_blocks
-                    .iter()
-                    .any(|inflight| inflight.hash == hash)
-                    .then_some(peer.id)
-            });
+            let owner = inflight_owners.get(&hash).copied();
             if let Some(owner) = owner {
                 if waiting_for.is_none() && peer_id != Some(owner) {
                     waiting_for = Some(owner);
@@ -6029,21 +6364,21 @@ impl Node {
     }
 
     fn note_block_staller_at(&self, peer_id: usize, since: Instant) -> bool {
-        if self.peers.read().contains_key(&peer_id) {
-            let mut stalling = self.block_stalling_since.write();
-            if stalling.contains_key(&peer_id) {
-                return false;
-            }
-            stalling.insert(
-                peer_id,
-                BlockStallingMoment {
-                    wall: since,
-                    unix_time: time::unix_time(),
-                },
-            );
-            return true;
+        if !self.peers.read().contains_key(&peer_id) {
+            return false;
         }
-        false
+        let mut stalling = self.block_stalling_since.write();
+        if stalling.contains_key(&peer_id) {
+            return false;
+        }
+        stalling.insert(
+            peer_id,
+            BlockStallingMoment {
+                wall: since,
+                unix_time: time::unix_time(),
+            },
+        );
+        true
     }
 
     pub(crate) fn take_stalled_block_peer(&self) -> Option<usize> {
@@ -6873,6 +7208,7 @@ impl Node {
         self.header_availability_probed.lock().remove(&id);
         self.inv_triggered_headers_sync.lock().remove(&id);
         self.block_stalling_since.write().remove(&id);
+        self.block_download_path_caches.lock().remove(&Some(id));
         self.chain_sync_states.write().remove(&id);
         self.pending_header_direct_fetches
             .lock()
@@ -6894,7 +7230,7 @@ impl Node {
             }
         }
         if let Some(sender) = replacement {
-            let _ = sender.send(p2p::PeerCommand::RequestHeaders);
+            let _ = sender.send(p2p::PeerCommand::RequestInitialHeaders);
         }
         self.orphans.lock().erase_for_peer(id);
         self.maybe_check_addrman();
@@ -7177,7 +7513,13 @@ impl Node {
                     endpoint.clone(),
                     KnownNetworkAddress {
                         endpoint: endpoint.clone(),
-                        services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+                        services: crate::wire::NODE_NETWORK
+                            | crate::wire::NODE_WITNESS
+                            | if self.config.advertises_reduced_data_service() {
+                                crate::wire::NODE_REDUCED_DATA
+                            } else {
+                                0
+                            },
                         time: now,
                     },
                 );
@@ -7259,7 +7601,13 @@ impl Node {
                 reported_local_address: None,
                 inbound: false,
                 version: None,
-                services: crate::wire::NODE_NETWORK | crate::wire::NODE_WITNESS,
+                services: crate::wire::NODE_NETWORK
+                    | crate::wire::NODE_WITNESS
+                    | if self.config.advertises_reduced_data_service() {
+                        crate::wire::NODE_REDUCED_DATA
+                    } else {
+                        0
+                    },
                 user_agent: String::new(),
                 start_height: 0,
                 relay_transactions: true,
@@ -8006,6 +8354,7 @@ impl Node {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
+                background_node.refresh_software_expiry_warning();
                 if let Err(error) = background_node.chain.write().poll_background_validation() {
                     warn!(%error, "background AssumeUTXO validation supervisor failed to poll");
                     background_node.set_warning(
@@ -8489,7 +8838,7 @@ fn quarantine_persistent_file(path: &Path, error: &anyhow::Error) {
 
 struct SettingsObjectVisitor;
 
-const SETTINGS_WARNING: &str = "This file is automatically generated and updated by Bitcoin Core. Please do not edit this file while the node is running, as any changes might be ignored or overwritten.";
+const SETTINGS_WARNING: &str = "This file is automatically generated and updated by Bitcoin Core functional test harness. Please do not edit this file while the node is running, as any changes might be ignored or overwritten.";
 
 impl<'de> Visitor<'de> for SettingsObjectVisitor {
     type Value = serde_json::Value;
@@ -8550,14 +8899,14 @@ fn initialize_settings_file(path: &Path) -> Result<()> {
                     )
                 } else {
                     anyhow::anyhow!(
-                        "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error",
+                        "Settings file {} does not contain valid JSON. This is probably caused by disk corruption or a crash",
                         path.display()
                     )
                 }
             })?;
         deserializer.end().map_err(|_error| {
             anyhow::anyhow!(
-                "Settings file {} does not contain valid JSON. This may be caused by a crash, power loss, full disk, or storage error",
+                "Settings file {} does not contain valid JSON. This is probably caused by disk corruption or a crash",
                 path.display()
             )
         })?;
@@ -9029,7 +9378,7 @@ mod tests {
 
     #[test]
     fn compact_extra_transaction_cache_is_bounded_fifo() {
-        let mut cache = CompactExtraTransactions::new(2);
+        let mut cache = CompactExtraTransactions::new(2, usize::MAX);
         let transaction = |value| Transaction {
             version: Version::ONE,
             lock_time: LockTime::ZERO,
@@ -9119,6 +9468,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -9209,6 +9559,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         }
@@ -10079,6 +10430,11 @@ mod tests {
     }
 
     #[test]
+    fn ibd_uses_cores_fixed_per_peer_block_pipeline() {
+        assert_eq!(MAX_IBD_BLOCKS_IN_TRANSIT_PER_PEER, 16);
+    }
+
+    #[test]
     fn peer_unknown_block_availability_is_resolved_after_header_arrives() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(test_config(directory.path())).unwrap();
@@ -10165,6 +10521,40 @@ mod tests {
     }
 
     #[test]
+    fn stale_initial_header_sync_uses_one_peer_and_replaces_on_release() {
+        let _guard = time::mock_time_test_guard();
+        time::set_mock_time(0);
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        for peer_id in 1..=7 {
+            let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+            node.register_peer(
+                peer_id,
+                format!("192.0.2.{peer_id}:18444").parse().unwrap(),
+                false,
+                sender,
+            );
+            node.update_peer_version(
+                peer_id,
+                wire::VersionMessage::PROTOCOL_VERSION,
+                wire::NODE_NETWORK | wire::NODE_WITNESS,
+                "/headers-race-test/",
+                1,
+                true,
+            );
+        }
+
+        assert!(node.start_initial_headers_sync(1));
+        assert!(!node.start_initial_headers_sync(2));
+        assert!(!node.start_initial_headers_sync(3));
+        assert_eq!(node.headers_sync_peers.load(Ordering::Relaxed), 1);
+
+        assert!(node.clear_headers_sync_peer(1));
+        assert!(node.start_initial_headers_sync(7));
+        assert_eq!(node.headers_sync_peers.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn block_download_queue_resumes_from_persisted_headers() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(test_config(directory.path())).unwrap();
@@ -10237,12 +10627,60 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![first.block_hash()]
         );
+        let caches = node.block_download_path_caches.lock();
+        assert!(Arc::ptr_eq(
+            caches.get(&Some(1)).unwrap(),
+            caches.get(&Some(2)).unwrap()
+        ));
         assert_eq!(
-            node.block_download_path_cache
-                .lock()
-                .as_ref()
-                .and_then(|cache| cache.hashes.last().copied()),
+            caches.values().find_map(|path| path.last().copied()),
             Some(second.block_hash())
+        );
+    }
+
+    #[test]
+    fn block_download_path_cache_retains_competing_peer_tips() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let genesis = *node.chain.read().header(0).unwrap();
+        let first_a = mine_test_block(&genesis, 1, 1);
+        let second_a = mine_test_block(&first_a.header, 2, 1);
+        let first_b = mine_test_block(&genesis, 1, 2);
+        let second_b = mine_test_block(&first_b.header, 2, 2);
+        node.chain
+            .write()
+            .accept_headers(&[
+                first_a.header,
+                second_a.header,
+                first_b.header,
+                second_b.header,
+            ])
+            .unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender.clone());
+        node.register_peer(2, "192.0.2.2:18444".parse().unwrap(), false, sender);
+        node.update_peer_best_known_block(1, second_a.block_hash());
+        node.update_peer_best_known_block(2, second_b.block_hash());
+
+        for peer_id in [1, 2, 1, 2] {
+            let schedule = node.next_block_download_schedule(
+                peer_id,
+                MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+                wire::NODE_NETWORK | wire::NODE_WITNESS,
+            );
+            assert_eq!(schedule.requests.len(), 2);
+        }
+
+        let cached_tips = node
+            .block_download_path_caches
+            .lock()
+            .values()
+            .filter_map(|path| path.last().copied())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            cached_tips,
+            HashSet::from([second_a.block_hash(), second_b.block_hash()])
         );
     }
 
@@ -10300,9 +10738,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![side_three.block_hash()]
         );
+        // Core does not advance pindexLastCommonBlock over future side-chain
+        // bodies. The peer still gets the stored descendant requested, but
+        // the download window remains anchored at the active-chain fork.
         assert_eq!(
             node.peers.read().get(&1).unwrap().last_common_block,
-            Some(side_two.block_hash())
+            Some(genesis.block_hash())
         );
     }
 
@@ -10346,27 +10787,6 @@ mod tests {
     }
 
     #[test]
-    fn block_download_window_advances_across_stored_fork_bodies() {
-        let hashes = (0..=BLOCK_DOWNLOAD_WINDOW + 2)
-            .map(|height| {
-                let mut bytes = [0; 32];
-                bytes[..4].copy_from_slice(&height.to_le_bytes());
-                BlockHash::from_byte_array(bytes)
-            })
-            .collect::<Vec<_>>();
-        let stored_through = BLOCK_DOWNLOAD_WINDOW;
-        let advanced = advance_download_common_height(&hashes, 0, |hash| {
-            hashes
-                .iter()
-                .position(|candidate| candidate == hash)
-                .is_some_and(|height| height <= stored_through as usize)
-        });
-
-        assert_eq!(advanced, stored_through);
-        assert!(advanced.saturating_add(BLOCK_DOWNLOAD_WINDOW) > stored_through);
-    }
-
-    #[test]
     fn block_download_request_reservation_is_global() {
         let directory = tempfile::tempdir().unwrap();
         let node = Node::open(test_config(directory.path())).unwrap();
@@ -10385,6 +10805,65 @@ mod tests {
         assert!(!node.track_peer_block_request(2, first.block_hash()));
         node.clear_peer_block_request(1, first.block_hash());
         assert!(node.track_peer_block_request(2, first.block_hash()));
+    }
+
+    #[test]
+    fn block_download_scheduler_excludes_queued_body_reservations() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 4);
+        node.chain
+            .write()
+            .accept_headers(std::slice::from_ref(&first.header))
+            .unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        node.update_peer_best_known_block(1, first.block_hash());
+
+        // A body has been received and handed to the asynchronous validation
+        // queue. Its per-peer request slot is free, but the body must remain
+        // unavailable to every other scheduler pass until validation finishes.
+        assert!(node.queue_peer_block_hash(first.block_hash()));
+        let schedule = node.next_block_download_schedule(
+            1,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
+        assert!(schedule.requests.is_empty());
+        assert_eq!(schedule.staller, None);
+
+        node.finish_queued_peer_block(first.block_hash());
+        let schedule = node.next_block_download_schedule(
+            1,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
+        assert_eq!(schedule.requests.len(), 1);
+        assert_eq!(schedule.requests[0].hash, first.block_hash());
+    }
+
+    #[test]
+    fn stored_block_cleanup_reclaims_stale_download_reservation() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 3);
+        node.chain
+            .write()
+            .accept_headers(std::slice::from_ref(&first.header))
+            .unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender);
+        assert!(node.track_peer_block_request(1, first.block_hash()));
+
+        // Simulate a body that was connected through a different receive
+        // path while this peer still owns the old in-flight reservation.
+        node.chain.write().connect_block_from_peer(first).unwrap();
+        assert_eq!(node.peer_inflight_block_count(1), 1);
+
+        node.clear_peer_block_requests_for_stored_blocks(1);
+        assert_eq!(node.peer_inflight_block_count(1), 0);
     }
 
     #[test]
@@ -10490,6 +10969,32 @@ mod tests {
             node.block_stalling_timeout_secs.load(Ordering::Relaxed),
             BLOCK_STALLING_TIMEOUT_DEFAULT.as_secs() * 2
         );
+    }
+
+    #[test]
+    fn block_download_window_does_not_report_staller_with_later_body_in_flight() {
+        let directory = tempfile::tempdir().unwrap();
+        let node = Node::open(test_config(directory.path())).unwrap();
+        let first = mine_test_block(&node.chain.read().header(0).unwrap().to_owned(), 1, 1);
+        let second = mine_test_block(&first.header, 2, 1);
+        node.chain
+            .write()
+            .accept_headers(&[first.header.clone(), second.header.clone()])
+            .unwrap();
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        node.register_peer(1, "192.0.2.1:18444".parse().unwrap(), false, sender.clone());
+        node.register_peer(2, "192.0.2.2:18444".parse().unwrap(), false, sender);
+        assert!(node.track_peer_block_request(1, first.block_hash()));
+        assert!(node.track_peer_block_request(2, second.block_hash()));
+
+        let schedule = node.next_block_download_schedule(
+            2,
+            MAX_BLOCKS_IN_TRANSIT_PER_PEER,
+            wire::NODE_NETWORK | wire::NODE_WITNESS,
+        );
+        assert!(schedule.requests.is_empty());
+        assert_eq!(schedule.staller, None);
     }
 
     #[test]

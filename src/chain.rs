@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use bincode::{deserialize as deserialize_binary, serialize as serialize_binary};
 use bitcoin::bip158::{BlockFilter, FilterHeader};
+use bitcoin::block::Header;
 use bitcoin::blockdata::constants::genesis_block;
 use bitcoin::consensus::encode::{Decodable, VarInt, deserialize, serialize};
 use bitcoin::hashes::{Hash, HashEngine};
@@ -23,7 +24,7 @@ use bitcoin::{
     Amount, Block, BlockHash, Network, OutPoint, Script, ScriptBuf, Transaction, TxOut, Txid,
     Witness,
 };
-use hashbrown::HashMap as FastHashMap;
+use hashbrown::{HashMap as FastHashMap, HashSet as FastHashSet};
 use num_bigint::BigUint;
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -39,8 +40,8 @@ use crate::muhash::MuHash3072;
 use crate::storage::{
     ActiveTransactionLocationsQuery, BlockStore, BlockStoreReader, ChainstateStore,
     CoinStatsRecord, CoinStatsStore, ElectrumBlockStore, ElectrumBlockStoreReader,
-    ElectrumHistoryQuery, ElectrumHistoryStore, FilterStore, StoredTxLocation, StoredUndo,
-    StoredUtxo, TransactionIndexStore, UtxoQuery, UtxoStore,
+    ElectrumHistoryQuery, ElectrumHistoryStore, FilterStore, PreparedBlockRecord, StoredTxLocation,
+    StoredUndo, StoredUtxo, TransactionIndexStore, UtxoQuery, UtxoStore, UtxoValidationView,
 };
 use crate::validation::{self, ValidationError};
 
@@ -125,23 +126,37 @@ const HEADER_JOURNAL_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024;
 // Peer/IBD writes use append-only records and publish a bounded durability
 // boundary instead of forcing several fsyncs for every block. Direct API and
 // mining paths retain their immediate-sync behavior.
-const PEER_STORAGE_FLUSH_BLOCKS: u32 = 4_096;
-const PEER_STORAGE_FLUSH_BYTES: u64 = 64 * 1024 * 1024;
+// Core lets dirty coin-cache pressure, rather than historical body bytes,
+// decide when chainstate must be flushed. Keep a large safety cap for the
+// low-transaction early chain so crash recovery remains bounded without
+// turning every few thousand IBD blocks into a stop-the-world NFS sync.
+const PEER_STORAGE_FLUSH_BLOCKS: u32 = 65_536;
 // Native persistence writes the compressed body, undo, chainstate delta,
 // UTXO/index keys, and optional Electrum history events. Reserve a generous
 // multiple of incoming body bytes so an LSM journal or compaction cannot
 // consume Core's 50 MiB emergency floor mid-batch.
 const NATIVE_STORAGE_WRITE_RESERVE_MULTIPLIER: u64 = 10;
 const IBD_BENCH_BLOCKS: u32 = 256;
+// A 4,096-block suffix keeps startup bounded while covering a much larger
+// fraction of the spend-locality window that Core rebuilds naturally during
+// IBD. The byte cap below still prevents this from materializing the whole
+// mainnet UTXO set.
 const UTXO_CACHE_WARM_BLOCKS: usize = 4_096;
 const UTXO_CACHE_WARM_DELTA_BYTES: usize = 512 * 1024 * 1024;
-const UTXO_CACHE_WARM_ENTRY_BYTES: usize = 512 * 1024 * 1024;
+// Startup warming is deliberately bounded below the full decoded coin-cache
+// budget so reopening an IBD node does not materialize the entire UTXO set.
+// The previous 512 MiB cap left most of a 2 GiB `-dbcache` unused while the
+// first post-restart windows immediately reread older coins from NFS.
+const UTXO_CACHE_STARTUP_MAX_BYTES: usize = 1_536 * 1024 * 1024;
 
 #[derive(Default)]
 struct IbdConnectBench {
     blocks: u32,
     transactions: u64,
     validation: Duration,
+    utxo_prefetch: Duration,
+    transaction_validation: Duration,
+    utxo_misses: u64,
     undo_and_filters: Duration,
     block_and_delta_storage: Duration,
     state_mutation: Duration,
@@ -154,6 +169,9 @@ struct IbdConnectBench {
 
 struct ConnectTimings {
     validation: Duration,
+    utxo_prefetch: Duration,
+    transaction_validation: Duration,
+    utxo_misses: u64,
     undo_and_filters: Duration,
     block_and_delta_storage: Duration,
     state_mutation: Duration,
@@ -382,21 +400,21 @@ const DEFAULT_SIGNET_ASSUMEUTXO: &[AssumeUtxoData] = &[
 const REGTEST_ASSUMEUTXO: &[AssumeUtxoData] = &[
     AssumeUtxoData {
         height: 110,
-        hash_serialized: "b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327",
+        hash_serialized: "6657b736d4fe4db0cbc796789e812d5dba7f5c143764b1b6905612f1830609d1",
         chain_tx_count: 111,
-        blockhash: "6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397",
+        blockhash: "696e92821f65549c7ee134edceeeeaaa4105647a3c4fd9f298c0aec0ab50425c",
     },
     AssumeUtxoData {
         height: 200,
-        hash_serialized: "17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a",
+        hash_serialized: "4f34d431c3e482f6b0d67b64609ece3964dc8d7976d02ac68dd7c9c1421738f2",
         chain_tx_count: 201,
-        blockhash: "385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9",
+        blockhash: "5e93653318f294fb5aa339d00bbf8cf1c3515488ad99412c37608b139ea63b27",
     },
     AssumeUtxoData {
         height: 299,
-        hash_serialized: "d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2",
+        hash_serialized: "a4bf3407ccb2cc0145c49ebba8fa91199f8a3903daf0883875941497d2493c27",
         chain_tx_count: 334,
-        blockhash: "7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2",
+        blockhash: "3bb7ce5eba0be48939b7a521ac1ba9316afee2c7bada3a0cca24188e6d7d96c0",
     },
 ];
 
@@ -410,17 +428,27 @@ fn assumeutxo_data_for_network(network: Network) -> &'static [AssumeUtxoData] {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct UtxoEntry {
-    pub output: TxOut,
-    pub height: u32,
-    pub median_time_past: u32,
-    pub coinbase: bool,
-}
+/// Public chain-facing name for the shared decoded UTXO representation.
+///
+/// Core's `CCoinsViewCache` retains the exact coin object fetched during
+/// validation.  An alias keeps that same ownership model here instead of
+/// making every miss perform a storage-to-chain conversion and a second
+/// `TxOut` clone.
+pub type UtxoEntry = StoredUtxo;
+
+/// In-memory active-chain coin maps use the same fast hash family as the
+/// block-local validation maps. Core's coin cache uses a specialized outpoint
+/// hasher; the standard-library SipHash map is needlessly expensive for the
+/// millions of lookups performed during IBD and full chainstate replay.
+type ActiveUtxoMap = FastHashMap<OutPoint, UtxoEntry>;
 
 trait UtxoLookup {
     fn contains(&self, outpoint: &OutPoint) -> Result<bool>;
-    fn get(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>>;
+    fn with_entry<T>(
+        &self,
+        outpoint: &OutPoint,
+        f: impl FnOnce(Option<&UtxoEntry>) -> Result<T>,
+    ) -> Result<T>;
 }
 
 impl UtxoLookup for HashMap<OutPoint, UtxoEntry> {
@@ -428,8 +456,26 @@ impl UtxoLookup for HashMap<OutPoint, UtxoEntry> {
         Ok(self.contains_key(outpoint))
     }
 
-    fn get(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>> {
-        Ok(HashMap::get(self, outpoint).cloned())
+    fn with_entry<T>(
+        &self,
+        outpoint: &OutPoint,
+        f: impl FnOnce(Option<&UtxoEntry>) -> Result<T>,
+    ) -> Result<T> {
+        f(HashMap::get(self, outpoint))
+    }
+}
+
+impl UtxoLookup for FastHashMap<OutPoint, UtxoEntry> {
+    fn contains(&self, outpoint: &OutPoint) -> Result<bool> {
+        Ok(self.contains_key(outpoint))
+    }
+
+    fn with_entry<T>(
+        &self,
+        outpoint: &OutPoint,
+        f: impl FnOnce(Option<&UtxoEntry>) -> Result<T>,
+    ) -> Result<T> {
+        f(FastHashMap::get(self, outpoint))
     }
 }
 
@@ -438,13 +484,58 @@ impl UtxoLookup for UtxoStore {
         UtxoStore::contains(self, outpoint)
     }
 
-    fn get(&self, outpoint: &OutPoint) -> Result<Option<UtxoEntry>> {
-        Ok(UtxoStore::get(self, outpoint)?.map(|entry| UtxoEntry {
-            output: entry.output,
-            height: entry.height,
-            median_time_past: entry.median_time_past,
-            coinbase: entry.coinbase,
-        }))
+    fn with_entry<T>(
+        &self,
+        outpoint: &OutPoint,
+        f: impl FnOnce(Option<&UtxoEntry>) -> Result<T>,
+    ) -> Result<T> {
+        UtxoStore::with_entry(self, outpoint, f)
+    }
+}
+
+impl UtxoLookup for UtxoValidationView<'_> {
+    fn contains(&self, outpoint: &OutPoint) -> Result<bool> {
+        UtxoValidationView::contains(self, outpoint)
+    }
+
+    fn with_entry<T>(
+        &self,
+        outpoint: &OutPoint,
+        f: impl FnOnce(Option<&UtxoEntry>) -> Result<T>,
+    ) -> Result<T> {
+        UtxoValidationView::with_entry(self, outpoint, f)
+    }
+}
+
+/// A block-local view of the shared UTXO cache. Parallel prefetch records
+/// absent outpoints as well as decoded coins, so consensus checks such as the
+/// BIP30 probe do not issue a second disk lookup for the same negative result.
+struct PrefetchedUtxos<'a, 'cache> {
+    view: &'a UtxoValidationView<'cache>,
+    // Successful and negative point reads share one map so validation does
+    // not probe a second missing-input set for every transaction input.
+    prefetched: &'a FastHashMap<OutPoint, Option<UtxoEntry>>,
+}
+
+impl UtxoLookup for PrefetchedUtxos<'_, '_> {
+    fn contains(&self, outpoint: &OutPoint) -> Result<bool> {
+        if let Some(entry) = self.prefetched.get(outpoint) {
+            Ok(entry.is_some())
+        } else {
+            self.view.contains(outpoint)
+        }
+    }
+
+    fn with_entry<T>(
+        &self,
+        outpoint: &OutPoint,
+        f: impl FnOnce(Option<&UtxoEntry>) -> Result<T>,
+    ) -> Result<T> {
+        if let Some(entry) = self.prefetched.get(outpoint) {
+            f(entry.as_ref())
+        } else {
+            self.view.with_entry(outpoint, f)
+        }
     }
 }
 
@@ -615,7 +706,7 @@ struct CoinStatsState {
 }
 
 impl CoinStatsState {
-    fn from_utxos(utxos: &HashMap<OutPoint, UtxoEntry>) -> Self {
+    fn from_utxos(utxos: &ActiveUtxoMap) -> Self {
         let mut state = Self::default();
         for (outpoint, entry) in utxos {
             state.add(outpoint, entry);
@@ -738,6 +829,20 @@ impl CoinStatsState {
 
 struct BlockApplication {
     spent_entries: Vec<(OutPoint, UtxoEntry)>,
+    // Every non-coinbase input is needed for the state transition, but the
+    // full coin is only needed when undo/filter/history data must be built.
+    // Keeping the outpoints separately lets the default wallet-free replay
+    // follow Core's move-from-cache path without cloning spent TxOuts.
+    spent_outpoints: FastHashSet<OutPoint>,
+    // Outputs created by non-coinbase transactions in this block.  The
+    // validator already constructs these entries so later transactions can
+    // spend them; moving the map into the chainstate delta avoids rebuilding
+    // and cloning every output a second time after validation.
+    created_entries: ActiveUtxoMap,
+    // Outputs created and spent within this block are erased from Core's
+    // FRESH cache immediately. Keep only their keys so the durable path does
+    // not emit tombstones for coins that never existed on disk.
+    same_block_spent: FastHashSet<OutPoint>,
     metrics: CoinStatsBlockMetrics,
 }
 
@@ -748,7 +853,7 @@ struct BlockApplication {
 /// of order.
 struct SideChainUtxoCache {
     hash: BlockHash,
-    utxos: HashMap<OutPoint, UtxoEntry>,
+    utxos: ActiveUtxoMap,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -814,7 +919,7 @@ pub struct PruneLock {
 struct ChainSnapshot {
     tip: String,
     headers: Vec<bitcoin::block::Header>,
-    utxos: HashMap<OutPoint, UtxoEntry>,
+    utxos: ActiveUtxoMap,
     history: HashMap<String, Vec<HistoryEntry>>,
     spent_by: Option<HashMap<OutPoint, SpentTransaction>>,
     prune_height: Option<u32>,
@@ -834,8 +939,7 @@ struct ChainstateDelta {
 }
 
 struct PreparedTransactionDelta {
-    transaction: (Txid, TxLocation),
-    created: Vec<(OutPoint, UtxoEntry)>,
+    transaction: Option<(Txid, TxLocation)>,
     history: Vec<(String, HistoryEntry)>,
     spent_by: Vec<(OutPoint, SpentTransaction)>,
 }
@@ -875,7 +979,7 @@ struct SnapshotProvenance {
 #[derive(Serialize, Deserialize)]
 struct AssumeUtxoBaseSnapshot {
     base_hash: String,
-    utxos: HashMap<OutPoint, UtxoEntry>,
+    utxos: ActiveUtxoMap,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -885,20 +989,20 @@ struct AssumeUtxoCheckpoint {
     block_hash: String,
     #[serde(default)]
     base_matches: Option<bool>,
-    utxos: HashMap<OutPoint, UtxoEntry>,
+    utxos: ActiveUtxoMap,
 }
 
 #[derive(Debug)]
 enum BackgroundValidationOutcome {
     Complete {
         target_tip: BlockHash,
-        utxos: HashMap<OutPoint, UtxoEntry>,
+        utxos: ActiveUtxoMap,
         base_matches: bool,
     },
     Failed {
         target_tip: BlockHash,
         error: String,
-        utxos: Option<HashMap<OutPoint, UtxoEntry>>,
+        utxos: Option<ActiveUtxoMap>,
     },
 }
 
@@ -979,6 +1083,22 @@ fn script_check_workers(par: i32) -> usize {
         0,
         i32::try_from(MAX_SCRIPT_CHECK_THREADS).unwrap_or(i32::MAX),
     ) as usize
+}
+
+/// Core creates its script-check queue once and reuses the worker threads for
+/// every block. Rebuilding an OS-thread set in `validate_script_checks` adds a
+/// scheduler and stack-allocation cost to every script-checked block, which is
+/// especially visible near the chain tip where assume-valid no longer skips
+/// script verification.
+fn build_script_check_pool(workers: usize) -> Option<rayon::ThreadPool> {
+    let thread_count = workers.saturating_add(1);
+    (thread_count > 1).then(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .thread_name(|index| format!("script-check-{index}"))
+            .build()
+            .expect("building script-check worker pool")
+    })
 }
 
 fn serialize_internal<T: Serialize>(magic: &[u8], value: &T) -> Result<Vec<u8>> {
@@ -1349,9 +1469,11 @@ pub struct ChainState {
     blocks_xor: bool,
     minimum_chain_work_override: Option<Work>,
     assume_valid_block: Option<BlockHash>,
+    software_expiry: i64,
     max_tip_age_secs: u64,
     script_check_workers: usize,
     script_checks_enabled: bool,
+    script_check_pool: Option<rayon::ThreadPool>,
     // `None` means no transition has been logged yet; the nested option
     // preserves a logged "disabled" state separately from that sentinel.
     script_check_log_state: Mutex<Option<Option<&'static str>>>,
@@ -1382,6 +1504,11 @@ pub struct ChainState {
     active_tx_counts: Vec<u32>,
     active_tx_totals: Vec<u64>,
     initial_block_download: bool,
+    // A full chainstate reindex can publish the durable UTXO/index markers
+    // directly.  Building a second full snapshot map at the end would
+    // duplicate the already-materialized UTXO set and is unnecessary for a
+    // restart once the durable stores agree with the active tip.
+    startup_reindex: bool,
     max_tip_age_configured: bool,
     snapshot_base: Option<BlockHash>,
     snapshot_validated: bool,
@@ -1403,6 +1530,15 @@ pub struct ChainState {
     // walk the available suffix without scanning the global header index.
     pending_body_children: HashMap<BlockHash, Vec<BlockHash>>,
     processing_known_children: bool,
+    // Core's BLOCK_VALID_TRANSACTIONS/HaveNumChainTxs state is distinct from
+    // merely having a body in the block store.  Keep the runtime equivalent
+    // for bodies accepted by the peer path so the download scheduler can
+    // advance over a contiguous out-of-order suffix without treating an
+    // arbitrary stored body as validated.  This is intentionally rebuilt
+    // only for bodies received during the current run; old bodies remain
+    // safe but conservative after restart because their native store has no
+    // persisted validity-status bit.
+    peer_body_chain_ready: HashSet<BlockHash>,
     // Preserve the arrival order of bodies whose parent data is not yet
     // available. Core replays these bodies in insertion order when the
     // missing parent arrives, which determines equal-work chain selection.
@@ -1429,7 +1565,7 @@ pub struct ChainState {
     prune_target_size: Option<u64>,
     prune_after_height: u32,
     fast_prune: bool,
-    utxos: HashMap<OutPoint, UtxoEntry>,
+    utxos: ActiveUtxoMap,
     utxos_materialized: bool,
     side_chain_utxos: Option<SideChainUtxoCache>,
     history: HashMap<String, Vec<HistoryEntry>>,
@@ -1873,6 +2009,8 @@ impl ChainState {
             txospender_index_enabled,
             preserve_disabled_spender_snapshot,
             Arc::new(AtomicBool::new(false)),
+            None,
+            0,
         )
     }
 
@@ -1899,6 +2037,8 @@ impl ChainState {
         txospender_index_enabled: bool,
         preserve_disabled_spender_snapshot: bool,
         shutdown_interrupt: Arc<AtomicBool>,
+        storage_cache_mib: Option<i64>,
+        max_mempool_bytes: usize,
     ) -> Result<Self> {
         if deployment_parameters.network != network {
             bail!("consensus deployment parameters use a different network");
@@ -1922,12 +2062,13 @@ impl ChainState {
         let auxiliary_store_started = Instant::now();
         info!("Loading auxiliary storage indexes");
         let filter_store = FilterStore::open(data_dir.join("filters"))?;
-        // Best-chain transaction lookup is part of the wallet-free RPC/REST
-        // surface even when Electrum and the optional all-chain txindex are
-        // disabled. Keep its locations in the bounded-cache disk database.
-        let tx_index_store = Some(TransactionIndexStore::open(
-            data_dir.join("indexes/txindex"),
-        )?);
+        // Core does not maintain historical transaction locations unless
+        // `-txindex` is enabled. Electrum needs equivalent active-chain
+        // locations for its txid-based protocol, but the default wallet-free
+        // RPC/P2P node must not pay that IBD cost when both features are off.
+        let tx_index_store = (tx_index_all_enabled || electrum_history_index_enabled)
+            .then(|| TransactionIndexStore::open(data_dir.join("indexes/txindex")))
+            .transpose()?;
         let coinstats_store = CoinStatsStore::open(data_dir.join("indexes/coinstatsindex"))?;
         info!(
             "Loaded auxiliary storage indexes in {:.2}s",
@@ -1963,10 +2104,17 @@ impl ChainState {
         );
         let utxo_store_started = Instant::now();
         info!("Loading UTXO value index");
-        let utxo_store = UtxoStore::open(chainstate_path.join("utxos"))?;
+        let utxo_disk_cache_bytes = UtxoStore::recommended_disk_cache_bytes(storage_cache_mib);
+        let mut utxo_store =
+            UtxoStore::open_with_cache(chainstate_path.join("utxos"), utxo_disk_cache_bytes)?;
+        if let Some(storage_cache_mib) = storage_cache_mib {
+            store.configure_cache_size_mib(storage_cache_mib);
+            utxo_store.configure_cache_size_mib_with_mempool(storage_cache_mib, max_mempool_bytes);
+        }
         info!(
-            "Loaded UTXO value index: entries={} in {:.2}s",
+            "Loaded UTXO value index: entries={} disk_cache={}MiB in {:.2}s",
             utxo_store.len(),
+            utxo_disk_cache_bytes / (1024 * 1024),
             utxo_store_started.elapsed().as_secs_f64()
         );
         let history_store_started = Instant::now();
@@ -2106,7 +2254,11 @@ impl ChainState {
         // by a pre-SegWit validation path.  The block-index database carries
         // this information in BLOCK_OPT_WITNESS; native storage keeps the
         // equivalent set in chainstate metadata.
+        let pending_snapshot_validation = persisted_snapshot_provenance
+            .as_ref()
+            .is_some_and(|provenance| !provenance.validated && provenance.failure.is_none());
         if !rebuild_chainstate
+            && !pending_snapshot_validation
             && active_chain
                 .iter()
                 .enumerate()
@@ -2155,9 +2307,13 @@ impl ChainState {
             blocks_xor,
             minimum_chain_work_override,
             assume_valid_block,
+            software_expiry: 0,
             max_tip_age_secs: MAX_TIP_AGE_SECS,
             script_check_workers: script_check_workers(DEFAULT_SCRIPT_CHECK_THREADS),
             script_checks_enabled: script_check_workers(DEFAULT_SCRIPT_CHECK_THREADS) > 0,
+            script_check_pool: build_script_check_pool(script_check_workers(
+                DEFAULT_SCRIPT_CHECK_THREADS,
+            )),
             script_check_log_state: Mutex::new(None),
             signet_challenge: (network == Network::Signet).then(|| {
                 signet_challenge
@@ -2186,6 +2342,7 @@ impl ChainState {
             active_tx_counts: persisted_tx_counts.unwrap_or_default(),
             active_tx_totals: persisted_tx_totals,
             initial_block_download: true,
+            startup_reindex: rebuild_chainstate,
             max_tip_age_configured: false,
             snapshot_base: persisted_snapshot_provenance
                 .as_ref()
@@ -2205,6 +2362,7 @@ impl ChainState {
             next_block_sequence_id: 1,
             pending_body_children: HashMap::new(),
             processing_known_children: false,
+            peer_body_chain_ready: HashSet::new(),
             unlinked_body_order: HashMap::new(),
             next_unlinked_body_order: 1,
             header_sequence_ids: HashMap::new(),
@@ -2221,7 +2379,7 @@ impl ChainState {
             // the owning Node applies the network-specific Core parameter.
             prune_after_height: MIN_BLOCKS_TO_KEEP,
             fast_prune: false,
-            utxos: HashMap::new(),
+            utxos: FastHashMap::new(),
             utxos_materialized: true,
             side_chain_utxos: None,
             history: HashMap::new(),
@@ -2486,8 +2644,13 @@ impl ChainState {
                 );
             }
         }
+        let transaction_locations = if state.tx_index_store.is_some() {
+            "disk"
+        } else {
+            "disabled"
+        };
         info!(
-            "Restored chainstate indexes: transaction_locations=disk history_scripts={} in {:.2}s",
+            "Restored chainstate indexes: transaction_locations={transaction_locations} history_scripts={} in {:.2}s",
             state.history.len(),
             chainstate_restore_started.elapsed().as_secs_f64()
         );
@@ -2542,11 +2705,19 @@ impl ChainState {
                 && !state.snapshot_validated
                 && state.snapshot_validation_error.is_none();
             if pending_assumeutxo {
-                let snapshot_height = state
+                let base_height = state
                     .snapshot_base
                     .and_then(|base| state.block_height_by_hash(&base))
                     .unwrap_or_else(|| state.height());
-                state.validate_snapshot_utxo_shape(&state.utxos, snapshot_height)?;
+                // The persisted UTXO set starts at the snapshot base, but it
+                // may already include blocks received after that base.  This
+                // is the normal AssumeUTXO serving-chain state after a
+                // restart during background validation.  Validate against
+                // whichever height the restored set actually reaches rather
+                // than rejecting legitimate post-snapshot outputs as
+                // "future" coins.
+                let serving_tip_height = state.height().max(base_height);
+                state.validate_snapshot_utxo_shape(&state.utxos, serving_tip_height)?;
             }
         }
         info!("Reconciling UTXO index");
@@ -2723,10 +2894,15 @@ impl ChainState {
 
     fn flush_append_only_stores(&mut self) -> Result<()> {
         self.ensure_disk_space_for_pending_flush()?;
+        let started = Instant::now();
         self.store.flush()?;
+        let after_blocks = Instant::now();
         self.chainstate_store.flush()?;
+        let after_chainstate = Instant::now();
         self.utxo_store.flush()?;
+        let after_utxos = Instant::now();
         self.electrum_history_store.flush()?;
+        let after_history = Instant::now();
         self.filter_store.flush()?;
         self.coinstats_store.flush()?;
         if let Some(store) = self.electrum_store.as_mut() {
@@ -2734,6 +2910,18 @@ impl ChainState {
         }
         if let Some(store) = self.tx_index_store.as_mut() {
             store.flush()?;
+        }
+        let finished = Instant::now();
+        if finished.duration_since(started) >= Duration::from_secs(1) {
+            info!(
+                "Storage flush phases: blocks_undo={:.3}s chainstate_deltas={:.3}s utxos={:.3}s electrum_history={:.3}s remaining={:.3}s total={:.3}s",
+                after_blocks.duration_since(started).as_secs_f64(),
+                after_chainstate.duration_since(after_blocks).as_secs_f64(),
+                after_utxos.duration_since(after_chainstate).as_secs_f64(),
+                after_history.duration_since(after_utxos).as_secs_f64(),
+                finished.duration_since(after_history).as_secs_f64(),
+                finished.duration_since(started).as_secs_f64(),
+            );
         }
         Ok(())
     }
@@ -2773,7 +2961,9 @@ impl ChainState {
         let estimated_batch_bytes = if sync_storage {
             body_bytes
         } else {
-            PEER_STORAGE_FLUSH_BYTES.max(body_bytes)
+            // This is a disk-space reservation, not a durability threshold.
+            // Dirty UTXO cache pressure controls the actual checkpoint.
+            (512 * 1024 * 1024).max(body_bytes)
         };
         self.ensure_disk_space_for_paths(
             estimated_batch_bytes.saturating_mul(NATIVE_STORAGE_WRITE_RESERVE_MULTIPLIER),
@@ -2782,7 +2972,7 @@ impl ChainState {
 
     fn flush_peer_storage_if_needed(&mut self) -> Result<()> {
         if self.peer_storage_blocks_since_flush < PEER_STORAGE_FLUSH_BLOCKS
-            && self.peer_storage_bytes_since_flush < PEER_STORAGE_FLUSH_BYTES
+            && !self.utxo_store.needs_durability_checkpoint()
         {
             return Ok(());
         }
@@ -2808,16 +2998,33 @@ impl ChainState {
         Ok(())
     }
 
-    fn record_ibd_connect_bench(&mut self, transactions: usize, timings: ConnectTimings) {
+    fn record_connect_bench(
+        &mut self,
+        transactions: usize,
+        timings: ConnectTimings,
+        label: &str,
+        trim_heap: bool,
+    ) {
         if !self.initial_block_download {
             return;
         }
+        // Returning allocator arenas to the OS is useful after a large
+        // parallel prefetch, but malloc_trim is itself a process-wide heap
+        // operation. Running it for every block made the unreported part of
+        // IBD slower than Core and distorted the 256-block benchmark rate.
+        // Keep the cleanup at the same cadence as the benchmark window.
+        let should_trim_heap = trim_heap
+            && timings.utxo_prefetch > Duration::from_millis(5)
+            && (self.ibd_connect_bench.blocks + 1) % IBD_BENCH_BLOCKS == 0;
         let bench = &mut self.ibd_connect_bench;
         bench.blocks = bench.blocks.saturating_add(1);
         bench.transactions = bench
             .transactions
             .saturating_add(u64::try_from(transactions).unwrap_or(u64::MAX));
         bench.validation += timings.validation;
+        bench.utxo_prefetch += timings.utxo_prefetch;
+        bench.transaction_validation += timings.transaction_validation;
+        bench.utxo_misses = bench.utxo_misses.saturating_add(timings.utxo_misses);
         bench.undo_and_filters += timings.undo_and_filters;
         bench.block_and_delta_storage += timings.block_and_delta_storage;
         bench.state_mutation += timings.state_mutation;
@@ -2841,11 +3048,23 @@ impl ChainState {
         } else {
             0.0
         };
+        let (utxo_cache_entries, utxo_cache_bytes) = self.utxo_store.cache_stats();
+        let (utxo_pending_entries, utxo_pending_bytes, utxo_clean_bytes, utxo_cache_limit) =
+            self.utxo_store.pending_stats();
         info!(
-            "IBD connect benchmark: blocks={} txs={} rate={blocks_per_second:.1} blocks/s txrate={transactions_per_second:.0} tx/s validation={:.2}s undo_filters={:.2}s block_delta_storage={:.2}s state_mutation={:.2}s tx_indexes={:.2}s utxo_index={:.2}s history_index={:.2}s finalization={:.2}s total={total_seconds:.2}s",
+            "{label} connect benchmark: blocks={} txs={} rate={blocks_per_second:.1} blocks/s txrate={transactions_per_second:.0} tx/s validation={:.2}s utxo_prefetch={:.2}s transaction_validation={:.2}s utxo_misses={} utxo_cache={} entries/{}MiB utxo_pending={} entries/{}MiB clean_cache={}MiB cache_limit={}MiB undo_filters={:.2}s block_delta_storage={:.2}s state_mutation={:.2}s tx_indexes={:.2}s utxo_index={:.2}s history_index={:.2}s finalization={:.2}s total={total_seconds:.2}s",
             bench.blocks,
             bench.transactions,
             bench.validation.as_secs_f64(),
+            bench.utxo_prefetch.as_secs_f64(),
+            bench.transaction_validation.as_secs_f64(),
+            bench.utxo_misses,
+            utxo_cache_entries,
+            utxo_cache_bytes / (1024 * 1024),
+            utxo_pending_entries,
+            utxo_pending_bytes / (1024 * 1024),
+            utxo_clean_bytes / (1024 * 1024),
+            utxo_cache_limit / (1024 * 1024),
             bench.undo_and_filters.as_secs_f64(),
             bench.block_and_delta_storage.as_secs_f64(),
             bench.state_mutation.as_secs_f64(),
@@ -2854,6 +3073,13 @@ impl ChainState {
             bench.history_index.as_secs_f64(),
             bench.finalization.as_secs_f64(),
         );
+        // A block-sized prefetch batch releases many decoded values and wire
+        // buffers. glibc otherwise retains those pages in worker arenas until
+        // the much later 65,536-block storage flush, creating the RSS slope
+        // that does not exist in Core's long-lived coin cache.
+        if should_trim_heap {
+            trim_process_heap();
+        }
     }
 
     /// Make all append-only stores and the chain metadata durable.
@@ -3382,6 +3608,20 @@ impl ChainState {
             self.prune_locks.remove("coinstatsindex");
             return Ok(());
         }
+        // Core indexes the background (pre-snapshot) chainstate while an
+        // AssumeUTXO snapshot is pending.  The serving chain may already be
+        // extended to the snapshot base using headers only, so rebuilding
+        // from the live snapshot tip would incorrectly require bodies and
+        // undo records that belong to the background validator.  Leave the
+        // existing index at its durable prefix and rebuild it when that
+        // validation completes.
+        if self.snapshot_base.is_some()
+            && !self.snapshot_validated
+            && self.snapshot_validation_error.is_none()
+        {
+            self.coin_stats = None;
+            return Ok(());
+        }
         let utxos = if self.utxos_materialized {
             self.utxos.clone()
         } else {
@@ -3440,7 +3680,7 @@ impl ChainState {
         path.reverse();
 
         let mut stats = CoinStatsState::default();
-        let mut utxos = HashMap::new();
+        let mut utxos = FastHashMap::new();
         for (height, block_hash) in path.into_iter().enumerate() {
             let Some(block) = self.store.get(&block_hash)? else {
                 return Ok(None);
@@ -4103,6 +4343,9 @@ impl ChainState {
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
                 self.mark_active_chain_segwit_validated();
+                if self.coinstats_index_enabled && self.coin_stats.is_none() {
+                    self.rebuild_coinstats_index()?;
+                }
                 self.persist_snapshot()?;
                 self.remove_assumeutxo_artifacts()?;
                 self.persist_snapshot_provenance()?;
@@ -4125,6 +4368,9 @@ impl ChainState {
                 self.snapshot_validated = true;
                 self.snapshot_validation_error = None;
                 self.mark_active_chain_segwit_validated();
+                if self.coinstats_index_enabled && self.coin_stats.is_none() {
+                    self.rebuild_coinstats_index()?;
+                }
                 self.persist_snapshot()?;
                 self.remove_assumeutxo_artifacts()?;
                 self.persist_snapshot_provenance()?;
@@ -4144,6 +4390,9 @@ impl ChainState {
                     self.snapshot_base = None;
                     self.snapshot_validated = true;
                     self.snapshot_validation_error = None;
+                    if self.coinstats_index_enabled && self.coin_stats.is_none() {
+                        self.rebuild_coinstats_index()?;
+                    }
                     self.persist_snapshot()?;
                     self.remove_assumeutxo_artifacts()?;
                     self.persist_snapshot_provenance()?;
@@ -4178,12 +4427,19 @@ impl ChainState {
         self.update_ibd_status();
     }
 
+    /// Configure Core's debug-only software expiration policy. Keeping this
+    /// in chainstate makes peer, RPC, and replay validation use one rule.
+    pub fn configure_software_expiry(&mut self, software_expiry: i64) {
+        self.software_expiry = software_expiry;
+    }
+
     /// Configure the number of parallel script-check workers using Core's
     /// `-par` convention. Zero autodetects, while a negative value leaves
     /// that many cores available to the rest of the node.
     pub fn configure_script_check_threads(&mut self, par: i32) {
         self.script_check_workers = script_check_workers(par);
         self.script_checks_enabled = self.script_check_workers > 0;
+        self.script_check_pool = build_script_check_pool(self.script_check_workers);
     }
 
     fn check_shutdown_interrupt(&self) -> Result<()> {
@@ -4231,25 +4487,44 @@ impl ChainState {
         }
     }
 
-    /// Configure the custom append-only store's decoded block cache from the
-    /// Core-compatible `-dbcache` setting.
+    /// Configure the custom stores' caches from Core's `-dbcache` setting.
+    ///
+    /// Core gives almost all of the database budget to the decoded coin cache:
+    /// the block-tree and coins LevelDB caches are capped at 2 MiB and 8 MiB.
+    /// It also allows unused mempool space to be consumed by dirty coins while
+    /// the mempool is below its limit. Keep both parts of that accounting in
+    /// the native UTXO cache so an empty-mempool IBD has the same working-set
+    /// budget as Core.
     pub fn configure_storage_cache_size_mib(&mut self, mib: i64) {
+        self.configure_storage_cache_size_mib_with_mempool(mib, 0);
+    }
+
+    pub fn configure_storage_cache_size_mib_with_mempool(
+        &mut self,
+        mib: i64,
+        max_mempool_bytes: usize,
+    ) {
         self.store.configure_cache_size_mib(mib);
-        self.utxo_store.configure_cache_size_mib(mib);
+        self.utxo_store
+            .configure_cache_size_mib_with_mempool(mib, max_mempool_bytes);
     }
 
     pub fn warm_utxo_cache(&mut self) -> Result<(usize, usize)> {
         let capacity = self.utxo_store.cache_capacity_bytes();
-        let target_bytes = capacity.min(UTXO_CACHE_WARM_ENTRY_BYTES);
+        // Match Core's useful post-flush cache locality: devote most of the
+        // configured cache to recently created live coins while retaining
+        // headroom for continued IBD growth.  Do not let startup warming turn
+        // a restart into a full in-memory UTXO materialization: Core starts
+        // with an empty CCoinsViewCache and repopulates it from the database.
+        // A bounded recent window gives the same locality benefit without
+        // allocating the complete multi-gigabyte mainnet UTXO set.
+        let target_bytes = capacity
+            .saturating_mul(7)
+            .checked_div(8)
+            .unwrap_or(0)
+            .min(UTXO_CACHE_STARTUP_MAX_BYTES);
         if target_bytes == 0 || self.active_chain.len() <= 1 {
             return self.utxo_store.warm_cache();
-        }
-        if let Some(warmed) = self.utxo_store.warm_complete_cache_if_fits()? {
-            info!(
-                "Selected complete UTXO set for cache: entries={} bytes={}",
-                warmed.0, warmed.1
-            );
-            return Ok(warmed);
         }
 
         // Walk checksummed active-chain deltas backwards. A created output is
@@ -4293,13 +4568,116 @@ impl ChainState {
                 break;
             }
         }
+        if scanned_blocks == 0 {
+            // A fully published UTXO checkpoint can have no mutation suffix.
+            // Reconstruct the newest live outputs from authoritative block
+            // bodies instead; unlike a key-ordered database sample this
+            // preserves the strong spend-locality that Core's IBD cache gets
+            // naturally by remaining resident from genesis.
+            let hashes = self
+                .active_chain
+                .iter()
+                .rev()
+                .take(UTXO_CACHE_WARM_BLOCKS)
+                .copied()
+                .collect::<Vec<_>>();
+            let mut spent_after = HashSet::new();
+            for hash in hashes {
+                let median_time_past = self
+                    .block_index
+                    .get(&hash)
+                    .map(|node| {
+                        // The genesis block has no indexed parent. Its own
+                        // timestamp is the only available median-time value
+                        // and is also the value used for its descendants'
+                        // lock-time context during replay.
+                        if node.height == 0 {
+                            node.header.time
+                        } else {
+                            self.median_time_past_for_parent(node.header.prev_blockhash)
+                        }
+                    })
+                    .unwrap_or_default();
+                let height = self
+                    .block_index
+                    .get(&hash)
+                    .map(|node| node.height)
+                    .unwrap_or_default();
+                let Some(block) = self.store.get(&hash)? else {
+                    break;
+                };
+                let transaction_ids = block_transaction_ids(&block);
+                let created_in_block = block
+                    .txdata
+                    .iter()
+                    .zip(transaction_ids.iter())
+                    .flat_map(|(transaction, txid)| {
+                        (0..transaction.output.len())
+                            .map(move |output_index| OutPoint::new(*txid, output_index as u32))
+                    })
+                    .collect::<HashSet<_>>();
+                let spent_in_block = block
+                    .txdata
+                    .iter()
+                    .flat_map(|transaction| transaction.input.iter())
+                    .filter_map(|input| {
+                        (!input.previous_output.is_null()).then_some(input.previous_output)
+                    })
+                    .collect::<HashSet<_>>();
+                for (transaction_index, (transaction, txid)) in
+                    block.txdata.iter().zip(transaction_ids.iter()).enumerate()
+                {
+                    for (output_index, output) in transaction.output.iter().enumerate() {
+                        let outpoint = OutPoint::new(*txid, output_index as u32);
+                        if spent_after.remove(&outpoint)
+                            || spent_in_block.contains(&outpoint)
+                            || is_unspendable_script(&output.script_pubkey)
+                        {
+                            continue;
+                        }
+                        candidate_bytes = candidate_bytes
+                            .saturating_add(64usize.saturating_add(output.script_pubkey.len()));
+                        candidates.push((
+                            outpoint,
+                            StoredUtxo {
+                                output: output.clone(),
+                                height,
+                                median_time_past,
+                                coinbase: transaction_index == 0,
+                            },
+                        ));
+                    }
+                }
+                for transaction in &block.txdata {
+                    for input in &transaction.input {
+                        if !input.previous_output.is_null()
+                            && !created_in_block.contains(&input.previous_output)
+                        {
+                            spent_after.insert(input.previous_output);
+                        }
+                    }
+                }
+                scanned_blocks = scanned_blocks.saturating_add(1);
+                if candidate_bytes >= target_bytes {
+                    break;
+                }
+            }
+            info!(
+                "Reconstructed recent UTXOs from blocks: blocks={scanned_blocks} entries={} bytes={candidate_bytes}",
+                candidates.len()
+            );
+        }
         candidates.reverse();
-        let warmed = self.utxo_store.seed_cache(candidates);
+        let recent = self.utxo_store.seed_cache(candidates);
         info!(
             "Selected recent UTXOs for cache: blocks={scanned_blocks} delta_bytes={delta_bytes} entries={} bytes={}",
-            warmed.0, warmed.1
+            recent.0, recent.1
         );
-        Ok(warmed)
+        // Do not scan the complete key-ordered UTXO database here. On NFS it
+        // delays startup and consumes several GiB of allocator/hash-table
+        // memory, while the IBD working set is naturally populated by the
+        // same misses that Core retains in CCoinsViewCache.
+        Ok(recent)
     }
 
     /// Configure chainstate write batching from Core's debug-only
@@ -4307,6 +4685,7 @@ impl ChainState {
     pub fn configure_storage_batch_size_bytes(&mut self, bytes: i64) {
         self.chainstate_store
             .configure_write_batch_size_bytes(bytes);
+        self.utxo_store.configure_write_batch_size_bytes(bytes);
     }
 
     /// Configure Core's debug-only chainstate crash simulation. The UTXO
@@ -4676,6 +5055,42 @@ impl ChainState {
             cursor = node.header.prev_blockhash;
         }
         hashes.reverse();
+        Some(hashes)
+    }
+
+    /// Build the indexed ancestry ending at `hash`, reusing the common prefix
+    /// of a previously built path. Header sync normally advances a peer's tip
+    /// in small batches, so walking all the way back from the new tip on every
+    /// batch is needlessly expensive during IBD.
+    pub(crate) fn block_hashes_to_hash_reusing_path(
+        &self,
+        hash: &BlockHash,
+        cached: &[BlockHash],
+    ) -> Option<Vec<BlockHash>> {
+        let target = self.block_index.get(hash)?;
+        let target_height = usize::try_from(target.height).ok()?;
+        if cached.get(target_height) == Some(hash) {
+            return Some(cached[..=target_height].to_vec());
+        }
+
+        let mut suffix = Vec::new();
+        let mut cursor = *hash;
+        let prefix_len = loop {
+            let node = self.block_index.get(&cursor)?;
+            let height = usize::try_from(node.height).ok()?;
+            if cached.get(height) == Some(&cursor) {
+                break height.saturating_add(1);
+            }
+            suffix.push(cursor);
+            if node.height == 0 {
+                break 0;
+            }
+            cursor = node.header.prev_blockhash;
+        };
+
+        let mut hashes = Vec::with_capacity(prefix_len.saturating_add(suffix.len()));
+        hashes.extend_from_slice(&cached[..prefix_len]);
+        hashes.extend(suffix.into_iter().rev());
         Some(hashes)
     }
 
@@ -5271,17 +5686,31 @@ impl ChainState {
         &mut self,
         hash: &BlockHash,
     ) -> Result<Option<Vec<Vec<TxOut>>>> {
-        self.spent_outputs_by_transaction_impl(hash, true)
+        Ok(self
+            .spent_undo_by_transaction_impl(hash, true)?
+            .map(|undo| Self::undo_outputs(&undo)))
     }
 
-    /// Read undo from the authoritative store before considering derived
-    /// data. RPC callers use this to avoid masking an unreadable record with
-    /// the recently-connected-block cache.
-    pub fn spent_outputs_by_transaction_from_storage(
+    pub fn spent_entries_by_transaction(
         &mut self,
         hash: &BlockHash,
-    ) -> Result<Option<Vec<Vec<TxOut>>>> {
-        self.spent_outputs_by_transaction_impl(hash, false)
+    ) -> Result<Option<Vec<Vec<UtxoEntry>>>> {
+        Ok(self
+            .spent_undo_by_transaction_impl(hash, true)?
+            .map(|undo| Self::undo_entries(&undo)))
+    }
+
+    /// Read complete undo coins from the authoritative store before
+    /// considering derived data. Core's verbosity-3 `getblock` obtains the
+    /// prevout height and coinbase flag directly from these coins; it does
+    /// not require a historical transaction index.
+    pub fn spent_entries_by_transaction_from_storage(
+        &mut self,
+        hash: &BlockHash,
+    ) -> Result<Option<Vec<Vec<UtxoEntry>>>> {
+        Ok(self
+            .spent_undo_by_transaction_impl(hash, false)?
+            .map(|undo| Self::undo_entries(&undo)))
     }
 
     pub fn expects_undo_data(&self, hash: &BlockHash) -> bool {
@@ -5291,18 +5720,17 @@ impl ChainState {
             })
     }
 
-    fn spent_outputs_by_transaction_impl(
+    fn spent_undo_by_transaction_impl(
         &mut self,
         hash: &BlockHash,
         allow_cache: bool,
-    ) -> Result<Option<Vec<Vec<TxOut>>>> {
+    ) -> Result<Option<Vec<Vec<StoredUndo>>>> {
         if allow_cache && let Some(undo) = self.block_undo_cache.get(hash) {
-            return Ok(Some(Self::undo_outputs(undo)));
+            return Ok(Some(undo.clone()));
         }
         if let Some(undo) = self.store.get_undo(hash)? {
-            let outputs = Self::undo_outputs(&undo);
             self.remember_block_undo(*hash, undo.clone());
-            return Ok(Some(outputs));
+            return Ok(Some(undo));
         }
         if !allow_cache && self.expects_undo_data(hash) {
             return Ok(None);
@@ -5316,7 +5744,7 @@ impl ChainState {
         let mut undo = vec![Vec::new()];
         if node.height == 0 {
             self.remember_block_undo(*hash, undo.clone());
-            return Ok(Some(Self::undo_outputs(&undo)));
+            return Ok(Some(undo));
         }
         let Some(mut outputs) = self.replay_utxos_for_block(block.header.prev_blockhash, true)?
         else {
@@ -5353,9 +5781,8 @@ impl ChainState {
                 );
             }
         }
-        let spent_outputs = Self::undo_outputs(&undo);
         self.remember_block_undo(*hash, undo.clone());
-        Ok(Some(spent_outputs))
+        Ok(Some(undo))
     }
 
     /// Return the Electrum script hashes whose confirmed histories can change
@@ -5393,6 +5820,26 @@ impl ChainState {
 
     pub fn block_hash(&self, height: u32) -> Option<BlockHash> {
         self.active_chain.get(height as usize).copied()
+    }
+
+    /// Return whether a transaction was confirmed in the tip's two-block
+    /// recent window.  Core uses its rolling recently-confirmed filter for
+    /// orphan-parent suppression; that filter is independent of `-txindex`,
+    /// so a node without the optional transaction index must still answer
+    /// this query from the retained tip block bodies.
+    pub fn recently_confirmed_transaction(&self, txid: &Txid) -> bool {
+        let start_height = self.height().saturating_sub(1) as usize;
+        self.active_chain
+            .iter()
+            .enumerate()
+            .skip(start_height)
+            .any(|(_, hash)| {
+                self.store
+                    .get_readonly(hash)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|block| block.txdata.iter().any(|tx| tx.compute_txid() == *txid))
+            })
     }
 
     /// Build the exponentially backed-off locator used by `getheaders` and
@@ -5549,59 +5996,12 @@ impl ChainState {
             return self.header_by_hash(&stop_hash).map(|header| vec![header]);
         }
 
-        // During headers-first synchronization the best-known header chain
-        // can extend well beyond the active chain (notably while an
-        // AssumeUTXO node is waiting for its snapshot body).  Core serves
-        // that branch from the global block index, rather than returning an
-        // empty range from the active-chain header vector.
-        let best_header = self.best_header_tip().hash;
-        let mut path = Vec::new();
-        let mut cursor = best_header;
-        loop {
-            path.push(cursor);
-            if cursor == self.network_genesis_hash() {
-                break;
-            }
-            let Some(node) = self.block_index.get(&cursor) else {
-                return Some(Vec::new());
-            };
-            cursor = node.header.prev_blockhash;
-        }
-        path.reverse();
-
-        if let Some(snapshot_base) = self.snapshot_base.filter(|_| !self.snapshot_validated)
-            && let Some(base_index) = path.iter().position(|hash| *hash == snapshot_base)
-        {
-            path.truncate(base_index.saturating_add(1));
-        }
-
-        let fork_height = locator.iter().find_map(|hash| {
-            self.block_index
-                .get(hash)
-                .filter(|_| self.is_descendant_or_self(&best_header, hash))
-                .map(|node| node.height)
-        });
-        let start = fork_height
-            .and_then(|height| usize::try_from(height).ok())
-            .and_then(|height| height.checked_add(1))
-            .unwrap_or_default();
-        let stop = if stop_hash == BlockHash::all_zeros() {
-            path.len()
-        } else {
-            path.iter()
-                .position(|hash| *hash == stop_hash)
-                .map_or(path.len(), |height| height.saturating_add(1))
-        };
-        if start >= stop || start >= path.len() {
-            return Some(Vec::new());
-        }
-        Some(
-            path[start..stop.min(path.len())]
-                .iter()
-                .filter_map(|hash| self.block_index.get(hash).map(|node| node.header))
-                .take(2_000)
-                .collect(),
-        )
+        // Core's ProcessGetHeaders uses FindForkInGlobalIndex followed by
+        // ActiveChain().Next(), and therefore serves only the active chain.
+        // In particular, a best-header side branch must not be advertised as
+        // if it were our chain: doing so makes peers request bodies we cannot
+        // serve and can trigger false stalled-peer disconnects during IBD.
+        Some(self.headers_after_locator(locator, stop_hash))
     }
 
     /// Validate and index a contiguous header batch without requiring the
@@ -5758,6 +6158,32 @@ impl ChainState {
                     .with_context(|| format!("active block {hash} is missing"))
             })
             .collect()
+    }
+
+    /// Return the number of blocks that became active after a chain transition
+    /// from `previous_tip`, without loading their bodies. Core emits one
+    /// BlockConnected notification—and therefore applies one block-stalling
+    /// timeout decay—for every block in this suffix, including descendants
+    /// drained from the out-of-order body queue.
+    pub fn active_block_count_after(&self, previous_tip: BlockHash) -> usize {
+        if previous_tip == self.best_hash() {
+            return 0;
+        }
+        let mut cursor = previous_tip;
+        let common_height = loop {
+            if self.is_active_block(&cursor) {
+                break self.block_index.get(&cursor).map_or(0, |node| node.height);
+            }
+            let Some(node) = self.block_index.get(&cursor) else {
+                return 0;
+            };
+            cursor = node.header.prev_blockhash;
+        };
+        self.active_chain.len().saturating_sub(
+            usize::try_from(common_height)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1),
+        )
     }
 
     pub fn disconnected_blocks_after(&mut self, previous_tip: BlockHash) -> Result<Vec<Block>> {
@@ -6529,6 +6955,9 @@ impl ChainState {
                 // processing.
                 fs::create_dir_all(self.snapshot_chainstate_path())?;
                 self.snapshot_base = Some(result.1);
+                if self.coinstats_index_enabled {
+                    self.coin_stats = None;
+                }
                 // Strict activation always creates a second, independently
                 // replayed chainstate.  Even when local block data happens to
                 // be complete, doing the replay asynchronously preserves the
@@ -6579,11 +7008,14 @@ impl ChainState {
         if strict_assumeutxo && self.snapshot_base.is_some() {
             bail!("Can't activate a snapshot-based chainstate more than once")
         }
-        let mut snapshot =
-            read_core_utxo_snapshot(bytes, self.network, self.signet_challenge.as_deref())?;
+        let metadata = read_core_utxo_snapshot_metadata(
+            bytes,
+            self.network,
+            self.signet_challenge.as_deref(),
+        )?;
         let commitment = if strict_assumeutxo {
             Some(
-                self.assumeutxo_for_block(snapshot.base_hash)
+                self.assumeutxo_for_block(metadata.base_hash)
                     .with_context(|| {
                         let heights = self
                             .assumeutxo_data()
@@ -6593,28 +7025,28 @@ impl ChainState {
                             .join(", ");
                         format!(
                             "assumeutxo block hash in snapshot metadata not recognized (hash: {}). The following snapshot heights are available: {}.",
-                            snapshot.base_hash, heights
+                            metadata.base_hash, heights
                         )
                     })?,
             )
         } else {
             None
         };
-        let Some(base_height) = self.block_height_by_hash(&snapshot.base_hash) else {
+        let Some(base_height) = self.block_height_by_hash(&metadata.base_hash) else {
             bail!(
                 "The base block header ({}) must appear in the headers chain. Make sure all headers are syncing, and call loadtxoutset again.",
-                snapshot.base_hash
+                metadata.base_hash
             )
         };
-        if self.has_invalid_ancestor(snapshot.base_hash) {
+        if self.has_invalid_ancestor(metadata.base_hash) {
             bail!(
                 "The base block header ({}) is part of an invalid chain.",
-                snapshot.base_hash
+                metadata.base_hash
             )
         }
         if strict_assumeutxo
             && self.ancestor_hash(self.best_header_tip().hash, base_height)
-                != Some(snapshot.base_hash)
+                != Some(metadata.base_hash)
         {
             bail!(
                 "A forked headers-chain with more work than the chain with the snapshot base block header exists. Please proceed to sync without AssumeUtxo."
@@ -6623,27 +7055,21 @@ impl ChainState {
         if strict_assumeutxo
             && self
                 .block_index
-                .get(&snapshot.base_hash)
+                .get(&metadata.base_hash)
                 .is_some_and(|node| node.chain_work <= self.tip().work)
         {
             bail!("Population failed: Work does not exceed active chainstate.")
         }
-        if snapshot
-            .utxos
-            .values()
-            .any(|entry| entry.height > base_height)
-        {
-            bail!("Population failed: Bad snapshot data after deserializing 0 coins")
-        }
-        if snapshot
-            .utxos
-            .values()
-            .any(|entry| entry.output.value > Amount::MAX_MONEY)
-        {
-            bail!(
-                "Population failed: Bad snapshot data after deserializing 0 coins - bad tx out value"
-            )
-        }
+        let mut snapshot = if strict_assumeutxo {
+            read_core_utxo_snapshot_with_max_height(
+                bytes,
+                self.network,
+                self.signet_challenge.as_deref(),
+                Some(base_height),
+            )?
+        } else {
+            read_core_utxo_snapshot(bytes, self.network, self.signet_challenge.as_deref())?
+        };
         if strict_assumeutxo {
             let commitment = commitment.expect("strict AssumeUTXO commitment is present");
             if base_height != commitment.height {
@@ -6759,15 +7185,11 @@ impl ChainState {
         Ok(((coins_count, base_hash, base_height), fully_validated))
     }
 
-    fn validate_snapshot_utxos(&mut self, utxos: &HashMap<OutPoint, UtxoEntry>) -> Result<()> {
+    fn validate_snapshot_utxos(&mut self, utxos: &ActiveUtxoMap) -> Result<()> {
         self.validate_snapshot_utxos_at(utxos, self.best_hash())
     }
 
-    fn validate_snapshot_utxo_shape(
-        &self,
-        utxos: &HashMap<OutPoint, UtxoEntry>,
-        tip_height: u32,
-    ) -> Result<()> {
+    fn validate_snapshot_utxo_shape(&self, utxos: &ActiveUtxoMap, tip_height: u32) -> Result<()> {
         for entry in utxos.values() {
             if entry.height > tip_height {
                 bail!("UTXO snapshot contains an output from the future")
@@ -6781,7 +7203,7 @@ impl ChainState {
 
     fn validate_snapshot_utxos_at(
         &mut self,
-        utxos: &HashMap<OutPoint, UtxoEntry>,
+        utxos: &ActiveUtxoMap,
         tip_hash: BlockHash,
     ) -> Result<()> {
         let tip_height = self
@@ -6898,7 +7320,11 @@ impl ChainState {
                     tracing::info!(
                         "Block verification stopping at height {height} (no data). This could be due to pruning or use of an assumeutxo snapshot."
                     );
-                    bail!("active block {hash} is missing from block store")
+                    // Core's VerifyDB treats a missing historical body as a
+                    // normal boundary in prune/snapshot mode.  The remaining
+                    // recent suffix is still checked, but a header-only
+                    // portion cannot make startup fail.
+                    return Ok(());
                 }
                 None => bail!("active block {hash} is missing from block store"),
             };
@@ -7232,15 +7658,70 @@ impl ChainState {
     }
 
     pub fn connect_block(&mut self, block: Block) -> Result<ChainTip> {
-        self.connect_block_with_existing_body(block, false, false, true)
+        self.connect_block_with_existing_body(block, None, false, false, true)
     }
 
     pub(crate) fn connect_block_from_peer(&mut self, block: Block) -> Result<ChainTip> {
-        let result = self.connect_block_with_existing_body(block, false, true, false);
+        let prepared = BlockStore::prepare_record(&block)?;
+        self.connect_prepared_block_from_peer(block, prepared)
+    }
+
+    pub(crate) fn connect_prepared_block_from_peer(
+        &mut self,
+        block: Block,
+        prepared: PreparedBlockRecord,
+    ) -> Result<ChainTip> {
+        let hash = block.block_hash();
+        let result =
+            self.connect_block_with_existing_body(block, Some(prepared), false, true, false);
         if result.is_ok() {
+            self.note_peer_body_chain_ready(hash);
             self.flush_peer_storage_if_needed()?;
         }
         result
+    }
+
+    /// Record a body that completed the peer admission path and propagate
+    /// Core's contiguous `HaveNumChainTxs` equivalent to any already-stored
+    /// descendants.  The body may have arrived before its parent, so only a
+    /// parent on the active chain or an already-ready peer suffix can make
+    /// this block scheduler-visible.
+    fn note_peer_body_chain_ready(&mut self, hash: BlockHash) {
+        let parent_ready = self.block_index.get(&hash).is_some_and(|node| {
+            self.is_active_block(&node.header.prev_blockhash)
+                || self
+                    .peer_body_chain_ready
+                    .contains(&node.header.prev_blockhash)
+        });
+        if !parent_ready && !self.is_active_block(&hash) {
+            return;
+        }
+        let mut queue = VecDeque::from([hash]);
+        while let Some(parent_hash) = queue.pop_front() {
+            if !self.is_active_block(&parent_hash) {
+                self.peer_body_chain_ready.insert(parent_hash);
+            }
+            let Some(children) = self.pending_body_children.get(&parent_hash).cloned() else {
+                continue;
+            };
+            for child_hash in children {
+                if self.store.contains(&child_hash)
+                    && self.block_index.get(&child_hash).is_some_and(|node| {
+                        self.is_active_block(&node.header.prev_blockhash)
+                            || self.peer_body_chain_ready.contains(&parent_hash)
+                    })
+                {
+                    queue.push_back(child_hash);
+                }
+            }
+        }
+    }
+
+    /// Return whether a full peer body and every body before it on its
+    /// indexed branch are available. Active-chain blocks are always treated
+    /// as ready, matching Core's chain-index status.
+    pub(crate) fn peer_body_chain_ready(&self, hash: &BlockHash) -> bool {
+        self.is_active_block(hash) || self.peer_body_chain_ready.contains(hash)
     }
 
     /// Validate the context-free block body before a peer path admits a new
@@ -7256,6 +7737,7 @@ impl ChainState {
     fn connect_block_with_existing_body(
         &mut self,
         block: Block,
+        mut prepared_record: Option<PreparedBlockRecord>,
         allow_existing_body: bool,
         retain_invalid_body: bool,
         sync_storage: bool,
@@ -7287,7 +7769,11 @@ impl ChainState {
                 Amount::MAX_MONEY.to_sat(),
             )?;
             self.ensure_disk_space_for_persisted_block(&block, true)?;
-            self.store.insert(&block)?;
+            if let Some(prepared) = prepared_record.take() {
+                self.store.insert_prepared(&block, prepared)?;
+            } else {
+                self.store.insert(&block)?;
+            }
             self.index_active_transactions(&block, node.height)?;
             self.index_all_transactions(&block, node.height)?;
             self.persist_transaction_index_for_block(&block)?;
@@ -7329,9 +7815,12 @@ impl ChainState {
             bail!("block {hash} is on an invalidated branch")
         }
         if parent_hash == self.best_hash() {
-            if let Err(error) =
-                self.connect_block_internal_with_storage_sync(&block, true, sync_storage)
-            {
+            if let Err(error) = self.connect_block_internal_with_prepared_storage_sync(
+                &block,
+                true,
+                sync_storage,
+                prepared_record.take(),
+            ) {
                 if retain_invalid_body
                     && error
                         .downcast_ref::<ValidationError>()
@@ -7381,7 +7870,7 @@ impl ChainState {
                 Amount::MAX_MONEY.to_sat(),
             )?;
             self.record_unlinked_body(hash);
-            self.insert_side_chain_body(&block)?;
+            self.insert_side_chain_body(&block, &mut prepared_record)?;
             self.index_all_transactions(&block, height)?;
             let skip = self.ancestor_hash(parent_hash, block_index_skip_height(height));
             self.block_index.insert(
@@ -7394,10 +7883,19 @@ impl ChainState {
                 },
             );
             self.assign_header_sequence_id(hash);
+            if retain_invalid_body {
+                // Core's AcceptBlock succeeds after persisting a requested,
+                // structurally valid body even when an earlier body is still
+                // missing. ActivateBestChain simply makes no progress yet.
+                // Treating this as rejection caused the P2P layer to reshuffle
+                // parent requests and defeated ordered download accounting.
+                return Ok(self.tip());
+            }
             bail!("block {} has a parent whose full body is unavailable", hash)
         }
 
         let height = parent.height.saturating_add(1);
+        let side_validation_started = Instant::now();
         validation::validate_bip94_timewarp_with_params(
             &self.deployment_parameters,
             height,
@@ -7413,7 +7911,9 @@ impl ChainState {
         )?;
         self.validate_block_structure(&block, self.network, height, Amount::MAX_MONEY.to_sat())?;
         let skip = self.ancestor_hash(parent_hash, block_index_skip_height(height));
+        let side_validation_elapsed = side_validation_started.elapsed();
         if retain_invalid_body {
+            let side_body_started = Instant::now();
             // Core's peer path accepts and stores a structurally valid
             // side-chain body without checking its UTXO-dependent rules. The
             // branch is validated only if it later becomes the best-chain
@@ -7421,8 +7921,13 @@ impl ChainState {
             // disconnecting the announcing peer before it can announce a
             // longer descendant.
             self.side_chain_utxos = None;
-            self.insert_side_chain_body(&block)?;
+            let insert_started = Instant::now();
+            self.insert_side_chain_body(&block, &mut prepared_record)?;
+            let insert_elapsed = insert_started.elapsed();
+            let tx_index_started = Instant::now();
             self.index_all_transactions(&block, height)?;
+            let tx_index_elapsed = tx_index_started.elapsed();
+            let index_update_started = Instant::now();
             let chain_work = parent.chain_work + block.header.work();
             self.block_index.insert(
                 hash,
@@ -7435,13 +7940,16 @@ impl ChainState {
             );
             self.assign_header_sequence_id(hash);
             self.assign_block_sequence_id(hash);
+            let index_update_elapsed = index_update_started.elapsed();
             // A headers-first download can deliver this body before an
             // earlier body on the same higher-work branch.  Keep the body
             // indexed and defer activation until the missing ancestor
             // arrives; the body is not invalid merely because the candidate
             // chain is temporarily incomplete.
+            let candidate_check_started = Instant::now();
             let extends_active_tip =
                 self.ancestor_hash(hash, self.height()) == Some(self.best_hash());
+            let mut activated_candidate = false;
             if chain_work > self.tip().work
                 && !extends_active_tip
                 && !self.candidate_chain_has_missing_body(hash)
@@ -7449,14 +7957,35 @@ impl ChainState {
                 self.store.flush()?;
                 self.flush_transaction_index_store()?;
                 self.activate_chain(hash)?;
+                activated_candidate = true;
             }
+            let candidate_check_elapsed = candidate_check_started.elapsed();
+            let children_started = Instant::now();
             self.process_orphans(hash, sync_storage);
             // This block can fill a missing body below an already-stored
             // side-chain suffix without itself becoming the active tip. Walk
             // children from the body that just became available so the
             // complete higher-work candidate can be validated and activated.
             self.process_known_children(hash, sync_storage)?;
+            let children_elapsed = children_started.elapsed();
             self.update_ibd_status();
+            let total_elapsed = side_body_started.elapsed();
+            if total_elapsed >= Duration::from_secs(1) {
+                info!(
+                    %hash,
+                    height,
+                    extends_active_tip,
+                    activated_candidate,
+                    validation = ?side_validation_elapsed,
+                    body_insert = ?insert_elapsed,
+                    tx_index = ?tx_index_elapsed,
+                    index_update = ?index_update_elapsed,
+                    candidate_check = ?candidate_check_elapsed,
+                    children = ?children_elapsed,
+                    total = ?total_elapsed,
+                    "Slow out-of-order peer block storage"
+                );
+            }
             return Ok(self.tip());
         }
         // Once BIP34 is active, a coinbase-only block has no UTXO-dependent
@@ -7482,7 +8011,7 @@ impl ChainState {
                             .downcast_ref::<ValidationError>()
                             .is_some_and(ValidationError::should_mark_block_invalid)
                     {
-                        self.insert_side_chain_body(&block)?;
+                        self.insert_side_chain_body(&block, &mut prepared_record)?;
                         self.assign_block_sequence_id(hash);
                     }
                     return Err(error);
@@ -7531,7 +8060,7 @@ impl ChainState {
                 // the missing ancestor arrives, while postponing script
                 // validation.
                 self.record_unlinked_body(hash);
-                self.insert_side_chain_body(&block)?;
+                self.insert_side_chain_body(&block, &mut prepared_record)?;
                 self.index_all_transactions(&block, height)?;
                 self.block_index.insert(
                     hash,
@@ -7558,7 +8087,7 @@ impl ChainState {
                             .downcast_ref::<ValidationError>()
                             .is_some_and(ValidationError::should_mark_block_invalid)
                     {
-                        self.insert_side_chain_body(&block)?;
+                        self.insert_side_chain_body(&block, &mut prepared_record)?;
                         self.assign_block_sequence_id(hash);
                     }
                     return Err(error);
@@ -7576,7 +8105,7 @@ impl ChainState {
                 utxos: parent_utxos,
             });
         }
-        self.insert_side_chain_body(&block)?;
+        self.insert_side_chain_body(&block, &mut prepared_record)?;
         self.index_all_transactions(&block, height)?;
         let chain_work = parent.chain_work + block.header.work();
         self.block_index.insert(
@@ -7606,8 +8135,16 @@ impl ChainState {
         Ok(self.tip())
     }
 
-    fn insert_side_chain_body(&mut self, block: &Block) -> Result<()> {
-        self.store.insert_unsynced(block)?;
+    fn insert_side_chain_body(
+        &mut self,
+        block: &Block,
+        prepared_record: &mut Option<PreparedBlockRecord>,
+    ) -> Result<()> {
+        if let Some(prepared) = prepared_record.take() {
+            self.store.insert_prepared_unsynced(block, prepared)?;
+        } else {
+            self.store.insert_unsynced(block)?;
+        }
         self.persist_transaction_index_for_block_unsynced(block)?;
         let hash = block.block_hash();
         let children = self
@@ -7628,7 +8165,7 @@ impl ChainState {
             return;
         };
         for child in children {
-            let _ = self.connect_block_with_existing_body(child, true, false, sync_storage);
+            let _ = self.connect_block_with_existing_body(child, None, true, false, sync_storage);
         }
     }
 
@@ -7665,8 +8202,17 @@ impl ChainState {
         self.processing_known_children = true;
         let result = (|| -> Result<()> {
             let mut parents = VecDeque::from([parent_hash]);
+            // A child connection can advance the active tip, and the old
+            // implementation queued that tip once for every child.  Large
+            // headers-first suffixes consequently revisited the same empty
+            // pending-body bucket thousands of times.  Track only entries
+            // currently waiting in the queue; removing on pop preserves the
+            // ability to enqueue a hash again if a nested connection adds new
+            // children after its first visit.
+            let mut queued_parents = HashSet::from([parent_hash]);
             let mut connected = 0u64;
             while let Some(parent_hash) = parents.pop_front() {
+                queued_parents.remove(&parent_hash);
                 let Some(mut children) = self.pending_body_children.remove(&parent_hash) else {
                     continue;
                 };
@@ -7688,15 +8234,29 @@ impl ChainState {
                     let Ok(Some(child)) = self.store.get(&child_hash) else {
                         continue;
                     };
+                    // These are peer bodies retained while an earlier body
+                    // was missing. Re-enter them with peer semantics so an
+                    // inactive parent does not trigger reconstruction of a
+                    // historical UTXO map for every descendant. If the
+                    // parent is now the active tip, the ordinary direct
+                    // connect path still performs full validation. Otherwise
+                    // the body remains unlinked until the missing active
+                    // ancestor arrives, matching Core's block-candidate
+                    // handling during headers-first IBD.
                     if self
-                        .connect_block_with_existing_body(child, true, false, sync_storage)
+                        .connect_block_with_existing_body(child, None, true, true, sync_storage)
                         .is_err()
                     {
                         continue;
                     }
-                    parents.push_back(child_hash);
+                    if !sync_storage {
+                        self.note_peer_body_chain_ready(child_hash);
+                    }
+                    if queued_parents.insert(child_hash) {
+                        parents.push_back(child_hash);
+                    }
                     let active_tip = self.best_hash();
-                    if active_tip != child_hash {
+                    if active_tip != child_hash && queued_parents.insert(active_tip) {
                         parents.push_back(active_tip);
                     }
                     connected = connected.saturating_add(1);
@@ -7758,7 +8318,7 @@ impl ChainState {
         }
     }
 
-    fn utxos_for_block(&mut self, hash: BlockHash) -> Result<Option<HashMap<OutPoint, UtxoEntry>>> {
+    fn utxos_for_block(&mut self, hash: BlockHash) -> Result<Option<ActiveUtxoMap>> {
         self.replay_utxos_for_block(hash, true)
     }
 
@@ -7767,10 +8327,7 @@ impl ChainState {
     /// compatibility fallback for pruned stores and historical BIP30 edge
     /// cases, but reverse replay avoids walking the entire chain for ordinary
     /// historical RPC and snapshot queries.
-    fn replay_active_utxos_backwards(
-        &mut self,
-        hash: BlockHash,
-    ) -> Result<Option<HashMap<OutPoint, UtxoEntry>>> {
+    fn replay_active_utxos_backwards(&mut self, hash: BlockHash) -> Result<Option<ActiveUtxoMap>> {
         if !self.is_active_block(&hash) {
             return Ok(None);
         }
@@ -7822,7 +8379,7 @@ impl ChainState {
 
     fn disconnect_block_from_utxos(
         &self,
-        utxos: &mut HashMap<OutPoint, UtxoEntry>,
+        utxos: &mut ActiveUtxoMap,
         block: &Block,
         _height: u32,
         undo: &[Vec<StoredUndo>],
@@ -7899,7 +8456,7 @@ impl ChainState {
 
     fn disconnect_block_for_verification(
         &self,
-        utxos: &mut HashMap<OutPoint, UtxoEntry>,
+        utxos: &mut ActiveUtxoMap,
         block: &Block,
         height: u32,
         undo: &[Vec<StoredUndo>],
@@ -7951,7 +8508,7 @@ impl ChainState {
         &mut self,
         hash: BlockHash,
         use_active_cache: bool,
-    ) -> Result<Option<HashMap<OutPoint, UtxoEntry>>> {
+    ) -> Result<Option<ActiveUtxoMap>> {
         if use_active_cache && hash == self.best_hash() {
             return Ok(Some(if self.utxos_materialized {
                 self.utxos.clone()
@@ -7978,7 +8535,7 @@ impl ChainState {
         let Some(_genesis) = self.store.get(&path[0])? else {
             return Ok(None);
         };
-        let mut utxos = HashMap::new();
+        let mut utxos = FastHashMap::new();
         for block_hash in path.into_iter().skip(1) {
             let Some(block) = self.store.get(&block_hash)? else {
                 return Ok(None);
@@ -8052,6 +8609,25 @@ impl ChainState {
         utxos: &U,
         block_median_time_past: u32,
     ) -> Result<BlockApplication> {
+        self.validate_block_transactions_with_txids_and_retention(
+            block,
+            transaction_ids,
+            height,
+            utxos,
+            block_median_time_past,
+            true,
+        )
+    }
+
+    fn validate_block_transactions_with_txids_and_retention<U: UtxoLookup + ?Sized>(
+        &self,
+        block: &Block,
+        transaction_ids: &[Txid],
+        height: u32,
+        utxos: &U,
+        block_median_time_past: u32,
+        retain_spent_entries: bool,
+    ) -> Result<BlockApplication> {
         let script_check_reason = self.script_check_reason(block, height);
         let block_hash = block.block_hash();
         let log_script_transition = {
@@ -8070,13 +8646,14 @@ impl ChainState {
             }
         }
         let skip_script_checks = self.should_skip_script_checks(block, height);
-        self.validate_block_transactions_with_options_and_txids(
+        self.validate_block_transactions_with_options_and_txids_and_retention(
             block,
             transaction_ids,
             height,
             utxos,
             block_median_time_past,
             skip_script_checks,
+            retain_spent_entries,
         )
     }
 
@@ -8108,6 +8685,27 @@ impl ChainState {
         block_median_time_past: u32,
         skip_script_checks: bool,
     ) -> Result<BlockApplication> {
+        self.validate_block_transactions_with_options_and_txids_and_retention(
+            block,
+            transaction_ids,
+            height,
+            utxos,
+            block_median_time_past,
+            skip_script_checks,
+            true,
+        )
+    }
+
+    fn validate_block_transactions_with_options_and_txids_and_retention<U: UtxoLookup + ?Sized>(
+        &self,
+        block: &Block,
+        transaction_ids: &[Txid],
+        height: u32,
+        utxos: &U,
+        block_median_time_past: u32,
+        skip_script_checks: bool,
+        retain_spent_entries: bool,
+    ) -> Result<BlockApplication> {
         if transaction_ids.len() != block.txdata.len() {
             bail!("cached transaction ID count does not match block")
         }
@@ -8122,9 +8720,28 @@ impl ChainState {
                 }
             }
         }
-        let mut spent_entries = Vec::new();
-        let mut spent = HashSet::new();
-        let mut created = HashMap::new();
+        let block_input_count = block
+            .txdata
+            .iter()
+            .skip(1)
+            .map(|transaction| transaction.input.len())
+            .sum::<usize>();
+        let block_output_count = block
+            .txdata
+            .iter()
+            .skip(1)
+            .map(|transaction| transaction.output.len())
+            .sum::<usize>();
+        let mut spent_entries = retain_spent_entries
+            .then(|| Vec::with_capacity(block_input_count))
+            .unwrap_or_default();
+        // These maps are rebuilt for every block and are on the consensus
+        // validation hot path. Core's outpoint map uses a cheap integer hash;
+        // std::collections' SipHash costs materially more for the hundreds of
+        // thousands of lookups performed by a large IBD block.
+        let mut spent = FastHashSet::with_capacity(block_input_count);
+        let mut created = ActiveUtxoMap::with_capacity(block_output_count);
+        let mut same_block_spent = FastHashSet::with_capacity(block_input_count);
         let mut total_fees = 0u64;
         let mut metrics = CoinStatsBlockMetrics {
             subsidy_sat: validation::block_subsidy_for_network(self.network, height),
@@ -8145,12 +8762,10 @@ impl ChainState {
         } else {
             block.header.time
         };
-        validation::validate_transaction_finality(
+        validation::validate_transaction_absolute_finality(
             &block.txdata[0],
             height,
             lock_time_cutoff,
-            csv_active,
-            &[],
         )?;
         if reduced_data_activation_height.is_some() {
             validation::validate_reduced_data_output_sizes(&block.txdata[0])?;
@@ -8167,10 +8782,26 @@ impl ChainState {
             .skip(1)
         {
             self.check_shutdown_interrupt()?;
-            let mut transaction_spent = HashSet::new();
+            let mut transaction_spent = FastHashSet::with_capacity(transaction.input.len());
             let mut input_total = 0u64;
             let mut previous_outputs = Vec::with_capacity(transaction.input.len());
-            let mut previous_entries = Vec::with_capacity(transaction.input.len());
+            let mut previous_heights = reduced_data_activation_height
+                .is_some()
+                .then(|| Vec::with_capacity(transaction.input.len()));
+            // Under assumevalid, script checks are deliberately skipped and
+            // reduced-data input checks are inactive on the current mainnet
+            // chain. Core's sigop accounting borrows each cached coin in
+            // that case; avoid cloning every full TxOut just to inspect its
+            // script template.
+            let borrow_prevouts_for_sigops =
+                skip_script_checks && reduced_data_activation_height.is_none();
+            let mut tx_sigop_cost =
+                validation::transaction_sigop_cost(transaction, &[], sigop_flags);
+            validation::validate_transaction_absolute_finality(
+                transaction,
+                height,
+                lock_time_cutoff,
+            )?;
             for input in &transaction.input {
                 let outpoint = input.previous_output;
                 if !transaction_spent.insert(outpoint) {
@@ -8179,59 +8810,80 @@ impl ChainState {
                 if !spent.insert(outpoint) {
                     return Err(ValidationError::MissingInput { outpoint }.into());
                 }
-                let entry = if let Some(entry) = created.get(&outpoint).cloned() {
-                    entry
-                } else if let Some(entry) = utxos.get(&outpoint)? {
-                    entry
-                } else {
-                    return Err(ValidationError::MissingInput { outpoint }.into());
+                let mut process_entry = |entry: &UtxoEntry| -> Result<()> {
+                    if entry.coinbase && height < entry.height.saturating_add(COINBASE_MATURITY) {
+                        return Err(ValidationError::ImmatureCoinbase { outpoint }.into());
+                    }
+                    validation::validate_transaction_sequence_lock_input(
+                        input,
+                        transaction.version,
+                        height,
+                        lock_time_cutoff,
+                        csv_active,
+                        entry.height,
+                        entry.median_time_past,
+                    )?;
+                    input_total = input_total
+                        .checked_add(entry.output.value.to_sat())
+                        .ok_or(ValidationError::InputTotalOverflow)?;
+                    if input_total > Amount::MAX_MONEY.to_sat() {
+                        return Err(ValidationError::InputTotalOverflow.into());
+                    }
+                    metrics.prevout_spent_sat = metrics
+                        .prevout_spent_sat
+                        .saturating_add(entry.output.value.to_sat());
+                    if borrow_prevouts_for_sigops {
+                        tx_sigop_cost =
+                            tx_sigop_cost.saturating_add(validation::transaction_input_sigop_cost(
+                                input,
+                                &entry.output,
+                                sigop_flags,
+                            ));
+                    } else {
+                        previous_outputs.push(entry.output.clone());
+                    }
+                    if let Some(previous_heights) = previous_heights.as_mut() {
+                        previous_heights.push(entry.height);
+                    }
+                    // The full entry is retained once for undo/delta
+                    // construction. The lookup itself is borrowed, matching
+                    // Core's AccessCoin path and avoiding another TxOut clone.
+                    if retain_spent_entries {
+                        spent_entries.push((outpoint, entry.clone()));
+                    }
+                    Ok(())
                 };
-                if entry.coinbase && height < entry.height.saturating_add(COINBASE_MATURITY) {
-                    return Err(ValidationError::ImmatureCoinbase { outpoint }.into());
+                if let Some(entry) = created.remove(&outpoint) {
+                    same_block_spent.insert(outpoint);
+                    process_entry(&entry)?;
+                } else {
+                    utxos.with_entry(&outpoint, |entry| {
+                        let entry = entry.ok_or(ValidationError::MissingInput { outpoint })?;
+                        process_entry(entry)
+                    })?;
                 }
-                input_total = input_total
-                    .checked_add(entry.output.value.to_sat())
-                    .ok_or(ValidationError::InputTotalOverflow)?;
-                if input_total > Amount::MAX_MONEY.to_sat() {
-                    return Err(ValidationError::InputTotalOverflow.into());
-                }
-                metrics.prevout_spent_sat = metrics
-                    .prevout_spent_sat
-                    .saturating_add(entry.output.value.to_sat());
-                previous_outputs.push(entry.output.clone());
-                previous_entries.push(entry.clone());
-                spent_entries.push((outpoint, entry));
             }
             if let Some(activation_height) = reduced_data_activation_height {
                 validation::validate_reduced_data_output_sizes(transaction)?;
                 if !skip_script_checks {
-                    let previous_heights = previous_entries
-                        .iter()
-                        .map(|entry| entry.height)
-                        .collect::<Vec<_>>();
                     validation::validate_reduced_data_input_sizes(
                         transaction,
                         &previous_outputs,
-                        &previous_heights,
+                        previous_heights
+                            .as_deref()
+                            .expect("reduced-data validation collected prevout heights"),
                         activation_height,
                     )?;
                 }
             }
-            sigop_cost = sigop_cost.saturating_add(validation::transaction_sigop_cost(
-                transaction,
-                &previous_outputs,
-                sigop_flags,
-            ));
+            if !borrow_prevouts_for_sigops {
+                tx_sigop_cost =
+                    validation::transaction_sigop_cost(transaction, &previous_outputs, sigop_flags);
+            }
+            sigop_cost = sigop_cost.saturating_add(tx_sigop_cost);
             if sigop_cost > validation::MAX_BLOCK_SIGOP_COST {
                 return Err(ValidationError::TooManySigopsInConnect.into());
             }
-            validation::validate_transaction_finality(
-                transaction,
-                height,
-                lock_time_cutoff,
-                csv_active,
-                &previous_entries,
-            )?;
             if !skip_script_checks {
                 script_jobs.push(ScriptCheckJob {
                     tx_index: transaction_index,
@@ -8319,6 +8971,9 @@ impl ChainState {
         }
         Ok(BlockApplication {
             spent_entries,
+            spent_outpoints: spent,
+            created_entries: created,
+            same_block_spent,
             metrics,
         })
     }
@@ -8367,43 +9022,77 @@ impl ChainState {
         } else {
             let chunk_size = pending.len().div_ceil(thread_count);
             let shutdown_interrupt = self.shutdown_interrupt.clone();
-            let failures = thread::scope(|scope| -> Result<Vec<(usize, ValidationError)>> {
-                let handles = pending
-                    .chunks(chunk_size)
-                    .map(|chunk| {
-                        let shutdown_interrupt = shutdown_interrupt.clone();
-                        scope.spawn(move || -> Result<Option<(usize, ValidationError)>> {
-                            for job in chunk {
-                                if shutdown_interrupt.load(Ordering::Acquire) {
-                                    bail!("block validation interrupted by shutdown")
-                                }
-                                if let Err(error) =
-                                    validation::validate_transaction_scripts_at_time_with_block_hash_with_params(
-                                        &deployment_parameters,
-                                        height,
-                                        block_time,
-                                        Some(block_hash),
-                                        job.transaction,
-                                        &job.previous_outputs,
-                                    )
-                                {
-                                    return Ok(Some((job.tx_index, error)));
-                                }
-                            }
-                            Ok(None)
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let mut failures = Vec::new();
-                for handle in handles {
-                    if let Some(failure) =
-                        handle.join().expect("script validation worker panicked")?
-                    {
-                        failures.push(failure);
-                    }
+            let validate_job = |job: &&ScriptCheckJob<'_>| {
+                if shutdown_interrupt.load(Ordering::Acquire) {
+                    bail!("block validation interrupted by shutdown")
                 }
-                Ok(failures)
-            })?;
+                if let Err(error) =
+                    validation::validate_transaction_scripts_at_time_with_block_hash_with_params(
+                        &deployment_parameters,
+                        height,
+                        block_time,
+                        Some(block_hash),
+                        job.transaction,
+                        &job.previous_outputs,
+                    )
+                {
+                    return Ok(Some((job.tx_index, error)));
+                }
+                Ok(None)
+            };
+            let failures: Vec<(usize, ValidationError)> = if let Some(pool) =
+                self.script_check_pool.as_ref()
+            {
+                pool.install(|| {
+                    pending
+                        .par_iter()
+                        .map(validate_job)
+                        .collect::<Result<Vec<_>>>()
+                })?
+                .into_iter()
+                .flatten()
+                .collect()
+            } else {
+                // Keep a defensive fallback for ChainState values created by
+                // older in-process callers that did not initialize a pool.
+                thread::scope(|scope| -> Result<Vec<(usize, ValidationError)>> {
+                    let handles = pending
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            let shutdown_interrupt = shutdown_interrupt.clone();
+                            scope.spawn(move || -> Result<Option<(usize, ValidationError)>> {
+                                for job in chunk {
+                                    if shutdown_interrupt.load(Ordering::Acquire) {
+                                        bail!("block validation interrupted by shutdown")
+                                    }
+                                    if let Err(error) =
+                                        validation::validate_transaction_scripts_at_time_with_block_hash_with_params(
+                                            &deployment_parameters,
+                                            height,
+                                            block_time,
+                                            Some(block_hash),
+                                            job.transaction,
+                                            &job.previous_outputs,
+                                        )
+                                    {
+                                        return Ok(Some((job.tx_index, error)));
+                                    }
+                                }
+                                Ok(None)
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let mut failures = Vec::new();
+                    for handle in handles {
+                        if let Some(failure) =
+                            handle.join().expect("script validation worker panicked")?
+                        {
+                            failures.push(failure);
+                        }
+                    }
+                    Ok(failures)
+                })?
+            };
             if let Some((_, error)) = failures.into_iter().min_by_key(|(tx_index, _)| *tx_index) {
                 return Err(error.into());
             }
@@ -8521,6 +9210,24 @@ impl ChainState {
         let Some(expected_bip34_hash) = bip34_activation_hash(self.network) else {
             return true;
         };
+        // The normal connect path always extends the active chain. Consult
+        // its already-indexed BIP34 entry directly before walking ancestors;
+        // this is the same canonical-chain shortcut Core uses for BIP30.
+        // Besides avoiding an ancestor traversal, it keeps the IBD prefetch
+        // query from adding every new transaction output as a guaranteed
+        // disk miss after the first UTXO-cache flush.
+        let parent_is_active = self
+            .block_index
+            .get(&parent_hash)
+            .is_some_and(|node| self.active_chain.get(node.height as usize) == Some(&parent_hash));
+        if parent_is_active
+            && self
+                .active_chain
+                .get(self.deployment_parameters.buried.bip34 as usize)
+                .is_some_and(|hash| hash.to_string() == expected_bip34_hash)
+        {
+            return false;
+        }
         self.ancestor_hash(parent_hash, self.deployment_parameters.buried.bip34)
             .map(|hash| hash.to_string() != expected_bip34_hash)
             .unwrap_or(true)
@@ -8536,7 +9243,17 @@ impl ChainState {
         persist: bool,
         sync_storage: bool,
     ) -> Result<()> {
-        self.connect_block_internal_impl(block, persist, sync_storage)
+        self.connect_block_internal_impl(block, persist, sync_storage, None)
+    }
+
+    fn connect_block_internal_with_prepared_storage_sync(
+        &mut self,
+        block: &Block,
+        persist: bool,
+        sync_storage: bool,
+        prepared_record: Option<PreparedBlockRecord>,
+    ) -> Result<()> {
+        self.connect_block_internal_impl(block, persist, sync_storage, prepared_record)
     }
 
     fn connect_block_internal_impl(
@@ -8544,6 +9261,7 @@ impl ChainState {
         block: &Block,
         persist: bool,
         sync_storage: bool,
+        prepared_record: Option<PreparedBlockRecord>,
     ) -> Result<()> {
         if persist {
             self.ensure_disk_space_for_persisted_block(block, sync_storage)?;
@@ -8577,26 +9295,152 @@ impl ChainState {
             Amount::MAX_MONEY.to_sat(),
         )?;
         let block_median_time_past = self.median_time_past();
-        let application = if persist {
-            self.validate_block_transactions_with_txids(
-                block,
-                &transaction_ids,
-                height,
-                &self.utxo_store,
-                block_median_time_past,
-            )?
+        let hash = block.block_hash();
+        let needs_undo = !self.store.has_undo(&hash);
+        let prepare_delta = persist && sync_storage && !self.chainstate_store.contains(&hash);
+        let retain_spent_entries = needs_undo
+            || self.blockfilter_index_enabled
+            || self.history_index_enabled
+            || prepare_delta;
+        let mut utxo_prefetch = Duration::ZERO;
+        let transaction_validation;
+        let mut utxo_misses = 0u64;
+        // Core's CCoinsViewCache retains the unspent coins touched by the
+        // previous block connections until a large checkpoint flushes it.
+        // Keep the decoded values loaded by the IBD prefetch alive as well;
+        // otherwise every large checkpoint leaves this cache empty and the
+        // next block window repeats the same random UTXO reads.
+        let mut prefetched_for_cache: FastHashMap<OutPoint, Option<StoredUtxo>> =
+            FastHashMap::new();
+        let mut application = if persist {
+            let prefetch_started = Instant::now();
+            // If the pending overlay or complete decoded cache already
+            // covers the current set, validate directly against it. Core's
+            // ConnectBlock does not make a second pass over every input just
+            // to discover that its CCoinsViewCache contains the coin.
+            let prefetched = if sync_storage || self.utxo_store.validation_view_is_complete() {
+                FastHashMap::new()
+            } else {
+                let enforce_bip30 =
+                    self.enforce_bip30(height, block.block_hash(), block.header.prev_blockhash);
+                let mut lookup_outpoints = block
+                    .txdata
+                    .iter()
+                    .skip(1)
+                    .flat_map(|transaction| transaction.input.iter())
+                    .map(|input| input.previous_output)
+                    .collect::<Vec<_>>();
+                if enforce_bip30 {
+                    lookup_outpoints.extend(
+                        block.txdata.iter().zip(transaction_ids.iter()).flat_map(
+                            |(transaction, txid)| {
+                                (0..transaction.output.len()).map(move |output_index| {
+                                    OutPoint::new(*txid, output_index as u32)
+                                })
+                            },
+                        ),
+                    );
+                }
+                let utxo_query = self.utxo_store.query_unresolved(&lookup_outpoints);
+                utxo_misses = u64::try_from(utxo_query.unresolved_len()).unwrap_or(u64::MAX);
+                // Decode misses in bounded batches so the allocator never
+                // retains a complete large block's temporary UTXO map.
+                utxo_query.seed_unresolved_into()?
+            };
+            utxo_prefetch = prefetch_started.elapsed();
+            let transaction_validation_started = Instant::now();
+            // The peer IBD path has a complete, bounded prefetch set for the
+            // block and can keep Core's single decoded-coin view locked while
+            // consensus walks the inputs. Synchronous callers still retain
+            // UtxoStore's normal on-demand fallback: tests and RPC-style
+            // callers can construct in-memory/same-block lookup states that
+            // are deliberately not represented by the disk prefetch query.
+            let application = if sync_storage {
+                self.validate_block_transactions_with_txids_and_retention(
+                    block,
+                    &transaction_ids,
+                    height,
+                    &self.utxo_store,
+                    block_median_time_past,
+                    retain_spent_entries,
+                )?
+            } else {
+                self.utxo_store.with_validation_view(|view| {
+                    if prefetched.is_empty() {
+                        // The normal post-BIP34 mainnet path has no absent
+                        // outpoints in the prefetch set. Use the locked
+                        // Core-style view directly; wrapping it in a second
+                        // lookup map would add a hash probe for every input.
+                        self.validate_block_transactions_with_txids_and_retention(
+                            block,
+                            &transaction_ids,
+                            height,
+                            view,
+                            block_median_time_past,
+                            retain_spent_entries,
+                        )
+                    } else {
+                        let prefetched_utxos = PrefetchedUtxos {
+                            view,
+                            prefetched: &prefetched,
+                        };
+                        self.validate_block_transactions_with_txids_and_retention(
+                            block,
+                            &transaction_ids,
+                            height,
+                            &prefetched_utxos,
+                            block_median_time_past,
+                            retain_spent_entries,
+                        )
+                    }
+                })?
+            };
+            if !sync_storage {
+                prefetched_for_cache = prefetched;
+            }
+            transaction_validation = transaction_validation_started.elapsed();
+            application
         } else {
-            self.validate_block_transactions_with_txids(
+            let transaction_validation_started = Instant::now();
+            let application = self.validate_block_transactions_with_txids(
                 block,
                 &transaction_ids,
                 height,
                 &self.utxos,
                 block_median_time_past,
-            )?
+            )?;
+            transaction_validation = transaction_validation_started.elapsed();
+            application
         };
         self.check_shutdown_interrupt()?;
+        if !prefetched_for_cache.is_empty() {
+            // Coins spent by this block are removed from the cache by the
+            // validated UTXO mutation below. Do not insert them only to
+            // remove them again; retaining the untouched prevouts mirrors
+            // the post-ConnectBlock Core cache and avoids duplicate work.
+            let spent = &application.spent_outpoints;
+            self.utxo_store
+                .seed_cache(
+                    prefetched_for_cache
+                        .into_iter()
+                        .filter_map(|(outpoint, entry)| {
+                            (!spent.contains(&outpoint))
+                                .then_some(entry)
+                                .flatten()
+                                .map(|entry| (outpoint, entry))
+                        }),
+                );
+        }
         let validation_finished = Instant::now();
-        self.cache_block_undo(block, &application.spent_entries, persist && sync_storage)?;
+        // Reindex/reorg replay commonly walks blocks whose undo records are
+        // already present in the native block store.  Rebuilding the full
+        // undo vector here would clone every spent TxOut and then discard it
+        // after the store's existing-record check.  Core's block manager also
+        // treats those records as authoritative; only construct a new undo
+        // record when the block does not already have one.
+        if needs_undo {
+            self.cache_block_undo(block, &application.spent_entries, persist && sync_storage)?;
+        }
         let previous_filter_header = self
             .basic_filter_for_block(&previous)?
             .map(|(_, header)| header)
@@ -8609,20 +9453,46 @@ impl ChainState {
         )?;
         let undo_and_filters_finished = Instant::now();
 
-        let hash = block.block_hash();
-        let spent_entries: HashMap<OutPoint, UtxoEntry> =
-            application.spent_entries.iter().cloned().collect();
+        // A peer IBD block is already durably represented by its body, undo,
+        // and direct UTXO/index updates.  Only synchronous API connects need
+        // the historical chainstate delta.  Avoid cloning every spent coin
+        // into a second map when neither a delta nor Electrum history needs
+        // that lookup.
+        let retain_spent_entries = prepare_delta || self.history_index_enabled;
+        let spent_entries: FastHashMap<OutPoint, UtxoEntry> = if retain_spent_entries {
+            application.spent_entries.iter().cloned().collect()
+        } else {
+            FastHashMap::new()
+        };
+        let spent_outpoints = std::mem::take(&mut application.spent_outpoints);
+        let created_entries = std::mem::take(&mut application.created_entries);
+        let same_block_spent = std::mem::take(&mut application.same_block_spent);
+        // A negative point-lookup may have been cached before a transaction's
+        // output was confirmed.  The ordinary wallet-free path does not
+        // materialize `self.utxos`, so `insert_fresh_utxo` is intentionally
+        // skipped there; invalidate those negative entries explicitly for
+        // every newly created output or later mempool admission would keep
+        // reporting the now-existing prevout as missing.
+        {
+            let mut missing_utxo_cache = self.missing_utxo_cache.lock();
+            for outpoint in created_entries.keys() {
+                missing_utxo_cache.remove(outpoint);
+            }
+        }
         // Build all transaction-derived chainstate data once. Transaction
         // output construction and Electrum script hashing are independent
         // within a validated block, so larger blocks can use the full CPU
         // while the final state mutation remains deterministically ordered.
-        let delta = self.chainstate_delta_for_block(
+        let mut delta = self.chainstate_delta_for_block(
             block,
             &transaction_ids,
             height,
             block_median_time_past,
             &spent_entries,
+            &spent_outpoints,
+            created_entries,
             application.metrics,
+            prepare_delta,
         );
         let prepare_block = persist && !self.store.contains(&hash);
         // Peer IBD already commits the authoritative UTXO, transaction, and
@@ -8633,11 +9503,14 @@ impl ChainState {
         // restart never reads. Synchronously connected blocks retain deltas
         // for snapshot-suffix replay; batched peer blocks fall back to native
         // block replay if a snapshot ever needs a suffix reconstructed.
-        let prepare_delta = persist && sync_storage && !self.chainstate_store.contains(&hash);
         let prepare_block_record = || -> Result<_> {
-            prepare_block
-                .then(|| BlockStore::prepare_record(block))
-                .transpose()
+            if !prepare_block {
+                return Ok(None);
+            }
+            if let Some(prepared) = prepared_record {
+                return Ok(Some(prepared));
+            }
+            Ok(Some(BlockStore::prepare_record(block)?))
         };
         let prepare_delta_record = || -> Result<_> {
             if !prepare_delta {
@@ -8672,32 +9545,55 @@ impl ChainState {
         // the durable UTXO set. Excluding them lets the normal validated path
         // update its exact entry count arithmetically instead of probing the
         // database for every input.
-        let persistent_removals = application
-            .spent_entries
-            .iter()
-            .filter_map(|(outpoint, entry)| (entry.height != height).then_some(*outpoint))
-            .collect::<Vec<_>>();
-        for (outpoint, entry) in &application.spent_entries {
-            let was_in_utxo_set = if self.utxos_materialized {
-                self.utxos.remove(outpoint).is_some()
-            } else {
-                // Validation sourced every older prevout from the durable
-                // UTXO set. Only an output created and spent within this same
-                // block is absent there, so do not repeat a cache/store lookup
-                // for every input after validation.
-                entry.height != height
-            };
-            if was_in_utxo_set {
-                self.remove_utxo_entry(outpoint, entry);
+        let persistent_removals = if application.spent_entries.is_empty() {
+            spent_outpoints
+                .iter()
+                .filter(|outpoint| !same_block_spent.contains(*outpoint))
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            application
+                .spent_entries
+                .iter()
+                .filter_map(|(outpoint, entry)| (entry.height != height).then_some(*outpoint))
+                .collect::<Vec<_>>()
+        };
+        if application.spent_entries.is_empty() {
+            for outpoint in &spent_outpoints {
+                if let Some(entry) = self.utxos.remove(outpoint) {
+                    self.remove_utxo_entry(outpoint, &entry);
+                }
+            }
+        } else {
+            for (outpoint, entry) in &application.spent_entries {
+                let was_in_utxo_set = if self.utxos_materialized {
+                    self.utxos.remove(outpoint).is_some()
+                } else {
+                    // Validation sourced every older prevout from the durable
+                    // UTXO set. Only an output created and spent within this
+                    // same block is absent there, so do not repeat a cache or
+                    // store lookup for every input after validation.
+                    entry.height != height
+                };
+                if was_in_utxo_set {
+                    self.remove_utxo_entry(outpoint, entry);
+                }
             }
         }
         let mut history_updates: HashMap<String, Vec<HistoryEntry>> = HashMap::new();
         let may_overwrite_utxo = is_bip30_repeat(self.network, height, hash);
-        for (outpoint, entry) in &delta.created {
-            if may_overwrite_utxo {
-                self.insert_utxo(*outpoint, entry.clone());
-            } else {
-                self.insert_fresh_utxo(*outpoint, entry.clone());
+        // The wallet-free durable IBD path has neither a materialized UTXO
+        // map nor coinstats state. In that mode the validated entries go
+        // straight to the owned UTXO batch below; cloning them here would
+        // reproduce the same output allocation a second time, unlike Core's
+        // move into CCoinsViewCache.
+        if self.utxos_materialized || self.coin_stats.is_some() {
+            for (outpoint, entry) in &delta.created {
+                if may_overwrite_utxo {
+                    self.insert_utxo(*outpoint, entry.clone());
+                } else {
+                    self.insert_fresh_utxo(*outpoint, entry.clone());
+                }
             }
         }
         for (script_hash, entry) in &delta.history {
@@ -8726,15 +9622,15 @@ impl ChainState {
         }
         let transaction_indexes_finished = Instant::now();
         if persist {
-            let additions = delta
-                .created
-                .iter()
-                .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
-                .collect::<Vec<_>>();
             if may_overwrite_utxo {
                 // The two historical BIP30 duplicate-coinbase exceptions can
                 // replace an existing outpoint, so retain exact key probing
                 // for those blocks only.
+                let additions = delta
+                    .created
+                    .iter()
+                    .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
+                    .collect::<Vec<_>>();
                 if sync_storage {
                     self.utxo_store
                         .apply_batch(&persistent_removals, &additions)?;
@@ -8742,12 +9638,18 @@ impl ChainState {
                     self.utxo_store
                         .apply_batch_unsynced(&persistent_removals, &additions)?;
                 }
-            } else if sync_storage {
-                self.utxo_store
-                    .apply_validated_batch(&persistent_removals, &additions)?;
             } else {
-                self.utxo_store
-                    .apply_validated_batch_unsynced(&persistent_removals, &additions)?;
+                let additions = std::mem::take(&mut delta.created)
+                    .into_iter()
+                    .map(|(outpoint, entry)| (outpoint, Self::into_stored_utxo(entry)))
+                    .collect::<Vec<_>>();
+                if sync_storage {
+                    self.utxo_store
+                        .apply_validated_batch_owned(&persistent_removals, additions)?;
+                } else {
+                    self.utxo_store
+                        .apply_validated_batch_owned_unsynced(&persistent_removals, additions)?;
+                }
             }
         }
         let utxo_index_finished = Instant::now();
@@ -8841,10 +9743,13 @@ impl ChainState {
         }
         let connect_finished = Instant::now();
         if persist && !sync_storage {
-            self.record_ibd_connect_bench(
+            self.record_connect_bench(
                 block.txdata.len(),
                 ConnectTimings {
                     validation: validation_finished.duration_since(connect_started),
+                    utxo_prefetch,
+                    transaction_validation,
+                    utxo_misses,
                     undo_and_filters: undo_and_filters_finished.duration_since(validation_finished),
                     block_and_delta_storage: block_and_delta_storage_finished
                         .duration_since(undo_and_filters_finished),
@@ -8857,6 +9762,31 @@ impl ChainState {
                     finalization: connect_finished.duration_since(history_index_finished),
                     total: connect_finished.duration_since(connect_started),
                 },
+                "IBD",
+                true,
+            );
+        } else if !persist {
+            self.record_connect_bench(
+                block.txdata.len(),
+                ConnectTimings {
+                    validation: validation_finished.duration_since(connect_started),
+                    utxo_prefetch,
+                    transaction_validation,
+                    utxo_misses,
+                    undo_and_filters: undo_and_filters_finished.duration_since(validation_finished),
+                    block_and_delta_storage: block_and_delta_storage_finished
+                        .duration_since(undo_and_filters_finished),
+                    state_mutation: state_mutation_finished
+                        .duration_since(block_and_delta_storage_finished),
+                    transaction_indexes: transaction_indexes_finished
+                        .duration_since(state_mutation_finished),
+                    utxo_index: utxo_index_finished.duration_since(transaction_indexes_finished),
+                    history_index: history_index_finished.duration_since(utxo_index_finished),
+                    finalization: connect_finished.duration_since(history_index_finished),
+                    total: connect_finished.duration_since(connect_started),
+                },
+                "Replay",
+                false,
             );
         }
         Ok(())
@@ -8868,17 +9798,63 @@ impl ChainState {
         transaction_ids: &[Txid],
         height: u32,
         median_time_past: u32,
-        spent_entries: &HashMap<OutPoint, UtxoEntry>,
+        spent_entries: &FastHashMap<OutPoint, UtxoEntry>,
+        spent_outpoints: &FastHashSet<OutPoint>,
+        created_entries: ActiveUtxoMap,
         metrics: CoinStatsBlockMetrics,
+        include_storage_delta: bool,
     ) -> ChainstateDelta {
         let block_hash = block.block_hash();
-        let spent_outpoints: HashSet<OutPoint> = spent_entries.keys().copied().collect();
         let history_index_enabled = self.history_index_enabled;
         let txospender_index_enabled = self.txospender_index_enabled;
+        let mut created = created_entries
+            .into_iter()
+            .filter(|(outpoint, _)| !spent_outpoints.contains(outpoint))
+            .collect::<Vec<_>>();
+        // The transaction validator deliberately keeps coinbase outputs out
+        // of its intra-block map. Add them here once, after the block reward
+        // has passed validation, so the state transition contains the full
+        // post-connect UTXO set without rebuilding normal outputs.
+        if let Some(coinbase) = block.txdata.first() {
+            let coinbase_txid = transaction_ids[0];
+            for (output_index, output) in coinbase.output.iter().enumerate() {
+                let outpoint = OutPoint::new(coinbase_txid, output_index as u32);
+                if !spent_outpoints.contains(&outpoint)
+                    && !is_unspendable_script(&output.script_pubkey)
+                {
+                    created.push((
+                        outpoint,
+                        UtxoEntry {
+                            output: output.clone(),
+                            height,
+                            median_time_past,
+                            coinbase: true,
+                        },
+                    ));
+                }
+            }
+        }
+        // This is the normal wallet-free IBD path.  There is no historical
+        // chainstate delta, Electrum event stream, or tx-spender index to
+        // derive. Core updates its coin cache directly while connecting the
+        // block; avoid a second transaction walk just to construct empty
+        // service-index vectors.
+        if !include_storage_delta && !history_index_enabled && !txospender_index_enabled {
+            return ChainstateDelta {
+                block_hash,
+                parent_hash: block.header.prev_blockhash,
+                height,
+                spent: Vec::new(),
+                created,
+                transactions: Vec::new(),
+                history: Vec::new(),
+                spent_by: Vec::new(),
+                metrics,
+            };
+        }
         let prepare_transaction =
             |(transaction_index, (transaction, txid)): (usize, (&Transaction, &Txid))| {
                 let txid = *txid;
-                let mut created = Vec::new();
                 let mut affected_scripts = Vec::new();
                 let mut spent_by = Vec::new();
                 for (input_index, input) in transaction.input.iter().enumerate() {
@@ -8897,21 +9873,7 @@ impl ChainState {
                         ));
                     }
                 }
-                for (output_index, output) in transaction.output.iter().enumerate() {
-                    let outpoint = OutPoint::new(txid, output_index as u32);
-                    if !spent_outpoints.contains(&outpoint)
-                        && !is_unspendable_script(&output.script_pubkey)
-                    {
-                        created.push((
-                            outpoint,
-                            UtxoEntry {
-                                output: output.clone(),
-                                height,
-                                median_time_past,
-                                coinbase: transaction_index == 0,
-                            },
-                        ));
-                    }
+                for output in &transaction.output {
                     if history_index_enabled {
                         let script_hash = electrum_script_hash(&output.script_pubkey);
                         if !affected_scripts.contains(&script_hash) {
@@ -8924,15 +9886,14 @@ impl ChainState {
                     .map(|script_hash| (script_hash, HistoryEntry { txid, height }))
                     .collect();
                 PreparedTransactionDelta {
-                    transaction: (
+                    transaction: include_storage_delta.then_some((
                         txid,
                         TxLocation {
                             block_hash,
                             height,
                             transaction_index,
                         },
-                    ),
-                    created,
+                    )),
                     history,
                     spent_by,
                 }
@@ -8954,16 +9915,20 @@ impl ChainState {
                 .map(prepare_transaction)
                 .collect::<Vec<_>>()
         };
-        let created_capacity = prepared.iter().map(|entry| entry.created.len()).sum();
         let history_capacity = prepared.iter().map(|entry| entry.history.len()).sum();
         let spent_by_capacity = prepared.iter().map(|entry| entry.spent_by.len()).sum();
-        let mut created = Vec::with_capacity(created_capacity);
-        let mut transactions = Vec::with_capacity(prepared.len());
+        let mut transactions =
+            Vec::with_capacity(include_storage_delta.then_some(prepared.len()).unwrap_or(0));
         let mut history = Vec::with_capacity(history_capacity);
         let mut spent_by = Vec::with_capacity(spent_by_capacity);
         for prepared_transaction in prepared {
-            transactions.push(prepared_transaction.transaction);
-            created.extend(prepared_transaction.created);
+            if include_storage_delta {
+                transactions.push(
+                    prepared_transaction
+                        .transaction
+                        .expect("transaction location was prepared"),
+                );
+            }
             history.extend(prepared_transaction.history);
             spent_by.extend(prepared_transaction.spent_by);
         }
@@ -8971,10 +9936,14 @@ impl ChainState {
             block_hash,
             parent_hash: block.header.prev_blockhash,
             height,
-            spent: spent_entries
-                .iter()
-                .map(|(outpoint, entry)| (*outpoint, entry.clone()))
-                .collect(),
+            spent: include_storage_delta
+                .then(|| {
+                    spent_entries
+                        .iter()
+                        .map(|(outpoint, entry)| (*outpoint, entry.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
             created,
             transactions,
             history,
@@ -9033,10 +10002,13 @@ impl ChainState {
         if !self.coinstats_index_enabled {
             return Ok(());
         }
-        let stats = self
-            .coin_stats
-            .as_ref()
-            .context("coinstats accumulator is not initialized")?;
+        let Some(stats) = self.coin_stats.as_ref() else {
+            // During pending AssumeUTXO activation the index follows the
+            // background chainstate, not the header-only serving suffix.
+            // Leave the durable prefix untouched until background validation
+            // can rebuild the accumulator from a complete chain.
+            return Ok(());
+        };
         let record = stats.record(hash, height);
         if sync {
             self.coinstats_store.insert(&record)?;
@@ -9049,48 +10021,100 @@ impl ChainState {
 
     fn rebuild_block_index(&mut self, rebuild_tx_index: bool) -> Result<()> {
         let hashes: Vec<BlockHash> = self.store.hashes().copied().collect();
-        let mut blocks = Vec::new();
-        for hash in &hashes {
-            if self.block_index.contains_key(hash) {
+        // Core's reindex path scans block files sequentially.  The native
+        // store keeps a hash index for random RPC reads, but recover the
+        // block-tree headers in physical append order so reindex does not
+        // turn the NFS read into one positional lookup per block.  On a
+        // linear main chain this also preserves the parent's natural arrival
+        // order, while the pending graph handles out-of-order side chains.
+        let mut pending_by_parent: HashMap<BlockHash, Vec<(BlockHash, Header)>> = HashMap::new();
+        let mut ready = VecDeque::new();
+        // A normal `-reindex-chainstate` already loaded the persisted header
+        // journal above.  Core likewise keeps its block-index headers while
+        // rebuilding only the coins database; do not decompress every native
+        // block body just to rediscover headers that are already indexed.
+        // Scan physical records only when the header index is genuinely
+        // missing entries (for example, a fresh data directory with no
+        // metadata checkpoint).
+        let ordered_headers = if hashes
+            .iter()
+            .any(|hash| !self.block_index.contains_key(hash))
+        {
+            self.store.headers_in_file_order()?
+        } else {
+            Vec::new()
+        };
+        let bodies_read = ordered_headers.len();
+        let mut inserted = 0usize;
+        for (position, (hash, header)) in ordered_headers.into_iter().enumerate() {
+            if position % 16_384 == 0 {
+                self.check_shutdown_interrupt()?;
+            }
+            if self.block_index.contains_key(&hash) {
                 continue;
             }
-            if let Some(block) = self.store.get(hash)? {
-                blocks.push((*hash, block));
+            if self.block_index.contains_key(&header.prev_blockhash) {
+                ready.push_back((hash, header));
+            } else {
+                pending_by_parent
+                    .entry(header.prev_blockhash)
+                    .or_default()
+                    .push((hash, header));
             }
         }
-        for _ in 0..blocks.len() {
-            let mut progress = false;
-            for (hash, block) in &blocks {
-                if self.block_index.contains_key(hash) {
-                    continue;
+
+        while let Some((hash, header)) = ready.pop_front() {
+            if inserted % 16_384 == 0 {
+                self.check_shutdown_interrupt()?;
+            }
+            if self.block_index.contains_key(&hash) {
+                continue;
+            }
+            let Some(parent) = self.block_index.get(&header.prev_blockhash).copied() else {
+                // This can only happen when a caller supplied a malformed
+                // block index concurrently with recovery, but retaining the
+                // header here gives the same orphan fallback as before.
+                pending_by_parent
+                    .entry(header.prev_blockhash)
+                    .or_default()
+                    .push((hash, header));
+                continue;
+            };
+            let height = parent.height.saturating_add(1);
+            let skip = self.ancestor_hash(header.prev_blockhash, block_index_skip_height(height));
+            self.block_index.insert(
+                hash,
+                BlockNode {
+                    header,
+                    height,
+                    chain_work: parent.chain_work + header.work(),
+                    skip,
+                },
+            );
+            self.assign_header_sequence_id(hash);
+            inserted = inserted.saturating_add(1);
+            if let Some(children) = pending_by_parent.remove(&hash) {
+                ready.extend(children);
+            }
+        }
+
+        // Bodies whose parents are absent remain genuine orphans.  Read those
+        // bodies only now; normal main-chain recovery never retains full
+        // blocks just to resolve an iteration-order dependency.
+        let orphan_parents = pending_by_parent.len();
+        for (parent_hash, children) in pending_by_parent {
+            self.check_shutdown_interrupt()?;
+            for (hash, _) in children {
+                if let Some(block) = self.store.get(&hash)? {
+                    let _ = self.queue_orphan_block(parent_hash, block);
                 }
-                let Some(parent) = self.block_index.get(&block.header.prev_blockhash).copied()
-                else {
-                    continue;
-                };
-                let height = parent.height.saturating_add(1);
-                let skip = self
-                    .ancestor_hash(block.header.prev_blockhash, block_index_skip_height(height));
-                self.block_index.insert(
-                    *hash,
-                    BlockNode {
-                        header: block.header,
-                        height,
-                        chain_work: parent.chain_work + block.header.work(),
-                        skip,
-                    },
-                );
-                self.assign_header_sequence_id(*hash);
-                progress = true;
-            }
-            if !progress {
-                break;
             }
         }
-        for (hash, block) in blocks {
-            if !self.block_index.contains_key(&hash) {
-                let _ = self.queue_orphan_block(block.header.prev_blockhash, block);
-            }
+        if bodies_read != 0 || inserted != 0 {
+            info!(
+                "Rebuilt block index: stored_bodies={} new_headers={} pending_orphan_parents={}",
+                bodies_read, inserted, orphan_parents
+            );
         }
         if rebuild_tx_index
             && self.tx_index_all_enabled
@@ -9193,6 +10217,7 @@ impl ChainState {
                     .map(|record| (u32::try_from(height).unwrap_or(u32::MAX), record))
             });
 
+        let mut replay_from_genesis = false;
         let (mut utxos, mut stats, first_height) = if let Some((base_height, record)) = indexed_base
         {
             let mut utxos = current_utxos;
@@ -9205,17 +10230,33 @@ impl ChainState {
                     .store
                     .get(&hash)?
                     .with_context(|| format!("coinstats index is missing block {hash}"))?;
-                let undo = self
-                    .store
-                    .get_undo(&hash)?
-                    .with_context(|| format!("coinstats undo is missing block {hash}"))?;
+                let Some(undo) = self.store.get_undo(&hash)? else {
+                    // An AssumeUTXO serving chain can legitimately lack
+                    // undo for the snapshot boundary: that block was
+                    // never connected through the serving chainstate.
+                    // If all block bodies are retained, reconstruct the
+                    // missing suffix by replaying forward from genesis.
+                    // This is also the recovery path Core's background
+                    // chainstate provides for a pruned node.
+                    warn!(
+                        hash = %hash,
+                        height,
+                        "coinstats undo is unavailable; falling back to forward replay"
+                    );
+                    replay_from_genesis = true;
+                    break;
+                };
                 self.disconnect_block_from_utxos(&mut utxos, &block, height, &undo)?;
             }
-            let mut stats = CoinStatsState::from_utxos(&utxos);
-            stats.load_cumulative_from_record(&record);
-            (utxos, stats, base_height.saturating_add(1))
+            if replay_from_genesis {
+                (FastHashMap::new(), CoinStatsState::default(), 0)
+            } else {
+                let mut stats = CoinStatsState::from_utxos(&utxos);
+                stats.load_cumulative_from_record(&record);
+                (utxos, stats, base_height.saturating_add(1))
+            }
         } else {
-            (HashMap::new(), CoinStatsState::default(), 0)
+            (FastHashMap::new(), CoinStatsState::default(), 0)
         };
 
         for height in first_height..=tip_height {
@@ -9239,7 +10280,24 @@ impl ChainState {
         if self.has_invalid_ancestor(tip_hash) {
             bail!("cannot activate an invalidated chain")
         }
-        self.materialize_utxos()?;
+        // A full startup reindex has no snapshot to serve and an empty
+        // durable UTXO store.  Replay it through the same bounded disk-backed
+        // coin cache used by peer IBD instead of materializing the entire
+        // historical UTXO set in one in-memory hash map.  Core's reindex path
+        // keeps CCoinsViewCache bounded for exactly this reason.
+        let durable_replay = self.startup_reindex
+            && self.active_chain.len() <= 1
+            && self.utxo_store.is_empty()
+            && !self.history_index_enabled
+            && !self.tx_index_all_enabled
+            && !self.txospender_index_enabled
+            && !self.coinstats_index_enabled;
+        if !durable_replay {
+            self.materialize_utxos()?;
+        } else {
+            self.utxos.clear();
+            self.utxos_materialized = false;
+        }
         let mut path = Vec::new();
         let mut cursor = tip_hash;
         loop {
@@ -9281,7 +10339,9 @@ impl ChainState {
         let pending_snapshot_reorg = self.snapshot_base.is_some_and(|base| {
             !self.snapshot_validated && !self.is_active_block(&base) && path.contains(&base)
         });
-        if let Some(common_height) = common_height.filter(|_| !pending_snapshot_reorg) {
+        if let Some(common_height) =
+            common_height.filter(|_| !pending_snapshot_reorg && self.active_chain.len() > 1)
+        {
             // Any candidate sharing the live chainstate can be activated by
             // disconnecting and connecting only its suffix. Falling back to
             // a genesis replay for a short extension is especially harmful
@@ -9295,7 +10355,11 @@ impl ChainState {
         let missing_block = {
             let mut missing = None;
             for hash in path.iter().skip(replay_start) {
-                if self.store.get(hash)?.is_none() {
+                // Preflight the native index without decoding every full
+                // block. The replay below streams one body at a time; using
+                // `get` here would turn the preflight into a full-chain read
+                // before validation even starts.
+                if !self.store.contains(hash) {
                     missing = Some(*hash);
                     break;
                 }
@@ -9305,19 +10369,6 @@ impl ChainState {
         if let Some(missing_hash) = missing_block {
             bail!("candidate block {missing_hash} is missing");
         }
-        let blocks = path
-            .iter()
-            .skip(replay_start)
-            .map(|hash| self.store.get(hash))
-            .collect::<Result<Vec<Option<Block>>>>()?
-            .into_iter()
-            .enumerate()
-            .map(|(index, block)| {
-                block.with_context(|| {
-                    format!("candidate block {} is missing", path[replay_start + index])
-                })
-            })
-            .collect::<Result<Vec<Block>>>()?;
         let old_active_chain = std::mem::take(&mut self.active_chain);
         let old_segwit_validated_blocks = self.segwit_validated_blocks.clone();
         let old_headers = std::mem::take(&mut self.headers);
@@ -9342,7 +10393,7 @@ impl ChainState {
         self.active_tx_counts.clear();
         self.active_tx_totals.clear();
         self.utxos.clear();
-        self.utxos_materialized = true;
+        self.utxos_materialized = !durable_replay;
         self.history.clear();
         self.history_materialized = true;
         self.spent_by.clear();
@@ -9392,13 +10443,55 @@ impl ChainState {
                         stats.load_cumulative_from_record(&record);
                     }
                 }
-                for block in &blocks {
-                    self.connect_block_internal(block, false)?;
+                let replay_total = path.len().saturating_sub(snapshot_chain_len);
+                let replay_started = Instant::now();
+                for (offset, hash) in path.iter().skip(snapshot_chain_len).enumerate() {
+                    self.check_shutdown_interrupt()?;
+                    let block = self
+                        .store
+                        .get(hash)?
+                        .with_context(|| format!("candidate block {hash} is missing"))?;
+                    if durable_replay {
+                        self.connect_block_internal_with_storage_sync(&block, true, false)?;
+                    } else {
+                        self.connect_block_internal(&block, false)?;
+                    }
+                    log_replay_progress(
+                        "apply-blocks",
+                        offset + 1,
+                        replay_total,
+                        snapshot_chain_len + offset,
+                        path.len().saturating_sub(1),
+                        replay_started,
+                    );
                 }
             } else {
-                self.initialize_genesis(&blocks[0])?;
-                for block in blocks.iter().skip(1) {
-                    self.connect_block_internal(block, false)?;
+                let genesis = self
+                    .store
+                    .get(&path[0])?
+                    .context("candidate chain is missing the genesis block")?;
+                self.initialize_genesis(&genesis)?;
+                let replay_total = path.len().saturating_sub(1);
+                let replay_started = Instant::now();
+                for (offset, hash) in path.iter().skip(1).enumerate() {
+                    self.check_shutdown_interrupt()?;
+                    let block = self
+                        .store
+                        .get(hash)?
+                        .with_context(|| format!("candidate block {hash} is missing"))?;
+                    if durable_replay {
+                        self.connect_block_internal_with_storage_sync(&block, true, false)?;
+                    } else {
+                        self.connect_block_internal(&block, false)?;
+                    }
+                    log_replay_progress(
+                        "apply-blocks",
+                        offset + 1,
+                        replay_total,
+                        offset + 1,
+                        path.len().saturating_sub(1),
+                        replay_started,
+                    );
                 }
             }
             // A persisted snapshot does not carry the transaction-count
@@ -9980,6 +11073,22 @@ impl ChainState {
             .collect()
     }
 
+    fn undo_entries(undo: &[Vec<StoredUndo>]) -> Vec<Vec<UtxoEntry>> {
+        undo.iter()
+            .map(|coins| {
+                coins
+                    .iter()
+                    .map(|coin| UtxoEntry {
+                        output: coin.output.clone(),
+                        height: coin.height,
+                        median_time_past: coin.median_time_past,
+                        coinbase: coin.coinbase,
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     fn remember_block_undo(&mut self, hash: BlockHash, undo: Vec<Vec<StoredUndo>>) {
         self.block_undo_cache.insert(hash, undo);
         while self.block_undo_cache.len() > MAX_UNDO_CACHE_ENTRIES {
@@ -10026,11 +11135,44 @@ impl ChainState {
     }
 
     fn best_valid_tip_hash(&self) -> Option<BlockHash> {
+        // Candidates are often evaluated while only genesis is active (for
+        // example during reindex).  Walking every candidate back to the
+        // active chain independently makes a linear chain quadratic.  Build
+        // the two ancestor properties once in height order, matching Core's
+        // block-index metadata lookup rather than replaying the chain.
+        let mut ordered_hashes = self.block_index.keys().copied().collect::<Vec<_>>();
+        ordered_hashes.sort_unstable_by_key(|hash| {
+            self.block_index
+                .get(hash)
+                .map_or(u32::MAX, |node| node.height)
+        });
+        let mut has_full_data = HashMap::with_capacity(ordered_hashes.len());
+        let mut has_valid_ancestors = HashMap::with_capacity(ordered_hashes.len());
+        for hash in &ordered_hashes {
+            let Some(node) = self.block_index.get(hash) else {
+                continue;
+            };
+            let active = self.is_active_block(hash);
+            let parent_full = node.height == 0
+                || self.is_active_block(&node.header.prev_blockhash)
+                || has_full_data
+                    .get(&node.header.prev_blockhash)
+                    .copied()
+                    .unwrap_or(false);
+            has_full_data.insert(*hash, active || (self.store.contains(hash) && parent_full));
+            let parent_valid = node.height == 0
+                || has_valid_ancestors
+                    .get(&node.header.prev_blockhash)
+                    .copied()
+                    .unwrap_or(false);
+            has_valid_ancestors.insert(*hash, !self.invalid_blocks.contains(hash) && parent_valid);
+        }
+
         self.block_index
             .iter()
             .filter(|(hash, _)| {
-                !self.has_invalid_ancestor(**hash)
-                    && self.has_full_block_data_to_active_fork(**hash)
+                has_valid_ancestors.get(*hash).copied().unwrap_or(false)
+                    && has_full_data.get(*hash).copied().unwrap_or(false)
             })
             .max_by(|(left_hash, left), (right_hash, right)| {
                 left.chain_work
@@ -10164,20 +11306,6 @@ impl ChainState {
         self.next_block_sequence_id = if has_loaded_fork { 2 } else { 1 };
         self.next_header_sequence_id = 2;
         self.best_header_hash.lock().take();
-    }
-
-    fn has_full_block_data_to_active_fork(&self, hash: BlockHash) -> bool {
-        let mut cursor = hash;
-        while !self.is_active_block(&cursor) {
-            if !self.store.contains(&cursor) {
-                return false;
-            }
-            let Some(node) = self.block_index.get(&cursor) else {
-                return false;
-            };
-            cursor = node.header.prev_blockhash;
-        }
-        true
     }
 
     fn precious_priority(&self, hash: &BlockHash) -> i32 {
@@ -10414,6 +11542,15 @@ impl ChainState {
         }
     }
 
+    fn into_stored_utxo(entry: UtxoEntry) -> StoredUtxo {
+        StoredUtxo {
+            output: entry.output,
+            height: entry.height,
+            median_time_past: entry.median_time_past,
+            coinbase: entry.coinbase,
+        }
+    }
+
     fn decoded_tx_location(location: StoredTxLocation) -> Result<TxLocation> {
         Ok(TxLocation {
             block_hash: location.block_hash,
@@ -10432,7 +11569,7 @@ impl ChainState {
         }
     }
 
-    fn load_utxo_map_from_store(&self) -> Result<HashMap<OutPoint, UtxoEntry>> {
+    fn load_utxo_map_from_store(&self) -> Result<ActiveUtxoMap> {
         Ok(self.load_utxo_entries_from_store()?.into_iter().collect())
     }
 
@@ -10543,7 +11680,7 @@ impl ChainState {
         }
     }
 
-    fn active_utxo_map_for_read(&self) -> HashMap<OutPoint, UtxoEntry> {
+    fn active_utxo_map_for_read(&self) -> ActiveUtxoMap {
         if self.utxos_materialized {
             self.utxos.clone()
         } else {
@@ -10561,7 +11698,7 @@ impl ChainState {
     }
 
     fn release_materialized_utxos(&mut self) {
-        self.utxos = HashMap::new();
+        self.utxos = FastHashMap::new();
         self.utxos_materialized = false;
     }
 
@@ -10613,8 +11750,7 @@ impl ChainState {
         let entries = self
             .utxos
             .iter()
-            .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)))
-            .collect::<Vec<_>>();
+            .map(|(outpoint, entry)| (*outpoint, Self::stored_utxo(entry)));
         self.utxo_store.replace_all(entries)?;
         self.persist_utxo_store_tip()
     }
@@ -10879,6 +12015,22 @@ impl ChainState {
                 height,
                 header.version.to_consensus(),
             )?;
+        }
+        if self.software_expiry > 0 && i64::from(header.time) > self.software_expiry {
+            let parent = self
+                .block_index
+                .get(&parent_hash)
+                .context("header parent is not indexed")?;
+            let old_height = parent.height.saturating_sub(144);
+            let old_hash = self
+                .ancestor_hash(parent_hash, old_height)
+                .context("software expiry ancestor is not indexed")?;
+            let old_median_time = self
+                .median_time_past_for_hash(&old_hash)
+                .context("software expiry ancestor median time is unavailable")?;
+            if i64::from(old_median_time) > self.software_expiry {
+                return Err(ValidationError::NodeExpired.into());
+            }
         }
         Ok(())
     }
@@ -11360,6 +12512,17 @@ impl ChainState {
         {
             self.persist_electrum_history_store_tip()?;
         }
+        if self.startup_reindex && self.snapshot_base.is_none() {
+            // The durable UTXO and metadata stores are now a complete
+            // restart point.  Avoid cloning the entire in-memory UTXO map
+            // into a second chainstate.snapshot during a full reindex.
+            self.persist_active_chain_tip()?;
+            self.peer_storage_blocks_since_flush = 0;
+            self.peer_storage_bytes_since_flush = 0;
+            self.startup_reindex = false;
+            info!("Published durable reindex chainstate without duplicate snapshot");
+            return Ok(());
+        }
         let snapshot = self.current_snapshot()?;
         let bytes = serialize_internal(CHAIN_SNAPSHOT_MAGIC, &snapshot)?;
         let path = self.data_dir.join("chainstate.snapshot");
@@ -11396,7 +12559,7 @@ impl ChainState {
     fn persist_assumeutxo_base_snapshot(
         &self,
         base_hash: BlockHash,
-        utxos: &HashMap<OutPoint, UtxoEntry>,
+        utxos: &ActiveUtxoMap,
     ) -> Result<()> {
         let snapshot = AssumeUtxoBaseSnapshot {
             base_hash: base_hash.to_string(),
@@ -11786,7 +12949,7 @@ fn load_assumeutxo_expected_snapshot(
     data_dir: &Path,
     base_hash: BlockHash,
     target_tip: BlockHash,
-) -> Result<HashMap<OutPoint, UtxoEntry>> {
+) -> Result<ActiveUtxoMap> {
     let base_path = data_dir.join("assumeutxo-base.bin");
     if base_path.exists() {
         let bytes = fs::read(&base_path)
@@ -11873,9 +13036,11 @@ fn open_background_replay_state(
         blocks_xor,
         minimum_chain_work_override: None,
         assume_valid_block: None,
+        software_expiry: 0,
         max_tip_age_secs: MAX_TIP_AGE_SECS,
         script_check_workers,
         script_checks_enabled: script_check_workers > 0,
+        script_check_pool: build_script_check_pool(script_check_workers),
         script_check_log_state: Mutex::new(None),
         signet_challenge,
         deployment_parameters,
@@ -11900,6 +13065,7 @@ fn open_background_replay_state(
         active_tx_counts: Vec::new(),
         active_tx_totals: Vec::new(),
         initial_block_download: true,
+        startup_reindex: false,
         max_tip_age_configured: false,
         snapshot_base: None,
         snapshot_validated: true,
@@ -11911,6 +13077,7 @@ fn open_background_replay_state(
         next_block_sequence_id: 1,
         pending_body_children: HashMap::new(),
         processing_known_children: false,
+        peer_body_chain_ready: HashSet::new(),
         unlinked_body_order: HashMap::new(),
         next_unlinked_body_order: 1,
         header_sequence_ids: HashMap::new(),
@@ -11925,7 +13092,7 @@ fn open_background_replay_state(
         prune_target_size: None,
         prune_after_height: MIN_BLOCKS_TO_KEEP,
         fast_prune: false,
-        utxos: HashMap::new(),
+        utxos: FastHashMap::new(),
         utxos_materialized: true,
         side_chain_utxos: None,
         history: HashMap::new(),
@@ -11971,7 +13138,7 @@ fn run_background_validation(
         script_cache_max_entries,
         cancel,
     } = job;
-    let result = (|| -> Result<(HashMap<OutPoint, UtxoEntry>, bool)> {
+    let result = (|| -> Result<(ActiveUtxoMap, bool)> {
         let target_height = active_chain
             .iter()
             .position(|hash| *hash == target_tip)
@@ -11986,7 +13153,7 @@ fn run_background_validation(
             let height = checkpoint.height;
             (checkpoint.utxos, height, checkpoint.base_matches)
         } else {
-            (HashMap::new(), 0, None)
+            (FastHashMap::new(), 0, None)
         };
         if start_height > target_height {
             start_height = 0;
@@ -12120,7 +13287,7 @@ fn run_background_validation(
 }
 
 fn calculate_utxo_statistics(
-    utxos: &HashMap<OutPoint, UtxoEntry>,
+    utxos: &ActiveUtxoMap,
     include_serialized_hash: bool,
     include_muhash: bool,
 ) -> UtxoSetStats {
@@ -12174,6 +13341,9 @@ where
     let entries = entries.into_iter().collect::<Vec<_>>();
     let (serialized_hash, muhash) = if include_serialized_hash {
         let mut sorted_entries = entries;
+        // Core's LevelDB cursor orders the serialized COutPoint key. The
+        // rust-bitcoin hash byte array is already the consensus/display byte
+        // order used by the stored OutPoint serialization here.
         sorted_entries.sort_by_key(|(outpoint, _)| (outpoint.txid.to_byte_array(), outpoint.vout));
         let mut serialized_engine = bitcoin::hashes::sha256d::Hash::engine();
         let mut muhash = include_muhash.then(MuHash3072::default);
@@ -12235,7 +13405,13 @@ fn snapshot_checksum(bytes: &[u8]) -> String {
 struct CoreUtxoSnapshot {
     base_hash: BlockHash,
     coins_count: u64,
-    utxos: HashMap<OutPoint, UtxoEntry>,
+    utxos: ActiveUtxoMap,
+}
+
+struct CoreUtxoSnapshotMetadata {
+    base_hash: BlockHash,
+    coins_count: u64,
+    body_offset: usize,
 }
 
 fn write_core_utxo_snapshot(
@@ -12243,7 +13419,7 @@ fn write_core_utxo_snapshot(
     network: Network,
     signet_challenge: Option<&[u8]>,
     base_hash: BlockHash,
-    utxos: &HashMap<OutPoint, UtxoEntry>,
+    utxos: &ActiveUtxoMap,
 ) -> Result<()> {
     let temporary = PathBuf::from(format!("{}.incomplete", path.display()));
     let mut file = fs::File::create(&temporary)
@@ -12358,11 +13534,11 @@ fn write_compressed_snapshot_script(writer: &mut impl Write, script: &Script) ->
     Ok(())
 }
 
-fn read_core_utxo_snapshot(
+fn read_core_utxo_snapshot_metadata(
     bytes: &[u8],
     network: Network,
     signet_challenge: Option<&[u8]>,
-) -> Result<CoreUtxoSnapshot> {
+) -> Result<CoreUtxoSnapshotMetadata> {
     let mut cursor = Cursor::new(bytes);
     let magic = read_snapshot_array::<5>(&mut cursor).map_err(|_| {
         anyhow!(
@@ -12428,8 +13604,34 @@ fn read_core_utxo_snapshot(
             "Population failed: Bad snapshot format or truncated snapshot after deserializing 0 coins."
         )
     }
+    Ok(CoreUtxoSnapshotMetadata {
+        base_hash,
+        coins_count,
+        body_offset: cursor.position() as usize,
+    })
+}
+
+fn read_core_utxo_snapshot(
+    bytes: &[u8],
+    network: Network,
+    signet_challenge: Option<&[u8]>,
+) -> Result<CoreUtxoSnapshot> {
+    read_core_utxo_snapshot_with_max_height(bytes, network, signet_challenge, None)
+}
+
+fn read_core_utxo_snapshot_with_max_height(
+    bytes: &[u8],
+    network: Network,
+    signet_challenge: Option<&[u8]>,
+    max_coin_height: Option<u32>,
+) -> Result<CoreUtxoSnapshot> {
+    let metadata = read_core_utxo_snapshot_metadata(bytes, network, signet_challenge)?;
+    let mut cursor = Cursor::new(bytes);
+    cursor.set_position(metadata.body_offset as u64);
+    let base_hash = metadata.base_hash;
+    let coins_count = metadata.coins_count;
     let capacity = usize::try_from(coins_count.min(1_000_000)).unwrap_or(0);
-    let mut utxos = HashMap::with_capacity(capacity);
+    let mut utxos = FastHashMap::with_capacity(capacity);
     let mut coins_left = coins_count;
     let mut coins_deserialized = 0u64;
     while coins_left != 0 {
@@ -12454,22 +13656,10 @@ fn read_core_utxo_snapshot(
                     "Population failed: Bad snapshot format or truncated snapshot after deserializing {coins_deserialized} coins."
                 )
             })?;
-            let vout = u32::try_from(vout).map_err(|_| {
-                anyhow!(
-                    "Population failed: Bad snapshot format or truncated snapshot after deserializing {coins_deserialized} coins."
-                )
-            })?;
-            if vout == u32::MAX {
-                bail!(
-                    "Population failed: Bad snapshot format or truncated snapshot after deserializing {coins_deserialized} coins."
-                )
-            }
+            let vout = vout as u32;
             let entry = match read_core_coin(&mut cursor) {
                 Ok(entry) => entry,
-                Err(error)
-                    if coins_deserialized == 0
-                        && error.to_string() == "UTXO snapshot coin value is out of range" =>
-                {
+                Err(error) if error.to_string() == "UTXO snapshot coin value is out of range" => {
                     bail!(
                         "Population failed: Bad snapshot data after deserializing {coins_deserialized} coins - bad tx out value"
                     )
@@ -12480,6 +13670,13 @@ fn read_core_utxo_snapshot(
                     )
                 }
             };
+            if vout == u32::MAX
+                || max_coin_height.is_some_and(|max_height| entry.height > max_height)
+            {
+                bail!(
+                    "Population failed: Bad snapshot data after deserializing {coins_deserialized} coins."
+                )
+            }
             if utxos.insert(OutPoint::new(txid, vout), entry).is_some() {
                 bail!(
                     "Population failed: Bad snapshot format or truncated snapshot after deserializing {coins_deserialized} coins."
@@ -12491,7 +13688,7 @@ fn read_core_utxo_snapshot(
     }
     if cursor.position() as usize != bytes.len() {
         bail!(
-            "Population failed: Bad snapshot - coins left over after deserializing {coins_deserialized} coins."
+            "Population failed: Bad snapshot - coins left over after deserializing {coins_count} coins."
         )
     }
     Ok(CoreUtxoSnapshot {
@@ -12506,7 +13703,8 @@ fn read_core_coin(cursor: &mut Cursor<&[u8]>) -> Result<UtxoEntry> {
         .context("UTXO snapshot coin metadata is too large")?;
     let height = code >> 1;
     let coinbase = code & 1 != 0;
-    let value = decompress_snapshot_amount(read_snapshot_varint(cursor)?)?;
+    let value = decompress_snapshot_amount(read_snapshot_varint(cursor)?)
+        .map_err(|_| anyhow!("UTXO snapshot coin value is out of range"))?;
     if value > Amount::MAX_MONEY.to_sat() {
         bail!("UTXO snapshot coin value is out of range")
     }
@@ -12676,7 +13874,7 @@ fn serialize_utxo_coin(outpoint: &OutPoint, entry: &UtxoEntry) -> Vec<u8> {
 
 fn apply_block_to_coin_stats(
     network: Network,
-    utxos: &mut HashMap<OutPoint, UtxoEntry>,
+    utxos: &mut ActiveUtxoMap,
     stats: &mut CoinStatsState,
     block: &Block,
     height: u32,
@@ -12736,13 +13934,13 @@ fn apply_block_to_coin_stats(
 }
 
 fn apply_block_to_utxos(
-    utxos: &mut HashMap<OutPoint, UtxoEntry>,
+    utxos: &mut ActiveUtxoMap,
     block: &Block,
     height: u32,
     median_time_past: u32,
     spent_entries: Vec<(OutPoint, UtxoEntry)>,
 ) {
-    let spent_outpoints: HashSet<OutPoint> = spent_entries
+    let spent_outpoints: FastHashSet<OutPoint> = spent_entries
         .iter()
         .map(|(outpoint, _)| *outpoint)
         .collect();
@@ -13321,7 +14519,7 @@ mod tests {
         let expected = state.load_utxo_map_from_store().unwrap();
         state.persist_snapshot().unwrap();
         state
-            .persist_assumeutxo_base_snapshot(base, &HashMap::new())
+            .persist_assumeutxo_base_snapshot(base, &FastHashMap::new())
             .unwrap();
         state.snapshot_base = Some(base);
         state.snapshot_validated = false;
@@ -13851,6 +15049,10 @@ mod tests {
         assert_eq!(
             state.headers_after_locator(&[side_hash], BlockHash::all_zeros()),
             Vec::new()
+        );
+        assert_eq!(
+            state.headers_for_getheaders(&[side_hash], BlockHash::all_zeros(), 0),
+            Some(Vec::new())
         );
         assert_eq!(state.best_header_locator_hashes()[0], side_hash);
     }
@@ -14656,7 +15858,7 @@ mod tests {
         }
         let tip = state.best_hash();
         assert_eq!(state.height(), 70);
-        state.peer_storage_bytes_since_flush = PEER_STORAGE_FLUSH_BYTES;
+        state.peer_storage_blocks_since_flush = PEER_STORAGE_FLUSH_BLOCKS;
         state.flush_peer_storage_if_needed().unwrap();
         assert_eq!(state.peer_storage_blocks_since_flush, 0);
         assert_eq!(state.peer_storage_bytes_since_flush, 0);
@@ -14783,7 +15985,7 @@ mod tests {
             true,
             false,
             false,
-            true,
+            false,
             None,
             None,
             false,
@@ -14794,6 +15996,7 @@ mod tests {
         )
         .unwrap();
         assert!(!disabled.history_index_enabled);
+        assert!(disabled.tx_index_store.is_none());
         assert!(disabled.get_history(&script_hash).is_empty());
         assert_eq!(disabled.electrum_history_store.generation(), generation);
 
@@ -15107,6 +16310,39 @@ mod tests {
             .block_hashes_to_hash(&side_three.block_hash())
             .unwrap();
         assert_eq!(state.common_active_height_for_hash_path(&side_path), 1);
+    }
+
+    #[test]
+    fn indexed_hash_path_reuses_cached_prefix_for_tip_extensions_and_forks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let genesis = *state.header(0).unwrap();
+        let first = mine_block_from_header(&genesis, 1, 1);
+        let second = mine_block_from_header(&first.header, 2, 2);
+        state
+            .accept_headers(&[first.header, second.header])
+            .unwrap();
+
+        let cached = vec![genesis.block_hash(), first.block_hash()];
+        assert_eq!(
+            state
+                .block_hashes_to_hash_reusing_path(&second.block_hash(), &cached)
+                .unwrap(),
+            vec![
+                genesis.block_hash(),
+                first.block_hash(),
+                second.block_hash()
+            ]
+        );
+
+        let fork = mine_block_from_header(&genesis, 1, 3);
+        state.accept_headers(&[fork.header]).unwrap();
+        assert_eq!(
+            state
+                .block_hashes_to_hash_reusing_path(&fork.block_hash(), &cached)
+                .unwrap(),
+            vec![genesis.block_hash(), fork.block_hash()]
+        );
     }
 
     #[test]
@@ -15854,7 +17090,7 @@ mod tests {
         state
             .accept_headers(&[parent.header, child.header, grandchild.header])
             .unwrap();
-        assert!(state.connect_block_from_peer(child.clone()).is_err());
+        assert!(state.connect_block_from_peer(child.clone()).is_ok());
         assert!(state.connect_block_from_peer(grandchild.clone()).is_ok());
         assert!(state.store.contains(&child.block_hash()));
         assert!(state.store.contains(&grandchild.block_hash()));
@@ -16015,15 +17251,15 @@ mod tests {
         state
             .accept_headers(&[parent.header, child.header, grandchild.header])
             .unwrap();
-        assert!(state.connect_block_from_peer(grandchild).is_err());
-        assert!(state.connect_block_from_peer(child).is_err());
+        assert!(state.connect_block_from_peer(grandchild).is_ok());
+        assert!(state.connect_block_from_peer(child).is_ok());
         assert_eq!(state.height(), 0);
-        state.peer_storage_bytes_since_flush = PEER_STORAGE_FLUSH_BYTES;
+        state.peer_storage_blocks_since_flush = PEER_STORAGE_FLUSH_BLOCKS;
         state.connect_block_from_peer(parent).unwrap();
         assert_eq!(state.height(), 3);
         assert!(!state.processing_known_children);
         assert_eq!(state.peer_storage_blocks_since_flush, 1);
-        assert!(state.peer_storage_bytes_since_flush < PEER_STORAGE_FLUSH_BYTES);
+        assert!(state.peer_storage_blocks_since_flush < PEER_STORAGE_FLUSH_BLOCKS);
     }
 
     #[test]
@@ -16041,8 +17277,8 @@ mod tests {
             .accept_headers(&[side_parent.header, side_child.header, side_tip.header])
             .unwrap();
 
-        assert!(state.connect_block_from_peer(side_tip.clone()).is_err());
-        assert!(state.connect_block_from_peer(side_child).is_err());
+        assert!(state.connect_block_from_peer(side_tip.clone()).is_ok());
+        assert!(state.connect_block_from_peer(side_child).is_ok());
         assert_eq!(state.height(), 2);
 
         state.connect_block_from_peer(side_parent).unwrap();

@@ -279,6 +279,7 @@ const ADDR_FETCH_TIMEOUT_SECS: u64 = 10 * 30;
 const AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const HEADERS_RESPONSE_TIME: Duration = Duration::from_secs(2 * 60);
 const HEADERS_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const INITIAL_HEADERS_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 const PING_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const AVG_FEEFILTER_BROADCAST_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const MAX_FEEFILTER_CHANGE_DELAY: Duration = Duration::from_secs(5 * 60);
@@ -308,6 +309,10 @@ const AUTOMATIC_OUTBOUND_RETRY_INTERVAL: Duration = Duration::from_secs(10 * 60)
 /// than consuming automatic `-maxconnections` slots.
 pub(crate) const MAX_ADDNODE_CONNECTIONS: usize = 8;
 const MAX_OUTBOUND_FULL_RELAY_CONNECTIONS: usize = 8;
+// Match Core's eight full-relay download peers. A larger pool fragments the
+// 1,024-block download window across more slow-peer-owned gaps and can reduce
+// useful chain progress even when aggregate bytes received increases.
+const MAX_IBD_OUTBOUND_FULL_RELAY_CONNECTIONS: usize = MAX_OUTBOUND_FULL_RELAY_CONNECTIONS;
 const MAX_BLOCK_RELAY_ONLY_CONNECTIONS: usize = 2;
 const MAX_FEELER_CONNECTIONS: usize = 1;
 /// Private broadcast connections are short-lived and have their own limit in
@@ -316,12 +321,25 @@ pub(crate) const MAX_PRIVATE_BROADCAST_CONNECTIONS: usize = 64;
 const INVENTORY_BROADCAST_TARGET: usize = 70;
 const INVENTORY_BROADCAST_MAX: usize = 1_000;
 const BLOCK_RELAY_INTERVAL: Duration = Duration::from_millis(100);
+// Coalesce freed IBD slots into short batches. Refilling after every body
+// permanently stripes consecutive heights across peers, so the active chain
+// advances at the speed of the slowest peer and Core's empty-window staller
+// detector never gets a chance to run.
+const BLOCK_DOWNLOAD_REFILL_INTERVAL: Duration = Duration::from_millis(25);
 // Give a burst of block announcements a short chance to coalesce before
 // emitting getdata, while keeping direct block fetches responsive.
 const GETDATA_FLUSH_INTERVAL: Duration = Duration::from_millis(10);
 
 fn block_relay_cursor_after_batch(previous: BlockHash, announced: &[BlockHash]) -> BlockHash {
     announced.last().copied().unwrap_or(previous)
+}
+
+fn automatic_full_relay_target(max_peers: usize, initial_block_download: bool) -> usize {
+    max_peers.min(if initial_block_download {
+        MAX_IBD_OUTBOUND_FULL_RELAY_CONNECTIONS
+    } else {
+        MAX_OUTBOUND_FULL_RELAY_CONNECTIONS
+    })
 }
 
 fn local_transaction_relay_enabled(
@@ -488,7 +506,14 @@ fn peer_block_download_allowed_for_node(
     peer_id: usize,
     peer_services: u64,
 ) -> bool {
-    let initial_block_download = node.chain.read().is_initial_block_download();
+    // This is a policy observation, not a consensus decision. If the
+    // validation lane owns the chain write lock, assume IBD for this pass so
+    // a peer reader is not parked behind validation; full peers remain
+    // eligible and limited peers are conservatively deferred.
+    let initial_block_download = node
+        .chain
+        .try_read()
+        .map_or(true, |chain| chain.is_initial_block_download());
     if !peer_block_download_allowed(initial_block_download, peer_services) {
         return false;
     }
@@ -591,6 +616,16 @@ fn headers_download_timed_out_with_mocktime(
         })
 }
 
+fn initial_headers_progress_timed_out_with_mocktime(
+    last_request: Option<Instant>,
+    last_request_time: Option<u64>,
+) -> bool {
+    last_request.is_some_and(|sent| sent.elapsed() > INITIAL_HEADERS_PROGRESS_TIMEOUT)
+        || last_request_time.is_some_and(|sent| {
+            unix_time_seconds().saturating_sub(sent) > INITIAL_HEADERS_PROGRESS_TIMEOUT.as_secs()
+        })
+}
+
 /// Apply Core's initial-header timeout policy. The boolean result tells the
 /// caller that a `noban` peer was retained but its sync claim was cleared;
 /// message-driven callers still need to finish replying to the triggering
@@ -609,10 +644,13 @@ fn handle_headers_download_timeout(
         *peer_state.last_headers_request_time.lock() = None;
         return Ok(false);
     }
-    if !headers_download_timed_out_with_mocktime(
-        *peer_state.last_headers_request.lock(),
-        *peer_state.last_headers_request_time.lock(),
-    ) {
+    let last_request = *peer_state.last_headers_request.lock();
+    let last_request_time = *peer_state.last_headers_request_time.lock();
+    let initial_sync_stalled = node.initial_headers_sync_is_active(peer_id)
+        && initial_headers_progress_timed_out_with_mocktime(last_request, last_request_time);
+    if !initial_sync_stalled
+        && !headers_download_timed_out_with_mocktime(last_request, last_request_time)
+    {
         return Ok(false);
     }
     let replacement_available = node.peer_infos().into_iter().any(|peer| {
@@ -741,14 +779,10 @@ struct LowWorkHeadersSync {
 }
 
 impl LowWorkHeadersSync {
-    fn params(network: Network) -> (u32, usize) {
-        match network {
-            Network::Bitcoin => (641, 15_218),
-            Network::Testnet => (673, 14_460),
-            Network::Testnet4 => (606, 16_092),
-            Network::Signet => (620, 15_724),
-            Network::Regtest => (275, 7_017),
-        }
+    fn params(_network: Network) -> (u32, usize) {
+        // These are the simulation-derived constants used by Core v31.1 on
+        // every network.
+        (632, 15_009)
     }
 
     fn new(
@@ -1056,17 +1090,29 @@ fn permitted_difficulty_transition(
 }
 
 fn headers_sync_work_threshold(chain: &crate::chain::ChainState) -> Work {
-    let minimum = chain.minimum_chain_work();
     let tip = chain.tip();
     let tip_header = chain
         .header(tip.height)
         .expect("active tip header is always indexed");
+    anti_dos_work_threshold(tip.work, tip_header.work(), chain.minimum_chain_work())
+}
+
+/// Match Core's `GetAntiDoSWorkThreshold()` for a block/header received from
+/// a peer.  The fixed network minimum protects the early chain; once the
+/// active tip is beyond it, retaining only a 144-block work buffer also
+/// permits legitimate short forks near the tip without admitting arbitrary
+/// low-work history.
+fn anti_dos_work_threshold(active_work: Work, tip_proof: Work, minimum: Work) -> Work {
     let mut recent_work = Work::from_be_bytes([0; 32]);
     for _ in 0..144 {
-        recent_work = add_work_saturating(recent_work, tip_header.work());
+        recent_work = add_work_saturating(recent_work, tip_proof);
     }
-    let recent_work = recent_work.min(tip.work);
-    let near_tip = tip.work - recent_work;
+    let recent_work = recent_work.min(active_work);
+    let near_tip = if active_work >= recent_work {
+        active_work - recent_work
+    } else {
+        Work::from_be_bytes([0; 32])
+    };
     near_tip.max(minimum)
 }
 
@@ -1762,7 +1808,7 @@ impl PeerReader {
 #[derive(Debug)]
 pub(crate) enum PeerCommand {
     Disconnect,
-    RequestHeaders,
+    RequestInitialHeaders,
     ProbeHeaderAvailability,
     RequestBlock(BlockHash),
     Ping(u64),
@@ -1828,10 +1874,9 @@ impl PeerManager {
             info!("txospenderindex thread start");
         }
         info!("Loading P2P addresses");
-        info!(
-            "Loaded {} addresses from peers.json",
-            self.node.known_network_addresses().len()
-        );
+        let address_count = self.node.known_network_addresses().len();
+        info!("Loaded {address_count} addresses from peers.dat");
+        info!("Loaded {address_count} addresses from peers.json");
         let listeners = if self.node.config.listen {
             let binds = if self.node.config.p2p_binds.is_empty() {
                 vec![self.node.config.p2p_bind]
@@ -1908,18 +1953,15 @@ impl PeerManager {
         {
             tokio::spawn(crate::portmap::run(self.node.clone(), address.port()));
         }
-        let max_full_relay = self
-            .node
-            .config
-            .max_peers
-            .min(MAX_OUTBOUND_FULL_RELAY_CONNECTIONS);
+        let max_full_relay = automatic_full_relay_target(self.node.config.max_peers, false);
+        let max_ibd_full_relay = automatic_full_relay_target(self.node.config.max_peers, true);
         let max_block_relay = self
             .node
             .config
             .max_peers
             .saturating_sub(max_full_relay)
             .min(MAX_BLOCK_RELAY_ONLY_CONNECTIONS);
-        let max_automatic_outbound = max_full_relay
+        let max_automatic_outbound = max_ibd_full_relay
             .saturating_add(max_block_relay)
             .saturating_add(MAX_FEELER_CONNECTIONS);
         let slots = Arc::new(Semaphore::new(
@@ -2357,13 +2399,20 @@ impl PeerManager {
                     let block_relay_attempts = discovery_outbound
                         .automatic_block_relay_attempts
                         .load(Ordering::Acquire);
+                    let target_full_relay =
+                        if discovery_node.chain.read().is_initial_block_download() {
+                            max_ibd_full_relay
+                        } else {
+                            max_full_relay
+                        };
                     let extra_full = discovery_node.extra_full_outbound_requested()
                         && max_full_relay == MAX_OUTBOUND_FULL_RELAY_CONNECTIONS
-                        && full_attempts >= max_full_relay;
+                        && target_full_relay == max_full_relay
+                        && full_attempts >= target_full_relay;
                     let extra_block_relay = discovery_node
                         .extra_block_relay_attempt_due(unix_time_seconds())
                         && block_relay_attempts >= max_block_relay;
-                    let full_slots = max_full_relay.saturating_sub(full_attempts);
+                    let full_slots = target_full_relay.saturating_sub(full_attempts);
                     let block_relay_slots = max_block_relay.saturating_sub(block_relay_attempts);
                     let available = discovery_outbound.slots.available_permits().min(8).min(
                         full_slots
@@ -2447,7 +2496,13 @@ impl PeerManager {
                     let block_relay_attempts = feeler_outbound
                         .automatic_block_relay_attempts
                         .load(Ordering::Acquire);
-                    if full_attempts < max_full_relay
+                    let target_full_relay = if feeler_node.chain.read().is_initial_block_download()
+                    {
+                        max_ibd_full_relay
+                    } else {
+                        max_full_relay
+                    };
+                    if full_attempts < target_full_relay
                         || block_relay_attempts < max_block_relay
                         || feeler_node.extra_full_outbound_requested()
                         || feeler_node.extra_block_relay_attempt_due(unix_time_seconds())
@@ -2485,9 +2540,18 @@ impl PeerManager {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        let target_full_relay = if maintenance_node
+                            .chain
+                            .read()
+                            .is_initial_block_download()
+                        {
+                            max_ibd_full_relay
+                        } else {
+                            max_full_relay
+                        };
                         maintenance_node.check_for_stale_tip_and_evict_peers(
                             unix_time_seconds(),
-                            max_full_relay,
+                            target_full_relay,
                             max_block_relay,
                         );
                     }
@@ -4520,6 +4584,18 @@ async fn serve_peer_loop(
         version.receiver_services |= wire::NODE_NETWORK_LIMITED;
         version.sender_services |= wire::NODE_NETWORK_LIMITED;
     }
+    if peer_state.connection_type != "private-broadcast"
+        && node.config.advertises_reduced_data_service()
+    {
+        // Core's compatibility-policy mode advertises the reduced-data
+        // service bit alongside its normal network services. Keep the
+        // advertisement symmetrical across the three VERSION service
+        // fields, as Core does, so inbound peers observe the same capability
+        // in every direction.
+        version.services |= wire::NODE_REDUCED_DATA;
+        version.receiver_services |= wire::NODE_REDUCED_DATA;
+        version.sender_services |= wire::NODE_REDUCED_DATA;
+    }
     if peer_state.connection_type != "private-broadcast" {
         if let Some(address) = advertised_local_address(node, peer_state, peer_id) {
             version.sender_address = socket_address_bytes(address);
@@ -4620,7 +4696,7 @@ async fn serve_peer_loop(
     let mut block_relay_interval = tokio::time::interval(BLOCK_RELAY_INTERVAL);
     block_relay_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     block_relay_interval.tick().await;
-    let mut block_download_interval = tokio::time::interval(Duration::from_millis(100));
+    let mut block_download_interval = tokio::time::interval(BLOCK_DOWNLOAD_REFILL_INTERVAL);
     block_download_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     block_download_interval.tick().await;
     let mut getdata_flush_interval = tokio::time::interval(GETDATA_FLUSH_INTERVAL);
@@ -4697,8 +4773,8 @@ async fn serve_peer_loop(
             command = commands.recv() => {
                 match command {
                     Some(PeerCommand::Disconnect) | None => anyhow::bail!("peer disconnected by node"),
-                    Some(PeerCommand::RequestHeaders) => {
-                        request_headers(node, peer_id, writer, peer_state).await?;
+                    Some(PeerCommand::RequestInitialHeaders) => {
+                        request_initial_headers(node, peer_id, writer, peer_state, true).await?;
                         continue;
                     }
                     Some(PeerCommand::ProbeHeaderAvailability) => {
@@ -4706,7 +4782,7 @@ async fn serve_peer_loop(
                         // up-to-date peer returns a short, non-empty response
                         // that records its best-known block for parallel body
                         // download.
-                        request_initial_headers(node, peer_id, writer, peer_state).await?;
+                        request_initial_headers(node, peer_id, writer, peer_state, false).await?;
                         continue;
                     }
                     Some(PeerCommand::RequestBlock(hash)) => {
@@ -4871,9 +4947,6 @@ async fn serve_peer_loop(
                     peer_version,
                 )
                 .await?;
-                if let Some(staller) = node.take_stalled_block_peer() {
-                    node.disconnect_peer(staller);
-                }
                 let inventory_send_due = transaction_inventory_send_due(
                     node,
                     peer_state,
@@ -4969,6 +5042,13 @@ async fn serve_peer_loop(
                 continue;
             }
             _ = block_download_interval.tick(), if version_received && verack_received => {
+                // Core evaluates block-window stalling on every SendMessages
+                // pass. Checking only on the much slower transaction-relay
+                // timer lets a peer reset its two-second stall immediately
+                // before inspection and repeatedly hold the critical prefix.
+                if let Some(staller) = node.take_stalled_block_peer() {
+                    node.disconnect_peer(staller);
+                }
                 let retry_headers = handle_headers_download_timeout(node, peer_id, peer_state)?;
                 if retry_headers {
                     request_headers(node, peer_id, writer, peer_state).await?;
@@ -5304,7 +5384,7 @@ async fn serve_peer_loop(
                     info!(
                         "initial getheaders ({start_height}) to peer={peer_id} (startheight:{peer_start_height})"
                     );
-                    request_initial_headers(node, peer_id, writer, peer_state).await?;
+                    request_initial_headers(node, peer_id, writer, peer_state, false).await?;
                 }
                 if connection_fetches_addresses(outbound, peer_state.connection_type) {
                     send_message(
@@ -5383,6 +5463,25 @@ async fn serve_peer_loop(
                 *registered = true;
             }
             Message::Ping(nonce) => {
+                // IBD block bodies are validated on a bounded asynchronous
+                // queue so the socket reader can keep draining the peer's
+                // sixteen-block pipeline. Core's ping/pong exchange is also
+                // used by functional clients as a message-ordering barrier:
+                // a pong sent before queued blocks finish would let callers
+                // observe an older active tip even though all preceding
+                // block messages were already written to the socket.
+                if node.chain.read().is_initial_block_download() {
+                    let queue_barrier = node
+                        .peer_block_queue
+                        .clone()
+                        .acquire_many_owned(
+                            u32::try_from(crate::PEER_BLOCK_QUEUE_CAPACITY)
+                                .expect("peer block queue capacity fits u32"),
+                        )
+                        .await
+                        .context("peer block queue barrier closed")?;
+                    drop(queue_barrier);
+                }
                 let retry_headers = handle_headers_download_timeout(node, peer_id, peer_state)?;
                 if peer_version > BIP31_VERSION {
                     send_message(
@@ -5579,17 +5678,8 @@ async fn serve_peer_loop(
             Message::Headers(headers) => {
                 let request_more_headers = headers.len() == 2_000;
                 if headers.is_empty() {
-                    let had_headers_request = peer_state.last_headers_request.lock().is_some();
                     *peer_state.last_headers_request.lock() = None;
                     *peer_state.last_headers_request_time.lock() = None;
-                    // An empty response to our getheaders completes the
-                    // inventory-triggered round.  An unsolicited empty
-                    // headers message, however, is the testable equivalent
-                    // of clearing a stale request before a new announcement
-                    // (Core keeps these two pieces of state separate).
-                    if !had_headers_request {
-                        node.clear_inv_headers_sync_trigger(peer_id);
-                    }
                     headers_sync = None;
                     node.update_peer_presynced_headers(peer_id, None);
                     continue;
@@ -5624,6 +5714,12 @@ async fn serve_peer_loop(
                     .any(|header| !valid_header_pow(node.config.network, header))
                 {
                     debug!("Misbehaving peer={peer_id}: header with invalid proof of work");
+                    // Core records the misbehavior but preserves a whitelisted
+                    // (noban) connection. The bad batch is discarded and the
+                    // peer may continue with later protocol messages.
+                    if peer_state.permissions.contains(PeerPermissions::NO_BAN) {
+                        continue;
+                    }
                     anyhow::bail!("header with invalid proof of work");
                 }
 
@@ -5765,12 +5861,11 @@ async fn serve_peer_loop(
                     node.update_peer_presynced_headers(peer_id, Some(sync.presync_height()));
                 }
                 let header_sync_round_finished = sync_finished || !request_more_headers;
-                if header_sync_round_finished {
-                    // A non-full headers response is the end of this
-                    // initial synchronization round.  Release the global
-                    // claim so a later peer can receive its own getheaders.
-                    node.clear_headers_sync_peer(peer_id);
-                }
+                // A non-full headers response ends this request, but it does
+                // not release Core's per-connection fSyncStarted state. The
+                // global initial-sync slot remains associated with this peer
+                // until it disconnects or stalls; new peers can still be
+                // selected by the INV-triggered path.
 
                 // A later announcement of the tip header may carry a
                 // different body for the same hash (the merkle-tree
@@ -6057,6 +6152,24 @@ async fn serve_peer_loop(
                     )
                     .await?;
                 }
+                // The initial availability probe intentionally starts one
+                // header before the best known header. When our header tip
+                // is already ahead of the active body tip, the response is
+                // non-empty but every header is already indexed, so
+                // `hashes` above is empty. Core still replenishes the
+                // headers-first body window in that case; relying only on
+                // newly accepted headers leaves a restarted node connected
+                // forever with all of its body requests at zero.
+                if header_sync_round_finished && request_block_bodies {
+                    replenish_peer_block_download(
+                        node,
+                        peer_id,
+                        peer_services,
+                        writer,
+                        &mut pending_block_requests,
+                    )
+                    .await?;
+                }
                 if let Some(locator) = request_sync_locator {
                     request_headers_with_locator(node, peer_id, writer, peer_state, locator, true)
                         .await?;
@@ -6266,7 +6379,8 @@ async fn serve_peer_loop(
                     request_headers(node, peer_id, writer, peer_state).await?;
                 }
                 if known_block_missing_body {
-                    let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER
+                    let available = node
+                        .peer_ibd_block_capacity(peer_id)
                         .saturating_sub(node.peer_inflight_block_count(peer_id));
                     if available != 0 {
                         let schedule =
@@ -6660,36 +6774,118 @@ async fn serve_peer_loop(
                 }
             }
             Message::Block(block) => {
-                // Chain connection is serialized. Queue peer bodies on an
-                // async semaphore before any chain-lock access so a burst
-                // from several peers cannot park every Tokio worker behind a
-                // convoy of blocking chain writers.
-                let _peer_block_processing = node
-                    .peer_block_processing
-                    .acquire()
-                    .await
-                    .context("peer block processing gate closed")?;
                 let hash = block.header.block_hash();
-                let parent_hash = block.header.prev_blockhash;
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
-                if node
+                // Core releases the per-peer download-window reservation as
+                // soon as the complete body has been received, before
+                // ProcessNewBlock performs validation and chainstate writes.
+                // Keep the parsed body globally reserved while it is queued
+                // below, but do not make the peer wait for the single
+                // validation lane before requesting the next body.
+                node.clear_peer_block_request(peer_id, hash);
+                let (parent_known, was_stored, initial_block_download) = node
                     .chain
-                    .read()
-                    .block_height_by_hash(&block.header.prev_blockhash)
-                    .is_none()
-                {
+                    .try_read()
+                    .map(|chain| {
+                        (
+                            chain
+                                .block_height_by_hash(&block.header.prev_blockhash)
+                                .is_some(),
+                            chain.store.contains(&hash),
+                            chain.is_initial_block_download(),
+                        )
+                    })
+                    // The queued validation path will perform the definitive
+                    // parent check. Treat an unavailable read snapshot as
+                    // potentially valid so a busy write lane never stalls
+                    // the socket reader.
+                    .unwrap_or((true, false, true));
+                if !parent_known {
                     debug!("AcceptBlock FAILED (prev-blk-not-found)");
                     anyhow::bail!(
                         "block {hash} has an unknown parent {}",
                         block.header.prev_blockhash
                     );
                 }
-                let was_stored = node.chain.read().store.contains(&hash);
                 for transaction in &block.txdata {
                     forget_transaction_requests(peers, transaction);
                 }
                 let disconnect_on_invalid =
                     !peer_state.permissions.contains(PeerPermissions::NO_BAN);
+
+                // Keep the socket reader independent from ordered chainstate
+                // activation during IBD. Core continues receiving a bounded
+                // body queue while its validation/UTXO lane works on the
+                // oldest available block; waiting here makes every peer's
+                // sixteen-block window drain one body at a time instead.
+                if initial_block_download {
+                    match node.peer_block_queue.clone().try_acquire_owned() {
+                        Ok(queue_permit) if node.queue_peer_block_hash(hash) => {
+                            let queued_node = Arc::clone(node);
+                            let queued_peers = Arc::clone(peers);
+                            tokio::spawn(async move {
+                                let _queue_permit = queue_permit;
+                                let result = handle_received_block(
+                                    &queued_node,
+                                    peer_id,
+                                    block,
+                                    requested,
+                                    true,
+                                    disconnect_on_invalid,
+                                )
+                                .await;
+                                match result {
+                                    Ok(true) => {
+                                        // A peer can request a block as soon as
+                                        // its header is known, before the body
+                                        // has finished validation and storage.
+                                        // The synchronous receive path flushes
+                                        // those pending serves immediately;
+                                        // preserve the same behaviour for the
+                                        // asynchronous IBD queue or the
+                                        // requesting peer will look stalled.
+                                        if let Err(error) = flush_pending_block_serves(
+                                            &queued_node,
+                                            &queued_peers,
+                                            hash,
+                                        )
+                                        .await
+                                        {
+                                            warn!(
+                                                peer = peer_id,
+                                                %hash,
+                                                %error,
+                                                "queued peer block serve failed"
+                                            );
+                                            queued_node.disconnect_peer(peer_id);
+                                        }
+                                        queued_node.record_peer_block(peer_id, hash);
+                                    }
+                                    Ok(false) => {}
+                                    Err(error) => {
+                                        warn!(
+                                            peer = peer_id,
+                                            %hash,
+                                            %error,
+                                            "queued peer block processing failed"
+                                        );
+                                        queued_node.disconnect_peer(peer_id);
+                                    }
+                                }
+                                queued_node.finish_queued_peer_block(hash);
+                            });
+                            continue;
+                        }
+                        Ok(queue_permit) => {
+                            // Another peer already handed this body to the
+                            // activation queue. Do not validate it twice.
+                            drop(queue_permit);
+                            node.clear_peer_block_request(peer_id, hash);
+                            continue;
+                        }
+                        Err(_) => {}
+                    }
+                }
                 suppress_block_relay(peer_state, hash);
                 let accepted = handle_received_block(
                     node,
@@ -6725,53 +6921,15 @@ async fn serve_peer_loop(
                 } else {
                     unsuppress_block_relay(peer_state, hash);
                 }
-                // A headers-first download can receive a later body before
-                // an earlier body from the same bounded request window. Keep
-                // the child indexed, then explicitly pull the missing parent
-                // instead of waiting for a new announcement that may never
-                // arrive.
-                if !accepted {
-                    let parent_body_missing = {
-                        let chain = node.chain.read();
-                        chain.block_height_by_hash(&parent_hash).is_some()
-                            && !chain.store.contains(&parent_hash)
-                    };
-                    if parent_body_missing {
-                        // The parent was often part of the same request
-                        // window as this child. The serving peer may have
-                        // answered before it had stored the parent body, so
-                        // drop that stale marker before retrying it.
-                        node.clear_peer_block_request(peer_id, parent_hash);
-                        request_full_block(
-                            node,
-                            peer_id,
-                            writer,
-                            node.config.network,
-                            peer_services,
-                            parent_hash,
-                        )
-                        .await?;
-                    }
-                }
-                // Keep the completed request marked until after chain-event
-                // relays have observed the accepted block. This prevents a
-                // relay task from racing the download loop in the brief gap
-                // between validation and scheduling the next body.
-                node.clear_peer_block_request(peer_id, hash);
-                // Core refills a peer's bounded in-flight window from its
-                // SendMessages path as soon as block processing frees a
-                // slot. Waiting for our 100 ms maintenance tick imposed a
-                // hard ceiling of 16 / 0.1s = 160 blocks/s on a fast peer,
-                // even when validation and storage could sustain far more.
-                replenish_peer_block_download(
-                    node,
-                    peer_id,
-                    peer_services,
-                    writer,
-                    &mut pending_block_requests,
-                )
-                .await?;
-                if getaddr_response_pending && !node.chain.read().is_initial_block_download() {
+                // Refill on the short block-download timer. It batches slots
+                // freed by a burst of responses and lets an exhausted fast
+                // peer identify a slower peer that is holding the download
+                // window, matching Core's staller-detection precondition.
+                let still_in_initial_block_download = node
+                    .chain
+                    .try_read()
+                    .map_or(true, |chain| chain.is_initial_block_download());
+                if getaddr_response_pending && !still_in_initial_block_download {
                     getaddr_response_pending = false;
                     if send_getaddr_response(
                         node,
@@ -6790,11 +6948,6 @@ async fn serve_peer_loop(
                 }
             }
             Message::CompactBlock(compact) => {
-                let _peer_block_processing = node
-                    .peer_block_processing
-                    .acquire()
-                    .await
-                    .context("peer compact-block processing gate closed")?;
                 let hash = compact.header.block_hash();
                 let requested = node.peer_has_inflight_block_request(peer_id, hash);
                 let (already_in_flight, block_requested_from_outbound) =
@@ -6846,6 +6999,9 @@ async fn serve_peer_loop(
                     .write()
                     .accept_headers(std::slice::from_ref(&compact.header))
                 {
+                    if is_node_expired_error(&error) {
+                        debug!(%hash, "node-expired");
+                    }
                     // A header whose parent is already known to be invalid
                     // is a peer protocol violation.  Re-announcing the
                     // cached-invalid block itself is harmless and is handled
@@ -7080,11 +7236,6 @@ async fn serve_peer_loop(
                 .await?;
             }
             Message::BlockTxn(response) => {
-                let _peer_block_processing = node
-                    .peer_block_processing
-                    .acquire()
-                    .await
-                    .context("peer blocktxn processing gate closed")?;
                 let Some(mut pending) = pending_compact.take() else {
                     if compact_reconstruction_failed == Some(response.block_hash) {
                         debug!("previous compact block reconstruction attempt failed");
@@ -7956,15 +8107,22 @@ async fn handle_received_block(
                 false,
             );
         }
-        let header_work = {
+        let (header_work, minimum_chain_work) = {
             let chain = node.chain.read();
-            chain
-                .chain_work_by_hash(&block.header.prev_blockhash)
-                .map(|work| work + block.header.work())
+            (
+                chain
+                    .chain_work_by_hash(&block.header.prev_blockhash)
+                    .map(|work| work + block.header.work()),
+                headers_sync_work_threshold(&chain),
+            )
         };
-        if header_work.is_none_or(|work| work < node.chain.read().minimum_chain_work()) {
+        if header_work.is_none_or(|work| work < minimum_chain_work) {
             debug!(
-                "AcceptBlockHeader: not adding new block header {hash}, missing anti-dos proof-of-work validation"
+                %hash,
+                peer = peer_id,
+                header_work = ?header_work,
+                minimum_chain_work = ?minimum_chain_work,
+                "AcceptBlockHeader: not adding new block header, missing anti-dos proof-of-work validation"
             );
             return Ok(false);
         }
@@ -8010,16 +8168,25 @@ async fn handle_received_block(
             return Ok(false);
         }
     }
-    // Full block connection performs synchronous consensus, database, and
-    // compression work while holding the serialized chain writer. Running it
-    // directly on a Tokio worker lets several peer handlers occupy every
-    // runtime thread while they wait for that lock, starving RPC accepts and
-    // unrelated network I/O during IBD. The blocking pool preserves the same
-    // chain ordering without consuming async scheduler workers.
+    // Serialize and compress bodies in parallel before entering the single
+    // chain-mutation lane. Keeping the permit out of preparation lets all CPU
+    // cores contribute without allowing competing chain writers to form a
+    // lock convoy or deadlock with short peer/RPC chain readers.
+    let (block, prepared) = tokio::task::spawn_blocking(move || {
+        let prepared = crate::storage::BlockStore::prepare_record(&block)?;
+        Ok::<_, anyhow::Error>((block, prepared))
+    })
+    .await
+    .context("peer block preparation task failed")??;
+    let _peer_block_processing = node
+        .peer_block_processing
+        .acquire()
+        .await
+        .context("peer block processing gate closed")?;
     let validation_node = Arc::clone(node);
     let result = tokio::task::spawn_blocking(move || {
         if disconnect_on_invalid {
-            validation_node.connect_block_from_peer(block)
+            validation_node.connect_prepared_block_from_peer(block, prepared)
         } else {
             validation_node.connect_block(block)
         }
@@ -8043,6 +8210,7 @@ async fn handle_received_block(
                 // height to a block hash.
                 info!(
                     %hash,
+                    peer = peer_id,
                     height = block_height.unwrap_or(tip.height),
                     active_tip_height = tip.height,
                     "accepted peer block"
@@ -8050,9 +8218,9 @@ async fn handle_received_block(
             } else {
                 debug!(
                     %hash,
-                    height = ?block_height,
+                    body_height = ?block_height,
                     active_tip_height = tip.height,
-                    "stored peer side-chain block"
+                    "stored peer non-active block body"
                 );
             }
             node.clear_peer_block_requests_for_hash(hash);
@@ -8072,6 +8240,9 @@ fn handle_peer_block_validation_error(
     disconnect_on_invalid: bool,
     header_was_accepted: bool,
 ) -> Result<bool> {
+    if is_node_expired_error(&error) {
+        debug!(%hash, "node-expired");
+    }
     if let Some(validation_error) = error.downcast_ref::<ValidationError>() {
         let reject_reason = block_validation_log_reason(validation_error);
         debug!("Block validation error: {reject_reason}");
@@ -8148,12 +8319,20 @@ fn handle_peer_block_validation_error(
     Ok(false)
 }
 
+fn is_node_expired_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ValidationError>()
+            .is_some_and(|error| matches!(error, ValidationError::NodeExpired))
+    })
+}
+
 fn block_validation_log_reason(error: &ValidationError) -> String {
     let reason = error.bip22_reject_reason();
     reason
-        .strip_prefix("mandatory-script-verify-flag-failed")
+        .strip_prefix("block-script-verify-flag-failed")
         .map_or(reason.clone(), |suffix| {
-            format!("block-script-verify-flag-failed{suffix}")
+            format!("mandatory-script-verify-flag-failed{suffix}")
         })
 }
 
@@ -8291,7 +8470,8 @@ async fn flush_pending_block_requests(
 ) -> Result<()> {
     node.clear_peer_block_requests_for_stored_blocks(peer_id);
     let inflight = node.peer_inflight_block_count(peer_id);
-    let available = MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(inflight);
+    let capacity = node.peer_ibd_block_capacity(peer_id);
+    let available = capacity.saturating_sub(inflight);
     if available == 0 || pending.is_empty() {
         return Ok(());
     }
@@ -8300,16 +8480,14 @@ async fn flush_pending_block_requests(
     let mut requests = Vec::with_capacity(available);
     let mut remaining = Vec::new();
     for request in queued {
-        if node.peer_inflight_block_count(peer_id) >= MAX_BLOCKS_IN_TRANSIT_PER_PEER
-            || requests.len() >= available
-        {
+        if node.peer_inflight_block_count(peer_id) >= capacity || requests.len() >= available {
             remaining.push(request);
             continue;
         }
         if node.block_request_in_flight(request.hash) {
             continue;
         }
-        if node.track_peer_block_request(peer_id, request.hash) {
+        if node.track_ibd_peer_block_request(peer_id, request.hash) {
             requests.push(request);
         }
     }
@@ -8328,8 +8506,16 @@ async fn replenish_peer_block_download(
         return Ok(());
     }
 
-    let available =
-        MAX_BLOCKS_IN_TRANSIT_PER_PEER.saturating_sub(node.peer_inflight_block_count(peer_id));
+    // A parent arriving can recursively connect descendants that were
+    // received earlier.  Those descendants may still be recorded as
+    // in-flight on a different peer, so reclaim stored bodies before testing
+    // whether this peer's window is full.  Checking the count first would
+    // make a peer with sixteen stale reservations return forever and stop
+    // participating in IBD.
+    node.clear_peer_block_requests_for_stored_blocks(peer_id);
+    let available = node
+        .peer_ibd_block_capacity(peer_id)
+        .saturating_sub(node.peer_inflight_block_count(peer_id));
     let peer_has_block_availability = node
         .peer_infos()
         .into_iter()
@@ -8344,7 +8530,18 @@ async fn replenish_peer_block_download(
         return Ok(());
     }
 
+    let schedule_started = Instant::now();
     let schedule = node.next_block_download_schedule(peer_id, available, peer_services);
+    let schedule_elapsed = schedule_started.elapsed();
+    if schedule_elapsed >= Duration::from_millis(50) {
+        info!(
+            peer_id,
+            available,
+            requests = schedule.requests.len(),
+            elapsed_ms = schedule_elapsed.as_millis(),
+            "Slow IBD block scheduler pass"
+        );
+    }
     let staller = schedule.staller;
     queue_block_requests(pending, schedule.requests);
     flush_pending_block_requests(node, peer_id, writer, node.config.network, pending).await?;
@@ -8998,6 +9195,7 @@ async fn request_initial_headers(
     peer_id: usize,
     writer: &PeerWriter,
     peer_state: &PeerState,
+    force: bool,
 ) -> Result<()> {
     // Core starts the initial request one header before the best known header.
     // That makes an already-known tip produce a short, non-empty response,
@@ -9015,7 +9213,7 @@ async fn request_initial_headers(
             .unwrap_or(best_header.hash);
         chain.block_locator_hashes_from(start_hash)
     };
-    request_headers_with_locator(node, peer_id, writer, peer_state, locator, false).await
+    request_headers_with_locator(node, peer_id, writer, peer_state, locator, force).await
 }
 
 async fn request_headers_from_start_hash(
@@ -10625,6 +10823,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -10686,6 +10885,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             peer_bloom_filters: false,
             blocksonly: false,
@@ -11165,6 +11365,17 @@ mod tests {
     }
 
     #[test]
+    fn ibd_uses_cores_full_relay_peer_count_without_consuming_block_relay_slots() {
+        assert_eq!(automatic_full_relay_target(64, false), 8);
+        assert_eq!(automatic_full_relay_target(64, true), 8);
+        assert_eq!(automatic_full_relay_target(10, true), 8);
+        assert_eq!(automatic_full_relay_target(17, true), 8);
+        assert_eq!(automatic_full_relay_target(32, true), 8);
+        assert_eq!(automatic_full_relay_target(33, true), 8);
+        assert_eq!(automatic_full_relay_target(1, true), 1);
+    }
+
+    #[test]
     fn peer_service_requirements_match_core_limited_peer_window() {
         let full = wire::NODE_NETWORK | wire::NODE_WITNESS;
         let limited = wire::NODE_NETWORK_LIMITED | wire::NODE_WITNESS;
@@ -11568,6 +11779,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -11658,6 +11870,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -11794,6 +12007,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -11884,6 +12098,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -12053,6 +12268,15 @@ mod tests {
         assert!(headers_download_timed_out(Some(
             now.checked_sub(HEADERS_DOWNLOAD_TIMEOUT).unwrap()
         )));
+
+        assert!(!initial_headers_progress_timed_out_with_mocktime(
+            Some(now),
+            None
+        ));
+        assert!(initial_headers_progress_timed_out_with_mocktime(
+            Some(now.checked_sub(INITIAL_HEADERS_PROGRESS_TIMEOUT).unwrap()),
+            None
+        ));
     }
 
     #[test]
@@ -12273,10 +12497,10 @@ mod tests {
 
     #[test]
     fn low_work_headers_transition_to_redownload_and_release_verified_headers() {
-        let (chain_start, headers) = mined_regtest_headers(300);
+        let (chain_start, headers) = mined_regtest_headers(700);
         let per_header = headers[0].work();
         let mut minimum_work = chain_start.work();
-        for _ in 0..250 {
+        for _ in 0..650 {
             minimum_work = minimum_work + per_header;
         }
         let mut sync = LowWorkHeadersSync::new(
@@ -12295,7 +12519,7 @@ mod tests {
         assert!(presync.success);
         assert!(presync.request_more);
         assert!(!presync.finished);
-        assert_eq!(sync.presync_height(), 300);
+        assert_eq!(sync.presync_height(), 700);
         assert_eq!(sync.phase(), LowWorkHeadersPhase::Redownload);
         assert_eq!(sync.commitment_count(), 2);
 
@@ -12304,15 +12528,15 @@ mod tests {
         assert!(redownload.finished);
         assert!(!redownload.request_more);
         assert_eq!(redownload.ready, headers);
-        assert_eq!(sync.presync_height(), 300);
+        assert_eq!(sync.presync_height(), 700);
     }
 
     #[test]
     fn low_work_headers_abort_on_a_redownload_commitment_mismatch() {
-        let (chain_start, headers) = mined_regtest_headers(300);
+        let (chain_start, headers) = mined_regtest_headers(700);
         let per_header = headers[0].work();
         let mut minimum_work = chain_start.work();
-        for _ in 0..250 {
+        for _ in 0..650 {
             minimum_work = minimum_work + per_header;
         }
         let mut sync = LowWorkHeadersSync::new(
@@ -12612,6 +12836,35 @@ mod tests {
     }
 
     #[test]
+    fn anti_dos_work_threshold_keeps_core_144_block_buffer() {
+        let zero = Work::from_be_bytes([0; 32]);
+        let mut one_bytes = [0; 32];
+        one_bytes[31] = 1;
+        let one = Work::from_be_bytes(one_bytes);
+        let mut two_bytes = [0; 32];
+        two_bytes[31] = 2;
+        let two = Work::from_be_bytes(two_bytes);
+        let mut eighty_bytes = [0; 32];
+        eighty_bytes[31] = 80;
+        let eighty = Work::from_be_bytes(eighty_bytes);
+        let mut two_hundred_bytes = [0; 32];
+        two_hundred_bytes[31] = 200;
+        let two_hundred = Work::from_be_bytes(two_hundred_bytes);
+
+        // 200 - 144 one-block proofs leaves 56 work near the tip.
+        let mut fifty_six_bytes = [0; 32];
+        fifty_six_bytes[31] = 56;
+        assert_eq!(
+            anti_dos_work_threshold(two_hundred, one, zero),
+            Work::from_be_bytes(fifty_six_bytes)
+        );
+        // The buffer cannot underflow while the chain is shorter than it.
+        assert_eq!(anti_dos_work_threshold(two_hundred, two, zero), zero);
+        // The configured network minimum remains a floor.
+        assert_eq!(anti_dos_work_threshold(two_hundred, one, eighty), eighty);
+    }
+
+    #[test]
     fn unrequested_block_work_gate_matches_core_antidos_policy() {
         let zero = Work::from_be_bytes([0; 32]);
         let mut one_bytes = [0; 32];
@@ -12827,6 +13080,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -12917,6 +13171,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -13069,6 +13324,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -13159,6 +13415,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -13291,6 +13548,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -13381,6 +13639,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -13597,6 +13856,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -13687,6 +13947,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -13782,6 +14043,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -13872,6 +14134,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -13952,6 +14215,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -14042,6 +14306,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -14254,6 +14519,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -14344,6 +14610,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq: crate::config::ZmqConfig::default(),
         })
@@ -14557,6 +14824,7 @@ mod tests {
             rpc_work_queue: 64,
             script_check_threads: 0,
             block_reconstruction_extra_txn: 100,
+            block_reconstruction_extra_txn_size_bytes: 10_000_000,
             user_agent_comments: Vec::new(),
             startup_notify: None,
             block_notify: None,
@@ -14647,6 +14915,7 @@ mod tests {
             dust_relay_fee_sat_per_kvb: 3_000,
             max_datacarrier_bytes: Some(100_000),
             bytes_per_sigop: 20,
+            max_script_size: crate::config::DEFAULT_MAX_SCRIPT_SIZE_POLICY as usize,
             permit_bare_multisig: true,
             zmq,
         })

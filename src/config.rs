@@ -15,7 +15,10 @@ use crate::IpSubnet;
 use crate::address::NetworkEndpoint;
 use crate::asmap::EMBEDDED_ASMAP_PATH;
 use crate::i2p::I2P_SAM_PORT;
-use crate::mempool::{RbfPolicy, TrucPolicy};
+use crate::mempool::{
+    DEFAULT_ANCESTOR_COUNT_LIMIT, DEFAULT_ANCESTOR_SIZE_LIMIT_VBYTES,
+    DEFAULT_DESCENDANT_COUNT_LIMIT, DEFAULT_DESCENDANT_SIZE_LIMIT_VBYTES, RbfPolicy, TrucPolicy,
+};
 use crate::tor::DEFAULT_TOR_CONTROL_PORT;
 use crate::validation::{self, DeploymentParameters};
 
@@ -35,6 +38,9 @@ pub const DEFAULT_INCREMENTAL_RELAY_FEE_SAT_PER_KVB: u64 = 100;
 pub const DEFAULT_DUST_RELAY_FEE_SAT_PER_KVB: u64 = 3_000;
 pub const DEFAULT_BYTES_PER_SIGOP: u64 = 20;
 pub const DEFAULT_MAX_TX_LEGACY_SIGOPS: u64 = 2_500;
+/// Core's default maximum serialized script/witness size accepted by relay
+/// policy. `-corepolicy` raises this soft default to the uint32 maximum.
+pub const DEFAULT_MAX_SCRIPT_SIZE_POLICY: u64 = 1_650;
 // Core v31.1 relays a standard OP_RETURN output up to the standard
 // transaction weight limit (400,000 WU / 4 = 100,000 vbytes). The full
 // script size, rather than only the pushed payload, is charged against this
@@ -55,11 +61,22 @@ pub const DEFAULT_SCRIPT_CHECK_THREADS: i32 = 0;
 pub const DEFAULT_MAX_SIG_CACHE_MIB: i64 = 32;
 pub const DEFAULT_DB_CACHE_MIB: i64 = 450;
 pub const HIGH_DEFAULT_DB_CACHE_MIB: i64 = 1_024;
+// Core v31.1's debug-only default is based on the 2025 copyright year in the
+// release source. Zero remains the escape hatch used by the functional-test
+// harness and by developers running an unexpiring build.
+pub const DEFAULT_SOFTWARE_EXPIRY: i64 = (2025 - 1970) * 31_558_060 + 2 * 31_558_060 + 26_784_000;
+pub const SOFTWARE_EXPIRY_WARN_PERIOD_SECS: i64 = 4 * 604_800;
 const HIGH_DEFAULT_DB_CACHE_MIN_RAM_BYTES: u64 = 4 * 1_024 * 1_024 * 1_024;
-pub const DEFAULT_DB_BATCH_SIZE_BYTES: i64 = 32 * 1024 * 1024;
+// Core's hidden nDefaultDbBatchSize is 64 MiB. Keep the default aligned so
+// chainstate checkpoints do not split into twice as many Fjall commits.
+pub const DEFAULT_DB_BATCH_SIZE_BYTES: i64 = 64 * 1024 * 1024;
 pub const MAX_SCRIPT_CHECK_THREADS: usize = 15;
 pub const MAX_SUBVERSION_LENGTH: usize = 256;
 pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN: usize = 100;
+/// Default upper bound for Core's compact-block reconstruction extra pool.
+/// Core exposes this as a decimal megabyte value; store the effective limit
+/// in bytes so eviction does not need floating-point arithmetic.
+pub const DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN_SIZE_BYTES: usize = 10_000_000;
 pub const DEFAULT_I2P_ACCEPT_INCOMING: bool = true;
 pub const DEFAULT_MAX_RECEIVE_BUFFER_KB: u64 = 5_000;
 pub const DEFAULT_MAX_SEND_BUFFER_KB: u64 = 1_000;
@@ -869,8 +886,19 @@ impl PeerPermissionConfig {
         whitelist_relay: Option<bool>,
         whitelist_force_relay: bool,
         blocksonly: bool,
+        peer_bloom_filters: Option<bool>,
     ) -> Result<Self> {
-        let whitelist = whitelist
+        let mut whitelist_values = whitelist.to_vec();
+        // Core keeps bloom-filter serving disabled globally by default, but
+        // grants localhost the implicit bloomfilter permission unless the
+        // option was explicitly set to false.
+        if peer_bloom_filters.is_none() {
+            whitelist_values.extend([
+                "in,out,bloomfilter@127.0.0.0/8".to_owned(),
+                "in,out,bloomfilter@::1/128".to_owned(),
+            ]);
+        }
+        let whitelist = whitelist_values
             .iter()
             .map(|value| WhitelistRule::parse(value))
             .collect::<Result<Vec<_>>>()?;
@@ -1366,9 +1394,7 @@ pub struct Args {
     )]
     pub checkpoints: Option<bool>,
 
-    /// Deprecated Core wallet/mempool compatibility limits. Cluster limits
-    /// supersede these values in Core v31.1, and this wallet-free build does
-    /// not apply them.
+    /// Hidden Core-compatible legacy mempool ancestor/descendant limits.
     #[arg(long = "limitancestorcount", hide = true)]
     pub limit_ancestor_count: Option<i64>,
 
@@ -1383,9 +1409,14 @@ pub struct Args {
 
     #[arg(
         long = "blockreconstructionextratxn",
-        default_value_t = DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN
+        default_value_t = DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN as i64
     )]
-    pub block_reconstruction_extra_txn: usize,
+    pub block_reconstruction_extra_txn: i64,
+
+    /// Upper bound for the compact-block reconstruction extra pool in decimal
+    /// megabytes. Omission under --corepolicy means effectively unlimited.
+    #[arg(long = "blockreconstructionextratxnsize", value_name = "MB")]
+    pub block_reconstruction_extra_txn_size_mb: Option<f64>,
 
     #[arg(long = "uacomment", value_name = "COMMENT")]
     pub user_agent_comments: Vec<String>,
@@ -1410,6 +1441,27 @@ pub struct Args {
 
     #[arg(long = "mocktime", value_name = "N")]
     pub mock_time: Option<i64>,
+
+    /// Core's debug-only software expiration timestamp. Zero disables it.
+    #[arg(
+        long = "softwareexpiry",
+        value_name = "N",
+        default_value_t = DEFAULT_SOFTWARE_EXPIRY,
+        hide = true
+    )]
+    pub software_expiry: i64,
+
+    /// Accepted Core test-harness compatibility switch with no wallet effect
+    /// in this wallet-free implementation.
+    #[arg(
+        long = "walletimplicitsegwit",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub wallet_implicit_segwit: bool,
 
     #[arg(long)]
     pub p2p: Option<SocketAddr>,
@@ -1468,6 +1520,18 @@ pub struct Args {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     pub natpmp: bool,
+
+    /// Deprecated Core compatibility option. UPnP support is not used;
+    /// accepting the spelling keeps existing Core configuration files valid.
+    #[arg(
+        long = "upnp",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        hide = true
+    )]
+    pub upnp: bool,
 
     #[arg(
         long,
@@ -1867,6 +1931,9 @@ pub struct Args {
 
     #[arg(long = "maxtxlegacysigops")]
     pub max_tx_legacy_sigops: Option<u64>,
+
+    #[arg(long = "maxscriptsize")]
+    pub max_script_size: Option<u64>,
 
     #[arg(
         long,
@@ -3174,6 +3241,7 @@ pub struct Config {
     pub rpc_doc_check: bool,
     pub accept_stale_fee_estimates: bool,
     pub block_reconstruction_extra_txn: usize,
+    pub block_reconstruction_extra_txn_size_bytes: usize,
     pub user_agent_comments: Vec<String>,
     pub startup_notify: Option<String>,
     pub block_notify: Option<String>,
@@ -3182,6 +3250,8 @@ pub struct Config {
     pub stop_at_height: u32,
     pub(crate) max_tip_age_secs: u64,
     pub mock_time: Option<i64>,
+    #[cfg(not(test))]
+    pub software_expiry: i64,
     pub p2p_bind: SocketAddr,
     pub p2p_binds: Vec<SocketAddr>,
     pub listen: bool,
@@ -3247,6 +3317,7 @@ pub struct Config {
     pub incremental_relay_fee_sat_per_kvb: u64,
     pub dust_relay_fee_sat_per_kvb: u64,
     pub bytes_per_sigop: u64,
+    pub max_script_size: usize,
     #[cfg(not(test))]
     pub max_tx_legacy_sigops: usize,
     pub max_datacarrier_bytes: Option<usize>,
@@ -3381,7 +3452,37 @@ fn parse_truc_policy(value: Option<&str>) -> Result<TrucPolicy> {
     })
 }
 
+fn parse_block_reconstruction_extra_txn_size(
+    size_mb: Option<f64>,
+    core_policy: bool,
+) -> Result<usize> {
+    let Some(size_mb) = size_mb else {
+        return Ok(if core_policy {
+            usize::MAX
+        } else {
+            DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN_SIZE_BYTES
+        });
+    };
+    if !size_mb.is_finite() || size_mb < 0.0 {
+        bail!("blockreconstructionextratxnsize must be a non-negative finite number");
+    }
+    let bytes = size_mb * 1_000_000.0;
+    if bytes >= usize::MAX as f64 {
+        Ok(usize::MAX)
+    } else {
+        Ok(bytes.floor() as usize)
+    }
+}
+
 impl Config {
+    /// Return whether the effective settings came from Core compatibility
+    /// policy defaults.  That mode raises the block reconstruction byte limit
+    /// to `usize::MAX`; retaining this derived check avoids duplicating a
+    /// policy-only flag in every in-process test configuration literal.
+    pub(crate) fn advertises_reduced_data_service(&self) -> bool {
+        self.block_reconstruction_extra_txn_size_bytes == usize::MAX
+    }
+
     pub(crate) fn electrum_monitoring_bind(&self) -> Option<SocketAddr> {
         #[cfg(not(test))]
         {
@@ -3426,6 +3527,7 @@ impl Config {
             args.permitbaremultisig.get_or_insert(true);
             args.datacarrier_fullcount.get_or_insert(false);
             args.max_tx_legacy_sigops.get_or_insert(u64::from(u32::MAX));
+            args.max_script_size.get_or_insert(u64::from(u32::MAX));
             args.mempool_truc
                 .get_or_insert_with(|| "enforce".to_owned());
         }
@@ -3437,6 +3539,10 @@ impl Config {
             bail!("Prune cannot be configured with a negative value.");
         }
         let prune = u64::try_from(args.prune).context("prune value is out of range")?;
+        let block_reconstruction_extra_txn_size_bytes = parse_block_reconstruction_extra_txn_size(
+            args.block_reconstruction_extra_txn_size_mb,
+            args.core_policy,
+        )?;
         let logging = parse_logging_config(&args)?;
         let network = network_from_args(&args)?;
         let proxy = parse_proxy_settings(&args.proxy)?;
@@ -3447,7 +3553,8 @@ impl Config {
         #[cfg(not(test))]
         let electrum_monitoring_bind = args
             .monitoring_addr
-            .unwrap_or_else(|| default_electrum_monitoring_addr(network));
+            .or_else(|| (args.electrum != "0").then(|| default_electrum_monitoring_addr(network)))
+            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
         if args.datadir_explicit && !args.datadir.is_dir() {
             bail!(
                 "Specified data directory \"{}\" does not exist.",
@@ -3837,6 +3944,7 @@ impl Config {
             args.whitelistrelay,
             args.whitelistforcerelay,
             args.blocksonly,
+            args.peer_bloom_filters,
         )?;
         let mut seen_bindings = HashSet::new();
         for address in p2p_binds
@@ -3937,21 +4045,47 @@ impl Config {
             .limit_cluster_size_kvb
             .checked_mul(1_000)
             .context("--limitclustersize is too large")?;
-        // Core v31.1 deprecated these four node-level limits in favor of
-        // connected-cluster limits. Keep accepting the options for command
-        // line/config compatibility, but do not apply them to admission;
-        // wallet-free operation has no wallet coin-selection consumer for
-        // the legacy values.
-        let _ = (
+        // Core retains these hidden legacy limits alongside connected-cluster
+        // policy. The size arguments are expressed in decimal kilobytes.
+        let parse_count_limit = |value: Option<i64>, default: usize, name: &str| -> Result<usize> {
+            value
+                .map(|value| {
+                    usize::try_from(value.max(0)).with_context(|| format!("{name} is too large"))
+                })
+                .transpose()
+                .map(|value| value.unwrap_or(default))
+        };
+        let parse_size_limit = |value: Option<i64>, default: u64, name: &str| -> Result<u64> {
+            value
+                .map(|value| {
+                    u64::try_from(value.max(0))
+                        .ok()
+                        .and_then(|value| value.checked_mul(1_000))
+                        .with_context(|| format!("{name} is too large"))
+                })
+                .transpose()
+                .map(|value| value.unwrap_or(default))
+        };
+        let ancestor_count_limit = parse_count_limit(
             args.limit_ancestor_count,
+            DEFAULT_ANCESTOR_COUNT_LIMIT,
+            "--limitancestorcount",
+        )?;
+        let ancestor_size_vbytes = parse_size_limit(
             args.limit_ancestor_size,
+            DEFAULT_ANCESTOR_SIZE_LIMIT_VBYTES,
+            "--limitancestorsize",
+        )?;
+        let descendant_count_limit = parse_count_limit(
             args.limit_descendant_count,
+            DEFAULT_DESCENDANT_COUNT_LIMIT,
+            "--limitdescendantcount",
+        )?;
+        let descendant_size_vbytes = parse_size_limit(
             args.limit_descendant_size,
-        );
-        let ancestor_count_limit = usize::MAX;
-        let ancestor_size_vbytes = u64::MAX;
-        let descendant_count_limit = usize::MAX;
-        let descendant_size_vbytes = u64::MAX;
+            DEFAULT_DESCENDANT_SIZE_LIMIT_VBYTES,
+            "--limitdescendantsize",
+        )?;
         let max_upload_target =
             parse_byte_units(&args.max_upload_target, 1 << 20).with_context(|| {
                 format!(
@@ -4119,7 +4253,12 @@ impl Config {
             print_priority: args.print_priority,
             rpc_doc_check: args.rpc_doc_check,
             accept_stale_fee_estimates: args.accept_stale_fee_estimates,
-            block_reconstruction_extra_txn: args.block_reconstruction_extra_txn,
+            block_reconstruction_extra_txn: if args.block_reconstruction_extra_txn < 0 {
+                0
+            } else {
+                usize::try_from(args.block_reconstruction_extra_txn).unwrap_or(usize::MAX)
+            },
+            block_reconstruction_extra_txn_size_bytes,
             user_agent_comments,
             startup_notify: args.startup_notify,
             block_notify: args.block_notify,
@@ -4128,6 +4267,8 @@ impl Config {
             stop_at_height: args.stop_at_height,
             max_tip_age_secs: args.max_tip_age,
             mock_time: args.mock_time,
+            #[cfg(not(test))]
+            software_expiry: args.software_expiry,
             p2p_bind: primary_p2p_bind,
             p2p_binds,
             listen,
@@ -4199,6 +4340,11 @@ impl Config {
             incremental_relay_fee_sat_per_kvb,
             dust_relay_fee_sat_per_kvb,
             bytes_per_sigop: args.bytes_per_sigop.unwrap_or(DEFAULT_BYTES_PER_SIGOP),
+            max_script_size: usize::try_from(
+                args.max_script_size
+                    .unwrap_or(DEFAULT_MAX_SCRIPT_SIZE_POLICY),
+            )
+            .context("--maxscriptsize does not fit usize")?,
             #[cfg(not(test))]
             max_tx_legacy_sigops: usize::try_from(
                 args.max_tx_legacy_sigops
@@ -5028,6 +5174,7 @@ mod tests {
         .unwrap();
         let config = Config::from_args(args).unwrap();
         assert!(!config.logging.debug_all);
+        assert!(config.debug_log_file_enabled);
         assert_eq!(config.logging.debug_categories, ["net"]);
         assert_eq!(config.logging.level, LogLevel::Trace);
         assert_eq!(
@@ -5074,6 +5221,15 @@ mod tests {
         ])
         .unwrap();
         assert!(Config::from_args(args).is_err());
+
+        let args = Args::try_parse_from([
+            "bitcoind-rs",
+            "--datadir",
+            directory.path().to_str().unwrap(),
+            "--nodebuglogfile",
+        ])
+        .unwrap();
+        assert!(!Config::from_args(args).unwrap().debug_log_file_enabled);
     }
 
     #[test]
@@ -5232,6 +5388,7 @@ mod tests {
             "--onlynet=ipv4",
             "--proxy=127.0.0.1:9050",
             "--blockreconstructionextratxn=7",
+            "--blockreconstructionextratxnsize=0.1",
             "--maxsigcachesize=1",
             "--dbcache=4",
             "--dbbatchsize=4096",
@@ -5257,6 +5414,7 @@ mod tests {
         assert_eq!(config.onlynet, vec![OnlyNet::Ipv4]);
         assert_eq!(config.proxy, Some("127.0.0.1:9050".parse().unwrap()));
         assert_eq!(config.block_reconstruction_extra_txn, 7);
+        assert_eq!(config.block_reconstruction_extra_txn_size_bytes, 100_000);
         assert_eq!(config.max_sig_cache_mib, 1);
         assert_eq!(config.db_cache_mib, 4);
         assert_eq!(config.db_batch_size_bytes, 4096);

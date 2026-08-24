@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::fmt;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc,
 };
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(not(unix))]
@@ -61,7 +63,9 @@ fn main() {
     };
     if let Err(error) = result {
         if let Some(core_error) = nested_core_startup_error(&error) {
-            // Core prints the non-interactive recovery message verbatim.
+            // Core prints translated chainstate recovery messages directly;
+            // callers (including the functional test harness) compare this
+            // diagnostic without an additional prefix.
             eprintln!("{core_error}");
         } else {
             eprintln!("Error: {error}");
@@ -154,23 +158,25 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
         .debug_log_file_enabled
         .then_some(&config.debug_log_path)
     {
-        let log_file = ReloadableLogFile::open(path, config.shrink_debug_file)
+        let log_file = AsyncLogFile::open(path, config.shrink_debug_file)
             .with_context(|| format!("Could not open debug log file {}", path.display()))?;
-        let log_file_for_signal = log_file.clone();
+        let log_file_handle = log_file.handle();
         if config.print_to_console {
             let writer = if config.logging.log_rate_limit {
-                BoxMakeWriter::new(std::io::stdout.and(RateLimitedLogFile::new(log_file.clone())))
+                BoxMakeWriter::new(
+                    std::io::stdout.and(RateLimitedLogFile::new(log_file_handle.clone())),
+                )
             } else {
-                BoxMakeWriter::new(std::io::stdout.and(log_file.clone()))
+                BoxMakeWriter::new(std::io::stdout.and(log_file_handle.clone()))
             };
-            (writer, Some(log_file_for_signal))
+            (writer, Some(log_file))
         } else {
             let writer = if config.logging.log_rate_limit {
-                BoxMakeWriter::new(RateLimitedLogFile::new(log_file.clone()))
+                BoxMakeWriter::new(RateLimitedLogFile::new(log_file_handle.clone()))
             } else {
-                BoxMakeWriter::new(log_file.clone())
+                BoxMakeWriter::new(log_file_handle.clone())
             };
-            (writer, Some(log_file_for_signal))
+            (writer, Some(log_file))
         }
     } else if config.print_to_console {
         (BoxMakeWriter::new(std::io::stdout), None)
@@ -197,6 +203,7 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     }
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let startup_signal_task = install_startup_signal_listener(shutdown_requested.clone())?;
+    tracing::info!("version 31.1.0 (bitcoind-rs)");
     tracing::info!("Loading block index");
     let node = match Node::open_with_shutdown(config, shutdown_requested.clone()) {
         Ok(node) => node,
@@ -267,7 +274,9 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
     log_parameter_interactions(&node.config.config_file_args);
     log_ignored_config(&node.config.datadir);
     #[cfg(unix)]
-    let log_reopen_task = log_file.map(|log_file| tokio::spawn(reopen_log_on_sighup(log_file)));
+    let log_reopen_task = log_file
+        .as_ref()
+        .map(|log_file| tokio::spawn(reopen_log_on_sighup(log_file.handle())));
     let (startup_sender, startup_receiver) = tokio::sync::oneshot::channel();
     let mut node_run = Box::pin(node.run_with_startup(Some(startup_sender)));
     let result = tokio::select! {
@@ -285,6 +294,9 @@ async fn run_node(config: Config, mut readiness: DaemonReadyGuard) -> Result<()>
         task.abort();
     }
     startup_signal_task.abort();
+    if let Some(log_file) = log_file {
+        log_file.shutdown();
+    }
     result
 }
 
@@ -532,13 +544,38 @@ fn log_ignored_config(datadir: &std::path::Path) {
     }
 }
 
-#[derive(Clone)]
-struct ReloadableLogFile {
-    path: PathBuf,
-    file: Arc<Mutex<std::fs::File>>,
+const ASYNC_LOG_QUEUE_CAPACITY: usize = 16_384;
+const ASYNC_LOG_FILE_BUFFER_BYTES: usize = 1024 * 1024;
+// Keep asynchronous logging decoupled from request handling while making
+// diagnostics visible promptly to Core-compatible log watchers.
+const ASYNC_LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(25);
+
+enum AsyncLogCommand {
+    Write(Vec<u8>),
+    Reopen,
+    #[cfg(test)]
+    Flush(mpsc::Sender<io::Result<()>>),
+    Shutdown(mpsc::Sender<io::Result<()>>),
 }
 
-impl ReloadableLogFile {
+struct AsyncLogState {
+    sender: mpsc::SyncSender<AsyncLogCommand>,
+    dropped_bytes: AtomicU64,
+    last_error: Mutex<Option<String>>,
+}
+
+#[derive(Clone)]
+struct AsyncLogFileHandle {
+    state: Arc<AsyncLogState>,
+    path: PathBuf,
+}
+
+struct AsyncLogFile {
+    handle: AsyncLogFileHandle,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl AsyncLogFile {
     fn open(path: &std::path::Path, shrink: bool) -> io::Result<Self> {
         let mut options = OpenOptions::new();
         options.create(true).write(true);
@@ -548,32 +585,198 @@ impl ReloadableLogFile {
             options.append(true);
         }
         let file = options.open(path)?;
+        let (sender, receiver) = mpsc::sync_channel(ASYNC_LOG_QUEUE_CAPACITY);
+        let log_path = path.to_owned();
+        let state = Arc::new(AsyncLogState {
+            sender,
+            dropped_bytes: AtomicU64::new(0),
+            last_error: Mutex::new(None),
+        });
+        let worker_state = state.clone();
+        let worker_path = log_path.clone();
+        let worker = thread::Builder::new()
+            .name("debug-log".to_owned())
+            .spawn(move || async_log_worker(file, worker_path, receiver, worker_state))?;
         Ok(Self {
-            path: path.to_owned(),
-            file: Arc::new(Mutex::new(file)),
+            handle: AsyncLogFileHandle {
+                state,
+                path: log_path,
+            },
+            worker: Some(worker),
         })
     }
 
-    fn reopen(&self) -> io::Result<()> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        let mut current = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("debug log lock poisoned"))?;
-        *current = file;
-        Ok(())
+    fn handle(&self) -> AsyncLogFileHandle {
+        self.handle.clone()
+    }
+
+    fn shutdown(mut self) {
+        self.shutdown_inner();
+    }
+
+    fn shutdown_inner(&mut self) {
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let (sender, receiver) = mpsc::channel();
+        let _ = self
+            .handle
+            .state
+            .sender
+            .send(AsyncLogCommand::Shutdown(sender));
+        let _ = receiver.recv();
+        let _ = worker.join();
+        let dropped = self.handle.state.dropped_bytes.load(Ordering::Relaxed);
+        if dropped != 0 {
+            eprintln!("[debug-log] dropped {dropped} bytes because the async log queue was full");
+        }
+        if let Ok(last_error) = self.handle.state.last_error.lock()
+            && let Some(error) = last_error.as_deref()
+        {
+            eprintln!("[debug-log] worker error: {error}");
+        }
     }
 }
 
-struct ReloadableLogWriter {
-    file: Arc<Mutex<std::fs::File>>,
+impl Drop for AsyncLogFile {
+    fn drop(&mut self) {
+        // Startup has several fallible steps after the logger is installed.
+        // Drain the worker on those early-return paths too; otherwise the
+        // final diagnostic records can be lost when `run_node` unwinds.
+        self.shutdown_inner();
+    }
+}
+
+impl AsyncLogFileHandle {
+    fn enqueue(&self, bytes: Vec<u8>) {
+        let byte_count = bytes.len() as u64;
+        if let Err(error) = self.state.sender.try_send(AsyncLogCommand::Write(bytes)) {
+            match error {
+                mpsc::TrySendError::Full(AsyncLogCommand::Write(_))
+                | mpsc::TrySendError::Disconnected(AsyncLogCommand::Write(_)) => {
+                    self.state
+                        .dropped_bytes
+                        .fetch_add(byte_count, Ordering::Relaxed);
+                }
+                // Only Write commands are sent through this non-blocking path.
+                mpsc::TrySendError::Full(_) | mpsc::TrySendError::Disconnected(_) => unreachable!(),
+            }
+        }
+    }
+
+    fn reopen(&self) -> io::Result<()> {
+        // Reopen is a control operation rather than a log record.  It is rare,
+        // so waiting for room preserves ordering even if the diagnostic queue
+        // is temporarily saturated.
+        self.state
+            .sender
+            .send(AsyncLogCommand::Reopen)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "debug log worker stopped"))
+    }
+
+    #[cfg(test)]
+    fn flush(&self) -> io::Result<()> {
+        let (sender, receiver) = mpsc::channel();
+        self.state
+            .sender
+            .send(AsyncLogCommand::Flush(sender))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "debug log worker stopped"))?;
+        receiver
+            .recv()
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "debug log worker stopped"))?
+    }
+}
+
+fn async_log_worker(
+    file: File,
+    path: PathBuf,
+    receiver: mpsc::Receiver<AsyncLogCommand>,
+    state: Arc<AsyncLogState>,
+) {
+    let mut file = BufWriter::with_capacity(ASYNC_LOG_FILE_BUFFER_BYTES, file);
+    let mut last_flush = Instant::now();
+    loop {
+        // A timeout alone is not sufficient here: while the node is busy the
+        // queue can remain continuously readable, so recv_timeout() never
+        // times out and a large BufWriter would hide recent records from
+        // tools that tail debug.log. Keep an explicit deadline and flush
+        // after processing a command once it expires.
+        let wait = ASYNC_LOG_FLUSH_INTERVAL.saturating_sub(last_flush.elapsed());
+        let command = match receiver.recv_timeout(wait) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = file.flush() {
+                    record_async_log_error(&state, error);
+                }
+                last_flush = Instant::now();
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Err(error) = file.flush() {
+                    record_async_log_error(&state, error);
+                }
+                break;
+            }
+        };
+        match command {
+            AsyncLogCommand::Write(bytes) => {
+                if let Err(error) = file.write_all(&bytes) {
+                    record_async_log_error(&state, error);
+                }
+            }
+            AsyncLogCommand::Reopen => {
+                if let Err(error) = file.flush() {
+                    record_async_log_error(&state, error);
+                }
+                last_flush = Instant::now();
+                match OpenOptions::new().create(true).append(true).open(&path) {
+                    Ok(new_file) => {
+                        file = BufWriter::with_capacity(ASYNC_LOG_FILE_BUFFER_BYTES, new_file);
+                    }
+                    Err(error) => record_async_log_error(&state, error),
+                }
+            }
+            #[cfg(test)]
+            AsyncLogCommand::Flush(reply) => {
+                let result = file.flush().map_err(|error| {
+                    record_async_log_error(&state, io::Error::other(error.to_string()));
+                    error
+                });
+                last_flush = Instant::now();
+                let _ = reply.send(result);
+            }
+            AsyncLogCommand::Shutdown(reply) => {
+                let result = file.flush().map_err(|error| {
+                    record_async_log_error(&state, io::Error::other(error.to_string()));
+                    error
+                });
+                let _ = reply.send(result);
+                break;
+            }
+        }
+        if last_flush.elapsed() >= ASYNC_LOG_FLUSH_INTERVAL {
+            if let Err(error) = file.flush() {
+                record_async_log_error(&state, error);
+            }
+            last_flush = Instant::now();
+        }
+    }
+}
+
+fn record_async_log_error(state: &AsyncLogState, error: io::Error) {
+    if let Ok(mut last_error) = state.last_error.lock() {
+        if last_error.is_none() {
+            *last_error = Some(error.to_string());
+        }
+    }
+}
+
+struct AsyncLogWriter {
+    file: AsyncLogFileHandle,
     buffer: Vec<u8>,
 }
 
-impl Write for ReloadableLogWriter {
+impl Write for AsyncLogWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.buffer.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -583,29 +786,24 @@ impl Write for ReloadableLogWriter {
         if self.buffer.is_empty() {
             return Ok(());
         }
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| io::Error::other("debug log lock poisoned"))?;
-        file.write_all(&self.buffer)?;
-        file.flush()?;
-        self.buffer.clear();
+        let buffer = std::mem::take(&mut self.buffer);
+        self.file.enqueue(buffer);
         Ok(())
     }
 }
 
-impl Drop for ReloadableLogWriter {
+impl Drop for AsyncLogWriter {
     fn drop(&mut self) {
         let _ = self.flush();
     }
 }
 
-impl<'a> MakeWriter<'a> for ReloadableLogFile {
-    type Writer = ReloadableLogWriter;
+impl<'a> MakeWriter<'a> for AsyncLogFileHandle {
+    type Writer = AsyncLogWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
-        ReloadableLogWriter {
-            file: self.file.clone(),
+        AsyncLogWriter {
+            file: self.clone(),
             buffer: Vec::new(),
         }
     }
@@ -719,12 +917,12 @@ impl LogRateLimiter {
 
 #[derive(Clone)]
 struct RateLimitedLogFile {
-    file: ReloadableLogFile,
+    file: AsyncLogFileHandle,
     limiter: Arc<LogRateLimiter>,
 }
 
 impl RateLimitedLogFile {
-    fn new(file: ReloadableLogFile) -> Self {
+    fn new(file: AsyncLogFileHandle) -> Self {
         Self {
             file,
             limiter: Arc::new(LogRateLimiter::new()),
@@ -733,7 +931,7 @@ impl RateLimitedLogFile {
 }
 
 struct RateLimitedLogWriter {
-    inner: ReloadableLogWriter,
+    inner: AsyncLogWriter,
     limiter: Arc<LogRateLimiter>,
     source: LogSource,
     buffer: Vec<u8>,
@@ -803,7 +1001,7 @@ impl<'a> MakeWriter<'a> for RateLimitedLogFile {
 }
 
 #[cfg(unix)]
-async fn reopen_log_on_sighup(log_file: ReloadableLogFile) {
+async fn reopen_log_on_sighup(log_file: AsyncLogFileHandle) {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut sighup = match signal(SignalKind::hangup()) {
@@ -1069,21 +1267,82 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("debug.log");
         let rotated = directory.path().join("debug.log.1");
-        let log_file = ReloadableLogFile::open(&path, true).unwrap();
+        let log_file = AsyncLogFile::open(&path, true).unwrap();
+        let handle = log_file.handle();
 
-        let mut writer = log_file.make_writer();
+        let mut writer = handle.make_writer();
         writer.write_all(b"before rotation\n").unwrap();
         writer.flush().unwrap();
         drop(writer);
+        handle.flush().unwrap();
 
         fs::rename(&path, &rotated).unwrap();
-        log_file.reopen().unwrap();
-        let mut writer = log_file.make_writer();
+        handle.reopen().unwrap();
+        let mut writer = handle.make_writer();
         writer.write_all(b"after rotation\n").unwrap();
         writer.flush().unwrap();
+        drop(writer);
+        handle.flush().unwrap();
 
         assert_eq!(fs::read_to_string(rotated).unwrap(), "before rotation\n");
         assert_eq!(fs::read_to_string(path).unwrap(), "after rotation\n");
+        log_file.shutdown();
+    }
+
+    #[test]
+    fn debug_log_flushes_while_worker_is_idle() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("debug.log");
+        let log_file = AsyncLogFile::open(&path, true).unwrap();
+        let handle = log_file.handle();
+
+        let mut writer = handle.make_writer();
+        writer.write_all(b"visible during startup\n").unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if fs::read_to_string(&path)
+                .unwrap()
+                .contains("visible during startup")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "async log worker did not flush");
+            thread::sleep(Duration::from_millis(20));
+        }
+        log_file.shutdown();
+    }
+
+    #[test]
+    fn debug_log_flushes_while_worker_is_busy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("debug.log");
+        let log_file = AsyncLogFile::open(&path, true).unwrap();
+        let handle = log_file.handle();
+        let producer = thread::spawn(move || {
+            for index in 0..600 {
+                let mut writer = handle.make_writer();
+                writeln!(writer, "busy record {index}").unwrap();
+                writer.flush().unwrap();
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if fs::metadata(&path).unwrap().len() > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "busy async log worker did not flush"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        producer.join().unwrap();
+        log_file.shutdown();
     }
 
     #[test]

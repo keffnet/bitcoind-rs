@@ -295,6 +295,7 @@ dependencies = [
  "capnp-rpc",
  "capnpc",
  "capnpc-embedded",
+ "cc",
  "chacha20",
  "clap",
  "fjall",
@@ -974,6 +975,7 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+ "serde",
 ]
 
 [[package]]

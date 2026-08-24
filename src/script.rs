@@ -4,7 +4,67 @@
 //! a few of them are broader than Core's policy `Solver`. RPC output, standard
 //! transaction policy, and BIP37 all expose the narrower Core classification.
 
-use bitcoin::Script;
+use bitcoin::consensus::encode::serialize;
+use bitcoin::{Script, Transaction, TxOut};
+
+#[repr(C)]
+struct NativeUtxo {
+    script_pubkey: *const u8,
+    script_pubkey_len: u32,
+    value: i64,
+}
+
+unsafe extern "C" {
+    fn bitcoind_rs_verify_transaction_scripts(
+        transaction_bytes: *const u8,
+        transaction_len: u32,
+        spent_outputs: *const NativeUtxo,
+        spent_outputs_len: u32,
+        flags: u32,
+        failed_input: *mut u32,
+    ) -> i32;
+}
+
+/// Verify all inputs of one transaction through Core's script engine while
+/// sharing its transaction-level precomputed signature hashes. The public
+/// libbitcoinconsensus ABI has one call per input, which reparses the
+/// transaction and rebuilds that state for every input.
+pub(crate) fn verify_transaction_scripts(
+    transaction: &Transaction,
+    previous_outputs: &[TxOut],
+    flags: u32,
+) -> Result<(), usize> {
+    if previous_outputs.len() != transaction.input.len() {
+        return Err(0);
+    }
+    let serialized = serialize(transaction);
+    let native_outputs = previous_outputs
+        .iter()
+        .map(|output| NativeUtxo {
+            script_pubkey: output.script_pubkey.as_bytes().as_ptr(),
+            script_pubkey_len: u32::try_from(output.script_pubkey.len())
+                .expect("scriptPubKey length fits the native consensus ABI"),
+            value: i64::try_from(output.value.to_sat())
+                .expect("consensus output value fits the native consensus ABI"),
+        })
+        .collect::<Vec<_>>();
+    let mut failed_input = 0u32;
+    let result = unsafe {
+        bitcoind_rs_verify_transaction_scripts(
+            serialized.as_ptr(),
+            u32::try_from(serialized.len()).expect("transaction length fits the native ABI"),
+            native_outputs.as_ptr(),
+            u32::try_from(native_outputs.len()).expect("input count fits the native ABI"),
+            flags,
+            &mut failed_input,
+        )
+    };
+    if result == 1 {
+        Ok(())
+    } else {
+        Err(usize::try_from(failed_input).unwrap_or(0))
+    }
+}
 
 /// Match Core's `CPubKey::ValidSize` check.
 ///

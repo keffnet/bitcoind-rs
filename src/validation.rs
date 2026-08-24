@@ -21,6 +21,7 @@ use bitcoin::{
     WitnessCommitment,
 };
 
+use crate::script::verify_transaction_scripts;
 use crate::time;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,6 +103,8 @@ pub enum ValidationError {
     TimeTooOld,
     #[error("block timestamp is too far in the future")]
     TimeTooNew,
+    #[error("node software has expired")]
+    NodeExpired,
     #[error("block timestamp violates the BIP94 timewarp limit")]
     Bip94TimeWarp,
     #[error("block contains no transactions")]
@@ -227,6 +230,7 @@ impl ValidationError {
             Self::BadProofOfWork => "high-hash".to_owned(),
             Self::TimeTooOld => "time-too-old".to_owned(),
             Self::TimeTooNew => "time-too-new".to_owned(),
+            Self::NodeExpired => "node-expired".to_owned(),
             Self::Bip94TimeWarp => "time-timewarp-attack".to_owned(),
             Self::EmptyBlock => "bad-blk-length".to_owned(),
             Self::BadMerkleRoot => "bad-txnmrklroot".to_owned(),
@@ -267,7 +271,7 @@ impl ValidationError {
             Self::NonFinalTransaction => "bad-txns-nonfinal".to_owned(),
             Self::NonFinalSequence => "bad-txns-nonfinal".to_owned(),
             Self::Script { reason, .. } => {
-                format!("block-script-verify-flag-failed ({reason})")
+                format!("mandatory-script-verify-flag-failed ({reason})")
             }
         }
     }
@@ -1849,46 +1853,109 @@ pub fn validate_transaction_finality(
     csv_active: bool,
     previous_entries: &[crate::chain::UtxoEntry],
 ) -> Result<(), ValidationError> {
-    // Core treats nLockTime as the last invalid height/time, so equality is
-    // still non-final. Do this comparison directly instead of using the
-    // bitcoin crate's inclusive typed helper; it also remains valid once a
-    // chain height exceeds the typed block-height range.
-    let absolute_satisfied = if !transaction.is_lock_time_enabled() {
-        true
+    let metadata = previous_entries
+        .iter()
+        .map(|entry| (entry.height, entry.median_time_past))
+        .collect::<Vec<_>>();
+    validate_transaction_finality_with_metadata(
+        transaction,
+        height,
+        lock_time_cutoff,
+        csv_active,
+        &metadata,
+    )
+}
+
+/// Check the absolute nLockTime portion of transaction finality.
+///
+/// Block connection can validate relative locks as each prevout is already
+/// borrowed. Keeping this part separate avoids materializing a metadata
+/// vector merely to make a second pass over the inputs.
+pub fn validate_transaction_absolute_finality(
+    transaction: &Transaction,
+    height: u32,
+    lock_time_cutoff: u32,
+) -> Result<(), ValidationError> {
+    if !transaction.is_lock_time_enabled() {
+        return Ok(());
+    }
+    let lock_time = transaction.lock_time.to_consensus_u32();
+    if lock_time == 0 {
+        return Ok(());
+    }
+    let limit = if lock_time < LOCK_TIME_THRESHOLD {
+        height
     } else {
-        let lock_time = transaction.lock_time.to_consensus_u32();
-        lock_time == 0
-            || lock_time
-                < if lock_time < LOCK_TIME_THRESHOLD {
-                    height
-                } else {
-                    lock_time_cutoff
-                }
+        lock_time_cutoff
     };
-    if !absolute_satisfied {
+    if lock_time >= limit {
         return Err(ValidationError::NonFinalTransaction);
     }
+    Ok(())
+}
+
+/// Check one BIP68 relative lock while its spent coin is borrowed.
+///
+/// This is equivalent to Core's `CalculateSequenceLocks` plus
+/// `EvaluateSequenceLocks` for one input. The stored median time is the MTP
+/// of the block before the one that created the output, which is the same
+/// time base Core derives from the coin's height.
+pub fn validate_transaction_sequence_lock_input(
+    input: &bitcoin::TxIn,
+    transaction_version: bitcoin::transaction::Version,
+    height: u32,
+    lock_time_cutoff: u32,
+    csv_active: bool,
+    entry_height: u32,
+    entry_median_time_past: u32,
+) -> Result<(), ValidationError> {
+    if !csv_active || transaction_version.0 < 2 || !input.sequence.is_relative_lock_time() {
+        return Ok(());
+    }
+    let sequence = input.sequence.to_consensus_u32();
+    let relative = u32::from((sequence & 0x0000_ffff) as u16);
+    if input.sequence.is_height_locked() {
+        if height < entry_height.saturating_add(relative) {
+            return Err(ValidationError::NonFinalSequence);
+        }
+    } else {
+        let relative_seconds = relative.saturating_mul(512);
+        let required_time = i64::from(entry_median_time_past) + i64::from(relative_seconds) - 1;
+        if i64::from(lock_time_cutoff) <= required_time {
+            return Err(ValidationError::NonFinalSequence);
+        }
+    }
+    Ok(())
+}
+
+/// Validate transaction finality using only the metadata needed by BIP68.
+/// Consensus block connection already owns the full prevout for undo and
+/// script work; retaining a second full `TxOut` per input just to check height
+/// and median-time locks needlessly multiplies IBD allocations.
+pub fn validate_transaction_finality_with_metadata(
+    transaction: &Transaction,
+    height: u32,
+    lock_time_cutoff: u32,
+    csv_active: bool,
+    previous_entries: &[(u32, u32)],
+) -> Result<(), ValidationError> {
+    validate_transaction_absolute_finality(transaction, height, lock_time_cutoff)?;
     if !csv_active || transaction.version.0 < 2 || previous_entries.len() != transaction.input.len()
     {
         return Ok(());
     }
-    for (input, entry) in transaction.input.iter().zip(previous_entries) {
-        let sequence = input.sequence.to_consensus_u32();
-        if !input.sequence.is_relative_lock_time() {
-            continue;
-        }
-        let relative = u32::from((sequence & 0x0000_ffff) as u16);
-        if input.sequence.is_height_locked() {
-            if height < entry.height.saturating_add(relative) {
-                return Err(ValidationError::NonFinalSequence);
-            }
-        } else {
-            let relative_seconds = relative.saturating_mul(512);
-            let required_time = i64::from(entry.median_time_past) + i64::from(relative_seconds) - 1;
-            if i64::from(lock_time_cutoff) <= required_time {
-                return Err(ValidationError::NonFinalSequence);
-            }
-        }
+    for (input, (entry_height, entry_median_time_past)) in
+        transaction.input.iter().zip(previous_entries)
+    {
+        validate_transaction_sequence_lock_input(
+            input,
+            transaction.version,
+            height,
+            lock_time_cutoff,
+            csv_active,
+            *entry_height,
+            *entry_median_time_past,
+        )?;
     }
     Ok(())
 }
@@ -1974,32 +2041,14 @@ pub(crate) fn validate_transaction_scripts_with_flags(
             reason: "previous-output count does not match input count".to_owned(),
         });
     }
-    let serialized = bitcoin::consensus::encode::serialize(transaction);
-    let spent_outputs: Vec<bitcoinconsensus::Utxo> = previous_outputs
-        .iter()
-        .map(|output| bitcoinconsensus::Utxo {
-            script_pubkey: output.script_pubkey.as_bytes().as_ptr(),
-            script_pubkey_len: output.script_pubkey.len() as u32,
-            value: output.value.to_sat() as i64,
-        })
-        .collect();
-    for (input, previous_output) in previous_outputs.iter().enumerate() {
-        if let Err(error) = bitcoinconsensus::verify_with_flags(
-            previous_output.script_pubkey.as_bytes(),
-            previous_output.value.to_sat(),
-            &serialized,
-            Some(&spent_outputs),
+    if let Err(input) = verify_transaction_scripts(transaction, previous_outputs, flags) {
+        return Err(ValidationError::Script {
+            txid: transaction.compute_txid(),
             input,
-            flags,
-        ) {
-            return Err(ValidationError::Script {
-                txid: transaction.compute_txid(),
-                input,
-                reason: script_error_reason_hint(transaction, previous_outputs, input)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| format!("{error:?}")),
-            });
-        }
+            reason: script_error_reason_hint(transaction, previous_outputs, input)
+                .map(str::to_owned)
+                .unwrap_or_else(|| "script verification failed".to_owned()),
+        });
     }
     Ok(())
 }
@@ -2456,44 +2505,57 @@ pub(crate) fn transaction_sigop_cost(
         return cost;
     }
 
-    if flags & bitcoinconsensus::VERIFY_P2SH != 0 {
-        for (input, previous_output) in transaction.input.iter().zip(previous_outputs) {
-            if previous_output.script_pubkey.is_p2sh()
-                && input.script_sig.is_push_only()
-                && let Some(redeem_script) = last_push_bytes(&input.script_sig)
-            {
-                cost = cost.saturating_add(
-                    ScriptBuf::from_bytes(redeem_script)
-                        .count_sigops()
-                        .saturating_mul(4),
-                );
-            }
-        }
-    }
-
-    if flags & bitcoinconsensus::VERIFY_WITNESS != 0 {
-        for (input, previous_output) in transaction.input.iter().zip(previous_outputs) {
-            let witness_program = if previous_output.script_pubkey.is_witness_program() {
-                Some(previous_output.script_pubkey.clone())
-            } else if previous_output.script_pubkey.is_p2sh() && input.script_sig.is_push_only() {
-                last_push_bytes(&input.script_sig).map(ScriptBuf::from_bytes)
-            } else {
-                None
-            };
-            let Some(witness_program) = witness_program else {
-                continue;
-            };
-            if witness_program.is_p2wpkh() {
-                cost = cost.saturating_add(1);
-            } else if witness_program.is_p2wsh()
-                && let Some(witness_script) = input.witness.last()
-            {
-                cost = cost
-                    .saturating_add(ScriptBuf::from_bytes(witness_script.to_vec()).count_sigops());
-            }
-        }
+    for (input, previous_output) in transaction.input.iter().zip(previous_outputs) {
+        cost = cost.saturating_add(transaction_input_sigop_cost(input, previous_output, flags));
     }
     cost
+}
+
+/// Return the contextual sigop contribution for one input without requiring
+/// the caller to materialize a complete `TxOut` slice. Core reads each coin
+/// directly from its cache while calculating this value; the replay path uses
+/// this helper to keep that same borrowed-coin behavior when script checks are
+/// skipped by assumevalid.
+pub(crate) fn transaction_input_sigop_cost(
+    input: &TxIn,
+    previous_output: &TxOut,
+    flags: u32,
+) -> usize {
+    let mut cost = 0usize;
+    if flags & bitcoinconsensus::VERIFY_P2SH != 0
+        && previous_output.script_pubkey.is_p2sh()
+        && input.script_sig.is_push_only()
+        && let Some(redeem_script) = last_push_bytes(&input.script_sig)
+    {
+        cost = cost.saturating_add(
+            ScriptBuf::from_bytes(redeem_script)
+                .count_sigops()
+                .saturating_mul(4),
+        );
+    }
+
+    if flags & bitcoinconsensus::VERIFY_WITNESS == 0 {
+        return cost;
+    }
+    let witness_program = if previous_output.script_pubkey.is_witness_program() {
+        Some(previous_output.script_pubkey.clone())
+    } else if previous_output.script_pubkey.is_p2sh() && input.script_sig.is_push_only() {
+        last_push_bytes(&input.script_sig).map(ScriptBuf::from_bytes)
+    } else {
+        None
+    };
+    let Some(witness_program) = witness_program else {
+        return cost;
+    };
+    if witness_program.is_p2wpkh() {
+        cost.saturating_add(1)
+    } else if witness_program.is_p2wsh()
+        && let Some(witness_script) = input.witness.last()
+    {
+        cost.saturating_add(ScriptBuf::from_bytes(witness_script.to_vec()).count_sigops())
+    } else {
+        cost
+    }
 }
 
 fn last_push_bytes(script: &ScriptBuf) -> Option<Vec<u8>> {

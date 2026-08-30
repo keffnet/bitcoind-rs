@@ -3716,6 +3716,7 @@ pub struct UtxoStore {
     generation: u64,
     crash_ratio: Option<u64>,
     read_cache: Mutex<UtxoReadCache>,
+    read_tuner: Arc<UtxoReadTuner>,
     pending: FastHashMap<OutPoint, PendingUtxo>,
     pending_bytes: usize,
     pending_limit_bytes: usize,
@@ -3791,6 +3792,8 @@ pub struct UtxoQuery {
     source: UtxoQuerySource,
     known: FastHashMap<OutPoint, Option<StoredUtxo>>,
     unresolved: Vec<OutPoint>,
+    read_workers: usize,
+    adaptive_tuner: Option<Arc<UtxoReadTuner>>,
 }
 
 // Keep each prefetch wave bounded so a pathological block batch cannot turn
@@ -3799,6 +3802,152 @@ pub struct UtxoQuery {
 // IBD block more efficiently than four 131k waves while keeping the decoded
 // working set and the reader pool bounded.
 const UTXO_PREFETCH_CHUNK: usize = 262_144;
+
+const ADAPTIVE_UTXO_MIN_SAMPLE_LOOKUPS: usize = 16_384;
+const ADAPTIVE_UTXO_MIN_SAMPLES: u32 = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UtxoReadProfile {
+    Latency,
+    Balanced,
+    LowOverhead,
+}
+
+impl UtxoReadProfile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Latency => "latency",
+            Self::Balanced => "balanced",
+            Self::LowOverhead => "low-overhead",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UtxoPrefetchTuning {
+    pub(crate) max_blocks: usize,
+    pub(crate) max_outpoints: usize,
+    pub(crate) read_workers: usize,
+    pub(crate) adaptive: bool,
+    pub(crate) profile: &'static str,
+}
+
+struct UtxoReadTunerState {
+    enabled: bool,
+    profile: UtxoReadProfile,
+    samples: u32,
+    lookup_rate_ewma: Option<f64>,
+}
+
+impl Default for UtxoReadTunerState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profile: UtxoReadProfile::Latency,
+            samples: 0,
+            lookup_rate_ewma: None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct UtxoReadTuner {
+    state: Mutex<UtxoReadTunerState>,
+}
+
+impl UtxoReadTuner {
+    fn configure(&self, enabled: bool) {
+        let mut state = self.state.lock();
+        state.enabled = enabled;
+        state.profile = UtxoReadProfile::Latency;
+        state.samples = 0;
+        state.lookup_rate_ewma = None;
+    }
+
+    fn tuning(&self) -> UtxoPrefetchTuning {
+        let state = self.state.lock();
+        Self::profile_tuning(state.profile, state.enabled)
+    }
+
+    fn profile_tuning(profile: UtxoReadProfile, adaptive: bool) -> UtxoPrefetchTuning {
+        let latency_workers = thread::available_parallelism()
+            .map_or(8, usize::from)
+            .saturating_mul(8)
+            .clamp(32, 64);
+        let (max_blocks, max_outpoints, read_workers) = match profile {
+            UtxoReadProfile::Latency => (128, 1_048_576, latency_workers),
+            UtxoReadProfile::Balanced => (64, 524_288, latency_workers.saturating_div(2).max(16)),
+            UtxoReadProfile::LowOverhead => (32, 262_144, latency_workers.saturating_div(4).max(8)),
+        };
+        UtxoPrefetchTuning {
+            max_blocks,
+            max_outpoints,
+            read_workers,
+            adaptive,
+            profile: profile.name(),
+        }
+    }
+
+    fn record(&self, lookups: usize, elapsed: Duration) {
+        if lookups < ADAPTIVE_UTXO_MIN_SAMPLE_LOOKUPS || elapsed.is_zero() {
+            return;
+        }
+        let lookup_rate = lookups as f64 / elapsed.as_secs_f64();
+        let mut state = self.state.lock();
+        if !state.enabled {
+            return;
+        }
+        let smoothed = state
+            .lookup_rate_ewma
+            .map_or(lookup_rate, |previous| previous * 0.75 + lookup_rate * 0.25);
+        state.lookup_rate_ewma = Some(smoothed);
+        state.samples = state.samples.saturating_add(1);
+        if state.samples < ADAPTIVE_UTXO_MIN_SAMPLES {
+            return;
+        }
+
+        // Promote only after a substantial sustained margin, and demote at a
+        // lower threshold. The gap prevents a database checkpoint or one hot
+        // cache window from making the profile oscillate.
+        let next = match state.profile {
+            UtxoReadProfile::Latency if smoothed >= 450_000.0 => UtxoReadProfile::LowOverhead,
+            UtxoReadProfile::Latency if smoothed >= 125_000.0 => UtxoReadProfile::Balanced,
+            UtxoReadProfile::Balanced if smoothed < 75_000.0 => UtxoReadProfile::Latency,
+            UtxoReadProfile::Balanced if smoothed >= 350_000.0 => UtxoReadProfile::LowOverhead,
+            UtxoReadProfile::LowOverhead if smoothed < 200_000.0 => UtxoReadProfile::Balanced,
+            profile => profile,
+        };
+        if next != state.profile {
+            let previous = state.profile;
+            state.profile = next;
+            let tuning = Self::profile_tuning(next, true);
+            tracing::info!(
+                previous = previous.name(),
+                profile = next.name(),
+                lookup_rate = smoothed,
+                max_blocks = tuning.max_blocks,
+                max_outpoints = tuning.max_outpoints,
+                read_workers = tuning.read_workers,
+                "Adaptive UTXO prefetch profile changed"
+            );
+        }
+    }
+}
+
+fn utxo_read_pool(workers: usize) -> Arc<rayon::ThreadPool> {
+    static READ_POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock::new();
+    let pools = READ_POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut pools = pools.lock();
+    Arc::clone(pools.entry(workers).or_insert_with(|| {
+        Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .thread_name(move |index| format!("utxo-reader-{workers}-{index}"))
+                .build()
+                .expect("building bounded UTXO read pool"),
+        )
+    }))
+}
 
 impl UtxoQuery {
     pub fn unresolved_len(&self) -> usize {
@@ -3810,14 +3959,25 @@ impl UtxoQuery {
             source,
             known,
             unresolved,
+            read_workers,
+            adaptive_tuner,
         } = self;
+        let unresolved_len = unresolved.len();
+        let started = Instant::now();
         let mut entries = FastHashMap::with_capacity(known.len() + unresolved.len());
         for (outpoint, entry) in known {
             if let Some(entry) = entry {
                 entries.insert(outpoint, entry);
             }
         }
-        entries.extend(Self::execute_unresolved_values(&source, unresolved)?);
+        entries.extend(Self::execute_unresolved_values(
+            &source,
+            unresolved,
+            read_workers,
+        )?);
+        if let Some(tuner) = adaptive_tuner {
+            tuner.record(unresolved_len, started.elapsed());
+        }
         Ok(entries)
     }
 
@@ -3828,9 +3988,19 @@ impl UtxoQuery {
     /// retain a second allocation until the block finishes.
     pub fn execute_unresolved(self) -> Result<FastHashMap<OutPoint, StoredUtxo>> {
         let UtxoQuery {
-            source, unresolved, ..
+            source,
+            unresolved,
+            read_workers,
+            adaptive_tuner,
+            ..
         } = self;
-        Self::execute_unresolved_values(&source, unresolved)
+        let unresolved_len = unresolved.len();
+        let started = Instant::now();
+        let entries = Self::execute_unresolved_values(&source, unresolved, read_workers)?;
+        if let Some(tuner) = adaptive_tuner {
+            tuner.record(unresolved_len, started.elapsed());
+        }
+        Ok(entries)
     }
 
     /// Decode unresolved coins in bounded batches for the current block. The
@@ -3840,18 +4010,27 @@ impl UtxoQuery {
     /// `SpendCoin`.
     pub fn seed_unresolved_into(self) -> Result<FastHashMap<OutPoint, Option<StoredUtxo>>> {
         let UtxoQuery {
-            source, unresolved, ..
+            source,
+            unresolved,
+            read_workers,
+            adaptive_tuner,
+            ..
         } = self;
         // Keep negative reads in the same map as successful reads. A block
         // prefetch can be larger than the decoded cache; retaining this
         // bounded fallback keeps validation independent of later evictions.
         // Core's cache has the same fallback relationship to its DB view.
         let mut prefetched = FastHashMap::with_capacity(unresolved.len());
+        let unresolved_len = unresolved.len();
+        let started = Instant::now();
         for chunk in unresolved.chunks(UTXO_PREFETCH_CHUNK) {
-            let loaded = Self::load_unresolved(&source, chunk)?;
+            let loaded = Self::load_unresolved(&source, chunk, read_workers)?;
             for (outpoint, entry) in loaded {
                 prefetched.insert(outpoint, entry);
             }
+        }
+        if let Some(tuner) = adaptive_tuner {
+            tuner.record(unresolved_len, started.elapsed());
         }
         Ok(prefetched)
     }
@@ -3859,9 +4038,10 @@ impl UtxoQuery {
     fn execute_unresolved_values(
         source: &UtxoQuerySource,
         unresolved: Vec<OutPoint>,
+        read_workers: usize,
     ) -> Result<FastHashMap<OutPoint, StoredUtxo>> {
         let entries = FastHashMap::with_capacity(unresolved.len());
-        let loaded = Self::load_unresolved(source, &unresolved)?;
+        let loaded = Self::load_unresolved(source, &unresolved, read_workers)?;
         Ok(loaded
             .into_iter()
             .fold(entries, |mut entries, (outpoint, entry)| {
@@ -3875,6 +4055,7 @@ impl UtxoQuery {
     fn load_unresolved(
         source: &UtxoQuerySource,
         unresolved: &[OutPoint],
+        read_workers: usize,
     ) -> Result<Vec<(OutPoint, Option<StoredUtxo>)>> {
         // Point reads are independent and storage latency dominates cache
         // misses during IBD. The peer path uses the current partition,
@@ -3887,18 +4068,7 @@ impl UtxoQuery {
         // waiting for a bloom/index/value-block read.  Sixty-four workers is
         // enough to keep the remote store busy on the current 8-core host,
         // while avoiding the allocator/thread pressure of larger pools.
-        static READ_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-        let read_pool = READ_POOL.get_or_init(|| {
-            let threads = thread::available_parallelism()
-                .map_or(8, usize::from)
-                .saturating_mul(8)
-                .clamp(32, 64);
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .thread_name(|index| format!("utxo-reader-{index}"))
-                .build()
-                .expect("building bounded UTXO read pool")
-        });
+        let read_pool = utxo_read_pool(read_workers);
         read_pool.install(|| {
             unresolved
                 .par_iter()
@@ -4055,6 +4225,7 @@ impl UtxoStore {
             generation,
             crash_ratio: None,
             read_cache: Mutex::new(read_cache),
+            read_tuner: Arc::new(UtxoReadTuner::default()),
             pending: FastHashMap::new(),
             pending_bytes: 0,
             pending_limit_bytes: UTXO_PENDING_DEFAULT_LIMIT_BYTES,
@@ -4070,6 +4241,23 @@ impl UtxoStore {
 
     pub fn configure_crash_ratio(&mut self, ratio: Option<u64>) {
         self.crash_ratio = ratio.filter(|ratio| *ratio > 0);
+    }
+
+    pub(crate) fn configure_adaptive_prefetch(&self, enabled: bool) {
+        self.read_tuner.configure(enabled);
+        let tuning = self.read_tuner.tuning();
+        tracing::info!(
+            enabled,
+            profile = tuning.profile,
+            max_blocks = tuning.max_blocks,
+            max_outpoints = tuning.max_outpoints,
+            read_workers = tuning.read_workers,
+            "Configured adaptive UTXO prefetch"
+        );
+    }
+
+    pub(crate) fn prefetch_tuning(&self) -> UtxoPrefetchTuning {
+        self.read_tuner.tuning()
     }
 
     fn mark_recovery_pending(&self) -> Result<()> {
@@ -4472,6 +4660,9 @@ impl UtxoStore {
             source: UtxoQuerySource::Snapshot(self.coins.snapshot()),
             known,
             unresolved,
+            read_workers: UtxoReadTuner::profile_tuning(UtxoReadProfile::Latency, false)
+                .read_workers,
+            adaptive_tuner: None,
         }
     }
 
@@ -4513,6 +4704,7 @@ impl UtxoStore {
         // reach consensus validation, while the storage layer performs one
         // point read for the shared outpoint.
         unresolved.dedup();
+        let tuning = self.read_tuner.tuning();
         UtxoQuery {
             // Peer IBD owns the chain writer for the whole query/validation
             // sequence, so no other UTXO mutation can race these reads. Use
@@ -4520,6 +4712,8 @@ impl UtxoStore {
             source: UtxoQuerySource::Latest(self.coins.clone()),
             known: FastHashMap::new(),
             unresolved,
+            read_workers: tuning.read_workers,
+            adaptive_tuner: tuning.adaptive.then(|| Arc::clone(&self.read_tuner)),
         }
     }
 
@@ -7607,6 +7801,46 @@ mod tests {
             mib(UtxoStore::recommended_disk_cache_bytes(Some(8_192))),
             768
         );
+    }
+
+    #[test]
+    fn adaptive_utxo_prefetch_uses_sustained_throughput_and_hysteresis() {
+        let tuner = UtxoReadTuner::default();
+        let fixed = tuner.tuning();
+        assert!(!fixed.adaptive);
+        assert_eq!(fixed.profile, "latency");
+
+        // Disabled observations must preserve the established fixed profile.
+        for _ in 0..8 {
+            tuner.record(1_000_000, Duration::from_secs(1));
+        }
+        assert_eq!(tuner.tuning().profile, "latency");
+
+        tuner.configure(true);
+        let initial = tuner.tuning();
+        assert!(initial.adaptive);
+        assert_eq!(initial.profile, "latency");
+
+        // One fast sample is not enough to reconfigure a running IBD.
+        tuner.record(1_000_000, Duration::from_secs(1));
+        assert_eq!(tuner.tuning().profile, "latency");
+        for _ in 1..ADAPTIVE_UTXO_MIN_SAMPLES {
+            tuner.record(1_000_000, Duration::from_secs(1));
+        }
+        let low_overhead = tuner.tuning();
+        assert_eq!(low_overhead.profile, "low-overhead");
+        assert!(low_overhead.max_blocks < initial.max_blocks);
+        assert!(low_overhead.max_outpoints < initial.max_outpoints);
+        assert!(low_overhead.read_workers < initial.read_workers);
+
+        // Sustained slow samples eventually demote through the hysteresis
+        // band, while one checkpoint-sized disturbance cannot do so.
+        tuner.record(20_000, Duration::from_secs(1));
+        assert_eq!(tuner.tuning().profile, "low-overhead");
+        for _ in 0..16 {
+            tuner.record(20_000, Duration::from_secs(1));
+        }
+        assert_eq!(tuner.tuning().profile, "latency");
     }
 
     #[test]

@@ -2411,6 +2411,7 @@ impl Node {
         chain.configure_script_check_threads(config.script_check_threads);
         chain.configure_script_cache_size_mib(config.max_sig_cache_mib);
         chain.configure_storage_cache_size_mib_with_mempool(config.db_cache_mib, max_mempool_bytes);
+        chain.configure_adaptive_utxo_prefetch(config.adaptive_utxo_prefetch());
         let utxo_cache_started = Instant::now();
         let (cached_utxos, cached_utxo_bytes) =
             chain.warm_utxo_cache().map_err(core_startup_chain_error)?;

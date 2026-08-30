@@ -164,16 +164,10 @@ const IBD_BENCH_BLOCKS: u32 = 256;
 // Headers-first IBD normally drains long contiguous runs of already-stored
 // bodies after one missing parent arrives. Fetching prevouts one block at a
 // time makes every small query sparse across the UTXO keyspace, defeating
-// NFS readahead and Fjall's block cache. Keep one decoded-block-cache-sized
-// suffix in flight and sort all of its unresolved prevouts as one query;
-// consensus validation and UTXO mutation remain strictly block ordered.
-const IBD_UTXO_PREFETCH_BLOCKS: usize = 128;
+// filesystem readahead and Fjall's block cache. The storage tuner supplies
+// the maximum suffix size; consensus validation and UTXO mutation remain
+// strictly block ordered.
 const IBD_UTXO_PREFETCH_MIN_BLOCKS: usize = 8;
-// A valid contemporary batch is normally a few hundred thousand prevouts,
-// but consensus permits unusually input-dense blocks. Bound the temporary
-// map independently of the block count so a hostile suffix cannot consume
-// multiple GiB before validation reaches its first block.
-const IBD_UTXO_PREFETCH_MAX_OUTPOINTS: usize = 1_048_576;
 // An 8,192-block suffix keeps startup bounded while covering a much larger
 // fraction of the spend-locality window that Core rebuilds naturally during
 // IBD. The byte cap below still prevents this from materializing the whole
@@ -4839,6 +4833,14 @@ impl ChainState {
             .configure_cache_size_mib_with_mempool(mib, max_mempool_bytes);
     }
 
+    /// Optionally tune IBD UTXO read batching from observed lookup
+    /// throughput. Device-name or filesystem detection is intentionally
+    /// avoided because virtual, RAID, and remote block devices do not expose
+    /// reliable performance characteristics through their mount type.
+    pub fn configure_adaptive_utxo_prefetch(&mut self, enabled: bool) {
+        self.utxo_store.configure_adaptive_prefetch(enabled);
+    }
+
     pub fn warm_utxo_cache(&mut self) -> Result<(usize, usize)> {
         let capacity = self.utxo_store.cache_capacity_bytes();
         // Match Core's useful post-flush cache locality: devote most of the
@@ -8652,9 +8654,10 @@ impl ChainState {
         parent_hash: BlockHash,
     ) -> Result<Option<BlockHash>> {
         self.ibd_batch_prefetched_utxos.clear();
-        let mut hashes = Vec::with_capacity(IBD_UTXO_PREFETCH_BLOCKS);
+        let tuning = self.utxo_store.prefetch_tuning();
+        let mut hashes = Vec::with_capacity(tuning.max_blocks);
         let mut cursor = parent_hash;
-        while hashes.len() < IBD_UTXO_PREFETCH_BLOCKS {
+        while hashes.len() < tuning.max_blocks {
             let Some(children) = self.pending_body_children.get(&cursor) else {
                 break;
             };
@@ -8719,9 +8722,7 @@ impl ChainState {
                     // be both redundant and, for a repeated txid, stale.
                     .filter(|outpoint| !earlier_block_txids.contains(&outpoint.txid))
                     .collect::<Vec<_>>();
-            if lookup_outpoints.len().saturating_add(block_outpoints.len())
-                > IBD_UTXO_PREFETCH_MAX_OUTPOINTS
-            {
+            if lookup_outpoints.len().saturating_add(block_outpoints.len()) > tuning.max_outpoints {
                 break;
             }
             lookup_outpoints.extend(block_outpoints);
@@ -8758,6 +8759,9 @@ impl ChainState {
             outpoints = lookup_outpoints.len(),
             misses,
             loaded,
+            adaptive = tuning.adaptive,
+            profile = tuning.profile,
+            read_workers = tuning.read_workers,
             elapsed = ?elapsed,
             "IBD UTXO batch prefetch"
         );

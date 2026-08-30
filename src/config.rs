@@ -1339,6 +1339,18 @@ pub struct Args {
     )]
     pub db_batch_size_bytes: i64,
 
+    /// Adapt IBD UTXO prefetch batch size and read concurrency to measured
+    /// storage throughput. Disabled by default so existing deployments keep
+    /// their established fixed tuning.
+    #[arg(
+        long = "adaptiveutxoprefetch",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    pub adaptive_utxo_prefetch: bool,
+
     /// Simulate a chainstate write crash at the requested one-in-N rate, as
     /// used by Core's crash-recovery functional test.
     #[arg(long = "dbcrashratio", value_name = "N", hide = true)]
@@ -3230,6 +3242,8 @@ pub struct Config {
     pub db_cache_mib: i64,
     pub db_batch_size_bytes: i64,
     #[cfg(not(test))]
+    pub adaptive_utxo_prefetch: bool,
+    #[cfg(not(test))]
     pub db_crash_ratio: Option<u64>,
     #[cfg(not(test))]
     pub signer: Option<String>,
@@ -3471,6 +3485,17 @@ fn parse_block_reconstruction_extra_txn_size(
 }
 
 impl Config {
+    pub(crate) fn adaptive_utxo_prefetch(&self) -> bool {
+        #[cfg(not(test))]
+        {
+            self.adaptive_utxo_prefetch
+        }
+        #[cfg(test)]
+        {
+            false
+        }
+    }
+
     /// Return whether the effective settings came from Core compatibility
     /// policy defaults.  That mode raises the block reconstruction byte limit
     /// to `usize::MAX`; retaining this derived check avoids duplicating a
@@ -4241,6 +4266,8 @@ impl Config {
             max_sig_cache_mib: args.max_sig_cache_mib,
             db_cache_mib: args.db_cache_mib,
             db_batch_size_bytes: args.db_batch_size_bytes,
+            #[cfg(not(test))]
+            adaptive_utxo_prefetch: args.adaptive_utxo_prefetch,
             #[cfg(not(test))]
             db_crash_ratio: args.db_crash_ratio,
             #[cfg(not(test))]
@@ -6382,9 +6409,16 @@ mod tests {
     fn dbcache_default_matches_core_ram_tier_and_explicit_values() {
         let args = Args::try_parse_from(["bitcoind-rs"]).unwrap();
         assert_eq!(args.db_cache_mib, default_db_cache_mib());
+        assert!(!args.adaptive_utxo_prefetch);
 
         let args = Args::try_parse_from(["bitcoind-rs", "--dbcache=450"]).unwrap();
         assert_eq!(args.db_cache_mib, DEFAULT_DB_CACHE_MIB);
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--adaptiveutxoprefetch"]).unwrap();
+        assert!(args.adaptive_utxo_prefetch);
+
+        let args = Args::try_parse_from(["bitcoind-rs", "--adaptiveutxoprefetch=0"]).unwrap();
+        assert!(!args.adaptive_utxo_prefetch);
     }
 
     #[test]

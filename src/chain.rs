@@ -161,6 +161,19 @@ const PEER_STORAGE_FLUSH_BLOCKS: u32 = 65_536;
 // consume Core's 50 MiB emergency floor mid-batch.
 const NATIVE_STORAGE_WRITE_RESERVE_MULTIPLIER: u64 = 10;
 const IBD_BENCH_BLOCKS: u32 = 256;
+// Headers-first IBD normally drains long contiguous runs of already-stored
+// bodies after one missing parent arrives. Fetching prevouts one block at a
+// time makes every small query sparse across the UTXO keyspace, defeating
+// NFS readahead and Fjall's block cache. Keep one decoded-block-cache-sized
+// suffix in flight and sort all of its unresolved prevouts as one query;
+// consensus validation and UTXO mutation remain strictly block ordered.
+const IBD_UTXO_PREFETCH_BLOCKS: usize = 128;
+const IBD_UTXO_PREFETCH_MIN_BLOCKS: usize = 8;
+// A valid contemporary batch is normally a few hundred thousand prevouts,
+// but consensus permits unusually input-dense blocks. Bound the temporary
+// map independently of the block count so a hostile suffix cannot consume
+// multiple GiB before validation reaches its first block.
+const IBD_UTXO_PREFETCH_MAX_OUTPOINTS: usize = 1_048_576;
 // An 8,192-block suffix keeps startup bounded while covering a much larger
 // fraction of the spend-locality window that Core rebuilds naturally during
 // IBD. The byte cap below still prevents this from materializing the whole
@@ -1775,6 +1788,11 @@ pub struct ChainState {
     // walk the available suffix without scanning the global header index.
     pending_body_children: HashMap<BlockHash, Vec<BlockHash>>,
     processing_known_children: bool,
+    // Values loaded by one multi-block IBD prefetch wave. They are consumed
+    // into the existing block-local validation view as each block connects,
+    // so soon-to-be-spent coins do not evict useful recent outputs from the
+    // long-lived decoded UTXO cache.
+    ibd_batch_prefetched_utxos: FastHashMap<OutPoint, StoredUtxo>,
     // Core's BLOCK_VALID_TRANSACTIONS/HaveNumChainTxs state is distinct from
     // merely having a body in the block store.  Keep the runtime equivalent
     // for bodies accepted by the peer path so the download scheduler can
@@ -2616,6 +2634,7 @@ impl ChainState {
             next_block_sequence_id: 1,
             pending_body_children: HashMap::new(),
             processing_known_children: false,
+            ibd_batch_prefetched_utxos: FastHashMap::new(),
             peer_body_chain_ready: HashSet::new(),
             unlinked_body_order: HashMap::new(),
             next_unlinked_body_order: 1,
@@ -3304,7 +3323,11 @@ impl ChainState {
         // IBD slower than Core and distorted the 256-block benchmark rate.
         // Keep the cleanup at the same cadence as the benchmark window.
         let should_trim_heap = trim_heap
-            && timings.utxo_prefetch > Duration::from_millis(5)
+            && self
+                .ibd_connect_bench
+                .utxo_prefetch
+                .saturating_add(timings.utxo_prefetch)
+                > Duration::from_millis(5)
             && (self.ibd_connect_bench.blocks + 1) % IBD_BENCH_BLOCKS == 0;
         let bench = &mut self.ibd_connect_bench;
         bench.blocks = bench.blocks.saturating_add(1);
@@ -8620,6 +8643,127 @@ impl ChainState {
         self.next_unlinked_body_order = self.next_unlinked_body_order.saturating_add(1);
     }
 
+    /// Prefetch the unresolved prevouts for the next contiguous active-chain
+    /// suffix as one globally sorted lookup. The returned hash is the end of
+    /// the inspected wave, including short waves that were not prefetched;
+    /// callers use it to avoid rescanning the same suffix for every block.
+    fn prefetch_pending_active_suffix(
+        &mut self,
+        parent_hash: BlockHash,
+    ) -> Result<Option<BlockHash>> {
+        self.ibd_batch_prefetched_utxos.clear();
+        let mut hashes = Vec::with_capacity(IBD_UTXO_PREFETCH_BLOCKS);
+        let mut cursor = parent_hash;
+        while hashes.len() < IBD_UTXO_PREFETCH_BLOCKS {
+            let Some(children) = self.pending_body_children.get(&cursor) else {
+                break;
+            };
+            let Some(child_hash) = children
+                .iter()
+                .copied()
+                .filter(|hash| self.store.contains(hash))
+                .min_by(|left, right| {
+                    self.unlinked_body_order
+                        .get(left)
+                        .copied()
+                        .unwrap_or(u64::MAX)
+                        .cmp(
+                            &self
+                                .unlinked_body_order
+                                .get(right)
+                                .copied()
+                                .unwrap_or(u64::MAX),
+                        )
+                        .then_with(|| left.to_string().cmp(&right.to_string()))
+                })
+            else {
+                break;
+            };
+            let Some(node) = self.block_index.get(&child_hash) else {
+                break;
+            };
+            if node.header.prev_blockhash != cursor {
+                break;
+            }
+            hashes.push(child_hash);
+            cursor = child_hash;
+        }
+        let batch_end = hashes.last().copied();
+        if hashes.len() < IBD_UTXO_PREFETCH_MIN_BLOCKS {
+            return Ok(batch_end);
+        }
+
+        let started = Instant::now();
+        let mut lookup_outpoints = Vec::new();
+        let mut earlier_block_txids = FastHashSet::new();
+        let mut prefetched_blocks = 0usize;
+        for hash in &hashes {
+            self.check_shutdown_interrupt()?;
+            let block = self
+                .store
+                .get(hash)?
+                .with_context(|| format!("stored IBD prefetch block {hash} is missing"))?;
+            let transaction_ids = block_transaction_ids(&block);
+            let node = self
+                .block_index
+                .get(hash)
+                .copied()
+                .with_context(|| format!("stored IBD prefetch block {hash} is not indexed"))?;
+            let enforce_bip30 = self.enforce_bip30(node.height, *hash, block.header.prev_blockhash);
+            let block_outpoints =
+                block_utxo_prefetch_outpoints(&block, &transaction_ids, enforce_bip30)
+                    .into_iter()
+                    // Outputs created by an earlier block in this wave will
+                    // be present in the pending overlay before their spender
+                    // is validated. Reading their old disk state now would
+                    // be both redundant and, for a repeated txid, stale.
+                    .filter(|outpoint| !earlier_block_txids.contains(&outpoint.txid))
+                    .collect::<Vec<_>>();
+            if lookup_outpoints.len().saturating_add(block_outpoints.len())
+                > IBD_UTXO_PREFETCH_MAX_OUTPOINTS
+            {
+                break;
+            }
+            lookup_outpoints.extend(block_outpoints);
+            earlier_block_txids.extend(transaction_ids);
+            prefetched_blocks += 1;
+        }
+        if prefetched_blocks < IBD_UTXO_PREFETCH_MIN_BLOCKS {
+            // The ordinary per-block query is already chunked. Leave a very
+            // dense or short wave to that bounded path rather than building
+            // a large second map here.
+            return Ok(hashes.get(prefetched_blocks).copied().or(batch_end));
+        }
+        let batch_end = hashes.get(prefetched_blocks - 1).copied();
+
+        let query = self.utxo_store.query_unresolved(&lookup_outpoints);
+        let misses = query.unresolved_len();
+        self.ibd_batch_prefetched_utxos = query.execute_unresolved()?;
+        let loaded = self.ibd_batch_prefetched_utxos.len();
+        let elapsed = started.elapsed();
+        // The work happens before individual ConnectBlock timings begin, so
+        // charge it explicitly to the same benchmark accumulator. Aggregate
+        // IBD rates then continue to represent elapsed validation work.
+        if self.initial_block_download {
+            let bench = &mut self.ibd_connect_bench;
+            bench.validation += elapsed;
+            bench.utxo_prefetch += elapsed;
+            bench.utxo_misses = bench
+                .utxo_misses
+                .saturating_add(u64::try_from(misses).unwrap_or(u64::MAX));
+            bench.total += elapsed;
+        }
+        info!(
+            blocks = prefetched_blocks,
+            outpoints = lookup_outpoints.len(),
+            misses,
+            loaded,
+            elapsed = ?elapsed,
+            "IBD UTXO batch prefetch"
+        );
+        Ok(batch_end)
+    }
+
     fn process_known_children(
         &mut self,
         parent_hash: BlockHash,
@@ -8641,8 +8785,15 @@ impl ChainState {
             // children after its first visit.
             let mut queued_parents = HashSet::from([parent_hash]);
             let mut connected = 0u64;
+            let mut prefetched_through = None;
             while let Some(parent_hash) = parents.pop_front() {
                 queued_parents.remove(&parent_hash);
+                if !sync_storage
+                    && parent_hash == self.best_hash()
+                    && prefetched_through.is_none_or(|hash| hash == parent_hash)
+                {
+                    prefetched_through = self.prefetch_pending_active_suffix(parent_hash)?;
+                }
                 let Some(mut children) = self.pending_body_children.remove(&parent_hash) else {
                     continue;
                 };
@@ -8722,6 +8873,7 @@ impl ChainState {
             Ok(())
         })();
         self.processing_known_children = false;
+        self.ibd_batch_prefetched_utxos.clear();
         result
     }
 
@@ -10042,11 +10194,24 @@ impl ChainState {
                     self.enforce_bip30(height, block.block_hash(), block.header.prev_blockhash);
                 let lookup_outpoints =
                     block_utxo_prefetch_outpoints(block, transaction_ids, enforce_bip30);
-                let utxo_query = self.utxo_store.query_unresolved(&lookup_outpoints);
+                let mut batch_prefetched = FastHashMap::new();
+                let mut unresolved_outpoints = Vec::with_capacity(lookup_outpoints.len());
+                for outpoint in lookup_outpoints {
+                    if batch_prefetched.contains_key(&outpoint) {
+                        continue;
+                    }
+                    if let Some(entry) = self.ibd_batch_prefetched_utxos.remove(&outpoint) {
+                        batch_prefetched.insert(outpoint, Some(entry));
+                    } else {
+                        unresolved_outpoints.push(outpoint);
+                    }
+                }
+                let utxo_query = self.utxo_store.query_unresolved(&unresolved_outpoints);
                 utxo_misses = u64::try_from(utxo_query.unresolved_len()).unwrap_or(u64::MAX);
                 // Decode misses in bounded batches so the allocator never
                 // retains a complete large block's temporary UTXO map.
-                utxo_query.seed_unresolved_into()?
+                batch_prefetched.extend(utxo_query.seed_unresolved_into()?);
+                batch_prefetched
             };
             utxo_prefetch = prefetch_started.elapsed();
             let transaction_validation_started = Instant::now();
@@ -13788,6 +13953,7 @@ fn open_background_replay_state(
         next_block_sequence_id: 1,
         pending_body_children: HashMap::new(),
         processing_known_children: false,
+        ibd_batch_prefetched_utxos: FastHashMap::new(),
         peer_body_chain_ready: HashSet::new(),
         unlinked_body_order: HashMap::new(),
         next_unlinked_body_order: 1,
@@ -17911,6 +18077,37 @@ mod tests {
         assert_eq!(state.height(), 3);
         assert_eq!(state.peer_storage_blocks_since_flush, 3);
         assert!(state.pending_body_children.is_empty());
+    }
+
+    #[test]
+    fn drains_a_batched_headers_first_suffix_in_consensus_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = ChainState::open(Network::Regtest, directory.path()).unwrap();
+        let mut previous = *state.header(0).unwrap();
+        let mut blocks = Vec::new();
+        for height in 1..=9 {
+            let block = mine_block_from_header(&previous, height, height as u8);
+            previous = block.header;
+            blocks.push(block);
+        }
+        let headers = blocks.iter().map(|block| block.header).collect::<Vec<_>>();
+        state.accept_headers(&headers).unwrap();
+
+        // Store an eight-block future suffix behind a missing first body.
+        // Its arrival should trigger one batched prefetch wave, followed by
+        // the ordinary strictly ordered block connector.
+        for block in blocks.iter().skip(1) {
+            state.connect_block_from_peer(block.clone()).unwrap();
+        }
+        assert_eq!(state.height(), 0);
+        state.connect_block_from_peer(blocks[0].clone()).unwrap();
+
+        assert_eq!(state.height(), 9);
+        assert_eq!(state.best_hash(), blocks[8].block_hash());
+        assert!(state.pending_body_children.is_empty());
+        assert!(!state.processing_known_children);
+        assert!(state.ibd_batch_prefetched_utxos.is_empty());
+        assert_eq!(state.peer_storage_blocks_since_flush, 9);
     }
 
     #[test]
